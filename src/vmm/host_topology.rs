@@ -21,11 +21,15 @@ pub struct HostTopology {
     pub online_cpus: Vec<usize>,
 }
 
-/// Pinning plan: maps each vCPU index to a host CPU.
+/// Pinning plan: maps each vCPU index to a host CPU, plus a dedicated
+/// CPU for service threads (monitor, watchdog).
 #[derive(Debug)]
 pub struct PinningPlan {
     /// vcpu_index -> host_cpu
     pub assignments: Vec<(u32, usize)>,
+    /// Dedicated host CPU for monitor/watchdog threads. Set when
+    /// `reserve_service_cpu` is true in `compute_pinning`.
+    pub service_cpu: Option<usize>,
 }
 
 impl HostTopology {
@@ -55,15 +59,27 @@ impl HostTopology {
     /// Compute a pinning plan that maps virtual sockets to physical LLC groups.
     ///
     /// Each virtual socket's vCPUs are assigned to cores within a single LLC.
+    /// When `reserve_service_cpu` is true, one additional host CPU is reserved
+    /// for service threads (monitor, watchdog) and not assigned to any vCPU.
     /// Returns an error if the host cannot satisfy the topology.
-    pub fn compute_pinning(&self, sockets: u32, cores: u32, threads: u32) -> Result<PinningPlan> {
+    pub fn compute_pinning(
+        &self,
+        sockets: u32,
+        cores: u32,
+        threads: u32,
+        reserve_service_cpu: bool,
+    ) -> Result<PinningPlan> {
         let vcpus_per_socket = cores * threads;
         let total_vcpus = sockets * vcpus_per_socket;
+        let total_needed = total_vcpus as usize + if reserve_service_cpu { 1 } else { 0 };
 
         anyhow::ensure!(
-            total_vcpus as usize <= self.total_cpus(),
-            "performance_mode: need {} vCPUs but only {} host CPUs available",
+            total_needed <= self.total_cpus(),
+            "performance_mode: need {} CPUs ({} vCPUs + {} service) \
+             but only {} host CPUs available",
+            total_needed,
             total_vcpus,
+            if reserve_service_cpu { 1 } else { 0 },
             self.total_cpus(),
         );
 
@@ -106,7 +122,28 @@ impl HostTopology {
             }
         }
 
-        Ok(PinningPlan { assignments })
+        let service_cpu = if reserve_service_cpu {
+            // Pick any online CPU not assigned to a vCPU.
+            let cpu = self
+                .online_cpus
+                .iter()
+                .copied()
+                .find(|c| !used_cpus.contains(c));
+            anyhow::ensure!(
+                cpu.is_some(),
+                "performance_mode: no free host CPU for service threads \
+                 after assigning {} vCPUs",
+                total_vcpus,
+            );
+            cpu
+        } else {
+            None
+        };
+
+        Ok(PinningPlan {
+            assignments,
+            service_cpu,
+        })
     }
 }
 
@@ -204,7 +241,7 @@ mod tests {
         if topo.total_cpus() < 2 {
             return; // skip on single-CPU hosts
         }
-        let plan = topo.compute_pinning(1, 2, 1);
+        let plan = topo.compute_pinning(1, 2, 1, false);
         assert!(plan.is_ok(), "pinning should succeed: {:?}", plan.err());
         let plan = plan.unwrap();
         assert_eq!(plan.assignments.len(), 2);
@@ -218,7 +255,7 @@ mod tests {
     fn pinning_plan_oversubscribed() {
         let topo = HostTopology::from_sysfs().unwrap();
         let too_many = topo.total_cpus() as u32 + 1;
-        let plan = topo.compute_pinning(1, too_many, 1);
+        let plan = topo.compute_pinning(1, too_many, 1, false);
         assert!(plan.is_err());
     }
 
@@ -297,7 +334,7 @@ mod tests {
     fn mapping_single_socket_single_llc() {
         // 1 LLC with 4 CPUs, request 1 socket x 2 cores x 1 thread.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
-        let plan = topo.compute_pinning(1, 2, 1).unwrap();
+        let plan = topo.compute_pinning(1, 2, 1, false).unwrap();
         assert_eq!(plan.assignments.len(), 2);
         assert_eq!(plan.assignments[0], (0, 0));
         assert_eq!(plan.assignments[1], (1, 1));
@@ -307,7 +344,7 @@ mod tests {
     fn mapping_two_sockets_two_llcs() {
         // 2 LLCs, each with 4 CPUs. Request 2s2c1t.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
-        let plan = topo.compute_pinning(2, 2, 1).unwrap();
+        let plan = topo.compute_pinning(2, 2, 1, false).unwrap();
         assert_eq!(plan.assignments.len(), 4);
         // Socket 0 vCPUs (0,1) should map to LLC 0 CPUs (0,1).
         assert_eq!(plan.assignments[0], (0, 0));
@@ -321,7 +358,7 @@ mod tests {
     fn mapping_with_smt() {
         // 1 LLC with 8 CPUs, request 1s2c2t = 4 vCPUs.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]);
-        let plan = topo.compute_pinning(1, 2, 2).unwrap();
+        let plan = topo.compute_pinning(1, 2, 2, false).unwrap();
         assert_eq!(plan.assignments.len(), 4);
         // All 4 vCPUs map to distinct CPUs within the same LLC.
         let cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
@@ -333,7 +370,7 @@ mod tests {
     fn mapping_exact_fit() {
         // 2 LLCs with exactly 2 CPUs each, request 2s2c1t = 4 total.
         let topo = synthetic_topo(vec![vec![0, 1], vec![2, 3]]);
-        let plan = topo.compute_pinning(2, 2, 1).unwrap();
+        let plan = topo.compute_pinning(2, 2, 1, false).unwrap();
         assert_eq!(plan.assignments.len(), 4);
     }
 
@@ -341,7 +378,7 @@ mod tests {
     fn mapping_error_too_many_vcpus() {
         // 1 LLC with 2 CPUs, request 4 vCPUs.
         let topo = synthetic_topo(vec![vec![0, 1]]);
-        let err = topo.compute_pinning(1, 4, 1).unwrap_err();
+        let err = topo.compute_pinning(1, 4, 1, false).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("4 vCPUs") && msg.contains("2 host CPUs"),
@@ -353,7 +390,7 @@ mod tests {
     fn mapping_error_too_many_sockets() {
         // 1 LLC, request 2 sockets.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
-        let err = topo.compute_pinning(2, 1, 1).unwrap_err();
+        let err = topo.compute_pinning(2, 1, 1, false).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("2 LLCs") && msg.contains("1 LLC groups"),
@@ -365,7 +402,7 @@ mod tests {
     fn mapping_error_llc_too_small() {
         // 2 LLCs: first has 4 CPUs, second has only 1. Request 2s2c1t.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4]]);
-        let err = topo.compute_pinning(2, 2, 1).unwrap_err();
+        let err = topo.compute_pinning(2, 2, 1, false).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("LLC group 1") && msg.contains("1 available"),
@@ -377,7 +414,7 @@ mod tests {
     fn mapping_no_cross_llc_sharing() {
         // Verify vCPUs in different sockets never share an LLC's CPUs.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]]);
-        let plan = topo.compute_pinning(3, 2, 1).unwrap();
+        let plan = topo.compute_pinning(3, 2, 1, false).unwrap();
         // Socket 0 should only use CPUs 0-3, socket 1 only 4-7, socket 2 only 8-11.
         for (vcpu_id, host_cpu) in &plan.assignments {
             let socket = vcpu_id / 2; // 2 vCPUs per socket
@@ -394,7 +431,7 @@ mod tests {
     #[test]
     fn mapping_all_assignments_unique() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
-        let plan = topo.compute_pinning(2, 4, 1).unwrap();
+        let plan = topo.compute_pinning(2, 4, 1, false).unwrap();
         let cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
         let unique: std::collections::HashSet<usize> = cpus.iter().copied().collect();
         assert_eq!(
@@ -408,7 +445,7 @@ mod tests {
     #[test]
     fn mapping_vcpu_ids_sequential() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
-        let plan = topo.compute_pinning(1, 4, 1).unwrap();
+        let plan = topo.compute_pinning(1, 4, 1, false).unwrap();
         let vcpu_ids: Vec<u32> = plan.assignments.iter().map(|a| a.0).collect();
         assert_eq!(vcpu_ids, vec![0, 1, 2, 3]);
     }
@@ -416,7 +453,7 @@ mod tests {
     #[test]
     fn mapping_single_vcpu() {
         let topo = synthetic_topo(vec![vec![42]]);
-        let plan = topo.compute_pinning(1, 1, 1).unwrap();
+        let plan = topo.compute_pinning(1, 1, 1, false).unwrap();
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.assignments[0], (0, 42));
     }
@@ -468,7 +505,7 @@ mod tests {
         if min_llc_size < 2 {
             return;
         }
-        let plan = topo.compute_pinning(2, 2, 1).unwrap();
+        let plan = topo.compute_pinning(2, 2, 1, false).unwrap();
         // Socket 0 vCPUs should be in LLC group 0.
         for (vcpu_id, host_cpu) in &plan.assignments {
             let socket = vcpu_id / 2;
@@ -494,5 +531,61 @@ mod tests {
     #[test]
     fn hugepages_needed_exact_multiple() {
         assert_eq!(hugepages_needed(1024), 512);
+    }
+
+    // -- service CPU reservation tests --
+
+    #[test]
+    fn reserve_service_cpu_picks_unpinned() {
+        // 4 CPUs in one LLC, request 2 vCPUs + service CPU.
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
+        let plan = topo.compute_pinning(1, 2, 1, true).unwrap();
+        assert_eq!(plan.assignments.len(), 2);
+        let service = plan.service_cpu.expect("service_cpu should be set");
+        // Service CPU must not overlap with any vCPU assignment.
+        let vcpu_cpus: std::collections::HashSet<usize> =
+            plan.assignments.iter().map(|a| a.1).collect();
+        assert!(
+            !vcpu_cpus.contains(&service),
+            "service CPU {service} must not be assigned to a vCPU",
+        );
+    }
+
+    #[test]
+    fn reserve_service_cpu_false_returns_none() {
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
+        let plan = topo.compute_pinning(1, 2, 1, false).unwrap();
+        assert!(plan.service_cpu.is_none());
+    }
+
+    #[test]
+    fn reserve_service_cpu_exact_fit() {
+        // 3 CPUs total, request 2 vCPUs + 1 service = exact fit.
+        let topo = synthetic_topo(vec![vec![0, 1, 2]]);
+        let plan = topo.compute_pinning(1, 2, 1, true).unwrap();
+        assert!(plan.service_cpu.is_some());
+    }
+
+    #[test]
+    fn reserve_service_cpu_insufficient_fails() {
+        // 2 CPUs, request 2 vCPUs + 1 service = 3 needed, only 2 available.
+        let topo = synthetic_topo(vec![vec![0, 1]]);
+        let err = topo.compute_pinning(1, 2, 1, true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("3 CPUs") && msg.contains("2 host CPUs"),
+            "error should mention CPU shortage: {msg}",
+        );
+    }
+
+    #[test]
+    fn reserve_service_cpu_multi_llc() {
+        // 2 LLCs with 3 CPUs each, request 2s2c1t + service = 5 CPUs needed.
+        let topo = synthetic_topo(vec![vec![0, 1, 2], vec![3, 4, 5]]);
+        let plan = topo.compute_pinning(2, 2, 1, true).unwrap();
+        let service = plan.service_cpu.unwrap();
+        let vcpu_cpus: std::collections::HashSet<usize> =
+            plan.assignments.iter().map(|a| a.1).collect();
+        assert!(!vcpu_cpus.contains(&service));
     }
 }

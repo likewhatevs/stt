@@ -738,6 +738,7 @@ fn demo_host_crash_auto_repro() {
     scheduler = STT_SCHED,
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_jiffies = 60000,
+    max_imbalance = 20.0,
 )]
 fn cover_monitor_evaluation(ctx: &Ctx) -> Result<VerifyResult> {
     // Exercises the host-side monitor threshold evaluation path in

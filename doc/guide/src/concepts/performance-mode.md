@@ -19,16 +19,28 @@ thrashing noise to measurements.
 (`MAP_HUGETLB`) when sufficient free hugepages exist. This eliminates
 TLB pressure from host-side page walks during guest execution.
 
+**RT scheduling** -- vCPU threads are set to `SCHED_FIFO` priority 1.
+The watchdog and monitor threads run at priority 2 on a dedicated
+host CPU not assigned to any vCPU, so they can preempt for
+timeout/sampling without competing for vCPU cores. The serial console
+mutex uses `PTHREAD_PRIO_INHERIT` to avoid priority inversion between
+RT vCPU threads and service threads.
+
 ## Prerequisites
 
-**Sufficient host CPUs** -- the host must have at least as many online
-CPUs as the VM's total vCPU count (`sockets * cores * threads`). The
-host must also have at least as many LLC groups as virtual sockets.
-Oversubscription (more vCPUs than host CPUs) is a hard error.
+**Sufficient host CPUs** -- the host must have at least
+`(sockets * cores * threads) + 1` online CPUs. The extra CPU is
+reserved for service threads (monitor, watchdog) so they do not share
+a core with any RT vCPU. The host must also have at least as many LLC
+groups as virtual sockets.
 
 **2MB hugepages** (optional) -- the host must have free 2MB hugepages
 (check `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages`).
 Without them, guest memory uses regular pages. A warning is printed.
+
+**CAP_SYS_NICE** (optional) -- required for `SCHED_FIFO`. Without it,
+RT scheduling is skipped with a warning. The VM still runs with pinning
+and hugepages.
 
 ## Validation
 
@@ -36,10 +48,11 @@ Without them, guest memory uses regular pages. A warning is printed.
 levels of checks:
 
 **Errors (fatal):**
-- Total vCPUs exceed available host CPUs.
+- Total vCPUs + 1 service CPU exceed available host CPUs.
 - Virtual sockets exceed available LLC groups.
 - Pinning plan cannot be satisfied (an LLC group has fewer available
   CPUs than the virtual socket requires).
+- No free host CPU for service threads after vCPU assignment.
 
 **Warnings (non-fatal):**
 - Insufficient free hugepages -- regular page allocation is used.

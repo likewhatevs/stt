@@ -25,6 +25,91 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory};
 use crate::monitor;
 
 // ---------------------------------------------------------------------------
+// PiMutex — priority-inheritance mutex via pthread_mutex + PTHREAD_PRIO_INHERIT
+// ---------------------------------------------------------------------------
+
+/// Mutex that uses the kernel's priority-inheritance protocol to avoid
+/// priority inversion between RT and non-RT threads.
+///
+/// When a SCHED_FIFO thread blocks on a PiMutex held by a SCHED_OTHER
+/// thread, the kernel temporarily boosts the holder to the waiter's
+/// priority, ensuring the critical section completes without unbounded
+/// delay.
+///
+/// Uses `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` which maps
+/// to `FUTEX_LOCK_PI` in the kernel.
+pub(crate) struct PiMutex<T> {
+    inner: std::cell::UnsafeCell<T>,
+    mutex: std::cell::UnsafeCell<libc::pthread_mutex_t>,
+}
+
+// SAFETY: PiMutex provides mutual exclusion via pthread_mutex_lock/unlock.
+// The UnsafeCell<T> is only accessed while the mutex is held.
+unsafe impl<T: Send> Send for PiMutex<T> {}
+unsafe impl<T: Send> Sync for PiMutex<T> {}
+
+impl<T> PiMutex<T> {
+    /// Create a new PI mutex wrapping `value`.
+    pub(crate) fn new(value: T) -> Self {
+        unsafe {
+            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
+            libc::pthread_mutexattr_init(&mut attr);
+            libc::pthread_mutexattr_setprotocol(&mut attr, libc::PTHREAD_PRIO_INHERIT);
+            let mut mutex: libc::pthread_mutex_t = std::mem::zeroed();
+            libc::pthread_mutex_init(&mut mutex, &attr);
+            libc::pthread_mutexattr_destroy(&mut attr);
+            PiMutex {
+                inner: std::cell::UnsafeCell::new(value),
+                mutex: std::cell::UnsafeCell::new(mutex),
+            }
+        }
+    }
+
+    /// Lock the mutex and return a guard providing `&mut T`.
+    pub(crate) fn lock(&self) -> PiMutexGuard<'_, T> {
+        unsafe {
+            let rc = libc::pthread_mutex_lock(self.mutex.get());
+            debug_assert_eq!(rc, 0, "pthread_mutex_lock failed: {rc}");
+        }
+        PiMutexGuard { mutex: self }
+    }
+}
+
+impl<T> Drop for PiMutex<T> {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_mutex_destroy(self.mutex.get());
+        }
+    }
+}
+
+pub(crate) struct PiMutexGuard<'a, T> {
+    mutex: &'a PiMutex<T>,
+}
+
+impl<T> std::ops::Deref for PiMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.inner.get() }
+    }
+}
+
+impl<T> std::ops::DerefMut for PiMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.inner.get() }
+    }
+}
+
+impl<T> Drop for PiMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        unsafe {
+            let rc = libc::pthread_mutex_unlock(self.mutex.mutex.get());
+            debug_assert_eq!(rc, 0, "pthread_mutex_unlock failed: {rc}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Initramfs cache — two-tier: POSIX shm (cross-process) + in-process HashMap
 // ---------------------------------------------------------------------------
 
@@ -376,6 +461,21 @@ fn pin_current_thread(cpu: usize, label: &str) {
     match nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
         Ok(()) => eprintln!("performance_mode: pinned {label} to host CPU {cpu}"),
         Err(e) => eprintln!("performance_mode: WARNING: pin {label} to CPU {cpu}: {e}"),
+    }
+}
+
+/// Set the calling thread to SCHED_FIFO at the given priority.
+/// Logs success or warning; does not fail the VM.
+fn set_rt_priority(priority: i32, label: &str) {
+    let param = libc::sched_param {
+        sched_priority: priority,
+    };
+    let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+    if rc == 0 {
+        eprintln!("performance_mode: {label} set to SCHED_FIFO priority {priority}");
+    } else {
+        let err = std::io::Error::last_os_error();
+        eprintln!("performance_mode: WARNING: SCHED_FIFO for {label}: {err} (need CAP_SYS_NICE)");
     }
 }
 
@@ -743,27 +843,23 @@ impl SttVm {
         Vec<VcpuThread>,
         Option<JoinHandle<Vec<monitor::MonitorSample>>>,
         Option<JoinHandle<()>>,
-        Arc<std::sync::Mutex<console::Serial>>,
-        Arc<std::sync::Mutex<console::Serial>>,
+        Arc<PiMutex<console::Serial>>,
+        Arc<PiMutex<console::Serial>>,
         Arc<AtomicBool>,
         kvm::SttKvm,
     )> {
-        let com1 = Arc::new(std::sync::Mutex::new(console::Serial::new(
-            console::COM1_BASE,
-        )));
-        let com2 = Arc::new(std::sync::Mutex::new(console::Serial::new(
-            console::COM2_BASE,
-        )));
+        let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
+        let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
         // Register serial EventFds with KVM's irqfd so vm-superio trigger()
         // calls inject the corresponding IRQ into the guest. Without this the
         // 8250 driver never receives THRE interrupts and write() hangs.
         if !vm.split_irqchip {
             vm.vm_fd
-                .register_irqfd(com1.lock().unwrap().irq_evt(), console::COM1_IRQ)
+                .register_irqfd(com1.lock().irq_evt(), console::COM1_IRQ)
                 .context("register COM1 irqfd")?;
             vm.vm_fd
-                .register_irqfd(com2.lock().unwrap().irq_evt(), console::COM2_IRQ)
+                .register_irqfd(com2.lock().irq_evt(), console::COM2_IRQ)
                 .context("register COM2 irqfd")?;
         }
 
@@ -802,6 +898,9 @@ impl SttVm {
         if let Some(Some(host_cpu)) = pin_targets.first() {
             pin_current_thread(*host_cpu, "BSP (vCPU 0)");
         }
+        if self.performance_mode {
+            set_rt_priority(1, "BSP (vCPU 0)");
+        }
 
         // Collect vCPU pthread_t handles for monitor stall detection.
         // BSP runs on the current thread; APs have spawned threads.
@@ -833,9 +932,17 @@ impl SttVm {
         let bsp_done = Arc::new(AtomicBool::new(false));
         let bsp_done_for_wd = bsp_done.clone();
         let kill_for_watchdog = kill.clone();
+        let rt_watchdog = self.performance_mode;
+        let wd_service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
         let watchdog = std::thread::Builder::new()
             .name("vmm-watchdog".into())
             .spawn(move || {
+                if let Some(cpu) = wd_service_cpu {
+                    pin_current_thread(cpu, "watchdog");
+                }
+                if rt_watchdog {
+                    set_rt_priority(2, "watchdog");
+                }
                 let deadline = Instant::now() + timeout;
                 eprintln!("watchdog: started, timeout={timeout:?}");
                 loop {
@@ -905,8 +1012,8 @@ impl SttVm {
         &self,
         vcpus: Vec<kvm_ioctls::VcpuFd>,
         has_immediate_exit: bool,
-        com1: &Arc<std::sync::Mutex<console::Serial>>,
-        com2: &Arc<std::sync::Mutex<console::Serial>>,
+        com1: &Arc<PiMutex<console::Serial>>,
+        com2: &Arc<PiMutex<console::Serial>>,
         kill: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
     ) -> Result<Vec<VcpuThread>> {
@@ -924,6 +1031,7 @@ impl SttVm {
             let exited_clone = exited.clone();
             let pin_cpu = pin_targets.get(i).copied().flatten();
 
+            let rt = self.performance_mode;
             let handle = std::thread::Builder::new()
                 .name(format!("vcpu-{}", i + 1))
                 .spawn(move || {
@@ -931,6 +1039,9 @@ impl SttVm {
                     // Pin inside the thread using pid=0 (calling thread).
                     if let Some(cpu) = pin_cpu {
                         pin_current_thread(cpu, &format!("vCPU {}", i + 1));
+                    }
+                    if rt {
+                        set_rt_priority(1, &format!("vCPU {}", i + 1));
                     }
                     vcpu_run_loop(&mut vcpu, &com1_clone, &com2_clone, &kill_clone);
                     exited_clone.store(true, Ordering::Release);
@@ -983,10 +1094,18 @@ impl SttVm {
 
         let watchdog_jiffies = self.watchdog_timeout_jiffies;
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
+        let rt_monitor = self.performance_mode;
+        let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
 
         let handle = std::thread::Builder::new()
             .name("vmm-monitor".into())
             .spawn(move || {
+                if let Some(cpu) = service_cpu {
+                    pin_current_thread(cpu, "monitor");
+                }
+                if rt_monitor {
+                    set_rt_priority(2, "monitor");
+                }
                 std::thread::sleep(Duration::from_millis(500));
 
                 let page_offset = monitor::symbols::resolve_page_offset(&mem, &symbols);
@@ -1197,8 +1316,8 @@ impl SttVm {
     fn run_bsp(
         &self,
         bsp: &mut kvm_ioctls::VcpuFd,
-        com1: &Arc<std::sync::Mutex<console::Serial>>,
-        com2: &Arc<std::sync::Mutex<console::Serial>>,
+        com1: &Arc<PiMutex<console::Serial>>,
+        com2: &Arc<PiMutex<console::Serial>>,
         kill: &Arc<AtomicBool>,
         has_immediate_exit: bool,
         start: Instant,
@@ -1281,8 +1400,8 @@ impl SttVm {
         ap_threads: Vec<VcpuThread>,
         monitor_handle: Option<JoinHandle<Vec<monitor::MonitorSample>>>,
         bpf_write_handle: Option<JoinHandle<()>>,
-        com1: Arc<std::sync::Mutex<console::Serial>>,
-        com2: Arc<std::sync::Mutex<console::Serial>>,
+        com1: Arc<PiMutex<console::Serial>>,
+        com2: Arc<PiMutex<console::Serial>>,
         kill: Arc<AtomicBool>,
         vm: kvm::SttKvm,
     ) -> Result<VmResult> {
@@ -1338,8 +1457,8 @@ impl SttVm {
             (None, Vec::new())
         };
 
-        let app_output = com2.lock().unwrap().output();
-        let console_output = com1.lock().unwrap().output();
+        let app_output = com2.lock().output();
+        let console_output = com1.lock().output();
 
         if let Some(line) = app_output
             .lines()
@@ -1382,8 +1501,8 @@ const I8042_CMD_RESET_CPU: u8 = 0xFE;
 /// Dispatch an I/O out to serial ports or system devices.
 /// Returns `true` if the caller should exit (system reset detected).
 fn dispatch_io_out(
-    com1: &std::sync::Mutex<console::Serial>,
-    com2: &std::sync::Mutex<console::Serial>,
+    com1: &PiMutex<console::Serial>,
+    com2: &PiMutex<console::Serial>,
     port: u16,
     data: &[u8],
 ) -> bool {
@@ -1393,9 +1512,9 @@ fn dispatch_io_out(
     }
     // Only lock the matching serial port based on port range.
     if (console::COM1_BASE..console::COM1_BASE + 8).contains(&port) {
-        com1.lock().unwrap().handle_out(port, data);
+        com1.lock().handle_out(port, data);
     } else if (console::COM2_BASE..console::COM2_BASE + 8).contains(&port) {
-        com2.lock().unwrap().handle_out(port, data);
+        com2.lock().handle_out(port, data);
     }
     false
 }
@@ -1403,8 +1522,8 @@ fn dispatch_io_out(
 /// Dispatch an I/O in from serial ports or system devices.
 /// Handles i8042 reads to satisfy the kernel's keyboard probe.
 fn dispatch_io_in(
-    com1: &std::sync::Mutex<console::Serial>,
-    com2: &std::sync::Mutex<console::Serial>,
+    com1: &PiMutex<console::Serial>,
+    com2: &PiMutex<console::Serial>,
     port: u16,
     data: &mut [u8],
 ) {
@@ -1423,10 +1542,10 @@ fn dispatch_io_in(
         }
         // Only lock the matching serial port based on port range.
         p if (console::COM1_BASE..console::COM1_BASE + 8).contains(&p) => {
-            com1.lock().unwrap().handle_in(port, data);
+            com1.lock().handle_in(port, data);
         }
         p if (console::COM2_BASE..console::COM2_BASE + 8).contains(&p) => {
-            com2.lock().unwrap().handle_in(port, data);
+            com2.lock().handle_in(port, data);
         }
         _ => {}
     }
@@ -1443,8 +1562,8 @@ fn dispatch_io_in(
 /// HLT for APs is normal — KVM wakes them on SIPI/interrupt delivery.
 fn vcpu_run_loop(
     vcpu: &mut kvm_ioctls::VcpuFd,
-    com1: &Arc<std::sync::Mutex<console::Serial>>,
-    com2: &Arc<std::sync::Mutex<console::Serial>>,
+    com1: &Arc<PiMutex<console::Serial>>,
+    com2: &Arc<PiMutex<console::Serial>>,
     kill: &Arc<AtomicBool>,
 ) {
     loop {
@@ -1736,18 +1855,10 @@ impl SttVmBuilder {
         let t = &self.topology;
         let total_vcpus = t.total_cpus();
 
-        // ERROR: oversubscription.
-        anyhow::ensure!(
-            total_vcpus as usize <= host_topo.total_cpus(),
-            "performance_mode: {} vCPUs requested but only {} host CPUs available \
-             — oversubscription not allowed",
-            total_vcpus,
-            host_topo.total_cpus(),
-        );
-
-        // ERROR: cannot map virtual sockets to physical LLCs.
+        // compute_pinning validates oversubscription internally,
+        // accounting for the reserved service CPU.
         let plan = host_topo
-            .compute_pinning(t.sockets, t.cores_per_socket, t.threads_per_core)
+            .compute_pinning(t.sockets, t.cores_per_socket, t.threads_per_core, true)
             .context("performance_mode: topology mapping")?;
 
         // WARN: hugepages.
@@ -2419,8 +2530,8 @@ mod tests {
 
     #[test]
     fn dispatch_io_out_i8042_reset() {
-        let com1 = std::sync::Mutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = std::sync::Mutex::new(console::Serial::new(console::COM2_BASE));
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         assert!(dispatch_io_out(
             &com1,
             &com2,
@@ -2431,39 +2542,39 @@ mod tests {
 
     #[test]
     fn dispatch_io_out_i8042_non_reset() {
-        let com1 = std::sync::Mutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = std::sync::Mutex::new(console::Serial::new(console::COM2_BASE));
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         assert!(!dispatch_io_out(&com1, &com2, I8042_CMD_PORT, &[0x00]));
     }
 
     #[test]
     fn dispatch_io_out_serial_com1() {
-        let com1 = std::sync::Mutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = std::sync::Mutex::new(console::Serial::new(console::COM2_BASE));
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         // Write 'A' to COM1 THR — should not trigger reset.
         assert!(!dispatch_io_out(&com1, &com2, console::COM1_BASE, b"A"));
     }
 
     #[test]
     fn dispatch_io_out_serial_com2() {
-        let com1 = std::sync::Mutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = std::sync::Mutex::new(console::Serial::new(console::COM2_BASE));
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         assert!(!dispatch_io_out(&com1, &com2, console::COM2_BASE, b"B"));
-        let output = com2.lock().unwrap().output();
+        let output = com2.lock().output();
         assert!(output.contains('B'));
     }
 
     #[test]
     fn dispatch_io_out_unknown_port() {
-        let com1 = std::sync::Mutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = std::sync::Mutex::new(console::Serial::new(console::COM2_BASE));
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         assert!(!dispatch_io_out(&com1, &com2, 0x1234, &[0xFF]));
     }
 
     #[test]
     fn dispatch_io_in_i8042_status() {
-        let com1 = std::sync::Mutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = std::sync::Mutex::new(console::Serial::new(console::COM2_BASE));
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut data = [0xFFu8; 1];
         dispatch_io_in(&com1, &com2, I8042_CMD_PORT, &mut data);
         assert_eq!(data[0], 0);
@@ -2471,8 +2582,8 @@ mod tests {
 
     #[test]
     fn dispatch_io_in_i8042_data() {
-        let com1 = std::sync::Mutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = std::sync::Mutex::new(console::Serial::new(console::COM2_BASE));
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut data = [0xFFu8; 1];
         dispatch_io_in(&com1, &com2, I8042_DATA_PORT, &mut data);
         assert_eq!(data[0], 0);
@@ -2480,11 +2591,35 @@ mod tests {
 
     #[test]
     fn dispatch_io_in_unknown_port() {
-        let com1 = std::sync::Mutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = std::sync::Mutex::new(console::Serial::new(console::COM2_BASE));
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
         let mut data = [0xFFu8; 1];
         dispatch_io_in(&com1, &com2, 0x1234, &mut data);
         assert_eq!(data[0], 0xFF, "unknown port should not modify data");
+    }
+
+    // -- PiMutex tests --
+
+    #[test]
+    fn pi_mutex_lock_unlock() {
+        let m = PiMutex::new(42u32);
+        {
+            let mut guard = m.lock();
+            assert_eq!(*guard, 42);
+            *guard = 99;
+        }
+        assert_eq!(*m.lock(), 99);
+    }
+
+    #[test]
+    fn pi_mutex_cross_thread() {
+        let m = Arc::new(PiMutex::new(0u32));
+        let m2 = m.clone();
+        let handle = std::thread::spawn(move || {
+            *m2.lock() += 1;
+        });
+        handle.join().unwrap();
+        assert_eq!(*m.lock(), 1);
     }
 
     // -- builder watchdog_timeout_jiffies --
@@ -2574,8 +2709,8 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
         let too_many_sockets = host_topo.llc_groups.len() as u32 + 1;
-        // Use 1 core per socket to avoid oversubscription on total vCPUs.
-        if too_many_sockets as usize <= host_topo.total_cpus() {
+        // Need total vCPUs + 1 service CPU to fit without oversubscription.
+        if (too_many_sockets as usize + 1) <= host_topo.total_cpus() {
             let result = SttVmBuilder::default()
                 .kernel(&exe)
                 .topology(too_many_sockets, 1, 1)
@@ -2589,7 +2724,8 @@ mod tests {
     fn builder_performance_mode_valid_succeeds() {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
-        if host_topo.total_cpus() < 2 {
+        // Need 2 vCPUs + 1 service CPU = 3 host CPUs minimum.
+        if host_topo.total_cpus() < 3 {
             return;
         }
         let result = SttVmBuilder::default()
@@ -2608,7 +2744,8 @@ mod tests {
     fn builder_performance_mode_preserves_in_vm() {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
-        if host_topo.total_cpus() < 2 {
+        // Need 2 vCPUs + 1 service CPU = 3 host CPUs minimum.
+        if host_topo.total_cpus() < 3 {
             return;
         }
         let vm = SttVmBuilder::default()
@@ -2644,5 +2781,74 @@ mod tests {
         assert_eq!(initramfs::shm_load_base(h2).unwrap().as_ref(), &d2[..]);
         initramfs::shm_unlink_base(h1);
         initramfs::shm_unlink_base(h2);
+    }
+
+    #[test]
+    fn pi_mutex_concurrent_increment() {
+        let m = Arc::new(PiMutex::new(0u64));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let m = m.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        *m.lock() += 1;
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(*m.lock(), 8000);
+    }
+
+    #[test]
+    fn pi_mutex_protocol_is_inherit() {
+        // Verify PTHREAD_PRIO_INHERIT is supported on this system.
+        unsafe {
+            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
+            assert_eq!(libc::pthread_mutexattr_init(&mut attr), 0);
+            assert_eq!(
+                libc::pthread_mutexattr_setprotocol(&mut attr, libc::PTHREAD_PRIO_INHERIT),
+                0,
+            );
+            let mut protocol: libc::c_int = 0;
+            assert_eq!(libc::pthread_mutexattr_getprotocol(&attr, &mut protocol), 0);
+            assert_eq!(protocol, libc::PTHREAD_PRIO_INHERIT);
+            libc::pthread_mutexattr_destroy(&mut attr);
+        }
+    }
+
+    // -- RT scheduling tests --
+
+    #[test]
+    fn set_rt_priority_applies_when_capable() {
+        // Verify set_rt_priority sets SCHED_FIFO when the process has
+        // CAP_SYS_NICE. Skip (pass) if not capable.
+        let param = libc::sched_param { sched_priority: 1 };
+        let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+        if rc != 0 {
+            // No CAP_SYS_NICE — skip test.
+            eprintln!("skipping set_rt_priority test: no CAP_SYS_NICE");
+            return;
+        }
+        // Verify it took effect.
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        assert_eq!(policy, libc::SCHED_FIFO);
+        let mut out_param: libc::sched_param = unsafe { std::mem::zeroed() };
+        unsafe { libc::sched_getparam(0, &mut out_param) };
+        assert_eq!(out_param.sched_priority, 1);
+        // Restore SCHED_OTHER to avoid affecting other tests.
+        let restore = libc::sched_param { sched_priority: 0 };
+        unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &restore) };
+    }
+
+    #[test]
+    fn set_rt_priority_warns_without_cap() {
+        // Verify set_rt_priority does not panic when called without
+        // CAP_SYS_NICE — it should print a warning and continue.
+        // This test always passes; it exercises the warning path.
+        set_rt_priority(1, "test-thread");
+        // If we get here, set_rt_priority didn't panic.
     }
 }
