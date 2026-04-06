@@ -1,0 +1,67 @@
+# VMM
+
+stt includes a purpose-built VMM (virtual machine monitor) that boots
+Linux kernels in KVM for testing.
+
+## SttVm builder
+
+```rust
+let result = vmm::SttVm::builder()
+    .kernel(&kernel_path)
+    .init_binary(&stt_binary)
+    .topology(sockets, cores_per_socket, threads_per_core)
+    .memory_mb(4096)
+    .run_args(&["run", "cgroup_steady"])
+    .build()?
+    .run()?;
+```
+
+## Topology
+
+The VM topology is specified as `(sockets, cores_per_socket,
+threads_per_core)`. The VMM creates the appropriate ACPI tables
+(MADT, SRAT) and MP tables so the guest kernel sees the specified
+topology.
+
+```rust
+pub struct Topology {
+    pub sockets: u32,
+    pub cores_per_socket: u32,
+    pub threads_per_core: u32,
+}
+```
+
+`total_cpus()` = sockets * cores_per_socket * threads_per_core.
+`num_llcs()` = sockets (one LLC per socket).
+
+## initramfs
+
+The VMM builds a cpio initramfs containing:
+
+- The stt binary (as `/init`)
+- Busybox (for shell utilities)
+- Optional scheduler binary (as `/scheduler`)
+
+Busybox is built statically from source by `build.rs`. The initramfs
+is cached based on a `BaseKey` derived from the binary contents.
+
+## Guest-host communication
+
+**Serial console** -- the guest writes test results (JSON) to COM2.
+The host reads results from the serial output after VM exit.
+
+**SHM ring buffer** -- a shared memory ring buffer passes data from
+guest to host. Used for profraw data (`MSG_TYPE_PROFRAW`) and stimulus
+events (`MSG_TYPE_STIMULUS`). Each entry has a CRC32 for integrity
+checking.
+
+## Boot process
+
+1. Load bzImage kernel via `linux-loader`.
+2. Set up KVM vCPUs with the specified topology.
+3. Build and load initramfs.
+4. Set up serial devices (COM1 for console, COM2 for results).
+5. Boot the kernel.
+6. Kernel starts `/init` (the stt binary).
+7. For `#[stt_test]`: `ctor` early dispatch runs the test function.
+   For `stt vm`: `main()` dispatches via the `run` subcommand.

@@ -1,0 +1,20 @@
+[package]
+name = "stt-sched"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-2.0-only"
+repository = "https://github.com/likewhatevs/stt"
+description = "Minimal BPF scheduler for stt integration tests"
+keywords = ["sched_ext", "scheduler", "bpf"]
+categories = ["development-tools::testing"]
+publish = false
+
+[dependencies]
+anyhow = "1"
+ctrlc = "3"
+libbpf-rs = "=0.26.1"
+scx_utils = "1.1.0"
+
+[build-dependencies]
+scx_cargo = "1.1.0"

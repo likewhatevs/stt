@@ -1,0 +1,562 @@
+//! CPU topology abstraction.
+//!
+//! [`TestTopology`] reads sysfs to discover CPUs, LLCs, and NUMA nodes.
+//! Provides cpuset generation methods used by [`CpusetMode`](crate::scenario::CpusetMode)
+//! and [`CpusetSpec`](crate::scenario::ops::CpusetSpec).
+//!
+//! See the [Scenarios](https://sched-ext.github.io/scx/stt/concepts/scenarios.html)
+//! chapter for how topology drives cpuset partitioning.
+
+use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+
+/// Information about a last-level cache domain.
+#[derive(Debug, Clone)]
+pub struct LlcInfo {
+    cpus: Vec<usize>,
+    numa_node: usize,
+}
+
+impl LlcInfo {
+    pub fn cpus(&self) -> &[usize] {
+        &self.cpus
+    }
+    pub fn numa_node(&self) -> usize {
+        self.numa_node
+    }
+}
+
+/// CPU topology abstraction for test configuration.
+///
+/// Provides LLC-aware CPU partitioning, cpuset generation, and
+/// topology queries. Built from sysfs (`from_system()`), a VM spec
+/// (`from_spec()`), or synthetic parameters (test-only).
+#[derive(Debug, Clone)]
+pub struct TestTopology {
+    cpus: Vec<usize>,
+    llcs: Vec<LlcInfo>,
+    numa_nodes: BTreeSet<usize>,
+}
+
+/// Parse a CPU list string (e.g., "0-3,5,7-9") into a sorted vec of CPU IDs.
+fn parse_cpu_list(s: &str) -> Result<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in s.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            let lo: usize = lo.parse()?;
+            let hi: usize = hi.parse()?;
+            cpus.extend(lo..=hi);
+        } else {
+            cpus.push(part.parse()?);
+        }
+    }
+    cpus.sort();
+    Ok(cpus)
+}
+
+/// Read the LLC cache ID for a CPU from sysfs.
+fn read_llc_id(cpu: usize) -> Result<usize> {
+    // Find the highest-level cache index (last-level cache)
+    let cache_dir = format!("/sys/devices/system/cpu/cpu{cpu}/cache");
+    let mut max_level = 0;
+    let mut llc_index = 0;
+    for entry in fs::read_dir(&cache_dir).context("read cache dir")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("index") {
+            continue;
+        }
+        let level_path = entry.path().join("level");
+        if let Ok(level_str) = fs::read_to_string(&level_path)
+            && let Ok(level) = level_str.trim().parse::<usize>()
+            && level > max_level
+        {
+            max_level = level;
+            llc_index = name
+                .strip_prefix("index")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+        }
+    }
+    let id_path = format!("{cache_dir}/index{llc_index}/id");
+    let id_str = fs::read_to_string(&id_path).unwrap_or_else(|_| llc_index.to_string());
+    Ok(id_str.trim().parse().unwrap_or(0))
+}
+
+/// Read the NUMA node ID for a CPU from sysfs.
+fn read_numa_node(cpu: usize) -> Result<usize> {
+    let node_dir = format!("/sys/devices/system/cpu/cpu{cpu}");
+    for entry in fs::read_dir(&node_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("node")
+            && let Some(id_str) = name.strip_prefix("node")
+            && let Ok(id) = id_str.parse::<usize>()
+        {
+            return Ok(id);
+        }
+    }
+    Ok(0)
+}
+
+impl TestTopology {
+    /// Discover topology from sysfs (reads `/sys/devices/system/cpu/`).
+    pub fn from_system() -> Result<Self> {
+        let online_str =
+            fs::read_to_string("/sys/devices/system/cpu/online").context("read online cpus")?;
+        let online_cpus = parse_cpu_list(&online_str)?;
+        if online_cpus.is_empty() {
+            bail!("no online CPUs found");
+        }
+
+        let mut cpus = BTreeSet::new();
+        let mut llc_map: BTreeMap<usize, LlcInfo> = BTreeMap::new();
+        let mut numa_nodes = BTreeSet::new();
+
+        for &cpu_id in &online_cpus {
+            if !Path::new(&format!("/sys/devices/system/cpu/cpu{cpu_id}")).exists() {
+                continue;
+            }
+            cpus.insert(cpu_id);
+            let llc_id = read_llc_id(cpu_id).unwrap_or(0);
+            let node_id = read_numa_node(cpu_id).unwrap_or(0);
+            numa_nodes.insert(node_id);
+            llc_map
+                .entry(llc_id)
+                .and_modify(|info| info.cpus.push(cpu_id))
+                .or_insert_with(|| LlcInfo {
+                    cpus: vec![cpu_id],
+                    numa_node: node_id,
+                });
+        }
+        for info in llc_map.values_mut() {
+            info.cpus.sort();
+        }
+        Ok(Self {
+            cpus: cpus.into_iter().collect(),
+            llcs: llc_map.into_values().collect(),
+            numa_nodes,
+        })
+    }
+
+    /// Total number of CPUs.
+    pub fn total_cpus(&self) -> usize {
+        self.cpus.len()
+    }
+    /// Number of last-level caches.
+    pub fn num_llcs(&self) -> usize {
+        self.llcs.len()
+    }
+    /// Number of NUMA nodes.
+    pub fn num_numa_nodes(&self) -> usize {
+        self.numa_nodes.len()
+    }
+    /// All LLC domains.
+    pub fn llcs(&self) -> &[LlcInfo] {
+        &self.llcs
+    }
+    /// All CPU IDs, sorted.
+    pub fn all_cpus(&self) -> &[usize] {
+        &self.cpus
+    }
+
+    /// CPUs available for workload placement. Reserves the last CPU for
+    /// the root cell (cell 0) when the topology has more than 2 CPUs.
+    pub fn usable_cpus(&self) -> &[usize] {
+        if self.cpus.len() > 2 {
+            &self.cpus[..self.cpus.len() - 1]
+        } else {
+            &self.cpus
+        }
+    }
+    /// CPUs belonging to LLC at index `idx`.
+    pub fn cpus_in_llc(&self, idx: usize) -> &[usize] {
+        &self.llcs[idx].cpus
+    }
+    /// CPUs in LLC `idx` as a `BTreeSet`.
+    pub fn llc_aligned_cpuset(&self, idx: usize) -> BTreeSet<usize> {
+        self.llcs[idx].cpus.iter().copied().collect()
+    }
+
+    /// One `BTreeSet` of CPUs per LLC.
+    pub fn split_by_llc(&self) -> Vec<BTreeSet<usize>> {
+        self.llcs
+            .iter()
+            .map(|l| l.cpus.iter().copied().collect())
+            .collect()
+    }
+
+    /// Generate `n` cpusets with `overlap_frac` overlap between adjacent sets.
+    pub fn overlapping_cpusets(&self, n: usize, overlap_frac: f64) -> Vec<BTreeSet<usize>> {
+        let total = self.cpus.len();
+        if n == 0 || total == 0 {
+            return vec![];
+        }
+        let base = total / n;
+        let overlap = ((base as f64) * overlap_frac).ceil() as usize;
+        let stride = if base > overlap { base - overlap } else { 1 };
+        (0..n)
+            .map(|i| {
+                let start = (i * stride) % total;
+                (0..base.max(1))
+                    .map(|j| self.cpus[(start + j) % total])
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Format a CPU set as a compact range string (e.g. `"0-3,5,7-9"`).
+    pub fn cpuset_string(cpus: &BTreeSet<usize>) -> String {
+        if cpus.is_empty() {
+            return String::new();
+        }
+        let sorted: Vec<usize> = cpus.iter().copied().collect();
+        let mut ranges = Vec::new();
+        let (mut start, mut end) = (sorted[0], sorted[0]);
+        for &cpu in &sorted[1..] {
+            if cpu == end + 1 {
+                end = cpu;
+            } else {
+                ranges.push(if start == end {
+                    format!("{start}")
+                } else {
+                    format!("{start}-{end}")
+                });
+                start = cpu;
+                end = cpu;
+            }
+        }
+        ranges.push(if start == end {
+            format!("{start}")
+        } else {
+            format!("{start}-{end}")
+        });
+        ranges.join(",")
+    }
+
+    /// Build a topology from a VM spec (sockets x cores x threads).
+    ///
+    /// One LLC per socket, one NUMA node per socket, CPUs numbered
+    /// sequentially. Used as a fallback when sysfs is incomplete
+    /// inside a guest VM.
+    #[allow(dead_code)]
+    pub fn from_spec(sockets: u32, cores: u32, threads: u32) -> Self {
+        let total = (sockets * cores * threads) as usize;
+        let cpus_per_socket = (cores * threads) as usize;
+        let cpus: Vec<usize> = (0..total).collect();
+        let llcs: Vec<LlcInfo> = (0..sockets as usize)
+            .map(|s| {
+                let start = s * cpus_per_socket;
+                let end = start + cpus_per_socket;
+                LlcInfo {
+                    cpus: (start..end).collect(),
+                    numa_node: s,
+                }
+            })
+            .collect();
+        let numa_nodes = (0..sockets as usize).collect();
+        Self {
+            cpus,
+            llcs,
+            numa_nodes,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn synthetic(num_cpus: usize, num_llcs: usize) -> Self {
+        let cpus: Vec<usize> = (0..num_cpus).collect();
+        let per_llc = num_cpus / num_llcs;
+        let llcs: Vec<LlcInfo> = (0..num_llcs)
+            .map(|i| {
+                let start = i * per_llc;
+                let end = if i == num_llcs - 1 {
+                    num_cpus
+                } else {
+                    (i + 1) * per_llc
+                };
+                LlcInfo {
+                    cpus: (start..end).collect(),
+                    numa_node: i,
+                }
+            })
+            .collect();
+        let numa_nodes = (0..num_llcs).collect();
+        Self {
+            cpus,
+            llcs,
+            numa_nodes,
+        }
+    }
+}
+
+/// Print topology summary to stdout.
+pub fn print_topo() -> Result<()> {
+    let topo = TestTopology::from_system()?;
+    println!(
+        "{} CPUs, {} LLCs, {} NUMA\n",
+        console::style(topo.total_cpus()).cyan().bold(),
+        console::style(topo.num_llcs()).cyan().bold(),
+        console::style(topo.num_numa_nodes()).cyan().bold()
+    );
+    for (i, llc) in topo.llcs().iter().enumerate() {
+        let cpus = llc
+            .cpus()
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("LLC {i} (NUMA {}): {cpus}", llc.numa_node());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpuset_string_empty() {
+        assert_eq!(TestTopology::cpuset_string(&BTreeSet::new()), "");
+    }
+
+    #[test]
+    fn cpuset_string_single() {
+        assert_eq!(TestTopology::cpuset_string(&[3].into_iter().collect()), "3");
+    }
+
+    #[test]
+    fn cpuset_string_range() {
+        assert_eq!(
+            TestTopology::cpuset_string(&[0, 1, 2, 3].into_iter().collect()),
+            "0-3"
+        );
+    }
+
+    #[test]
+    fn cpuset_string_gaps() {
+        assert_eq!(
+            TestTopology::cpuset_string(&[0, 1, 3, 5, 6, 7].into_iter().collect()),
+            "0-1,3,5-7"
+        );
+    }
+
+    #[test]
+    fn synthetic_topology() {
+        let t = TestTopology::synthetic(8, 2);
+        assert_eq!(t.total_cpus(), 8);
+        assert_eq!(t.num_llcs(), 2);
+        assert_eq!(t.cpus_in_llc(0), &[0, 1, 2, 3]);
+        assert_eq!(t.cpus_in_llc(1), &[4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn overlapping_cpusets_basic() {
+        let t = TestTopology::synthetic(8, 1);
+        let sets = t.overlapping_cpusets(2, 0.5);
+        assert_eq!(sets.len(), 2);
+        for s in &sets {
+            assert_eq!(s.len(), 4);
+        }
+        let overlap: BTreeSet<usize> = sets[0].intersection(&sets[1]).copied().collect();
+        assert!(!overlap.is_empty());
+    }
+
+    #[test]
+    fn overlapping_cpusets_no_overlap() {
+        let t = TestTopology::synthetic(8, 1);
+        let sets = t.overlapping_cpusets(2, 0.0);
+        assert_eq!(sets.len(), 2);
+        let overlap: BTreeSet<usize> = sets[0].intersection(&sets[1]).copied().collect();
+        assert!(overlap.is_empty());
+    }
+
+    #[test]
+    fn split_by_llc() {
+        let t = TestTopology::synthetic(8, 2);
+        let splits = t.split_by_llc();
+        assert_eq!(splits.len(), 2);
+        assert_eq!(splits[0], [0, 1, 2, 3].into_iter().collect());
+        assert_eq!(splits[1], [4, 5, 6, 7].into_iter().collect());
+    }
+
+    #[test]
+    fn llc_aligned_cpuset() {
+        let t = TestTopology::synthetic(8, 2);
+        assert_eq!(t.llc_aligned_cpuset(0), [0, 1, 2, 3].into_iter().collect());
+        assert_eq!(t.llc_aligned_cpuset(1), [4, 5, 6, 7].into_iter().collect());
+    }
+
+    #[test]
+    fn from_spec_single_socket() {
+        let t = TestTopology::from_spec(1, 4, 2);
+        assert_eq!(t.total_cpus(), 8);
+        assert_eq!(t.num_llcs(), 1);
+        assert_eq!(t.num_numa_nodes(), 1);
+        assert_eq!(t.all_cpus(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(t.cpus_in_llc(0), &[0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn from_spec_multi_socket() {
+        let t = TestTopology::from_spec(2, 4, 2);
+        assert_eq!(t.total_cpus(), 16);
+        assert_eq!(t.num_llcs(), 2);
+        assert_eq!(t.num_numa_nodes(), 2);
+        assert_eq!(t.cpus_in_llc(0), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(t.cpus_in_llc(1), &[8, 9, 10, 11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn from_spec_no_smt() {
+        let t = TestTopology::from_spec(2, 2, 1);
+        assert_eq!(t.total_cpus(), 4);
+        assert_eq!(t.num_llcs(), 2);
+        assert_eq!(t.cpus_in_llc(0), &[0, 1]);
+        assert_eq!(t.cpus_in_llc(1), &[2, 3]);
+    }
+
+    #[test]
+    fn from_spec_minimal() {
+        let t = TestTopology::from_spec(1, 1, 1);
+        assert_eq!(t.total_cpus(), 1);
+        assert_eq!(t.num_llcs(), 1);
+        assert_eq!(t.all_cpus(), &[0]);
+    }
+
+    #[test]
+    fn overlapping_cpusets_zero_n() {
+        let t = TestTopology::synthetic(8, 1);
+        assert!(t.overlapping_cpusets(0, 0.5).is_empty());
+    }
+
+    #[test]
+    fn synthetic_single_llc() {
+        let t = TestTopology::synthetic(4, 1);
+        assert_eq!(t.num_llcs(), 1);
+        assert_eq!(t.total_cpus(), 4);
+        assert_eq!(t.num_numa_nodes(), 1);
+        assert_eq!(t.all_cpus(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn synthetic_many_llcs() {
+        let t = TestTopology::synthetic(16, 4);
+        assert_eq!(t.num_llcs(), 4);
+        for i in 0..4 {
+            assert_eq!(t.cpus_in_llc(i).len(), 4);
+        }
+    }
+
+    #[test]
+    fn cpuset_string_two_ranges() {
+        assert_eq!(
+            TestTopology::cpuset_string(&[0, 1, 2, 5, 6, 7].into_iter().collect()),
+            "0-2,5-7"
+        );
+    }
+
+    #[test]
+    fn cpuset_string_all_isolated() {
+        assert_eq!(
+            TestTopology::cpuset_string(&[1, 3, 5].into_iter().collect()),
+            "1,3,5"
+        );
+    }
+
+    #[test]
+    fn cpuset_string_large_range() {
+        let cpus: BTreeSet<usize> = (0..128).collect();
+        assert_eq!(TestTopology::cpuset_string(&cpus), "0-127");
+    }
+
+    #[test]
+    fn overlapping_cpusets_single_set() {
+        let t = TestTopology::synthetic(8, 1);
+        let sets = t.overlapping_cpusets(1, 0.5);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].len(), 8);
+    }
+
+    #[test]
+    fn split_by_llc_single() {
+        let t = TestTopology::synthetic(4, 1);
+        let splits = t.split_by_llc();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].len(), 4);
+    }
+
+    #[test]
+    fn usable_cpus_reserves_last() {
+        let t = TestTopology::synthetic(8, 2);
+        assert_eq!(t.usable_cpus().len(), 7);
+        assert!(!t.usable_cpus().contains(&7));
+    }
+
+    #[test]
+    fn usable_cpus_small_no_reserve() {
+        let t = TestTopology::synthetic(2, 1);
+        assert_eq!(t.usable_cpus().len(), 2);
+    }
+
+    #[test]
+    fn usable_cpus_single_cpu() {
+        let t = TestTopology::synthetic(1, 1);
+        assert_eq!(t.usable_cpus().len(), 1);
+    }
+
+    #[test]
+    fn parse_cpu_list_simple() {
+        assert_eq!(parse_cpu_list("0,1,2,3").unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_cpu_list_range() {
+        assert_eq!(parse_cpu_list("0-3").unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_cpu_list_mixed() {
+        assert_eq!(
+            parse_cpu_list("0-2,5,7-9").unwrap(),
+            vec![0, 1, 2, 5, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn parse_cpu_list_empty() {
+        assert!(parse_cpu_list("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_cpu_list_whitespace() {
+        assert_eq!(parse_cpu_list("  0 , 1 , 2  ").unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn from_spec_large() {
+        let t = TestTopology::from_spec(4, 8, 2);
+        assert_eq!(t.total_cpus(), 64);
+        assert_eq!(t.num_llcs(), 4);
+        assert_eq!(t.num_numa_nodes(), 4);
+    }
+
+    #[test]
+    fn llc_info_accessors() {
+        let t = TestTopology::synthetic(8, 2);
+        let llcs = t.llcs();
+        assert_eq!(llcs.len(), 2);
+        assert_eq!(llcs[0].cpus(), &[0, 1, 2, 3]);
+        assert_eq!(llcs[0].numa_node(), 0);
+        assert_eq!(llcs[1].cpus(), &[4, 5, 6, 7]);
+        assert_eq!(llcs[1].numa_node(), 1);
+    }
+}

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            linux-tools-common \
+            bpftool \
+            bpftrace \
+            gcc \
+            make \
+            pkg-config \
+            linux-headers-$(uname -r) || true
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88 --profile minimal --component clippy,llvm-tools-preview
+          rustup default 1.88
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache busybox build
+        uses: actions/cache@v4
+        with:
+          path: target/debug/build/**/busybox
+          key: ${{ runner.os }}-busybox-v1
+          restore-keys: |
+            ${{ runner.os }}-busybox-
+
+      - name: Install cargo-llvm-cov and cargo-nextest
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo install cargo-nextest --locked
+
+      - name: Build all workspace members
+        run: cargo build --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Detect KVM availability
+        id: kvm
+        run: |
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::KVM not available — VM and boot tests will be skipped"
+          fi
+
+      - name: Run tests (nextest, CI profile)
+        run: |
+          if [ "${{ steps.kvm.outputs.available }}" = "true" ]; then
+            cargo nextest run --workspace --profile ci
+          else
+            cargo nextest run --workspace --profile ci \
+              -E 'not (test(boot_kernel) | test(bench_boot) | test(vmm::kvm::) | test(vmm::tests::ap_mp) | test(vmm::tests::kvm_) | test(vmm::tests::immediate_exit) | test(vmm::tests::vcpu_thread_kick) | test(vmm::boot::tests::setup_fpu_with_kvm) | test(vmm::boot::tests::setup_msrs_with_kvm) | test(vmm::boot::tests::setup_regs_with_kvm) | test(vmm::boot::tests::setup_sregs_with_kvm) | test(vmm::boot::tests::setup_lapic))'
+          fi
+
+      - name: Run coverage (cargo-llvm-cov)
+        run: |
+          if [ "${{ steps.kvm.outputs.available }}" = "true" ]; then
+            cargo llvm-cov --workspace --lcov --output-path lcov.info
+          else
+            cargo llvm-cov --workspace --lcov --output-path lcov.info \
+              -- --skip boot_kernel --skip bench_boot
+          fi
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-coverage
+          path: lcov.info
+
+      - name: Upload nextest JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-results
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore

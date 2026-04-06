@@ -1,0 +1,335 @@
+use super::Ctx;
+use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
+use crate::verify::VerifyResult;
+use crate::workload::*;
+use anyhow::Result;
+use std::time::Duration;
+
+pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+    let steps = vec![
+        Step {
+            setup: vec![
+                CgroupDef::named("cell_0")
+                    .workers(1)
+                    .work_type(WorkType::YieldHeavy),
+                CgroupDef::named("cell_1")
+                    .workers(1)
+                    .work_type(WorkType::YieldHeavy),
+            ]
+            .into(),
+            ops: vec![],
+            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+        },
+        Step {
+            setup: vec![CgroupDef::named("cell_2").workers(16)].into(),
+            ops: vec![],
+            hold: HoldSpec::Frac(0.5),
+        },
+    ];
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<VerifyResult> {
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cell_0").workers(8),
+            CgroupDef::named("cell_1")
+                .workers(ctx.workers_per_cell)
+                .work_type(WorkType::Bursty {
+                    burst_ms: 100,
+                    sleep_ms: 50,
+                }),
+            CgroupDef::named("cell_2")
+                .workers(ctx.workers_per_cell)
+                .work_type(WorkType::IoSync),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+    }];
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<VerifyResult> {
+    let heavy = WorkloadConfig {
+        num_workers: ctx.workers_per_cell * 2,
+        ..Default::default()
+    };
+    let light = WorkloadConfig {
+        num_workers: 1,
+        work_type: WorkType::YieldHeavy,
+        ..Default::default()
+    };
+
+    let mut steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cell_0").workers(ctx.workers_per_cell * 2),
+            CgroupDef::named("cell_1")
+                .workers(1)
+                .work_type(WorkType::YieldHeavy),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration / 4),
+    }];
+
+    // Phases 1-3: swap load by stopping and respawning.
+    for i in 1..4 {
+        let (heavy_cell, light_cell): (&str, &str) = if i % 2 == 0 {
+            ("cell_0", "cell_1")
+        } else {
+            ("cell_1", "cell_0")
+        };
+        steps.push(Step {
+            setup: vec![].into(),
+            ops: vec![
+                Op::StopCgroup {
+                    cgroup: "cell_0".into(),
+                },
+                Op::StopCgroup {
+                    cgroup: "cell_1".into(),
+                },
+                Op::Spawn {
+                    cgroup: heavy_cell.into(),
+                    workload: heavy.clone(),
+                },
+                Op::Spawn {
+                    cgroup: light_cell.into(),
+                    workload: light.clone(),
+                },
+            ],
+            hold: HoldSpec::Frac(0.25),
+        });
+    }
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+    if ctx.topo.all_cpus().len() < 5 {
+        return Ok(VerifyResult {
+            passed: true,
+            details: vec!["skipped: need >=5 CPUs for 4 cells".into()],
+            stats: Default::default(),
+        });
+    }
+
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cell_0").workers(16),
+            CgroupDef::named("cell_1")
+                .workers(1)
+                .work_type(WorkType::YieldHeavy),
+            CgroupDef::named("cell_2").workers(8),
+            CgroupDef::named("cell_3").workers(4),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+    }];
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<VerifyResult> {
+    let mid = ctx.topo.usable_cpus().len() / 2;
+
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cell_0")
+                .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
+                .workers(mid * 2),
+            CgroupDef::named("cell_1")
+                .with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 })
+                .workers(2)
+                .work_type(WorkType::Bursty {
+                    burst_ms: 50,
+                    sleep_ms: 150,
+                }),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration),
+    }];
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<VerifyResult> {
+    let sets = ctx.topo.overlapping_cpusets(3, 0.5);
+    if sets.iter().any(|s| s.is_empty()) {
+        return Ok(VerifyResult {
+            passed: true,
+            details: vec!["skipped: not enough CPUs".into()],
+            stats: Default::default(),
+        });
+    }
+
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cell_0")
+                .with_cpuset(CpusetSpec::Exact(sets[0].clone()))
+                .workers(12),
+            CgroupDef::named("cell_1")
+                .with_cpuset(CpusetSpec::Exact(sets[1].clone()))
+                .workers(2)
+                .work_type(WorkType::Bursty {
+                    burst_ms: 50,
+                    sleep_ms: 100,
+                }),
+            CgroupDef::named("cell_2")
+                .with_cpuset(CpusetSpec::Exact(sets[2].clone()))
+                .workers(1)
+                .work_type(WorkType::YieldHeavy),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration),
+    }];
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<VerifyResult> {
+    let half = ctx.workers_per_cell;
+
+    let mut move_steps: Vec<Step> = (0..9)
+        .map(|i| {
+            let target = if i % 2 == 0 { "cell_1" } else { "cell_0" };
+            let from = if i % 2 == 0 { "cell_0" } else { "cell_1" };
+            Step {
+                setup: vec![].into(),
+                ops: vec![Op::MoveTasks {
+                    from: from.into(),
+                    to: target.into(),
+                    count: half,
+                }],
+                hold: HoldSpec::Frac(0.1),
+            }
+        })
+        .collect();
+
+    let mut steps = vec![Step {
+        setup: vec![CgroupDef::named("cell_0").workers(ctx.workers_per_cell * 2)].into(),
+        ops: vec![Op::AddCgroup {
+            name: "cell_1".into(),
+        }],
+        hold: HoldSpec::Fixed(Duration::from_secs(2)),
+    }];
+    steps.append(&mut move_steps);
+    // Final hold for remaining time.
+    steps.push(Step {
+        setup: vec![].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(0.1),
+    });
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+    let mut move_steps: Vec<Step> = (0..5)
+        .map(|i| {
+            let (from, to) = if i % 2 == 0 {
+                ("cell_0", "cell_1")
+            } else {
+                ("cell_1", "cell_0")
+            };
+            Step {
+                setup: vec![].into(),
+                ops: vec![Op::MoveTasks {
+                    from: from.into(),
+                    to: to.into(),
+                    count: 2,
+                }],
+                hold: HoldSpec::Frac(1.0 / 6.0),
+            }
+        })
+        .collect();
+
+    let mut steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cell_0").workers(8),
+            CgroupDef::named("cell_1")
+                .workers(2)
+                .work_type(WorkType::Bursty {
+                    burst_ms: 50,
+                    sleep_ms: 100,
+                }),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_secs(3)),
+    }];
+    steps.append(&mut move_steps);
+    steps.push(Step {
+        setup: vec![].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0 / 6.0),
+    });
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<VerifyResult> {
+    let steps = vec![
+        Step {
+            setup: vec![
+                CgroupDef::named("cell_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+                CgroupDef::named("cell_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+            ]
+            .into(),
+            ops: vec![],
+            hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration / 2),
+        },
+        // Phase 2: clear cpusets, hold remaining half.
+        Step {
+            setup: vec![].into(),
+            ops: vec![
+                Op::ClearCpuset {
+                    cgroup: "cell_0".into(),
+                },
+                Op::ClearCpuset {
+                    cgroup: "cell_1".into(),
+                },
+            ],
+            hold: HoldSpec::Frac(0.5),
+        },
+    ];
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cell_0").workers(16),
+            CgroupDef::named("cell_1")
+                .workers(1)
+                .work_type(WorkType::YieldHeavy),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+    }];
+
+    execute_steps(ctx, steps)
+}
+
+pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cell_0")
+                .workers(ctx.workers_per_cell)
+                .work_type(WorkType::IoSync),
+            CgroupDef::named("cell_1").workers(ctx.topo.total_cpus()),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+    }];
+
+    execute_steps(ctx, steps)
+}

@@ -1,0 +1,979 @@
+/// Shared-memory ring buffer for guest-to-host data transfer.
+///
+/// The guest writes TLV-framed messages into a fixed region at the top of
+/// guest physical memory. The host drains the ring after the VM exits.
+/// Single producer (guest), single consumer (host), no locking required.
+///
+/// Memory layout:
+///   [ShmRingHeader (40 bytes)] [data (capacity bytes)]
+///
+/// The SHM region is an E820 gap — no E820 entry covers it, so the kernel
+/// never touches it. The guest init binary discovers the region via
+/// STT_SHM_BASE and STT_SHM_SIZE environment variables on the kernel
+/// command line.
+use zerocopy::IntoBytes;
+
+/// Magic value identifying a valid SHM ring header.
+pub const SHM_RING_MAGIC: u32 = 0x5354_4d52; // "STMR"
+
+/// Message type for stimulus events written by the guest step executor.
+pub const MSG_TYPE_STIMULUS: u32 = 0x5354_494D; // "STIM"
+
+/// Message type for scenario start marker.
+pub const MSG_TYPE_SCENARIO_START: u32 = 0x5343_5354; // "SCST"
+
+/// Message type for scenario end marker.
+pub const MSG_TYPE_SCENARIO_END: u32 = 0x5343_454E; // "SCEN"
+
+/// Current header version.
+pub const SHM_RING_VERSION: u32 = 1;
+
+/// Byte offset within the SHM region for the host-to-guest dump request flag.
+/// Occupies the first byte of the `_pad` field in ShmRingHeader (offset 12).
+/// Host writes `DUMP_REQ_SYSRQ_D` to request a SysRq-D dump; guest polls
+/// this byte, triggers the dump, and clears it back to 0.
+pub const DUMP_REQ_OFFSET: usize = 12;
+
+/// Value written to DUMP_REQ_OFFSET to request a SysRq-D dump.
+pub const DUMP_REQ_SYSRQ_D: u8 = b'D';
+
+/// Byte offset within the SHM region for the host-to-guest stall request flag.
+/// Occupies the second byte of the `_pad` field in ShmRingHeader (offset 13).
+/// Host writes `STALL_REQ_ACTIVATE` to request a scheduler stall; guest polls
+/// this byte, creates /tmp/stt_stall, and clears it back to 0.
+pub const STALL_REQ_OFFSET: usize = 13;
+
+/// Value written to STALL_REQ_OFFSET to request a scheduler stall.
+pub const STALL_REQ_ACTIVATE: u8 = b'S';
+
+/// Default SHM region size (64 KB).
+#[allow(dead_code)]
+pub const SHM_DEFAULT_SIZE: u64 = 64 * 1024;
+
+/// Minimum SHM region size. Must hold header + at least one message.
+#[allow(dead_code)]
+pub const SHM_MIN_SIZE: u64 =
+    std::mem::size_of::<ShmRingHeader>() as u64 + std::mem::size_of::<ShmMessage>() as u64 + 1;
+
+/// Ring buffer header at the start of the SHM region.
+///
+/// write_ptr and read_ptr are monotonically increasing byte offsets into
+/// the data area. Actual position = ptr % capacity.
+#[repr(C)]
+#[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct ShmRingHeader {
+    pub magic: u32,
+    pub version: u32,
+    /// Data area size in bytes (region_size - sizeof(ShmRingHeader)).
+    pub capacity: u32,
+    pub _pad: u32,
+    /// Total bytes written by the guest (monotonic).
+    pub write_ptr: u64,
+    /// Total bytes read by the host (monotonic).
+    pub read_ptr: u64,
+    /// Number of messages dropped due to ring full.
+    pub drops: u64,
+}
+
+const _HEADER_SIZE: () = assert!(std::mem::size_of::<ShmRingHeader>() == 40);
+
+/// TLV message header preceding each payload in the ring.
+///
+/// CRC32 covers only the payload bytes (not this header).
+#[repr(C)]
+#[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct ShmMessage {
+    pub msg_type: u32,
+    pub length: u32,
+    pub crc32: u32,
+    pub _pad: u32,
+}
+
+const _MSG_SIZE: () = assert!(std::mem::size_of::<ShmMessage>() == 16);
+
+/// Size of the ShmRingHeader.
+pub const HEADER_SIZE: usize = std::mem::size_of::<ShmRingHeader>();
+/// Size of the ShmMessage TLV header.
+pub const MSG_HEADER_SIZE: usize = std::mem::size_of::<ShmMessage>();
+
+/// A parsed message from the ring buffer.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ShmEntry {
+    pub msg_type: u32,
+    pub payload: Vec<u8>,
+    /// True if the CRC32 matched.
+    pub crc_ok: bool,
+}
+
+/// Result of draining the ring buffer.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct ShmDrainResult {
+    pub entries: Vec<ShmEntry>,
+    pub drops: u64,
+}
+
+/// Payload for stimulus events written by the guest step executor.
+///
+/// Compact 24-byte struct describing the state after each step's ops
+/// are applied. The host correlates these with monitor samples to map
+/// scheduler telemetry to scenario phases.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct StimulusPayload {
+    /// Milliseconds since scenario start.
+    pub elapsed_ms: u32,
+    /// Index of the step that was just applied.
+    pub step_index: u16,
+    /// Number of ops applied in this step.
+    pub op_count: u16,
+    /// Bitmask of Op variant discriminants present in this step.
+    pub op_kinds: u32,
+    /// Number of live cgroups after this step.
+    pub cgroup_count: u16,
+    /// Total worker handles after this step.
+    pub worker_count: u16,
+    /// Total CPUs across all cpusets after this step.
+    pub total_cpuset_cpus: u32,
+    /// Reserved for future use.
+    pub _pad: u32,
+}
+
+const _STIMULUS_SIZE: () = assert!(std::mem::size_of::<StimulusPayload>() == 24);
+
+/// Deserialized stimulus event from the SHM ring.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct StimulusEvent {
+    pub elapsed_ms: u32,
+    pub step_index: u16,
+    pub op_count: u16,
+    pub op_kinds: u32,
+    pub cgroup_count: u16,
+    pub worker_count: u16,
+    pub total_cpuset_cpus: u32,
+}
+
+impl StimulusEvent {
+    /// Deserialize from raw payload bytes.
+    pub fn from_payload(data: &[u8]) -> Option<Self> {
+        if data.len() < std::mem::size_of::<StimulusPayload>() {
+            return None;
+        }
+        Some(StimulusEvent {
+            elapsed_ms: u32::from_ne_bytes(data[0..4].try_into().ok()?),
+            step_index: u16::from_ne_bytes(data[4..6].try_into().ok()?),
+            op_count: u16::from_ne_bytes(data[6..8].try_into().ok()?),
+            op_kinds: u32::from_ne_bytes(data[8..12].try_into().ok()?),
+            cgroup_count: u16::from_ne_bytes(data[12..14].try_into().ok()?),
+            worker_count: u16::from_ne_bytes(data[14..16].try_into().ok()?),
+            total_cpuset_cpus: u32::from_ne_bytes(data[16..20].try_into().ok()?),
+            // bytes 20..24 are padding
+        })
+    }
+}
+
+/// Initialize the SHM ring header at the given offset in guest memory.
+///
+/// `buf` is the full guest memory slice. `shm_offset` is the byte offset
+/// where the SHM region starts. `shm_size` is the total region size.
+#[allow(dead_code)]
+pub fn shm_init(buf: &mut [u8], shm_offset: usize, shm_size: usize) {
+    let capacity = shm_size - HEADER_SIZE;
+    let header = ShmRingHeader {
+        magic: SHM_RING_MAGIC,
+        version: SHM_RING_VERSION,
+        capacity: capacity as u32,
+        _pad: 0,
+        write_ptr: 0,
+        read_ptr: 0,
+        drops: 0,
+    };
+    let hdr_bytes = header.as_bytes();
+    buf[shm_offset..shm_offset + HEADER_SIZE].copy_from_slice(hdr_bytes);
+    // Zero the data area.
+    let data_start = shm_offset + HEADER_SIZE;
+    let data_end = shm_offset + shm_size;
+    buf[data_start..data_end].fill(0);
+}
+
+/// Read the ring header from guest memory.
+fn read_header(buf: &[u8], shm_offset: usize) -> ShmRingHeader {
+    let s = &buf[shm_offset..shm_offset + HEADER_SIZE];
+    ShmRingHeader {
+        magic: u32::from_ne_bytes(s[0..4].try_into().unwrap()),
+        version: u32::from_ne_bytes(s[4..8].try_into().unwrap()),
+        capacity: u32::from_ne_bytes(s[8..12].try_into().unwrap()),
+        _pad: u32::from_ne_bytes(s[12..16].try_into().unwrap()),
+        write_ptr: u64::from_ne_bytes(s[16..24].try_into().unwrap()),
+        read_ptr: u64::from_ne_bytes(s[24..32].try_into().unwrap()),
+        drops: u64::from_ne_bytes(s[32..40].try_into().unwrap()),
+    }
+}
+
+/// Read `len` bytes from the ring's data area starting at monotonic offset
+/// `ptr`, handling wraparound.
+fn read_ring_bytes(
+    buf: &[u8],
+    data_start: usize,
+    capacity: usize,
+    ptr: u64,
+    len: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    read_ring_into(buf, data_start, capacity, ptr, &mut out);
+    out
+}
+
+/// Read `len` bytes from the ring into an existing buffer, handling wraparound.
+fn read_ring_into(buf: &[u8], data_start: usize, capacity: usize, ptr: u64, out: &mut [u8]) {
+    let len = out.len();
+    let mut remaining = len;
+    let mut src_pos = (ptr % capacity as u64) as usize;
+    let mut dst_pos = 0;
+    while remaining > 0 {
+        let chunk = remaining.min(capacity - src_pos);
+        out[dst_pos..dst_pos + chunk]
+            .copy_from_slice(&buf[data_start + src_pos..data_start + src_pos + chunk]);
+        dst_pos += chunk;
+        src_pos = 0; // wrap
+        remaining -= chunk;
+    }
+}
+
+/// Drain all complete messages from the ring buffer.
+///
+/// `buf` is the full guest memory (read-only). `shm_offset` is the byte
+/// offset where the SHM region starts.
+pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
+    let header = read_header(buf, shm_offset);
+    if header.magic != SHM_RING_MAGIC {
+        return ShmDrainResult::default();
+    }
+
+    let capacity = header.capacity as usize;
+    let data_start = shm_offset + HEADER_SIZE;
+    let mut read_pos = header.read_ptr;
+    let write_pos = header.write_ptr;
+    let mut entries = Vec::new();
+
+    while read_pos + MSG_HEADER_SIZE as u64 <= write_pos {
+        let mut hdr_buf = [0u8; MSG_HEADER_SIZE];
+        read_ring_into(buf, data_start, capacity, read_pos, &mut hdr_buf);
+        let msg = ShmMessage {
+            msg_type: u32::from_ne_bytes(hdr_buf[0..4].try_into().unwrap()),
+            length: u32::from_ne_bytes(hdr_buf[4..8].try_into().unwrap()),
+            crc32: u32::from_ne_bytes(hdr_buf[8..12].try_into().unwrap()),
+            _pad: u32::from_ne_bytes(hdr_buf[12..16].try_into().unwrap()),
+        };
+
+        let total_msg_size = MSG_HEADER_SIZE as u64 + msg.length as u64;
+        if read_pos + total_msg_size > write_pos {
+            // Incomplete message — stop.
+            break;
+        }
+
+        let payload = read_ring_bytes(
+            buf,
+            data_start,
+            capacity,
+            read_pos + MSG_HEADER_SIZE as u64,
+            msg.length as usize,
+        );
+
+        let computed_crc = crc32fast::hash(&payload);
+        entries.push(ShmEntry {
+            msg_type: msg.msg_type,
+            payload,
+            crc_ok: computed_crc == msg.crc32,
+        });
+
+        read_pos += total_msg_size;
+    }
+
+    ShmDrainResult {
+        entries,
+        drops: header.drops,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: write a message into the ring (for testing / guest-side simulation)
+// ---------------------------------------------------------------------------
+
+/// Write a TLV message into the ring buffer. Returns the number of bytes
+/// written (MSG_HEADER_SIZE + payload.len()), or 0 if the ring is full
+/// (and increments the drops counter).
+///
+/// This is the guest-side write operation, used in tests to simulate a
+/// producer.
+#[allow(dead_code)]
+pub fn shm_write(buf: &mut [u8], shm_offset: usize, msg_type: u32, payload: &[u8]) -> usize {
+    let header = read_header(buf, shm_offset);
+    let capacity = header.capacity as usize;
+    let total = MSG_HEADER_SIZE + payload.len();
+
+    // Available space: capacity - (write_ptr - read_ptr)
+    let used = (header.write_ptr - header.read_ptr) as usize;
+    if used + total > capacity {
+        // Ring full — increment drops counter.
+        let drops_offset = shm_offset + 32; // offset of `drops` field
+        let current = u64::from_ne_bytes(buf[drops_offset..drops_offset + 8].try_into().unwrap());
+        buf[drops_offset..drops_offset + 8].copy_from_slice(&(current + 1).to_ne_bytes());
+        return 0;
+    }
+
+    let data_start = shm_offset + HEADER_SIZE;
+
+    // Write message header
+    let msg = ShmMessage {
+        msg_type,
+        length: payload.len() as u32,
+        crc32: crc32fast::hash(payload),
+        _pad: 0,
+    };
+    write_ring_bytes(buf, data_start, capacity, header.write_ptr, msg.as_bytes());
+
+    // Write payload
+    if !payload.is_empty() {
+        write_ring_bytes(
+            buf,
+            data_start,
+            capacity,
+            header.write_ptr + MSG_HEADER_SIZE as u64,
+            payload,
+        );
+    }
+
+    // Update write_ptr
+    let new_write = header.write_ptr + total as u64;
+    let wp_offset = shm_offset + 16; // offset of `write_ptr` field
+    buf[wp_offset..wp_offset + 8].copy_from_slice(&new_write.to_ne_bytes());
+
+    total
+}
+
+/// Write bytes into the ring's data area at monotonic offset `ptr`,
+/// handling wraparound.
+#[allow(dead_code)]
+fn write_ring_bytes(buf: &mut [u8], data_start: usize, capacity: usize, ptr: u64, data: &[u8]) {
+    let mut remaining = data.len();
+    let mut src_pos = 0;
+    let mut dst_pos = (ptr % capacity as u64) as usize;
+    while remaining > 0 {
+        let chunk = remaining.min(capacity - dst_pos);
+        buf[data_start + dst_pos..data_start + dst_pos + chunk]
+            .copy_from_slice(&data[src_pos..src_pos + chunk]);
+        src_pos += chunk;
+        dst_pos = 0; // wrap
+        remaining -= chunk;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Compile-time size assertions (also present above, but explicit tests
+    // for visibility in test output).
+    #[test]
+    fn header_size_is_40() {
+        assert_eq!(std::mem::size_of::<ShmRingHeader>(), 40);
+    }
+
+    #[test]
+    fn message_size_is_16() {
+        assert_eq!(std::mem::size_of::<ShmMessage>(), 16);
+    }
+
+    /// Allocate a buffer and initialize a ring of the given size.
+    fn make_ring(shm_size: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        buf
+    }
+
+    #[test]
+    fn init_sets_magic_and_capacity() {
+        let buf = make_ring(1024);
+        let hdr = read_header(&buf, 0);
+        assert_eq!(hdr.magic, SHM_RING_MAGIC);
+        assert_eq!(hdr.version, SHM_RING_VERSION);
+        assert_eq!(hdr.capacity, (1024 - HEADER_SIZE) as u32);
+        assert_eq!(hdr.write_ptr, 0);
+        assert_eq!(hdr.read_ptr, 0);
+        assert_eq!(hdr.drops, 0);
+    }
+
+    #[test]
+    fn drain_empty_ring() {
+        let buf = make_ring(1024);
+        let result = shm_drain(&buf, 0);
+        assert!(result.entries.is_empty());
+        assert_eq!(result.drops, 0);
+    }
+
+    #[test]
+    fn drain_bad_magic() {
+        let mut buf = vec![0u8; 1024];
+        // Don't initialize — magic is 0.
+        let result = shm_drain(&buf, 0);
+        assert!(result.entries.is_empty());
+
+        // Set wrong magic.
+        buf[0..4].copy_from_slice(&0xDEADBEEFu32.to_ne_bytes());
+        let result = shm_drain(&buf, 0);
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn write_and_drain_single_message() {
+        let mut buf = make_ring(1024);
+        let payload = b"hello world";
+        let written = shm_write(&mut buf, 0, 1, payload);
+        assert_eq!(written, MSG_HEADER_SIZE + payload.len());
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, 1);
+        assert_eq!(result.entries[0].payload, payload);
+        assert!(result.entries[0].crc_ok);
+        assert_eq!(result.drops, 0);
+    }
+
+    #[test]
+    fn write_and_drain_multiple_messages() {
+        let mut buf = make_ring(1024);
+        shm_write(&mut buf, 0, 1, b"first");
+        shm_write(&mut buf, 0, 2, b"second");
+        shm_write(&mut buf, 0, 3, b"third");
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.entries[0].msg_type, 1);
+        assert_eq!(result.entries[0].payload, b"first");
+        assert_eq!(result.entries[1].msg_type, 2);
+        assert_eq!(result.entries[1].payload, b"second");
+        assert_eq!(result.entries[2].msg_type, 3);
+        assert_eq!(result.entries[2].payload, b"third");
+        for e in &result.entries {
+            assert!(e.crc_ok);
+        }
+    }
+
+    #[test]
+    fn write_empty_payload() {
+        let mut buf = make_ring(1024);
+        let written = shm_write(&mut buf, 0, 42, b"");
+        assert_eq!(written, MSG_HEADER_SIZE);
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, 42);
+        assert!(result.entries[0].payload.is_empty());
+        assert!(result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn ring_full_increments_drops() {
+        // Small ring: header (40) + data (60) = 100 bytes.
+        // MSG_HEADER_SIZE = 16, so a message with 44 bytes payload = 60 bytes total
+        // fills the ring exactly.
+        let shm_size = HEADER_SIZE + 60;
+        let mut buf = make_ring(shm_size);
+        let payload = vec![0xAA; 44]; // 16 + 44 = 60, fills ring
+        let written = shm_write(&mut buf, 0, 1, &payload);
+        assert_eq!(written, 60);
+
+        // Second write should fail — ring full.
+        let written = shm_write(&mut buf, 0, 2, b"x");
+        assert_eq!(written, 0);
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.drops, 1);
+    }
+
+    #[test]
+    fn ring_full_multiple_drops() {
+        let shm_size = HEADER_SIZE + 32;
+        let mut buf = make_ring(shm_size);
+        let payload = vec![0xBB; 16]; // 16 + 16 = 32, fills ring
+        shm_write(&mut buf, 0, 1, &payload);
+
+        // Three failed writes.
+        assert_eq!(shm_write(&mut buf, 0, 2, b"a"), 0);
+        assert_eq!(shm_write(&mut buf, 0, 3, b"b"), 0);
+        assert_eq!(shm_write(&mut buf, 0, 4, b"c"), 0);
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.drops, 3);
+    }
+
+    #[test]
+    fn wraparound_single_message() {
+        // Ring with capacity = 48. Write a 32-byte message (16 hdr + 16 payload)
+        // to advance write_ptr to 32. Then simulate the host advancing read_ptr
+        // to 32. Then write another 32-byte message that wraps around.
+        let shm_size = HEADER_SIZE + 48;
+        let mut buf = make_ring(shm_size);
+
+        // First message: 16 + 16 = 32 bytes.
+        let payload1 = vec![0x11; 16];
+        shm_write(&mut buf, 0, 1, &payload1);
+
+        // Simulate host draining: advance read_ptr to match write_ptr.
+        let hdr = read_header(&buf, 0);
+        buf[24..32].copy_from_slice(&hdr.write_ptr.to_ne_bytes());
+
+        // Second message: 16 + 16 = 32 bytes. Starts at position 32 in a
+        // 48-byte ring, so it wraps around.
+        let payload2 = vec![0x22; 16];
+        shm_write(&mut buf, 0, 2, &payload2);
+
+        // Drain should see only the second message.
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, 2);
+        assert_eq!(result.entries[0].payload, payload2);
+        assert!(result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn wraparound_message_header_splits() {
+        // Ring with capacity = 40. Write 32 bytes to advance to position 32.
+        // Then advance read_ptr. Write another message starting at 32 —
+        // the 16-byte message header crosses the 40-byte boundary.
+        let shm_size = HEADER_SIZE + 40;
+        let mut buf = make_ring(shm_size);
+
+        // First: 16 + 16 = 32 bytes.
+        shm_write(&mut buf, 0, 1, &[0xAA; 16]);
+
+        // Advance read_ptr.
+        let hdr = read_header(&buf, 0);
+        buf[24..32].copy_from_slice(&hdr.write_ptr.to_ne_bytes());
+
+        // Second: 16 + 4 = 20 bytes, starting at position 32 in a 40-byte ring.
+        // Header bytes: 32..40 (8 bytes) then 0..8 (8 bytes) — wraps mid-header.
+        let payload2 = vec![0xBB; 4];
+        shm_write(&mut buf, 0, 2, &payload2);
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, 2);
+        assert_eq!(result.entries[0].payload, payload2);
+        assert!(result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn crc_detects_corruption() {
+        let mut buf = make_ring(1024);
+        shm_write(&mut buf, 0, 1, b"integrity check");
+
+        // Corrupt one byte of the payload in the ring data area.
+        let data_start = HEADER_SIZE;
+        let payload_start = data_start + MSG_HEADER_SIZE;
+        buf[payload_start] ^= 0xFF;
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert!(!result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn crc_empty_payload_is_zero_for_empty() {
+        // CRC32 of empty input is 0x00000000.
+        assert_eq!(crc32fast::hash(b""), 0x0000_0000);
+    }
+
+    #[test]
+    fn crc32_known_vectors() {
+        // Standard CRC32 test vectors.
+        assert_eq!(crc32fast::hash(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32fast::hash(b""), 0x0000_0000);
+        assert_eq!(crc32fast::hash(b"a"), 0xE8B7_BE43);
+    }
+
+    #[test]
+    fn nonzero_shm_offset() {
+        // SHM region at offset 4096 in a larger buffer (simulating guest memory).
+        let offset = 4096;
+        let shm_size = 512;
+        let total = offset + shm_size;
+        let mut buf = vec![0xFFu8; total];
+        shm_init(&mut buf, offset, shm_size);
+
+        shm_write(&mut buf, offset, 7, b"offset test");
+
+        let result = shm_drain(&buf, offset);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, 7);
+        assert_eq!(result.entries[0].payload, b"offset test");
+        assert!(result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn large_payload() {
+        let mut buf = make_ring(65536);
+        let payload = vec![0x42; 60000];
+        let written = shm_write(&mut buf, 0, 99, &payload);
+        assert_eq!(written, MSG_HEADER_SIZE + 60000);
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].payload.len(), 60000);
+        assert!(result.entries[0].payload.iter().all(|&b| b == 0x42));
+        assert!(result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn incomplete_message_not_drained() {
+        let mut buf = make_ring(1024);
+        shm_write(&mut buf, 0, 1, b"complete");
+
+        // Manually advance write_ptr by 20 bytes (pretend a message header
+        // was written but payload is incomplete).
+        let hdr = read_header(&buf, 0);
+        let fake_write = hdr.write_ptr + 20;
+        // Write a fake message header at the current write position claiming
+        // 100 bytes of payload (which we don't actually write).
+        let fake_msg = ShmMessage {
+            msg_type: 99,
+            length: 100,
+            crc32: 0,
+            _pad: 0,
+        };
+        let data_start = HEADER_SIZE;
+        let capacity = hdr.capacity as usize;
+        write_ring_bytes(
+            &mut buf,
+            data_start,
+            capacity,
+            hdr.write_ptr,
+            fake_msg.as_bytes(),
+        );
+        // Advance write_ptr to only partially cover the fake message.
+        buf[16..24].copy_from_slice(&fake_write.to_ne_bytes());
+
+        let result = shm_drain(&buf, 0);
+        // Only the first complete message should be drained.
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, 1);
+        assert_eq!(result.entries[0].payload, b"complete");
+    }
+
+    #[test]
+    fn stimulus_payload_size_is_24() {
+        assert_eq!(std::mem::size_of::<StimulusPayload>(), 24);
+    }
+
+    #[test]
+    fn msg_type_stimulus_ascii() {
+        let bytes = MSG_TYPE_STIMULUS.to_be_bytes();
+        assert_eq!(&bytes, b"STIM");
+    }
+
+    #[test]
+    fn msg_type_scenario_start_ascii() {
+        let bytes = MSG_TYPE_SCENARIO_START.to_be_bytes();
+        assert_eq!(&bytes, b"SCST");
+    }
+
+    #[test]
+    fn msg_type_scenario_end_ascii() {
+        let bytes = MSG_TYPE_SCENARIO_END.to_be_bytes();
+        assert_eq!(&bytes, b"SCEN");
+    }
+
+    #[test]
+    fn stimulus_payload_roundtrip() {
+        let payload = StimulusPayload {
+            elapsed_ms: 1234,
+            step_index: 3,
+            op_count: 5,
+            op_kinds: 0b1010_0101,
+            cgroup_count: 4,
+            worker_count: 16,
+            total_cpuset_cpus: 8,
+            _pad: 0,
+        };
+        let bytes = payload.as_bytes();
+        let event = StimulusEvent::from_payload(bytes).unwrap();
+        assert_eq!(event.elapsed_ms, 1234);
+        assert_eq!(event.step_index, 3);
+        assert_eq!(event.op_count, 5);
+        assert_eq!(event.op_kinds, 0b1010_0101);
+        assert_eq!(event.cgroup_count, 4);
+        assert_eq!(event.worker_count, 16);
+        assert_eq!(event.total_cpuset_cpus, 8);
+    }
+
+    #[test]
+    fn stimulus_event_from_short_payload() {
+        assert!(StimulusEvent::from_payload(&[0u8; 19]).is_none());
+        assert!(StimulusEvent::from_payload(&[0u8; 24]).is_some());
+    }
+
+    #[test]
+    fn stimulus_write_and_drain() {
+        let mut buf = make_ring(1024);
+        let payload = StimulusPayload {
+            elapsed_ms: 500,
+            step_index: 1,
+            op_count: 3,
+            op_kinds: 7,
+            cgroup_count: 2,
+            worker_count: 8,
+            total_cpuset_cpus: 6,
+            _pad: 0,
+        };
+        let written = shm_write(&mut buf, 0, MSG_TYPE_STIMULUS, payload.as_bytes());
+        assert_eq!(written, MSG_HEADER_SIZE + 24);
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, MSG_TYPE_STIMULUS);
+        assert!(result.entries[0].crc_ok);
+        let event = StimulusEvent::from_payload(&result.entries[0].payload).unwrap();
+        assert_eq!(event.elapsed_ms, 500);
+        assert_eq!(event.step_index, 1);
+        assert_eq!(event.op_count, 3);
+    }
+
+    #[test]
+    fn header_fields_at_expected_offsets() {
+        let mut buf = make_ring(256);
+        // Write known values and verify byte-level layout.
+        let hdr = ShmRingHeader {
+            magic: SHM_RING_MAGIC,
+            version: SHM_RING_VERSION,
+            capacity: 216,
+            _pad: 0,
+            write_ptr: 0x1122_3344_5566_7788,
+            read_ptr: 0xAABB_CCDD_EEFF_0011,
+            drops: 42,
+        };
+        buf[..HEADER_SIZE].copy_from_slice(hdr.as_bytes());
+
+        assert_eq!(
+            u32::from_ne_bytes(buf[0..4].try_into().unwrap()),
+            SHM_RING_MAGIC
+        );
+        assert_eq!(
+            u32::from_ne_bytes(buf[4..8].try_into().unwrap()),
+            SHM_RING_VERSION
+        );
+        assert_eq!(u32::from_ne_bytes(buf[8..12].try_into().unwrap()), 216);
+        assert_eq!(
+            u64::from_ne_bytes(buf[16..24].try_into().unwrap()),
+            0x1122_3344_5566_7788
+        );
+        assert_eq!(
+            u64::from_ne_bytes(buf[24..32].try_into().unwrap()),
+            0xAABB_CCDD_EEFF_0011
+        );
+        assert_eq!(u64::from_ne_bytes(buf[32..40].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn dump_req_offset_in_pad() {
+        assert_eq!(DUMP_REQ_OFFSET, 12);
+        assert_eq!(DUMP_REQ_SYSRQ_D, b'D');
+    }
+
+    #[test]
+    fn stall_req_offset_in_pad() {
+        assert_eq!(STALL_REQ_OFFSET, 13);
+        assert_eq!(STALL_REQ_ACTIVATE, b'S');
+    }
+
+    #[test]
+    fn shm_min_size_holds_one_message() {
+        assert!(SHM_MIN_SIZE > HEADER_SIZE as u64 + MSG_HEADER_SIZE as u64);
+    }
+
+    #[test]
+    fn shm_default_size_value() {
+        assert_eq!(SHM_DEFAULT_SIZE, 64 * 1024);
+    }
+
+    #[test]
+    fn stimulus_event_from_exact_size_payload() {
+        let payload = StimulusPayload {
+            elapsed_ms: 42,
+            step_index: 7,
+            op_count: 3,
+            op_kinds: 0xFF,
+            cgroup_count: 2,
+            worker_count: 10,
+            total_cpuset_cpus: 4,
+            _pad: 0,
+        };
+        let bytes = payload.as_bytes();
+        assert_eq!(bytes.len(), 24);
+        let event = StimulusEvent::from_payload(bytes).unwrap();
+        assert_eq!(event.elapsed_ms, 42);
+        assert_eq!(event.step_index, 7);
+        assert_eq!(event.op_count, 3);
+        assert_eq!(event.op_kinds, 0xFF);
+        assert_eq!(event.cgroup_count, 2);
+        assert_eq!(event.worker_count, 10);
+        assert_eq!(event.total_cpuset_cpus, 4);
+    }
+
+    #[test]
+    fn stimulus_event_from_oversized_payload() {
+        let mut bytes = vec![0u8; 32];
+        // Set elapsed_ms to 123 at offset 0.
+        bytes[0..4].copy_from_slice(&123u32.to_ne_bytes());
+        let event = StimulusEvent::from_payload(&bytes).unwrap();
+        assert_eq!(event.elapsed_ms, 123);
+    }
+
+    #[test]
+    fn concurrent_producer_consumer_simulated() {
+        // Simulate alternating writes and drains to exercise the read_ptr
+        // advancement path.
+        let shm_size = HEADER_SIZE + 128;
+        let mut buf = make_ring(shm_size);
+
+        // Write 3 messages, drain, advance read_ptr, write 3 more, drain.
+        for round in 0..3 {
+            let base_type = round * 10;
+            shm_write(&mut buf, 0, base_type + 1, b"aa");
+            shm_write(&mut buf, 0, base_type + 2, b"bb");
+            shm_write(&mut buf, 0, base_type + 3, b"cc");
+
+            let result = shm_drain(&buf, 0);
+            assert_eq!(result.entries.len(), 3);
+            for e in &result.entries {
+                assert!(e.crc_ok);
+            }
+
+            // Advance read_ptr to write_ptr (simulate host consuming).
+            let hdr = read_header(&buf, 0);
+            buf[24..32].copy_from_slice(&hdr.write_ptr.to_ne_bytes());
+        }
+    }
+
+    #[test]
+    fn stimulus_event_from_empty_payload() {
+        assert!(StimulusEvent::from_payload(&[]).is_none());
+    }
+
+    #[test]
+    fn stimulus_event_clone_preserves_fields() {
+        let event = StimulusEvent {
+            elapsed_ms: 999,
+            step_index: 7,
+            op_count: 3,
+            op_kinds: 0xF0,
+            cgroup_count: 5,
+            worker_count: 20,
+            total_cpuset_cpus: 16,
+        };
+        let c = event.clone();
+        assert_eq!(c.elapsed_ms, 999);
+        assert_eq!(c.step_index, 7);
+        assert_eq!(c.op_count, 3);
+        assert_eq!(c.op_kinds, 0xF0);
+        assert_eq!(c.cgroup_count, 5);
+        assert_eq!(c.worker_count, 20);
+        assert_eq!(c.total_cpuset_cpus, 16);
+    }
+
+    #[test]
+    fn shm_drain_result_default_empty() {
+        let r = ShmDrainResult::default();
+        assert!(r.entries.is_empty());
+        assert_eq!(r.drops, 0);
+    }
+
+    #[test]
+    fn write_exact_capacity_then_empty() {
+        // Exactly fill capacity with one message, drain, verify empty after.
+        let data_size = 64;
+        let shm_size = HEADER_SIZE + data_size;
+        let mut buf = make_ring(shm_size);
+        let payload_len = data_size - MSG_HEADER_SIZE;
+        let payload = vec![0x55u8; payload_len];
+        let written = shm_write(&mut buf, 0, 1, &payload);
+        assert_eq!(written, data_size);
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert!(result.entries[0].crc_ok);
+        assert_eq!(result.entries[0].payload.len(), payload_len);
+    }
+
+    #[test]
+    fn write_ring_bytes_wraparound_exact() {
+        // Data area of 16 bytes, write 8 bytes starting at position 12 —
+        // first 4 bytes fit, then wraps to start for remaining 4.
+        let data_start = HEADER_SIZE;
+        let capacity = 16;
+        let shm_size = HEADER_SIZE + capacity;
+        let mut buf = vec![0u8; shm_size];
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        write_ring_bytes(&mut buf, data_start, capacity, 12, &data);
+        // Bytes at positions 12..16 then 0..4
+        assert_eq!(&buf[data_start + 12..data_start + 16], &[1, 2, 3, 4]);
+        assert_eq!(&buf[data_start..data_start + 4], &[5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn read_ring_bytes_wraparound_exact() {
+        let data_start = HEADER_SIZE;
+        let capacity = 16;
+        let shm_size = HEADER_SIZE + capacity;
+        let mut buf = vec![0u8; shm_size];
+        // Plant data that wraps: positions 14..16 and 0..2
+        buf[data_start + 14] = 0xAA;
+        buf[data_start + 15] = 0xBB;
+        buf[data_start] = 0xCC;
+        buf[data_start + 1] = 0xDD;
+        let out = read_ring_bytes(&buf, data_start, capacity, 14, 4);
+        assert_eq!(out, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn stimulus_payload_as_bytes_roundtrip() {
+        let p = StimulusPayload {
+            elapsed_ms: u32::MAX,
+            step_index: u16::MAX,
+            op_count: u16::MAX,
+            op_kinds: u32::MAX,
+            cgroup_count: u16::MAX,
+            worker_count: u16::MAX,
+            total_cpuset_cpus: u32::MAX,
+            _pad: 0,
+        };
+        let bytes = p.as_bytes();
+        let e = StimulusEvent::from_payload(bytes).unwrap();
+        assert_eq!(e.elapsed_ms, u32::MAX);
+        assert_eq!(e.step_index, u16::MAX);
+        assert_eq!(e.op_count, u16::MAX);
+        assert_eq!(e.op_kinds, u32::MAX);
+        assert_eq!(e.cgroup_count, u16::MAX);
+        assert_eq!(e.worker_count, u16::MAX);
+        assert_eq!(e.total_cpuset_cpus, u32::MAX);
+    }
+
+    #[test]
+    fn multiple_writes_fill_and_drop() {
+        // Ring with 80 bytes of data. Each message = 16 + 8 = 24 bytes.
+        // Can fit 3 messages (72 bytes). 4th should drop.
+        let shm_size = HEADER_SIZE + 80;
+        let mut buf = make_ring(shm_size);
+        assert_eq!(shm_write(&mut buf, 0, 1, &[0xAA; 8]), 24);
+        assert_eq!(shm_write(&mut buf, 0, 2, &[0xBB; 8]), 24);
+        assert_eq!(shm_write(&mut buf, 0, 3, &[0xCC; 8]), 24);
+        assert_eq!(shm_write(&mut buf, 0, 4, &[0xDD; 8]), 0); // dropped
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.drops, 1);
+    }
+}

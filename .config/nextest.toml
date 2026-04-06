@@ -1,0 +1,55 @@
+# ── Profiles ──────────────────────────────────────────────────────────
+
+[profile.default]
+# Most tests are fast unit tests; 30s is generous.
+slow-timeout = { period = "30s", terminate-after = 2 }
+# Run all tests with generous parallelism.
+test-threads = "num-cpus"
+
+[profile.ci]
+# CI should surface slow tests early and hard-kill hangs.
+slow-timeout = { period = "20s", terminate-after = 3 }
+retries = 0
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[profile.quick]
+# Skip boot tests entirely via filter; run only fast tests.
+# Usage: cargo nextest run --profile quick
+slow-timeout = { period = "10s", terminate-after = 2 }
+
+# ── Overrides ─────────────────────────────────────────────────────────
+
+# Boot tests: long timeout, retry in CI.
+# Coverage instrumentation (llvm-cov) makes VM boots 5-10x slower,
+# so the budget must accommodate the slowest observed coverage run.
+[[profile.default.overrides]]
+filter = "test(boot_kernel) | test(bench_boot)"
+slow-timeout = { period = "180s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = "test(boot_kernel) | test(bench_boot)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 1
+
+# KVM tests: create VMs but don't boot kernels. Moderate timeout.
+[[profile.default.overrides]]
+filter = "test(vmm::kvm::) | test(vmm::tests::ap_mp) | test(vmm::tests::kvm_) | test(vmm::tests::immediate_exit) | test(vmm::tests::vcpu_thread_kick) | test(vmm::boot::tests::setup_fpu_with_kvm) | test(vmm::boot::tests::setup_msrs_with_kvm) | test(vmm::boot::tests::setup_regs_with_kvm) | test(vmm::boot::tests::setup_sregs_with_kvm) | test(vmm::boot::tests::setup_lapic)"
+slow-timeout = { period = "15s", terminate-after = 2 }
+
+# Coverage tests: boot full VMs with coverage-instrumented binaries.
+[[profile.default.overrides]]
+filter = "test(cover_)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = "test(cover_)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 1
+
+# Quick profile: exclude boot and bench tests.
+[[profile.quick.overrides]]
+filter = "test(boot_kernel) | test(bench_boot)"
+slow-timeout = { period = "60s", terminate-after = 1 }

@@ -1,0 +1,2620 @@
+//! Runtime support for `#[stt_test]` integration tests.
+//!
+//! Provides the registration type, distributed slice, VM launcher, and
+//! guest-side profraw flush for coverage-instrumented test functions.
+//!
+//! See the [Writing Tests](https://sched-ext.github.io/scx/stt/writing-tests.html)
+//! and [`#[stt_test]` Macro](https://sched-ext.github.io/scx/stt/writing-tests/stt-test-macro.html)
+//! chapters of the guide.
+
+use anyhow::{Context, Result};
+use linkme::distributed_slice;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::monitor::MonitorSummary;
+use crate::scenario::Ctx;
+use crate::timeline::StimulusEvent;
+use crate::verify::{ScenarioStats, VerifyResult};
+use crate::vmm;
+
+/// Test result sidecar written to STT_SIDECAR_DIR for `stt test` collection.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SidecarResult {
+    pub test_name: String,
+    pub topology: String,
+    pub scheduler: String,
+    pub passed: bool,
+    pub stats: ScenarioStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<MonitorSummary>,
+    pub stimulus_events: Vec<StimulusEvent>,
+    #[serde(default = "crate::stats::default_work_type")]
+    pub work_type: String,
+}
+
+/// Scan a directory for stt sidecar JSON files. Recurses one level
+/// into subdirectories to handle per-job gauntlet layouts.
+pub fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
+    let mut sidecars = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return sidecars,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json")
+            && path.to_str().is_some_and(|s| s.contains(".stt."))
+            && let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(sc) = serde_json::from_str::<SidecarResult>(&data)
+        {
+            sidecars.push(sc);
+        }
+    }
+    // Recurse one level for gauntlet per-job subdirectories.
+    if let Ok(dirs) = std::fs::read_dir(dir) {
+        for d in dirs.flatten() {
+            let sub = d.path();
+            if sub.is_dir()
+                && let Ok(entries) = std::fs::read_dir(&sub)
+            {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("json")
+                        && path.to_str().is_some_and(|s| s.contains(".stt."))
+                        && let Ok(data) = std::fs::read_to_string(&path)
+                        && let Ok(sc) = serde_json::from_str::<SidecarResult>(&data)
+                    {
+                        sidecars.push(sc);
+                    }
+                }
+            }
+        }
+    }
+    sidecars
+}
+
+/// Early dispatch for `#[stt_test]` guest-side execution.
+///
+/// Runs before `main()` in any binary that links against stt.
+///
+/// - `--stt-list`: dumps registered test entries as JSON and exits.
+/// - `--stt-test-fn=NAME --stt-topo=NsNcNt`: host-side dispatch —
+///   boots a VM with the specified topology and runs the test inside it.
+/// - `--stt-test-fn=NAME` (without `--stt-topo`): guest-side dispatch —
+///   runs the test function directly (inside a VM that was already booted).
+/// - Otherwise: no-op.
+#[ctor::ctor]
+fn stt_test_early_dispatch() {
+    if maybe_list_tests() {
+        std::process::exit(0);
+    }
+    if let Some(code) = maybe_dispatch_host_test() {
+        std::process::exit(code);
+    }
+    if let Some(code) = maybe_dispatch_vm_test() {
+        // The LLVM profiling runtime registers its atexit handler via a
+        // .init_array entry (C++ global initializer). Our ctor also lives
+        // in .init_array, and the execution order between them is
+        // non-deterministic. If our ctor runs first, the atexit handler
+        // was never registered, so std::process::exit() won't write the
+        // profraw. Serialize profraw to a buffer and write it to the SHM
+        // ring for host-side extraction.
+        try_flush_profraw();
+        std::process::exit(code);
+    }
+}
+
+/// Host-side dispatch: if both `--stt-test-fn` and `--stt-topo` are
+/// present, boot a VM with the specified topology and run the test
+/// inside it. Returns `Some(exit_code)` if dispatched, `None` otherwise.
+fn maybe_dispatch_host_test() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let name = extract_test_fn_arg(&args)?;
+    let topo_str = extract_topo_arg(&args)?;
+
+    let entry = match find_test(name) {
+        Some(e) => e,
+        None => {
+            eprintln!("stt_test: unknown test function '{name}'");
+            return Some(1);
+        }
+    };
+
+    let (sockets, cores, threads) = match parse_topo_string(&topo_str) {
+        Some(t) => t,
+        None => {
+            eprintln!("stt_test: invalid --stt-topo format '{topo_str}' (expected NsNcNt)");
+            return Some(1);
+        }
+    };
+
+    let cpus = sockets * cores * threads;
+    let memory_mb = (cpus * 256).max(entry.memory_mb);
+    let topo = TopoOverride {
+        sockets,
+        cores,
+        threads,
+        memory_mb,
+    };
+
+    match run_stt_test_with_topo(entry, &topo) {
+        Ok(()) => Some(0),
+        Err(e) => {
+            eprintln!("stt_test: {e:#}");
+            Some(1)
+        }
+    }
+}
+
+/// SHM ring message type for profraw data.
+pub const MSG_TYPE_PROFRAW: u32 = 0x50524157; // "PRAW"
+
+/// SHM size for stt_test VMs: 4 MB (profraw can be 1-2 MB).
+const STT_TEST_SHM_SIZE: u64 = 4 * 1024 * 1024;
+
+/// How to specify the scheduler binary for an `#[stt_test]`.
+pub enum SchedulerSpec {
+    /// No scheduler binary — use EEVDF (kernel default).
+    None,
+    /// Auto-discover a scheduler binary by name.
+    Name(&'static str),
+    /// Explicit path to a scheduler binary.
+    Path(&'static str),
+}
+
+pub use crate::scenario::flags::FlagDecl;
+
+/// Definition of a scheduler for the test framework.
+///
+/// Captures everything the framework needs to know about a scheduler:
+/// its binary, flag declarations, sysctls, kernel args, and monitor
+/// thresholds.
+pub struct Scheduler {
+    pub name: &'static str,
+    pub binary: SchedulerSpec,
+    pub flags: &'static [&'static FlagDecl],
+    pub sysctls: &'static [(&'static str, &'static str)],
+    pub kargs: &'static [&'static str],
+    pub verify: crate::verify::Verify,
+}
+
+impl Scheduler {
+    pub const EEVDF: Scheduler = Scheduler {
+        name: "eevdf",
+        binary: SchedulerSpec::None,
+        flags: &[],
+        sysctls: &[],
+        kargs: &[],
+        verify: crate::verify::Verify::NONE,
+    };
+
+    /// Const constructor for defining schedulers in static context.
+    pub const fn new(name: &'static str) -> Scheduler {
+        Scheduler {
+            name,
+            binary: SchedulerSpec::None,
+            flags: &[],
+            sysctls: &[],
+            kargs: &[],
+            verify: crate::verify::Verify::NONE,
+        }
+    }
+
+    /// Set the binary spec. Returns self for const chaining.
+    pub const fn binary(mut self, binary: SchedulerSpec) -> Self {
+        self.binary = binary;
+        self
+    }
+
+    /// Set flag declarations. Returns self for const chaining.
+    pub const fn flags(mut self, flags: &'static [&'static FlagDecl]) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Set sysctls. Returns self for const chaining.
+    pub const fn sysctls(mut self, sysctls: &'static [(&'static str, &'static str)]) -> Self {
+        self.sysctls = sysctls;
+        self
+    }
+
+    /// Set kernel args. Returns self for const chaining.
+    pub const fn kargs(mut self, kargs: &'static [&'static str]) -> Self {
+        self.kargs = kargs;
+        self
+    }
+
+    /// Set verification config. Returns self for const chaining.
+    pub const fn verify(mut self, verify: crate::verify::Verify) -> Self {
+        self.verify = verify;
+        self
+    }
+
+    /// Set monitor thresholds via a Verify. Returns self for const chaining.
+    pub const fn thresholds(mut self, thresholds: crate::monitor::MonitorThresholds) -> Self {
+        self.verify.max_imbalance_ratio = Some(thresholds.max_imbalance_ratio);
+        self.verify.max_local_dsq_depth = Some(thresholds.max_local_dsq_depth);
+        self.verify.fail_on_stall = Some(thresholds.fail_on_stall);
+        self.verify.sustained_samples = Some(thresholds.sustained_samples);
+        self.verify.max_fallback_rate = Some(thresholds.max_fallback_rate);
+        self.verify.max_keep_last_rate = Some(thresholds.max_keep_last_rate);
+        self
+    }
+
+    /// Names of all flags this scheduler supports.
+    pub fn supported_flag_names(&self) -> Vec<&str> {
+        self.flags.iter().map(|f| f.name).collect()
+    }
+
+    /// Dependencies of a flag (from its `FlagDecl.requires`).
+    pub fn flag_requires(&self, name: &str) -> Vec<&str> {
+        self.flags
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.requires.iter().map(|r| r.name).collect())
+            .unwrap_or_default()
+    }
+
+    /// Extra CLI arguments associated with a flag.
+    pub fn flag_args(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.flags.iter().find(|f| f.name == name).map(|f| f.args)
+    }
+
+    /// Generate flag profiles scoped to this scheduler's supported flags.
+    ///
+    /// Uses `FlagDecl::requires` for dependency constraints instead of
+    /// the module-level `flag_requires()` hardcoded table.
+    pub fn generate_profiles(
+        &self,
+        required: &[&'static str],
+        excluded: &[&'static str],
+    ) -> Vec<crate::scenario::FlagProfile> {
+        let optional: Vec<&'static str> = self
+            .flags
+            .iter()
+            .map(|f| f.name)
+            .filter(|f| !required.contains(f) && !excluded.contains(f))
+            .collect();
+        let mut out = Vec::new();
+        for mask in 0..(1u32 << optional.len()) {
+            let mut fl: Vec<&'static str> = required.to_vec();
+            for (i, &f) in optional.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    fl.push(f);
+                }
+            }
+            let valid = fl
+                .iter()
+                .all(|f| self.flag_requires(f).iter().all(|r| fl.contains(r)));
+            if valid {
+                fl.sort_by_key(|f| {
+                    self.flags
+                        .iter()
+                        .position(|d| d.name == *f)
+                        .unwrap_or(usize::MAX)
+                });
+                out.push(crate::scenario::FlagProfile { flags: fl });
+            }
+        }
+        out
+    }
+}
+
+/// Registration entry for an `#[stt_test]`-annotated function.
+pub struct SttTestEntry {
+    pub name: &'static str,
+    pub func: fn(&Ctx) -> Result<VerifyResult>,
+    pub sockets: u32,
+    pub cores: u32,
+    pub threads: u32,
+    pub memory_mb: u32,
+    pub scheduler: &'static Scheduler,
+    pub auto_repro: bool,
+    pub replicas: u32,
+    pub verify: crate::verify::Verify,
+    pub extra_sched_args: &'static [&'static str],
+    /// Override for scx_watchdog_timeout in the guest kernel (jiffies).
+    /// 0 = no override (use kernel default).
+    pub watchdog_timeout_jiffies: u64,
+}
+
+/// Distributed slice collecting all `#[stt_test]` entries via linkme.
+#[distributed_slice]
+pub static STT_TESTS: [SttTestEntry];
+
+/// Look up a registered test function by name.
+pub fn find_test(name: &str) -> Option<&'static SttTestEntry> {
+    STT_TESTS.iter().find(|e| e.name == name)
+}
+
+/// Serializable test entry info for `--stt-list` output.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SttTestInfo {
+    pub name: String,
+    pub sockets: u32,
+    pub cores: u32,
+    pub threads: u32,
+    pub memory_mb: u32,
+    pub scheduler: String,
+    pub replicas: u32,
+}
+
+impl SttTestInfo {
+    fn from_entry(e: &SttTestEntry) -> Self {
+        Self {
+            name: e.name.to_string(),
+            sockets: e.sockets,
+            cores: e.cores,
+            threads: e.threads,
+            memory_mb: e.memory_mb,
+            scheduler: e.scheduler.name.to_string(),
+            replicas: e.replicas,
+        }
+    }
+}
+
+/// Check for `--stt-list` in args, dump all registered test entries as
+/// JSON to stdout, and return true. Returns false if not an stt-list
+/// invocation.
+fn maybe_list_tests() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    if !args.iter().any(|a| a == "--stt-list") {
+        return false;
+    }
+    let infos: Vec<SttTestInfo> = STT_TESTS.iter().map(SttTestInfo::from_entry).collect();
+    if let Ok(json) = serde_json::to_string_pretty(&infos) {
+        println!("{json}");
+    }
+    true
+}
+
+/// Optional topology override for `run_stt_test`.
+pub struct TopoOverride {
+    pub sockets: u32,
+    pub cores: u32,
+    pub threads: u32,
+    pub memory_mb: u32,
+}
+
+/// Parse a topology string in "NsNcNt" format (e.g. "2s4c2t").
+/// Returns None if the string doesn't match the expected format.
+pub fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
+    let s_pos = s.find('s')?;
+    let c_pos = s.find('c')?;
+    let t_pos = s.find('t')?;
+    if s_pos >= c_pos || c_pos >= t_pos {
+        return None;
+    }
+    let sockets: u32 = s[..s_pos].parse().ok()?;
+    let cores: u32 = s[s_pos + 1..c_pos].parse().ok()?;
+    let threads: u32 = s[c_pos + 1..t_pos].parse().ok()?;
+    if sockets == 0 || cores == 0 || threads == 0 {
+        return None;
+    }
+    Some((sockets, cores, threads))
+}
+
+/// Host-side entry point: build a VM, boot it with `--stt-test-fn=NAME`,
+/// extract profraw from SHM, and return the test result.
+///
+/// Validates KVM access and auto-discovers a kernel image via
+/// `resolve_kernel()` when `STT_TEST_KERNEL` is not set.
+pub fn run_stt_test(entry: &SttTestEntry) -> Result<()> {
+    run_stt_test_inner(entry, None)
+}
+
+/// Like `run_stt_test` but with an explicit topology override.
+pub fn run_stt_test_with_topo(entry: &SttTestEntry, topo: &TopoOverride) -> Result<()> {
+    run_stt_test_inner(entry, Some(topo))
+}
+
+fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Result<()> {
+    ensure_kvm()?;
+    let kernel = resolve_kernel()?;
+    let scheduler = resolve_scheduler(&entry.scheduler.binary)?;
+    let stt_bin = crate::resolve_current_exe()?;
+
+    let guest_args = vec![
+        "run".to_string(),
+        "--stt-test-fn".to_string(),
+        entry.name.to_string(),
+    ];
+
+    // Build cmdline: base args + sysctls (as sysctl.key=value) + kargs.
+    let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
+    for &(key, value) in entry.scheduler.sysctls {
+        cmdline_parts.push(format!("sysctl.{}={}", key, value));
+    }
+    for &karg in entry.scheduler.kargs {
+        cmdline_parts.push(karg.to_string());
+    }
+    let cmdline_extra = cmdline_parts.join(" ");
+
+    let (sockets, cores, threads, memory_mb) = match topo {
+        Some(t) => (t.sockets, t.cores, t.threads, t.memory_mb),
+        None => (entry.sockets, entry.cores, entry.threads, entry.memory_mb),
+    };
+
+    let mut builder = vmm::SttVm::builder()
+        .kernel(&kernel)
+        .init_binary(&stt_bin)
+        .topology(sockets, cores, threads)
+        .memory_mb(memory_mb)
+        .cmdline(&cmdline_extra)
+        .shm_size(STT_TEST_SHM_SIZE)
+        .run_args(&guest_args)
+        .timeout(Duration::from_secs(30));
+
+    // Merge order: default_checks -> scheduler.verify -> per-test verify.
+    let merged_verify = crate::verify::Verify::default_checks()
+        .merge(&entry.scheduler.verify)
+        .merge(&entry.verify);
+
+    if let Some(ref sched_path) = scheduler {
+        builder = builder.scheduler_binary(sched_path);
+        builder = builder.monitor_thresholds(merged_verify.monitor_thresholds());
+    }
+
+    if !entry.extra_sched_args.is_empty() {
+        let args: Vec<String> = entry
+            .extra_sched_args
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        builder = builder.sched_args(&args);
+    }
+
+    if entry.watchdog_timeout_jiffies > 0 {
+        builder = builder.watchdog_timeout_jiffies(entry.watchdog_timeout_jiffies);
+    }
+
+    let vm = builder.build().context("build stt_test VM")?;
+
+    let result = vm.run().context("run stt_test VM")?;
+
+    // Extract profraw from SHM ring buffer and collect stimulus events.
+    let mut stimulus_events = Vec::new();
+    if let Some(ref shm) = result.shm_data {
+        for entry in &shm.entries {
+            if entry.msg_type == MSG_TYPE_PROFRAW
+                && entry.crc_ok
+                && !entry.payload.is_empty()
+                && let Err(e) = write_profraw(&entry.payload)
+            {
+                eprintln!("stt_test: write guest profraw: {e}");
+            }
+            if entry.msg_type == crate::vmm::shm_ring::MSG_TYPE_STIMULUS
+                && entry.crc_ok
+                && let Some(ev) = crate::vmm::shm_ring::StimulusEvent::from_payload(&entry.payload)
+            {
+                stimulus_events.push(crate::timeline::StimulusEvent {
+                    elapsed_ms: ev.elapsed_ms as u64,
+                    label: format!("StepStart[{}]", ev.step_index),
+                    op_kind: Some(format!("ops={}", ev.op_count)),
+                    detail: Some(format!(
+                        "{} cgroups, {} workers, {} cpuset cpus",
+                        ev.cgroup_count, ev.worker_count, ev.total_cpuset_cpus,
+                    )),
+                });
+            }
+        }
+    }
+
+    // Build timeline from stimulus events + monitor samples.
+    let timeline = result
+        .monitor
+        .as_ref()
+        .map(|m| crate::timeline::Timeline::build(&stimulus_events, &m.samples));
+
+    let sched_label = scheduler_label(&entry.scheduler.binary);
+    let output = &result.output;
+    let dump_section = extract_sched_ext_dump(output)
+        .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
+        .unwrap_or_default();
+
+    let tl_ctx = crate::timeline::TimelineContext {
+        kernel: extract_kernel_version(&result.stderr),
+        topology: Some(format!(
+            "{}s{}c{}t ({} cpus)",
+            sockets,
+            cores,
+            threads,
+            sockets * cores * threads,
+        )),
+        scheduler: Some(entry.scheduler.name.to_string()),
+        scenario: Some(entry.name.to_string()),
+        duration_s: Some(result.duration.as_secs_f64()),
+    };
+
+    if let Ok(verify_result) = parse_verify_result(output) {
+        // Write sidecar before checking pass/fail so both outcomes are captured.
+        write_sidecar(entry, &result, &stimulus_events, &verify_result, "CpuSpin");
+
+        if !verify_result.passed {
+            let details = verify_result.details.join("\n  ");
+            let repro = if entry.auto_repro && scheduler.is_some() {
+                attempt_auto_repro(entry, &kernel, scheduler.as_deref(), &stt_bin, output, topo)
+            } else {
+                None
+            };
+            let repro_section = repro
+                .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
+                .unwrap_or_default();
+            let timeline_section = timeline
+                .as_ref()
+                .filter(|t| !t.phases.is_empty())
+                .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "stt_test '{}'{} failed:\n  {}{}{}{}",
+                entry.name,
+                sched_label,
+                details,
+                timeline_section,
+                dump_section,
+                repro_section,
+            );
+        }
+
+        // Evaluate monitor data against thresholds when a scheduler is running.
+        // Without a scheduler (EEVDF), monitor reads rq data that may be
+        // uninitialized or irrelevant — skip evaluation in that case.
+        if scheduler.is_some()
+            && let Some(ref monitor) = result.monitor
+        {
+            let thresholds = merged_verify.monitor_thresholds();
+            let verdict = thresholds.evaluate(monitor);
+            if !verdict.passed {
+                let details = verdict.details.join("\n  ");
+                let timeline_section = timeline
+                    .as_ref()
+                    .filter(|t| !t.phases.is_empty())
+                    .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "stt_test '{}'{} passed scenario but monitor failed:\n  {}{}{}",
+                    entry.name,
+                    sched_label,
+                    details,
+                    timeline_section,
+                    dump_section,
+                );
+            }
+        }
+
+        return Ok(());
+    }
+
+    // No parseable result — scheduler likely died before producing output.
+    // Attempt auto-repro if enabled and a scheduler was running.
+    let repro_section = if entry.auto_repro
+        && scheduler.is_some()
+        && (output.contains("SCHEDULER_DIED") || output.contains("scheduler died"))
+    {
+        attempt_auto_repro(entry, &kernel, scheduler.as_deref(), &stt_bin, output, topo)
+            .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if result.timed_out {
+        anyhow::bail!(
+            "stt_test '{}'{} timed out (no result in COM2){}",
+            entry.name,
+            sched_label,
+            repro_section,
+        );
+    }
+    anyhow::bail!(
+        "stt_test '{}'{} scheduler died (no test result in COM2){}{}",
+        entry.name,
+        sched_label,
+        dump_section,
+        repro_section,
+    )
+}
+
+/// Attempt auto-repro: extract stack functions from the scheduler output,
+/// boot a second VM with BPF probes attached, and return formatted probe
+/// data. Returns `None` if repro cannot be attempted or yields no data.
+fn attempt_auto_repro(
+    entry: &SttTestEntry,
+    kernel: &Path,
+    scheduler: Option<&Path>,
+    stt_bin: &Path,
+    first_vm_output: &str,
+    topo: Option<&TopoOverride>,
+) -> Option<String> {
+    use crate::probe::stack::extract_stack_functions_all;
+
+    // Extract scheduler log from COM2 output.
+    let sched_output = parse_sched_output(first_vm_output)?;
+
+    // Extract function names from the scheduler log.
+    let stack_funcs = extract_stack_functions_all(sched_output);
+    if stack_funcs.is_empty() {
+        eprintln!("stt_test: auto-repro: no functions extracted from scheduler output");
+        return None;
+    }
+
+    let func_names: Vec<String> = stack_funcs.iter().map(|f| f.raw_name.clone()).collect();
+    let probe_arg = format!("--stt-probe-stack={}", func_names.join(","));
+
+    eprintln!(
+        "stt_test: auto-repro: probing {} functions in second VM",
+        func_names.len()
+    );
+
+    // Build guest args for the repro VM.
+    let guest_args = vec![
+        "run".to_string(),
+        "--stt-test-fn".to_string(),
+        entry.name.to_string(),
+        probe_arg,
+    ];
+
+    // Build cmdline: base args + sysctls + kargs (same as first VM).
+    let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
+    for &(key, value) in entry.scheduler.sysctls {
+        cmdline_parts.push(format!("sysctl.{}={}", key, value));
+    }
+    for &karg in entry.scheduler.kargs {
+        cmdline_parts.push(karg.to_string());
+    }
+    let cmdline_extra = cmdline_parts.join(" ");
+
+    let (sockets, cores, threads, memory_mb) = match topo {
+        Some(t) => (t.sockets, t.cores, t.threads, t.memory_mb),
+        None => (entry.sockets, entry.cores, entry.threads, entry.memory_mb),
+    };
+
+    let mut builder = vmm::SttVm::builder()
+        .kernel(kernel)
+        .init_binary(stt_bin)
+        .topology(sockets, cores, threads)
+        .memory_mb(memory_mb)
+        .cmdline(&cmdline_extra)
+        .shm_size(STT_TEST_SHM_SIZE)
+        .run_args(&guest_args)
+        .timeout(Duration::from_secs(30));
+
+    if let Some(sched_path) = scheduler {
+        builder = builder.scheduler_binary(sched_path);
+    }
+
+    if !entry.extra_sched_args.is_empty() {
+        let args: Vec<String> = entry
+            .extra_sched_args
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        builder = builder.sched_args(&args);
+    }
+
+    let vm = match builder.build() {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("stt_test: auto-repro: failed to build VM: {e:#}");
+            return None;
+        }
+    };
+
+    let repro_result = match vm.run() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("stt_test: auto-repro: VM run failed: {e:#}");
+            return None;
+        }
+    };
+
+    // Extract probe output from the repro VM's COM2 output.
+    extract_probe_output(&repro_result.output)
+}
+
+/// Delimiters for probe output in guest COM2 (written by collect_and_print_probe_data).
+const PROBE_OUTPUT_START: &str = "===PROBE_OUTPUT_START===";
+const PROBE_OUTPUT_END: &str = "===PROBE_OUTPUT_END===";
+
+/// Extract probe output from guest COM2 output between delimiters.
+fn extract_probe_output(output: &str) -> Option<String> {
+    let s = crate::probe::output::extract_section(output, PROBE_OUTPUT_START, PROBE_OUTPUT_END);
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Setup function for nextest `setup-script` integration.
+///
+/// Validates KVM access, discovers a kernel, writes `STT_TEST_KERNEL`
+/// to `env_writer`, and warms the SHM initramfs cache for each binary.
+pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<()> {
+    ensure_kvm()?;
+    let kernel = resolve_kernel()?;
+    writeln!(env_writer, "STT_TEST_KERNEL={}", kernel.display())
+        .context("write STT_TEST_KERNEL to env")?;
+
+    for bin in binaries {
+        let key = vmm::BaseKey::new(bin, None)?;
+        let _ = vmm::get_or_build_base(bin, &[], &key)?;
+    }
+
+    Ok(())
+}
+
+/// Guest-side dispatch: check for `--stt-test-fn=NAME` in args, run the
+/// registered function, write the result to stdout (captured by COM2),
+/// and exit. Profraw flush is handled by `try_flush_profraw()` in the
+/// ctor before `std::process::exit()`.
+///
+/// Call this early in main(). Returns `Some(exit_code)` if dispatched,
+/// `None` if not an stt_test invocation.
+pub fn maybe_dispatch_vm_test() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let name = extract_test_fn_arg(&args)?;
+
+    // Coverage instrumentation adds overhead that affects scheduling
+    // fairness and causes larger scheduling gaps. Downgrade spread
+    // violations to warnings and relax the gap threshold.
+    #[cfg(coverage)]
+    {
+        crate::verify::set_warn_unfair(true);
+        crate::verify::set_coverage_gap_ms(5000);
+    }
+
+    let entry = match find_test(name) {
+        Some(e) => e,
+        None => {
+            eprintln!("stt_test: unknown test function '{name}'");
+            return Some(1);
+        }
+    };
+
+    // Parse --stt-probe-stack=func1,func2,... for auto-repro mode.
+    let probe_stack = extract_probe_stack_arg(&args);
+
+    // Parse --stt-work-type=NAME for work type override.
+    let work_type_override = extract_work_type_arg(&args).and_then(|s| {
+        crate::workload::WorkType::from_name(&s).or_else(|| {
+            eprintln!("stt_test: unknown work type '{s}'");
+            None
+        })
+    });
+
+    // Set up BPF probes if --stt-probe-stack was provided.
+    let probe_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_handle = probe_stack.as_ref().and_then(|stack_input| {
+        use crate::probe::stack::load_probe_stack;
+
+        let functions = load_probe_stack(stack_input);
+        if functions.is_empty() {
+            eprintln!("stt_test: no traceable functions from --stt-probe-stack");
+            return None;
+        }
+
+        let stop = probe_stop.clone();
+        let funcs = functions.clone();
+        Some(std::thread::spawn(move || {
+            use crate::probe::process::run_probe_skeleton;
+            run_probe_skeleton(&funcs, &[], "scx_exit", &stop)
+        }))
+    });
+
+    // Build a minimal Ctx for the test function.
+    let topo = crate::topology::TestTopology::from_system().unwrap_or_else(|e| {
+        eprintln!("stt_test: topology from sysfs failed ({e}), using VM spec fallback");
+        crate::topology::TestTopology::from_spec(entry.sockets, entry.cores, entry.threads)
+    });
+    let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/stt");
+    if let Err(e) = cgroups.setup(false) {
+        eprintln!("stt_test: cgroup setup failed: {e}");
+    }
+    let sched_pid = std::env::var("SCHED_PID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let ctx = Ctx {
+        cgroups: &cgroups,
+        topo: &topo,
+        duration: Duration::from_secs(2),
+        workers_per_cell: 2,
+        sched_pid,
+        settle_ms: 500,
+        work_type_override,
+    };
+
+    let result = match (entry.func)(&ctx) {
+        Ok(r) => r,
+        Err(e) => {
+            let r = VerifyResult {
+                passed: false,
+                details: vec![format!("{e:#}")],
+                stats: Default::default(),
+            };
+            print_verify_result(&r);
+            collect_and_print_probe_data(probe_stop, probe_handle, probe_stack.as_deref());
+            return Some(1);
+        }
+    };
+
+    let exit_code = if result.passed { 0 } else { 1 };
+    print_verify_result(&result);
+    collect_and_print_probe_data(probe_stop, probe_handle, probe_stack.as_deref());
+    Some(exit_code)
+}
+
+/// Stop probes, join the probe thread, and print captured probe data to
+/// stdout (COM2) between delimiters so the host can extract it.
+fn collect_and_print_probe_data(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Option<Vec<crate::probe::process::ProbeEvent>>>>,
+    stack_input: Option<&str>,
+) {
+    let Some(handle) = handle else { return };
+
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let events = match handle.join() {
+        Ok(Some(events)) if !events.is_empty() => events,
+        _ => return,
+    };
+
+    // Build func_names from the probe stack input.
+    let func_names: Vec<(u32, String)> = stack_input
+        .map(|input| {
+            crate::probe::stack::load_probe_stack(input)
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| (i as u32, f.display_name))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let formatted = crate::probe::output::format_probe_events(&events, &func_names, None, false);
+    println!("===PROBE_OUTPUT_START===");
+    print!("{formatted}");
+    println!("===PROBE_OUTPUT_END===");
+}
+
+// ---------------------------------------------------------------------------
+// Profraw handling
+// ---------------------------------------------------------------------------
+
+/// Flush LLVM coverage profraw to the SHM ring buffer.
+///
+/// Calls `__llvm_profile_set_filename` to set the output path, then
+/// `__llvm_profile_write_file` to write profraw to a tmpfs file inside
+/// the guest. Reads the file back and writes the contents to the SHM
+/// ring for host-side extraction.
+///
+/// All symbols have hidden visibility in compiler-rt, so we resolve
+/// them via ELF .symtab parsing (dlsym cannot find hidden symbols).
+///
+/// No-op when built without `-C instrument-coverage` or when SHM
+/// parameters are absent from the kernel command line.
+fn try_flush_profraw() {
+    let Some((shm_base, shm_size)) = parse_shm_params() else {
+        return;
+    };
+
+    let exe = match std::fs::read("/proc/self/exe") {
+        Ok(data) => data,
+        Err(_) => return,
+    };
+    let slide = pie_load_bias(&exe);
+
+    // Set profraw output path, then call __llvm_profile_initialize to
+    // read it and register the atexit handler.
+    // SAFETY: single-threaded guest dispatch context.
+    unsafe { std::env::set_var("LLVM_PROFILE_FILE", "/tmp/stt.profraw") };
+    if let Some(vaddr) = find_symbol_vaddr(&exe, "__llvm_profile_initialize")
+        && vaddr != 0
+    {
+        let f: extern "C" fn() =
+            unsafe { std::mem::transmute((vaddr as usize).wrapping_add(slide)) };
+        f();
+    }
+
+    // Write profraw to the file.
+    let write_file_vaddr = match find_symbol_vaddr(&exe, "__llvm_profile_write_file") {
+        Some(v) if v != 0 => v,
+        _ => return,
+    };
+    let write_file: extern "C" fn() -> i32 =
+        unsafe { std::mem::transmute((write_file_vaddr as usize).wrapping_add(slide)) };
+    if write_file() != 0 {
+        return;
+    }
+
+    // Read the profraw file and send through SHM ring.
+    let data = match std::fs::read("/tmp/stt.profraw") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return,
+    };
+    let _ = write_to_shm_ring(shm_base, shm_size, MSG_TYPE_PROFRAW, &data);
+}
+
+/// Find a symbol's file virtual address in an ELF binary's .symtab.
+fn find_symbol_vaddr(data: &[u8], name: &str) -> Option<u64> {
+    use object::elf;
+    use object::read::elf::{FileHeader, Sym};
+
+    let header = elf::FileHeader64::<object::Endianness>::parse(data).ok()?;
+    let endian = header.endian().ok()?;
+    let sections = header.sections(endian, data).ok()?;
+    let symbols = sections.symbols(endian, data, elf::SHT_SYMTAB).ok()?;
+
+    for sym in symbols.iter() {
+        if sym.st_size(endian) == 0 {
+            continue;
+        }
+        let sym_name = match sym.name(endian, symbols.strings()) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if sym_name == name.as_bytes() {
+            return Some(sym.st_value(endian));
+        }
+    }
+    None
+}
+
+/// Compute the ASLR load bias for a PIE binary.
+///
+/// For ET_DYN (PIE), the kernel loads the binary at an arbitrary base.
+/// The bias is `runtime_phdr_addr - file_phdr_offset`. We get the
+/// runtime phdr address from AT_PHDR (via getauxval) and the file
+/// offset from e_phoff.
+///
+/// Returns 0 for ET_EXEC (non-PIE), where st_value is already absolute.
+fn pie_load_bias(data: &[u8]) -> usize {
+    use object::elf;
+    use object::read::elf::FileHeader;
+
+    let header = match elf::FileHeader64::<object::Endianness>::parse(data) {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+    let endian = match header.endian() {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    if header.e_type(endian) != elf::ET_DYN {
+        return 0;
+    }
+
+    let phdr_file_offset = header.e_phoff(endian) as usize;
+    // SAFETY: AT_PHDR is a well-defined auxiliary vector key.
+    let phdr_runtime = unsafe { libc::getauxval(libc::AT_PHDR) } as usize;
+    if phdr_runtime == 0 {
+        return 0;
+    }
+    phdr_runtime.wrapping_sub(phdr_file_offset)
+}
+
+/// Parse STT_SHM_BASE and STT_SHM_SIZE from /proc/cmdline.
+fn parse_shm_params() -> Option<(u64, u64)> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    parse_shm_params_from_str(&cmdline)
+}
+
+/// Parse STT_SHM_BASE and STT_SHM_SIZE from a kernel command line string.
+fn parse_shm_params_from_str(cmdline: &str) -> Option<(u64, u64)> {
+    let base = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("STT_SHM_BASE="))?
+        .strip_prefix("STT_SHM_BASE=")?;
+    let size = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("STT_SHM_SIZE="))?
+        .strip_prefix("STT_SHM_SIZE=")?;
+    let base =
+        u64::from_str_radix(base.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
+    let size =
+        u64::from_str_radix(size.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
+    Some((base, size))
+}
+
+/// Write a TLV message to the SHM ring buffer via /dev/mem mmap.
+fn write_to_shm_ring(shm_base: u64, shm_size: u64, msg_type: u32, payload: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let fd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_SYNC)
+        .open("/dev/mem")
+        .context("open /dev/mem")?;
+
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let aligned_base = shm_base & !(page_size - 1);
+    let offset_in_page = (shm_base - aligned_base) as usize;
+    let map_size = shm_size as usize + offset_in_page;
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+            aligned_base as libc::off_t,
+        )
+    };
+
+    if ptr == libc::MAP_FAILED {
+        anyhow::bail!("mmap /dev/mem failed");
+    }
+
+    let shm_buf = unsafe {
+        std::slice::from_raw_parts_mut((ptr as *mut u8).add(offset_in_page), shm_size as usize)
+    };
+
+    let written = vmm::shm_ring::shm_write(shm_buf, 0, msg_type, payload);
+
+    unsafe {
+        libc::munmap(ptr, map_size);
+    }
+
+    if written == 0 {
+        anyhow::bail!(
+            "SHM ring full: failed to write {} byte payload",
+            payload.len()
+        );
+    }
+
+    Ok(())
+}
+
+static PROFRAW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Write profraw data to the llvm-cov-target directory.
+fn write_profraw(data: &[u8]) -> Result<()> {
+    let target_dir = target_dir();
+    std::fs::create_dir_all(&target_dir)
+        .with_context(|| format!("create profraw dir: {}", target_dir.display()))?;
+    let id = PROFRAW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = target_dir.join(format!("stt-test-{}-{}.profraw", std::process::id(), id));
+    std::fs::write(&path, data).with_context(|| format!("write profraw: {}", path.display()))?;
+    Ok(())
+}
+
+/// Resolve the llvm-cov-target directory for profraw output.
+fn target_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("LLVM_COV_TARGET_DIR") {
+        return PathBuf::from(d);
+    }
+    if let Some(parent) = std::env::var("LLVM_PROFILE_FILE")
+        .ok()
+        .as_ref()
+        .and_then(|p| Path::new(p).parent())
+    {
+        return parent.to_path_buf();
+    }
+    let mut p = crate::resolve_current_exe().unwrap_or_else(|_| std::env::temp_dir());
+    p.pop(); // remove binary name
+    p.push("llvm-cov-target");
+    p
+}
+
+// ---------------------------------------------------------------------------
+// Result serialization
+// ---------------------------------------------------------------------------
+
+/// Delimiters for the VerifyResult JSON in guest output.
+const RESULT_START: &str = "===STT_TEST_RESULT_START===";
+const RESULT_END: &str = "===STT_TEST_RESULT_END===";
+
+/// Print VerifyResult as delimited JSON to stdout (captured by COM2).
+fn print_verify_result(r: &VerifyResult) {
+    println!("{RESULT_START}");
+    if let Ok(json) = serde_json::to_string(r) {
+        println!("{json}");
+    }
+    println!("{RESULT_END}");
+}
+
+/// Parse VerifyResult from guest output between delimiters.
+fn parse_verify_result(output: &str) -> Result<VerifyResult> {
+    let json = crate::probe::output::extract_section(output, RESULT_START, RESULT_END);
+    anyhow::ensure!(!json.is_empty(), "missing result delimiters");
+    serde_json::from_str(&json).context("parse VerifyResult JSON")
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler output extraction
+// ---------------------------------------------------------------------------
+
+/// Delimiters for the scheduler log in guest output (written by init script).
+const SCHED_OUTPUT_START: &str = "===SCHED_OUTPUT_START===";
+const SCHED_OUTPUT_END: &str = "===SCHED_OUTPUT_END===";
+
+/// Extract the scheduler log from guest output between delimiters.
+/// Returns `None` if the delimiters are absent or the content is empty.
+fn parse_sched_output(output: &str) -> Option<&str> {
+    // Cannot use extract_section here: it returns an owned String,
+    // but callers need a borrowed &str tied to `output`'s lifetime.
+    let start = output.find(SCHED_OUTPUT_START)?;
+    let end = output.find(SCHED_OUTPUT_END)?;
+    let after_marker = start + SCHED_OUTPUT_START.len();
+    if after_marker >= end {
+        return None;
+    }
+    let content = output[after_marker..end].trim();
+    if content.is_empty() {
+        return None;
+    }
+    Some(content)
+}
+
+// ---------------------------------------------------------------------------
+// sched_ext dump extraction
+// ---------------------------------------------------------------------------
+
+/// Extract sched_ext_dump lines from guest output (trace_pipe output on COM2).
+///
+/// The trace_pipe stream contains lines with `sched_ext_dump:` prefixes when
+/// a SysRq-D dump is triggered. Collects all such lines into a single string.
+/// Returns `None` if no dump lines are present.
+fn extract_sched_ext_dump(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|l| l.contains("sched_ext_dump"))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+/// Extract kernel version from console output (COM1/stderr).
+///
+/// Looks for "Linux version X.Y.Z..." in boot messages.
+fn extract_kernel_version(console: &str) -> Option<String> {
+    for line in console.lines() {
+        if let Some(rest) = line.split("Linux version ").nth(1) {
+            return Some(rest.split_whitespace().next().unwrap_or("").to_string());
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// KVM validation
+// ---------------------------------------------------------------------------
+
+/// Verify that `/dev/kvm` is accessible for read+write.
+fn ensure_kvm() -> Result<()> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .context(
+            "/dev/kvm not accessible — KVM is required for stt_test. \
+             Check that KVM is enabled and your user is in the kvm group.",
+        )?;
+    Ok(())
+}
+
+/// Format a label for the scheduler spec, for use in test output.
+fn scheduler_label(spec: &SchedulerSpec) -> String {
+    match spec {
+        SchedulerSpec::None => String::new(),
+        SchedulerSpec::Name(n) => format!(" [sched={n}]"),
+        SchedulerSpec::Path(p) => format!(" [sched={p}]"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a scheduler binary from a `SchedulerSpec`.
+///
+/// Returns `Ok(None)` for `SchedulerSpec::None` (EEVDF).
+/// For `Name`, searches: `STT_SCHEDULER` env, sibling of current_exe,
+/// `target/debug/`, `target/release/`.
+/// For `Path`, validates the file exists.
+pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
+    match spec {
+        SchedulerSpec::None => Ok(None),
+        SchedulerSpec::Path(p) => {
+            let path = PathBuf::from(p);
+            anyhow::ensure!(path.exists(), "scheduler not found: {p}");
+            Ok(Some(path))
+        }
+        SchedulerSpec::Name(name) => {
+            // 1. STT_SCHEDULER env var
+            if let Ok(p) = std::env::var("STT_SCHEDULER") {
+                let path = PathBuf::from(&p);
+                if path.exists() {
+                    return Ok(Some(path));
+                }
+            }
+
+            // 2. Sibling of current executable
+            if let Ok(exe) = crate::resolve_current_exe()
+                && let Some(dir) = exe.parent()
+            {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Ok(Some(candidate));
+                }
+            }
+
+            // 3. target/debug/
+            let candidate = PathBuf::from("target/debug").join(name);
+            if candidate.exists() {
+                return Ok(Some(candidate));
+            }
+
+            // 4. target/release/
+            let candidate = PathBuf::from("target/release").join(name);
+            if candidate.exists() {
+                return Ok(Some(candidate));
+            }
+
+            anyhow::bail!(
+                "scheduler '{name}' not found. Set STT_SCHEDULER or \
+                 place it next to the test binary or in target/{{debug,release}}/"
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel resolution
+// ---------------------------------------------------------------------------
+
+/// Find a kernel bzImage for running tests.
+pub fn resolve_kernel() -> Result<PathBuf> {
+    // Check environment variable first.
+    if let Ok(path) = std::env::var("STT_TEST_KERNEL") {
+        let p = PathBuf::from(&path);
+        anyhow::ensure!(p.exists(), "STT_TEST_KERNEL not found: {path}");
+        return Ok(p);
+    }
+
+    // Standard locations.
+    let candidates = [
+        "./linux/arch/x86/boot/bzImage",
+        "../linux/arch/x86/boot/bzImage",
+        "/boot/vmlinuz",
+    ];
+    for c in &candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    anyhow::bail!("no kernel found. Set STT_TEST_KERNEL or build one at ../linux/")
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing helper
+// ---------------------------------------------------------------------------
+
+/// Extract the test function name from `--stt-test-fn=NAME` or
+/// `--stt-test-fn NAME` in the argument list.
+fn extract_test_fn_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if let Some(val) = a.strip_prefix("--stt-test-fn=") {
+            return Some(val);
+        }
+        if a == "--stt-test-fn" {
+            return iter.next().map(|s| s.as_str());
+        }
+    }
+    None
+}
+
+/// Extract `--stt-probe-stack=func1,func2,...` from the argument list.
+fn extract_probe_stack_arg(args: &[String]) -> Option<String> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--stt-probe-stack=")
+            && !val.is_empty()
+        {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Extract `--stt-topo=NsNcNt` from the argument list.
+fn extract_topo_arg(args: &[String]) -> Option<String> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--stt-topo=")
+            && !val.is_empty()
+        {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Extract `--stt-work-type=NAME` from the argument list.
+fn extract_work_type_arg(args: &[String]) -> Option<String> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--stt-work-type=")
+            && !val.is_empty()
+        {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Write a sidecar JSON file to STT_SIDECAR_DIR if the env var is set.
+/// No-op when the var is absent, so tests remain runnable with plain cargo test.
+fn write_sidecar(
+    entry: &SttTestEntry,
+    vm_result: &vmm::VmResult,
+    stimulus_events: &[StimulusEvent],
+    verify_result: &VerifyResult,
+    work_type: &str,
+) {
+    let dir = match std::env::var("STT_SIDECAR_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => return,
+    };
+    let topo = format!("{}s{}c{}t", entry.sockets, entry.cores, entry.threads,);
+    let sched_name = match &entry.scheduler.binary {
+        SchedulerSpec::None => "eevdf",
+        SchedulerSpec::Name(n) => n,
+        SchedulerSpec::Path(p) => p,
+    };
+    let sidecar = SidecarResult {
+        test_name: entry.name.to_string(),
+        topology: topo,
+        scheduler: sched_name.to_string(),
+        passed: verify_result.passed,
+        stats: verify_result.stats.clone(),
+        monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
+        stimulus_events: stimulus_events.to_vec(),
+        work_type: work_type.to_string(),
+    };
+    let path = dir.join(format!("{}.stt.json", entry.name));
+    if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::write(&path, json) {
+            eprintln!("stt_test: write sidecar {}: {e}", path.display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes tests that mutate env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Register a test entry in the distributed slice for unit testing find_test.
+    fn __stt_inner_unit_test_dummy(_ctx: &Ctx) -> Result<VerifyResult> {
+        Ok(VerifyResult::pass())
+    }
+
+    #[distributed_slice(STT_TESTS)]
+    static __STT_ENTRY_UNIT_TEST_DUMMY: SttTestEntry = SttTestEntry {
+        name: "__unit_test_dummy__",
+        func: __stt_inner_unit_test_dummy,
+        sockets: 1,
+        cores: 2,
+        threads: 1,
+        memory_mb: 2048,
+        scheduler: &Scheduler::EEVDF,
+        auto_repro: true,
+        replicas: 1,
+        verify: crate::verify::Verify::NONE,
+        extra_sched_args: &[],
+        watchdog_timeout_jiffies: 0,
+    };
+
+    #[test]
+    fn find_test_registered_entry() {
+        let entry = find_test("__unit_test_dummy__");
+        assert!(entry.is_some(), "registered entry should be found");
+        let entry = entry.unwrap();
+        assert_eq!(entry.name, "__unit_test_dummy__");
+        assert_eq!(entry.sockets, 1);
+        assert_eq!(entry.cores, 2);
+    }
+
+    #[test]
+    fn find_test_nonexistent() {
+        assert!(find_test("__nonexistent_test_xyz__").is_none());
+    }
+
+    #[test]
+    fn extract_test_fn_arg_equals() {
+        let args = vec!["stt".into(), "run".into(), "--stt-test-fn=my_test".into()];
+        assert_eq!(extract_test_fn_arg(&args), Some("my_test"));
+    }
+
+    #[test]
+    fn extract_test_fn_arg_space() {
+        let args = vec![
+            "stt".into(),
+            "run".into(),
+            "--stt-test-fn".into(),
+            "my_test".into(),
+        ];
+        assert_eq!(extract_test_fn_arg(&args), Some("my_test"));
+    }
+
+    #[test]
+    fn extract_test_fn_arg_missing() {
+        let args = vec!["stt".into(), "run".into()];
+        assert!(extract_test_fn_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_test_fn_arg_trailing() {
+        let args = vec!["stt".into(), "run".into(), "--stt-test-fn".into()];
+        assert!(extract_test_fn_arg(&args).is_none());
+    }
+
+    #[test]
+    fn parse_verify_result_valid() {
+        let json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("noise\n{RESULT_START}\n{json}\n{RESULT_END}\nmore");
+        let r = parse_verify_result(&output).unwrap();
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn parse_verify_result_missing_start() {
+        let output = format!("no start\n{RESULT_END}\n");
+        assert!(parse_verify_result(&output).is_err());
+    }
+
+    #[test]
+    fn parse_verify_result_missing_end() {
+        let output = format!("{RESULT_START}\n{{}}");
+        assert!(parse_verify_result(&output).is_err());
+    }
+
+    #[test]
+    fn parse_verify_result_failed() {
+        let json = r#"{"passed":false,"details":["stuck 3000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let r = parse_verify_result(&output).unwrap();
+        assert!(!r.passed);
+        assert_eq!(r.details, vec!["stuck 3000ms"]);
+    }
+
+    #[test]
+    fn parse_shm_params_absent() {
+        // Host /proc/cmdline does not contain STT_SHM_BASE/STT_SHM_SIZE.
+        let result = parse_shm_params();
+        assert!(
+            result.is_none(),
+            "host should not have STT_SHM_BASE in /proc/cmdline"
+        );
+    }
+
+    // -- parse_shm_params_from_str tests --
+
+    #[test]
+    fn parse_shm_params_from_str_lowercase_hex() {
+        let cmdline = "console=ttyS0 STT_SHM_BASE=0xfc000000 STT_SHM_SIZE=0x400000 quiet";
+        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
+        assert_eq!(base, 0xfc000000);
+        assert_eq!(size, 0x400000);
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_uppercase_hex() {
+        let cmdline = "STT_SHM_BASE=0XFC000000 STT_SHM_SIZE=0X400000";
+        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
+        assert_eq!(base, 0xFC000000);
+        assert_eq!(size, 0x400000);
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_no_prefix() {
+        let cmdline = "STT_SHM_BASE=fc000000 STT_SHM_SIZE=400000";
+        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
+        assert_eq!(base, 0xfc000000);
+        assert_eq!(size, 0x400000);
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_missing_base() {
+        let cmdline = "console=ttyS0 STT_SHM_SIZE=0x400000";
+        assert!(parse_shm_params_from_str(cmdline).is_none());
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_missing_size() {
+        let cmdline = "STT_SHM_BASE=0xfc000000 quiet";
+        assert!(parse_shm_params_from_str(cmdline).is_none());
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_missing_both() {
+        let cmdline = "console=ttyS0 quiet";
+        assert!(parse_shm_params_from_str(cmdline).is_none());
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_empty() {
+        assert!(parse_shm_params_from_str("").is_none());
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_invalid_hex() {
+        let cmdline = "STT_SHM_BASE=0xZZZZ STT_SHM_SIZE=0x400000";
+        assert!(parse_shm_params_from_str(cmdline).is_none());
+    }
+
+    // -- extract_test_fn_arg additional tests --
+
+    #[test]
+    fn extract_test_fn_arg_empty_value() {
+        let args = vec!["stt".into(), "run".into(), "--stt-test-fn=".into()];
+        assert_eq!(extract_test_fn_arg(&args), Some(""));
+    }
+
+    #[test]
+    fn extract_test_fn_arg_space_form_empty_args() {
+        let args: Vec<String> = vec![];
+        assert!(extract_test_fn_arg(&args).is_none());
+    }
+
+    // -- parse_verify_result additional tests --
+
+    #[test]
+    fn parse_verify_result_malformed_json() {
+        let output = format!("{RESULT_START}\nnot valid json\n{RESULT_END}");
+        assert!(parse_verify_result(&output).is_err());
+    }
+
+    #[test]
+    fn parse_verify_result_empty_json_between_delimiters() {
+        let output = format!("{RESULT_START}\n\n{RESULT_END}");
+        assert!(parse_verify_result(&output).is_err());
+    }
+
+    #[test]
+    fn parse_verify_result_with_details() {
+        let json = r#"{"passed":false,"details":["err1","err2"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let r = parse_verify_result(&output).unwrap();
+        assert!(!r.passed);
+        assert_eq!(r.details.len(), 2);
+        assert_eq!(r.details[0], "err1");
+        assert_eq!(r.details[1], "err2");
+    }
+
+    // -- target_dir tests --
+
+    #[test]
+    fn target_dir_with_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "LLVM_COV_TARGET_DIR";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, "/tmp/my-cov-dir") };
+        let dir = target_dir();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert_eq!(dir, PathBuf::from("/tmp/my-cov-dir"));
+    }
+
+    #[test]
+    fn target_dir_from_llvm_profile_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key_cov = "LLVM_COV_TARGET_DIR";
+        let key_prof = "LLVM_PROFILE_FILE";
+        let prev_cov = std::env::var(key_cov).ok();
+        let prev_prof = std::env::var(key_prof).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe {
+            std::env::remove_var(key_cov);
+            std::env::set_var(key_prof, "/tmp/cov-target/stt-%p-%m.profraw");
+        }
+        let dir = target_dir();
+        unsafe {
+            match prev_cov {
+                Some(v) => std::env::set_var(key_cov, v),
+                None => std::env::remove_var(key_cov),
+            }
+            match prev_prof {
+                Some(v) => std::env::set_var(key_prof, v),
+                None => std::env::remove_var(key_prof),
+            }
+        }
+        assert_eq!(dir, PathBuf::from("/tmp/cov-target"));
+    }
+
+    #[test]
+    fn target_dir_without_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key_cov = "LLVM_COV_TARGET_DIR";
+        let key_prof = "LLVM_PROFILE_FILE";
+        let prev_cov = std::env::var(key_cov).ok();
+        let prev_prof = std::env::var(key_prof).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe {
+            std::env::remove_var(key_cov);
+            std::env::remove_var(key_prof);
+        }
+        let dir = target_dir();
+        unsafe {
+            match prev_cov {
+                Some(v) => std::env::set_var(key_cov, v),
+                None => std::env::remove_var(key_cov),
+            }
+            match prev_prof {
+                Some(v) => std::env::set_var(key_prof, v),
+                None => std::env::remove_var(key_prof),
+            }
+        }
+        // Falls back to current_exe parent + "llvm-cov-target".
+        assert!(
+            dir.ends_with("llvm-cov-target"),
+            "expected path ending in llvm-cov-target, got: {}",
+            dir.display()
+        );
+    }
+
+    // -- shm_write return value on full ring --
+
+    #[test]
+    fn shm_write_returns_zero_on_full_ring() {
+        use crate::vmm::shm_ring::{HEADER_SIZE, MSG_HEADER_SIZE, shm_init, shm_write};
+
+        // Small ring: header + 32 bytes data.
+        let shm_size = HEADER_SIZE + 32;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+
+        // Fill the ring: 16-byte header + 16-byte payload = 32 bytes.
+        let payload = vec![0xAA; 16];
+        let written = shm_write(&mut buf, 0, MSG_TYPE_PROFRAW, &payload);
+        assert_eq!(written, MSG_HEADER_SIZE + 16);
+
+        // Ring is full — next write returns 0.
+        let written = shm_write(&mut buf, 0, MSG_TYPE_PROFRAW, b"overflow");
+        assert_eq!(written, 0);
+    }
+
+    // -- resolve_kernel tests --
+
+    #[test]
+    fn resolve_kernel_with_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "STT_TEST_KERNEL";
+        let prev = std::env::var(key).ok();
+        let exe = crate::resolve_current_exe().unwrap();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+        let result = resolve_kernel();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), exe);
+    }
+
+    #[test]
+    fn resolve_kernel_with_nonexistent_env_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "STT_TEST_KERNEL";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, "/nonexistent/kernel/path") };
+        let result = resolve_kernel();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(result.is_err());
+    }
+
+    // -- MSG_TYPE_PROFRAW encoding --
+
+    #[test]
+    fn msg_type_profraw_ascii() {
+        // 0x50524157 == "PRAW" in ASCII.
+        let bytes = MSG_TYPE_PROFRAW.to_be_bytes();
+        assert_eq!(&bytes, b"PRAW");
+    }
+
+    // -- KVM check --
+
+    #[test]
+    fn kvm_accessible_on_test_host() {
+        // Verifies /dev/kvm is accessible with read+write permissions.
+        ensure_kvm().expect("/dev/kvm not accessible");
+    }
+
+    // -- resolve_scheduler tests --
+
+    #[test]
+    fn resolve_scheduler_none() {
+        let result = resolve_scheduler(&SchedulerSpec::None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_scheduler_path_exists() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let result = resolve_scheduler(&SchedulerSpec::Path(Box::leak(
+            exe.to_str().unwrap().to_string().into_boxed_str(),
+        )))
+        .unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn resolve_scheduler_path_missing() {
+        let result = resolve_scheduler(&SchedulerSpec::Path("/nonexistent/scheduler"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_scheduler_name_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "STT_SCHEDULER";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::remove_var(key) };
+        let result = resolve_scheduler(&SchedulerSpec::Name("__nonexistent_scheduler_xyz__"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_scheduler_name_via_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "STT_SCHEDULER";
+        let prev = std::env::var(key).ok();
+        let exe = crate::resolve_current_exe().unwrap();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+        let result = resolve_scheduler(&SchedulerSpec::Name("anything"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap(), exe);
+    }
+
+    // -- scheduler_label tests --
+
+    #[test]
+    fn scheduler_label_none_empty() {
+        assert_eq!(scheduler_label(&SchedulerSpec::None), "");
+    }
+
+    #[test]
+    fn scheduler_label_name() {
+        assert_eq!(
+            scheduler_label(&SchedulerSpec::Name("scx_mitosis")),
+            " [sched=scx_mitosis]"
+        );
+    }
+
+    #[test]
+    fn scheduler_label_path() {
+        assert_eq!(
+            scheduler_label(&SchedulerSpec::Path("/usr/bin/sched")),
+            " [sched=/usr/bin/sched]"
+        );
+    }
+
+    // -- nextest_setup --
+
+    #[test]
+    fn nextest_setup_writes_kernel_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "STT_TEST_KERNEL";
+        let prev = std::env::var(key).ok();
+        let exe = crate::resolve_current_exe().unwrap();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+
+        let mut buf = Vec::new();
+        let result = nextest_setup(&[exe.as_path()], &mut buf);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+
+        assert!(result.is_ok(), "nextest_setup failed: {result:?}");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.starts_with("STT_TEST_KERNEL="),
+            "expected STT_TEST_KERNEL=..., got: {output}"
+        );
+    }
+
+    // -- parse_sched_output tests --
+
+    #[test]
+    fn parse_sched_output_valid() {
+        let output = format!(
+            "noise\n{SCHED_OUTPUT_START}\nscheduler log line 1\nline 2\n{SCHED_OUTPUT_END}\nmore"
+        );
+        let parsed = parse_sched_output(&output);
+        assert!(parsed.is_some());
+        let content = parsed.unwrap();
+        assert!(content.contains("scheduler log line 1"));
+        assert!(content.contains("line 2"));
+    }
+
+    #[test]
+    fn parse_sched_output_missing_start() {
+        let output = format!("no start\n{SCHED_OUTPUT_END}\n");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_missing_end() {
+        let output = format!("{SCHED_OUTPUT_START}\nsome content");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_empty_content() {
+        let output = format!("{SCHED_OUTPUT_START}\n\n{SCHED_OUTPUT_END}");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_with_stack_traces() {
+        let stack = "do_enqueue_task+0x1a0/0x380\nbalance_one+0x50/0x100\n";
+        let output = format!("{SCHED_OUTPUT_START}\n{stack}\n{SCHED_OUTPUT_END}");
+        let parsed = parse_sched_output(&output).unwrap();
+        assert!(parsed.contains("do_enqueue_task"));
+        assert!(parsed.contains("balance_one"));
+    }
+
+    // -- extract_probe_stack_arg tests --
+
+    #[test]
+    fn extract_probe_stack_arg_equals() {
+        let args = vec![
+            "stt".into(),
+            "run".into(),
+            "--stt-probe-stack=func_a,func_b".into(),
+        ];
+        assert_eq!(
+            extract_probe_stack_arg(&args),
+            Some("func_a,func_b".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_probe_stack_arg_missing() {
+        let args = vec!["stt".into(), "run".into()];
+        assert!(extract_probe_stack_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_probe_stack_arg_empty_value() {
+        let args = vec!["stt".into(), "--stt-probe-stack=".into()];
+        assert!(extract_probe_stack_arg(&args).is_none());
+    }
+
+    // -- extract_probe_output tests --
+
+    #[test]
+    fn extract_probe_output_valid() {
+        let output =
+            format!("noise\n{PROBE_OUTPUT_START}\nprobe data here\n{PROBE_OUTPUT_END}\nmore");
+        let parsed = extract_probe_output(&output);
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap().contains("probe data here"));
+    }
+
+    #[test]
+    fn extract_probe_output_missing() {
+        assert!(extract_probe_output("no markers").is_none());
+    }
+
+    #[test]
+    fn extract_probe_output_empty() {
+        let output = format!("{PROBE_OUTPUT_START}\n\n{PROBE_OUTPUT_END}");
+        assert!(extract_probe_output(&output).is_none());
+    }
+
+    // -- extract_sched_ext_dump tests --
+
+    #[test]
+    fn extract_sched_ext_dump_present() {
+        let output = "noise\n  stt-0  [001]  0.500: sched_ext_dump: Debug dump\n  stt-0  [001]  0.501: sched_ext_dump: scheduler state\nmore";
+        let parsed = extract_sched_ext_dump(output);
+        assert!(parsed.is_some());
+        let dump = parsed.unwrap();
+        assert!(dump.contains("sched_ext_dump: Debug dump"));
+        assert!(dump.contains("sched_ext_dump: scheduler state"));
+    }
+
+    #[test]
+    fn extract_sched_ext_dump_absent() {
+        assert!(extract_sched_ext_dump("no dump lines here").is_none());
+    }
+
+    #[test]
+    fn extract_sched_ext_dump_empty_output() {
+        assert!(extract_sched_ext_dump("").is_none());
+    }
+
+    // -- Scheduler method tests --
+
+    #[test]
+    fn scheduler_eevdf_defaults() {
+        let s = &Scheduler::EEVDF;
+        assert_eq!(s.name, "eevdf");
+        assert!(s.flags.is_empty());
+        assert!(s.sysctls.is_empty());
+        assert!(s.kargs.is_empty());
+        assert!(!s.verify.not_starved);
+        assert!(s.verify.max_imbalance_ratio.is_none());
+    }
+
+    static FLAG_A: FlagDecl = FlagDecl {
+        name: "flag_a",
+        args: &["--flag-a"],
+        requires: &[],
+    };
+    static BORROW: FlagDecl = FlagDecl {
+        name: "borrow",
+        args: &["--borrow"],
+        requires: &[],
+    };
+    static REBAL: FlagDecl = FlagDecl {
+        name: "rebal",
+        args: &["--rebal"],
+        requires: &[],
+    };
+    static TEST_LLC: FlagDecl = FlagDecl {
+        name: "llc",
+        args: &["--llc"],
+        requires: &[],
+    };
+    static TEST_STEAL: FlagDecl = FlagDecl {
+        name: "steal",
+        args: &["--steal"],
+        requires: &[&TEST_LLC],
+    };
+    static BORROW_LONG: FlagDecl = FlagDecl {
+        name: "borrow",
+        args: &["--enable-borrow"],
+        requires: &[],
+    };
+    static TEST_A: FlagDecl = FlagDecl {
+        name: "a",
+        args: &["-a"],
+        requires: &[],
+    };
+    static TEST_B: FlagDecl = FlagDecl {
+        name: "b",
+        args: &["-b"],
+        requires: &[],
+    };
+
+    // Static flag slices for tests (Scheduler.flags needs &'static).
+    static FLAGS_A: &[&FlagDecl] = &[&FLAG_A];
+    static FLAGS_BORROW_REBAL: &[&FlagDecl] = &[&BORROW, &REBAL];
+    static FLAGS_STEAL_LLC: &[&FlagDecl] = &[&TEST_STEAL, &TEST_LLC];
+    static FLAGS_BORROW_LONG: &[&FlagDecl] = &[&BORROW_LONG];
+    static FLAGS_AB: &[&FlagDecl] = &[&TEST_A, &TEST_B];
+    static FLAGS_LLC_STEAL: &[&FlagDecl] = &[&TEST_LLC, &TEST_STEAL];
+
+    #[test]
+    fn scheduler_new_builder() {
+        let s = Scheduler::new("test_sched")
+            .binary(SchedulerSpec::Name("test_bin"))
+            .flags(FLAGS_A)
+            .sysctls(&[("kernel.sched_cfs_bandwidth_slice_us", "1000")])
+            .kargs(&["nosmt"]);
+        assert_eq!(s.name, "test_sched");
+        assert_eq!(s.flags.len(), 1);
+        assert_eq!(s.sysctls.len(), 1);
+        assert_eq!(s.kargs.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_supported_flag_names() {
+        let s = Scheduler::new("sched").flags(FLAGS_BORROW_REBAL);
+        let names = s.supported_flag_names();
+        assert_eq!(names, vec!["borrow", "rebal"]);
+    }
+
+    #[test]
+    fn scheduler_flag_requires_found() {
+        let s = Scheduler::new("sched").flags(FLAGS_STEAL_LLC);
+        assert_eq!(s.flag_requires("steal"), vec!["llc"]);
+        assert!(s.flag_requires("llc").is_empty());
+    }
+
+    #[test]
+    fn scheduler_flag_requires_not_found() {
+        let s = Scheduler::new("sched").flags(&[]);
+        assert!(s.flag_requires("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn scheduler_flag_args_found() {
+        let s = Scheduler::new("sched").flags(FLAGS_BORROW_LONG);
+        assert_eq!(s.flag_args("borrow"), Some(["--enable-borrow"].as_slice()));
+    }
+
+    #[test]
+    fn scheduler_flag_args_not_found() {
+        let s = Scheduler::new("sched").flags(&[]);
+        assert!(s.flag_args("nonexistent").is_none());
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_no_flags() {
+        let s = Scheduler::new("sched");
+        let profiles = s.generate_profiles(&[], &[]);
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].flags.is_empty());
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_all_optional() {
+        let s = Scheduler::new("sched").flags(FLAGS_AB);
+        let profiles = s.generate_profiles(&[], &[]);
+        assert_eq!(profiles.len(), 4);
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_with_required() {
+        let s = Scheduler::new("sched").flags(FLAGS_AB);
+        let profiles = s.generate_profiles(&["a"], &[]);
+        assert_eq!(profiles.len(), 2);
+        for p in &profiles {
+            assert!(p.flags.contains(&"a"));
+        }
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_with_excluded() {
+        let s = Scheduler::new("sched").flags(FLAGS_AB);
+        let profiles = s.generate_profiles(&[], &["a"]);
+        assert_eq!(profiles.len(), 2);
+        for p in &profiles {
+            assert!(!p.flags.contains(&"a"));
+        }
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_dependency_filter() {
+        let s = Scheduler::new("sched").flags(FLAGS_LLC_STEAL);
+        let profiles = s.generate_profiles(&[], &[]);
+        assert_eq!(profiles.len(), 3);
+        let steal_alone = profiles
+            .iter()
+            .any(|p| p.flags.contains(&"steal") && !p.flags.contains(&"llc"));
+        assert!(!steal_alone);
+    }
+
+    #[test]
+    fn scheduler_with_thresholds() {
+        let t = crate::monitor::MonitorThresholds {
+            max_imbalance_ratio: 2.0,
+            ..Default::default()
+        };
+        let s = Scheduler::new("sched").thresholds(t);
+        assert_eq!(s.verify.max_imbalance_ratio, Some(2.0));
+    }
+
+    #[test]
+    fn scheduler_with_verify() {
+        let v = crate::verify::Verify::NONE
+            .check_not_starved()
+            .max_imbalance_ratio(3.0);
+        let s = Scheduler::new("sched").verify(v);
+        assert!(s.verify.not_starved);
+        assert_eq!(s.verify.max_imbalance_ratio, Some(3.0));
+    }
+
+    #[test]
+    fn sidecar_result_roundtrip() {
+        let sc = SidecarResult {
+            test_name: "my_test".to_string(),
+            topology: "2s4c2t".to_string(),
+            scheduler: "scx_mitosis".to_string(),
+            passed: true,
+            stats: crate::verify::ScenarioStats {
+                cgroups: vec![crate::verify::CgroupStats {
+                    num_workers: 4,
+                    num_cpus: 2,
+                    avg_runnable_pct: 50.0,
+                    min_runnable_pct: 40.0,
+                    max_runnable_pct: 60.0,
+                    spread: 20.0,
+                    max_gap_ms: 100,
+                    max_gap_cpu: 1,
+                    total_migrations: 5,
+                }],
+                total_workers: 4,
+                total_cpus: 2,
+                total_migrations: 5,
+                worst_spread: 20.0,
+                worst_gap_ms: 100,
+                worst_gap_cpu: 1,
+            },
+            monitor: Some(MonitorSummary {
+                total_samples: 10,
+                max_imbalance_ratio: 1.5,
+                max_local_dsq_depth: 3,
+                stall_detected: false,
+                event_deltas: Some(crate::monitor::ScxEventDeltas {
+                    total_fallback: 7,
+                    fallback_rate: 0.5,
+                    max_fallback_burst: 2,
+                    total_dispatch_offline: 0,
+                    total_dispatch_keep_last: 3,
+                    keep_last_rate: 0.2,
+                    total_enq_skip_exiting: 0,
+                    total_enq_skip_migration_disabled: 0,
+                }),
+            }),
+            stimulus_events: vec![crate::timeline::StimulusEvent {
+                elapsed_ms: 500,
+                label: "StepStart[0]".to_string(),
+                op_kind: Some("SetCpuset".to_string()),
+                detail: Some("4 cpus".to_string()),
+            }],
+            work_type: "CpuSpin".to_string(),
+        };
+        let json = serde_json::to_string_pretty(&sc).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.test_name, "my_test");
+        assert_eq!(loaded.topology, "2s4c2t");
+        assert_eq!(loaded.scheduler, "scx_mitosis");
+        assert!(loaded.passed);
+        assert_eq!(loaded.stats.total_workers, 4);
+        assert_eq!(loaded.stats.cgroups.len(), 1);
+        assert_eq!(loaded.stats.cgroups[0].num_workers, 4);
+        assert_eq!(loaded.stats.worst_spread, 20.0);
+        let mon = loaded.monitor.unwrap();
+        assert_eq!(mon.total_samples, 10);
+        assert_eq!(mon.max_imbalance_ratio, 1.5);
+        assert_eq!(mon.max_local_dsq_depth, 3);
+        assert!(!mon.stall_detected);
+        let deltas = mon.event_deltas.unwrap();
+        assert_eq!(deltas.total_fallback, 7);
+        assert_eq!(deltas.total_dispatch_keep_last, 3);
+        assert_eq!(loaded.stimulus_events.len(), 1);
+        assert_eq!(loaded.stimulus_events[0].label, "StepStart[0]");
+    }
+
+    #[test]
+    fn sidecar_result_roundtrip_no_monitor() {
+        let sc = SidecarResult {
+            test_name: "eevdf_test".to_string(),
+            topology: "1s2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.test_name, "eevdf_test");
+        assert!(!loaded.passed);
+        assert!(loaded.monitor.is_none());
+        assert!(loaded.stimulus_events.is_empty());
+        // monitor field should be absent from JSON when None
+        assert!(!json.contains("\"monitor\""));
+    }
+
+    // -- SttTestInfo tests --
+
+    #[test]
+    fn stt_test_info_from_entry() {
+        let entry = find_test("__unit_test_dummy__").unwrap();
+        let info = SttTestInfo::from_entry(entry);
+        assert_eq!(info.name, "__unit_test_dummy__");
+        assert_eq!(info.sockets, 1);
+        assert_eq!(info.cores, 2);
+        assert_eq!(info.threads, 1);
+        assert_eq!(info.memory_mb, 2048);
+        assert_eq!(info.scheduler, "eevdf");
+        assert_eq!(info.replicas, 1);
+    }
+
+    #[test]
+    fn stt_test_info_roundtrip() {
+        let info = SttTestInfo {
+            name: "test_fn".to_string(),
+            sockets: 2,
+            cores: 4,
+            threads: 2,
+            memory_mb: 4096,
+            scheduler: "scx_mitosis".to_string(),
+            replicas: 3,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let loaded: SttTestInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.name, "test_fn");
+        assert_eq!(loaded.sockets, 2);
+        assert_eq!(loaded.cores, 4);
+        assert_eq!(loaded.threads, 2);
+        assert_eq!(loaded.memory_mb, 4096);
+        assert_eq!(loaded.scheduler, "scx_mitosis");
+        assert_eq!(loaded.replicas, 3);
+    }
+
+    #[test]
+    fn stt_test_info_list_serializable() {
+        let infos: Vec<SttTestInfo> = STT_TESTS.iter().map(SttTestInfo::from_entry).collect();
+        let json = serde_json::to_string_pretty(&infos).unwrap();
+        let loaded: Vec<SttTestInfo> = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.is_empty());
+        assert!(loaded.iter().any(|i| i.name == "__unit_test_dummy__"));
+    }
+
+    // -- parse_topo_string tests --
+
+    #[test]
+    fn parse_topo_valid() {
+        assert_eq!(parse_topo_string("2s4c2t"), Some((2, 4, 2)));
+    }
+
+    #[test]
+    fn parse_topo_single_digits() {
+        assert_eq!(parse_topo_string("1s1c1t"), Some((1, 1, 1)));
+    }
+
+    #[test]
+    fn parse_topo_large() {
+        assert_eq!(parse_topo_string("14s9c2t"), Some((14, 9, 2)));
+    }
+
+    #[test]
+    fn parse_topo_zero_sockets() {
+        assert!(parse_topo_string("0s4c2t").is_none());
+    }
+
+    #[test]
+    fn parse_topo_zero_cores() {
+        assert!(parse_topo_string("2s0c2t").is_none());
+    }
+
+    #[test]
+    fn parse_topo_zero_threads() {
+        assert!(parse_topo_string("2s4c0t").is_none());
+    }
+
+    #[test]
+    fn parse_topo_missing_suffix() {
+        assert!(parse_topo_string("2s4c2").is_none());
+    }
+
+    #[test]
+    fn parse_topo_empty() {
+        assert!(parse_topo_string("").is_none());
+    }
+
+    #[test]
+    fn parse_topo_garbage() {
+        assert!(parse_topo_string("hello").is_none());
+    }
+
+    #[test]
+    fn parse_topo_wrong_order() {
+        assert!(parse_topo_string("2c4s2t").is_none());
+    }
+
+    // -- extract_topo_arg tests --
+
+    #[test]
+    fn extract_topo_arg_equals() {
+        let args = vec!["bin".into(), "--stt-topo=2s4c2t".into()];
+        assert_eq!(extract_topo_arg(&args), Some("2s4c2t".to_string()));
+    }
+
+    #[test]
+    fn extract_topo_arg_missing() {
+        let args = vec!["bin".into(), "--stt-test-fn=test".into()];
+        assert!(extract_topo_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_topo_arg_empty_value() {
+        let args = vec!["bin".into(), "--stt-topo=".into()];
+        assert!(extract_topo_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_topo_arg_with_other_args() {
+        let args = vec![
+            "bin".into(),
+            "--stt-test-fn=my_test".into(),
+            "--stt-topo=1s2c1t".into(),
+        ];
+        assert_eq!(extract_topo_arg(&args), Some("1s2c1t".to_string()));
+    }
+
+    #[test]
+    fn extract_kernel_version_from_boot() {
+        let console = "[    0.000000] Linux version 6.14.0-rc3+ (user@host) (gcc) #1 SMP\n\
+                        [    0.001000] Command line: console=ttyS0";
+        assert_eq!(
+            extract_kernel_version(console),
+            Some("6.14.0-rc3+".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_kernel_version_none() {
+        assert_eq!(extract_kernel_version("no kernel here"), None);
+    }
+
+    #[test]
+    fn extract_kernel_version_bare() {
+        let console = "Linux version 6.12.0";
+        assert_eq!(extract_kernel_version(console), Some("6.12.0".to_string()),);
+    }
+
+    // -- extract_work_type_arg tests --
+
+    #[test]
+    fn extract_work_type_arg_equals() {
+        let args = vec!["stt".into(), "--stt-work-type=CpuSpin".into()];
+        assert_eq!(extract_work_type_arg(&args), Some("CpuSpin".to_string()));
+    }
+
+    #[test]
+    fn extract_work_type_arg_missing() {
+        let args = vec!["stt".into(), "run".into()];
+        assert!(extract_work_type_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_work_type_arg_empty_value() {
+        let args = vec!["stt".into(), "--stt-work-type=".into()];
+        assert!(extract_work_type_arg(&args).is_none());
+    }
+
+    // -- collect_sidecars tests --
+
+    #[test]
+    fn collect_sidecars_empty_dir() {
+        let tmp = std::env::temp_dir().join("stt-sidecars-empty-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let results = collect_sidecars(&tmp);
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn collect_sidecars_nonexistent_dir() {
+        let results = collect_sidecars(std::path::Path::new("/nonexistent/path"));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn collect_sidecars_reads_json() {
+        let tmp = std::env::temp_dir().join("stt-sidecars-json-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sc = SidecarResult {
+            test_name: "test_x".to_string(),
+            topology: "1s2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: true,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        std::fs::write(tmp.join("test_x.stt.json"), &json).unwrap();
+        // Non-stt JSON should be ignored.
+        std::fs::write(tmp.join("other.json"), r#"{"key":"val"}"#).unwrap();
+        let results = collect_sidecars(&tmp);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].test_name, "test_x");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn collect_sidecars_recurses_one_level() {
+        let tmp = std::env::temp_dir().join("stt-sidecars-recurse-test");
+        let sub = tmp.join("job-0");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sc = SidecarResult {
+            test_name: "nested_test".to_string(),
+            topology: "2s4c2t".to_string(),
+            scheduler: "scx_mitosis".to_string(),
+            passed: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        std::fs::write(sub.join("nested_test.stt.json"), &json).unwrap();
+        let results = collect_sidecars(&tmp);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].test_name, "nested_test");
+        assert!(!results[0].passed);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn collect_sidecars_skips_invalid_json() {
+        let tmp = std::env::temp_dir().join("stt-sidecars-invalid-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("bad.stt.json"), "not json").unwrap();
+        let results = collect_sidecars(&tmp);
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn collect_sidecars_skips_non_stt_json() {
+        let tmp = std::env::temp_dir().join("stt-sidecars-notstt-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // File ends in .json but does NOT contain ".stt." in the name
+        std::fs::write(tmp.join("other.json"), r#"{"test":"val"}"#).unwrap();
+        let results = collect_sidecars(&tmp);
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn sidecar_result_work_type_field() {
+        let sc = SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1s1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: true,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "Bursty".to_string(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.work_type, "Bursty");
+    }
+
+    #[test]
+    fn write_sidecar_noop_without_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "STT_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::remove_var(key) };
+
+        fn dummy(_ctx: &Ctx) -> Result<VerifyResult> {
+            Ok(VerifyResult::pass())
+        }
+        let entry = SttTestEntry {
+            name: "__sidecar_noop__",
+            func: dummy,
+            sockets: 1,
+            cores: 2,
+            threads: 1,
+            memory_mb: 2048,
+            scheduler: &Scheduler::EEVDF,
+            auto_repro: false,
+            replicas: 1,
+            verify: crate::verify::Verify::NONE,
+            extra_sched_args: &[],
+            watchdog_timeout_jiffies: 0,
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+        };
+        let verify_result = VerifyResult::pass();
+        // This should be a no-op because STT_SIDECAR_DIR is not set.
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn write_sidecar_writes_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "STT_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("stt-sidecar-write-test");
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<VerifyResult> {
+            Ok(VerifyResult::pass())
+        }
+        let entry = SttTestEntry {
+            name: "__sidecar_write_test__",
+            func: dummy,
+            sockets: 1,
+            cores: 2,
+            threads: 1,
+            memory_mb: 2048,
+            scheduler: &Scheduler::EEVDF,
+            auto_repro: false,
+            replicas: 1,
+            verify: crate::verify::Verify::NONE,
+            extra_sched_args: &[],
+            watchdog_timeout_jiffies: 0,
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+        };
+        let verify_result = VerifyResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
+
+        let path = tmp.join("__sidecar_write_test__.stt.json");
+        assert!(path.exists(), "sidecar file should be written");
+        let data = std::fs::read_to_string(&path).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
+        assert_eq!(loaded.test_name, "__sidecar_write_test__");
+        assert!(loaded.passed);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn parse_topo_double_digit_threads() {
+        assert_eq!(parse_topo_string("1s1c12t"), Some((1, 1, 12)));
+    }
+
+    #[test]
+    fn find_test_from_distributed_slice() {
+        // STT_TESTS should contain at least the __unit_test_dummy__ entry.
+        assert!(!STT_TESTS.is_empty());
+    }
+
+    #[test]
+    fn topo_override_fields() {
+        let t = TopoOverride {
+            sockets: 2,
+            cores: 4,
+            threads: 2,
+            memory_mb: 8192,
+        };
+        assert_eq!(t.sockets, 2);
+        assert_eq!(t.cores, 4);
+        assert_eq!(t.threads, 2);
+        assert_eq!(t.memory_mb, 8192);
+    }
+}
