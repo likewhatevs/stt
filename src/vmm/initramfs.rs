@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 /// Payload stdout/stderr and STT_EXIT are directed to /dev/ttyS1 (COM2)
 /// to separate them from kernel console output on /dev/ttyS0 (COM1).
 const INIT_SCRIPT: &str = r#"#!/bin/sh
+echo "STT_INIT_STARTED" > /dev/ttyS1
 export PATH=/bin
 busybox mkdir -p /proc /sys /dev /tmp
 busybox mount -t proc proc /proc
@@ -68,6 +69,7 @@ if [ -n "$SHM_BASE" ]; then
     done &
 fi
 ARGS=$(busybox cat /args 2>/dev/null)
+echo "STT_PAYLOAD_STARTING" > /dev/ttyS1
 echo "===STT_JSON_START===" > /dev/ttyS1
 /payload $ARGS >/dev/ttyS1 2>&1
 RC=$?
@@ -550,6 +552,8 @@ mod tests {
         assert!(s.contains("trace_pipe"));
         assert!(s.contains("sysrq-trigger"));
         assert!(s.contains("STT_SHM_BASE="));
+        assert!(s.contains("STT_INIT_STARTED"));
+        assert!(s.contains("STT_PAYLOAD_STARTING"));
     }
 
     #[test]

@@ -502,11 +502,49 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
         }
     }
 
+    let repro_fn = |output: &str| -> Option<String> {
+        if !entry.auto_repro || scheduler.is_none() {
+            return None;
+        }
+        attempt_auto_repro(entry, &kernel, scheduler.as_deref(), &stt_bin, output, topo)
+    };
+
+    evaluate_vm_result(
+        entry,
+        &result,
+        scheduler.as_deref(),
+        &merged_verify,
+        &stimulus_events,
+        sockets,
+        cores,
+        threads,
+        &repro_fn,
+    )
+}
+
+/// Evaluate a VM result and produce the appropriate error or Ok.
+///
+/// This is the core result-evaluation logic, extracted from
+/// `run_stt_test_inner` so that error message formatting can be tested
+/// without booting a VM. The `repro_fn` callback handles auto-repro
+/// (which requires a second VM boot) when provided.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_vm_result(
+    entry: &SttTestEntry,
+    result: &vmm::VmResult,
+    scheduler: Option<&Path>,
+    merged_verify: &crate::verify::Verify,
+    stimulus_events: &[StimulusEvent],
+    sockets: u32,
+    cores: u32,
+    threads: u32,
+    repro_fn: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
     // Build timeline from stimulus events + monitor samples.
     let timeline = result
         .monitor
         .as_ref()
-        .map(|m| crate::timeline::Timeline::build(&stimulus_events, &m.samples));
+        .map(|m| crate::timeline::Timeline::build(stimulus_events, &m.samples));
 
     let sched_label = scheduler_label(&entry.scheduler.binary);
     let output = &result.output;
@@ -533,12 +571,12 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
 
     if let Ok(verify_result) = parse_verify_result(output) {
         // Write sidecar before checking pass/fail so both outcomes are captured.
-        write_sidecar(entry, &result, &stimulus_events, &verify_result, "CpuSpin");
+        write_sidecar(entry, result, stimulus_events, &verify_result, "CpuSpin");
 
         if !verify_result.passed {
             let details = verify_result.details.join("\n  ");
-            let repro = if entry.auto_repro && scheduler.is_some() {
-                attempt_auto_repro(entry, &kernel, scheduler.as_deref(), &stt_bin, output, topo)
+            let repro = if scheduler.is_some() {
+                repro_fn(output)
             } else {
                 None
             };
@@ -591,31 +629,45 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
         return Ok(());
     }
 
-    // No parseable result — scheduler likely died before producing output.
+    // No parseable result — the payload never wrote a VerifyResult to COM2.
+    // When a scheduler is running this typically means the scheduler died;
+    // without a scheduler (EEVDF) it means the payload itself failed.
     // Attempt auto-repro if enabled and a scheduler was running.
-    let repro_section = if entry.auto_repro
-        && scheduler.is_some()
+    let repro_section = if scheduler.is_some()
         && (output.contains("SCHEDULER_DIED") || output.contains("scheduler died"))
     {
-        attempt_auto_repro(entry, &kernel, scheduler.as_deref(), &stt_bin, output, topo)
+        repro_fn(output)
             .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
             .unwrap_or_default()
     } else {
         String::new()
     };
 
+    // Build a diagnostic section from COM1 kernel console output and exit code.
+    let init_stage = classify_init_stage(output);
+    let console_section = format_console_diagnostics(&result.stderr, result.exit_code, init_stage);
+
     if result.timed_out {
         anyhow::bail!(
-            "stt_test '{}'{} timed out (no result in COM2){}",
+            "stt_test '{}'{} timed out (no result in COM2){}{}",
             entry.name,
             sched_label,
+            console_section,
             repro_section,
         );
     }
+
+    let reason = if scheduler.is_some() {
+        "scheduler died (no test result in COM2)"
+    } else {
+        "payload produced no output (no test result in COM2)"
+    };
     anyhow::bail!(
-        "stt_test '{}'{} scheduler died (no test result in COM2){}{}{}",
+        "stt_test '{}'{} {}{}{}{}{}",
         entry.name,
         sched_label,
+        reason,
+        console_section,
         sched_log_section,
         dump_section,
         repro_section,
@@ -1183,6 +1235,56 @@ fn extract_kernel_version(console: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Init script sentinels (written to COM2 by the init script)
+// ---------------------------------------------------------------------------
+
+/// Written to COM2 immediately on init script entry, before any mounts.
+const SENTINEL_INIT_STARTED: &str = "STT_INIT_STARTED";
+
+/// Written to COM2 after mounts, scheduler start, and trace setup —
+/// immediately before the payload binary is exec'd.
+const SENTINEL_PAYLOAD_STARTING: &str = "STT_PAYLOAD_STARTING";
+
+/// Classify the failure stage based on which sentinels appear in COM2 output.
+fn classify_init_stage(output: &str) -> &'static str {
+    if output.contains(SENTINEL_PAYLOAD_STARTING) {
+        "payload started but produced no test result"
+    } else if output.contains(SENTINEL_INIT_STARTED) {
+        "init started but payload never ran (mount or scheduler setup failed)"
+    } else {
+        "init script never started (kernel failed to mount initramfs)"
+    }
+}
+
+/// Format diagnostic info from COM1 kernel console output, VM exit code,
+/// and init stage classification.
+///
+/// Returns an empty string when there is nothing useful to show.
+/// Otherwise returns a section starting with a blank line, containing the
+/// init stage, exit code, and the last few lines of kernel console output.
+fn format_console_diagnostics(console: &str, exit_code: i32, init_stage: &str) -> String {
+    const TAIL_LINES: usize = 20;
+    let trimmed = console.trim();
+    if trimmed.is_empty() && exit_code == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::with_capacity(3);
+    parts.push(format!("stage: {init_stage}"));
+    parts.push(format!("exit_code={exit_code}"));
+    if !trimmed.is_empty() {
+        let lines: Vec<&str> = trimmed.lines().collect();
+        let start = lines.len().saturating_sub(TAIL_LINES);
+        let tail = &lines[start..];
+        parts.push(format!(
+            "kernel console (last {} lines):\n{}",
+            tail.len(),
+            tail.join("\n"),
+        ));
+    }
+    format!("\n\n--- diagnostics ---\n{}", parts.join("\n"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2367,6 +2469,51 @@ mod tests {
         assert_eq!(extract_kernel_version(console), Some("6.12.0".to_string()),);
     }
 
+    // -- format_console_diagnostics tests --
+
+    #[test]
+    fn format_console_diagnostics_empty_ok() {
+        assert_eq!(format_console_diagnostics("", 0, "test stage"), "");
+    }
+
+    #[test]
+    fn format_console_diagnostics_empty_nonzero_exit() {
+        let s = format_console_diagnostics("", 1, "test stage");
+        assert!(s.contains("exit_code=1"));
+        assert!(s.contains("--- diagnostics ---"));
+        assert!(s.contains("stage: test stage"));
+        assert!(!s.contains("kernel console"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_with_console() {
+        let console = "line1\nline2\nKernel panic - not syncing";
+        let s = format_console_diagnostics(console, -1, "payload started");
+        assert!(s.contains("exit_code=-1"));
+        assert!(s.contains("kernel console"));
+        assert!(s.contains("Kernel panic"));
+        assert!(s.contains("stage: payload started"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_truncates_long() {
+        let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
+        let console = lines.join("\n");
+        let s = format_console_diagnostics(&console, 0, "test");
+        assert!(s.contains("last 20 lines"));
+        assert!(s.contains("boot line 49"));
+        assert!(!s.contains("boot line 29"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_short_console() {
+        let console = "Linux version 6.14.0\nbooted ok";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains("last 2 lines"));
+        assert!(s.contains("Linux version 6.14.0"));
+        assert!(s.contains("booted ok"));
+    }
+
     // -- extract_work_type_arg tests --
 
     #[test]
@@ -2613,5 +2760,400 @@ mod tests {
         assert_eq!(t.cores, 4);
         assert_eq!(t.threads, 2);
         assert_eq!(t.memory_mb, 8192);
+    }
+
+    // -- evaluate_vm_result error path tests --
+
+    fn dummy_test_fn(_ctx: &Ctx) -> Result<VerifyResult> {
+        Ok(VerifyResult::pass())
+    }
+
+    fn eevdf_entry(name: &'static str) -> SttTestEntry {
+        SttTestEntry {
+            name,
+            func: dummy_test_fn,
+            sockets: 1,
+            cores: 2,
+            threads: 1,
+            memory_mb: 2048,
+            scheduler: &Scheduler::EEVDF,
+            auto_repro: false,
+            replicas: 1,
+            verify: crate::verify::Verify::NONE,
+            extra_sched_args: &[],
+            watchdog_timeout_jiffies: 0,
+        }
+    }
+
+    static SCHED_TEST: Scheduler = Scheduler {
+        name: "test_sched",
+        binary: SchedulerSpec::Name("test_sched_bin"),
+        flags: &[],
+        sysctls: &[],
+        kargs: &[],
+        verify: crate::verify::Verify::NONE,
+    };
+
+    fn sched_entry(name: &'static str) -> SttTestEntry {
+        SttTestEntry {
+            name,
+            func: dummy_test_fn,
+            sockets: 1,
+            cores: 2,
+            threads: 1,
+            memory_mb: 2048,
+            scheduler: &SCHED_TEST,
+            auto_repro: false,
+            replicas: 1,
+            verify: crate::verify::Verify::NONE,
+            extra_sched_args: &[],
+            watchdog_timeout_jiffies: 0,
+        }
+    }
+
+    fn no_repro(_output: &str) -> Option<String> {
+        None
+    }
+
+    fn make_vm_result(
+        output: &str,
+        stderr: &str,
+        exit_code: i32,
+        timed_out: bool,
+    ) -> crate::vmm::VmResult {
+        crate::vmm::VmResult {
+            success: !timed_out && exit_code == 0,
+            exit_code,
+            duration: std::time::Duration::from_secs(1),
+            timed_out,
+            output: output.to_string(),
+            stderr: stderr.to_string(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn eval_eevdf_no_com2_output() {
+        let entry = eevdf_entry("__eval_eevdf_no_out__");
+        let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
+        let verify = crate::verify::Verify::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("payload produced no output"),
+            "EEVDF with no COM2 output should say 'payload produced no output', got: {msg}",
+        );
+        assert!(
+            !msg.contains("scheduler died"),
+            "EEVDF error should not say 'scheduler died', got: {msg}",
+        );
+        assert!(
+            msg.contains("exit_code=1"),
+            "should include exit code, got: {msg}"
+        );
+        assert!(
+            msg.contains("Kernel panic"),
+            "should include console output, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn eval_sched_dies_no_com2_output() {
+        let entry = sched_entry("__eval_sched_dies__");
+        let result = make_vm_result("", "boot ok", 1, false);
+        let verify = crate::verify::Verify::NONE;
+        let sched_path = std::path::Path::new("/fake/sched");
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            Some(sched_path),
+            &verify,
+            &[],
+            1,
+            2,
+            1,
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scheduler died"),
+            "scheduler present with no output should say 'scheduler died', got: {msg}",
+        );
+        assert!(
+            !msg.contains("payload produced no output"),
+            "should not say 'payload produced no output' when scheduler is set, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_dies_with_sched_log() {
+        let sched_log = format!(
+            "noise\n{SCHED_OUTPUT_START}\ndo_enqueue_task+0x1a0\nbalance_one+0x50\n{SCHED_OUTPUT_END}\nmore",
+        );
+        let entry = sched_entry("__eval_sched_log__");
+        let result = make_vm_result(&sched_log, "", -1, false);
+        let verify = crate::verify::Verify::NONE;
+        let sched_path = std::path::Path::new("/fake/sched");
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            Some(sched_path),
+            &verify,
+            &[],
+            1,
+            2,
+            1,
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scheduler died"),
+            "should say scheduler died, got: {msg}",
+        );
+        assert!(
+            msg.contains("--- scheduler log ---"),
+            "should include scheduler log section, got: {msg}",
+        );
+        assert!(
+            msg.contains("do_enqueue_task"),
+            "should include scheduler log content, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_timeout_no_result() {
+        let entry = eevdf_entry("__eval_timeout__");
+        let result = make_vm_result("", "booting...\nstill booting...", 0, true);
+        let verify = crate::verify::Verify::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("timed out"),
+            "should say timed out, got: {msg}",
+        );
+        assert!(
+            msg.contains("no result in COM2"),
+            "should mention COM2, got: {msg}",
+        );
+        assert!(
+            msg.contains("booting"),
+            "should include console output, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_payload_exits_no_verify_result() {
+        // Payload wrote something to COM2 but not a valid VerifyResult.
+        let entry = eevdf_entry("__eval_no_verify__");
+        let result = make_vm_result(
+            "some output but no delimiters",
+            "Linux version 6.14.0\nboot complete",
+            0,
+            false,
+        );
+        let verify = crate::verify::Verify::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("payload produced no output"),
+            "non-parseable COM2 with EEVDF should say 'payload produced no output', got: {msg}",
+        );
+        assert!(
+            !msg.contains("scheduler died"),
+            "EEVDF should not say scheduler died, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_ext_dump_included() {
+        let output = "stt-0 [001] 0.5: sched_ext_dump: Debug dump line";
+        let entry = sched_entry("__eval_dump__");
+        let result = make_vm_result(output, "", -1, false);
+        let verify = crate::verify::Verify::NONE;
+        let sched_path = std::path::Path::new("/fake/sched");
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            Some(sched_path),
+            &verify,
+            &[],
+            1,
+            2,
+            1,
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--- sched_ext dump ---"),
+            "should include dump section, got: {msg}",
+        );
+        assert!(
+            msg.contains("sched_ext_dump: Debug dump"),
+            "should include dump content, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_verify_result_passed_returns_ok() {
+        let json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = eevdf_entry("__eval_pass__");
+        let result = make_vm_result(&output, "", 0, false);
+        let verify = crate::verify::Verify::NONE;
+        assert!(
+            evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro,).is_ok(),
+            "passing VerifyResult should return Ok",
+        );
+    }
+
+    #[test]
+    fn eval_verify_result_failed_includes_details() {
+        let json = r#"{"passed":false,"details":["stuck 3000ms","spread 45%"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = eevdf_entry("__eval_fail_details__");
+        let result = make_vm_result(&output, "", 0, false);
+        let verify = crate::verify::Verify::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed:"),
+            "failed VerifyResult should say 'failed:', got: {msg}",
+        );
+        assert!(
+            msg.contains("stuck 3000ms"),
+            "should include failure details, got: {msg}",
+        );
+        assert!(
+            msg.contains("spread 45%"),
+            "should include all failure details, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_timeout_with_sched_includes_diagnostics() {
+        let entry = sched_entry("__eval_timeout_sched__");
+        let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
+        let verify = crate::verify::Verify::NONE;
+        let sched_path = std::path::Path::new("/fake/sched");
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            Some(sched_path),
+            &verify,
+            &[],
+            1,
+            2,
+            1,
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("timed out"),
+            "should say timed out, got: {msg}"
+        );
+        assert!(
+            msg.contains("[sched=test_sched_bin]"),
+            "should include scheduler label, got: {msg}"
+        );
+        assert!(
+            msg.contains("--- diagnostics ---"),
+            "should include diagnostics, got: {msg}"
+        );
+        assert!(
+            msg.contains("kernel panic here"),
+            "should include console tail, got: {msg}"
+        );
+    }
+
+    // -- classify_init_stage tests --
+
+    #[test]
+    fn classify_no_sentinels() {
+        assert_eq!(
+            classify_init_stage(""),
+            "init script never started (kernel failed to mount initramfs)",
+        );
+    }
+
+    #[test]
+    fn classify_init_started_only() {
+        assert_eq!(
+            classify_init_stage("STT_INIT_STARTED\nsome noise"),
+            "init started but payload never ran (mount or scheduler setup failed)",
+        );
+    }
+
+    #[test]
+    fn classify_payload_starting() {
+        let output = "STT_INIT_STARTED\nSTT_PAYLOAD_STARTING\nsome output";
+        assert_eq!(
+            classify_init_stage(output),
+            "payload started but produced no test result",
+        );
+    }
+
+    #[test]
+    fn classify_payload_starting_without_init() {
+        // Edge case: payload sentinel present but init sentinel missing.
+        // payload_starting implies init ran, so classify as payload started.
+        assert_eq!(
+            classify_init_stage("STT_PAYLOAD_STARTING"),
+            "payload started but produced no test result",
+        );
+    }
+
+    // -- sentinel integration in evaluate_vm_result --
+
+    #[test]
+    fn eval_no_sentinels_shows_initramfs_failure() {
+        let entry = eevdf_entry("__eval_no_sentinel__");
+        let result = make_vm_result("", "Kernel panic", 1, false);
+        let verify = crate::verify::Verify::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("init script never started"),
+            "no sentinels should indicate initramfs mount failure, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_init_started_but_no_payload() {
+        let entry = eevdf_entry("__eval_init_only__");
+        let result = make_vm_result("STT_INIT_STARTED\n", "boot log", 1, false);
+        let verify = crate::verify::Verify::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("init started but payload never ran"),
+            "init sentinel only should indicate setup failure, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_payload_started_no_result() {
+        let entry = eevdf_entry("__eval_payload_start__");
+        let output = "STT_INIT_STARTED\nSTT_PAYLOAD_STARTING\ngarbage";
+        let result = make_vm_result(output, "", 1, false);
+        let verify = crate::verify::Verify::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("payload started but produced no test result"),
+            "both sentinels should indicate payload ran but failed, got: {msg}",
+        );
     }
 }
