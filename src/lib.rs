@@ -58,6 +58,40 @@ pub mod workload;
 
 pub use stt_macros::stt_test;
 
+/// Find a bootable kernel image on the host.
+///
+/// Checks build-tree paths first, then versioned paths
+/// (`/lib/modules/$(uname -r)/vmlinuz`, `/boot/vmlinuz-$(uname -r)`),
+/// then falls back to the unversioned `/boot/vmlinuz` symlink.
+pub fn find_kernel() -> Option<std::path::PathBuf> {
+    let rel = {
+        let mut buf: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut buf) } == 0 {
+            let cstr = unsafe { std::ffi::CStr::from_ptr(buf.release.as_ptr()) };
+            Some(cstr.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    };
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // Build-tree kernels (for development)
+    candidates.push("./linux/arch/x86/boot/bzImage".into());
+    candidates.push("../linux/arch/x86/boot/bzImage".into());
+
+    // Versioned paths (usually world-readable)
+    if let Some(ref r) = rel {
+        candidates.push(format!("/lib/modules/{r}/vmlinuz").into());
+        candidates.push(format!("/boot/vmlinuz-{r}").into());
+    }
+
+    // Unversioned fallback
+    candidates.push("/boot/vmlinuz".into());
+
+    candidates.into_iter().find(|p| p.exists())
+}
+
 /// Resolve the current executable path, falling back to `/proc/self/exe`
 /// when the binary has been deleted (e.g. by `cargo llvm-cov`).
 ///

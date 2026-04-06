@@ -1277,16 +1277,8 @@ pub fn resolve_kernel() -> Result<PathBuf> {
     }
 
     // Standard locations.
-    let candidates = [
-        "./linux/arch/x86/boot/bzImage",
-        "../linux/arch/x86/boot/bzImage",
-        "/boot/vmlinuz",
-    ];
-    for c in &candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Ok(p);
-        }
+    if let Some(p) = crate::find_kernel() {
+        return Ok(p);
     }
 
     anyhow::bail!("no kernel found. Set STT_TEST_KERNEL or build one at ../linux/")

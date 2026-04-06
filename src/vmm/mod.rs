@@ -1583,21 +1583,15 @@ mod tests {
         assert!(sig <= libc::SIGRTMAX(), "signal should be <= SIGRTMAX");
     }
 
-    /// Find a kernel bzImage for boot tests.
-    fn find_kernel() -> Option<std::path::PathBuf> {
-        ["../linux/arch/x86/boot/bzImage", "/boot/vmlinuz"]
-            .iter()
-            .map(std::path::PathBuf::from)
-            .find(|p| p.exists())
-    }
-
     /// Boot a real kernel and verify it produces console output.
     /// No initramfs — the kernel boots to panic, which is enough to
     /// confirm KVM, kernel loading, and serial console all work.
     #[test]
     fn boot_kernel_produces_output() {
         let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(kernel) = find_kernel() else { return };
+        let Some(kernel) = crate::find_kernel() else {
+            return;
+        };
 
         let vm = SttVm::builder()
             .kernel(&kernel)
@@ -1617,7 +1611,9 @@ mod tests {
     #[test]
     fn boot_kernel_smp_topology() {
         let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(kernel) = find_kernel() else { return };
+        let Some(kernel) = crate::find_kernel() else {
+            return;
+        };
 
         let vm = SttVm::builder()
             .kernel(&kernel)
@@ -1637,19 +1633,16 @@ mod tests {
     #[test]
     fn bench_boot_time() {
         let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let candidates = ["../linux/arch/x86/boot/bzImage", "/boot/vmlinuz"];
-        let kernel = candidates
-            .iter()
-            .map(std::path::Path::new)
-            .find(|p| p.exists());
-        let Some(kernel) = kernel else { return };
+        let Some(kernel) = crate::find_kernel() else {
+            return;
+        };
 
         for (label, sockets, cores, threads, mem) in
             [("1cpu", 1, 1, 1, 256), ("4cpu", 2, 2, 1, 512)]
         {
             let start = Instant::now();
             let vm = SttVm::builder()
-                .kernel(kernel)
+                .kernel(&kernel)
                 .topology(sockets, cores, threads)
                 .memory_mb(mem)
                 .timeout(Duration::from_secs(10))
@@ -1931,7 +1924,9 @@ mod tests {
     #[test]
     fn boot_kernel_with_monitor() {
         let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(kernel) = find_kernel() else { return };
+        let Some(kernel) = crate::find_kernel() else {
+            return;
+        };
         // Monitor needs vmlinux — skip if not present.
         let Some(_vmlinux) = find_vmlinux(&kernel) else {
             return;
