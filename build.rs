@@ -48,7 +48,9 @@ fn main() {
     let skel_path = out_dir.join("probe_skel.rs");
     SkeletonBuilder::new()
         .source("src/bpf/probe.bpf.c")
+        .obj(out_dir.join("probe.o"))
         .clang_args(clang_args)
+        .reference_obj(true)
         .build_and_generate(&skel_path)
         .expect("build probe BPF skeleton");
 

@@ -665,13 +665,11 @@ fn resolve_affinity(mode: &AffinityMode, _idx: usize) -> Result<Option<BTreeSet<
         AffinityMode::Fixed(cpus) => Ok(Some(cpus.clone())),
         AffinityMode::SingleCpu(cpu) => Ok(Some([*cpu].into_iter().collect())),
         AffinityMode::Random { from, count } => {
-            use rand::seq::SliceRandom;
+            use rand::seq::IndexedRandom;
             let pool: Vec<usize> = from.iter().copied().collect();
             let count = (*count).min(pool.len()).max(1);
             Ok(Some(
-                pool.choose_multiple(&mut rand::thread_rng(), count)
-                    .copied()
-                    .collect(),
+                pool.sample(&mut rand::rng(), count).copied().collect(),
             ))
         }
     }

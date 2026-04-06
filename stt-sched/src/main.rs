@@ -65,13 +65,12 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
 
     while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&skel, uei) {
         thread::sleep(Duration::from_secs(1));
-        if std::path::Path::new("/tmp/stt_stall").exists() {
-            if let Some(bss) = skel.maps.bss_data.as_mut() {
-                if bss.stall == 0 {
-                    bss.stall = 1;
-                    eprintln!("stt-sched: stall enabled via /tmp/stt_stall");
-                }
-            }
+        if std::path::Path::new("/tmp/stt_stall").exists()
+            && let Some(bss) = skel.maps.bss_data.as_mut()
+            && bss.stall == 0
+        {
+            bss.stall = 1;
+            eprintln!("stt-sched: stall enabled via /tmp/stt_stall");
         }
     }
 

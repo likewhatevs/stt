@@ -1,0 +1,19 @@
+#!/bin/sh
+
+if command -v cargo >/dev/null 2>&1; then
+    echo "Running cargo fmt..."
+    cargo fmt --all
+
+    echo "Running cargo clippy..."
+    cargo clippy --workspace --all-targets -- -D warnings
+    if [ $? -ne 0 ]; then
+        echo "clippy failed, aborting commit"
+        exit 1
+    fi
+else
+    echo "Warning: cargo not found, skipping fmt and clippy"
+fi
+
+git add $(git diff --name-only)
+
+exit 0

@@ -641,12 +641,10 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                         let pool: BTreeSet<usize> = all.iter().copied().collect();
                         for idx in 0..handle.tids().len() {
                             let count = (pool.len() / 2).max(1);
-                            use rand::seq::SliceRandom;
+                            use rand::seq::IndexedRandom;
                             let v: Vec<usize> = pool.iter().copied().collect();
-                            let chosen: BTreeSet<usize> = v
-                                .choose_multiple(&mut rand::thread_rng(), count)
-                                .copied()
-                                .collect();
+                            let chosen: BTreeSet<usize> =
+                                v.sample(&mut rand::rng(), count).copied().collect();
                             let _ = handle.set_affinity(idx, &chosen);
                         }
                     }
@@ -780,7 +778,7 @@ pub struct Traverse {
 impl Traverse {
     /// Generate a `Vec<Step>` from the Traverse configuration.
     pub fn generate(&self, ctx: &Ctx) -> Vec<Step> {
-        use rand::Rng;
+        use rand::RngExt;
 
         let seed = self.seed.unwrap_or_else(|| std::process::id() as u64);
         let mut rng = seeded_rng(seed);
@@ -798,8 +796,8 @@ impl Traverse {
 
         for phase in 0..self.phases {
             let range = max_cgroups - min_cgroups + 1;
-            let target_count = min_cgroups + rng.gen_range(0..range);
-            let layout_idx = rng.gen_range(0..self.layouts.len());
+            let target_count = min_cgroups + rng.random_range(0..range);
+            let layout_idx = rng.random_range(0..self.layouts.len());
             let layout = &self.layouts[layout_idx];
 
             let mut ops = Vec::new();
@@ -840,8 +838,8 @@ impl Traverse {
                         of: live_cgroups.len(),
                     },
                     Layout::Overlap(min_frac, max_frac) => {
-                        let frac =
-                            min_frac + rng.gen_range(0..100) as f64 / 100.0 * (max_frac - min_frac);
+                        let frac = min_frac
+                            + rng.random_range(0..100) as f64 / 100.0 * (max_frac - min_frac);
                         CpusetSpec::Overlap {
                             index: i,
                             of: live_cgroups.len(),
@@ -877,7 +875,7 @@ impl Traverse {
 ///
 /// Callers seed with a scenario-specific value so gauntlet runs are
 /// deterministic across reruns.
-fn seeded_rng(seed: u64) -> impl rand::Rng {
+fn seeded_rng(seed: u64) -> rand::rngs::StdRng {
     use rand::SeedableRng;
     rand::rngs::StdRng::seed_from_u64(seed)
 }
@@ -965,20 +963,20 @@ mod tests {
 
     #[test]
     fn seeded_rng_deterministic() {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng1 = seeded_rng(42);
         let mut rng2 = seeded_rng(42);
         for _ in 0..100 {
-            assert_eq!(rng1.r#gen::<u64>(), rng2.r#gen::<u64>());
+            assert_eq!(rng1.random::<u64>(), rng2.random::<u64>());
         }
     }
 
     #[test]
     fn seeded_rng_different_seeds_differ() {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng1 = seeded_rng(1);
         let mut rng2 = seeded_rng(2);
-        let same = (0..10).all(|_| rng1.r#gen::<u64>() == rng2.r#gen::<u64>());
+        let same = (0..10).all(|_| rng1.random::<u64>() == rng2.random::<u64>());
         assert!(!same);
     }
 
