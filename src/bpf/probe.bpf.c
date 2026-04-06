@@ -38,6 +38,15 @@ struct {
 /* Global enable flag. Set by userspace after all probes attached. */
 volatile const bool stt_enabled = false;
 
+/* Diagnostic counters — readable from userspace after drain. */
+u64 stt_trigger_count = 0;
+u64 stt_probe_count = 0;
+u64 stt_meta_miss = 0;
+
+/* Log of IPs that missed func_meta_map lookup, for diagnosis. */
+u64 stt_miss_log[MAX_MISS_LOG] = {};
+u32 stt_miss_log_idx = 0;
+
 /*
  * Generic kprobe handler. Attached at runtime to each target function
  * via attach_kprobe(). Uses bpf_get_func_ip() to identify which
@@ -49,12 +58,21 @@ int stt_probe(struct pt_regs *ctx)
 	if (!stt_enabled)
 		return 0;
 
+	__sync_fetch_and_add(&stt_probe_count, 1);
+
 	u64 ip = bpf_get_func_ip(ctx);
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 
 	struct func_meta *meta = bpf_map_lookup_elem(&func_meta_map, &ip);
-	if (!meta)
+	if (!meta) {
+		u64 miss_cnt = __sync_fetch_and_add(&stt_meta_miss, 1);
+		if (miss_cnt < MAX_MISS_LOG) {
+			u32 idx = __sync_fetch_and_add(&stt_miss_log_idx, 1);
+			if (idx < MAX_MISS_LOG)
+				stt_miss_log[idx] = ip;
+		}
 		return 0;
+	}
 
 	struct probe_entry entry = {};
 	entry.ts = bpf_ktime_get_ns();
@@ -71,18 +89,47 @@ int stt_probe(struct pt_regs *ctx)
 	entry.nr_fields = meta->nr_field_specs;
 	for (int i = 0; i < MAX_FIELDS && i < meta->nr_field_specs; i++) {
 		struct field_spec *spec = &meta->specs[i];
-		if (spec->param_idx >= MAX_ARGS)
+		u32 pidx = spec->param_idx;
+		u32 fidx = spec->field_idx;
+
+		if (pidx >= MAX_ARGS || fidx >= MAX_FIELDS || !spec->size)
 			continue;
 
-		u64 base = entry.args[spec->param_idx];
+		u64 base = entry.args[pidx];
 		if (!base)
 			continue;
 
+		/* Chained pointer dereference: read intermediate pointer
+		 * first, then read through it (e.g. ->cpus_ptr->bits[0]). */
+		if (spec->ptr_offset) {
+			u64 ptr = 0;
+			int r = bpf_probe_read_kernel(&ptr, sizeof(ptr),
+						(void *)(base + spec->ptr_offset));
+			if (r != 0 || !ptr)
+				continue;
+			base = ptr;
+		}
+
 		u64 val = 0;
-		int ret = bpf_probe_read_kernel(&val, sizeof(val),
+		u32 sz = spec->size;
+		if (sz > sizeof(val))
+			sz = sizeof(val);
+		int ret = bpf_probe_read_kernel(&val, sz,
 						(void *)(base + spec->offset));
 		if (ret == 0)
-			entry.fields[spec->field_idx] = val;
+			entry.fields[fidx] = val;
+	}
+
+	/* Read string arg if func_meta specifies one. */
+	if (meta->str_param_idx < MAX_ARGS) {
+		u64 str_ptr = entry.args[meta->str_param_idx];
+		if (str_ptr) {
+			bpf_probe_read_kernel_str(entry.str_val,
+						  sizeof(entry.str_val),
+						  (void *)str_ptr);
+			entry.has_str = 1;
+			entry.str_param_idx = meta->str_param_idx;
+		}
 	}
 
 	struct probe_key key = { .func_ip = ip, .tid = tid };
@@ -92,13 +139,15 @@ int stt_probe(struct pt_regs *ctx)
 }
 
 /*
- * Trigger kprobe. Attached to scx_exit (or user-specified function).
- * Reads all captured probe data for the current tid and sends it to
- * userspace via ring buffer.
+ * Trigger kprobe. Attached to scx_disable_workfn (or user-specified function).
+ * Sends an EVENT_TRIGGER event via ring buffer with the current task
+ * pointer and kernel stack.
  */
 SEC("kprobe/stt_trigger")
 int stt_trigger(struct pt_regs *ctx)
 {
+	__sync_fetch_and_add(&stt_trigger_count, 1);
+
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 
 	struct probe_event *event = bpf_ringbuf_reserve(&events,
@@ -111,6 +160,9 @@ int stt_trigger(struct pt_regs *ctx)
 	event->func_idx = 0;
 	event->ts = bpf_ktime_get_ns();
 	event->nr_fields = 0;
+
+	/* Capture current task_struct pointer for tptr-based stitching. */
+	event->args[0] = (u64)bpf_get_current_task();
 
 	/* Capture kernel stack. */
 	int stack_sz = bpf_get_stack(ctx, event->kstack,

@@ -1152,7 +1152,7 @@ fn cmd_probe(args: ProbeArgs) -> Result<()> {
     let btf_path = probe::btf::resolve_btf_path(args.kernel_dir.as_deref());
     let btf_funcs = parse_btf_functions(&kernel_names, btf_path.as_ref().and_then(|p| p.to_str()));
 
-    let trigger = args.trigger.as_deref().unwrap_or("scx_exit");
+    let trigger = args.trigger.as_deref().unwrap_or("scx_disable_workfn");
 
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_clone = stop.clone();

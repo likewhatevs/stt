@@ -44,17 +44,28 @@ fn main() {
         format!("-I{}", "src/bpf"),
     ];
 
-    // Build the probe BPF skeleton.
+    // Build the kprobe BPF skeleton.
     let skel_path = out_dir.join("probe_skel.rs");
     SkeletonBuilder::new()
         .source("src/bpf/probe.bpf.c")
         .obj(out_dir.join("probe.o"))
-        .clang_args(clang_args)
+        .clang_args(clang_args.clone())
         .reference_obj(true)
         .build_and_generate(&skel_path)
         .expect("build probe BPF skeleton");
 
+    // Build the fentry BPF skeleton (separate for independent loading).
+    let fentry_skel_path = out_dir.join("fentry_probe_skel.rs");
+    SkeletonBuilder::new()
+        .source("src/bpf/fentry_probe.bpf.c")
+        .obj(out_dir.join("fentry_probe.o"))
+        .clang_args(clang_args)
+        .reference_obj(true)
+        .build_and_generate(&fentry_skel_path)
+        .expect("build fentry probe BPF skeleton");
+
     println!("cargo::rerun-if-changed=src/bpf/probe.bpf.c");
+    println!("cargo::rerun-if-changed=src/bpf/fentry_probe.bpf.c");
     println!("cargo::rerun-if-changed=src/bpf/intf.h");
 
     // Build a statically-linked busybox from source for the VMM initramfs.

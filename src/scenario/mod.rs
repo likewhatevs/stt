@@ -48,16 +48,7 @@ fn process_alive(pid: u32) -> bool {
     kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
-pub fn read_kmsg() -> String {
-    match rmesg::log_entries(rmesg::Backend::Default, false) {
-        Ok(entries) => entries
-            .iter()
-            .map(|e| e.message.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Err(_) => String::new(),
-    }
-}
+pub use crate::read_kmsg;
 
 // ---------------------------------------------------------------------------
 // Flag system

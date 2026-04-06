@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use crate::cgroup::CgroupManager;
 use crate::probe::btf::discover_bpf_symbols;
-use crate::probe::stack::{extract_stack_functions_all, filter_traceable, load_probe_stack};
+use crate::probe::stack::{
+    expand_bpf_to_kernel_callers, extract_stack_functions_all, filter_traceable, load_probe_stack,
+};
 use crate::scenario::{self, Ctx, FlagProfile, Scenario, flags};
 use crate::topology::TestTopology;
 use crate::verify::ScenarioStats;
@@ -160,6 +162,7 @@ impl Runner {
             type SkeletonHandle = (
                 std::thread::JoinHandle<Option<Vec<crate::probe::process::ProbeEvent>>>,
                 Vec<(u32, String)>,
+                std::collections::HashMap<String, String>,
             );
             let mut skeleton_handle: Option<SkeletonHandle> = if self.config.repro
                 && let Some(ref stack_input) = self.config.probe_stack
@@ -170,6 +173,9 @@ impl Runner {
                     tracing::debug!(n = bpf_syms.len(), "auto-probe: BPF symbols discovered");
                     functions.extend(bpf_syms);
                 }
+                // Expand BPF functions to their kernel-side callers
+                // so they can be probed via kprobe.
+                let functions = expand_bpf_to_kernel_callers(functions);
                 if functions.is_empty() {
                     tracing::warn!("auto-probe: no functions in stack input");
                     None
@@ -181,26 +187,40 @@ impl Runner {
                         .collect();
                     let btf_path =
                         crate::probe::btf::resolve_btf_path(self.config.kernel_dir.as_deref());
-                    let btf_funcs = crate::probe::btf::parse_btf_functions(
+                    let mut btf_funcs = crate::probe::btf::parse_btf_functions(
                         &kernel_names,
                         btf_path.as_ref().and_then(|p| p.to_str()),
                     );
+                    // Parse BPF function signatures from BPF program BTF.
+                    let bpf_btf_args: Vec<(&str, u32)> = functions
+                        .iter()
+                        .filter(|f| f.is_bpf)
+                        .filter_map(|f| Some((f.display_name.as_str(), f.bpf_prog_id?)))
+                        .collect();
+                    if !bpf_btf_args.is_empty() {
+                        let bpf_btf = crate::probe::btf::parse_bpf_btf_functions(&bpf_btf_args);
+                        btf_funcs.extend(bpf_btf);
+                    }
                     let func_names: Vec<(u32, String)> = functions
                         .iter()
                         .enumerate()
                         .map(|(i, f)| (i as u32, f.display_name.clone()))
                         .collect();
+                    // Resolve BPF source locations from program BTF.
+                    let bpf_prog_ids: Vec<u32> =
+                        functions.iter().filter_map(|f| f.bpf_prog_id).collect();
+                    let bpf_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
                     let stop_clone = probe_stop.clone();
                     let handle = std::thread::spawn(move || {
                         crate::probe::process::run_probe_skeleton(
                             &functions,
                             &btf_funcs,
-                            "scx_exit",
+                            "scx_disable_workfn",
                             &stop_clone,
                         )
                     });
                     std::thread::sleep(Duration::from_secs(2));
-                    Some((handle, func_names))
+                    Some((handle, func_names, bpf_locs))
                 }
             } else {
                 None
@@ -211,14 +231,16 @@ impl Runner {
             tracing::info!(qname, elapsed = ?start.elapsed(), "scenario complete");
 
             // Stop probes and collect results.
-            let probe_output = if let Some((handle, func_names)) = skeleton_handle.take() {
+            let probe_output = if let Some((handle, func_names, bpf_locs)) = skeleton_handle.take()
+            {
                 probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 handle.join().ok().flatten().map(|events| {
-                    crate::probe::output::format_probe_events(
+                    crate::probe::output::format_probe_events_with_bpf_locs(
                         &events,
                         &func_names,
                         self.config.kernel_dir.as_deref(),
                         self.config.bootlin,
+                        &bpf_locs,
                     )
                 })
             } else {

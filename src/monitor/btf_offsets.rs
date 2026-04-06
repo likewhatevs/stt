@@ -1,3 +1,11 @@
+//! BTF-based struct field offset resolution.
+//!
+//! Parses BTF from a vmlinux ELF (or raw `/sys/kernel/btf/vmlinux`)
+//! to resolve byte offsets of kernel struct fields needed for
+//! host-side memory reads: runqueue monitoring ([`KernelOffsets`]),
+//! scx event counters ([`ScxEventOffsets`]), and BPF map discovery
+//! ([`BpfMapOffsets`]).
+
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -5,7 +13,7 @@ use btf_rs::{Btf, Type};
 
 /// Load BTF from a path. Handles both raw BTF (/sys/kernel/btf/vmlinux)
 /// and ELF files (vmlinux) by extracting the .BTF section.
-fn load_btf_from_path(path: &Path) -> Result<Btf> {
+pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     let data = std::fs::read(path).context("read file")?;
     // Try raw BTF first (starts with BTF magic 0x9FEB)
     if data.len() >= 4 && data[0] == 0x9F && data[1] == 0xEB {
@@ -151,7 +159,7 @@ fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
 }
 
 /// Find a named struct in BTF. Returns the Struct and its BTF type name.
-fn find_struct(btf: &Btf, name: &str) -> Result<(btf_rs::Struct, String)> {
+pub(crate) fn find_struct(btf: &Btf, name: &str) -> Result<(btf_rs::Struct, String)> {
     let types = btf
         .resolve_types_by_name(name)
         .with_context(|| format!("btf: type '{name}' not found"))?;
@@ -166,18 +174,63 @@ fn find_struct(btf: &Btf, name: &str) -> Result<(btf_rs::Struct, String)> {
 }
 
 /// Find a member by name in a struct and return its byte offset.
-fn member_byte_offset(btf: &Btf, s: &btf_rs::Struct, field: &str) -> Result<usize> {
+///
+/// Searches through anonymous struct/union members recursively to
+/// handle fields inside `DECLARE_FLEX_ARRAY` and anonymous unions.
+pub(crate) fn member_byte_offset(btf: &Btf, s: &btf_rs::Struct, field: &str) -> Result<usize> {
+    member_byte_offset_recursive(btf, s, field, 0)
+}
+
+fn member_byte_offset_recursive(
+    btf: &Btf,
+    s: &btf_rs::Struct,
+    field: &str,
+    base_offset: usize,
+) -> Result<usize> {
     for member in &s.members {
         let name = btf.resolve_name(member).unwrap_or_default();
-        if name == field {
-            let bits = member.bit_offset();
-            if bits % 8 != 0 {
+        let bits = member.bit_offset();
+        if bits % 8 != 0 {
+            if name == field {
                 bail!("btf: field '{field}' has non-byte-aligned offset ({bits} bits)");
             }
-            return Ok((bits / 8) as usize);
+            continue;
+        }
+        let member_offset = base_offset + (bits / 8) as usize;
+
+        if name == field {
+            return Ok(member_offset);
+        }
+
+        // Anonymous member (empty name): recurse into nested struct/union.
+        if name.is_empty()
+            && let Ok(inner) = resolve_member_composite(btf, member)
+            && let Ok(offset) = member_byte_offset_recursive(btf, &inner, field, member_offset)
+        {
+            return Ok(offset);
         }
     }
     bail!("btf: field '{field}' not found in struct");
+}
+
+/// Follow a Member's type_id through modifiers to reach a Struct or Union.
+/// btf-rs uses `Union = Struct`, so both return as `btf_rs::Struct`.
+fn resolve_member_composite(btf: &Btf, member: &btf_rs::Member) -> Result<btf_rs::Struct> {
+    let mut t = btf.resolve_chained_type(member)?;
+    for _ in 0..20 {
+        match t {
+            Type::Struct(s) | Type::Union(s) => return Ok(s),
+            Type::Const(_)
+            | Type::Volatile(_)
+            | Type::Typedef(_)
+            | Type::Restrict(_)
+            | Type::TypeTag(_) => {
+                t = btf.resolve_chained_type(t.as_btf_type().unwrap())?;
+            }
+            _ => bail!("btf: not a composite type"),
+        }
+    }
+    bail!("btf: type chain too deep")
 }
 
 /// Like `member_byte_offset` but also returns the Member for type resolution.
@@ -223,6 +276,102 @@ fn resolve_member_struct(btf: &Btf, member: &btf_rs::Member) -> Result<btf_rs::S
     bail!("btf: type chain too deep resolving member struct");
 }
 
+/// Byte offsets within kernel BPF structures needed for host-side
+/// BPF map discovery and value access.
+#[derive(Debug, Clone)]
+pub struct BpfMapOffsets {
+    /// Offset of `name` (char\[BPF_OBJ_NAME_LEN\]) within `struct bpf_map`.
+    pub map_name: usize,
+    /// Offset of `map_type` (enum bpf_map_type, u32) within `struct bpf_map`.
+    pub map_type: usize,
+    /// Offset of `map_flags` (u32) within `struct bpf_map`.
+    pub map_flags: usize,
+    /// Offset of `value_size` (u32) within `struct bpf_map`.
+    pub value_size: usize,
+    /// Offset of `value` flex array (DECLARE_FLEX_ARRAY) within `struct bpf_array`.
+    /// Value data is inline at this offset, not behind a pointer.
+    pub array_value: usize,
+    /// Offset of `slots` within `struct xa_node`.
+    pub xa_node_slots: usize,
+    /// Offset of `shift` (u8) within `struct xa_node`.
+    pub xa_node_shift: usize,
+    /// Offset of `xa_head` within `struct idr`.
+    /// Computed as idr.idr_rt (xarray) offset + xarray.xa_head offset.
+    pub idr_xa_head: usize,
+    /// Offset of `idr_next` (unsigned int) within `struct idr`.
+    /// The next ID to allocate — scanning `0..idr_next` covers all
+    /// allocated entries without wrapping past the xarray's slot count.
+    pub idr_next: usize,
+    /// Offset of `btf` pointer within `struct bpf_map`.
+    pub map_btf: usize,
+    /// Offset of `btf_value_type_id` (u32) within `struct bpf_map`.
+    pub map_btf_value_type_id: usize,
+    /// Offset of `data` pointer within `struct btf`.
+    pub btf_data: usize,
+    /// Offset of `data_size` (u32) within `struct btf`.
+    pub btf_data_size: usize,
+}
+
+impl BpfMapOffsets {
+    /// Parse BTF from a vmlinux ELF and resolve BPF map field offsets.
+    pub fn from_vmlinux(path: &Path) -> Result<Self> {
+        let btf =
+            load_btf_from_path(path).with_context(|| format!("btf: open {}", path.display()))?;
+        Self::from_btf(&btf)
+    }
+
+    /// Resolve BPF map struct offsets from a pre-loaded BTF object.
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (bpf_map, _) = find_struct(btf, "bpf_map")?;
+        let map_name = member_byte_offset(btf, &bpf_map, "name")?;
+        let map_type = member_byte_offset(btf, &bpf_map, "map_type")?;
+        let map_flags = member_byte_offset(btf, &bpf_map, "map_flags")?;
+        let value_size = member_byte_offset(btf, &bpf_map, "value_size")?;
+
+        let (bpf_array, _) = find_struct(btf, "bpf_array")?;
+        let array_value = member_byte_offset(btf, &bpf_array, "value")?;
+
+        let (xa_node, _) = find_struct(btf, "xa_node")?;
+        let xa_node_slots = member_byte_offset(btf, &xa_node, "slots")?;
+        let xa_node_shift = member_byte_offset(btf, &xa_node, "shift")?;
+
+        // struct idr { struct xarray idr_rt; ... }
+        // xa_head offset within idr = idr_rt offset + xa_head offset in xarray.
+        let (idr_struct, _) = find_struct(btf, "idr")?;
+        let (idr_rt_off, idr_rt_member) =
+            member_byte_offset_with_member(btf, &idr_struct, "idr_rt")?;
+        let xa_struct = resolve_member_struct(btf, &idr_rt_member)
+            .context("btf: resolve type of idr.idr_rt")?;
+        let xa_head_off = member_byte_offset(btf, &xa_struct, "xa_head")?;
+        let idr_xa_head = idr_rt_off + xa_head_off;
+
+        let idr_next = member_byte_offset(btf, &idr_struct, "idr_next")?;
+
+        let map_btf = member_byte_offset(btf, &bpf_map, "btf")?;
+        let map_btf_value_type_id = member_byte_offset(btf, &bpf_map, "btf_value_type_id")?;
+
+        let (btf_struct, _) = find_struct(btf, "btf")?;
+        let btf_data = member_byte_offset(btf, &btf_struct, "data")?;
+        let btf_data_size = member_byte_offset(btf, &btf_struct, "data_size")?;
+
+        Ok(Self {
+            map_name,
+            map_type,
+            map_flags,
+            value_size,
+            array_value,
+            xa_node_slots,
+            xa_node_shift,
+            idr_xa_head,
+            idr_next,
+            map_btf,
+            map_btf_value_type_id,
+            btf_data,
+            btf_data_size,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +412,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parse_bpf_map_offsets_from_vmlinux() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        let offsets = BpfMapOffsets::from_vmlinux(&path).unwrap();
+        // All offsets should be nonzero in a real kernel BTF.
+        assert!(offsets.map_name > 0);
+        assert!(offsets.map_type > 0);
+        assert!(offsets.value_size > 0);
+        assert!(offsets.array_value > 0);
+        // BTF-related offsets should be resolved.
+        // btf_data can be 0 (first field in struct btf), so just verify
+        // that parsing succeeded without error. btf_data_size cannot be
+        // the first field (data comes before it), so it must be nonzero.
+        assert!(offsets.map_btf > 0);
+        assert!(offsets.map_btf_value_type_id > 0);
+        assert!(offsets.btf_data_size > offsets.btf_data);
     }
 
     #[test]

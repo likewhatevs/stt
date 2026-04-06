@@ -25,7 +25,7 @@ cgroups, forks workers, and executes test scenarios.
 ## Quick taste
 
 ```sh
-$ cargo stt vm --sockets 2 --cores 4 --threads 2 \
+cargo stt vm --sockets 2 --cores 4 --threads 2 \
     -- cgroup_steady --duration-s 10
 [stt] booting VM: 2s4c2t (16 cpus), 4096 MB
 [stt] running: cgroup_steady/default
@@ -42,6 +42,54 @@ $ cargo stt vm --sockets 2 --cores 4 --threads 2 \
 - **Affinity** -- scheduler respects thread affinity constraints.
 - **Stress** -- many cgroups, many workers, rapid topology changes.
 - **Stall detection** -- scheduler doesn't drop tasks.
+
+## Auto-repro probe pipeline
+
+When a scheduler crashes, stt can automatically rerun the failing
+scenario with BPF probes attached to the crash-path functions. The
+probe pipeline captures function arguments, BTF-resolved struct fields,
+and source locations for both kernel functions (kprobe) and BPF
+struct_ops callbacks (fentry). See [Auto-Repro](running-tests/auto-repro.md)
+for details.
+
+## Library API
+
+The `stt::prelude` module re-exports the types needed for writing
+tests. A minimal `#[stt_test]` function:
+
+```rust,ignore
+use stt::prelude::*;
+use std::collections::BTreeSet;
+
+#[stt_test(sockets = 1, cores = 2, threads = 1)]
+fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
+    let mut group = CgroupGroup::new(ctx.cgroups);
+    group.add_cgroup_no_cpuset("workers")?;
+    let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
+    ctx.cgroups.set_cpuset("workers", &cpus)?;
+
+    let cfg = WorkloadConfig {
+        num_workers: 2,
+        work_type: WorkType::CpuSpin,
+        ..Default::default()
+    };
+    let mut handle = WorkloadHandle::spawn(&cfg)?;
+    for tid in handle.tids() {
+        ctx.cgroups.move_task("workers", tid)?;
+    }
+    handle.start();
+
+    std::thread::sleep(ctx.duration);
+    let reports = handle.stop_and_collect();
+
+    let plan = VerificationPlan::new().check_not_starved();
+    Ok(plan.verify_cell(&reports, None))
+}
+```
+
+The prelude also exports `BpfMapAccessor`, `BpfMapAccessorOwned`,
+`BpfMapInfo`, and `GuestKernel` for host-side BPF map introspection
+and guest memory access.
 
 ## Crate structure
 

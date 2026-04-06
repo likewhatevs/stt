@@ -22,6 +22,8 @@ static WARN_UNFAIR: AtomicBool = AtomicBool::new(false);
 static COVERAGE_GAP_MS: AtomicU64 = AtomicU64::new(0);
 
 /// When true, unfair spread produces a warning detail but does not fail the result.
+///
+/// `pub` because main.rs is a separate binary crate.
 pub fn set_warn_unfair(v: bool) {
     WARN_UNFAIR.store(v, Ordering::Relaxed);
 }
@@ -31,6 +33,8 @@ pub fn set_warn_unfair(v: bool) {
 /// Set to a higher value for coverage-instrumented runs where
 /// instrumentation overhead increases scheduling latency.
 /// 0 means use the default (2000ms release, 3000ms debug).
+///
+/// `pub` because main.rs is a separate binary crate.
 pub fn set_coverage_gap_ms(ms: u64) {
     COVERAGE_GAP_MS.store(ms, Ordering::Relaxed);
 }
@@ -142,7 +146,6 @@ impl VerificationPlan {
     }
 
     /// Enable the not-starved check (zero work units, spread, scheduling gaps).
-    #[allow(dead_code)]
     pub fn check_not_starved(mut self) -> Self {
         self.not_starved = true;
         self
@@ -150,21 +153,18 @@ impl VerificationPlan {
 
     /// Enable cpuset isolation check. Only applied when a cpuset is provided
     /// to `verify_cell`.
-    #[allow(dead_code)]
     pub fn check_isolation(mut self) -> Self {
         self.isolation = true;
         self
     }
 
     /// Override the default max scheduling gap threshold.
-    #[allow(dead_code)]
     pub fn max_gap_ms(mut self, ms: u64) -> Self {
         self.max_gap_ms = Some(ms);
         self
     }
 
     /// Override the default max spread threshold (%).
-    #[allow(dead_code)]
     pub fn max_spread_pct(mut self, pct: f64) -> Self {
         self.max_spread_pct = Some(pct);
         self
@@ -269,7 +269,6 @@ pub struct Verify {
     pub max_keep_last_rate: Option<f64>,
 }
 
-#[allow(dead_code)]
 impl Verify {
     /// Empty verify — no checks enabled, all overrides None.
     pub const NONE: Verify = Verify {
@@ -308,55 +307,46 @@ impl Verify {
         self
     }
 
-    #[allow(dead_code)]
     pub const fn check_isolation(mut self) -> Self {
         self.isolation = true;
         self
     }
 
-    #[allow(dead_code)]
     pub const fn max_gap_ms(mut self, ms: u64) -> Self {
         self.max_gap_ms = Some(ms);
         self
     }
 
-    #[allow(dead_code)]
     pub const fn max_spread_pct(mut self, pct: f64) -> Self {
         self.max_spread_pct = Some(pct);
         self
     }
 
-    #[allow(dead_code)]
     pub const fn max_imbalance_ratio(mut self, v: f64) -> Self {
         self.max_imbalance_ratio = Some(v);
         self
     }
 
-    #[allow(dead_code)]
     pub const fn max_local_dsq_depth(mut self, v: u32) -> Self {
         self.max_local_dsq_depth = Some(v);
         self
     }
 
-    #[allow(dead_code)]
     pub const fn fail_on_stall(mut self, v: bool) -> Self {
         self.fail_on_stall = Some(v);
         self
     }
 
-    #[allow(dead_code)]
     pub const fn sustained_samples(mut self, v: usize) -> Self {
         self.sustained_samples = Some(v);
         self
     }
 
-    #[allow(dead_code)]
     pub const fn max_fallback_rate(mut self, v: f64) -> Self {
         self.max_fallback_rate = Some(v);
         self
     }
 
-    #[allow(dead_code)]
     pub const fn max_keep_last_rate(mut self, v: f64) -> Self {
         self.max_keep_last_rate = Some(v);
         self

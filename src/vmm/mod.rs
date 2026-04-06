@@ -461,6 +461,18 @@ pub struct SttVm {
     /// Override for `scx_watchdog_timeout` in the guest kernel (jiffies).
     /// Written to guest memory via the monitor thread after the kernel boots.
     watchdog_timeout_jiffies: Option<u64>,
+    /// Host-side BPF map write parameters. When set, a thread polls for
+    /// BPF map discoverability, waits for scenario start via SHM ring,
+    /// then writes a u32 value at the specified offset.
+    bpf_map_write: Option<BpfMapWriteParams>,
+}
+
+/// Parameters for a host-side BPF map write during VM execution.
+#[derive(Clone)]
+struct BpfMapWriteParams {
+    map_name_suffix: String,
+    offset: usize,
+    value: u32,
 }
 
 impl SttVm {
@@ -479,8 +491,17 @@ impl SttVm {
         self.setup_vcpus(&vm, kernel_result.entry)?;
         tracing::debug!(elapsed_us = start.elapsed().as_micros(), "total_setup");
 
-        let (exit_code, timed_out, ap_threads, monitor_handle, com1, com2, kill, vm) =
-            self.run_vm(start, vm)?;
+        let (
+            exit_code,
+            timed_out,
+            ap_threads,
+            monitor_handle,
+            bpf_write_handle,
+            com1,
+            com2,
+            kill,
+            vm,
+        ) = self.run_vm(start, vm)?;
 
         self.collect_results(
             start,
@@ -488,6 +509,7 @@ impl SttVm {
             timed_out,
             ap_threads,
             monitor_handle,
+            bpf_write_handle,
             com1,
             com2,
             kill,
@@ -575,7 +597,8 @@ impl SttVm {
             "no_timer_check clocksource=kvm-clock ",
             "random.trust_cpu=on swiotlb=noforce ",
             "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
-            "pci=off reboot=k panic=-1 iomem=relaxed",
+            "pci=off reboot=k panic=-1 iomem=relaxed nokaslr lockdown=none ",
+            "sysctl.kernel.unprivileged_bpf_disabled=0",
         )
         .to_string();
         if self.init_binary.is_some() {
@@ -686,6 +709,7 @@ impl SttVm {
         bool,
         Vec<VcpuThread>,
         Option<JoinHandle<Vec<monitor::MonitorSample>>>,
+        Option<JoinHandle<()>>,
         Arc<std::sync::Mutex<console::Serial>>,
         Arc<std::sync::Mutex<console::Serial>>,
         Arc<AtomicBool>,
@@ -719,6 +743,9 @@ impl SttVm {
         let ap_threads = self.spawn_ap_threads(vcpus, has_immediate_exit, &com1, &com2, &kill)?;
 
         let monitor_handle = self.start_monitor(&vm, &kill, start)?;
+
+        // BPF map write thread: sleeps, discovers a BPF map, writes a value.
+        let bpf_write_handle = self.start_bpf_map_write(&vm, &kill)?;
 
         // Run BSP on this thread.
         register_vcpu_signal_handler();
@@ -792,6 +819,7 @@ impl SttVm {
             timed_out,
             ap_threads,
             monitor_handle,
+            bpf_write_handle,
             com1,
             com2,
             kill,
@@ -860,7 +888,7 @@ impl SttVm {
             return Ok(None);
         };
 
-        let host_base = vm.guest_mem.get_host_address(GuestAddress(0)).unwrap() as *const u8;
+        let host_base = vm.guest_mem.get_host_address(GuestAddress(0)).unwrap();
         let mem_size = (self.memory_mb as u64) << 20;
         let mem = monitor::reader::GuestMem::new(host_base, mem_size);
         let num_cpus = self.topology.total_cpus();
@@ -933,6 +961,150 @@ impl SttVm {
                 )
             })
             .context("spawn monitor thread")?;
+
+        Ok(Some(handle))
+    }
+
+    /// Spawn a thread that writes to a BPF map in guest memory.
+    ///
+    /// Event-driven sequence:
+    /// 1. Poll `find_map` until the scheduler's BPF maps are discoverable
+    /// 2. Poll the SHM ring for MSG_TYPE_SCENARIO_START
+    /// 3. Write the crash value
+    fn start_bpf_map_write(
+        &self,
+        vm: &kvm::SttKvm,
+        kill: &Arc<AtomicBool>,
+    ) -> Result<Option<JoinHandle<()>>> {
+        let Some(ref params) = self.bpf_map_write else {
+            return Ok(None);
+        };
+        let Some(vmlinux) = find_vmlinux(&self.kernel) else {
+            eprintln!("bpf_map_write: vmlinux not found, skipping");
+            return Ok(None);
+        };
+
+        let host_base = vm.guest_mem.get_host_address(GuestAddress(0)).unwrap();
+        let mem_size = (self.memory_mb as u64) << 20;
+        let mem = monitor::reader::GuestMem::new(host_base, mem_size);
+        let kill_clone = kill.clone();
+        let params = params.clone();
+        let shm_size = self.shm_size;
+
+        let handle = std::thread::Builder::new()
+            .name("bpf-map-write".into())
+            .spawn(move || {
+                if kill_clone.load(Ordering::Acquire) {
+                    return;
+                }
+
+                // Phase 1: wait for BPF map accessor (kernel booted, page tables up).
+                let phase1_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let accessor = loop {
+                    match monitor::bpf_map::BpfMapAccessorOwned::new(&mem, &vmlinux) {
+                        Ok(a) => break a,
+                        Err(e) => {
+                            if kill_clone.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if std::time::Instant::now() >= phase1_deadline {
+                                eprintln!("bpf_map_write: accessor init timed out: {e:#}");
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                    }
+                };
+
+                // Phase 2: poll find_map until the scheduler's BPF maps are discoverable.
+                let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut attempt = 0u32;
+                let map_info = loop {
+                    attempt += 1;
+                    if let Some(info) = accessor.find_map(&params.map_name_suffix) {
+                        break info;
+                    }
+                    if kill_clone.load(Ordering::Acquire) {
+                        eprintln!("bpf_map_write: VM exited during map search");
+                        return;
+                    }
+                    if std::time::Instant::now() >= retry_deadline {
+                        eprintln!(
+                            "bpf_map_write: map *{} not found after {} attempts",
+                            params.map_name_suffix, attempt,
+                        );
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                };
+                eprintln!(
+                    "bpf_map_write: map '{}' found after {} attempts",
+                    map_info.name, attempt,
+                );
+
+                // Phase 3: poll SHM ring for MSG_TYPE_SCENARIO_START.
+                if shm_size == 0 {
+                    eprintln!(
+                        "bpf_map_write: SHM disabled, no scenario synchronization — \
+                         write timing is not deterministic",
+                    );
+                } else {
+                    let shm_base = (mem.size() - shm_size) as usize;
+                    let shm_len = shm_size as usize;
+                    let scenario_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    let mut found_start = false;
+                    while std::time::Instant::now() < scenario_deadline {
+                        if kill_clone.load(Ordering::Acquire) {
+                            eprintln!("bpf_map_write: VM exited waiting for scenario start");
+                            return;
+                        }
+                        let mut shm_buf = vec![0u8; shm_len];
+                        mem.read_bytes(shm_base as u64, &mut shm_buf);
+                        let drain = shm_ring::shm_drain(&shm_buf, 0);
+                        if drain
+                            .entries
+                            .iter()
+                            .any(|e| e.msg_type == shm_ring::MSG_TYPE_SCENARIO_START && e.crc_ok)
+                        {
+                            found_start = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if !found_start {
+                        eprintln!("bpf_map_write: scenario start not seen, writing anyway");
+                    }
+                }
+
+                if kill_clone.load(Ordering::Acquire) {
+                    return;
+                }
+
+                // Log all maps for diagnostic visibility.
+                let all_maps = accessor.maps();
+                eprintln!(
+                    "bpf_map_write: maps() found {} map(s): [{}]",
+                    all_maps.len(),
+                    all_maps
+                        .iter()
+                        .map(|m| format!("{}(type={})", m.name, m.map_type))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+
+                // Read before write for round-trip verification.
+                let before = accessor.read_value_u32(&map_info, params.offset);
+                let ok = accessor.write_value_u32(&map_info, params.offset, params.value);
+                let after = accessor.read_value_u32(&map_info, params.offset);
+
+                eprintln!(
+                    "bpf_map_write: map '{}' write={} (value={} offset={} before={:?} after={:?})",
+                    map_info.name, ok, params.value, params.offset, before, after,
+                );
+            })
+            .context("spawn bpf-map-write thread")?;
 
         Ok(Some(handle))
     }
@@ -1024,6 +1196,7 @@ impl SttVm {
         timed_out: bool,
         ap_threads: Vec<VcpuThread>,
         monitor_handle: Option<JoinHandle<Vec<monitor::MonitorSample>>>,
+        bpf_write_handle: Option<JoinHandle<()>>,
         com1: Arc<std::sync::Mutex<console::Serial>>,
         com2: Arc<std::sync::Mutex<console::Serial>>,
         kill: Arc<AtomicBool>,
@@ -1051,6 +1224,10 @@ impl SttVm {
             let summary = monitor::MonitorSummary::from_samples(&samples);
             monitor::MonitorReport { samples, summary }
         });
+
+        if let Some(h) = bpf_write_handle {
+            let _ = h.join();
+        }
 
         let (shm_data, stimulus_events) = if self.shm_size > 0 {
             let mem_size = (self.memory_mb as u64) << 20;
@@ -1281,6 +1458,7 @@ pub struct SttVmBuilder {
     shm_size: u64,
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
     watchdog_timeout_jiffies: Option<u64>,
+    bpf_map_write: Option<BpfMapWriteParams>,
 }
 
 impl Default for SttVmBuilder {
@@ -1302,6 +1480,7 @@ impl Default for SttVmBuilder {
             shm_size: 0,
             monitor_thresholds: None,
             watchdog_timeout_jiffies: None,
+            bpf_map_write: None,
         }
     }
 }
@@ -1383,6 +1562,16 @@ impl SttVmBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn bpf_map_write(mut self, map_name_suffix: &str, offset: usize, value: u32) -> Self {
+        self.bpf_map_write = Some(BpfMapWriteParams {
+            map_name_suffix: map_name_suffix.to_string(),
+            offset,
+            value,
+        });
+        self
+    }
+
     pub fn build(self) -> Result<SttVm> {
         let kernel = self.kernel.context("kernel path required")?;
         anyhow::ensure!(kernel.exists(), "kernel not found: {}", kernel.display());
@@ -1415,6 +1604,7 @@ impl SttVmBuilder {
             shm_size: self.shm_size,
             monitor_thresholds: self.monitor_thresholds,
             watchdog_timeout_jiffies: self.watchdog_timeout_jiffies,
+            bpf_map_write: self.bpf_map_write,
         })
     }
 }

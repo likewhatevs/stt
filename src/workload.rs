@@ -178,12 +178,14 @@ static REPRO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// Set the scheduler PID for the work-conservation watchdog.
 ///
 /// Workers send SIGUSR2 to this PID when stuck > 2 seconds.
+/// `pub` because main.rs is a separate binary crate.
 pub fn set_sched_pid(pid: u32) {
     SCHED_PID.store(pid as i32, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Enable/disable repro mode. When true, the watchdog is suppressed
 /// so the scheduler stays alive for BPF kprobe assertions.
+/// `pub` because main.rs is a separate binary crate.
 pub fn set_repro_mode(v: bool) {
     REPRO_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
 }

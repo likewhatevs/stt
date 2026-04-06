@@ -19,6 +19,14 @@ use crate::timeline::StimulusEvent;
 use crate::verify::{ScenarioStats, VerifyResult};
 use crate::vmm;
 
+/// True when RUST_BACKTRACE is set to "1" or "full".
+/// Gates verbose diagnostic output (dmesg, scheduler log, COM1/COM2 dumps).
+fn verbose() -> bool {
+    std::env::var("RUST_BACKTRACE")
+        .map(|v| v == "1" || v == "full")
+        .unwrap_or(false)
+}
+
 /// Test result sidecar written to STT_SIDECAR_DIR for `stt test` collection.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SidecarResult {
@@ -302,6 +310,20 @@ impl Scheduler {
     }
 }
 
+/// Host-side BPF map write performed during VM execution.
+///
+/// The write is event-driven: the host polls for BPF map discoverability
+/// (scheduler loaded), then polls the SHM ring for scenario start, then
+/// writes.
+pub struct BpfMapWrite {
+    /// Map name suffix to match (e.g. ".bss").
+    pub map_name_suffix: &'static str,
+    /// Byte offset within the map's value region.
+    pub offset: usize,
+    /// u32 value to write.
+    pub value: u32,
+}
+
 /// Registration entry for an `#[stt_test]`-annotated function.
 pub struct SttTestEntry {
     pub name: &'static str,
@@ -318,6 +340,8 @@ pub struct SttTestEntry {
     /// Override for scx_watchdog_timeout in the guest kernel (jiffies).
     /// 0 = no override (use kernel default).
     pub watchdog_timeout_jiffies: u64,
+    /// Host-side BPF map write to perform during VM execution.
+    pub bpf_map_write: Option<&'static BpfMapWrite>,
 }
 
 /// Distributed slice collecting all `#[stt_test]` entries via linkme.
@@ -430,6 +454,11 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
     for &karg in entry.scheduler.kargs {
         cmdline_parts.push(karg.to_string());
     }
+    // Propagate RUST_BACKTRACE to the guest so guest-side code
+    // can gate verbose output.
+    if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
+        cmdline_parts.push(format!("RUST_BACKTRACE={bt}"));
+    }
     let cmdline_extra = cmdline_parts.join(" ");
 
     let (sockets, cores, threads, memory_mb) = match topo {
@@ -445,7 +474,7 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
         .cmdline(&cmdline_extra)
         .shm_size(STT_TEST_SHM_SIZE)
         .run_args(&guest_args)
-        .timeout(Duration::from_secs(30));
+        .timeout(Duration::from_secs(60));
 
     // Merge order: default_checks -> scheduler.verify -> per-test verify.
     let merged_verify = crate::verify::Verify::default_checks()
@@ -468,6 +497,11 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
 
     if entry.watchdog_timeout_jiffies > 0 {
         builder = builder.watchdog_timeout_jiffies(entry.watchdog_timeout_jiffies);
+    }
+
+    if let Some(bpf_write) = entry.bpf_map_write {
+        builder =
+            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }
 
     let vm = builder.build().context("build stt_test VM")?;
@@ -548,12 +582,17 @@ fn evaluate_vm_result(
 
     let sched_label = scheduler_label(&entry.scheduler.binary);
     let output = &result.output;
+    let verbose = verbose();
     let dump_section = extract_sched_ext_dump(output)
         .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
         .unwrap_or_default();
-    let sched_log_section = parse_sched_output(output)
-        .map(|s| format!("\n\n--- scheduler log ---\n{s}"))
-        .unwrap_or_default();
+    let sched_log_section = if verbose {
+        parse_sched_output(output)
+            .map(|s| format!("\n\n--- scheduler log ---\n{s}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
@@ -568,6 +607,26 @@ fn evaluate_vm_result(
         scenario: Some(entry.name.to_string()),
         duration_s: Some(result.duration.as_secs_f64()),
     };
+
+    if verbose {
+        eprintln!(
+            "stt_test: evaluate_vm_result: COM2 len={} has_sched_start={} has_sched_end={} has_json_start={} has_json_end={} has_DIED={}",
+            output.len(),
+            output.contains("===SCHED_OUTPUT_START==="),
+            output.contains("===SCHED_OUTPUT_END==="),
+            output.contains("===STT_JSON_START==="),
+            output.contains("===STT_JSON_END==="),
+            output.contains("SCHEDULER_DIED"),
+        );
+        if output.len() < 2000 {
+            eprintln!("stt_test: evaluate_vm_result: COM2 full:\n{output}");
+        } else {
+            eprintln!(
+                "stt_test: evaluate_vm_result: COM2 first 500 chars:\n{}",
+                &output[..500],
+            );
+        }
+    }
 
     if let Ok(verify_result) = parse_verify_result(output) {
         // Write sidecar before checking pass/fail so both outcomes are captured.
@@ -644,8 +703,12 @@ fn evaluate_vm_result(
     };
 
     // Build a diagnostic section from COM1 kernel console output and exit code.
-    let init_stage = classify_init_stage(output);
-    let console_section = format_console_diagnostics(&result.stderr, result.exit_code, init_stage);
+    let console_section = if verbose {
+        let init_stage = classify_init_stage(output);
+        format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
+    } else {
+        String::new()
+    };
 
     if result.timed_out {
         anyhow::bail!(
@@ -688,6 +751,12 @@ fn attempt_auto_repro(
     use crate::probe::stack::extract_stack_functions_all;
 
     // Extract scheduler log from COM2 output.
+    eprintln!(
+        "stt_test: auto-repro: COM2 length={} has_sched_start={} has_sched_end={}",
+        first_vm_output.len(),
+        first_vm_output.contains("===SCHED_OUTPUT_START==="),
+        first_vm_output.contains("===SCHED_OUTPUT_END==="),
+    );
     let sched_output = parse_sched_output(first_vm_output)?;
 
     // Extract function names from the scheduler log.
@@ -721,6 +790,9 @@ fn attempt_auto_repro(
     for &karg in entry.scheduler.kargs {
         cmdline_parts.push(karg.to_string());
     }
+    if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
+        cmdline_parts.push(format!("RUST_BACKTRACE={bt}"));
+    }
     let cmdline_extra = cmdline_parts.join(" ");
 
     let (sockets, cores, threads, memory_mb) = match topo {
@@ -736,7 +808,7 @@ fn attempt_auto_repro(
         .cmdline(&cmdline_extra)
         .shm_size(STT_TEST_SHM_SIZE)
         .run_args(&guest_args)
-        .timeout(Duration::from_secs(30));
+        .timeout(Duration::from_secs(60));
 
     if let Some(sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);
@@ -750,6 +822,13 @@ fn attempt_auto_repro(
             .collect();
         builder = builder.sched_args(&args);
     }
+
+    // Do NOT forward bpf_map_write to the repro VM. The repro VM
+    // runs the same workload with probes attached while the scheduler
+    // is alive. Probes capture sched_ext events during normal
+    // scheduling. No crash needed — the interesting data is how the
+    // probed functions behave under the same workload that caused
+    // the crash in the first VM.
 
     let vm = match builder.build() {
         Ok(vm) => vm,
@@ -767,18 +846,68 @@ fn attempt_auto_repro(
         }
     };
 
-    // Extract probe output from the repro VM's COM2 output.
-    extract_probe_output(&repro_result.output)
+    // Forward guest stderr (COM1) and COM2 probe lines when verbose.
+    if verbose() {
+        eprintln!(
+            "stt_test: auto-repro: COM1 stderr length={} COM2 stdout length={}",
+            repro_result.stderr.len(),
+            repro_result.output.len(),
+        );
+        for line in repro_result.stderr.lines() {
+            eprintln!("  repro-vm-com1: {line}");
+        }
+        let mut in_probe = false;
+        for line in repro_result.output.lines() {
+            if line.contains("stt_test: probe:") {
+                in_probe = true;
+            }
+            if in_probe {
+                eprintln!("  repro-vm-com2: {line}");
+            }
+        }
+    }
+
+    // Extract probe JSON from the repro VM and format on the host with
+    // kernel_dir so blazesym can resolve source locations via vmlinux DWARF.
+    // Canonicalize the kernel path first so relative paths resolve correctly.
+    let canon_kernel = std::fs::canonicalize(kernel).ok();
+    let kernel_dir = canon_kernel
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .and_then(|p| p.strip_suffix("/arch/x86/boot/bzImage"))
+        .map(|s| s.to_string());
+    let kernel_dir_str = kernel_dir.as_deref();
+    extract_probe_output(&repro_result.output, kernel_dir_str)
 }
 
 /// Delimiters for probe output in guest COM2 (written by collect_and_print_probe_data).
 const PROBE_OUTPUT_START: &str = "===PROBE_OUTPUT_START===";
 const PROBE_OUTPUT_END: &str = "===PROBE_OUTPUT_END===";
 
-/// Extract probe output from guest COM2 output between delimiters.
-fn extract_probe_output(output: &str) -> Option<String> {
-    let s = crate::probe::output::extract_section(output, PROBE_OUTPUT_START, PROBE_OUTPUT_END);
-    if s.is_empty() { None } else { Some(s) }
+/// Extract probe JSON from guest COM2, deserialize, and format on the
+/// host where vmlinux (DWARF) is available for source locations.
+fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Option<String> {
+    let json = crate::probe::output::extract_section(output, PROBE_OUTPUT_START, PROBE_OUTPUT_END);
+    if json.is_empty() {
+        return None;
+    }
+    let payload: ProbePayload = match serde_json::from_str(&json) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("stt_test: probe payload deserialize failed: {e}");
+            return None;
+        }
+    };
+    if payload.events.is_empty() {
+        return None;
+    }
+    Some(crate::probe::output::format_probe_events_with_bpf_locs(
+        &payload.events,
+        &payload.func_names,
+        kernel_dir,
+        false,
+        &payload.bpf_source_locs,
+    ))
 }
 
 /// Setup function for nextest `setup-script` integration.
@@ -810,6 +939,18 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
     let name = extract_test_fn_arg(&args)?;
 
+    // Propagate RUST_BACKTRACE from kernel cmdline to env.
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline")
+        && let Some(val) = cmdline
+            .split_whitespace()
+            .find(|s| s.starts_with("RUST_BACKTRACE="))
+            .and_then(|s| s.strip_prefix("RUST_BACKTRACE="))
+    {
+        // SAFETY: guest-side dispatch runs single-threaded before
+        // any test threads are spawned.
+        unsafe { std::env::set_var("RUST_BACKTRACE", val) };
+    }
+
     // Coverage instrumentation adds overhead that affects scheduling
     // fairness and causes larger scheduling gaps. Downgrade spread
     // violations to warnings and relax the gap threshold.
@@ -840,21 +981,65 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
 
     // Set up BPF probes if --stt-probe-stack was provided.
     let probe_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let probe_handle = probe_stack.as_ref().and_then(|stack_input| {
+    let probe_handle: Option<ProbeHandle> = probe_stack.as_ref().and_then(|stack_input| {
         use crate::probe::stack::load_probe_stack;
 
-        let functions = load_probe_stack(stack_input);
+        eprintln!("stt_test: probe: loading probe stack from --stt-probe-stack");
+        let mut functions = crate::probe::stack::filter_traceable(load_probe_stack(stack_input));
+        // Discover BPF scheduler functions from the running scheduler.
+        // Stack-extracted BPF names have stale prog IDs from the first VM;
+        // discover_bpf_symbols finds the current scheduler's programs.
+        let bpf_syms = crate::probe::btf::discover_bpf_symbols();
+        if !bpf_syms.is_empty() {
+            eprintln!("stt_test: probe: {} BPF symbols discovered", bpf_syms.len());
+            functions.extend(bpf_syms);
+        }
+        // Expand BPF functions to kernel-side callers for bridge kprobes,
+        // keeping BPF functions for fentry attachment.
+        let functions = crate::probe::stack::expand_bpf_to_kernel_callers(functions);
         if functions.is_empty() {
             eprintln!("stt_test: no traceable functions from --stt-probe-stack");
             return None;
         }
 
+        eprintln!(
+            "stt_test: probe: {} functions loaded, spawning probe thread",
+            functions.len()
+        );
+
+        // Resolve BTF signatures for kernel functions so probe output
+        // gets decoded field names instead of raw register values.
+        let kernel_names: Vec<&str> = functions
+            .iter()
+            .filter(|f| !f.is_bpf)
+            .map(|f| f.raw_name.as_str())
+            .collect();
+        let mut btf_funcs = crate::probe::btf::parse_btf_functions(&kernel_names, None);
+        // Parse BPF function signatures from BPF program BTF.
+        let bpf_btf_args: Vec<(&str, u32)> = functions
+            .iter()
+            .filter(|f| f.is_bpf)
+            .filter_map(|f| Some((f.display_name.as_str(), f.bpf_prog_id?)))
+            .collect();
+        if !bpf_btf_args.is_empty() {
+            btf_funcs.extend(crate::probe::btf::parse_bpf_btf_functions(&bpf_btf_args));
+        }
+
+        // Build func_names from the filtered list so indices match
+        // the func_idx values assigned by run_probe_skeleton.
+        let func_names: Vec<(u32, String)> = functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i as u32, f.display_name.clone()))
+            .collect();
+
         let stop = probe_stop.clone();
         let funcs = functions.clone();
-        Some(std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             use crate::probe::process::run_probe_skeleton;
-            run_probe_skeleton(&funcs, &[], "scx_exit", &stop)
-        }))
+            run_probe_skeleton(&funcs, &btf_funcs, "scx_disable_workfn", &stop)
+        });
+        Some((handle, func_names))
     });
 
     // Build a minimal Ctx for the test function.
@@ -889,25 +1074,41 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
                 stats: Default::default(),
             };
             print_verify_result(&r);
-            collect_and_print_probe_data(probe_stop, probe_handle, probe_stack.as_deref());
+            collect_and_print_probe_data(probe_stop, probe_handle);
             return Some(1);
         }
     };
 
     let exit_code = if result.passed { 0 } else { 1 };
     print_verify_result(&result);
-    collect_and_print_probe_data(probe_stop, probe_handle, probe_stack.as_deref());
+    collect_and_print_probe_data(probe_stop, probe_handle);
     Some(exit_code)
+}
+
+type ProbeHandle = (
+    std::thread::JoinHandle<Option<Vec<crate::probe::process::ProbeEvent>>>,
+    Vec<(u32, String)>,
+);
+
+/// Serialized probe data sent from guest to host via COM2.
+/// The host deserializes and formats with kernel_dir for source locations.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProbePayload {
+    pub events: Vec<crate::probe::process::ProbeEvent>,
+    pub func_names: Vec<(u32, String)>,
+    #[serde(default)]
+    pub bpf_source_locs: std::collections::HashMap<String, String>,
 }
 
 /// Stop probes, join the probe thread, and print captured probe data to
 /// stdout (COM2) between delimiters so the host can extract it.
 fn collect_and_print_probe_data(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<Option<Vec<crate::probe::process::ProbeEvent>>>>,
-    stack_input: Option<&str>,
+    handle: Option<ProbeHandle>,
 ) {
-    let Some(handle) = handle else { return };
+    let Some((handle, func_names)) = handle else {
+        return;
+    };
 
     stop.store(true, std::sync::atomic::Ordering::Release);
     let events = match handle.join() {
@@ -915,20 +1116,30 @@ fn collect_and_print_probe_data(
         _ => return,
     };
 
-    // Build func_names from the probe stack input.
-    let func_names: Vec<(u32, String)> = stack_input
-        .map(|input| {
-            crate::probe::stack::load_probe_stack(input)
+    // Resolve BPF source locations inside the guest where the BPF
+    // programs are loaded. The host doesn't have the prog FDs.
+    let bpf_prog_ids: Vec<u32> = func_names
+        .iter()
+        .filter_map(|(_, name)| {
+            // BPF functions have sentinel IPs — find their prog_ids
+            // from discover_bpf_symbols cache.
+            crate::probe::btf::discover_bpf_symbols()
                 .into_iter()
-                .enumerate()
-                .map(|(i, f)| (i as u32, f.display_name))
-                .collect()
+                .find(|s| s.display_name == *name)
+                .and_then(|s| s.bpf_prog_id)
         })
-        .unwrap_or_default();
+        .collect();
+    let bpf_source_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
 
-    let formatted = crate::probe::output::format_probe_events(&events, &func_names, None, false);
+    let payload = ProbePayload {
+        events,
+        func_names,
+        bpf_source_locs,
+    };
     println!("===PROBE_OUTPUT_START===");
-    print!("{formatted}");
+    if let Ok(json) = serde_json::to_string(&payload) {
+        println!("{json}");
+    }
     println!("===PROBE_OUTPUT_END===");
 }
 
@@ -1510,6 +1721,7 @@ mod tests {
         verify: crate::verify::Verify::NONE,
         extra_sched_args: &[],
         watchdog_timeout_jiffies: 0,
+        bpf_map_write: None,
     };
 
     #[test]
@@ -2012,23 +2224,122 @@ mod tests {
     // -- extract_probe_output tests --
 
     #[test]
-    fn extract_probe_output_valid() {
-        let output =
-            format!("noise\n{PROBE_OUTPUT_START}\nprobe data here\n{PROBE_OUTPUT_END}\nmore");
-        let parsed = extract_probe_output(&output);
+    fn extract_probe_output_valid_json() {
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbePayload {
+            events: vec![ProbeEvent {
+                func_idx: 0,
+                tid: 1,
+                ts: 100,
+                args: [0; 6],
+                fields: vec![("p:task_struct.pid".to_string(), 42)],
+                kstack: vec![],
+                str_val: None,
+            }],
+            func_names: vec![(0, "schedule".to_string())],
+            bpf_source_locs: Default::default(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let output = format!("noise\n{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}\nmore");
+        let parsed = extract_probe_output(&output, None);
         assert!(parsed.is_some());
-        assert!(parsed.unwrap().contains("probe data here"));
+        let formatted = parsed.unwrap();
+        assert!(
+            formatted.contains("schedule"),
+            "should contain func name: {formatted}"
+        );
+        assert!(
+            formatted.contains("pid"),
+            "should contain field name: {formatted}"
+        );
     }
 
     #[test]
     fn extract_probe_output_missing() {
-        assert!(extract_probe_output("no markers").is_none());
+        assert!(extract_probe_output("no markers", None).is_none());
     }
 
     #[test]
     fn extract_probe_output_empty() {
         let output = format!("{PROBE_OUTPUT_START}\n\n{PROBE_OUTPUT_END}");
-        assert!(extract_probe_output(&output).is_none());
+        assert!(extract_probe_output(&output, None).is_none());
+    }
+
+    #[test]
+    fn extract_probe_output_invalid_json() {
+        let output = format!("{PROBE_OUTPUT_START}\nnot valid json\n{PROBE_OUTPUT_END}");
+        assert!(extract_probe_output(&output, None).is_none());
+    }
+
+    #[test]
+    fn extract_probe_output_enriched_fields() {
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbePayload {
+            events: vec![
+                ProbeEvent {
+                    func_idx: 0,
+                    tid: 1,
+                    ts: 100,
+                    args: [0xDEAD, 0, 0, 0, 0, 0],
+                    fields: vec![
+                        ("prev:task_struct.pid".to_string(), 42),
+                        ("prev:task_struct.scx_flags".to_string(), 0x1c),
+                    ],
+                    kstack: vec![],
+                    str_val: None,
+                },
+                ProbeEvent {
+                    func_idx: 1,
+                    tid: 1,
+                    ts: 200,
+                    args: [0; 6],
+                    fields: vec![("rq:rq.cpu".to_string(), 3)],
+                    kstack: vec![],
+                    str_val: None,
+                },
+            ],
+            func_names: vec![
+                (0, "schedule".to_string()),
+                (1, "pick_task_scx".to_string()),
+            ],
+            bpf_source_locs: Default::default(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");
+        let formatted = extract_probe_output(&output, None).unwrap();
+
+        // Decoded fields present (not raw args).
+        assert!(formatted.contains("pid"), "pid field: {formatted}");
+        assert!(formatted.contains("42"), "pid value: {formatted}");
+        assert!(
+            formatted.contains("scx_flags"),
+            "scx_flags field: {formatted}"
+        );
+        assert!(formatted.contains("cpu"), "cpu field: {formatted}");
+        assert!(formatted.contains("3"), "cpu value: {formatted}");
+
+        // Type header grouping for struct params.
+        assert!(
+            formatted.contains("task_struct *prev"),
+            "type header for task_struct: {formatted}"
+        );
+        assert!(
+            formatted.contains("rq *rq"),
+            "type header for rq: {formatted}"
+        );
+
+        // Raw args suppressed when fields present.
+        assert!(
+            !formatted.contains("arg0"),
+            "raw args should not appear when fields exist: {formatted}"
+        );
+
+        // Function names present.
+        assert!(formatted.contains("schedule"), "func schedule: {formatted}");
+        assert!(
+            formatted.contains("pick_task_scx"),
+            "func pick_task_scx: {formatted}"
+        );
     }
 
     // -- extract_sched_ext_dump tests --
@@ -2661,6 +2972,7 @@ mod tests {
             verify: crate::verify::Verify::NONE,
             extra_sched_args: &[],
             watchdog_timeout_jiffies: 0,
+            bpf_map_write: None,
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -2708,6 +3020,7 @@ mod tests {
             verify: crate::verify::Verify::NONE,
             extra_sched_args: &[],
             watchdog_timeout_jiffies: 0,
+            bpf_map_write: None,
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -2782,6 +3095,7 @@ mod tests {
             verify: crate::verify::Verify::NONE,
             extra_sched_args: &[],
             watchdog_timeout_jiffies: 0,
+            bpf_map_write: None,
         }
     }
 
@@ -2808,6 +3122,7 @@ mod tests {
             verify: crate::verify::Verify::NONE,
             extra_sched_args: &[],
             watchdog_timeout_jiffies: 0,
+            bpf_map_write: None,
         }
     }
 
@@ -2836,6 +3151,8 @@ mod tests {
 
     #[test]
     fn eval_eevdf_no_com2_output() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
         let verify = crate::verify::Verify::NONE;
@@ -2891,6 +3208,8 @@ mod tests {
 
     #[test]
     fn eval_sched_dies_with_sched_log() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let sched_log = format!(
             "noise\n{SCHED_OUTPUT_START}\ndo_enqueue_task+0x1a0\nbalance_one+0x50\n{SCHED_OUTPUT_END}\nmore",
         );
@@ -2927,6 +3246,8 @@ mod tests {
 
     #[test]
     fn eval_timeout_no_result() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
         let verify = crate::verify::Verify::NONE;
@@ -3040,6 +3361,8 @@ mod tests {
 
     #[test]
     fn eval_timeout_with_sched_includes_diagnostics() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
         let verify = crate::verify::Verify::NONE;
@@ -3116,6 +3439,8 @@ mod tests {
 
     #[test]
     fn eval_no_sentinels_shows_initramfs_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
         let verify = crate::verify::Verify::NONE;
@@ -3130,6 +3455,8 @@ mod tests {
 
     #[test]
     fn eval_init_started_but_no_payload() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("STT_INIT_STARTED\n", "boot log", 1, false);
         let verify = crate::verify::Verify::NONE;
@@ -3144,6 +3471,8 @@ mod tests {
 
     #[test]
     fn eval_payload_started_no_result() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_payload_start__");
         let output = "STT_INIT_STARTED\nSTT_PAYLOAD_STARTING\ngarbage";
         let result = make_vm_result(output, "", 1, false);

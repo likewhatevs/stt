@@ -393,6 +393,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             },
             extra_sched_args: &[#(#extra_sched_args),*],
             watchdog_timeout_jiffies: #watchdog_timeout_jiffies,
+            bpf_map_write: None,
         };
 
         #[test]

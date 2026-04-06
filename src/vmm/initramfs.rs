@@ -18,6 +18,12 @@ busybox mkdir -p /proc /sys /dev /tmp
 busybox mount -t proc proc /proc
 busybox mount -t sysfs sys /sys
 busybox mount -t devtmpfs dev /dev
+busybox mkdir -p /sys/kernel/debug
+busybox mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+busybox mkdir -p /sys/kernel/tracing
+busybox mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
+busybox mkdir -p /sys/fs/bpf
+busybox mount -t bpf bpffs /sys/fs/bpf 2>/dev/null
 echo "STT_INIT_STARTED" > /dev/ttyS1
 busybox mkdir -p /sys/fs/cgroup
 busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
@@ -37,11 +43,12 @@ if [ -x /scheduler ]; then
         busybox reboot -f
     fi
 fi
-# Enable sched_ext_dump tracepoint and stream trace_pipe to COM2.
+# Enable sched_ext_dump tracepoint and stream trace_pipe to COM1
+# (kernel console). COM2 is reserved for payload JSON output.
 TRACE_EVENTS=/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable
 if [ -f "$TRACE_EVENTS" ]; then
     echo 1 > "$TRACE_EVENTS"
-    busybox cat /sys/kernel/tracing/trace_pipe > /dev/ttyS1 &
+    busybox cat /sys/kernel/tracing/trace_pipe > /dev/ttyS0 &
 fi
 # Poll SHM dump request flag. When set to 'D' (written by host monitor),
 # trigger SysRq-D for scheduler state dump and clear the flag.
@@ -82,6 +89,8 @@ if [ -n "$SCHED_PID" ]; then
     echo "===SCHED_OUTPUT_END===" > /dev/ttyS1
 fi
 echo "STT_EXIT=$RC" > /dev/ttyS1
+# Let serial buffers drain before reboot.
+busybox usleep 100000
 busybox reboot -f
 "#;
 

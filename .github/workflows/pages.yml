@@ -36,8 +36,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang \
-            llvm \
+            clang-19 \
+            llvm-19 \
             libelf-dev \
             libcap-dev \
             binutils-dev \
@@ -45,6 +45,8 @@ jobs:
             make \
             pkg-config
           sudo apt-get install -y linux-headers-$(uname -r) || true
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100
+          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-19 100
 
       - name: Build and install bpftool
         run: |

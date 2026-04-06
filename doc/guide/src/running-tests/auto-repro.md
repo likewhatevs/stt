@@ -1,8 +1,9 @@
 # Auto-Repro
 
 When a test crashes, auto-repro extracts function names from the crash
-stack and reruns in a second VM with BPF kprobes attached to those
-functions.
+stack and reruns in a second VM with BPF probes attached to those
+functions. The probes capture function arguments and struct fields at
+each point in the crash path.
 
 ## How it works
 
@@ -10,11 +11,30 @@ functions.
    captures the stack trace from the scenario output.
 
 2. **Stack extraction** -- function names are parsed from the crash
-   trace.
+   trace. BPF program symbols (`bpf_prog_*`) are recognized and their
+   short names extracted. Generic functions (scheduler entry points,
+   spinlocks, syscall handlers) are filtered out.
 
-3. **Second VM** -- stt boots a new VM and reruns the scenario with BPF
-   kprobes attached to each function in the crash chain. The probes
-   capture function arguments at each point in the crash path.
+3. **BPF discovery** -- for BPF functions, stt discovers loaded
+   struct_ops programs via libbpf-rs and adds their kernel-side callers
+   (e.g. `enqueue` -> `do_enqueue_task`) for bridge kprobes.
+
+4. **BTF resolution** -- function signatures are resolved from vmlinux
+   BTF (kernel functions) and program BTF (BPF callbacks). Known struct
+   types (task_struct, rq, scx_dispatch_q, etc.) have their fields
+   resolved to byte offsets. Unknown BPF-local types (e.g. task_ctx)
+   have scalar and cpumask pointer fields auto-discovered.
+
+5. **Second VM** -- stt boots a new VM and reruns the scenario with two
+   BPF skeletons:
+   - Kprobe skeleton for kernel functions (uses `bpf_get_func_ip`)
+   - Fentry skeleton for BPF callbacks (batched in groups of 4,
+     shares maps via `reuse_fd`)
+
+6. **Stitching** -- captured events are filtered by task_struct pointer
+   or tid, sorted by timestamp, and formatted with decoded field values
+   (cpumask ranges, DSQ names, enqueue flags, etc.) and source locations
+   (DWARF for kernel, line_info for BPF).
 
 ## Enabling auto-repro
 
@@ -27,7 +47,7 @@ cargo stt vm --sockets 2 --cores 4 --threads 2 \
 
 In `#[stt_test]`:
 
-```rust
+```rust,ignore
 #[stt_test(auto_repro = true)]
 fn my_test(ctx: &Ctx) -> anyhow::Result<VerifyResult> { ... }
 ```
@@ -41,3 +61,64 @@ During the second VM run, stt sets "repro mode" which disables the
 work-conservation watchdog. Workers normally send SIGUSR2 to the
 scheduler when stuck > 2 seconds. In repro mode, the scheduler stays
 alive so BPF assertion probes can fire.
+
+## Example output
+
+The `demo_host_crash_auto_repro` test triggers a host-initiated crash
+via BPF map write and captures the scheduling path. Probe output shows
+each function with decoded struct fields and source locations:
+
+```text
+=== AUTO-PROBE: scx_exit fired ===
+
+  stt_enqueue                                                   main.bpf.c:21
+    task_struct *p
+      pid         97
+      cpus_ptr    0xf(0-3)
+      dsq_id      GLOBAL
+      enq_flags   WAKEUP
+      slice       5000000
+      weight      100
+      sticky_cpu  -1
+      scx_flags   QUEUED|ENABLED
+    enq_flags     WAKEUP
+
+  stt_dispatch                                                  main.bpf.c:33
+      cpu         2
+
+  do_enqueue_task                                               kernel/sched/ext.c:2210
+    task_struct *p
+      pid         97
+      cpus_ptr    0xf(0-3)
+      ...
+```
+
+## Demo test
+
+The `demo_host_crash_auto_repro` test:
+
+```rust,ignore
+use stt::prelude::*;
+use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
+use stt::workload::WorkType;
+
+fn scenario(ctx: &Ctx) -> Result<VerifyResult> {
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("demo_workers")
+                .work_type(WorkType::YieldHeavy)
+                .workers(4),
+        ].into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_secs(8)),
+    }];
+    execute_steps(ctx, steps)
+}
+```
+
+Run manually to see full output:
+
+```sh
+cargo test demo_host_crash_auto_repro -- --ignored --nocapture
+```

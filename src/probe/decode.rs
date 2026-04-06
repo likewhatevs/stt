@@ -1,5 +1,12 @@
 use super::scx_defs::*;
 
+/// Decode a sched_ext dispatch queue ID into a human-readable name.
+///
+/// Inspects bits [63:62] (`DSQ_TYPE_SHIFT`) to classify:
+/// - `DSQ_TYPE_LOCAL_ON` (0b11): `LOCAL_ON|{cpu}`
+/// - `DSQ_TYPE_BUILTIN` (0b10): `SCX_DSQ_INVALID`, `GLOBAL`, `LOCAL`, `BYPASS`
+/// - Otherwise: `DSQ(0x{id:x})`
+/// - Zero: `"0"`
 pub(crate) fn decode_dsq_id(id: u64) -> String {
     if id == 0 {
         return "0".into();
@@ -18,17 +25,26 @@ pub(crate) fn decode_dsq_id(id: u64) -> String {
 }
 
 /// Decode a single 64-bit cpumask word into a CPU range string.
-/// Handles CPUs 0-63 (one u64 word). Multi-word cpumasks for >64 CPUs
-/// require the caller to decode each word separately.
+/// Handles CPUs 0-63 (one u64 word).
 pub(crate) fn decode_cpumask(bits: u64) -> String {
-    if bits == 0 {
-        return "none".into();
-    }
+    decode_cpumask_multi(&[bits])
+}
+
+/// Decode multiple 64-bit cpumask words into a CPU range string.
+/// Word 0 covers CPUs 0-63, word 1 covers CPUs 64-127, etc.
+/// Trailing zero words are ignored.
+pub(crate) fn decode_cpumask_multi(words: &[u64]) -> String {
     let mut cpus = Vec::new();
-    for i in 0..64u32 {
-        if bits & (1u64 << i) != 0 {
-            cpus.push(i);
+    for (word_idx, &bits) in words.iter().enumerate() {
+        let base = word_idx as u32 * 64;
+        for i in 0..64u32 {
+            if bits & (1u64 << i) != 0 {
+                cpus.push(base + i);
+            }
         }
+    }
+    if cpus.is_empty() {
+        return "none".into();
     }
     let mut ranges = Vec::new();
     let (mut s, mut e) = (cpus[0], cpus[0]);
@@ -105,7 +121,13 @@ pub(crate) fn format_raw_arg(val: u64) -> String {
     }
 }
 
-/// Decode a named key=value pair from a known function.
+/// Decode a named field value based on the field key.
+///
+/// Dispatches to specialized decoders: `dsq_id` -> [`decode_dsq_id`],
+/// `cpus_ptr`/`cpumask*` -> [`decode_cpumask`], `enq_flags` ->
+/// [`decode_enq_flags`], `exit_kind` -> [`decode_exit_kind`],
+/// `scx_flags` -> task state/queue flags, etc. Unknown keys pass
+/// the value through unchanged.
 pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
     let as_u64 = || -> u64 {
         if let Some(hex) = val.strip_prefix("0x") {
@@ -117,7 +139,7 @@ pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
 
     match key {
         "dsq_id" | "dsq" => decode_dsq_id(as_u64()),
-        "cpus_ptr" | "cpus" | "cpumask" => {
+        "cpus_ptr" | "cpus" | "cpumask" | "cpumask_0" | "cpumask_1" | "cpumask_2" | "cpumask_3" => {
             let v = as_u64();
             format!("0x{v:x}({cpus})", cpus = decode_cpumask(v))
         }
@@ -146,6 +168,8 @@ pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
             format!("{v}")
         }
         "weight" => val.to_string(),
+        "kick_flags" | "kick" => decode_kick_flags(as_u64()),
+        "ops_state" | "opss" => decode_ops_state(as_u64()),
         "flags" | "scx_flags" => {
             let v = as_u64();
             let mut parts = Vec::new();
@@ -171,7 +195,39 @@ pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
                 parts.join("|")
             }
         }
+        _ if key.contains("cpumask") || key.contains("cpus") => {
+            let v = as_u64();
+            format!("0x{v:x}({cpus})", cpus = decode_cpumask(v))
+        }
         _ => val.to_string(),
+    }
+}
+
+pub(crate) fn decode_kick_flags(flags: u64) -> String {
+    let mut parts = Vec::new();
+    if flags & 1 != 0 {
+        parts.push("IDLE");
+    }
+    if flags & 2 != 0 {
+        parts.push("PREEMPT");
+    }
+    if flags & 4 != 0 {
+        parts.push("WAIT");
+    }
+    if parts.is_empty() {
+        "NONE".into()
+    } else {
+        parts.join("|")
+    }
+}
+
+pub(crate) fn decode_ops_state(state: u64) -> String {
+    match state & 0xff {
+        0 => "NONE".into(),
+        1 => "QUEUEING".into(),
+        2 => "QUEUED".into(),
+        3 => "DISPATCHING".into(),
+        v => format!("OPSS({v})"),
     }
 }
 
@@ -567,5 +623,83 @@ mod tests {
     fn format_raw_arg_two() {
         // val=2 is in 2..=0xff range, should be "int:2"
         assert_eq!(format_raw_arg(2), "int:2");
+    }
+
+    // -- decode_cpumask_multi --
+
+    #[test]
+    fn decode_cpumask_multi_empty() {
+        assert_eq!(decode_cpumask_multi(&[0, 0, 0, 0]), "none");
+    }
+
+    #[test]
+    fn decode_cpumask_multi_word0_only() {
+        assert_eq!(decode_cpumask_multi(&[0xf, 0, 0, 0]), "0-3");
+    }
+
+    #[test]
+    fn decode_cpumask_multi_word1() {
+        // CPU 64 is bit 0 of word 1.
+        assert_eq!(decode_cpumask_multi(&[0, 1, 0, 0]), "64");
+    }
+
+    #[test]
+    fn decode_cpumask_multi_span_words() {
+        // CPUs 63 and 64: last bit of word 0, first bit of word 1.
+        assert_eq!(decode_cpumask_multi(&[1u64 << 63, 1, 0, 0]), "63-64");
+    }
+
+    #[test]
+    fn decode_cpumask_multi_all_four_words() {
+        // One CPU per word: 0, 64, 128, 192.
+        assert_eq!(decode_cpumask_multi(&[1, 1, 1, 1]), "0,64,128,192");
+    }
+
+    #[test]
+    fn decode_cpumask_multi_contiguous_across_boundary() {
+        // CPUs 62-65: last 2 bits of word 0, first 2 bits of word 1.
+        let w0 = (1u64 << 62) | (1u64 << 63);
+        let w1 = 0b11u64;
+        assert_eq!(decode_cpumask_multi(&[w0, w1, 0, 0]), "62-65");
+    }
+
+    #[test]
+    fn decode_cpumask_multi_single_word_compat() {
+        // Single-word call should match decode_cpumask.
+        assert_eq!(decode_cpumask_multi(&[0x33]), decode_cpumask(0x33));
+    }
+
+    #[test]
+    fn decode_cpumask_multi_word3_high() {
+        // CPU 255: highest bit of word 3.
+        assert_eq!(decode_cpumask_multi(&[0, 0, 0, 1u64 << 63]), "255");
+    }
+
+    // -- decode_named_value with cpumask_N keys --
+
+    #[test]
+    fn decode_named_value_cpumask_0() {
+        let out = decode_named_value("cpumask_0", "15");
+        assert!(out.contains("0-3"), "got: {out}");
+    }
+
+    #[test]
+    fn decode_named_value_cpumask_1() {
+        let out = decode_named_value("cpumask_1", "1");
+        assert!(out.contains("0x1"), "got: {out}");
+    }
+
+    #[test]
+    fn decode_named_value_cpumask_3() {
+        let out = decode_named_value("cpumask_3", "0");
+        assert!(out.contains("0x0"), "got: {out}");
+    }
+
+    // -- decode_named_value wildcard cpumask key --
+
+    #[test]
+    fn decode_named_value_key_containing_cpumask() {
+        let out = decode_named_value("my_cpumask_field", "255");
+        assert!(out.contains("0-7"), "wildcard cpumask key: {out}");
     }
 }

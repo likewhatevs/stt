@@ -1,3 +1,10 @@
+//! Kernel symbol resolution and address translation.
+//!
+//! Parses a vmlinux ELF to extract symbol addresses (`runqueues`,
+//! `__per_cpu_offset`, `page_offset_base`, etc.) and provides
+//! functions for translating kernel virtual addresses to guest
+//! physical addresses via the text mapping and direct mapping.
+
 use anyhow::{Context, Result};
 use object::{Object, ObjectSymbol};
 use std::path::Path;
@@ -12,7 +19,7 @@ const DEFAULT_PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
 
 /// Kernel symbol addresses extracted from vmlinux ELF.
 #[derive(Debug, Clone)]
-pub struct KernelSymbols {
+pub(crate) struct KernelSymbols {
     /// Kernel virtual address of the `runqueues` per-CPU variable.
     pub runqueues: u64,
     /// Kernel virtual address of the `__per_cpu_offset` array.
@@ -28,6 +35,14 @@ pub struct KernelSymbols {
     /// Kernel virtual address of `scx_watchdog_timeout`.
     /// None if the symbol is absent (kernel without sched_ext).
     pub scx_watchdog_timeout: Option<u64>,
+    /// Kernel virtual address of the top-level page table.
+    /// `init_top_pgt` (older kernels) or `swapper_pg_dir` (newer kernels).
+    /// Used to derive CR3 for page table walks when KVM SREGS are unavailable.
+    pub init_top_pgt: Option<u64>,
+    /// Kernel virtual address of `__pgtable_l5_enabled` (u32).
+    /// 0 = 4-level paging, 1 = 5-level paging (LA57 active).
+    /// None if the symbol is absent (CONFIG_PGTABLE_LEVELS < 5).
+    pub pgtable_l5_enabled: Option<u64>,
 }
 
 impl KernelSymbols {
@@ -59,12 +74,23 @@ impl KernelSymbols {
             .symbol_by_name("scx_watchdog_timeout")
             .map(|s| s.address());
 
+        let init_top_pgt = elf
+            .symbol_by_name("init_top_pgt")
+            .or_else(|| elf.symbol_by_name("swapper_pg_dir"))
+            .map(|s| s.address());
+
+        let pgtable_l5_enabled = elf
+            .symbol_by_name("__pgtable_l5_enabled")
+            .map(|s| s.address());
+
         Ok(Self {
             runqueues,
             per_cpu_offset,
             page_offset_base_kva,
             scx_root,
             scx_watchdog_timeout,
+            init_top_pgt,
+            pgtable_l5_enabled,
         })
     }
 }
@@ -83,19 +109,32 @@ pub(crate) fn resolve_page_offset(mem: &super::reader::GuestMem, symbols: &Kerne
     };
     let pob_pa = text_kva_to_pa(pob_kva);
     let val = mem.read_u64(pob_pa, 0);
-    // Valid PAGE_OFFSET must be in the kernel's upper-half canonical
-    // address range. Zero or non-canonical values indicate the guest
-    // hasn't initialized the variable yet.
-    if val >= 0xffff_8000_0000_0000 {
+    // Valid PAGE_OFFSET has bit 63 set (upper-half virtual address).
+    // Kernels with CONFIG_RANDOMIZE_MEMORY use values like
+    // 0xff11000000000000 that are below the traditional canonical
+    // boundary (0xffff800000000000), so check bit 63 instead.
+    if val & (1u64 << 63) != 0 {
         val
     } else {
         DEFAULT_PAGE_OFFSET
     }
 }
 
+/// Read the runtime value of `__pgtable_l5_enabled` from guest memory.
+///
+/// Returns `true` when the guest kernel uses 5-level paging (LA57),
+/// `false` when the symbol is absent or the value is 0.
+pub(crate) fn resolve_pgtable_l5(mem: &super::reader::GuestMem, symbols: &KernelSymbols) -> bool {
+    let Some(kva) = symbols.pgtable_l5_enabled else {
+        return false;
+    };
+    let pa = text_kva_to_pa(kva);
+    mem.read_u32(pa, 0) != 0
+}
+
 /// Translate a kernel virtual address in the direct mapping
 /// (PAGE_OFFSET region) to guest physical address.
-pub fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
+pub(crate) fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
     kva.wrapping_sub(page_offset)
 }
 
@@ -103,8 +142,9 @@ pub fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
 ///
 /// Kernel text and data symbols (.text, .data, .bss) are mapped via
 /// `__START_KERNEL_map`, not the direct mapping. Their PA is
-/// `VA - __START_KERNEL_map`.
-pub fn text_kva_to_pa(kva: u64) -> u64 {
+/// `VA - __START_KERNEL_map + phys_base`. This function assumes
+/// `phys_base = 0`, which requires `nokaslr` on the guest cmdline.
+pub(crate) fn text_kva_to_pa(kva: u64) -> u64 {
     kva.wrapping_sub(START_KERNEL_MAP)
 }
 
@@ -116,7 +156,7 @@ pub fn text_kva_to_pa(kva: u64) -> u64 {
 /// `host_base` must point to the start of a guest memory region at least
 /// `per_cpu_offset_pa + num_cpus * 8` bytes long. The memory at each
 /// offset must contain a valid `u64` written by the guest kernel.
-pub unsafe fn read_per_cpu_offsets(
+pub(crate) unsafe fn read_per_cpu_offsets(
     host_base: *const u8,
     per_cpu_offset_pa: u64,
     num_cpus: u32,
@@ -135,7 +175,11 @@ pub unsafe fn read_per_cpu_offsets(
 ///
 /// Each CPU's rq is at `runqueues_kva + per_cpu_offset[cpu]` in kernel
 /// virtual space; subtracting PAGE_OFFSET yields the guest physical address.
-pub fn compute_rq_pas(runqueues_kva: u64, per_cpu_offsets: &[u64], page_offset: u64) -> Vec<u64> {
+pub(crate) fn compute_rq_pas(
+    runqueues_kva: u64,
+    per_cpu_offsets: &[u64],
+    page_offset: u64,
+) -> Vec<u64> {
     per_cpu_offsets
         .iter()
         .map(|&offset| kva_to_pa(runqueues_kva.wrapping_add(offset), page_offset))
@@ -281,6 +325,9 @@ mod tests {
             page_offset_base_kva: None,
             scx_root: None,
             scx_watchdog_timeout: Some(watchdog_kva),
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
         };
 
         let mut buf = [0u8; 0x2000];
@@ -301,10 +348,13 @@ mod tests {
             page_offset_base_kva: None,
             scx_root: None,
             scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
         };
 
         let buf = [0u8; 64];
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
 
         assert!(!write_watchdog_timeout(&mem, &symbols, 30_000));
     }
@@ -329,6 +379,9 @@ mod tests {
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
             scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), expected_page_offset);
@@ -339,13 +392,16 @@ mod tests {
         use crate::monitor::reader::GuestMem;
 
         let buf = [0u8; 64];
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let symbols = KernelSymbols {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
             scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -358,13 +414,16 @@ mod tests {
         // page_offset_base exists but the guest hasn't written a value yet (all zeros)
         let pob_kva = START_KERNEL_MAP + 0x100;
         let buf = [0u8; 0x200];
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let symbols = KernelSymbols {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
             scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -387,8 +446,107 @@ mod tests {
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
             scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
+    }
+
+    #[test]
+    fn resolve_page_offset_randomized_memory() {
+        use crate::monitor::reader::GuestMem;
+
+        // CONFIG_RANDOMIZE_MEMORY produces PAGE_OFFSET values like
+        // 0xff11000000000000 that are below the traditional canonical
+        // boundary but have bit 63 set.
+        let pob_kva = START_KERNEL_MAP + 0x1000;
+        let randomized_page_offset = 0xff11_0000_0000_0000u64;
+
+        let mut buf = [0u8; 0x2000];
+        buf[0x1000..0x1008].copy_from_slice(&randomized_page_offset.to_ne_bytes());
+
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let symbols = KernelSymbols {
+            runqueues: 0,
+            per_cpu_offset: 0,
+            page_offset_base_kva: Some(pob_kva),
+            scx_root: None,
+            scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
+        };
+
+        assert_eq!(resolve_page_offset(&mem, &symbols), randomized_page_offset);
+    }
+
+    #[test]
+    fn resolve_pgtable_l5_enabled() {
+        use crate::monitor::reader::GuestMem;
+
+        let l5_kva = START_KERNEL_MAP + 0x1000;
+        let mut buf = [0u8; 0x2000];
+        // Write __pgtable_l5_enabled = 1 at PA 0x1000.
+        buf[0x1000..0x1004].copy_from_slice(&1u32.to_ne_bytes());
+
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let symbols = KernelSymbols {
+            runqueues: 0,
+            per_cpu_offset: 0,
+            page_offset_base_kva: None,
+            scx_root: None,
+            scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: Some(l5_kva),
+        };
+
+        assert!(resolve_pgtable_l5(&mem, &symbols));
+    }
+
+    #[test]
+    fn resolve_pgtable_l5_disabled() {
+        use crate::monitor::reader::GuestMem;
+
+        let l5_kva = START_KERNEL_MAP + 0x1000;
+        let mut buf = [0u8; 0x2000];
+        // Write __pgtable_l5_enabled = 0 at PA 0x1000.
+        buf[0x1000..0x1004].copy_from_slice(&0u32.to_ne_bytes());
+
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let symbols = KernelSymbols {
+            runqueues: 0,
+            per_cpu_offset: 0,
+            page_offset_base_kva: None,
+            scx_root: None,
+            scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: Some(l5_kva),
+        };
+
+        assert!(!resolve_pgtable_l5(&mem, &symbols));
+    }
+
+    #[test]
+    fn resolve_pgtable_l5_absent_symbol() {
+        use crate::monitor::reader::GuestMem;
+
+        let buf = [0u8; 64];
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let symbols = KernelSymbols {
+            runqueues: 0,
+            per_cpu_offset: 0,
+            page_offset_base_kva: None,
+            scx_root: None,
+            scx_watchdog_timeout: None,
+
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
+        };
+
+        assert!(!resolve_pgtable_l5(&mem, &symbols));
     }
 }

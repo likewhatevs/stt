@@ -1,13 +1,20 @@
-//! Host-side guest memory monitor.
+//! Host-side guest memory monitor and BPF map introspection.
 //!
 //! Reads per-CPU runqueue structures from guest VM memory via BTF-resolved
 //! offsets. Observes scheduler state without instrumenting the guest
 //! kernel or the scheduler under test.
 //!
+//! The [`bpf_map`] module provides host-side discovery and read/write
+//! access to BPF maps in guest memory. Maps are located by walking the
+//! kernel's `map_idr` xarray; values are accessed through page table
+//! translation. No guest cooperation is needed.
+//!
 //! See the [Monitor](https://sched-ext.github.io/scx/stt/architecture/monitor.html)
 //! chapter of the guide.
 
+pub mod bpf_map;
 pub mod btf_offsets;
+pub mod guest;
 pub mod reader;
 pub mod symbols;
 
@@ -82,7 +89,7 @@ pub struct MonitorSample {
 
 impl MonitorSample {
     /// Compute the imbalance ratio for this sample: max(nr_running) / max(1, min(nr_running)).
-    /// Returns 1.0 for empty or single-CPU samples.
+    /// Returns 1.0 for empty samples, 0.0 when all CPUs have nr_running=0.
     pub fn imbalance_ratio(&self) -> f64 {
         if self.cpus.is_empty() {
             return 1.0;
@@ -114,10 +121,15 @@ impl MonitorSample {
 /// Per-CPU state read from guest VM memory.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CpuSnapshot {
+    /// Total runnable tasks on this CPU (`rq.nr_running`).
     pub nr_running: u32,
+    /// Tasks managed by the sched_ext scheduler (`scx_rq.nr_running`).
     pub scx_nr_running: u32,
+    /// Depth of the scx local dispatch queue (`scx_rq.local_dsq.nr`).
     pub local_dsq_depth: u32,
+    /// Runqueue clock value (`rq.clock`). Non-advancing clock indicates a stall.
     pub rq_clock: u64,
+    /// sched_ext flags for this CPU (`scx_rq.flags`).
     pub scx_flags: u32,
     /// scx event counters (cumulative). None when event counter
     /// offsets are unavailable or scx_root is not set.
@@ -129,19 +141,28 @@ pub struct CpuSnapshot {
 /// These are s64 in the kernel but always non-negative; stored as i64.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScxEventCounters {
+    /// `SCX_EV_SELECT_CPU_FALLBACK`: scheduler's `ops.select_cpu()` failed to find a CPU.
     pub select_cpu_fallback: i64,
+    /// `SCX_EV_DISPATCH_LOCAL_DSQ_OFFLINE`: dispatch to an offline CPU's local DSQ.
     pub dispatch_local_dsq_offline: i64,
+    /// `SCX_EV_DISPATCH_KEEP_LAST`: CPU re-dispatched the previously running task.
     pub dispatch_keep_last: i64,
+    /// `SCX_EV_ENQ_SKIP_EXITING`: enqueue skipped because the task is exiting.
     pub enq_skip_exiting: i64,
+    /// `SCX_EV_ENQ_SKIP_MIGRATION_DISABLED`: enqueue skipped because migration is disabled.
     pub enq_skip_migration_disabled: i64,
 }
 
 /// Aggregated monitor statistics from a set of samples.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MonitorSummary {
+    /// Number of samples collected.
     pub total_samples: usize,
+    /// Peak imbalance ratio across all samples: `max(nr_running) / max(1, min(nr_running))`.
     pub max_imbalance_ratio: f64,
+    /// Peak local DSQ depth across all CPUs and samples.
     pub max_local_dsq_depth: u32,
+    /// Whether any CPU's `rq_clock` failed to advance between consecutive samples.
     pub stall_detected: bool,
     /// Aggregate event counter deltas over the monitoring window.
     /// None when event counters are not available.
@@ -363,16 +384,23 @@ impl Default for MonitorThresholds {
     }
 }
 
-/// Optional per-field overrides for MonitorThresholds. Used by
+/// Optional per-field overrides for [`MonitorThresholds`]. Used by
 /// `SttTestEntry` to carry proc-macro-specified threshold values.
+/// Each `Some` field replaces the corresponding default via [`MonitorThresholds::merge`].
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)]
 pub struct ThresholdOverrides {
+    /// Override for [`MonitorThresholds::max_imbalance_ratio`].
     pub max_imbalance_ratio: Option<f64>,
+    /// Override for [`MonitorThresholds::max_local_dsq_depth`].
     pub max_local_dsq_depth: Option<u32>,
+    /// Override for [`MonitorThresholds::fail_on_stall`].
     pub fail_on_stall: Option<bool>,
+    /// Override for [`MonitorThresholds::sustained_samples`].
     pub sustained_samples: Option<usize>,
+    /// Override for [`MonitorThresholds::max_fallback_rate`].
     pub max_fallback_rate: Option<f64>,
+    /// Override for [`MonitorThresholds::max_keep_last_rate`].
     pub max_keep_last_rate: Option<f64>,
 }
 
@@ -391,8 +419,11 @@ impl ThresholdOverrides {
 /// Verdict from evaluating monitor data against thresholds.
 #[derive(Debug, Clone)]
 pub struct MonitorVerdict {
+    /// `true` if all thresholds were met.
     pub passed: bool,
+    /// Per-violation detail messages (empty when `passed` is true).
     pub details: Vec<String>,
+    /// One-line summary: "monitor OK" or "monitor FAILED: N violation(s)".
     pub summary: String,
 }
 

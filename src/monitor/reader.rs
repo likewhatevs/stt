@@ -1,3 +1,13 @@
+//! Guest physical memory access and monitor sampling loop.
+//!
+//! [`GuestMem`] wraps a host pointer to guest physical address 0 and
+//! provides bounds-checked volatile reads and writes for scalar types;
+//! `read_bytes` uses `copy_nonoverlapping` for bulk copies. It also implements
+//! 4-level and 5-level x86-64 page table walks for vmalloc'd addresses.
+//!
+//! The monitor loop (`monitor_loop`) periodically reads per-CPU
+//! runqueue state from guest memory and collects `MonitorSample`s.
+
 use super::btf_offsets::{KernelOffsets, ScxEventOffsets};
 use super::{CpuSnapshot, MonitorSample, ScxEventCounters};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,8 +17,8 @@ use std::time::{Duration, Instant};
 ///
 /// SAFETY: The pointer is valid for the lifetime of the KVM VM (GuestMemoryMmap
 /// owns the mmap and outlives all threads).
-pub(crate) struct GuestMem {
-    base: *const u8,
+pub struct GuestMem {
+    base: *mut u8,
     size: u64,
 }
 
@@ -16,7 +26,7 @@ unsafe impl Send for GuestMem {}
 unsafe impl Sync for GuestMem {}
 
 impl GuestMem {
-    pub fn new(base: *const u8, size: u64) -> Self {
+    pub fn new(base: *mut u8, size: u64) -> Self {
         Self { base, size }
     }
 
@@ -31,7 +41,7 @@ impl GuestMem {
         if addr + 4 > self.size {
             return 0;
         }
-        unsafe { std::ptr::read_unaligned(self.base.add(addr as usize) as *const u32) }
+        unsafe { std::ptr::read_volatile(self.base.add(addr as usize) as *const u32) }
     }
 
     /// Read a u64 at guest physical address `pa + offset`.
@@ -40,7 +50,7 @@ impl GuestMem {
         if addr + 8 > self.size {
             return 0;
         }
-        unsafe { std::ptr::read_unaligned(self.base.add(addr as usize) as *const u64) }
+        unsafe { std::ptr::read_volatile(self.base.add(addr as usize) as *const u64) }
     }
 
     /// Read an i64 at guest physical address `pa + offset`.
@@ -54,7 +64,7 @@ impl GuestMem {
         if addr + 1 > self.size {
             return;
         }
-        unsafe { std::ptr::write_volatile(self.base.add(addr as usize) as *mut u8, val) }
+        unsafe { std::ptr::write_volatile(self.base.add(addr as usize), val) }
     }
 
     /// Write a u64 at guest physical address `pa + offset`.
@@ -67,13 +77,128 @@ impl GuestMem {
     }
 
     /// Read a u8 at guest physical address `pa + offset`.
-    #[allow(dead_code)]
     pub fn read_u8(&self, pa: u64, offset: usize) -> u8 {
         let addr = pa + offset as u64;
         if addr + 1 > self.size {
             return 0;
         }
         unsafe { std::ptr::read_volatile(self.base.add(addr as usize)) }
+    }
+
+    /// Read `len` bytes from guest physical address `pa` into `buf`.
+    /// Returns the number of bytes actually read (may be less than `len`
+    /// if the read would go past the end of guest memory).
+    pub fn read_bytes(&self, pa: u64, buf: &mut [u8]) -> usize {
+        let len = buf.len() as u64;
+        if pa >= self.size {
+            return 0;
+        }
+        let avail = (self.size - pa).min(len) as usize;
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.base.add(pa as usize), buf.as_mut_ptr(), avail);
+        }
+        avail
+    }
+
+    /// Write a u32 at guest physical address `pa + offset`.
+    pub fn write_u32(&self, pa: u64, offset: usize, val: u32) {
+        let addr = pa + offset as u64;
+        if addr + 4 > self.size {
+            return;
+        }
+        unsafe { std::ptr::write_volatile(self.base.add(addr as usize) as *mut u32, val) }
+    }
+
+    /// Translate a kernel virtual address to guest physical address via
+    /// page table walk. Supports both 4-level (PGD -> PUD -> PMD -> PTE)
+    /// and 5-level (PML5 -> P4D -> PUD -> PMD -> PTE) paging.
+    ///
+    /// `cr3_pa` is the physical address of the top-level page table.
+    /// `l5` selects 5-level paging (LA57); use `resolve_pgtable_l5`
+    /// to detect the guest's mode at runtime.
+    /// Returns `None` if any level is not present or the address is
+    /// out of guest memory bounds.
+    pub fn translate_kva(&self, cr3_pa: u64, kva: u64, l5: bool) -> Option<u64> {
+        if l5 {
+            self.walk_5level(cr3_pa, kva)
+        } else {
+            self.walk_4level(cr3_pa, kva)
+        }
+    }
+
+    /// 4-level page table walk: CR3 -> PGD -> PUD -> PMD -> PTE.
+    fn walk_4level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
+        const PRESENT: u64 = 1;
+        const PS: u64 = 1 << 7;
+        const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+        let pgd_idx = (kva >> 39) & 0x1FF;
+        let pud_idx = (kva >> 30) & 0x1FF;
+        let pmd_idx = (kva >> 21) & 0x1FF;
+        let pte_idx = (kva >> 12) & 0x1FF;
+        let page_off = kva & 0xFFF;
+
+        // PGD
+        let pgd_pa = (cr3_pa & ADDR_MASK) + pgd_idx * 8;
+        let pgde = self.read_u64(pgd_pa, 0);
+        if pgde & PRESENT == 0 {
+            return None;
+        }
+
+        // PUD
+        let pud_pa = (pgde & ADDR_MASK) + pud_idx * 8;
+        let pude = self.read_u64(pud_pa, 0);
+        if pude & PRESENT == 0 {
+            return None;
+        }
+        if pude & PS != 0 {
+            let base = pude & 0x000F_FFFF_C000_0000;
+            return Some(base | (kva & 0x3FFF_FFFF));
+        }
+
+        // PMD
+        let pmd_pa = (pude & ADDR_MASK) + pmd_idx * 8;
+        let pmde = self.read_u64(pmd_pa, 0);
+        if pmde & PRESENT == 0 {
+            return None;
+        }
+        if pmde & PS != 0 {
+            let base = pmde & 0x000F_FFFF_FFE0_0000;
+            return Some(base | (kva & 0x1F_FFFF));
+        }
+
+        // PTE
+        let pte_pa = (pmde & ADDR_MASK) + pte_idx * 8;
+        let ptee = self.read_u64(pte_pa, 0);
+        if ptee & PRESENT == 0 {
+            return None;
+        }
+
+        Some((ptee & ADDR_MASK) | page_off)
+    }
+
+    /// 5-level page table walk: CR3 -> PML5 -> P4D -> PUD -> PMD -> PTE.
+    fn walk_5level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
+        const PRESENT: u64 = 1;
+        const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+        // PML5 index: bits 56:48.
+        let pml5_idx = (kva >> 48) & 0x1FF;
+
+        let pml5_pa = (cr3_pa & ADDR_MASK) + pml5_idx * 8;
+        let pml5e = self.read_u64(pml5_pa, 0);
+        if pml5e & PRESENT == 0 {
+            return None;
+        }
+
+        // P4D is the next level; continue with 4-level walk from there.
+        let p4d_pa = pml5e & ADDR_MASK;
+        self.walk_4level(p4d_pa, kva)
+    }
+
+    /// Guest memory size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -319,7 +444,7 @@ mod tests {
     fn read_rq_stats_known_values() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 5, 3, 7, 999_000, 0x1);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert_eq!(snap.nr_running, 5);
         assert_eq!(snap.scx_nr_running, 3);
@@ -332,7 +457,7 @@ mod tests {
     fn read_rq_stats_all_zeros() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 0, 0, 0, 0, 0);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert_eq!(snap.nr_running, 0);
         assert_eq!(snap.scx_nr_running, 0);
@@ -345,7 +470,7 @@ mod tests {
     fn read_rq_stats_max_values() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, u32::MAX, u32::MAX, u32::MAX, u64::MAX, u32::MAX);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert_eq!(snap.nr_running, u32::MAX);
         assert_eq!(snap.scx_nr_running, u32::MAX);
@@ -357,7 +482,7 @@ mod tests {
     #[test]
     fn read_u32_out_of_bounds() {
         let buf = [0xFFu8; 8];
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         // PA 6 + 4 bytes = 10 > 8, out of bounds
         assert_eq!(mem.read_u32(6, 0), 0);
         // Exactly at boundary: PA 4, offset 0 => addr 4, 4+4=8 == size, not >
@@ -369,7 +494,7 @@ mod tests {
     #[test]
     fn read_u64_out_of_bounds() {
         let buf = [0xFFu8; 16];
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         // PA 10 + 8 = 18 > 16
         assert_eq!(mem.read_u64(10, 0), 0);
         // Exactly at boundary: PA 8, 8+8=16 == size
@@ -382,7 +507,7 @@ mod tests {
     fn monitor_loop_kill_immediately() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let kill = AtomicBool::new(true);
         let samples = monitor_loop(
             &mem,
@@ -402,7 +527,7 @@ mod tests {
     fn monitor_loop_one_iteration() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 2, 1, 3, 500, 0);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -445,7 +570,7 @@ mod tests {
         let mut combined = buf0;
         combined.extend_from_slice(&buf1);
 
-        let mem = GuestMem::new(combined.as_ptr(), combined.len() as u64);
+        let mem = GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64);
 
         let snap0 = read_rq_stats(&mem, 0, &offsets);
         let snap1 = read_rq_stats(&mem, pa1, &offsets);
@@ -469,7 +594,7 @@ mod tests {
         let mut buf = [0u8; 32];
         // Place 0xDEADBEEF at byte 20 (PA=12, offset=8).
         buf[20..24].copy_from_slice(&0xDEADBEEFu32.to_ne_bytes());
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         assert_eq!(mem.read_u32(12, 8), 0xDEADBEEF);
     }
 
@@ -478,7 +603,7 @@ mod tests {
         let mut buf = [0u8; 32];
         // Place value at byte 16 (PA=10, offset=6).
         buf[16..24].copy_from_slice(&0x0123456789ABCDEFu64.to_ne_bytes());
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         assert_eq!(mem.read_u64(10, 6), 0x0123456789ABCDEF);
     }
 
@@ -491,7 +616,7 @@ mod tests {
         let mut combined = buf0;
         combined.extend_from_slice(&buf1);
 
-        let mem = GuestMem::new(combined.as_ptr(), combined.len() as u64);
+        let mem = GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64);
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -532,7 +657,7 @@ mod tests {
     fn monitor_loop_elapsed_ms_progresses() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -615,7 +740,7 @@ mod tests {
     fn read_event_stats_known_values() {
         let ev = test_event_offsets();
         let buf = make_event_stats_buffer(&ev, 42, 7, 100, 3, 5);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let stats = read_event_stats(&mem, 0, &ev);
         assert_eq!(stats.select_cpu_fallback, 42);
         assert_eq!(stats.dispatch_local_dsq_offline, 7);
@@ -628,7 +753,7 @@ mod tests {
     fn read_event_stats_zeros() {
         let ev = test_event_offsets();
         let buf = make_event_stats_buffer(&ev, 0, 0, 0, 0, 0);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let stats = read_event_stats(&mem, 0, &ev);
         assert_eq!(stats.select_cpu_fallback, 0);
         assert_eq!(stats.dispatch_local_dsq_offline, 0);
@@ -638,7 +763,7 @@ mod tests {
     fn read_i64_roundtrip() {
         let val: i64 = -12345;
         let buf = val.to_ne_bytes();
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         assert_eq!(mem.read_i64(0, 0), -12345);
     }
 
@@ -693,7 +818,7 @@ mod tests {
     #[test]
     fn read_u8_out_of_bounds() {
         let buf = [0xFFu8; 4];
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         assert_eq!(mem.read_u8(4, 0), 0);
         assert_eq!(mem.read_u8(3, 0), 0xFF);
     }
@@ -702,7 +827,7 @@ mod tests {
     fn read_rq_stats_has_no_event_counters() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert!(snap.event_counters.is_none());
     }
@@ -721,7 +846,7 @@ mod tests {
         let mut combined = rq_buf;
         combined.extend_from_slice(&ev_buf);
 
-        let mem = GuestMem::new(combined.as_ptr(), combined.len() as u64);
+        let mem = GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64);
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -759,7 +884,7 @@ mod tests {
     fn monitor_loop_no_event_counters_when_none() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -792,7 +917,7 @@ mod tests {
         let ev = test_event_offsets();
         // scx_root pointer is 0 (null) — no scheduler loaded.
         let buf = [0u8; 64];
-        let mem = GuestMem::new(buf.as_ptr(), buf.len() as u64);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let result = resolve_event_pcpu_pas(&mem, 0, &ev, &[0, 0x4000], 0);
         assert!(result.is_none());
     }

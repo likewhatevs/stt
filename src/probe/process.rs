@@ -4,8 +4,15 @@ use std::time::Duration;
 use super::btf::{BtfFunc, STRUCT_FIELDS};
 use super::stack::StackFunction;
 
-/// Structured probe event returned from the skeleton.
-#[derive(Debug, Clone)]
+use crate::bpf_skel::types;
+
+/// Structured probe event captured by the BPF skeleton.
+///
+/// One per (function, tid) combination. `fields` contains BTF-resolved
+/// struct field values keyed as `"param:struct.field"` (from
+/// [`build_field_keys`]). Events are sorted by `ts` and stitched by
+/// `task_struct` pointer or tid before output.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProbeEvent {
     pub func_idx: u32,
     pub tid: u32,
@@ -13,11 +20,13 @@ pub struct ProbeEvent {
     pub args: [u64; 6],
     pub fields: Vec<(String, u64)>, // (field_key, value) — decoded by caller
     pub kstack: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub str_val: Option<String>,
 }
 
 /// Resolve a kernel function name to its address via /proc/kallsyms.
 #[cfg_attr(feature = "integration", visibility::make(pub))]
-fn resolve_func_ip(name: &str) -> Option<u64> {
+pub(super) fn resolve_func_ip(name: &str) -> Option<u64> {
     let kallsyms = std::fs::read_to_string("/proc/kallsyms").ok()?;
     for line in kallsyms.lines() {
         let mut parts = line.split_whitespace();
@@ -31,8 +40,45 @@ fn resolve_func_ip(name: &str) -> Option<u64> {
     None
 }
 
+/// Populate a `func_meta` with field specs from BTF-resolved offsets.
+/// Shared between kprobe and fentry paths.
+fn populate_field_specs(meta: &mut types::func_meta, field_specs: &[super::btf::FieldSpec]) {
+    let n = field_specs.len().min(16);
+    // nr_field_specs must be max(field_idx)+1, not count of specs,
+    // because the BPF program writes entry.fields[field_idx] and
+    // the Rust side reads entry.fields[..nr_field_specs] positionally
+    // against build_field_keys (which includes skipped fields).
+    let max_fidx = field_specs
+        .iter()
+        .take(n)
+        .map(|fs| fs.field_idx)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+    meta.nr_field_specs = max_fidx.min(16);
+    for fs in field_specs.iter().take(n) {
+        let slot = fs.field_idx as usize;
+        if slot < 16 {
+            meta.specs[slot] = types::field_spec {
+                param_idx: fs.param_idx,
+                offset: fs.offset,
+                size: fs.size,
+                field_idx: fs.field_idx,
+                ptr_offset: fs.ptr_offset,
+            };
+        }
+    }
+}
+
 /// Build field key names for a function based on its BTF info.
-/// Returns a vec mapping field_idx to an output key name like "param:struct.field".
+///
+/// Returns a vec mapping `field_idx` to an output key name. Format:
+/// - Known struct param: `"p:task_struct.pid"`
+/// - Auto-discovered BPF struct: `"ctx:task_ctx*.field_a"`
+/// - Scalar param: `"flags:val.flags"`
+///
+/// Processes at most 6 params (fentry/kprobe register limit) and
+/// at most 16 fields total (matching `MAX_FIELDS` in intf.h).
 fn build_field_keys(btf_func: &BtfFunc) -> Vec<String> {
     let mut keys = Vec::new();
     let mut field_idx: u32 = 0;
@@ -49,6 +95,15 @@ fn build_field_keys(btf_func: &BtfFunc) -> Vec<String> {
                     }
                 }
             }
+        } else if !param.auto_fields.is_empty() {
+            let tname = param.type_name.as_deref().unwrap_or("void");
+            for (fname, _) in &param.auto_fields {
+                keys.push(format!("{}:{}*.{}", param.name, tname, fname));
+                field_idx += 1;
+                if field_idx >= 16 {
+                    break;
+                }
+            }
         } else if !param.is_ptr {
             keys.push(format!("{}:val.{}", param.name, param.name));
             field_idx += 1;
@@ -58,8 +113,48 @@ fn build_field_keys(btf_func: &BtfFunc) -> Vec<String> {
     keys
 }
 
-/// Run the BPF skeleton probe. Attaches kprobes to the given functions,
-/// waits for the trigger to fire, returns captured events.
+/// Detect which param (if any) is a char * string.
+/// Uses BTF type detection first, then name heuristic as fallback.
+/// Returns 0xff if none found.
+fn detect_str_param(btf_func: &BtfFunc) -> u8 {
+    let max = btf_func.params.len().min(6);
+    // BTF-based: check is_string_ptr flag set by parse_btf_functions.
+    for (i, p) in btf_func.params[..max].iter().enumerate() {
+        if p.is_string_ptr {
+            return i as u8;
+        }
+    }
+    // Name heuristic fallback.
+    for (i, p) in btf_func.params[..max].iter().enumerate() {
+        if !p.is_ptr || p.struct_name.is_some() {
+            continue;
+        }
+        let n = p.name.as_str();
+        if matches!(n, "fmt" | "msg" | "str" | "reason" | "buf" | "s")
+            || n.contains("str")
+            || n.contains("msg")
+            || n.contains("fmt")
+        {
+            return i as u8;
+        }
+    }
+    0xff
+}
+
+/// Run the BPF probe skeleton for auto-repro.
+///
+/// Loads two BPF skeletons:
+/// - **Kprobe skeleton** (`probe.bpf.c`): attaches to kernel functions
+///   via `attach_kprobe`. Uses `bpf_get_func_ip` to identify the
+///   firing function and writes to the shared `probe_data` hash map.
+/// - **Fentry skeleton** (`fentry_probe.bpf.c`): attaches to BPF
+///   struct_ops callbacks in batches of 4 via `set_attach_target`.
+///   Shares `probe_data` and `func_meta_map` via `reuse_fd`.
+///
+/// Polls until the trigger kprobe fires (via ring buffer EVENT_TRIGGER)
+/// or `stop` is set. Then iterates `probe_data` entries, matches them
+/// to functions by IP, stitches events by `task_struct` pointer or tid,
+/// and returns them sorted by timestamp.
 pub fn run_probe_skeleton(
     functions: &[StackFunction],
     btf_funcs: &[BtfFunc],
@@ -70,13 +165,15 @@ pub fn run_probe_skeleton(
     use libbpf_rs::skel::{OpenSkel, SkelBuilder};
     use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder};
 
+    tracing::debug!(n = functions.len(), trigger, "run_probe_skeleton",);
+
     // Open skeleton
     let mut open_object = std::mem::MaybeUninit::uninit();
     let builder = ProbeSkelBuilder::default();
     let mut open_skel = match builder.open(&mut open_object) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(%e, "failed to open probe skeleton");
+            tracing::error!(%e, "probe skeleton open failed");
             return None;
         }
     };
@@ -90,17 +187,19 @@ pub fn run_probe_skeleton(
     let skel = match open_skel.load() {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(%e, "failed to load probe skeleton");
+            tracing::error!(%e, "probe skeleton load failed");
             return None;
         }
     };
 
     // Populate func_meta_map with function IPs and metadata
     let mut func_ips: Vec<(u32, u64, String)> = Vec::new(); // (idx, ip, display_name)
+    let mut bpf_funcs: Vec<(u32, &StackFunction)> = Vec::new(); // BPF functions for fentry
 
     for (idx, func) in functions.iter().enumerate() {
         if func.is_bpf {
-            continue; // BPF fentry handled separately (future)
+            bpf_funcs.push((idx as u32, func));
+            continue;
         }
         let ip = match resolve_func_ip(&func.raw_name) {
             Some(ip) => ip,
@@ -110,14 +209,18 @@ pub fn run_probe_skeleton(
             }
         };
 
-        let meta = types::func_meta {
+        let mut meta = types::func_meta {
             func_idx: idx as u32,
             ..Default::default()
         };
 
-        // nr_field_specs stays 0: BPF-side field dereferencing
-        // uses raw args. Full field capture needs CO-RE offset
-        // metadata which varies per kernel.
+        // Populate field specs from BTF-resolved offsets.
+        if let Some(btf_func) = btf_funcs.iter().find(|f| f.name == func.raw_name) {
+            let field_specs = super::btf::resolve_field_specs(btf_func, None);
+            populate_field_specs(&mut meta, &field_specs);
+            // Detect char * params for string capture.
+            meta.str_param_idx = detect_str_param(btf_func);
+        }
 
         let key_bytes = ip.to_ne_bytes();
         let meta_bytes = unsafe {
@@ -136,31 +239,253 @@ pub fn run_probe_skeleton(
             continue;
         }
 
+        tracing::debug!(func = %func.raw_name, ip, nr = meta.nr_field_specs, "kprobe meta");
         func_ips.push((idx as u32, ip, func.display_name.clone()));
     }
 
     if func_ips.is_empty() {
-        tracing::error!("no functions resolved — nothing to probe");
+        tracing::warn!("no functions resolved to IPs");
         return None;
     }
 
     // Attach kprobes to each function using the raw kernel symbol name.
-    let mut links: Vec<Link> = Vec::new();
-    for (idx, _, _) in &func_ips {
+    let mut links: Vec<(Link, String)> = Vec::new();
+    for (idx, _ip, _name) in &func_ips {
         let raw = &functions[*idx as usize].raw_name;
         match skel.progs.stt_probe.attach_kprobe(false, raw) {
-            Ok(link) => links.push(link),
+            Ok(link) => {
+                links.push((link, raw.clone()));
+            }
             Err(e) => {
-                tracing::warn!(%e, func = %raw, "failed to attach kprobe");
+                tracing::warn!(%e, func = raw, "kprobe attach failed");
             }
         }
+    }
+    tracing::debug!(attached = links.len(), total = func_ips.len(), "kprobes");
+
+    // Attach fentry probes for BPF functions in batches of 4.
+    // Each skeleton load handles up to FENTRY_BATCH fentry targets,
+    // reducing verifier passes. Links keep programs alive after
+    // skeleton drop via kernel refcounting.
+    const FENTRY_BATCH: usize = 4;
+    let mut fentry_links: Vec<Link> = Vec::new();
+    let valid_bpf: Vec<_> = bpf_funcs
+        .iter()
+        .filter(|(_, f)| f.bpf_prog_id.is_some())
+        .collect();
+
+    struct FentryTarget<'a> {
+        slot: usize,
+        fd: i32,
+        idx: u32,
+        name: &'a str,
+        ok: bool,
+    }
+
+    for chunk in valid_bpf.chunks(FENTRY_BATCH) {
+        let mut targets: Vec<FentryTarget<'_>> = Vec::new();
+        for (slot, (idx, func)) in chunk.iter().enumerate() {
+            let prog_id = func.bpf_prog_id.unwrap();
+            let fd = unsafe { libbpf_rs::libbpf_sys::bpf_prog_get_fd_by_id(prog_id) };
+            if fd < 0 {
+                tracing::warn!(prog_id, func = %func.display_name, "fentry: failed to get fd");
+                continue;
+            }
+            targets.push(FentryTarget {
+                slot,
+                fd,
+                idx: *idx,
+                name: &func.display_name,
+                ok: false,
+            });
+        }
+        if targets.is_empty() {
+            continue;
+        }
+
+        use crate::bpf_skel::fentry::*;
+        let mut fentry_open_obj = std::mem::MaybeUninit::uninit();
+        let fentry_builder = FentryProbeSkelBuilder::default();
+        let mut fentry_open = match fentry_builder.open(&mut fentry_open_obj) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "fentry skeleton open failed");
+                for t in &targets {
+                    unsafe { libc::close(t.fd) };
+                }
+                continue;
+            }
+        };
+
+        // Set rodata and attach targets for each slot.
+        if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
+            rodata.stt_enabled = true;
+            for t in &targets {
+                match t.slot {
+                    0 => rodata.stt_fentry_func_idx_0 = t.idx,
+                    1 => rodata.stt_fentry_func_idx_1 = t.idx,
+                    2 => rodata.stt_fentry_func_idx_2 = t.idx,
+                    3 => rodata.stt_fentry_func_idx_3 = t.idx,
+                    _ => {}
+                }
+            }
+        }
+
+        for t in targets.iter_mut() {
+            let prog = match t.slot {
+                0 => &mut fentry_open.progs.stt_fentry_0,
+                1 => &mut fentry_open.progs.stt_fentry_1,
+                2 => &mut fentry_open.progs.stt_fentry_2,
+                3 => &mut fentry_open.progs.stt_fentry_3,
+                _ => continue,
+            };
+            // Attach to the struct_ops wrapper. The fentry BPF handler
+            // dereferences through ctx[0] to reach the real callback args.
+            match prog.set_attach_target(t.fd, Some(t.name.to_string())) {
+                Ok(()) => {
+                    t.ok = true;
+                    tracing::debug!(slot = t.slot, func = t.name, "fentry: set_attach_target ok");
+                }
+                Err(e) => {
+                    tracing::warn!(slot = t.slot, func = t.name, %e, "fentry: set_attach_target failed");
+                }
+            }
+        }
+
+        if !targets.iter().any(|t| t.ok) {
+            for t in &targets {
+                unsafe { libc::close(t.fd) };
+            }
+            continue;
+        }
+
+        // Disable autoload on unused or failed fentry slots so the
+        // verifier doesn't reject the placeholder target.
+        let used_slots: std::collections::HashSet<usize> =
+            targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
+        for slot in 0..FENTRY_BATCH {
+            if !used_slots.contains(&slot) {
+                let prog = match slot {
+                    0 => &mut fentry_open.progs.stt_fentry_0,
+                    1 => &mut fentry_open.progs.stt_fentry_1,
+                    2 => &mut fentry_open.progs.stt_fentry_2,
+                    3 => &mut fentry_open.progs.stt_fentry_3,
+                    _ => continue,
+                };
+                prog.set_autoload(false);
+            }
+        }
+        tracing::debug!(
+            active = used_slots.len(),
+            disabled = FENTRY_BATCH - used_slots.len(),
+            "fentry: loading batch",
+        );
+        // Reuse the main skeleton's maps so fentry events land in the
+        // same probe_data map that the Rust side reads.
+        use std::os::unix::io::AsFd;
+        let _ = fentry_open
+            .maps
+            .probe_data
+            .reuse_fd(skel.maps.probe_data.as_fd());
+        let _ = fentry_open
+            .maps
+            .func_meta_map
+            .reuse_fd(skel.maps.func_meta_map.as_fd());
+
+        let fentry_skel = match fentry_open.load() {
+            Ok(s) => {
+                tracing::debug!("fentry: batch load success");
+                for t in &targets {
+                    unsafe { libc::close(t.fd) };
+                }
+                s
+            }
+            Err(e) => {
+                tracing::warn!(%e, "fentry: batch load failed");
+                for t in &targets {
+                    unsafe { libc::close(t.fd) };
+                }
+                continue;
+            }
+        };
+
+        // Populate func_meta and attach each slot.
+        for t in &targets {
+            if !t.ok {
+                continue;
+            }
+
+            let sentinel_ip = (t.idx as u64) | (1u64 << 63);
+            let mut meta = crate::bpf_skel::types::func_meta {
+                func_idx: t.idx,
+                ..Default::default()
+            };
+
+            if let Some(btf_func) = btf_funcs.iter().find(|f| f.name == t.name) {
+                // Try vmlinux BTF first (for known struct params like
+                // task_struct), then BPF program BTF (for auto-discovered
+                // BPF-local types like task_ctx).
+                let mut field_specs = super::btf::resolve_field_specs(btf_func, None);
+                if field_specs.is_empty()
+                    && let Some(prog_id) = functions
+                        .iter()
+                        .find(|f| f.display_name == t.name)
+                        .and_then(|f| f.bpf_prog_id)
+                {
+                    field_specs = super::btf::resolve_bpf_field_specs(btf_func, prog_id);
+                }
+                populate_field_specs(&mut meta, &field_specs);
+                meta.str_param_idx = detect_str_param(btf_func);
+            }
+
+            let key_bytes = sentinel_ip.to_ne_bytes();
+            let meta_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &meta as *const _ as *const u8,
+                    std::mem::size_of::<crate::bpf_skel::types::func_meta>(),
+                )
+            };
+            let _ = skel
+                .maps
+                .func_meta_map
+                .update(&key_bytes, meta_bytes, MapFlags::ANY);
+            func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
+
+            let result = match t.slot {
+                0 => fentry_skel.progs.stt_fentry_0.attach_trace(),
+                1 => fentry_skel.progs.stt_fentry_1.attach_trace(),
+                2 => fentry_skel.progs.stt_fentry_2.attach_trace(),
+                3 => fentry_skel.progs.stt_fentry_3.attach_trace(),
+                _ => continue,
+            };
+            match result {
+                Ok(link) => {
+                    tracing::debug!(func = t.name, "fentry attached");
+                    fentry_links.push(link);
+                }
+                Err(e) => {
+                    tracing::warn!(%e, func = t.name, "fentry attach failed");
+                }
+            }
+        }
+
+        drop(fentry_skel);
+    }
+    if !valid_bpf.is_empty() {
+        tracing::debug!(
+            attached = fentry_links.len(),
+            total = valid_bpf.len(),
+            "fentry probes",
+        );
     }
 
     // Attach trigger
     match skel.progs.stt_trigger.attach_kprobe(false, trigger) {
-        Ok(link) => links.push(link),
+        Ok(link) => {
+            links.push((link, trigger.to_string()));
+        }
         Err(e) => {
-            tracing::error!(%e, trigger, "failed to attach trigger kprobe");
+            tracing::error!(%e, trigger, "trigger attach failed");
             return None;
         }
     }
@@ -203,9 +528,10 @@ pub fn run_probe_skeleton(
                     func_idx: 0,
                     tid: raw.tid,
                     ts: raw.ts,
-                    args: [0; 6],
+                    args: raw.args,
                     fields: vec![],
                     kstack: raw.kstack[..kstack_sz].to_vec(),
+                    str_val: None,
                 };
 
                 events_clone.lock().unwrap().push(event);
@@ -228,94 +554,166 @@ pub fn run_probe_skeleton(
     // (stt_enabled defaults to false in BPF, but we always want probes
     // active once attached — remove the gate or set it before load.)
 
-    tracing::info!(
-        n_funcs = func_ips.len(),
+    tracing::debug!(
+        funcs = func_ips.len(),
+        links = links.len(),
         trigger,
-        "skeleton probes attached, waiting for trigger"
+        "polling for probe data",
     );
 
-    // Poll until trigger fires or stop requested
+    // Poll until trigger fires or stop requested.  When stop is
+    // signaled, iterate all probe_data entries instead of waiting
+    // for the trigger — the trigger (scx_disable_workfn) runs
+    // asynchronously in a kthread and may not fire before the
+    // payload process exits.
     loop {
         let _ = rb.poll(Duration::from_millis(100));
 
-        if triggered.load(Ordering::Relaxed) {
-            tracing::info!("trigger fired");
-            // Read probe_data map for all functions × current tid
-            // (the trigger event tells us the tid)
-            let guard = events.lock().unwrap();
-            if let Some(trigger_event) = guard.last() {
-                let tid = trigger_event.tid;
-                drop(guard);
+        if triggered.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+            let key_size = std::mem::size_of::<types::probe_key>();
+            let mut probe_events = Vec::new();
+            let mut total_keys = 0u32;
+            let mut unmatched_ips = 0u32;
 
-                let mut probe_events = Vec::new();
-                for (idx, ip, name) in &func_ips {
-                    let key = types::probe_key {
-                        func_ip: *ip,
-                        tid,
-                        _pad: 0,
-                    };
-                    let key_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            &key as *const _ as *const u8,
-                            std::mem::size_of::<types::probe_key>(),
-                        )
-                    };
+            for key_bytes in skel.maps.probe_data.keys() {
+                if key_bytes.len() < key_size {
+                    continue;
+                }
+                total_keys += 1;
+                let key: &types::probe_key =
+                    unsafe { &*(key_bytes.as_ptr() as *const types::probe_key) };
 
-                    if let Ok(val_bytes) = skel.maps.probe_data.lookup(key_bytes, MapFlags::ANY)
-                        && let Some(val_bytes) = val_bytes
-                    {
-                        let entry: &types::probe_entry =
-                            unsafe { &*(val_bytes.as_ptr() as *const types::probe_entry) };
-                        if entry.ts == 0 {
-                            continue; // never hit for this tid
-                        }
-
-                        // Build field keys from BTF info
-                        let field_names: Vec<String> = btf_funcs
-                            .iter()
-                            .find(|f| f.name == *name)
-                            .map(build_field_keys)
-                            .unwrap_or_default();
-
-                        let fields: Vec<(String, u64)> = entry.fields[..entry.nr_fields as usize]
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, &val)| field_names.get(i).map(|k| (k.clone(), val)))
-                            .collect();
-
-                        probe_events.push(ProbeEvent {
-                            func_idx: *idx,
-                            tid,
-                            ts: entry.ts,
-                            args: entry.args,
-                            fields,
-                            kstack: vec![],
-                        });
+                // Find which function this IP belongs to.
+                let func_entry = func_ips.iter().find(|(_, ip, _)| *ip == key.func_ip);
+                let (func_idx, display_name) = match func_entry {
+                    Some((idx, _, name)) => (*idx, name.as_str()),
+                    None => {
+                        unmatched_ips += 1;
+                        continue;
                     }
+                };
+
+                if let Ok(Some(val_bytes)) = skel.maps.probe_data.lookup(&key_bytes, MapFlags::ANY)
+                {
+                    let entry: &types::probe_entry =
+                        unsafe { &*(val_bytes.as_ptr() as *const types::probe_entry) };
+                    if entry.ts == 0 {
+                        continue;
+                    }
+
+                    let field_names: Vec<String> = btf_funcs
+                        .iter()
+                        .find(|f| f.name == display_name)
+                        .map(build_field_keys)
+                        .unwrap_or_default();
+
+                    let nr = (entry.nr_fields as usize).min(16);
+                    let fields: Vec<(String, u64)> = entry.fields[..nr]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &val)| field_names.get(i).map(|k| (k.clone(), val)))
+                        .collect();
+
+                    let str_val = if entry.has_str != 0 {
+                        let s = &entry.str_val;
+                        let bytes: Vec<u8> = s.iter().map(|&b| b as u8).collect();
+                        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                        let text = std::str::from_utf8(&bytes[..len]).unwrap_or("").to_string();
+                        if text.is_empty() { None } else { Some(text) }
+                    } else {
+                        None
+                    };
+
+                    probe_events.push(ProbeEvent {
+                        func_idx,
+                        tid: key.tid,
+                        ts: entry.ts,
+                        args: entry.args,
+                        fields,
+                        kstack: vec![],
+                        str_val,
+                    });
                 }
-
-                // Sort by timestamp
-                probe_events.sort_by_key(|e| e.ts);
-
-                // Add the trigger event's kstack to the last probe event (or create one)
-                let trigger_kstack = events
-                    .lock()
-                    .unwrap()
-                    .last()
-                    .map(|e| e.kstack.clone())
-                    .unwrap_or_default();
-                if let Some(last) = probe_events.last_mut() {
-                    last.kstack = trigger_kstack;
-                }
-
-                return Some(probe_events);
             }
 
-            return None;
-        }
+            probe_events.sort_by_key(|e| e.ts);
 
-        if stop.load(Ordering::Relaxed) {
-            return None;
+            tracing::debug!(
+                events = probe_events.len(),
+                total_keys,
+                unmatched_ips,
+                "probe_data readout",
+            );
+
+            if probe_events.is_empty() {
+                return None;
+            }
+
+            // Stitch by task_struct pointer. Build a map of func_idx →
+            // task_struct param index from BTF, then filter events to
+            // those referencing the same task_struct pointer as the most
+            // recent event (the task that triggered the exit).
+            let task_param_idx: std::collections::HashMap<u32, usize> = func_ips
+                .iter()
+                .filter_map(|(idx, _, name)| {
+                    let btf = btf_funcs.iter().find(|f| f.name == *name)?;
+                    let pos = btf
+                        .params
+                        .iter()
+                        .position(|p| p.struct_name.as_deref() == Some("task_struct"))?;
+                    Some((*idx, pos))
+                })
+                .collect();
+
+            // Get tptr and tid from the trigger event.
+            let trigger_event = events.lock().unwrap().last().cloned();
+            let trigger_tptr: Option<u64> = trigger_event.as_ref().and_then(|e| {
+                let ptr = e.args[0];
+                if ptr != 0 { Some(ptr) } else { None }
+            });
+            let trigger_tid: Option<u32> = trigger_event.as_ref().map(|e| e.tid);
+
+            let target_tptr: Option<u64> = trigger_tptr.or_else(|| {
+                probe_events.iter().rev().find_map(|e| {
+                    let pidx = task_param_idx.get(&e.func_idx)?;
+                    let ptr = e.args[*pidx];
+                    if ptr != 0 { Some(ptr) } else { None }
+                })
+            });
+
+            // Stitch: tptr for task-param functions, tid for non-task functions.
+            // Same filter for both kernel and BPF fentry events.
+            if let Some(tptr) = target_tptr {
+                let ttid = trigger_tid.unwrap_or(0);
+                let before = probe_events.len();
+                probe_events.retain(|e| {
+                    if let Some(&pidx) = task_param_idx.get(&e.func_idx) {
+                        e.args[pidx] == tptr
+                    } else {
+                        e.tid == ttid
+                    }
+                });
+                tracing::debug!(
+                    tptr = format_args!("0x{tptr:x}"),
+                    tid = ttid,
+                    kept = probe_events.len(),
+                    total = before,
+                    "stitched by tptr/tid",
+                );
+            }
+
+            // Attach trigger kstack if available.
+            let trigger_kstack = events
+                .lock()
+                .unwrap()
+                .last()
+                .map(|e| e.kstack.clone())
+                .unwrap_or_default();
+            if let Some(last) = probe_events.last_mut() {
+                last.kstack = trigger_kstack;
+            }
+
+            return Some(probe_events);
         }
     }
 }
@@ -332,7 +730,9 @@ mod tests {
                 name: "p".into(),
                 struct_name: Some("task_struct".into()),
                 is_ptr: true,
+                ..Default::default()
             }],
+            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(
@@ -350,7 +750,9 @@ mod tests {
                 name: "flags".into(),
                 struct_name: None,
                 is_ptr: false,
+                ..Default::default()
             }],
+            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(keys.iter().any(|k| k.contains("flags:val.flags")));
@@ -364,7 +766,9 @@ mod tests {
                 name: "ctx".into(),
                 struct_name: None,
                 is_ptr: true,
+                ..Default::default()
             }],
+            source_loc: None,
         };
         let keys = build_field_keys(&func);
         // Raw pointer with no struct info: no keys generated
@@ -376,6 +780,7 @@ mod tests {
         let func = super::BtfFunc {
             name: "empty".into(),
             params: vec![],
+            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(keys.is_empty());
@@ -394,10 +799,157 @@ mod tests {
                 name: "p".into(),
                 struct_name: Some("unknown_struct_xyz".into()),
                 is_ptr: true,
+                ..Default::default()
             }],
+            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(keys.is_empty(), "unknown struct should produce no keys");
+    }
+
+    // -- detect_str_param --
+
+    #[test]
+    fn detect_str_param_btf_string_ptr() {
+        let func = BtfFunc {
+            name: "test".into(),
+            params: vec![
+                super::super::btf::BtfParam {
+                    name: "p".into(),
+                    struct_name: Some("task_struct".into()),
+                    is_ptr: true,
+                    ..Default::default()
+                },
+                super::super::btf::BtfParam {
+                    name: "fmt".into(),
+                    struct_name: None,
+                    is_ptr: true,
+                    is_string_ptr: true,
+                    ..Default::default()
+                },
+            ],
+            source_loc: None,
+        };
+        assert_eq!(detect_str_param(&func), 1);
+    }
+
+    #[test]
+    fn detect_str_param_name_heuristic() {
+        let func = BtfFunc {
+            name: "test".into(),
+            params: vec![
+                super::super::btf::BtfParam {
+                    name: "flags".into(),
+                    struct_name: None,
+                    is_ptr: false,
+                    ..Default::default()
+                },
+                super::super::btf::BtfParam {
+                    name: "msg".into(),
+                    struct_name: None,
+                    is_ptr: true,
+                    ..Default::default()
+                },
+            ],
+            source_loc: None,
+        };
+        assert_eq!(detect_str_param(&func), 1);
+    }
+
+    #[test]
+    fn detect_str_param_none() {
+        let func = BtfFunc {
+            name: "test".into(),
+            params: vec![super::super::btf::BtfParam {
+                name: "flags".into(),
+                struct_name: None,
+                is_ptr: false,
+                ..Default::default()
+            }],
+            source_loc: None,
+        };
+        assert_eq!(detect_str_param(&func), 0xff);
+    }
+
+    #[test]
+    fn detect_str_param_struct_ptr_not_string() {
+        let func = BtfFunc {
+            name: "test".into(),
+            params: vec![super::super::btf::BtfParam {
+                name: "rq".into(),
+                struct_name: Some("rq".into()),
+                is_ptr: true,
+                ..Default::default()
+            }],
+            source_loc: None,
+        };
+        assert_eq!(detect_str_param(&func), 0xff);
+    }
+
+    #[test]
+    fn detect_str_param_name_contains_str() {
+        let func = BtfFunc {
+            name: "test".into(),
+            params: vec![super::super::btf::BtfParam {
+                name: "my_str_ptr".into(),
+                struct_name: None,
+                is_ptr: true,
+                ..Default::default()
+            }],
+            source_loc: None,
+        };
+        assert_eq!(detect_str_param(&func), 0);
+    }
+
+    // -- build_field_keys with auto_fields --
+
+    #[test]
+    fn build_field_keys_auto_fields() {
+        let func = BtfFunc {
+            name: "test".into(),
+            params: vec![super::super::btf::BtfParam {
+                name: "ctx".into(),
+                struct_name: None,
+                is_ptr: true,
+                auto_fields: vec![
+                    ("field_a".into(), "->field_a".into()),
+                    ("field_b".into(), "->field_b".into()),
+                ],
+                type_name: Some("task_ctx".into()),
+                ..Default::default()
+            }],
+            source_loc: None,
+        };
+        let keys = build_field_keys(&func);
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].contains("task_ctx*"));
+        assert!(keys[0].contains("field_a"));
+        assert!(keys[1].contains("field_b"));
+    }
+
+    // -- build_field_keys with cpumask fields --
+
+    #[test]
+    fn build_field_keys_includes_cpumask_words() {
+        let func = BtfFunc {
+            name: "test".into(),
+            params: vec![super::super::btf::BtfParam {
+                name: "p".into(),
+                struct_name: Some("task_struct".into()),
+                is_ptr: true,
+                ..Default::default()
+            }],
+            source_loc: None,
+        };
+        let keys = build_field_keys(&func);
+        assert!(
+            keys.iter().any(|k| k.contains("cpumask_0")),
+            "should have cpumask_0: {keys:?}",
+        );
+        assert!(
+            keys.iter().any(|k| k.contains("cpumask_3")),
+            "should have cpumask_3: {keys:?}",
+        );
     }
 
     #[test]
@@ -407,11 +959,13 @@ mod tests {
                 name: format!("p{i}"),
                 struct_name: None,
                 is_ptr: false,
+                ..Default::default()
             })
             .collect();
         let func = super::BtfFunc {
             name: "many".into(),
             params,
+            source_loc: None,
         };
         let keys = build_field_keys(&func);
         // Only first 6 params processed
