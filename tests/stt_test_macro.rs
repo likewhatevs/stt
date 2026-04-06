@@ -29,6 +29,24 @@ fn default_attrs_compile(ctx: &Ctx) -> Result<VerifyResult> {
     Ok(VerifyResult::pass())
 }
 
+/// Verify resolve_func_ip returns a real nonzero address inside the VM.
+/// On the host, kptr_restrict or kernel lockdown hides addresses.
+#[stt_test(sockets = 1, cores = 1, threads = 1)]
+fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<VerifyResult> {
+    let _ = ctx;
+    let ip = stt::probe::process::resolve_func_ip("schedule");
+    if let Some(addr) = ip
+        && addr > 0
+    {
+        return Ok(VerifyResult::pass());
+    }
+    Ok(VerifyResult {
+        passed: false,
+        details: vec![format!("schedule address: {ip:?}")],
+        stats: Default::default(),
+    })
+}
+
 /// Verify that find_test can locate registered entries.
 #[test]
 fn find_registered_tests() {

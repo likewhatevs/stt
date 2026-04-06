@@ -5,7 +5,7 @@ if command -v cargo >/dev/null 2>&1; then
     cargo fmt --all
 
     echo "Running cargo clippy..."
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --features integration -- -D warnings
     if [ $? -ne 0 ]; then
         echo "clippy failed, aborting commit"
         exit 1

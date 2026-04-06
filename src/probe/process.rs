@@ -16,6 +16,7 @@ pub struct ProbeEvent {
 }
 
 /// Resolve a kernel function name to its address via /proc/kallsyms.
+#[cfg_attr(feature = "integration", visibility::make(pub))]
 fn resolve_func_ip(name: &str) -> Option<u64> {
     let kallsyms = std::fs::read_to_string("/proc/kallsyms").ok()?;
     for line in kallsyms.lines() {
@@ -378,16 +379,6 @@ mod tests {
         };
         let keys = build_field_keys(&func);
         assert!(keys.is_empty());
-    }
-
-    #[test]
-    fn resolve_func_ip_known_symbol() {
-        // schedule is present in every kernel's kallsyms.
-        let ip = resolve_func_ip("schedule");
-        // May be None if /proc/kallsyms is restricted.
-        if let Some(addr) = ip {
-            assert!(addr > 0, "schedule should have nonzero address");
-        }
     }
 
     #[test]
