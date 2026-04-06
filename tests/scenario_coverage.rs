@@ -13,7 +13,7 @@ fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::basic::custom_cgroup_pipe_io(ctx)
 }
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::basic::custom_sched_mixed(ctx)
 }
@@ -79,7 +79,7 @@ fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<VerifyResult> {
 
 // -- dynamic --
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_add_midrun(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::dynamic::custom_cgroup_add_midrun(ctx)
 }
@@ -116,7 +116,7 @@ fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::interaction::custom_cgroup_add_load_imbalance(ctx)
 }
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }
@@ -156,7 +156,7 @@ fn cover_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::interaction::custom_cgroup_noctrl_load_imbalance(ctx)
 }
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::interaction::custom_cgroup_io_compute_imbalance(ctx)
 }
