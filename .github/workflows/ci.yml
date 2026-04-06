@@ -30,35 +30,17 @@ jobs:
             pkg-config \
             linux-headers-$(uname -r) || true
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install 1.88 --profile minimal --component clippy,llvm-tools-preview
-          rustup default 1.88
-
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          components: clippy, rustfmt, llvm-tools-preview
 
-      - name: Cache busybox build
-        uses: actions/cache@v4
+      - run: cargo fmt -- --check
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
         with:
-          path: target/debug/build/**/busybox
-          key: ${{ runner.os }}-busybox-v1
-          restore-keys: |
-            ${{ runner.os }}-busybox-
-
-      - name: Install cargo-llvm-cov and cargo-nextest
-        run: |
-          cargo install cargo-llvm-cov --locked
-          cargo install cargo-nextest --locked
+          tool: cargo-llvm-cov,cargo-nextest
 
       - name: Build all workspace members
         run: cargo build --workspace
@@ -94,11 +76,11 @@ jobs:
               -- --skip boot_kernel --skip bench_boot
           fi
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
         with:
-          name: lcov-coverage
-          path: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
 
       - name: Upload nextest JUnit results
         if: always()
