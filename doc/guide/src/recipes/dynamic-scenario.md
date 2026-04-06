@@ -6,9 +6,10 @@ without hand-written `Action::Custom` functions.
 ## Basic: two phases with cpuset resize
 
 ```rust
+use stt::prelude::*;
 use stt::scenario::ops::*;
 
-fn my_resize_scenario(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn my_resize_scenario(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         // Phase 1: two disjoint cgroups, hold for half the duration
         Step {
@@ -46,9 +47,10 @@ fn my_resize_scenario(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
 ## Using Traverse for random topology walks
 
 ```rust
+use stt::prelude::*;
 use stt::scenario::ops::*;
 
-fn my_traverse_scenario(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn my_traverse_scenario(ctx: &Ctx) -> Result<VerifyResult> {
     let traverse = Traverse {
         seed: Some(42),
         cgroup_count: 2..=4,

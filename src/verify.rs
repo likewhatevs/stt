@@ -24,6 +24,7 @@ static COVERAGE_GAP_MS: AtomicU64 = AtomicU64::new(0);
 /// When true, unfair spread produces a warning detail but does not fail the result.
 ///
 /// `pub` because main.rs is a separate binary crate.
+#[doc(hidden)]
 pub fn set_warn_unfair(v: bool) {
     WARN_UNFAIR.store(v, Ordering::Relaxed);
 }
@@ -35,6 +36,7 @@ pub fn set_warn_unfair(v: bool) {
 /// 0 means use the default (2000ms release, 3000ms debug).
 ///
 /// `pub` because main.rs is a separate binary crate.
+#[doc(hidden)]
 pub fn set_coverage_gap_ms(ms: u64) {
     COVERAGE_GAP_MS.store(ms, Ordering::Relaxed);
 }
@@ -255,8 +257,8 @@ impl Default for VerificationPlan {
 #[derive(Clone, Copy, Debug)]
 pub struct Verify {
     // Worker checks
-    pub not_starved: bool,
-    pub isolation: bool,
+    pub not_starved: Option<bool>,
+    pub isolation: Option<bool>,
     pub max_gap_ms: Option<u64>,
     pub max_spread_pct: Option<f64>,
 
@@ -272,8 +274,8 @@ pub struct Verify {
 impl Verify {
     /// Empty verify — no checks enabled, all overrides None.
     pub const NONE: Verify = Verify {
-        not_starved: false,
-        isolation: false,
+        not_starved: None,
+        isolation: None,
         max_gap_ms: None,
         max_spread_pct: None,
         max_imbalance_ratio: None,
@@ -289,8 +291,8 @@ impl Verify {
     pub const fn default_checks() -> Verify {
         use crate::monitor::MonitorThresholds;
         Verify {
-            not_starved: true,
-            isolation: false,
+            not_starved: Some(true),
+            isolation: None,
             max_gap_ms: None,
             max_spread_pct: None,
             max_imbalance_ratio: Some(MonitorThresholds::DEFAULT.max_imbalance_ratio),
@@ -303,12 +305,12 @@ impl Verify {
     }
 
     pub const fn check_not_starved(mut self) -> Self {
-        self.not_starved = true;
+        self.not_starved = Some(true);
         self
     }
 
     pub const fn check_isolation(mut self) -> Self {
-        self.isolation = true;
+        self.isolation = Some(true);
         self
     }
 
@@ -353,15 +355,21 @@ impl Verify {
     }
 
     /// Merge `other` on top of `self`. Each `Some` field in `other`
-    /// overrides the corresponding field in `self`. Bare `bool` fields
-    /// use OR (enabling in either layer keeps the check enabled).
+    /// overrides the corresponding field in `self`; `None` fields
+    /// inherit from `self`.
     ///
     /// Use when composing scheduler-level and test-level overrides:
     /// `Verify::default_checks().merge(&scheduler.verify).merge(&test.verify)`.
     pub const fn merge(&self, other: &Verify) -> Verify {
         Verify {
-            not_starved: self.not_starved || other.not_starved,
-            isolation: self.isolation || other.isolation,
+            not_starved: match other.not_starved {
+                Some(v) => Some(v),
+                None => self.not_starved,
+            },
+            isolation: match other.isolation {
+                Some(v) => Some(v),
+                None => self.isolation,
+            },
             max_gap_ms: match other.max_gap_ms {
                 Some(v) => Some(v),
                 None => self.max_gap_ms,
@@ -400,8 +408,8 @@ impl Verify {
     /// Extract a `VerificationPlan` for worker-side checks.
     pub fn worker_plan(&self) -> VerificationPlan {
         VerificationPlan {
-            not_starved: self.not_starved,
-            isolation: self.isolation,
+            not_starved: self.not_starved.unwrap_or(false),
+            isolation: self.isolation.unwrap_or(false),
             max_gap_ms: self.max_gap_ms,
             max_spread_pct: self.max_spread_pct,
         }
@@ -1098,8 +1106,8 @@ mod tests {
     #[test]
     fn verify_none_has_no_checks() {
         let v = Verify::NONE;
-        assert!(!v.not_starved);
-        assert!(!v.isolation);
+        assert!(v.not_starved.is_none());
+        assert!(v.isolation.is_none());
         assert!(v.max_gap_ms.is_none());
         assert!(v.max_spread_pct.is_none());
         assert!(v.max_imbalance_ratio.is_none());
@@ -1108,8 +1116,8 @@ mod tests {
     #[test]
     fn verify_default_checks_enables_not_starved() {
         let v = Verify::default_checks();
-        assert!(v.not_starved);
-        assert!(!v.isolation);
+        assert_eq!(v.not_starved, Some(true));
+        assert!(v.isolation.is_none());
         assert!(v.max_imbalance_ratio.is_some());
         assert!(v.max_local_dsq_depth.is_some());
         assert!(v.fail_on_stall.is_some());
@@ -1126,7 +1134,7 @@ mod tests {
             .max_gap_ms(5000)
             .max_imbalance_ratio(2.0);
         let merged = base.merge(&other);
-        assert!(merged.not_starved);
+        assert_eq!(merged.not_starved, Some(true));
         assert_eq!(merged.max_gap_ms, Some(5000));
         assert_eq!(merged.max_imbalance_ratio, Some(2.0));
     }
@@ -1135,7 +1143,7 @@ mod tests {
     fn verify_merge_preserves_self_when_other_is_none() {
         let base = Verify::default_checks();
         let merged = base.merge(&Verify::NONE);
-        assert!(merged.not_starved);
+        assert_eq!(merged.not_starved, Some(true));
         assert!(merged.max_imbalance_ratio.is_some());
         assert!(merged.max_local_dsq_depth.is_some());
     }
@@ -1149,12 +1157,36 @@ mod tests {
     }
 
     #[test]
-    fn verify_merge_bool_fields_or() {
+    fn verify_merge_last_some_wins() {
         let base = Verify::NONE.check_not_starved();
         let other = Verify::NONE.check_isolation();
         let merged = base.merge(&other);
-        assert!(merged.not_starved);
-        assert!(merged.isolation);
+        assert_eq!(merged.not_starved, Some(true));
+        assert_eq!(merged.isolation, Some(true));
+    }
+
+    #[test]
+    fn verify_merge_child_disables_not_starved() {
+        let base = Verify::default_checks(); // not_starved = Some(true)
+        let other = Verify {
+            not_starved: Some(false),
+            ..Verify::NONE
+        };
+        let merged = base.merge(&other);
+        assert_eq!(merged.not_starved, Some(false));
+        assert!(!merged.worker_plan().not_starved);
+    }
+
+    #[test]
+    fn verify_merge_child_disables_isolation() {
+        let base = Verify::NONE.check_isolation(); // isolation = Some(true)
+        let other = Verify {
+            isolation: Some(false),
+            ..Verify::NONE
+        };
+        let merged = base.merge(&other);
+        assert_eq!(merged.isolation, Some(false));
+        assert!(!merged.worker_plan().isolation);
     }
 
     #[test]
@@ -1164,6 +1196,8 @@ mod tests {
             .check_isolation()
             .max_gap_ms(3000)
             .max_spread_pct(25.0);
+        assert_eq!(v.not_starved, Some(true));
+        assert_eq!(v.isolation, Some(true));
         let plan = v.worker_plan();
         assert!(plan.not_starved);
         assert!(plan.isolation);
@@ -1220,8 +1254,8 @@ mod tests {
             .sustained_samples(3)
             .max_fallback_rate(100.0)
             .max_keep_last_rate(50.0);
-        assert!(v.not_starved);
-        assert!(v.isolation);
+        assert_eq!(v.not_starved, Some(true));
+        assert_eq!(v.isolation, Some(true));
         assert_eq!(v.max_gap_ms, Some(1000));
         assert_eq!(v.max_spread_pct, Some(5.0));
         assert_eq!(v.max_imbalance_ratio, Some(3.0));
@@ -1331,7 +1365,7 @@ mod tests {
             .max_fallback_rate(50.0);
         let test = Verify::NONE.max_gap_ms(5000);
         let merged = defaults.merge(&sched).merge(&test);
-        assert!(merged.not_starved);
+        assert_eq!(merged.not_starved, Some(true));
         assert_eq!(merged.max_imbalance_ratio, Some(2.0));
         assert_eq!(merged.max_fallback_rate, Some(50.0));
         assert_eq!(merged.max_gap_ms, Some(5000));
@@ -1528,7 +1562,7 @@ mod tests {
     fn verify_merge_none_preserves_base() {
         let base = Verify::default_checks();
         let merged = base.merge(&Verify::NONE);
-        assert!(merged.not_starved);
+        assert_eq!(merged.not_starved, Some(true));
         assert!(merged.max_imbalance_ratio.is_some());
         assert!(merged.fail_on_stall.is_some());
     }
@@ -1541,7 +1575,7 @@ mod tests {
             .max_gap_ms(1000)
             .check_not_starved();
         let merged = base.merge(&overrides);
-        assert!(merged.not_starved);
+        assert_eq!(merged.not_starved, Some(true));
         assert_eq!(merged.max_imbalance_ratio, Some(5.0));
         assert_eq!(merged.max_gap_ms, Some(1000));
     }
@@ -1561,6 +1595,8 @@ mod tests {
             .check_isolation()
             .max_gap_ms(500)
             .max_spread_pct(10.0);
+        assert_eq!(v.not_starved, Some(true));
+        assert_eq!(v.isolation, Some(true));
         let plan = v.worker_plan();
         assert!(plan.not_starved);
         assert!(plan.isolation);

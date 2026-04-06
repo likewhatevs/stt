@@ -5,9 +5,18 @@
 - Linux host with KVM access (`/dev/kvm`)
 - Rust toolchain (stable)
 
+## Add the dependency
+
+stt is not on crates.io. Add it as a git dependency:
+
+```toml
+[dev-dependencies]
+stt = { git = "https://github.com/likewhatevs/stt" }
+```
+
 ## Write a test
 
-Add stt as a dependency, then write an `#[stt_test]` function. The
+Write an `#[stt_test]` function. The
 [`prelude`](https://likewhatevs.github.io/stt/api/stt/prelude/index.html)
 module re-exports the types you need:
 

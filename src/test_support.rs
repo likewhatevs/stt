@@ -240,17 +240,6 @@ impl Scheduler {
         self
     }
 
-    /// Set monitor thresholds via a Verify. Returns self for const chaining.
-    pub const fn thresholds(mut self, thresholds: crate::monitor::MonitorThresholds) -> Self {
-        self.verify.max_imbalance_ratio = Some(thresholds.max_imbalance_ratio);
-        self.verify.max_local_dsq_depth = Some(thresholds.max_local_dsq_depth);
-        self.verify.fail_on_stall = Some(thresholds.fail_on_stall);
-        self.verify.sustained_samples = Some(thresholds.sustained_samples);
-        self.verify.max_fallback_rate = Some(thresholds.max_fallback_rate);
-        self.verify.max_keep_last_rate = Some(thresholds.max_keep_last_rate);
-        self
-    }
-
     /// Names of all flags this scheduler supports.
     pub fn supported_flag_names(&self) -> Vec<&str> {
         self.flags.iter().map(|f| f.name).collect()
@@ -347,6 +336,10 @@ pub struct SttTestEntry {
     /// host has enough CPUs and LLCs to satisfy the request without
     /// oversubscription.
     pub performance_mode: bool,
+    /// Override workload duration in seconds. 0 = use default (2s).
+    pub duration_s: u64,
+    /// Override workers per cgroup. 0 = use default (2).
+    pub workers_per_cell: u32,
 }
 
 /// Distributed slice collecting all `#[stt_test]` entries via linkme.
@@ -1061,11 +1054,21 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
+    let duration = if entry.duration_s > 0 {
+        Duration::from_secs(entry.duration_s)
+    } else {
+        Duration::from_secs(2)
+    };
+    let workers_per_cell = if entry.workers_per_cell > 0 {
+        entry.workers_per_cell as usize
+    } else {
+        2
+    };
     let ctx = Ctx {
         cgroups: &cgroups,
         topo: &topo,
-        duration: Duration::from_secs(2),
-        workers_per_cell: 2,
+        duration,
+        workers_per_cell,
         sched_pid,
         settle_ms: 500,
         work_type_override,
@@ -1729,6 +1732,8 @@ mod tests {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: None,
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     #[test]
@@ -2380,7 +2385,7 @@ mod tests {
         assert!(s.flags.is_empty());
         assert!(s.sysctls.is_empty());
         assert!(s.kargs.is_empty());
-        assert!(!s.verify.not_starved);
+        assert!(s.verify.not_starved.is_none());
         assert!(s.verify.max_imbalance_ratio.is_none());
     }
 
@@ -2525,22 +2530,12 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_with_thresholds() {
-        let t = crate::monitor::MonitorThresholds {
-            max_imbalance_ratio: 2.0,
-            ..Default::default()
-        };
-        let s = Scheduler::new("sched").thresholds(t);
-        assert_eq!(s.verify.max_imbalance_ratio, Some(2.0));
-    }
-
-    #[test]
     fn scheduler_with_verify() {
         let v = crate::verify::Verify::NONE
             .check_not_starved()
             .max_imbalance_ratio(3.0);
         let s = Scheduler::new("sched").verify(v);
-        assert!(s.verify.not_starved);
+        assert_eq!(s.verify.not_starved, Some(true));
         assert_eq!(s.verify.max_imbalance_ratio, Some(3.0));
     }
 
@@ -2981,6 +2976,8 @@ mod tests {
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
+            duration_s: 0,
+            workers_per_cell: 0,
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -3030,6 +3027,8 @@ mod tests {
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
+            duration_s: 0,
+            workers_per_cell: 0,
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -3106,6 +3105,8 @@ mod tests {
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
+            duration_s: 0,
+            workers_per_cell: 0,
         }
     }
 
@@ -3134,6 +3135,8 @@ mod tests {
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
+            duration_s: 0,
+            workers_per_cell: 0,
         }
     }
 

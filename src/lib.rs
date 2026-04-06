@@ -119,13 +119,12 @@ pub mod prelude {
     pub use anyhow::Result;
 
     pub use crate::cgroup::CgroupManager;
-    pub use crate::monitor::bpf_map::{BpfMapAccessor, BpfMapAccessorOwned, BpfMapInfo};
-    pub use crate::monitor::guest::GuestKernel;
+    pub use crate::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
     pub use crate::scenario::{CgroupGroup, Ctx};
     pub use crate::stt_test;
     pub use crate::test_support::{Scheduler, SchedulerSpec};
-    pub use crate::verify::{VerificationPlan, VerifyResult};
-    pub use crate::workload::{WorkType, WorkloadConfig, WorkloadHandle};
+    pub use crate::verify::{VerificationPlan, Verify, VerifyResult};
+    pub use crate::workload::{WorkType, WorkerReport, WorkloadConfig, WorkloadHandle};
 }
 
 /// Find a bootable kernel image on the host.

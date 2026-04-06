@@ -70,7 +70,7 @@ In `#[stt_test]`:
     threads = 2,
     performance_mode = true,
 )]
-fn my_perf_test(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn my_perf_test(ctx: &Ctx) -> Result<VerifyResult> {
     // vCPUs are pinned, hugepage-backed
     Ok(VerifyResult::pass())
 }

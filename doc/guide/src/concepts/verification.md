@@ -49,8 +49,8 @@ and monitor thresholds:
 ```rust
 pub struct Verify {
     // Worker checks
-    pub not_starved: bool,
-    pub isolation: bool,
+    pub not_starved: Option<bool>,
+    pub isolation: Option<bool>,
     pub max_gap_ms: Option<u64>,
     pub max_spread_pct: Option<f64>,
 
@@ -64,8 +64,7 @@ pub struct Verify {
 }
 ```
 
-Each `Option` field acts as an override -- `None` means "inherit from
-parent layer."
+Every field is `Option`. `None` means "inherit from parent layer."
 
 ## Merge layers
 
@@ -77,10 +76,8 @@ Verification uses a three-layer merge:
 3. Per-test `verify` -- test-specific overrides via `#[stt_test]`
    attributes.
 
-Each `Some` in a higher layer overrides the lower. The bare `bool`
-fields (`not_starved`, `isolation`) use OR logic -- enabling a check
-in any layer keeps it enabled. `Option<bool>` fields like `fail_on_stall`
-use last-`Some`-wins semantics like the other `Option` fields.
+All fields use last-`Some`-wins semantics. A `Some(false)` in a
+higher layer can disable a check that a lower layer enabled.
 
 ```rust
 let final_verify = Verify::default_checks()
@@ -88,11 +85,39 @@ let final_verify = Verify::default_checks()
     .merge(&test_verify);
 ```
 
+## Default thresholds
+
+### Worker checks
+
+| Check | Default (release) | Default (debug) |
+|---|---|---|
+| Scheduling gap | 2000 ms | 3000 ms |
+| Fairness spread | 15% | 35% |
+
+Debug builds run in small VMs with higher scheduling overhead, so
+thresholds are relaxed. The coverage gap override
+(`set_coverage_gap_ms`) further raises the gap threshold for
+instrumented builds.
+
+### Monitor checks
+
+| Threshold | Default | Rationale |
+|---|---|---|
+| `max_imbalance_ratio` | 4.0 | Max/min `nr_running` across CPUs. Lower values (2-3) false-positive during cpuset transitions. |
+| `max_local_dsq_depth` | 50 | Per-CPU dispatch queue overflow. Sustained depth above this means the scheduler is not consuming dispatched tasks. |
+| `fail_on_stall` | true | Fail when `rq_clock` does not advance on a CPU with runnable tasks. Idle CPUs (NOHZ) are exempt. |
+| `sustained_samples` | 5 | At ~100ms sample interval, requires ~500ms of sustained violation. Filters transient spikes from cpuset reconfiguration. |
+| `max_fallback_rate` | 200.0/s | `select_cpu_fallback` events per second across all CPUs. Sustained rate indicates systematic `select_cpu` failure. |
+| `max_keep_last_rate` | 100.0/s | `dispatch_keep_last` events per second across all CPUs. Sustained rate indicates dispatch starvation. |
+
+All monitor thresholds use the `sustained_samples` window -- a
+violation must persist for N consecutive samples before failing.
+
 ## Constants
 
 - `Verify::NONE` -- all checks disabled, all overrides `None`.
 - `Verify::default_checks()` -- `not_starved` enabled, monitor
-  thresholds populated from defaults.
+  thresholds populated from `MonitorThresholds::DEFAULT`.
 
 For examples of overriding thresholds at the scheduler and per-test
 level, see [Customize Verification](../recipes/custom-verification.md).

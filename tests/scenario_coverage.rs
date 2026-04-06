@@ -72,7 +72,7 @@ fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
 }
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance = 20.0, sustained_samples = 15)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15)]
 fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
 }
@@ -269,6 +269,8 @@ fn cover_watchdog_forced_stall() {
         watchdog_timeout_jiffies: 2000,
         bpf_map_write: None,
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_FORCED_STALL);
@@ -327,6 +329,8 @@ fn neg_stall_detection_scx_exit() {
         watchdog_timeout_jiffies: 3000,
         bpf_map_write: None,
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_STALL_DETECT);
@@ -376,6 +380,8 @@ fn neg_sched_death_no_verify_result() {
         watchdog_timeout_jiffies: 3000,
         bpf_map_write: None,
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_SCHED_DEATH);
@@ -440,6 +446,8 @@ fn neg_auto_repro_on_verify_failure() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: None,
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_AUTO_REPRO_VERIFY);
@@ -510,6 +518,8 @@ fn neg_crash_after_auto_repro() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_CRASH),
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_CRASH_AFTER);
@@ -580,6 +590,8 @@ fn demo_bpf_crash_auto_repro() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_CRASH),
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_DEMO_CRASH);
@@ -655,6 +667,8 @@ fn neg_host_crash_auto_repro() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_CRASH),
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_HOST_CRASH);
@@ -724,6 +738,8 @@ fn demo_host_crash_auto_repro() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_CRASH),
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_DEMO_CRASH);
@@ -738,7 +754,7 @@ fn demo_host_crash_auto_repro() {
     scheduler = STT_SCHED,
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_jiffies = 60000,
-    max_imbalance = 20.0,
+    max_imbalance_ratio = 20.0,
     sustained_samples = 15,
 )]
 fn cover_monitor_evaluation(ctx: &Ctx) -> Result<VerifyResult> {

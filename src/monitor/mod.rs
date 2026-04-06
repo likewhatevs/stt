@@ -514,67 +514,12 @@ impl MonitorThresholds {
         max_fallback_rate: 200.0,
         max_keep_last_rate: 100.0,
     };
-
-    /// Merge per-test overrides on top of these thresholds. Each `Some`
-    /// field in `overrides` replaces the corresponding field in `self`.
-    pub fn merge(&self, overrides: &ThresholdOverrides) -> MonitorThresholds {
-        MonitorThresholds {
-            max_imbalance_ratio: overrides
-                .max_imbalance_ratio
-                .unwrap_or(self.max_imbalance_ratio),
-            max_local_dsq_depth: overrides
-                .max_local_dsq_depth
-                .unwrap_or(self.max_local_dsq_depth),
-            fail_on_stall: overrides.fail_on_stall.unwrap_or(self.fail_on_stall),
-            sustained_samples: overrides
-                .sustained_samples
-                .unwrap_or(self.sustained_samples),
-            max_fallback_rate: overrides
-                .max_fallback_rate
-                .unwrap_or(self.max_fallback_rate),
-            max_keep_last_rate: overrides
-                .max_keep_last_rate
-                .unwrap_or(self.max_keep_last_rate),
-        }
-    }
 }
 
 impl Default for MonitorThresholds {
     fn default() -> Self {
         Self::DEFAULT
     }
-}
-
-/// Optional per-field overrides for [`MonitorThresholds`]. Used by
-/// `SttTestEntry` to carry proc-macro-specified threshold values.
-/// Each `Some` field replaces the corresponding default via [`MonitorThresholds::merge`].
-#[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
-pub struct ThresholdOverrides {
-    /// Override for [`MonitorThresholds::max_imbalance_ratio`].
-    pub max_imbalance_ratio: Option<f64>,
-    /// Override for [`MonitorThresholds::max_local_dsq_depth`].
-    pub max_local_dsq_depth: Option<u32>,
-    /// Override for [`MonitorThresholds::fail_on_stall`].
-    pub fail_on_stall: Option<bool>,
-    /// Override for [`MonitorThresholds::sustained_samples`].
-    pub sustained_samples: Option<usize>,
-    /// Override for [`MonitorThresholds::max_fallback_rate`].
-    pub max_fallback_rate: Option<f64>,
-    /// Override for [`MonitorThresholds::max_keep_last_rate`].
-    pub max_keep_last_rate: Option<f64>,
-}
-
-impl ThresholdOverrides {
-    #[allow(dead_code)]
-    pub const NONE: ThresholdOverrides = ThresholdOverrides {
-        max_imbalance_ratio: None,
-        max_local_dsq_depth: None,
-        fail_on_stall: None,
-        sustained_samples: None,
-        max_fallback_rate: None,
-        max_keep_last_rate: None,
-    };
 }
 
 /// Verdict from evaluating monitor data against thresholds.
@@ -2144,28 +2089,6 @@ mod tests {
     }
 
     #[test]
-    fn thresholds_merge_event_rate_overrides() {
-        let base = MonitorThresholds::DEFAULT;
-        let overrides = ThresholdOverrides {
-            max_fallback_rate: Some(50.0),
-            max_keep_last_rate: Some(25.0),
-            ..Default::default()
-        };
-        let merged = base.merge(&overrides);
-        assert!((merged.max_fallback_rate - 50.0).abs() < f64::EPSILON);
-        assert!((merged.max_keep_last_rate - 25.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn thresholds_merge_event_rate_none_keeps_default() {
-        let base = MonitorThresholds::DEFAULT;
-        let overrides = ThresholdOverrides::NONE;
-        let merged = base.merge(&overrides);
-        assert!((merged.max_fallback_rate - 200.0).abs() < f64::EPSILON);
-        assert!((merged.max_keep_last_rate - 100.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
     fn summary_keep_last_rate_computed() {
         // 2 CPUs, each with keep_last incrementing by 5 per sample.
         // 3 samples over 200ms -> total delta = 2*10 = 20, rate = 20/0.2 = 100.
@@ -2240,24 +2163,6 @@ mod tests {
         assert_eq!(d.total_dispatch_offline, 100);
         assert_eq!(d.total_enq_skip_exiting, 100);
         assert_eq!(d.total_enq_skip_migration_disabled, 100);
-    }
-
-    // -- ThresholdOverrides merge --
-
-    #[test]
-    fn threshold_overrides_partial_merge() {
-        let base = MonitorThresholds::DEFAULT;
-        let overrides = ThresholdOverrides {
-            max_imbalance_ratio: Some(10.0),
-            fail_on_stall: Some(false),
-            ..Default::default()
-        };
-        let merged = base.merge(&overrides);
-        assert!((merged.max_imbalance_ratio - 10.0).abs() < f64::EPSILON);
-        assert!(!merged.fail_on_stall);
-        // Unoverridden fields keep defaults.
-        assert_eq!(merged.max_local_dsq_depth, 50);
-        assert_eq!(merged.sustained_samples, 5);
     }
 
     // -- data_looks_valid tests --

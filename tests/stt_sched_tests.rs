@@ -98,6 +98,8 @@ fn sched_bpf_map_api_integration() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_NOOP),
         performance_mode: false,
+        duration_s: 0,
+        workers_per_cell: 0,
     };
 
     // The bpf_map_write thread exercises the full API:

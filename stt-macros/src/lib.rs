@@ -39,12 +39,12 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut memory_mb = DEFAULT_MEMORY_MB;
     let mut scheduler: Option<syn::Path> = None;
     let mut auto_repro = true;
-    let mut check_not_starved: bool = false;
-    let mut check_isolation: bool = false;
+    let mut not_starved: Option<bool> = None;
+    let mut isolation: Option<bool> = None;
     let mut max_gap_ms: Option<u64> = None;
     let mut max_spread_pct: Option<f64> = None;
-    let mut max_imbalance: Option<f64> = None;
-    let mut max_dsq_depth: Option<u32> = None;
+    let mut max_imbalance_ratio: Option<f64> = None;
+    let mut max_local_dsq_depth: Option<u32> = None;
     let mut fail_on_stall: Option<bool> = None;
     let mut sustained_samples: Option<usize> = None;
     let mut replicas: u32 = 1;
@@ -53,6 +53,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut extra_sched_args: Vec<String> = Vec::new();
     let mut watchdog_timeout_jiffies: u64 = 0;
     let mut performance_mode: bool = false;
+    let mut duration_s: u64 = 0;
+    let mut workers_per_cell: u32 = 0;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -86,7 +88,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         scheduler = Some(p);
                     }
-                    "auto_repro" | "check_not_starved" | "check_isolation" | "performance_mode" => {
+                    "auto_repro" | "not_starved" | "isolation" | "performance_mode" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -103,8 +105,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         match ident.as_str() {
                             "auto_repro" => auto_repro = lit_bool.value(),
-                            "check_not_starved" => check_not_starved = lit_bool.value(),
-                            "check_isolation" => check_isolation = lit_bool.value(),
+                            "not_starved" => not_starved = Some(lit_bool.value()),
+                            "isolation" => isolation = Some(lit_bool.value()),
                             "performance_mode" => performance_mode = lit_bool.value(),
                             _ => unreachable!(),
                         }
@@ -116,7 +118,10 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "replicas"
                     | "sustained_samples"
                     | "max_gap_ms"
-                    | "watchdog_timeout_jiffies" => {
+                    | "watchdog_timeout_jiffies"
+                    | "duration_s"
+                    | "workers_per_cell"
+                    | "max_local_dsq_depth" => {
                         let lit_int = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Int(li),
@@ -173,28 +178,29 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .base10_parse::<u64>()
                                     .unwrap_or_else(|e| panic!("{e}"))
                             }
+                            "duration_s" => {
+                                duration_s = lit_int
+                                    .base10_parse::<u64>()
+                                    .unwrap_or_else(|e| panic!("{e}"))
+                            }
+                            "workers_per_cell" => {
+                                workers_per_cell = lit_int
+                                    .base10_parse::<u32>()
+                                    .unwrap_or_else(|e| panic!("{e}"))
+                            }
+                            "max_local_dsq_depth" => {
+                                max_local_dsq_depth = Some(
+                                    lit_int
+                                        .base10_parse::<u32>()
+                                        .unwrap_or_else(|e| panic!("{e}")),
+                                )
+                            }
                             _ => unreachable!(),
                         }
                     }
-                    "max_dsq_depth" => {
-                        let lit_int = match value {
-                            syn::Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Int(li),
-                                ..
-                            }) => li,
-                            _ => {
-                                return syn::Error::new_spanned(value, "expected integer literal")
-                                    .to_compile_error()
-                                    .into();
-                            }
-                        };
-                        max_dsq_depth = Some(
-                            lit_int
-                                .base10_parse::<u32>()
-                                .unwrap_or_else(|e| panic!("{e}")),
-                        );
-                    }
-                    "max_imbalance" | "max_fallback_rate" | "max_keep_last_rate"
+                    "max_imbalance_ratio"
+                    | "max_fallback_rate"
+                    | "max_keep_last_rate"
                     | "max_spread_pct" => {
                         let lit_float = match value {
                             syn::Expr::Lit(syn::ExprLit {
@@ -214,7 +220,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .base10_parse::<f64>()
                             .unwrap_or_else(|e| panic!("{e}"));
                         match ident.as_str() {
-                            "max_imbalance" => max_imbalance = Some(v),
+                            "max_imbalance_ratio" => max_imbalance_ratio = Some(v),
                             "max_fallback_rate" => max_fallback_rate = Some(v),
                             "max_keep_last_rate" => max_keep_last_rate = Some(v),
                             "max_spread_pct" => max_spread_pct = Some(v),
@@ -270,7 +276,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, check_not_starved, check_isolation, max_gap_ms, max_spread_pct, max_imbalance, max_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, watchdog_timeout_jiffies, performance_mode"),
+                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, watchdog_timeout_jiffies, performance_mode, duration_s, workers_per_cell"),
                         )
                         .to_compile_error()
                         .into();
@@ -333,6 +339,14 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Build Verify field tokens.
+    let not_starved_tokens = match not_starved {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    };
+    let isolation_tokens = match isolation {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    };
     let gap_tokens = match max_gap_ms {
         Some(v) => quote! { Some(#v) },
         None => quote! { None },
@@ -341,11 +355,11 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         Some(v) => quote! { Some(#v) },
         None => quote! { None },
     };
-    let imbalance_tokens = match max_imbalance {
+    let imbalance_tokens = match max_imbalance_ratio {
         Some(v) => quote! { Some(#v) },
         None => quote! { None },
     };
-    let dsq_tokens = match max_dsq_depth {
+    let dsq_tokens = match max_local_dsq_depth {
         Some(v) => quote! { Some(#v) },
         None => quote! { None },
     };
@@ -383,8 +397,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             auto_repro: #auto_repro,
             replicas: #replicas,
             verify: ::stt::verify::Verify {
-                not_starved: #check_not_starved,
-                isolation: #check_isolation,
+                not_starved: #not_starved_tokens,
+                isolation: #isolation_tokens,
                 max_gap_ms: #gap_tokens,
                 max_spread_pct: #spread_tokens,
                 max_imbalance_ratio: #imbalance_tokens,
@@ -398,6 +412,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             watchdog_timeout_jiffies: #watchdog_timeout_jiffies,
             bpf_map_write: None,
             performance_mode: #performance_mode,
+            duration_s: #duration_s,
+            workers_per_cell: #workers_per_cell,
         };
 
         #[test]

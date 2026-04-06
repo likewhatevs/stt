@@ -37,3 +37,7 @@
   - [VMM](architecture/vmm.md)
   - [Monitor](architecture/monitor.md)
   - [Worker Processes](architecture/workers.md)
+
+# Reference
+
+- [Troubleshooting](troubleshooting.md)

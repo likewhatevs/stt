@@ -74,6 +74,35 @@ warning -- the VM runs with regular pages rather than failing.
 See [Performance Mode](../concepts/performance-mode.md) for usage
 and prerequisites.
 
+## Dual-binary architecture
+
+The same `stt` binary serves two roles:
+
+**Host side** -- manages the VM lifecycle: builds the initramfs, boots
+the kernel, runs the monitor, and evaluates results.
+
+**Guest side** -- runs inside the VM as `/init`. Creates cgroups,
+forks workers, runs scenarios, and writes results to the serial
+console.
+
+The role is determined at runtime by how the binary is invoked:
+
+- **`stt vm`** (host): `main()` builds and boots a KVM VM with the
+  stt binary embedded in the initramfs as `/init`.
+- **`stt run`** (guest): `main()` dispatches to the scenario runner.
+  This is the command the host passes to the VM via `run_args`.
+- **`#[stt_test]` host dispatch**: a `#[ctor::ctor]` function
+  (`stt_test_early_dispatch`) runs before `main()` in any binary
+  that links against stt. When both `--stt-test-fn` and `--stt-topo`
+  are present, it boots a VM and runs the test inside it.
+- **`#[stt_test]` guest dispatch**: when only `--stt-test-fn` is
+  present (no `--stt-topo`), the ctor runs the test function
+  directly -- the binary is already inside a VM.
+
+This design means one `cargo build` produces everything needed for
+both host and guest execution. The initramfs embeds the same binary
+that built it.
+
 ## Boot process
 
 1. Load bzImage kernel via `linux-loader`.

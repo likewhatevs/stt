@@ -6,12 +6,10 @@ inside a VM.
 ## Basic usage
 
 ```rust
-use stt::stt_test;
-use stt::scenario::Ctx;
-use stt::verify::VerifyResult;
+use stt::prelude::*;
 
 #[stt_test(sockets = 2, cores = 4, threads = 2)]
-fn my_test(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
     // ctx provides cgroup manager, topology, duration, etc.
     Ok(VerifyResult::pass())
 }
@@ -54,18 +52,18 @@ All attributes are optional with defaults.
 
 | Attribute | Default | Description |
 |---|---|---|
-| `check_not_starved` | `false` | Enable starvation (zero work units), fairness spread, and scheduling gap checks |
-| `check_isolation` | `false` | Enable cpuset isolation check (workers must stay on assigned CPUs) |
+| `not_starved` | inherited | Enable starvation (zero work units), fairness spread, and scheduling gap checks |
+| `isolation` | inherited | Enable cpuset isolation check (workers must stay on assigned CPUs) |
 | `max_gap_ms` | inherited | Max scheduling gap threshold |
 | `max_spread_pct` | inherited | Max fairness spread threshold |
-| `max_imbalance` | inherited | Monitor imbalance ratio |
-| `max_dsq_depth` | inherited | Monitor DSQ depth |
+| `max_imbalance_ratio` | inherited | Monitor imbalance ratio |
+| `max_local_dsq_depth` | inherited | Monitor DSQ depth |
 | `fail_on_stall` | inherited | Fail on stall detection |
 | `sustained_samples` | inherited | Sample window for sustained violations |
 | `max_fallback_rate` | inherited | Max fallback event rate |
 | `max_keep_last_rate` | inherited | Max keep-last event rate |
 
-`check_not_starved` enables three distinct checks: starvation (any
+`not_starved = true` enables three distinct checks: starvation (any
 worker with zero work units), fairness spread (max-min runnable% below
 `max_spread_pct`), and scheduling gaps (longest gap below `max_gap_ms`).
 Each threshold can be overridden independently. See
@@ -80,6 +78,8 @@ the merge chain.
 | `auto_repro` | `true` | Auto-repro on crash |
 | `replicas` | 1 | Number of times to run |
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages |
+| `duration_s` | 0 | Per-scenario duration override (0 = use default 2s) |
+| `workers_per_cell` | 0 | Workers per cgroup override (0 = use default 2) |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
 what `performance_mode` enables, prerequisites, and validation behavior.
@@ -87,13 +87,10 @@ what `performance_mode` enables, prerequisites, and validation behavior.
 ## Example with custom scheduler
 
 ```rust
-use stt::stt_test;
-use stt::scenario::Ctx;
-use stt::test_support::Scheduler;
-use stt::verify::VerifyResult;
+use stt::prelude::*;
 
 const MITOSIS: Scheduler = Scheduler::new("mitosis")
-    .binary(stt::test_support::SchedulerSpec::Name("scx_mitosis"))
+    .binary(SchedulerSpec::Name("scx_mitosis"))
     .flags(&[
         &stt::scenario::flags::LLC_DECL,
         &stt::scenario::flags::BORROW_DECL,
@@ -108,10 +105,10 @@ const MITOSIS: Scheduler = Scheduler::new("mitosis")
     cores = 4,
     threads = 2,
     scheduler = MITOSIS,
-    check_not_starved = true,
+    not_starved = true,
     max_gap_ms = 5000,
 )]
-fn mitosis_basic(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn mitosis_basic(ctx: &Ctx) -> Result<VerifyResult> {
     // Test logic here
     Ok(VerifyResult::pass())
 }

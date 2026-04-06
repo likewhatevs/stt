@@ -38,9 +38,8 @@ kernel's default EEVDF scheduler.
 Use the const builder pattern:
 
 ```rust
-use stt::test_support::{Scheduler, SchedulerSpec};
+use stt::prelude::*;
 use stt::scenario::flags::*;
-use stt::verify::Verify;
 
 const MY_SCHEDULER: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))

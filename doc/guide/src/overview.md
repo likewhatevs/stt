@@ -87,9 +87,9 @@ fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
 }
 ```
 
-The prelude also exports `BpfMapAccessor`, `BpfMapAccessorOwned`,
-`BpfMapInfo`, and `GuestKernel` for host-side BPF map introspection
-and guest memory access.
+The prelude also exports ops types (`CgroupDef`, `CpusetSpec`,
+`Step`, `execute_steps`), `Verify` for composable verification
+config, and `WorkerReport` for telemetry access.
 
 ## Crate structure
 

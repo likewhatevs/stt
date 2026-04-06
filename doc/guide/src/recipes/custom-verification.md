@@ -31,20 +31,20 @@ overrides in the merge chain.
     cores = 4,
     threads = 2,
     scheduler = RELAXED,
-    check_not_starved = true,
+    not_starved = true,
     max_gap_ms = 5000,
-    max_imbalance = 10.0,
+    max_imbalance_ratio = 10.0,
     sustained_samples = 10,
 )]
-fn high_imbalance_test(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn high_imbalance_test(ctx: &Ctx) -> Result<VerifyResult> {
     // ...
     Ok(VerifyResult::pass())
 }
 ```
 
-## Understanding check_not_starved
+## Understanding not_starved
 
-`check_not_starved = true` enables three distinct checks:
+`not_starved = true` enables three distinct checks:
 
 1. **Starvation**: any worker with zero work units fails.
 2. **Fairness spread**: max - min runnable% across workers in a cgroup
@@ -63,14 +63,14 @@ Verify::default_checks()     <- baseline (not_starved, monitor defaults)
     .merge(&test.verify)      <- per-test attribute overrides
 ```
 
-Bare `bool` fields (`not_starved`, `isolation`) use OR -- enabling in
-any layer keeps the check enabled. `Option` fields use last-`Some`-wins
--- a higher layer's value replaces the lower.
+All fields use last-`Some`-wins -- a higher layer's `Some` replaces
+the lower. A scheduler or test can disable a check by setting
+`Some(false)` even if a lower layer enabled it.
 
 ## Using Verify directly in ops scenarios
 
 ```rust
-fn my_scenario(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn my_scenario(ctx: &Ctx) -> Result<VerifyResult> {
     let verify = Verify::NONE
         .check_not_starved()
         .max_gap_ms(3000);

@@ -11,10 +11,10 @@ cannot express.
 ## Writing a custom scenario
 
 ```rust
+use stt::prelude::*;
 use stt::scenario::*;
-use stt::verify::VerifyResult;
 
-fn my_custom_scenario(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn my_custom_scenario(ctx: &Ctx) -> Result<VerifyResult> {
     let wl = dfl_wl(ctx);
     let (handles, _guard) = setup_cells(ctx, 2, &wl)?;
 

@@ -1,3 +1,9 @@
+//! Cgroup v2 filesystem operations for test cell management.
+//!
+//! Creates, configures, and removes cgroups under a parent path
+//! (default `/sys/fs/cgroup/stt`). Provides cpuset assignment,
+//! task migration, and cleanup.
+
 use crate::topology::TestTopology;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;

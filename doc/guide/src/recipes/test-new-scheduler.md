@@ -45,7 +45,7 @@ Once the scheduler passes the gauntlet, write `#[stt_test]` tests for
 CI. Define the scheduler for `#[stt_test]`:
 
 ```rust
-use stt::test_support::{Scheduler, SchedulerSpec};
+use stt::prelude::*;
 use stt::scenario::flags::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
@@ -56,8 +56,11 @@ const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
 Write a test:
 
 ```rust
+use stt::prelude::*;
+use stt::scenario::*;
+
 #[stt_test(sockets = 2, cores = 4, threads = 2, scheduler = MY_SCHED)]
-fn basic_proportional(ctx: &Ctx) -> anyhow::Result<VerifyResult> {
+fn basic_proportional(ctx: &Ctx) -> Result<VerifyResult> {
     let wl = dfl_wl(ctx);
     let (handles, _guard) = setup_cells(ctx, 2, &wl)?;
     std::thread::sleep(ctx.duration);
