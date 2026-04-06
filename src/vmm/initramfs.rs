@@ -22,6 +22,12 @@ busybox mknod /dev/ttyS0 c 4 64 2>/dev/null
 busybox mknod /dev/ttyS1 c 4 65 2>/dev/null
 if ! [ -c /dev/ttyS1 ]; then
     echo "FATAL: /dev/ttyS1 not available" > /dev/ttyS0
+    echo "--- ttyS diagnostic dump ---" > /dev/ttyS0
+    busybox ls -la /dev/ttyS* > /dev/ttyS0 2>&1
+    busybox cat /proc/cmdline > /dev/ttyS0
+    busybox cat /proc/consoles > /dev/ttyS0 2>/dev/null
+    busybox ls -la /sys/class/tty/ > /dev/ttyS0 2>&1
+    echo "--- end diagnostic dump ---" > /dev/ttyS0
     busybox reboot -f
 fi
 echo "STT_INIT_STARTED" > /dev/ttyS1
@@ -560,6 +566,9 @@ mod tests {
         assert!(s.contains("STT_SHM_BASE="));
         assert!(s.contains("STT_INIT_STARTED"));
         assert!(s.contains("STT_PAYLOAD_STARTING"));
+        assert!(s.contains("ttyS diagnostic dump"));
+        assert!(s.contains("/proc/cmdline"));
+        assert!(s.contains("/sys/class/tty/"));
     }
 
     #[test]

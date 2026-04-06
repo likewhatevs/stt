@@ -575,7 +575,8 @@ impl SttVm {
             "no_timer_check clocksource=kvm-clock ",
             "random.trust_cpu=on swiotlb=noforce ",
             "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
-            "pci=off reboot=k panic=-1 iomem=relaxed",
+            "pci=off reboot=k panic=-1 iomem=relaxed ",
+            "8250.nr_uarts=2",
         )
         .to_string();
         if self.init_binary.is_some() {
