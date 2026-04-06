@@ -28,6 +28,9 @@ if [ -x /scheduler ]; then
     export SCHED_PID
     busybox sleep 1
     if ! busybox kill -0 $SCHED_PID 2>/dev/null; then
+        echo "===SCHED_OUTPUT_START===" > /dev/ttyS1
+        busybox cat /tmp/sched.log > /dev/ttyS1 2>/dev/null
+        echo "===SCHED_OUTPUT_END===" > /dev/ttyS1
         echo "SCHEDULER_DIED" > /dev/ttyS1
         echo "STT_EXIT=1" > /dev/ttyS1
         busybox reboot -f

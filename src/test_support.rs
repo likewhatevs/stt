@@ -513,6 +513,9 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
     let dump_section = extract_sched_ext_dump(output)
         .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
         .unwrap_or_default();
+    let sched_log_section = parse_sched_output(output)
+        .map(|s| format!("\n\n--- scheduler log ---\n{s}"))
+        .unwrap_or_default();
 
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
@@ -548,11 +551,12 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
                 .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
                 .unwrap_or_default();
             anyhow::bail!(
-                "stt_test '{}'{} failed:\n  {}{}{}{}",
+                "stt_test '{}'{} failed:\n  {}{}{}{}{}",
                 entry.name,
                 sched_label,
                 details,
                 timeline_section,
+                sched_log_section,
                 dump_section,
                 repro_section,
             );
@@ -609,9 +613,10 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
         );
     }
     anyhow::bail!(
-        "stt_test '{}'{} scheduler died (no test result in COM2){}{}",
+        "stt_test '{}'{} scheduler died (no test result in COM2){}{}{}",
         entry.name,
         sched_label,
+        sched_log_section,
         dump_section,
         repro_section,
     )
