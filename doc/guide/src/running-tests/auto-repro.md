@@ -69,28 +69,51 @@ via BPF map write and captures the scheduling path. Probe output shows
 each function with decoded struct fields and source locations:
 
 ```text
+stt_test 'demo_host_crash_auto_repro' [sched=stt-sched] failed:
+  scheduler died
+
+--- auto-repro ---
 === AUTO-PROBE: scx_exit fired ===
 
   stt_enqueue                                                   main.bpf.c:21
     task_struct *p
       pid         97
       cpus_ptr    0xf(0-3)
-      dsq_id      GLOBAL
-      enq_flags   WAKEUP
-      slice       5000000
+      dsq_id      SCX_DSQ_INVALID
+      enq_flags   NONE
+      slice       0
+      vtime       0
       weight      100
       sticky_cpu  -1
       scx_flags   QUEUED|ENABLED
-    enq_flags     WAKEUP
-
-  stt_dispatch                                                  main.bpf.c:33
-      cpu         2
-
-  do_enqueue_task                                               kernel/sched/ext.c:2210
+  stt_dispatch                                                  main.bpf.c:28
+      cpu         0
     task_struct *p
       pid         97
       cpus_ptr    0xf(0-3)
-      ...
+      dsq_id      SCX_DSQ_INVALID
+      enq_flags   NONE
+      slice       19911318
+      vtime       0
+      weight      100
+      sticky_cpu  -1
+      scx_flags   RESET_RUNNABLE_AT|DEQD_FOR_SLEEP|ENABLED
+  do_enqueue_task                                               kernel/sched/ext.c:1344
+    rq *rq
+      cpu         1
+    task_struct *p
+      pid         97
+      cpus_ptr    0xf(0-3)
+      dsq_id      LOCAL
+      enq_flags   NONE
+      slice       20000000
+      vtime       0
+      weight      100
+      sticky_cpu  -1
+      scx_flags   QUEUED|DEQD_FOR_SLEEP|ENABLED
+  pick_task_scx                                                 kernel/sched/ext.c:2511
+    rq *rq
+      cpu         1
 ```
 
 ## Demo test
