@@ -36,6 +36,7 @@ jobs:
             llvm \
             libelf-dev \
             libcap-dev \
+            binutils-dev \
             gcc \
             make \
             pkg-config
