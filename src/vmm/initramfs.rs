@@ -15,11 +15,15 @@ use std::path::{Path, PathBuf};
 const INIT_SCRIPT: &str = r#"#!/bin/sh
 export PATH=/bin
 busybox mkdir -p /proc /sys /dev /tmp
-busybox mknod /dev/ttyS0 c 4 64
-busybox mknod /dev/ttyS1 c 4 65
 busybox mount -t proc proc /proc
 busybox mount -t sysfs sys /sys
 busybox mount -t devtmpfs dev /dev
+busybox mknod /dev/ttyS0 c 4 64 2>/dev/null
+busybox mknod /dev/ttyS1 c 4 65 2>/dev/null
+if ! [ -c /dev/ttyS1 ]; then
+    echo "FATAL: /dev/ttyS1 not available" > /dev/ttyS0
+    busybox reboot -f
+fi
 echo "STT_INIT_STARTED" > /dev/ttyS1
 busybox mkdir -p /sys/fs/cgroup
 busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
