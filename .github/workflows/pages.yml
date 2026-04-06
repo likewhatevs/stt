@@ -1,0 +1,67 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            linux-tools-common \
+            bpftool \
+            bpftrace \
+            gcc \
+            make \
+            pkg-config
+          sudo apt-get -o Acquire::Retries=3 install -y linux-headers-$(uname -r) || true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@mdbook
+
+      - name: Build guide
+        run: mdbook build doc/guide
+
+      - name: Build API docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: --enable-index-page -Zunstable-options
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site/guide _site/api
+          cp -r doc/guide/book/* _site/guide/
+          cp -r target/doc/* _site/api/
+          cat > _site/index.html <<'HTML'
+          <!DOCTYPE html>
+          <meta http-equiv="refresh" content="0; url=guide/">
+          HTML
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

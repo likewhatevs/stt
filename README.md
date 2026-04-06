@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/likewhatevs/stt/actions/workflows/ci.yml/badge.svg)](https://github.com/likewhatevs/stt/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/likewhatevs/stt/graph/badge.svg)](https://codecov.io/gh/likewhatevs/stt)
+[![guide](https://img.shields.io/badge/docs-guide-blue)](https://likewhatevs.github.io/stt/guide/)
+[![api](https://img.shields.io/badge/docs-api-blue)](https://likewhatevs.github.io/stt/api/stt/)
 
 Test harness for Linux process schedulers, with a focus on
 [sched_ext](https://github.com/sched-ext/scx). Boots kernels in KVM
@@ -33,8 +35,10 @@ cargo stt vm --gauntlet --parallel 4
 
 ## Documentation
 
-**[Guide](doc/guide/src/SUMMARY.md)** -- getting started, concepts,
+**[Guide](https://likewhatevs.github.io/stt/guide/)** -- getting started, concepts,
 writing tests, recipes, architecture.
+
+**[API docs](https://likewhatevs.github.io/stt/api/stt/)** -- rustdoc for all workspace crates.
 
 ## License
 
