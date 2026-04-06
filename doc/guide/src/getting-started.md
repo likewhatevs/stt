@@ -5,7 +5,49 @@
 - Linux host with KVM access (`/dev/kvm`)
 - Rust toolchain (stable)
 
-## Install
+## Write a test
+
+Add stt as a dependency, then write an `#[stt_test]` function. The
+[`prelude`](https://likewhatevs.github.io/stt/api/stt/prelude/index.html)
+module re-exports the types you need:
+
+```rust
+use stt::prelude::*;
+use std::collections::BTreeSet;
+
+#[stt_test(sockets = 1, cores = 2, threads = 1)]
+fn my_scheduler_test(ctx: &Ctx) -> Result<VerifyResult> {
+    // Create a cgroup and assign all CPUs.
+    let mut group = CgroupGroup::new(ctx.cgroups);
+    group.add_cgroup_no_cpuset("workers")?;
+    let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
+    ctx.cgroups.set_cpuset("workers", &cpus)?;
+
+    // Spawn workers into the cgroup.
+    let cfg = WorkloadConfig {
+        num_workers: 2,
+        work_type: WorkType::CpuSpin,
+        ..Default::default()
+    };
+    let mut handle = WorkloadHandle::spawn(&cfg)?;
+    for tid in handle.tids() {
+        ctx.cgroups.move_task("workers", tid)?;
+    }
+    handle.start();
+
+    // Let workers run, then collect results.
+    std::thread::sleep(ctx.duration);
+    let reports = handle.stop_and_collect();
+
+    // Verify: no worker was starved.
+    let plan = VerificationPlan::new().check_not_starved();
+    Ok(plan.verify_cell(&reports, None))
+}
+```
+
+Run with `cargo test` (requires `/dev/kvm`).
+
+## Install the CLI
 
 ```sh
 cargo install --path cargo-stt

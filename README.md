@@ -20,6 +20,49 @@ scheduler.
 
 ## Quick start
 
+### As a library
+
+Write a test that boots a VM, creates a cgroup, runs a workload, and
+checks the result:
+
+```rust
+use stt::prelude::*;
+use std::collections::BTreeSet;
+
+#[stt_test(sockets = 1, cores = 2, threads = 1)]
+fn my_scheduler_test(ctx: &Ctx) -> Result<VerifyResult> {
+    // Create a cgroup and assign all CPUs.
+    let mut group = CgroupGroup::new(ctx.cgroups);
+    group.add_cgroup_no_cpuset("workers")?;
+    let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
+    ctx.cgroups.set_cpuset("workers", &cpus)?;
+
+    // Spawn workers into the cgroup.
+    let cfg = WorkloadConfig {
+        num_workers: 2,
+        work_type: WorkType::CpuSpin,
+        ..Default::default()
+    };
+    let mut handle = WorkloadHandle::spawn(&cfg)?;
+    for tid in handle.tids() {
+        ctx.cgroups.move_task("workers", tid)?;
+    }
+    handle.start();
+
+    // Let workers run, then collect results.
+    std::thread::sleep(ctx.duration);
+    let reports = handle.stop_and_collect();
+
+    // Verify: no worker was starved.
+    let plan = VerificationPlan::new().check_not_starved();
+    Ok(plan.verify_cell(&reports, None))
+}
+```
+
+Run with `cargo test` (requires `/dev/kvm`).
+
+### From the CLI
+
 ```sh
 cargo install --path cargo-stt
 

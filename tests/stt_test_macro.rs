@@ -31,6 +31,7 @@ fn default_attrs_compile(ctx: &Ctx) -> Result<VerifyResult> {
 
 /// Verify resolve_func_ip returns a real nonzero address inside the VM.
 /// On the host, kptr_restrict or kernel lockdown hides addresses.
+#[cfg(feature = "integration")]
 #[stt_test(sockets = 1, cores = 1, threads = 1)]
 fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<VerifyResult> {
     let _ = ctx;

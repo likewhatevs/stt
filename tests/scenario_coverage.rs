@@ -464,6 +464,55 @@ fn neg_auto_repro_on_verify_failure() {
     );
 }
 
+// -- negative: --crash-after triggers SCX_EXIT_ERROR with stack trace --
+
+#[test]
+fn neg_crash_after_auto_repro() {
+    use stt::test_support::{SttTestEntry, run_stt_test};
+
+    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+        stt::scenario::basic::custom_sched_mixed(_ctx)
+    }
+
+    static CRASH_SCHED: Scheduler =
+        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
+
+    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+    #[linkme(crate = linkme)]
+    static __STT_ENTRY_CRASH_AFTER: SttTestEntry = SttTestEntry {
+        name: "neg_crash_after_auto_repro",
+        func: scenario,
+        sockets: 1,
+        cores: 4,
+        threads: 1,
+        memory_mb: 2048,
+        scheduler: &CRASH_SCHED,
+        auto_repro: true,
+        replicas: 1,
+        verify: stt::verify::Verify::NONE,
+        extra_sched_args: &["--crash-after", "1"],
+        watchdog_timeout_jiffies: 0,
+    };
+
+    let result = run_stt_test(&__STT_ENTRY_CRASH_AFTER);
+    assert!(result.is_err(), "scheduler crash must cause test failure");
+    let err = format!("{:#}", result.unwrap_err());
+    assert!(
+        err.contains("scheduler died")
+            || err.contains("SCHEDULER_DIED")
+            || err.contains("timed out"),
+        "expected scheduler death or timeout, got: {err}"
+    );
+    assert!(
+        err.contains("neg_crash_after_auto_repro"),
+        "error must reference the test name: {err}"
+    );
+    assert!(
+        err.contains("[sched="),
+        "error must include scheduler label: {err}"
+    );
+}
+
 // -- monitor evaluation path with default thresholds --
 
 #[stt_test(

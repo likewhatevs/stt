@@ -5,6 +5,53 @@
 //! processes, and verifies that the scheduler handled the workload correctly.
 //! Also tests under the kernel's default EEVDF scheduler.
 //!
+//! # Quick start
+//!
+//! Write a test that boots a VM, creates a cgroup, runs a workload, and
+//! checks the result:
+//!
+//! ```rust,ignore
+//! use stt::prelude::*;
+//! use std::collections::BTreeSet;
+//!
+//! #[stt_test(sockets = 1, cores = 2, threads = 1)]
+//! fn my_scheduler_test(ctx: &Ctx) -> Result<VerifyResult> {
+//!     // Create a cgroup and assign all CPUs.
+//!     let mut group = CgroupGroup::new(ctx.cgroups);
+//!     group.add_cgroup_no_cpuset("workers")?;
+//!     let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
+//!     ctx.cgroups.set_cpuset("workers", &cpus)?;
+//!
+//!     // Spawn workers into the cgroup.
+//!     let cfg = WorkloadConfig {
+//!         num_workers: 2,
+//!         work_type: WorkType::CpuSpin,
+//!         ..Default::default()
+//!     };
+//!     let mut handle = WorkloadHandle::spawn(&cfg)?;
+//!     for tid in handle.tids() {
+//!         ctx.cgroups.move_task("workers", tid)?;
+//!     }
+//!     handle.start();
+//!
+//!     // Let workers run, then collect results.
+//!     std::thread::sleep(ctx.duration);
+//!     let reports = handle.stop_and_collect();
+//!
+//!     // Verify: no worker was starved.
+//!     let plan = VerificationPlan::new().check_not_starved();
+//!     Ok(plan.verify_cell(&reports, None))
+//! }
+//! ```
+//!
+//! Run with `cargo test` (requires `/dev/kvm`), or target a scheduler:
+//!
+//! ```sh
+//! cargo stt test -- my_scheduler_test
+//! ```
+//!
+//! See the [`prelude`] module for the full set of re-exports.
+//!
 //! # Crate organization
 //!
 //! - [`cgroup`] -- cgroup v2 filesystem operations
@@ -57,6 +104,27 @@ pub mod vmm;
 pub mod workload;
 
 pub use stt_macros::stt_test;
+
+/// Re-exports for writing `#[stt_test]` functions.
+///
+/// ```ignore
+/// use stt::prelude::*;
+///
+/// #[stt_test(sockets = 1, cores = 2, threads = 1)]
+/// fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
+///     Ok(VerifyResult::pass())
+/// }
+/// ```
+pub mod prelude {
+    pub use anyhow::Result;
+
+    pub use crate::cgroup::CgroupManager;
+    pub use crate::scenario::{CgroupGroup, Ctx};
+    pub use crate::stt_test;
+    pub use crate::test_support::{Scheduler, SchedulerSpec};
+    pub use crate::verify::{VerificationPlan, VerifyResult};
+    pub use crate::workload::{WorkType, WorkloadConfig, WorkloadHandle};
+}
 
 /// Find a bootable kernel image on the host.
 ///
