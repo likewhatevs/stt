@@ -12,6 +12,11 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -20,54 +25,12 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          tools: mdbook
 
-      - name: Harden apt against flaky mirrors
-        run: |
-          echo 'Acquire::ForceIPv4 "true";'        | sudo tee /etc/apt/apt.conf.d/99force-ipv4 >/dev/null
-          echo 'Acquire::Retries "3";'              | sudo tee /etc/apt/apt.conf.d/99retries >/dev/null
-          echo 'Acquire::http::Pipeline-Depth "0";' | sudo tee /etc/apt/apt.conf.d/99pipeline >/dev/null
-          echo 'http://archive.ubuntu.com/ubuntu/'  | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-          sudo sed -i -E \
-            -e 's|https?://([a-z0-9-]+\.)*archive\.ubuntu\.com/ubuntu/?|http://archive.ubuntu.com/ubuntu/|g' \
-            -e 's|https?://security\.ubuntu\.com/ubuntu/?|http://archive.ubuntu.com/ubuntu/|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-
-      - name: Install system dependencies
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm-20.list
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang-20 \
-            llvm-20 \
-            libelf-dev \
-            libcap-dev \
-            binutils-dev \
-            gcc \
-            make \
-            pkg-config
-          sudo apt-get install -y linux-headers-$(uname -r) || true
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
-          sudo update-alternatives --set clang /usr/bin/clang-20
-          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-20 200
-          sudo update-alternatives --set llvm-strip /usr/bin/llvm-strip-20
-
-      - name: Build and install bpftool
-        run: |
-          git clone --recurse-submodules --depth 1 https://github.com/libbpf/bpftool.git
-          make -C bpftool/src -j$(nproc)
-          sudo make -C bpftool/src install
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: taiki-e/install-action@mdbook
-
-      - name: Build guide
-        run: mdbook build doc/guide
-
-      - name: Build API docs
-        run: cargo doc --workspace --no-deps
+      - run: mdbook build doc/guide
+      - run: cargo doc --workspace --no-deps
 
       - name: Assemble site
         run: |
