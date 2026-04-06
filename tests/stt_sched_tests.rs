@@ -7,7 +7,7 @@ use stt::verify::VerifyResult;
 
 const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 2, threads = 1)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 2, threads = 1, sustained_samples = 15)]
 fn sched_basic_proportional(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![Step {
         setup: vec![
@@ -21,7 +21,7 @@ fn sched_basic_proportional(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, sustained_samples = 15)]
 fn sched_cpuset_split(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![Step {
         setup: vec![
@@ -35,7 +35,7 @@ fn sched_cpuset_split(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 2, threads = 1)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 2, threads = 1, sustained_samples = 15)]
 fn sched_dynamic_add(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {

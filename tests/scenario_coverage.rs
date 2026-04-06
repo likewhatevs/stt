@@ -72,7 +72,7 @@ fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
 }
 
-#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance = 20.0)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance = 20.0, sustained_samples = 15)]
 fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
 }
@@ -739,6 +739,7 @@ fn demo_host_crash_auto_repro() {
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_jiffies = 60000,
     max_imbalance = 20.0,
+    sustained_samples = 15,
 )]
 fn cover_monitor_evaluation(ctx: &Ctx) -> Result<VerifyResult> {
     // Exercises the host-side monitor threshold evaluation path in
