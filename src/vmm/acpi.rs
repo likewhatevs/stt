@@ -2,7 +2,7 @@
 ///
 /// Generates RSDP rev 2 -> XSDT -> {FADT, MADT, SRAT, SLIT}.
 /// RSDT with 32-bit pointers is also provided as a fallback.
-/// FADT rev 6 with HW_REDUCED_ACPI flag (no legacy hardware).
+/// FADT rev 6 with legacy hardware (PIC, PIT, ISA serial).
 /// Per-CPU APIC type: Local APIC (type 0) for apic_id < 255,
 /// x2APIC (type 9) for apic_id >= 255.
 use anyhow::{Context, Result};
@@ -38,7 +38,6 @@ pub struct AcpiLayout {
 }
 
 // FADT flags
-const FADT_F_HW_REDUCED_ACPI: u32 = 1 << 20;
 const FADT_F_PWR_BUTTON: u32 = 1 << 4;
 const FADT_F_SLP_BUTTON: u32 = 1 << 5;
 
@@ -393,7 +392,7 @@ fn write_fadt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
     buf[40..44].copy_from_slice(&(layout.dsdt_addr as u32).to_le_bytes());
     // X_DSDT at offset 140 (64-bit)
     buf[140..148].copy_from_slice(&layout.dsdt_addr.to_le_bytes());
-    let flags = FADT_F_HW_REDUCED_ACPI | FADT_F_PWR_BUTTON | FADT_F_SLP_BUTTON;
+    let flags = FADT_F_PWR_BUTTON | FADT_F_SLP_BUTTON;
     buf[112..116].copy_from_slice(&flags.to_le_bytes());
     buf[131] = 5;
     set_sdt_checksum(&mut buf);
@@ -1194,7 +1193,7 @@ mod tests {
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
         let flags = u32::from_le_bytes(fadt[112..116].try_into().unwrap());
-        assert_ne!(flags & FADT_F_HW_REDUCED_ACPI, 0);
+        assert_eq!(flags & (1 << 20), 0, "HW_REDUCED_ACPI must not be set");
         assert_ne!(flags & FADT_F_PWR_BUTTON, 0);
         assert_ne!(flags & FADT_F_SLP_BUTTON, 0);
     }
