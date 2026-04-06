@@ -13,12 +13,14 @@ use std::path::{Path, PathBuf};
 /// Payload stdout/stderr and STT_EXIT are directed to /dev/ttyS1 (COM2)
 /// to separate them from kernel console output on /dev/ttyS0 (COM1).
 const INIT_SCRIPT: &str = r#"#!/bin/sh
-echo "STT_INIT_STARTED" > /dev/ttyS1
 export PATH=/bin
 busybox mkdir -p /proc /sys /dev /tmp
+busybox mknod /dev/ttyS0 c 4 64
+busybox mknod /dev/ttyS1 c 4 65
 busybox mount -t proc proc /proc
 busybox mount -t sysfs sys /sys
 busybox mount -t devtmpfs dev /dev
+echo "STT_INIT_STARTED" > /dev/ttyS1
 busybox mkdir -p /sys/fs/cgroup
 busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
 busybox mount -t tmpfs tmpfs /tmp

@@ -69,37 +69,18 @@ jobs:
         run: cargo clippy --workspace --all-targets
 
       - name: Enable KVM access
-        id: kvm
         run: |
-          if [ -e /dev/kvm ]; then
-            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-            sudo udevadm control --reload-rules
-            sudo udevadm trigger --name-match=kvm
-            sudo chmod a+r /boot/vmlinuz-* 2>/dev/null || true
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::KVM not available — VM and boot tests will be skipped"
-          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod a+r /boot/vmlinuz-* 2>/dev/null || true
 
       - name: Run tests (nextest, CI profile)
-        run: |
-          if [ "${{ steps.kvm.outputs.available }}" = "true" ]; then
-            cargo nextest run --workspace --profile ci
-          else
-            cargo nextest run --workspace --profile ci \
-              -E 'not (test(boot_kernel) | test(bench_boot) | test(vmm::kvm::) | test(vmm::tests::ap_mp) | test(vmm::tests::kvm_) | test(vmm::tests::immediate_exit) | test(vmm::tests::vcpu_thread_kick) | test(vmm::boot::tests::setup_fpu_with_kvm) | test(vmm::boot::tests::setup_msrs_with_kvm) | test(vmm::boot::tests::setup_regs_with_kvm) | test(vmm::boot::tests::setup_sregs_with_kvm) | test(vmm::boot::tests::setup_lapic))'
-          fi
+        run: cargo nextest run --workspace --profile ci
 
       - name: Run coverage (cargo-llvm-cov)
-        run: |
-          if [ "${{ steps.kvm.outputs.available }}" = "true" ]; then
-            cargo llvm-cov --workspace --lcov --output-path lcov.info
-          else
-            cargo llvm-cov --workspace --lcov --output-path lcov.info \
-              -- --skip boot_kernel --skip bench_boot
-          fi
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

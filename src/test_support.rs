@@ -1241,7 +1241,7 @@ fn extract_kernel_version(console: &str) -> Option<String> {
 // Init script sentinels (written to COM2 by the init script)
 // ---------------------------------------------------------------------------
 
-/// Written to COM2 immediately on init script entry, before any mounts.
+/// Written to COM2 after proc/sys/devtmpfs mounts, before scheduler start.
 const SENTINEL_INIT_STARTED: &str = "STT_INIT_STARTED";
 
 /// Written to COM2 after mounts, scheduler start, and trace setup —
@@ -1253,9 +1253,9 @@ fn classify_init_stage(output: &str) -> &'static str {
     if output.contains(SENTINEL_PAYLOAD_STARTING) {
         "payload started but produced no test result"
     } else if output.contains(SENTINEL_INIT_STARTED) {
-        "init started but payload never ran (mount or scheduler setup failed)"
+        "init started but payload never ran (cgroup/scheduler setup failed)"
     } else {
-        "init script never started (kernel failed to mount initramfs)"
+        "init script never started (kernel or mount failure)"
     }
 }
 
@@ -3081,7 +3081,7 @@ mod tests {
     fn classify_no_sentinels() {
         assert_eq!(
             classify_init_stage(""),
-            "init script never started (kernel failed to mount initramfs)",
+            "init script never started (kernel or mount failure)",
         );
     }
 
@@ -3089,7 +3089,7 @@ mod tests {
     fn classify_init_started_only() {
         assert_eq!(
             classify_init_stage("STT_INIT_STARTED\nsome noise"),
-            "init started but payload never ran (mount or scheduler setup failed)",
+            "init started but payload never ran (cgroup/scheduler setup failed)",
         );
     }
 
@@ -3124,7 +3124,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("init script never started"),
-            "no sentinels should indicate initramfs mount failure, got: {msg}",
+            "no sentinels should indicate kernel/mount failure, got: {msg}",
         );
     }
 
@@ -3138,7 +3138,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("init started but payload never ran"),
-            "init sentinel only should indicate setup failure, got: {msg}",
+            "init sentinel only should indicate cgroup/scheduler setup failure, got: {msg}",
         );
     }
 
