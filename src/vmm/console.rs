@@ -7,22 +7,28 @@
 pub(crate) const COM1_BASE: u16 = 0x3F8;
 pub(crate) const COM2_BASE: u16 = 0x2F8;
 
+/// ISA IRQ lines for the two COM ports.
+pub(crate) const COM1_IRQ: u32 = 4;
+pub(crate) const COM2_IRQ: u32 = 3;
+
 const NUM_REGS: u16 = 8;
 
-/// No-op interrupt trigger — we don't route serial IRQs to the guest.
-struct NoopTrigger;
+/// EventFd-based interrupt trigger. Signals the eventfd on each
+/// interrupt, which KVM's irqfd mechanism delivers to the guest as
+/// the configured IRQ line assertion.
+struct EventFdTrigger(vmm_sys_util::eventfd::EventFd);
 
-impl vm_superio::Trigger for NoopTrigger {
-    type E = std::convert::Infallible;
+impl vm_superio::Trigger for EventFdTrigger {
+    type E = std::io::Error;
     fn trigger(&self) -> Result<(), Self::E> {
-        Ok(())
+        self.0.write(1)
     }
 }
 
 /// Port-addressed serial wrapping vm-superio::Serial with output capture.
 pub struct Serial {
     base: u16,
-    inner: vm_superio::Serial<NoopTrigger, vm_superio::serial::NoEvents, Vec<u8>>,
+    inner: vm_superio::Serial<EventFdTrigger, vm_superio::serial::NoEvents, Vec<u8>>,
 }
 
 impl Default for Serial {
@@ -33,10 +39,17 @@ impl Default for Serial {
 
 impl Serial {
     pub fn new(base: u16) -> Self {
+        let evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .expect("failed to create serial eventfd");
         Serial {
             base,
-            inner: vm_superio::Serial::new(NoopTrigger, Vec::new()),
+            inner: vm_superio::Serial::new(EventFdTrigger(evt), Vec::new()),
         }
+    }
+
+    /// Return the interrupt eventfd for registering with KVM's irqfd.
+    pub fn irq_evt(&self) -> &vmm_sys_util::eventfd::EventFd {
+        &self.inner.interrupt_evt().0
     }
 
     /// Handle a port I/O write from the guest. Returns true if the port

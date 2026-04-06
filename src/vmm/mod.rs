@@ -698,6 +698,19 @@ impl SttVm {
         let com2 = Arc::new(std::sync::Mutex::new(console::Serial::new(
             console::COM2_BASE,
         )));
+
+        // Register serial EventFds with KVM's irqfd so vm-superio trigger()
+        // calls inject the corresponding IRQ into the guest. Without this the
+        // 8250 driver never receives THRE interrupts and write() hangs.
+        if !vm.split_irqchip {
+            vm.vm_fd
+                .register_irqfd(com1.lock().unwrap().irq_evt(), console::COM1_IRQ)
+                .context("register COM1 irqfd")?;
+            vm.vm_fd
+                .register_irqfd(com2.lock().unwrap().irq_evt(), console::COM2_IRQ)
+                .context("register COM2 irqfd")?;
+        }
+
         let kill = Arc::new(AtomicBool::new(false));
 
         let has_immediate_exit = vm.has_immediate_exit;
