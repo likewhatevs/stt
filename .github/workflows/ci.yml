@@ -76,6 +76,7 @@ jobs:
               | sudo tee /etc/udev/rules.d/99-kvm4all.rules
             sudo udevadm control --reload-rules
             sudo udevadm trigger --name-match=kvm
+            sudo chmod a+r /boot/vmlinuz-* 2>/dev/null || true
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"

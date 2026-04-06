@@ -89,7 +89,9 @@ pub fn find_kernel() -> Option<std::path::PathBuf> {
     // Unversioned fallback
     candidates.push("/boot/vmlinuz".into());
 
-    candidates.into_iter().find(|p| p.exists())
+    candidates
+        .into_iter()
+        .find(|p| std::fs::File::open(p).is_ok())
 }
 
 /// Resolve the current executable path, falling back to `/proc/self/exe`

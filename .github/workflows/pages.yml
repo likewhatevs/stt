@@ -61,8 +61,6 @@ jobs:
 
       - name: Build API docs
         run: cargo doc --workspace --no-deps
-        env:
-          RUSTDOCFLAGS: --enable-index-page -Zunstable-options
 
       - name: Assemble site
         run: |
