@@ -97,8 +97,8 @@ jobs:
       - name: Run tests (nextest, CI profile)
         run: cargo nextest run --workspace --profile ci --features integration
 
-      - name: Run coverage (cargo-llvm-cov)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --features integration
+      - name: Run coverage (cargo-llvm-cov + nextest)
+        run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
