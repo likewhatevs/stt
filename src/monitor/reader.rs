@@ -747,7 +747,7 @@ mod tests {
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(200));
                 kill.store(true, Ordering::Release);
             })
         };
@@ -1091,7 +1091,7 @@ mod tests {
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(200));
                 kill.store(true, Ordering::Release);
             })
         };
@@ -1153,7 +1153,7 @@ mod tests {
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(200));
                 kill.store(true, Ordering::Release);
             })
         };
@@ -1216,7 +1216,7 @@ mod tests {
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(200));
                 kill.store(true, Ordering::Release);
             })
         };
@@ -1434,7 +1434,7 @@ mod tests {
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(200));
                 kill.store(true, Ordering::Release);
             })
         };
@@ -1516,7 +1516,7 @@ mod tests {
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(200));
                 kill.store(true, Ordering::Release);
             })
         };
