@@ -44,6 +44,22 @@ A violation must persist for `sustained_samples` consecutive samples
 before triggering a failure. This filters transient spikes from cpuset
 transitions and cgroup creation/destruction.
 
+### Stall detection
+
+A stall is detected when a CPU's `rq_clock` does not advance between
+consecutive samples. Two exemptions prevent false positives:
+
+- **Idle CPUs**: when `nr_running == 0` in both the current and previous
+  sample, the CPU has no runnable tasks. The kernel stops the tick
+  (NOHZ) on idle CPUs, so `rq_clock` legitimately does not advance.
+  These CPUs are excluded from stall checks.
+
+- **Sustained window**: stall detection uses per-CPU consecutive
+  counters and the `sustained_samples` threshold, matching how
+  imbalance and DSQ depth checks work. A single stuck sample does
+  not trigger failure -- the stall must persist for `sustained_samples`
+  consecutive samples on the same CPU.
+
 ## Uninitialized memory detection
 
 Before the guest kernel initializes per-CPU structures, monitor reads

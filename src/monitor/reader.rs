@@ -214,6 +214,7 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
         rq_clock: mem.read_u64(rq_pa, offsets.rq_clock),
         scx_flags: mem.read_u32(rq_pa, offsets.rq_scx + offsets.scx_rq_flags),
         event_counters: None,
+        vcpu_cpu_time_ns: None,
     }
 }
 
@@ -266,6 +267,43 @@ pub(crate) fn resolve_event_pcpu_pas(
     Some(pas)
 }
 
+/// Per-vCPU host thread timing info for gating stall detection.
+///
+/// When the host is loaded, vCPU threads get preempted and rq_clock
+/// cannot advance. Reading per-thread CPU time distinguishes real
+/// stalls (vCPU running but clock stuck) from host preemption
+/// (vCPU not scheduled, clock can't advance).
+pub(crate) struct VcpuTiming {
+    /// pthread_t handles for each vCPU, indexed by vCPU ID.
+    /// Used with `pthread_getcpuclockid()` + `clock_gettime()`.
+    pub pthreads: Vec<libc::pthread_t>,
+}
+
+impl VcpuTiming {
+    /// Read CPU time for each vCPU thread. Returns nanoseconds per vCPU.
+    fn read_cpu_times(&self) -> Vec<u64> {
+        self.pthreads
+            .iter()
+            .map(|&pt| {
+                let mut clk: libc::clockid_t = 0;
+                let ret = unsafe { libc::pthread_getcpuclockid(pt, &mut clk) };
+                if ret != 0 {
+                    return 0;
+                }
+                let mut ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                let ret = unsafe { libc::clock_gettime(clk, &mut ts) };
+                if ret != 0 {
+                    return 0;
+                }
+                ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+            })
+            .collect()
+    }
+}
+
 /// Configuration for reactive SysRq-D dump triggering.
 ///
 /// When provided to `monitor_loop`, the monitor evaluates thresholds inline
@@ -307,12 +345,21 @@ pub(crate) fn monitor_loop(
     start: Instant,
     dump_trigger: Option<&DumpTrigger>,
     watchdog_override: Option<&WatchdogOverride>,
+    vcpu_timing: Option<&VcpuTiming>,
+    preemption_threshold_ns: u64,
 ) -> Vec<MonitorSample> {
-    let mut samples = Vec::new();
+    let preemption_threshold_ns = if preemption_threshold_ns > 0 {
+        preemption_threshold_ns
+    } else {
+        super::vcpu_preemption_threshold_ns(None)
+    };
+    let mut samples: Vec<MonitorSample> = Vec::new();
     let mut consecutive_imbalance = 0usize;
     let mut consecutive_dsq = 0usize;
+    let mut consecutive_stall = vec![0usize; rq_pas.len()];
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(rq_pas.len());
+    let mut prev_vcpu_times: Option<Vec<u64>> = None;
 
     loop {
         if kill.load(Ordering::Acquire) {
@@ -329,6 +376,16 @@ pub(crate) fn monitor_loop(
             for (i, cpu) in cpus.iter_mut().enumerate() {
                 if let Some(&pcpu_pa) = pcpu_pas.get(i) {
                     cpu.event_counters = Some(read_event_stats(mem, pcpu_pa, ev));
+                }
+            }
+        }
+
+        // Read vCPU CPU times and store in snapshots for post-hoc analysis.
+        let curr_vcpu_times = vcpu_timing.map(|vt| vt.read_cpu_times());
+        if let Some(ref times) = curr_vcpu_times {
+            for (i, cpu) in cpus.iter_mut().enumerate() {
+                if let Some(&t) = times.get(i) {
+                    cpu.vcpu_cpu_time_ns = Some(t);
                 }
             }
         }
@@ -364,17 +421,35 @@ pub(crate) fn monitor_loop(
                 consecutive_dsq = 0;
             }
 
-            // Stall check between last two samples.
-            let stall = t.fail_on_stall
-                && samples.last().is_some_and(|prev: &MonitorSample| {
-                    let n = prev.cpus.len().min(cpus.len());
-                    (0..n)
-                        .any(|i| cpus[i].rq_clock != 0 && cpus[i].rq_clock == prev.cpus[i].rq_clock)
-                });
-
+            // Stall check: per-CPU sustained window, exempt idle CPUs
+            // (nr_running==0 in both samples: NOHZ tick stopped) and
+            // preempted vCPUs (CPU time didn't advance: host stole the core).
+            if t.fail_on_stall
+                && let Some(prev) = samples.last()
+            {
+                let n = prev.cpus.len().min(cpus.len());
+                for i in 0..n {
+                    let idle = cpus[i].nr_running == 0 && prev.cpus[i].nr_running == 0;
+                    let preempted = match (&prev_vcpu_times, &curr_vcpu_times) {
+                        (Some(prev_t), Some(curr_t)) if i < prev_t.len() && i < curr_t.len() => {
+                            curr_t[i].saturating_sub(prev_t[i]) < preemption_threshold_ns
+                        }
+                        _ => false,
+                    };
+                    let is_stall = cpus[i].rq_clock != 0
+                        && cpus[i].rq_clock == prev.cpus[i].rq_clock
+                        && !idle
+                        && !preempted;
+                    if is_stall {
+                        consecutive_stall[i] += 1;
+                    } else {
+                        consecutive_stall[i] = 0;
+                    }
+                }
+            }
             let sustained = consecutive_imbalance >= t.sustained_samples
                 || consecutive_dsq >= t.sustained_samples
-                || stall;
+                || consecutive_stall.iter().any(|&c| c >= t.sustained_samples);
 
             if sustained {
                 mem.write_u8(
@@ -385,6 +460,8 @@ pub(crate) fn monitor_loop(
                 dump_requested = true;
             }
         }
+
+        prev_vcpu_times = curr_vcpu_times;
 
         samples.push(MonitorSample {
             elapsed_ms: start.elapsed().as_millis() as u64,
@@ -398,6 +475,7 @@ pub(crate) fn monitor_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::thread::JoinHandleExt;
 
     fn test_offsets() -> KernelOffsets {
         KernelOffsets {
@@ -519,6 +597,8 @@ mod tests {
             Instant::now(),
             None,
             None,
+            None,
+            0,
         );
         assert!(samples.is_empty());
     }
@@ -548,6 +628,8 @@ mod tests {
             Instant::now(),
             None,
             None,
+            None,
+            0,
         );
         handle.join().unwrap();
 
@@ -637,6 +719,8 @@ mod tests {
             Instant::now(),
             None,
             None,
+            None,
+            0,
         );
         handle.join().unwrap();
 
@@ -678,6 +762,8 @@ mod tests {
             Instant::now(),
             None,
             None,
+            None,
+            0,
         );
         handle.join().unwrap();
 
@@ -868,6 +954,8 @@ mod tests {
             Instant::now(),
             None,
             None,
+            None,
+            0,
         );
         handle.join().unwrap();
 
@@ -905,6 +993,8 @@ mod tests {
             Instant::now(),
             None,
             None,
+            None,
+            0,
         );
         handle.join().unwrap();
 
@@ -957,6 +1047,8 @@ mod tests {
             Instant::now(),
             None,
             Some(&wd),
+            None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1014,6 +1106,8 @@ mod tests {
             Instant::now(),
             Some(&trigger),
             None,
+            None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1024,6 +1118,457 @@ mod tests {
             dump_byte,
             crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
             "dump request should have been written to SHM"
+        );
+    }
+
+    #[test]
+    fn monitor_loop_dump_trigger_stall_with_sustained_window() {
+        // Reactive stall path: stuck rq_clock with nr_running>0 triggers
+        // dump after sustained_samples consecutive stall pairs.
+        let offsets = test_offsets();
+        // Single CPU: nr_running=2 (busy), rq_clock stuck at 5000.
+        // Need a second CPU with advancing clock so samples differ
+        // (otherwise all-same-clock triggers the uninitialized check in
+        // from_samples, though monitor_loop's reactive path doesn't use
+        // from_samples — it checks inline).
+        let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
+        let shm_pa = buf.len() as u64;
+        let mut combined = buf;
+        combined.extend(vec![0u8; 64]);
+
+        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let trigger = DumpTrigger {
+            shm_base_pa: shm_pa,
+            thresholds: super::super::MonitorThresholds {
+                max_imbalance_ratio: 100.0,
+                max_local_dsq_depth: 10000,
+                fail_on_stall: true,
+                sustained_samples: 2,
+                ..Default::default()
+            },
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let samples = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            None,
+            Duration::from_millis(10),
+            &kill,
+            Instant::now(),
+            Some(&trigger),
+            None,
+            None,
+            0,
+        );
+        handle.join().unwrap();
+
+        // Should have enough samples for 2+ stall pairs.
+        assert!(
+            samples.len() >= 3,
+            "need >= 3 samples for 2 stall pairs, got {}",
+            samples.len()
+        );
+        // Dump should have fired due to sustained stall.
+        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
+        assert_eq!(
+            dump_byte,
+            crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
+            "stall should trigger dump after sustained_samples=2"
+        );
+    }
+
+    #[test]
+    fn monitor_loop_dump_trigger_idle_cpu_no_stall() {
+        // Reactive path: nr_running==0 (idle) with stuck rq_clock should
+        // NOT trigger the dump, even with fail_on_stall=true.
+        let offsets = test_offsets();
+        // CPU idle: nr_running=0, rq_clock stuck at 5000.
+        let buf = make_rq_buffer(&offsets, 0, 0, 0, 5000, 0);
+        let shm_pa = buf.len() as u64;
+        let mut combined = buf;
+        combined.extend(vec![0u8; 64]);
+
+        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let trigger = DumpTrigger {
+            shm_base_pa: shm_pa,
+            thresholds: super::super::MonitorThresholds {
+                max_imbalance_ratio: 100.0,
+                max_local_dsq_depth: 10000,
+                fail_on_stall: true,
+                sustained_samples: 1,
+                ..Default::default()
+            },
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let samples = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            None,
+            Duration::from_millis(10),
+            &kill,
+            Instant::now(),
+            Some(&trigger),
+            None,
+            None,
+            0,
+        );
+        handle.join().unwrap();
+
+        assert!(
+            samples.len() >= 2,
+            "need >= 2 samples, got {}",
+            samples.len()
+        );
+        // Dump should NOT have fired — idle CPU is exempt.
+        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
+        assert_eq!(dump_byte, 0, "idle CPU should not trigger stall dump");
+    }
+
+    #[test]
+    fn monitor_loop_vcpu_timing_preempted_no_stall() {
+        // Sleeping thread: CPU time stays near zero between samples.
+        // rq_clock stuck + CPU time not advancing = preempted, suppress stall.
+        // 30ms interval gives margin on loaded hosts.
+        let offsets = test_offsets();
+        let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
+        let shm_pa = buf.len() as u64;
+        let mut combined = buf;
+        combined.extend(vec![0u8; 64]);
+
+        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let sleeper_kill = std::sync::Arc::new(AtomicBool::new(false));
+        let sleeper_kill_clone = sleeper_kill.clone();
+        let sleeper = std::thread::Builder::new()
+            .name("vcpu-sleeper".into())
+            .spawn(move || {
+                while !sleeper_kill_clone.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .unwrap();
+
+        let pt = sleeper.as_pthread_t() as libc::pthread_t;
+        let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
+
+        let trigger = DumpTrigger {
+            shm_base_pa: shm_pa,
+            thresholds: super::super::MonitorThresholds {
+                max_imbalance_ratio: 100.0,
+                max_local_dsq_depth: 10000,
+                fail_on_stall: true,
+                sustained_samples: 1,
+                ..Default::default()
+            },
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let samples = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            None,
+            Duration::from_millis(30),
+            &kill,
+            Instant::now(),
+            Some(&trigger),
+            None,
+            Some(&vcpu_timing),
+            0,
+        );
+        handle.join().unwrap();
+        sleeper_kill.store(true, Ordering::Release);
+        let _ = sleeper.join();
+
+        assert!(
+            samples.len() >= 2,
+            "need >= 2 samples, got {}",
+            samples.len()
+        );
+        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
+        assert_eq!(dump_byte, 0, "preempted vCPU should not trigger stall dump");
+    }
+
+    #[test]
+    fn monitor_loop_vcpu_timing_running_stall_fires() {
+        // Busy-spinning thread: accumulates CPU time every interval.
+        // 30ms interval ensures spinner clears the preemption threshold
+        // (10-40ms depending on CONFIG_HZ) with margin.
+        // rq_clock stuck + CPU time advancing = real stall.
+        let offsets = test_offsets();
+        let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
+        let shm_pa = buf.len() as u64;
+        let mut combined = buf;
+        combined.extend(vec![0u8; 64]);
+
+        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let spinner_kill = std::sync::Arc::new(AtomicBool::new(false));
+        let spinner_kill_clone = spinner_kill.clone();
+        let spinner = std::thread::Builder::new()
+            .name("vcpu-spinner".into())
+            .spawn(move || {
+                while !spinner_kill_clone.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+            .unwrap();
+
+        let pt = spinner.as_pthread_t() as libc::pthread_t;
+        let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
+
+        let trigger = DumpTrigger {
+            shm_base_pa: shm_pa,
+            thresholds: super::super::MonitorThresholds {
+                max_imbalance_ratio: 100.0,
+                max_local_dsq_depth: 10000,
+                fail_on_stall: true,
+                sustained_samples: 2,
+                ..Default::default()
+            },
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let samples = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            None,
+            Duration::from_millis(30),
+            &kill,
+            Instant::now(),
+            Some(&trigger),
+            None,
+            Some(&vcpu_timing),
+            0,
+        );
+        handle.join().unwrap();
+        spinner_kill.store(true, Ordering::Release);
+        let _ = spinner.join();
+
+        assert!(
+            samples.len() >= 3,
+            "need >= 3 samples for 2 stall pairs, got {}",
+            samples.len()
+        );
+        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
+        assert_eq!(
+            dump_byte,
+            crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
+            "real stall (vCPU running, clock stuck, nr_running>0) should trigger dump"
+        );
+    }
+
+    #[test]
+    fn reactive_and_evaluate_stall_consistency() {
+        // Verify that the reactive path (monitor_loop with dump_trigger)
+        // and the post-hoc path (evaluate) agree on stall detection.
+        // Build a scenario where stall fires: stuck rq_clock, nr_running>0,
+        // sustained_samples=2.
+        // Two CPUs: cpu0 stuck (rq_clock=5000), cpu1 advancing (rq_clock
+        // changes each sample because it reads from a different rq buffer).
+        // This ensures data_looks_valid passes in evaluate.
+        let offsets = test_offsets();
+        let buf0 = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
+        let buf1 = make_rq_buffer(&offsets, 1, 1, 1, 9000, 0);
+        let pa1 = buf0.len() as u64;
+        let mut combined = buf0;
+        combined.extend_from_slice(&buf1);
+        let shm_pa = combined.len() as u64;
+        combined.extend(vec![0u8; 64]);
+
+        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let thresholds = super::super::MonitorThresholds {
+            max_imbalance_ratio: 100.0,
+            max_local_dsq_depth: 10000,
+            fail_on_stall: true,
+            sustained_samples: 2,
+            ..Default::default()
+        };
+
+        let trigger = DumpTrigger {
+            shm_base_pa: shm_pa,
+            thresholds,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let samples = monitor_loop(
+            &mem,
+            &[0, pa1],
+            &offsets,
+            None,
+            Duration::from_millis(10),
+            &kill,
+            Instant::now(),
+            Some(&trigger),
+            None,
+            None,
+            0,
+        );
+        handle.join().unwrap();
+
+        assert!(
+            samples.len() >= 3,
+            "need >= 3 samples, got {}",
+            samples.len()
+        );
+
+        // Reactive path result: check if dump fired.
+        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
+        let reactive_stall = dump_byte == crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D;
+
+        // Post-hoc evaluate path on the same samples.
+        let summary = super::super::MonitorSummary::from_samples(&samples);
+        let report = super::super::MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let verdict = thresholds.evaluate(&report);
+
+        // Both paths should agree: stall detected on cpu0.
+        assert!(reactive_stall, "reactive path should detect stall");
+        assert!(
+            !verdict.passed,
+            "evaluate should detect stall: {:?}",
+            verdict.details
+        );
+        assert!(
+            verdict.details.iter().any(|d| d.contains("rq_clock stall")),
+            "evaluate details should mention stall: {:?}",
+            verdict.details
+        );
+    }
+
+    #[test]
+    fn reactive_and_evaluate_idle_consistency() {
+        // Both reactive and evaluate should agree: idle CPU is exempt.
+        let offsets = test_offsets();
+        // nr_running=0, rq_clock stuck.
+        let buf = make_rq_buffer(&offsets, 0, 0, 0, 5000, 0);
+        let shm_pa = buf.len() as u64;
+        let mut combined = buf;
+        combined.extend(vec![0u8; 64]);
+
+        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let thresholds = super::super::MonitorThresholds {
+            max_imbalance_ratio: 100.0,
+            max_local_dsq_depth: 10000,
+            fail_on_stall: true,
+            sustained_samples: 1,
+            ..Default::default()
+        };
+
+        let trigger = DumpTrigger {
+            shm_base_pa: shm_pa,
+            thresholds,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let samples = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            None,
+            Duration::from_millis(10),
+            &kill,
+            Instant::now(),
+            Some(&trigger),
+            None,
+            None,
+            0,
+        );
+        handle.join().unwrap();
+
+        assert!(
+            samples.len() >= 2,
+            "need >= 2 samples, got {}",
+            samples.len()
+        );
+
+        // Reactive: dump should NOT fire.
+        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
+        assert_eq!(
+            dump_byte, 0,
+            "reactive: idle CPU should not trigger stall dump"
+        );
+
+        // Evaluate: from_samples should not detect stall.
+        let summary = super::super::MonitorSummary::from_samples(&samples);
+        assert!(
+            !summary.stall_detected,
+            "from_samples: idle CPU should not flag stall"
+        );
+
+        // Evaluate verdict: should pass (no stall on idle CPU).
+        // Note: evaluate may pass via data_looks_valid returning false
+        // (all-same clocks with single CPU) — that's consistent behavior.
+        let report = super::super::MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let verdict = thresholds.evaluate(&report);
+        assert!(
+            verdict.passed,
+            "evaluate: idle CPU should pass: {:?}",
+            verdict.details
         );
     }
 }

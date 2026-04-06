@@ -22,6 +22,140 @@ pub mod symbols;
 /// Real kernels never queue this many tasks on a single CPU's local DSQ.
 pub const DSQ_PLAUSIBILITY_CEILING: u32 = 10_000;
 
+/// Number of tick periods a vCPU must have run before rq_clock is expected
+/// to have advanced. 10 ticks gives the scheduler tick multiple chances
+/// to fire and update rq_clock.
+const PREEMPTION_TICK_MULTIPLE: u64 = 10;
+
+/// Default HZ when CONFIG_HZ cannot be determined from the kernel.
+/// 250 is the most conservative common value (longest tick period =
+/// highest threshold), avoiding false stall detection.
+const DEFAULT_HZ: u64 = 250;
+
+/// Compute the vCPU preemption threshold for a given kernel.
+///
+/// Tries to determine CONFIG_HZ from (in order):
+/// 1. Embedded IKCONFIG in the vmlinux (gzip blob after `IKCFG_ST` marker)
+/// 2. `.config` next to the kernel image (build directory)
+/// 3. Host `/boot/config-$(uname -r)` (covers virtme default: host == guest)
+/// 4. Falls back to 250 (40ms threshold)
+///
+/// Returns the threshold in nanoseconds: `(1e9 / HZ) * 10`.
+pub(crate) fn vcpu_preemption_threshold_ns(kernel_path: Option<&std::path::Path>) -> u64 {
+    let hz = guest_kernel_hz(kernel_path);
+    let tick_ns = 1_000_000_000u64 / hz;
+    tick_ns * PREEMPTION_TICK_MULTIPLE
+}
+
+/// Determine CONFIG_HZ for the guest kernel.
+fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
+    if let Some(kp) = kernel_path {
+        // Try embedded IKCONFIG in the vmlinux.
+        if let Some(vmlinux) = find_vmlinux_from_kernel(kp)
+            && let Some(hz) = read_hz_from_ikconfig(&vmlinux)
+        {
+            return hz;
+        }
+
+        // Try .config next to the kernel image.
+        if let Some(hz) = read_hz_from_kernel_dir(kp) {
+            return hz;
+        }
+    }
+
+    // Try host /boot/config-$(uname -r).
+    if let Some(hz) = read_hz_from_boot_config() {
+        return hz;
+    }
+
+    DEFAULT_HZ
+}
+
+/// Locate the vmlinux ELF from a kernel image (bzImage) path.
+/// Mirrors the logic in `vmm::find_vmlinux`.
+fn find_vmlinux_from_kernel(kernel_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = kernel_path.parent()?;
+    let candidate = dir.join("vmlinux");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    // <root>/arch/x86/boot/bzImage -> <root>/vmlinux
+    if let Ok(root) = dir.join("../../..").canonicalize() {
+        let candidate = root.join("vmlinux");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// IKCONFIG marker: gzip data starts immediately after this 8-byte sequence.
+const IKCONFIG_MAGIC: &[u8] = b"IKCFG_ST";
+
+/// Extract CONFIG_HZ from the embedded IKCONFIG blob in a vmlinux ELF.
+///
+/// The kernel (when built with CONFIG_IKCONFIG) embeds a gzip-compressed
+/// copy of `.config` in `.rodata`, bracketed by `IKCFG_ST` / `IKCFG_ED`
+/// markers. This function scans the raw bytes for the marker, decompresses
+/// the gzip data, and parses CONFIG_HZ from the result.
+fn read_hz_from_ikconfig(vmlinux_path: &std::path::Path) -> Option<u64> {
+    let data = std::fs::read(vmlinux_path).ok()?;
+    let pos = data
+        .windows(IKCONFIG_MAGIC.len())
+        .position(|w| w == IKCONFIG_MAGIC)?;
+    let gz_start = pos + IKCONFIG_MAGIC.len();
+    if gz_start >= data.len() {
+        return None;
+    }
+    let cursor = std::io::Cursor::new(&data[gz_start..]);
+    let mut decoder = flate2::read::GzDecoder::new(cursor);
+    let mut config = String::new();
+    std::io::Read::read_to_string(&mut decoder, &mut config).ok()?;
+    parse_config_hz(&config)
+}
+
+/// Look for a `.config` file in the kernel's build directory and parse
+/// CONFIG_HZ from it. Walks up from the kernel image path (e.g.
+/// `<root>/arch/x86/boot/bzImage`) toward the build root.
+fn read_hz_from_kernel_dir(kernel_path: &std::path::Path) -> Option<u64> {
+    let mut dir = kernel_path.parent()?;
+    // Walk up at most 4 levels (arch/x86/boot/bzImage -> root).
+    for _ in 0..4 {
+        let config = dir.join(".config");
+        if config.exists() {
+            let contents = std::fs::read_to_string(&config).ok()?;
+            return parse_config_hz(&contents);
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Parse CONFIG_HZ=N from `/boot/config-$(uname -r)`.
+fn read_hz_from_boot_config() -> Option<u64> {
+    let mut uname: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uname) } != 0 {
+        return None;
+    }
+    let release = unsafe { std::ffi::CStr::from_ptr(uname.release.as_ptr()) }
+        .to_str()
+        .ok()?;
+    let path = format!("/boot/config-{release}");
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_config_hz(&contents)
+}
+
+/// Extract `CONFIG_HZ=N` from kernel config text.
+fn parse_config_hz(config: &str) -> Option<u64> {
+    for line in config.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("CONFIG_HZ=") {
+            return val.parse().ok();
+        }
+    }
+    None
+}
+
 /// Check whether a single monitor sample contains plausible data.
 ///
 /// Returns false when any CPU's local_dsq_depth exceeds the plausibility
@@ -76,6 +210,11 @@ pub struct MonitorReport {
     pub samples: Vec<MonitorSample>,
     /// Aggregated summary statistics.
     pub summary: MonitorSummary,
+    /// vCPU preemption threshold (ns) derived from the guest kernel's
+    /// CONFIG_HZ at the time the VM ran. Used by evaluate() and
+    /// from_samples() to gate stall detection. 0 means use a default.
+    #[serde(default)]
+    pub preemption_threshold_ns: u64,
 }
 
 /// Point-in-time snapshot of all CPUs.
@@ -135,6 +274,10 @@ pub struct CpuSnapshot {
     /// offsets are unavailable or scx_root is not set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_counters: Option<ScxEventCounters>,
+    /// Cumulative CPU time (ns) of the vCPU thread hosting this CPU.
+    /// Used by evaluate() to distinguish real stalls from host preemption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpu_cpu_time_ns: Option<u64>,
 }
 
 /// Cumulative scx event counter values for a single CPU.
@@ -162,7 +305,8 @@ pub struct MonitorSummary {
     pub max_imbalance_ratio: f64,
     /// Peak local DSQ depth across all CPUs and samples.
     pub max_local_dsq_depth: u32,
-    /// Whether any CPU's `rq_clock` failed to advance between consecutive samples.
+    /// Whether any CPU's `rq_clock` failed to advance between consecutive
+    /// samples. Idle CPUs (`nr_running == 0` in both samples) are exempt.
     pub stall_detected: bool,
     /// Aggregate event counter deltas over the monitoring window.
     /// None when event counters are not available.
@@ -215,6 +359,11 @@ impl MonitorSummary {
 
         // Stall detection: any CPU whose rq_clock did not advance between
         // consecutive samples. Skip invalid samples.
+        // Exempt idle CPUs: nr_running==0 in both samples means the tick
+        // is stopped (NOHZ) and rq_clock legitimately does not advance.
+        // Exempt preempted vCPUs: vcpu_cpu_time_ns didn't advance enough
+        // means the host preempted the vCPU thread.
+        let threshold = vcpu_preemption_threshold_ns(None);
         let mut stall_detected = false;
         let valid_samples: Vec<&MonitorSample> = samples
             .iter()
@@ -225,8 +374,18 @@ impl MonitorSummary {
             let curr = w[1];
             let cpu_count = prev.cpus.len().min(curr.cpus.len());
             for cpu in 0..cpu_count {
+                let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
+                let cpu_time_advanced = match (
+                    curr.cpus[cpu].vcpu_cpu_time_ns,
+                    prev.cpus[cpu].vcpu_cpu_time_ns,
+                ) {
+                    (Some(curr_t), Some(prev_t)) => curr_t.saturating_sub(prev_t) >= threshold,
+                    _ => true,
+                };
                 if curr.cpus[cpu].rq_clock != 0
                     && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
+                    && !idle
+                    && cpu_time_advanced
                 {
                     stall_detected = true;
                     break;
@@ -334,8 +493,10 @@ impl MonitorThresholds {
     ///   depth > 50 means the scheduler is not consuming dispatched tasks.
     ///   Transient spikes during cpuset changes are filtered by the
     ///   sustained_samples window.
-    /// - fail_on_stall true: rq_clock not advancing means a CPU stopped
-    ///   scheduling entirely. Always a bug — no workload makes this normal.
+    /// - fail_on_stall true: rq_clock not advancing on a CPU with
+    ///   runnable tasks means the scheduler stalled. Idle CPUs
+    ///   (nr_running==0 in both samples) are exempt because NOHZ
+    ///   stops the tick. Uses the sustained_samples window.
     /// - sustained_samples 5: at ~100ms sample interval, requires ~500ms
     ///   of sustained violation. Filters transient spikes from cpuset
     ///   reconfiguration, cgroup creation, and scheduler restart.
@@ -543,25 +704,69 @@ impl MonitorThresholds {
         }
 
         // Stall detection: any CPU whose rq_clock did not advance between
-        // consecutive samples.
+        // consecutive samples. Uses the sustained_samples window like
+        // imbalance and DSQ checks. Exempt idle CPUs (nr_running==0 in
+        // both samples): NOHZ stops the tick so rq_clock legitimately
+        // does not advance.
         if self.fail_on_stall {
+            let threshold = if report.preemption_threshold_ns > 0 {
+                report.preemption_threshold_ns
+            } else {
+                vcpu_preemption_threshold_ns(None)
+            };
+
+            // Per-CPU consecutive stall counters.
+            let num_cpus = report
+                .samples
+                .iter()
+                .map(|s| s.cpus.len())
+                .max()
+                .unwrap_or(0);
+            let mut consecutive_stall = vec![0usize; num_cpus];
+            let mut worst_stall_run = vec![0usize; num_cpus];
+            let mut worst_stall_sample_idx = vec![0usize; num_cpus];
+            let mut worst_stall_clock = vec![0u64; num_cpus];
+
             for i in 1..report.samples.len() {
                 let prev = &report.samples[i - 1];
                 let curr = &report.samples[i];
                 let cpu_count = prev.cpus.len().min(curr.cpus.len());
                 for cpu in 0..cpu_count {
-                    if curr.cpus[cpu].rq_clock != 0
+                    let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
+                    let cpu_time_advanced = match (
+                        curr.cpus[cpu].vcpu_cpu_time_ns,
+                        prev.cpus[cpu].vcpu_cpu_time_ns,
+                    ) {
+                        (Some(curr_t), Some(prev_t)) => curr_t.saturating_sub(prev_t) >= threshold,
+                        _ => true,
+                    };
+                    let is_stall = curr.cpus[cpu].rq_clock != 0
                         && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
-                    {
-                        failed = true;
-                        details.push(format!(
-                            "rq_clock stall on cpu{} between samples {} and {} (clock={})",
-                            cpu,
-                            i - 1,
-                            i,
-                            curr.cpus[cpu].rq_clock,
-                        ));
+                        && !idle
+                        && cpu_time_advanced;
+                    if is_stall {
+                        consecutive_stall[cpu] += 1;
+                        if consecutive_stall[cpu] > worst_stall_run[cpu] {
+                            worst_stall_run[cpu] = consecutive_stall[cpu];
+                            worst_stall_sample_idx[cpu] = i;
+                            worst_stall_clock[cpu] = curr.cpus[cpu].rq_clock;
+                        }
+                    } else {
+                        consecutive_stall[cpu] = 0;
                     }
+                }
+            }
+
+            for cpu in 0..num_cpus {
+                if worst_stall_run[cpu] >= self.sustained_samples {
+                    failed = true;
+                    details.push(format!(
+                        "rq_clock stall on cpu{} for {} consecutive samples (ending at sample {}, clock={})",
+                        cpu,
+                        worst_stall_run[cpu],
+                        worst_stall_sample_idx[cpu],
+                        worst_stall_clock[cpu],
+                    ));
                 }
             }
         }
@@ -708,6 +913,125 @@ impl MonitorThresholds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- parse_config_hz / vcpu_preemption_threshold_ns tests --
+
+    #[test]
+    fn parse_config_hz_standard() {
+        let config = "# comment\nCONFIG_HZ_1000=y\nCONFIG_HZ=1000\n";
+        assert_eq!(parse_config_hz(config), Some(1000));
+    }
+
+    #[test]
+    fn parse_config_hz_250() {
+        let config = "CONFIG_HZ=250\n";
+        assert_eq!(parse_config_hz(config), Some(250));
+    }
+
+    #[test]
+    fn parse_config_hz_100() {
+        let config = "CONFIG_HZ=100\n";
+        assert_eq!(parse_config_hz(config), Some(100));
+    }
+
+    #[test]
+    fn parse_config_hz_missing() {
+        let config = "CONFIG_PREEMPT=y\nCONFIG_HZ_1000=y\n";
+        assert_eq!(parse_config_hz(config), None);
+    }
+
+    #[test]
+    fn parse_config_hz_garbage_value() {
+        let config = "CONFIG_HZ=abc\n";
+        assert_eq!(parse_config_hz(config), None);
+    }
+
+    #[test]
+    fn parse_config_hz_whitespace() {
+        let config = "  CONFIG_HZ=1000  \n";
+        assert_eq!(parse_config_hz(config), Some(1000));
+    }
+
+    #[test]
+    fn vcpu_threshold_reasonable_range() {
+        // With no kernel path, falls back to host config or DEFAULT_HZ=250.
+        // Threshold should be between 10ms (HZ=1000) and 100ms (HZ=100).
+        let t = vcpu_preemption_threshold_ns(None);
+        assert!(
+            (10_000_000..=100_000_000).contains(&t),
+            "threshold {t} ns outside expected range 10ms-100ms"
+        );
+    }
+
+    #[test]
+    fn vcpu_threshold_default_hz_fallback() {
+        // Nonexistent kernel path -> falls back to host config or default.
+        let t = vcpu_preemption_threshold_ns(Some(std::path::Path::new("/nonexistent/bzImage")));
+        assert!(
+            (10_000_000..=100_000_000).contains(&t),
+            "fallback threshold {t} ns outside expected range"
+        );
+    }
+
+    // -- IKCONFIG extraction tests --
+
+    /// Build a synthetic blob: padding + IKCFG_ST marker + gzip(config_text).
+    fn make_ikconfig_blob(config_text: &str) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut blob = vec![0u8; 64]; // padding
+        blob.extend_from_slice(IKCONFIG_MAGIC);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(config_text.as_bytes()).unwrap();
+        blob.extend(encoder.finish().unwrap());
+        blob.extend_from_slice(b"IKCFG_ED");
+        blob
+    }
+
+    #[test]
+    fn ikconfig_extracts_hz_1000() {
+        let blob = make_ikconfig_blob("CONFIG_HZ=1000\nCONFIG_PREEMPT=y\n");
+        let dir = std::env::temp_dir().join("stt-ikconfig-test-1000");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vmlinux");
+        std::fs::write(&path, &blob).unwrap();
+        assert_eq!(read_hz_from_ikconfig(&path), Some(1000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ikconfig_extracts_hz_250() {
+        let blob = make_ikconfig_blob("CONFIG_HZ=250\n");
+        let dir = std::env::temp_dir().join("stt-ikconfig-test-250");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vmlinux");
+        std::fs::write(&path, &blob).unwrap();
+        assert_eq!(read_hz_from_ikconfig(&path), Some(250));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ikconfig_no_marker_returns_none() {
+        let dir = std::env::temp_dir().join("stt-ikconfig-test-none");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vmlinux");
+        std::fs::write(&path, b"no marker here").unwrap();
+        assert_eq!(read_hz_from_ikconfig(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ikconfig_missing_config_hz_returns_none() {
+        let blob = make_ikconfig_blob("CONFIG_PREEMPT=y\n");
+        let dir = std::env::temp_dir().join("stt-ikconfig-test-nohz");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vmlinux");
+        std::fs::write(&path, &blob).unwrap();
+        assert_eq!(read_hz_from_ikconfig(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn empty_samples_default_summary() {
@@ -1031,6 +1355,7 @@ mod tests {
         let report = MonitorReport {
             samples: vec![],
             summary: MonitorSummary::default(),
+            ..Default::default()
         };
         let v = t.evaluate(&report);
         assert!(v.passed);
@@ -1044,7 +1369,11 @@ mod tests {
             .map(|i| balanced_sample(i * 100, 1000 + i * 500))
             .collect();
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(v.passed, "balanced samples should pass: {:?}", v.details);
     }
@@ -1078,7 +1407,11 @@ mod tests {
         // Then a balanced one to break the streak.
         samples.push(balanced_sample(400, 3000));
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(
             v.passed,
@@ -1114,7 +1447,11 @@ mod tests {
             });
         }
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed);
         assert!(v.details.iter().any(|d| d.contains("imbalance")));
@@ -1149,7 +1486,11 @@ mod tests {
             });
         }
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed);
         assert!(v.details.iter().any(|d| d.contains("DSQ depth")));
@@ -1186,16 +1527,22 @@ mod tests {
         }
         samples.push(balanced_sample(200, 2000));
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(v.passed, "2 DSQ violations < sustained=3: {:?}", v.details);
     }
 
     #[test]
     fn thresholds_stall_detected_fails() {
+        // Stalls use the sustained_samples window. With sustained_samples=1,
+        // a single stall pair triggers failure.
         let t = MonitorThresholds {
             fail_on_stall: true,
-            sustained_samples: 100,
+            sustained_samples: 1,
             ..Default::default()
         };
         let samples = vec![
@@ -1231,7 +1578,11 @@ mod tests {
             },
         ];
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed);
         assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
@@ -1265,7 +1616,11 @@ mod tests {
             },
         ];
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(v.passed, "stall disabled should pass: {:?}", v.details);
     }
@@ -1316,7 +1671,11 @@ mod tests {
             });
         }
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(
             v.passed,
@@ -1327,7 +1686,10 @@ mod tests {
 
     #[test]
     fn thresholds_multiple_violations() {
-        // Both imbalance and stall in the same report.
+        // Both imbalance and stall in the same report. Both need to
+        // reach sustained_samples to trigger. 3 samples = 2 consecutive
+        // stall pairs for cpu0 (clock stuck at 1000), 2 consecutive
+        // imbalance violations (ratio=5.0 > 2.0).
         let t = MonitorThresholds {
             sustained_samples: 2,
             max_imbalance_ratio: 2.0,
@@ -1365,9 +1727,28 @@ mod tests {
                     },
                 ],
             },
+            MonitorSample {
+                elapsed_ms: 300,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 1000,
+                        ..Default::default()
+                    }, // stall continues
+                    CpuSnapshot {
+                        nr_running: 5,
+                        rq_clock: 4000,
+                        ..Default::default()
+                    },
+                ],
+            },
         ];
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed);
         assert!(v.details.iter().any(|d| d.contains("imbalance")));
@@ -1388,7 +1769,11 @@ mod tests {
             },
         ];
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(v.passed);
     }
@@ -1419,7 +1804,11 @@ mod tests {
             })
             .collect();
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(
             v.passed,
@@ -1468,7 +1857,11 @@ mod tests {
             },
         ];
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(
             v.passed,
@@ -1498,7 +1891,11 @@ mod tests {
             ],
         }];
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(
             v.passed,
@@ -1525,7 +1922,11 @@ mod tests {
             }],
         }];
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(v.passed, "single reading should be valid: {:?}", v.details);
     }
@@ -1582,7 +1983,11 @@ mod tests {
             .map(|i| sample_with_events(i * 100, 1000 + i * 500, i as i64 * 10, 0))
             .collect();
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed);
         assert!(v.details.iter().any(|d| d.contains("fallback rate")));
@@ -1603,7 +2008,11 @@ mod tests {
         // 4th sample: same fallback as 3rd -> rate = 0.
         samples.push(sample_with_events(300, 2500, 20, 0));
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(v.passed, "2 violations < sustained=3: {:?}", v.details);
     }
@@ -1620,7 +2029,11 @@ mod tests {
             .map(|i| sample_with_events(i * 100, 1000 + i * 500, 0, i as i64 * 10))
             .collect();
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed);
         assert!(v.details.iter().any(|d| d.contains("keep_last rate")));
@@ -1640,7 +2053,11 @@ mod tests {
         // Reset: same keep_last as previous -> rate = 0.
         samples.push(sample_with_events(300, 2500, 0, 20));
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(v.passed, "2 violations < sustained=3: {:?}", v.details);
     }
@@ -1679,7 +2096,11 @@ mod tests {
             ));
         }
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(
             v.passed,
@@ -1702,7 +2123,11 @@ mod tests {
             .map(|i| balanced_sample(i * 100, 1000 + i * 500))
             .collect();
         let summary = MonitorSummary::from_samples(&samples);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(
             v.passed,
@@ -2091,6 +2516,7 @@ mod tests {
                             dispatch_keep_last: i as i64,
                             ..Default::default()
                         }),
+                        vcpu_cpu_time_ns: None,
                     },
                     CpuSnapshot {
                         nr_running: (i as u32 + 2),
@@ -2103,6 +2529,7 @@ mod tests {
                             dispatch_keep_last: i as i64 * 2,
                             ..Default::default()
                         }),
+                        vcpu_cpu_time_ns: None,
                     },
                 ],
             })
@@ -2212,7 +2639,11 @@ mod tests {
         );
         assert!(!summary.stall_detected, "no stall in this scenario");
         assert_eq!(summary.total_samples, 3);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed, "imbalance=1.5 must fail threshold=1.0");
         // Format: "imbalance ratio 1.5 exceeded threshold 1.0 for 2 consecutive samples (ending at sample 2)"
@@ -2277,7 +2708,11 @@ mod tests {
             summary.max_local_dsq_depth <= DSQ_PLAUSIBILITY_CEILING,
             "depth must be plausible"
         );
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed, "dsq_depth=3 must fail threshold=1");
         // Format: "local DSQ depth 3 on cpu0 exceeded threshold 1 for 2 consecutive samples (ending at sample 2)"
@@ -2296,9 +2731,11 @@ mod tests {
 
     #[test]
     fn neg_stall_detection_catches_frozen_rq_clock() {
+        // Stalls use sustained_samples window. sustained_samples=1 means
+        // a single stall pair triggers failure.
         let t = MonitorThresholds {
             fail_on_stall: true,
-            sustained_samples: 100,
+            sustained_samples: 1,
             ..Default::default()
         };
         let samples = vec![
@@ -2338,10 +2775,13 @@ mod tests {
             summary.stall_detected,
             "summary.stall_detected must be true"
         );
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed, "frozen rq_clock must be detected");
-        // Format: "rq_clock stall on cpu0 between samples 0 and 1 (clock=5000)"
         let detail = v
             .details
             .iter()
@@ -2349,8 +2789,8 @@ mod tests {
             .unwrap();
         assert!(detail.contains("cpu0"), "must name frozen CPU: {detail}");
         assert!(
-            detail.contains("between samples 0 and 1"),
-            "must name sample indices: {detail}"
+            detail.contains("consecutive samples"),
+            "must show sustained count: {detail}"
         );
         assert!(
             detail.contains("clock=5000"),
@@ -2401,7 +2841,11 @@ mod tests {
         let summary = MonitorSummary::from_samples(&samples);
         assert!(summary.stall_detected);
         assert!(summary.max_imbalance_ratio >= 10.0);
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed);
         let imb = v.details.iter().find(|d| d.contains("imbalance")).unwrap();
@@ -2424,6 +2868,324 @@ mod tests {
     }
 
     #[test]
+    fn stall_idle_cpu_exempt() {
+        // nr_running==0 on both samples: idle CPU, NOHZ tick stopped.
+        // rq_clock not advancing is expected, not a stall.
+        let t = MonitorThresholds {
+            fail_on_stall: true,
+            sustained_samples: 1,
+            ..Default::default()
+        };
+        let samples = vec![
+            MonitorSample {
+                elapsed_ms: 100,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 0,
+                        rq_clock: 5000,
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000,
+                        ..Default::default()
+                    },
+                ],
+            },
+            MonitorSample {
+                elapsed_ms: 200,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 0,
+                        rq_clock: 5000, // stuck but idle
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 7000,
+                        ..Default::default()
+                    },
+                ],
+            },
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        assert!(
+            !summary.stall_detected,
+            "idle CPU should not trigger stall in summary"
+        );
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let v = t.evaluate(&report);
+        assert!(
+            v.passed,
+            "idle CPU should not trigger stall: {:?}",
+            v.details
+        );
+    }
+
+    #[test]
+    fn stall_idle_to_busy_not_exempt() {
+        // nr_running transitions from 0 to 1 — the CPU woke up but
+        // rq_clock didn't advance. This IS a stall (the CPU is now
+        // busy but the scheduler tick hasn't fired).
+        // Second CPU has advancing clock so data_looks_valid passes.
+        let t = MonitorThresholds {
+            fail_on_stall: true,
+            sustained_samples: 1,
+            ..Default::default()
+        };
+        let samples = vec![
+            MonitorSample {
+                elapsed_ms: 100,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 0,
+                        rq_clock: 5000,
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000,
+                        ..Default::default()
+                    },
+                ],
+            },
+            MonitorSample {
+                elapsed_ms: 200,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000, // stuck, but now busy
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 7000,
+                        ..Default::default()
+                    },
+                ],
+            },
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        assert!(
+            summary.stall_detected,
+            "busy CPU with frozen clock is a stall"
+        );
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let v = t.evaluate(&report);
+        assert!(
+            !v.passed,
+            "busy CPU with frozen clock must fail: {:?}",
+            v.details
+        );
+    }
+
+    #[test]
+    fn stall_sustained_window_filters_transient() {
+        // With sustained_samples=3, a 2-sample stall doesn't trigger.
+        // Second CPU has advancing clock so data_looks_valid passes.
+        let t = MonitorThresholds {
+            fail_on_stall: true,
+            sustained_samples: 3,
+            ..Default::default()
+        };
+        let mut samples = Vec::new();
+        // 3 samples: 2 consecutive stall pairs for cpu0, then clock advances.
+        for i in 0..3u64 {
+            samples.push(MonitorSample {
+                elapsed_ms: i * 100,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000, // stuck for all 3
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000 + i * 500, // advancing
+                        ..Default::default()
+                    },
+                ],
+            });
+        }
+        // Break the streak: clock advances in 4th sample.
+        samples.push(MonitorSample {
+            elapsed_ms: 300,
+            cpus: vec![
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 6000,
+                    ..Default::default()
+                },
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 7500,
+                    ..Default::default()
+                },
+            ],
+        });
+        let summary = MonitorSummary::from_samples(&samples);
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let v = t.evaluate(&report);
+        // 2 consecutive stall pairs < sustained_samples=3
+        assert!(v.passed, "2 stall pairs < sustained=3: {:?}", v.details);
+    }
+
+    #[test]
+    fn stall_sustained_window_catches_real_stall() {
+        // With sustained_samples=3, 3+ consecutive stall pairs trigger.
+        // Second CPU has advancing clock so data_looks_valid passes.
+        let t = MonitorThresholds {
+            fail_on_stall: true,
+            sustained_samples: 3,
+            ..Default::default()
+        };
+        // 4 samples = 3 consecutive stall pairs for cpu0. cpu1 advances.
+        let samples: Vec<_> = (0..4u64)
+            .map(|i| MonitorSample {
+                elapsed_ms: i * 100,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000, // stuck
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000 + i * 500, // advancing
+                        ..Default::default()
+                    },
+                ],
+            })
+            .collect();
+        let summary = MonitorSummary::from_samples(&samples);
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let v = t.evaluate(&report);
+        assert!(!v.passed, "3 consecutive stall pairs must fail");
+        assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
+    }
+
+    #[test]
+    fn from_samples_idle_cpu_no_stall() {
+        // from_samples should not flag stall when both samples have
+        // nr_running==0 on the stuck CPU.
+        let s1 = MonitorSample {
+            elapsed_ms: 100,
+            cpus: vec![
+                CpuSnapshot {
+                    nr_running: 0,
+                    rq_clock: 5000,
+                    ..Default::default()
+                },
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 6000,
+                    ..Default::default()
+                },
+            ],
+        };
+        let s2 = MonitorSample {
+            elapsed_ms: 200,
+            cpus: vec![
+                CpuSnapshot {
+                    nr_running: 0,
+                    rq_clock: 5000, // stuck but idle
+                    ..Default::default()
+                },
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 7000,
+                    ..Default::default()
+                },
+            ],
+        };
+        let summary = MonitorSummary::from_samples(&[s1, s2]);
+        assert!(!summary.stall_detected);
+    }
+
+    #[test]
+    fn stall_below_sustained_passes() {
+        // 1 stall pair with sustained_samples=5 should pass.
+        // Second CPU has advancing clock so data_looks_valid passes.
+        let t = MonitorThresholds {
+            fail_on_stall: true,
+            sustained_samples: 5,
+            ..Default::default()
+        };
+        let samples = vec![
+            MonitorSample {
+                elapsed_ms: 100,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000,
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000,
+                        ..Default::default()
+                    },
+                ],
+            },
+            MonitorSample {
+                elapsed_ms: 200,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000,
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 7000,
+                        ..Default::default()
+                    },
+                ],
+            },
+            // Clock recovers.
+            MonitorSample {
+                elapsed_ms: 300,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000,
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 8000,
+                        ..Default::default()
+                    },
+                ],
+            },
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let v = t.evaluate(&report);
+        assert!(v.passed, "1 stall < sustained=5: {:?}", v.details);
+    }
+
+    #[test]
     fn neg_fallback_rate_threshold_fires() {
         let t = MonitorThresholds {
             sustained_samples: 2,
@@ -2439,7 +3201,11 @@ mod tests {
             summary.event_deltas.is_some(),
             "event deltas must be computed"
         );
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed, "fallback rate must be caught");
         // Format: "fallback rate 200.0/s exceeded threshold 5.0/s for 2 consecutive intervals (ending at sample 2)"
@@ -2476,7 +3242,11 @@ mod tests {
             .collect();
         let summary = MonitorSummary::from_samples(&samples);
         assert!(summary.event_deltas.is_some());
-        let report = MonitorReport { samples, summary };
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
         let v = t.evaluate(&report);
         assert!(!v.passed, "keep_last rate must be caught");
         // Format: "keep_last rate .../s exceeded threshold 5.0/s for 2 consecutive intervals ..."
@@ -2493,6 +3263,233 @@ mod tests {
         assert!(
             detail.contains("5.0/s"),
             "must show threshold value: {detail}"
+        );
+    }
+
+    // -- vCPU CPU time gating tests --
+
+    #[test]
+    fn evaluate_suppresses_stall_when_vcpu_preempted() {
+        // vcpu_cpu_time_ns shows < 10ms advancement -> vCPU was
+        // preempted, stall should be suppressed.
+        let t = MonitorThresholds {
+            fail_on_stall: true,
+            sustained_samples: 1,
+            ..Default::default()
+        };
+        let samples = vec![
+            MonitorSample {
+                elapsed_ms: 100,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000,
+                        vcpu_cpu_time_ns: Some(1_000_000_000),
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000,
+                        vcpu_cpu_time_ns: Some(1_000_000_000),
+                        ..Default::default()
+                    },
+                ],
+            },
+            MonitorSample {
+                elapsed_ms: 200,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000,                        // stuck
+                        vcpu_cpu_time_ns: Some(1_000_500_000), // 0.5ms < 10ms threshold
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 7000,
+                        vcpu_cpu_time_ns: Some(1_010_000_000),
+                        ..Default::default()
+                    },
+                ],
+            },
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        assert!(
+            !summary.stall_detected,
+            "preempted vCPU should not flag stall in summary"
+        );
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let v = t.evaluate(&report);
+        assert!(
+            v.passed,
+            "preempted vCPU should suppress stall: {:?}",
+            v.details
+        );
+    }
+
+    #[test]
+    fn evaluate_catches_stall_when_vcpu_running() {
+        // vcpu_cpu_time_ns shows advancement >= 10ms -> vCPU was running,
+        // stall is real.
+        let t = MonitorThresholds {
+            fail_on_stall: true,
+            sustained_samples: 1,
+            ..Default::default()
+        };
+        let samples = vec![
+            MonitorSample {
+                elapsed_ms: 100,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000,
+                        vcpu_cpu_time_ns: Some(1_000_000_000),
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000,
+                        vcpu_cpu_time_ns: Some(1_000_000_000),
+                        ..Default::default()
+                    },
+                ],
+            },
+            MonitorSample {
+                elapsed_ms: 200,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000,                        // stuck
+                        vcpu_cpu_time_ns: Some(1_010_000_000), // 10ms advance
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 7000,
+                        vcpu_cpu_time_ns: Some(1_010_000_000),
+                        ..Default::default()
+                    },
+                ],
+            },
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        assert!(
+            summary.stall_detected,
+            "running vCPU with stuck clock is a stall"
+        );
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let v = t.evaluate(&report);
+        assert!(!v.passed, "running vCPU stall must fail: {:?}", v.details);
+        assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
+    }
+
+    #[test]
+    fn evaluate_stall_none_vcpu_time_falls_back_to_current_behavior() {
+        // vcpu_cpu_time_ns is None -> assume vCPU was running (don't suppress).
+        let t = MonitorThresholds {
+            fail_on_stall: true,
+            sustained_samples: 1,
+            ..Default::default()
+        };
+        let samples = vec![
+            MonitorSample {
+                elapsed_ms: 100,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000,
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 6000,
+                        ..Default::default()
+                    },
+                ],
+            },
+            MonitorSample {
+                elapsed_ms: 200,
+                cpus: vec![
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 5000, // stuck, no vcpu_cpu_time_ns
+                        ..Default::default()
+                    },
+                    CpuSnapshot {
+                        nr_running: 1,
+                        rq_clock: 7000,
+                        ..Default::default()
+                    },
+                ],
+            },
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        assert!(
+            summary.stall_detected,
+            "None vcpu time should not suppress stall"
+        );
+        let report = MonitorReport {
+            samples,
+            summary,
+            ..Default::default()
+        };
+        let v = t.evaluate(&report);
+        assert!(
+            !v.passed,
+            "None vcpu time should detect stall: {:?}",
+            v.details
+        );
+    }
+
+    #[test]
+    fn from_samples_suppresses_stall_when_vcpu_preempted() {
+        // from_samples should also respect vcpu_cpu_time_ns gating.
+        let s1 = MonitorSample {
+            elapsed_ms: 100,
+            cpus: vec![
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 5000,
+                    vcpu_cpu_time_ns: Some(1_000_000_000),
+                    ..Default::default()
+                },
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 6000,
+                    vcpu_cpu_time_ns: Some(1_000_000_000),
+                    ..Default::default()
+                },
+            ],
+        };
+        let s2 = MonitorSample {
+            elapsed_ms: 200,
+            cpus: vec![
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 5000,                        // stuck
+                    vcpu_cpu_time_ns: Some(1_000_100_000), // 0.1ms < 10ms threshold
+                    ..Default::default()
+                },
+                CpuSnapshot {
+                    nr_running: 1,
+                    rq_clock: 7000,
+                    vcpu_cpu_time_ns: Some(1_010_000_000),
+                    ..Default::default()
+                },
+            ],
+        };
+        let summary = MonitorSummary::from_samples(&[s1, s2]);
+        assert!(
+            !summary.stall_detected,
+            "preempted vCPU should not flag stall"
         );
     }
 }

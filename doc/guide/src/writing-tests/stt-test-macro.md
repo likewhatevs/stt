@@ -79,6 +79,10 @@ the merge chain.
 |---|---|---|
 | `auto_repro` | `true` | Auto-repro on crash |
 | `replicas` | 1 | Number of times to run |
+| `performance_mode` | `false` | Pin vCPUs to host cores, hugepages |
+
+See [Performance Mode](../concepts/performance-mode.md) for details on
+what `performance_mode` enables, prerequisites, and validation behavior.
 
 ## Example with custom scheduler
 

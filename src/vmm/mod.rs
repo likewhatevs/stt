@@ -1,6 +1,7 @@
 pub mod acpi;
 pub mod boot;
 pub mod console;
+pub mod host_topology;
 pub mod initramfs;
 pub mod kvm;
 pub mod mptable;
@@ -361,6 +362,24 @@ fn register_vcpu_signal_handler() {
 }
 
 // ---------------------------------------------------------------------------
+// vCPU affinity
+// ---------------------------------------------------------------------------
+
+/// Pin the calling thread to a single host CPU via sched_setaffinity(0, ...).
+/// Logs success or warning; does not fail the VM.
+fn pin_current_thread(cpu: usize, label: &str) {
+    let mut cpuset = nix::sched::CpuSet::new();
+    if let Err(e) = cpuset.set(cpu) {
+        eprintln!("performance_mode: WARNING: cpuset.set({cpu}) for {label}: {e}");
+        return;
+    }
+    match nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
+        Ok(()) => eprintln!("performance_mode: pinned {label} to host CPU {cpu}"),
+        Err(e) => eprintln!("performance_mode: WARNING: pin {label} to CPU {cpu}: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VmResult
 // ---------------------------------------------------------------------------
 
@@ -465,6 +484,13 @@ pub struct SttVm {
     /// BPF map discoverability, waits for scenario start via SHM ring,
     /// then writes a u32 value at the specified offset.
     bpf_map_write: Option<BpfMapWriteParams>,
+    /// Performance mode: pin vCPU threads to host cores matching the virtual
+    /// topology's LLC structure, allocate guest memory with 2MB hugepages,
+    /// and validate no oversubscription.
+    performance_mode: bool,
+    /// Pinning plan computed during build() when performance_mode is enabled.
+    /// Stored so topology is read once and the plan is reused at VM start.
+    pinning_plan: Option<host_topology::PinningPlan>,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -521,7 +547,14 @@ impl SttVm {
     /// load result. Spawns the initramfs-resolve thread to run in parallel.
     fn create_vm_and_load_kernel(&self) -> Result<(kvm::SttKvm, boot::KernelLoadResult)> {
         let t0 = Instant::now();
-        let vm = kvm::SttKvm::new(self.topology, self.memory_mb).context("create VM")?;
+        let use_hugepages = self.performance_mode
+            && host_topology::hugepages_free() >= host_topology::hugepages_needed(self.memory_mb);
+        let vm = if use_hugepages {
+            kvm::SttKvm::new_with_hugepages(self.topology, self.memory_mb)
+                .context("create VM with hugepages")?
+        } else {
+            kvm::SttKvm::new(self.topology, self.memory_mb).context("create VM")?
+        };
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "kvm_create");
 
         let t0 = Instant::now();
@@ -740,9 +773,48 @@ impl SttVm {
         let mut vcpus = std::mem::take(&mut vm.vcpus);
         let mut bsp = vcpus.remove(0);
 
-        let ap_threads = self.spawn_ap_threads(vcpus, has_immediate_exit, &com1, &com2, &kill)?;
+        // Build per-vCPU pin targets from the stored pinning plan.
+        // Index i holds the host CPU for vCPU i. BSP is index 0.
+        let pin_targets: Vec<Option<usize>> = if let Some(ref plan) = self.pinning_plan {
+            let total = self.topology.total_cpus() as usize;
+            let mut targets = vec![None; total];
+            for &(vcpu_id, host_cpu) in &plan.assignments {
+                if (vcpu_id as usize) < total {
+                    targets[vcpu_id as usize] = Some(host_cpu);
+                }
+            }
+            targets
+        } else {
+            Vec::new()
+        };
 
-        let monitor_handle = self.start_monitor(&vm, &kill, start)?;
+        // AP pin targets: indices 1..N.
+        let ap_pins: Vec<Option<usize>> = if pin_targets.len() > 1 {
+            pin_targets[1..].to_vec()
+        } else {
+            vec![None; vcpus.len()]
+        };
+
+        let ap_threads =
+            self.spawn_ap_threads(vcpus, has_immediate_exit, &com1, &com2, &kill, &ap_pins)?;
+
+        // Pin BSP (runs on current thread, pid=0 means calling thread).
+        if let Some(Some(host_cpu)) = pin_targets.first() {
+            pin_current_thread(*host_cpu, "BSP (vCPU 0)");
+        }
+
+        // Collect vCPU pthread_t handles for monitor stall detection.
+        // BSP runs on the current thread; APs have spawned threads.
+        let vcpu_pthreads = {
+            let mut pts = Vec::with_capacity(1 + ap_threads.len());
+            pts.push(unsafe { libc::pthread_self() } as libc::pthread_t);
+            for vt in &ap_threads {
+                pts.push(vt.handle.as_pthread_t() as libc::pthread_t);
+            }
+            pts
+        };
+
+        let monitor_handle = self.start_monitor(&vm, &kill, start, vcpu_pthreads)?;
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
         let bpf_write_handle = self.start_bpf_map_write(&vm, &kill)?;
@@ -827,7 +899,8 @@ impl SttVm {
         ))
     }
 
-    /// Spawn AP vCPU threads.
+    /// Spawn AP vCPU threads. Each thread optionally pins itself to a
+    /// host CPU from `pin_targets` (indexed by AP order, 0-based).
     fn spawn_ap_threads(
         &self,
         vcpus: Vec<kvm_ioctls::VcpuFd>,
@@ -835,6 +908,7 @@ impl SttVm {
         com1: &Arc<std::sync::Mutex<console::Serial>>,
         com2: &Arc<std::sync::Mutex<console::Serial>>,
         kill: &Arc<AtomicBool>,
+        pin_targets: &[Option<usize>],
     ) -> Result<Vec<VcpuThread>> {
         let mut ap_threads: Vec<VcpuThread> = Vec::new();
         for (i, mut vcpu) in vcpus.into_iter().enumerate() {
@@ -848,16 +922,18 @@ impl SttVm {
             let com2_clone = com2.clone();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
+            let pin_cpu = pin_targets.get(i).copied().flatten();
 
             let handle = std::thread::Builder::new()
                 .name(format!("vcpu-{}", i + 1))
                 .spawn(move || {
                     register_vcpu_signal_handler();
+                    // Pin inside the thread using pid=0 (calling thread).
+                    if let Some(cpu) = pin_cpu {
+                        pin_current_thread(cpu, &format!("vCPU {}", i + 1));
+                    }
                     vcpu_run_loop(&mut vcpu, &com1_clone, &com2_clone, &kill_clone);
                     exited_clone.store(true, Ordering::Release);
-                    // Return VcpuFd instead of dropping it here. The main
-                    // thread drops it after join, ensuring the kvm_run mmap
-                    // stays valid throughout the kick/wait_for_exit sequence.
                     vcpu
                 })
                 .with_context(|| format!("spawn vCPU {} thread", i + 1))?;
@@ -877,6 +953,7 @@ impl SttVm {
         vm: &kvm::SttKvm,
         kill: &Arc<AtomicBool>,
         start: Instant,
+        vcpu_pthreads: Vec<libc::pthread_t>,
     ) -> Result<Option<JoinHandle<Vec<monitor::MonitorSample>>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
@@ -905,6 +982,7 @@ impl SttVm {
                 });
 
         let watchdog_jiffies = self.watchdog_timeout_jiffies;
+        let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
 
         let handle = std::thread::Builder::new()
             .name("vmm-monitor".into())
@@ -948,6 +1026,10 @@ impl SttVm {
                         )
                     });
 
+                let vcpu_timing = monitor::reader::VcpuTiming {
+                    pthreads: vcpu_pthreads,
+                };
+
                 monitor::reader::monitor_loop(
                     &mem,
                     &rq_pas,
@@ -958,6 +1040,8 @@ impl SttVm {
                     start,
                     dump_trigger.as_ref(),
                     watchdog_override.as_ref(),
+                    Some(&vcpu_timing),
+                    preemption_threshold_ns,
                 )
             })
             .context("spawn monitor thread")?;
@@ -1222,7 +1306,12 @@ impl SttVm {
 
         let monitor_report = monitor_handle.and_then(|h| h.join().ok()).map(|samples| {
             let summary = monitor::MonitorSummary::from_samples(&samples);
-            monitor::MonitorReport { samples, summary }
+            let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
+            monitor::MonitorReport {
+                samples,
+                summary,
+                preemption_threshold_ns,
+            }
         });
 
         if let Some(h) = bpf_write_handle {
@@ -1467,6 +1556,7 @@ pub struct SttVmBuilder {
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
     watchdog_timeout_jiffies: Option<u64>,
     bpf_map_write: Option<BpfMapWriteParams>,
+    performance_mode: bool,
 }
 
 impl Default for SttVmBuilder {
@@ -1489,6 +1579,7 @@ impl Default for SttVmBuilder {
             monitor_thresholds: None,
             watchdog_timeout_jiffies: None,
             bpf_map_write: None,
+            performance_mode: false,
         }
     }
 }
@@ -1580,7 +1671,23 @@ impl SttVmBuilder {
         self
     }
 
+    /// Enable performance mode: vCPU pinning to host LLCs and
+    /// hugepage-backed guest memory. Validated at build time --
+    /// oversubscription is a fatal error, insufficient hugepages
+    /// is a warning.
+    #[allow(dead_code)]
+    pub fn performance_mode(mut self, enabled: bool) -> Self {
+        self.performance_mode = enabled;
+        self
+    }
+
     pub fn build(self) -> Result<SttVm> {
+        let pinning_plan = if self.performance_mode {
+            Some(self.validate_performance_mode()?)
+        } else {
+            None
+        };
+
         let kernel = self.kernel.context("kernel path required")?;
         anyhow::ensure!(kernel.exists(), "kernel not found: {}", kernel.display());
         let t = &self.topology;
@@ -1599,6 +1706,7 @@ impl SttVmBuilder {
                 bin.display()
             );
         }
+
         Ok(SttVm {
             kernel,
             init_binary: self.init_binary,
@@ -1613,7 +1721,64 @@ impl SttVmBuilder {
             monitor_thresholds: self.monitor_thresholds,
             watchdog_timeout_jiffies: self.watchdog_timeout_jiffies,
             bpf_map_write: self.bpf_map_write,
+            performance_mode: self.performance_mode,
+            pinning_plan,
         })
+    }
+
+    /// Validate host resources for performance_mode and compute the
+    /// pinning plan. Errors are fatal (oversubscription, unsatisfiable
+    /// topology). Warnings are printed for degraded conditions.
+    fn validate_performance_mode(&self) -> Result<host_topology::PinningPlan> {
+        let host_topo = host_topology::HostTopology::from_sysfs()
+            .context("performance_mode: read host topology")?;
+
+        let t = &self.topology;
+        let total_vcpus = t.total_cpus();
+
+        // ERROR: oversubscription.
+        anyhow::ensure!(
+            total_vcpus as usize <= host_topo.total_cpus(),
+            "performance_mode: {} vCPUs requested but only {} host CPUs available \
+             — oversubscription not allowed",
+            total_vcpus,
+            host_topo.total_cpus(),
+        );
+
+        // ERROR: cannot map virtual sockets to physical LLCs.
+        let plan = host_topo
+            .compute_pinning(t.sockets, t.cores_per_socket, t.threads_per_core)
+            .context("performance_mode: topology mapping")?;
+
+        // WARN: hugepages.
+        let free = host_topology::hugepages_free();
+        let needed = host_topology::hugepages_needed(self.memory_mb);
+        if free == 0 {
+            eprintln!(
+                "performance_mode: WARNING: no 2MB hugepages available, \
+                 guest memory will use regular pages",
+            );
+        } else if free < needed {
+            eprintln!(
+                "performance_mode: WARNING: need {} 2MB hugepages, \
+                 only {} free — falling back to regular pages",
+                needed, free,
+            );
+        }
+
+        // WARN: host load.
+        if let Some((running, total)) = host_topology::host_load_estimate() {
+            let threshold = (total_vcpus as f64 * 0.5) as usize;
+            if running > threshold {
+                eprintln!(
+                    "performance_mode: WARNING: {} processes running on {} CPUs \
+                     (threshold {} for {} vCPUs) — results may be noisy",
+                    running, total, threshold, total_vcpus,
+                );
+            }
+        }
+
+        Ok(plan)
     }
 }
 
@@ -2097,6 +2262,7 @@ mod tests {
         let report = monitor::MonitorReport {
             samples: vec![],
             summary: summary.clone(),
+            ..Default::default()
         };
         let r = VmResult {
             success: false,
@@ -2349,6 +2515,121 @@ mod tests {
     fn builder_sched_args() {
         let b = SttVmBuilder::default().sched_args(&["--enable-borrow".into()]);
         assert_eq!(b.sched_args, vec!["--enable-borrow"]);
+    }
+
+    // -- performance_mode builder tests --
+
+    #[test]
+    fn builder_performance_mode_default_false() {
+        let b = SttVmBuilder::default();
+        assert!(!b.performance_mode);
+    }
+
+    #[test]
+    fn builder_performance_mode_set() {
+        let b = SttVmBuilder::default().performance_mode(true);
+        assert!(b.performance_mode);
+    }
+
+    #[test]
+    fn builder_performance_mode_false_no_validation() {
+        // performance_mode=false should not trigger validation, even with
+        // a topology that exceeds host capacity.
+        let exe = crate::resolve_current_exe().unwrap();
+        let result = SttVmBuilder::default()
+            .kernel(&exe)
+            .topology(1, 1, 1)
+            .performance_mode(false)
+            .build();
+        assert!(
+            result.is_ok(),
+            "performance_mode=false should not validate host topology",
+        );
+    }
+
+    #[test]
+    fn builder_performance_mode_oversubscribed_fails() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
+        let too_many = host_topo.total_cpus() as u32 + 1;
+        let result = SttVmBuilder::default()
+            .kernel(&exe)
+            .topology(1, too_many, 1)
+            .performance_mode(true)
+            .build();
+        match result {
+            Ok(_) => panic!("oversubscribed topology should fail"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("performance_mode"),
+                    "error should mention performance_mode: {msg}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builder_performance_mode_too_many_sockets_fails() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
+        let too_many_sockets = host_topo.llc_groups.len() as u32 + 1;
+        // Use 1 core per socket to avoid oversubscription on total vCPUs.
+        if too_many_sockets as usize <= host_topo.total_cpus() {
+            let result = SttVmBuilder::default()
+                .kernel(&exe)
+                .topology(too_many_sockets, 1, 1)
+                .performance_mode(true)
+                .build();
+            assert!(result.is_err(), "more sockets than LLCs should fail",);
+        }
+    }
+
+    #[test]
+    fn builder_performance_mode_valid_succeeds() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
+        if host_topo.total_cpus() < 2 {
+            return;
+        }
+        let result = SttVmBuilder::default()
+            .kernel(&exe)
+            .topology(1, 2, 1)
+            .performance_mode(true)
+            .build();
+        assert!(
+            result.is_ok(),
+            "valid topology with performance_mode should build: {:?}",
+            result.err(),
+        );
+    }
+
+    #[test]
+    fn builder_performance_mode_preserves_in_vm() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
+        if host_topo.total_cpus() < 2 {
+            return;
+        }
+        let vm = SttVmBuilder::default()
+            .kernel(&exe)
+            .topology(1, 2, 1)
+            .performance_mode(true)
+            .build()
+            .unwrap();
+        assert!(vm.performance_mode);
+    }
+
+    #[test]
+    fn builder_performance_mode_false_preserves_in_vm() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let vm = SttVmBuilder::default()
+            .kernel(&exe)
+            .topology(1, 1, 1)
+            .performance_mode(false)
+            .build()
+            .unwrap();
+        assert!(!vm.performance_mode);
     }
 
     #[test]

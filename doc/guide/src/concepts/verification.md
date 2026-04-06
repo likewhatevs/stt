@@ -32,7 +32,10 @@ memory (per-CPU runqueue structs via BTF offsets) and evaluates:
 - **Local DSQ depth**: per-CPU dispatch queue depth.
 - **Stall detection**: any CPU's `rq_clock` does not advance between
   consecutive samples. CPUs with `rq_clock == 0` are excluded (not
-  yet initialized).
+  yet initialized). Idle CPUs (`nr_running == 0` in both samples) are
+  also excluded -- the kernel stops the tick (NOHZ) on idle CPUs, so
+  `rq_clock` legitimately does not advance. Stalls use the same
+  `sustained_samples` window as other monitor checks.
 - **Event rates**: scx fallback and keep-last event counters.
 
 Monitor thresholds use a sustained sample window (default: 5 samples).

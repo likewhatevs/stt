@@ -342,6 +342,11 @@ pub struct SttTestEntry {
     pub watchdog_timeout_jiffies: u64,
     /// Host-side BPF map write to perform during VM execution.
     pub bpf_map_write: Option<&'static BpfMapWrite>,
+    /// Pin vCPU threads to host cores matching the virtual topology's LLC
+    /// structure, use 2MB hugepages for guest memory, and validate that the
+    /// host has enough CPUs and LLCs to satisfy the request without
+    /// oversubscription.
+    pub performance_mode: bool,
 }
 
 /// Distributed slice collecting all `#[stt_test]` entries via linkme.
@@ -474,7 +479,8 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
         .cmdline(&cmdline_extra)
         .shm_size(STT_TEST_SHM_SIZE)
         .run_args(&guest_args)
-        .timeout(Duration::from_secs(60));
+        .timeout(Duration::from_secs(60))
+        .performance_mode(entry.performance_mode);
 
     // Merge order: default_checks -> scheduler.verify -> per-test verify.
     let merged_verify = crate::verify::Verify::default_checks()
@@ -1722,6 +1728,7 @@ mod tests {
         extra_sched_args: &[],
         watchdog_timeout_jiffies: 0,
         bpf_map_write: None,
+        performance_mode: false,
     };
 
     #[test]
@@ -2973,6 +2980,7 @@ mod tests {
             extra_sched_args: &[],
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
+            performance_mode: false,
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -3021,6 +3029,7 @@ mod tests {
             extra_sched_args: &[],
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
+            performance_mode: false,
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -3096,6 +3105,7 @@ mod tests {
             extra_sched_args: &[],
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
+            performance_mode: false,
         }
     }
 
@@ -3123,6 +3133,7 @@ mod tests {
             extra_sched_args: &[],
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
+            performance_mode: false,
         }
     }
 

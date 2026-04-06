@@ -23,6 +23,7 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `cores = N` (default: 2)
 ///   - `threads = N` (default: 1)
 ///   - `memory_mb = N` (default: 2048)
+///   - `performance_mode = bool` (default: false) -- vCPU pinning, hugepages
 #[proc_macro_attribute]
 pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -51,6 +52,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut max_keep_last_rate: Option<f64> = None;
     let mut extra_sched_args: Vec<String> = Vec::new();
     let mut watchdog_timeout_jiffies: u64 = 0;
+    let mut performance_mode: bool = false;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -84,7 +86,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         scheduler = Some(p);
                     }
-                    "auto_repro" | "check_not_starved" | "check_isolation" => {
+                    "auto_repro" | "check_not_starved" | "check_isolation" | "performance_mode" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -103,6 +105,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "auto_repro" => auto_repro = lit_bool.value(),
                             "check_not_starved" => check_not_starved = lit_bool.value(),
                             "check_isolation" => check_isolation = lit_bool.value(),
+                            "performance_mode" => performance_mode = lit_bool.value(),
                             _ => unreachable!(),
                         }
                     }
@@ -267,7 +270,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, check_not_starved, check_isolation, max_gap_ms, max_spread_pct, max_imbalance, max_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, watchdog_timeout_jiffies"),
+                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, check_not_starved, check_isolation, max_gap_ms, max_spread_pct, max_imbalance, max_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, watchdog_timeout_jiffies, performance_mode"),
                         )
                         .to_compile_error()
                         .into();
@@ -394,6 +397,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             extra_sched_args: &[#(#extra_sched_args),*],
             watchdog_timeout_jiffies: #watchdog_timeout_jiffies,
             bpf_map_write: None,
+            performance_mode: #performance_mode,
         };
 
         #[test]

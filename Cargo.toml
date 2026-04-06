@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive", "unicode", "wrap_help"] }
 crc32fast = "1.5"
 ctrlc = "3"
 console = "0.16"
+flate2 = "1"
 ctor = "0.8"
 gix = "0.81"
 libc = "0.2"

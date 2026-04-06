@@ -16,6 +16,7 @@
   - [Work Types](concepts/work-types.md)
   - [Verification](concepts/verification.md)
   - [Ops and Steps](concepts/ops.md)
+  - [Performance Mode](concepts/performance-mode.md)
 - [Writing Tests](writing-tests.md)
   - [The #\[stt_test\] Macro](writing-tests/stt-test-macro.md)
   - [Custom Scenarios](writing-tests/custom-scenarios.md)

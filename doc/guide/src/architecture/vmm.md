@@ -55,6 +55,25 @@ guest to host. Used for profraw data (`MSG_TYPE_PROFRAW`) and stimulus
 events (`MSG_TYPE_STIMULUS`). Each entry has a CRC32 for integrity
 checking.
 
+## Performance mode
+
+When `performance_mode` is enabled on the builder, the VMM applies
+host-side optimizations after vCPU threads are spawned:
+
+1. Reads host LLC topology from sysfs.
+2. Maps each virtual socket to a physical LLC group.
+3. Pins each vCPU thread to a dedicated host core via
+   `sched_setaffinity`.
+4. Allocates guest memory with 2MB hugepages (`MAP_HUGETLB`)
+   when sufficient free hugepages exist.
+
+Validation runs at build time. Oversubscription and unsatisfiable
+topology mappings are fatal errors. Insufficient hugepages is a
+warning -- the VM runs with regular pages rather than failing.
+
+See [Performance Mode](../concepts/performance-mode.md) for usage
+and prerequisites.
+
 ## Boot process
 
 1. Load bzImage kernel via `linux-loader`.

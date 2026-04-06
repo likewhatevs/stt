@@ -3895,6 +3895,7 @@ dependencies = [
  "crc32fast",
  "ctor",
  "ctrlc",
+ "flate2",
  "gix",
  "kvm-bindings",
  "kvm-ioctls",
