@@ -12,100 +12,26 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  build-and-test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Harden apt against flaky mirrors
-        run: |
-          echo 'Acquire::ForceIPv4 "true";'        | sudo tee /etc/apt/apt.conf.d/99force-ipv4 >/dev/null
-          echo 'Acquire::Retries "3";'              | sudo tee /etc/apt/apt.conf.d/99retries >/dev/null
-          echo 'Acquire::http::Pipeline-Depth "0";' | sudo tee /etc/apt/apt.conf.d/99pipeline >/dev/null
-          echo 'http://archive.ubuntu.com/ubuntu/'  | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-          sudo sed -i -E \
-            -e 's|https?://([a-z0-9-]+\.)*archive\.ubuntu\.com/ubuntu/?|http://archive.ubuntu.com/ubuntu/|g' \
-            -e 's|https?://security\.ubuntu\.com/ubuntu/?|http://archive.ubuntu.com/ubuntu/|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-
-      - name: Install system dependencies
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm-20.list
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang-20 \
-            llvm-20 \
-            libelf-dev \
-            libcap-dev \
-            binutils-dev \
-            gcc \
-            make \
-            pkg-config
-          sudo apt-get install -y linux-headers-$(uname -r) || true
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
-          sudo update-alternatives --set clang /usr/bin/clang-20
-          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-20 200
-          sudo update-alternatives --set llvm-strip /usr/bin/llvm-strip-20
-
-      - name: Build and install bpftool
-        run: |
-          git clone --recurse-submodules --depth 1 https://github.com/libbpf/bpftool.git
-          make -C bpftool/src -j$(nproc)
-          sudo make -C bpftool/src install
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup
         with:
-          components: clippy, rustfmt, llvm-tools-preview
-
+          rust-components: clippy,rustfmt
       - run: cargo fmt -- --check
+      - run: cargo build --workspace
+      - run: cargo clippy --workspace --all-targets
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
         with:
-          disable_annotations: true
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov,cargo-nextest
-
-      - name: Build all workspace members
-        run: cargo build --workspace
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets
-
-      - name: Install kernel debug symbols (vmlinux for BPF map introspection)
-        run: |
-          echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse
-          deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse" \
-            | sudo tee /etc/apt/sources.list.d/ddebs.list
-          sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys F2EDC64DC5AEE1F6B9C621F0C8CAB6595FDFF622 2>/dev/null || true
-          sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ddebs.list -o Dir::Etc::sourceparts=- || true
-          sudo apt-get install -y "linux-image-$(uname -r)-dbgsym" 2>/dev/null || \
-            sudo apt-get install -y "linux-image-unsigned-$(uname -r)-dbgsym" 2>/dev/null || true
-
-      - name: Enable KVM access
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          sudo chmod a+r /boot/vmlinuz-* 2>/dev/null || true
-          sudo sysctl -w kernel.kptr_restrict=0
-
-      - name: Run tests (nextest, CI profile)
-        run: cargo nextest run --workspace --profile ci --features integration
-
-      - name: Run coverage (cargo-llvm-cov + nextest)
-        run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-
+          tools: cargo-nextest
+          enable-kvm: 'true'
+      - run: cargo nextest run --workspace --profile ci --features integration
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
@@ -113,3 +39,19 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: target/nextest/ci/junit.xml
           report_type: test_results
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rust-components: llvm-tools-preview
+          tools: cargo-llvm-cov,cargo-nextest
+          enable-kvm: 'true'
+      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
