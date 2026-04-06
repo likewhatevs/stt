@@ -30,10 +30,13 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+          echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-20.list
           sudo apt-get update
           sudo apt-get install -y \
-            clang-19 \
-            llvm-19 \
+            clang-20 \
+            llvm-20 \
             libelf-dev \
             libcap-dev \
             binutils-dev \
@@ -41,8 +44,10 @@ jobs:
             make \
             pkg-config
           sudo apt-get install -y linux-headers-$(uname -r) || true
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100
-          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-19 100
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
+          sudo update-alternatives --set clang /usr/bin/clang-20
+          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-20 200
+          sudo update-alternatives --set llvm-strip /usr/bin/llvm-strip-20
 
       - name: Build and install bpftool
         run: |
@@ -69,6 +74,16 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets
+
+      - name: Install kernel debug symbols (vmlinux for BPF map introspection)
+        run: |
+          echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse
+          deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse" \
+            | sudo tee /etc/apt/sources.list.d/ddebs.list
+          sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys F2EDC64DC5AEE1F6B9C621F0C8CAB6595FDFF622 2>/dev/null || true
+          sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ddebs.list -o Dir::Etc::sourceparts=- || true
+          sudo apt-get install -y "linux-image-$(uname -r)-dbgsym" 2>/dev/null || \
+            sudo apt-get install -y "linux-image-unsigned-$(uname -r)-dbgsym" 2>/dev/null || true
 
       - name: Enable KVM access
         run: |

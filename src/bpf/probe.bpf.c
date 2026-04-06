@@ -65,12 +65,10 @@ int stt_probe(struct pt_regs *ctx)
 
 	struct func_meta *meta = bpf_map_lookup_elem(&func_meta_map, &ip);
 	if (!meta) {
-		u64 miss_cnt = __sync_fetch_and_add(&stt_meta_miss, 1);
-		if (miss_cnt < MAX_MISS_LOG) {
-			u32 idx = __sync_fetch_and_add(&stt_miss_log_idx, 1);
-			if (idx < MAX_MISS_LOG)
-				stt_miss_log[idx] = ip;
-		}
+		__sync_fetch_and_add(&stt_meta_miss, 1);
+		u32 idx = __sync_fetch_and_add(&stt_miss_log_idx, 1);
+		if (idx < MAX_MISS_LOG)
+			stt_miss_log[idx] = ip;
 		return 0;
 	}
 

@@ -49,6 +49,18 @@ filter = "test(cover_)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 retries = 1
 
+# Negative/auto-repro tests: boot two VMs (crash + repro).
+[[profile.ci.overrides]]
+filter = "test(neg_)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 1
+
+# stt-sched integration tests: full VM boots with scheduler.
+[[profile.ci.overrides]]
+filter = "test(sched_)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 1
+
 # Quick profile: exclude boot and bench tests.
 [[profile.quick.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"

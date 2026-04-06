@@ -1438,6 +1438,14 @@ fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
             return Some(candidate);
         }
     }
+    // CI/distro kernel: try /usr/lib/debug/boot/vmlinux-<version>
+    if let Some(name) = kernel_path.file_name().and_then(|n| n.to_str()) {
+        let version = name.strip_prefix("vmlinuz-").unwrap_or(name);
+        let debug = PathBuf::from(format!("/usr/lib/debug/boot/vmlinux-{version}"));
+        if debug.exists() {
+            return Some(debug);
+        }
+    }
     None
 }
 
