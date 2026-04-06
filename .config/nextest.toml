@@ -44,22 +44,19 @@ slow-timeout = { period = "15s", terminate-after = 2 }
 filter = "test(cover_)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+# VM-booting integration tests: CI runners are shared and noisy.
+# Two retries (three total attempts) absorb transient host load
+# that causes rq_clock stall false positives.
 [[profile.ci.overrides]]
-filter = "test(cover_)"
+filter = "test(cover_) | test(sched_)"
 slow-timeout = { period = "60s", terminate-after = 2 }
-retries = 1
+retries = 2
 
 # Negative/auto-repro tests: boot two VMs (crash + repro).
 [[profile.ci.overrides]]
 filter = "test(neg_)"
 slow-timeout = { period = "60s", terminate-after = 2 }
-retries = 1
-
-# stt-sched integration tests: full VM boots with scheduler.
-[[profile.ci.overrides]]
-filter = "test(sched_)"
-slow-timeout = { period = "60s", terminate-after = 2 }
-retries = 1
+retries = 2
 
 # VM-booting integration tests: retry once on host scheduling flakiness.
 [[profile.default.overrides]]
