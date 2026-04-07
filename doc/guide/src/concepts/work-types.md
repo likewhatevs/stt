@@ -10,6 +10,10 @@ pub enum WorkType {
     IoSync,
     Bursty { burst_ms: u64, sleep_ms: u64 },
     PipeIo { burst_iters: u64 },
+    FutexPingPong { spin_iters: u64 },
+    CachePressure { size_kb: usize, stride: usize },
+    CacheYield { size_kb: usize, stride: usize },
+    CachePipe { size_kb: usize, burst_iters: u64 },
 }
 ```
 
@@ -35,11 +39,69 @@ worker. Workers are paired: (0,1), (2,3), etc. Sleep duration depends
 on partner scheduling, exercising cross-CPU wake placement. Requires
 even `num_workers`.
 
+**`FutexPingPong`** -- paired futex wait/wake between partner workers.
+Each iteration does `spin_iters` of CPU work then wakes the partner
+and waits on a shared futex word. Exercises the non-WF_SYNC wake path.
+Requires even `num_workers`.
+
+**`CachePressure`** -- strided read-modify-write over a buffer sized
+to pressure the L1 cache. Each worker allocates its own buffer
+post-fork. `size_kb` controls buffer size, `stride` controls the byte
+step between accesses.
+
+**`CacheYield`** -- cache pressure followed by `sched_yield()`. Tests
+wake_affine placement after voluntary preemption.
+
+**`CachePipe`** -- cache pressure burst then 1-byte pipe exchange with
+a partner worker. Combines cache-hot working set with cross-CPU wake
+placement. Requires even `num_workers`.
+
+## Paired work types
+
+`PipeIo`, `FutexPingPong`, and `CachePipe` require even `num_workers`.
+`WorkType::requires_even_workers()` returns `true` for these variants.
+`PipeIo` and `CachePipe` use pipes; `FutexPingPong` uses shared mmap
+pages with futex wait/wake.
+
 ## Default values
 
 `WorkType::from_name()` uses these defaults:
 - `Bursty`: `burst_ms=50`, `sleep_ms=100`
 - `PipeIo`: `burst_iters=1024`
+- `FutexPingPong`: `spin_iters=1024`
+- `CachePressure`: `size_kb=32`, `stride=64`
+- `CacheYield`: `size_kb=32`, `stride=64`
+- `CachePipe`: `size_kb=32`, `burst_iters=1024`
+
+## WorkProgram
+
+`WorkProgram` is a composable layer above `WorkType`. It provides
+named presets for common workload patterns, resolved to a concrete
+`WorkType` via `resolve()`.
+
+```rust,ignore
+pub enum WorkProgram {
+    Single(WorkType),
+}
+```
+
+### Presets
+
+| Preset | Resolves to |
+|---|---|
+| `cpu_spin` | `CpuSpin` |
+| `mixed` | `Mixed` |
+| `bursty` | `Bursty { burst_ms: 50, sleep_ms: 100 }` |
+| `yield` | `YieldHeavy` |
+| `io` | `IoSync` |
+| `pipe` | `PipeIo { burst_iters: 1024 }` |
+| `cache_l1` | `CachePressure { size_kb: 32, stride: 64 }` |
+| `cache_yield` | `CacheYield { size_kb: 32, stride: 64 }` |
+| `cache_pipe` | `CachePipe { size_kb: 32, burst_iters: 1024 }` |
+| `futex` | `FutexPingPong { spin_iters: 1024 }` |
+
+Use `WorkProgram::from_name()` to parse CLI preset names.
+`WorkProgram` is re-exported in the prelude.
 
 ## Scheduling policies
 
@@ -63,8 +125,8 @@ The `--work-type` CLI flag overrides the default `CpuSpin` work type
 for all scenarios that use it. Scenarios with non-`CpuSpin` work types
 are not overridden.
 
-`PipeIo` overrides are skipped when a cgroup has an odd number of
-workers (PipeIo requires pairs).
+Overrides to paired work types (`PipeIo`, `FutexPingPong`,
+`CachePipe`) are skipped when a cgroup has an odd number of workers.
 
 Ops-based scenarios have a separate override mechanism via
 `CgroupDef.swappable`. See [Ops and Steps](ops.md#work-type-overrides-and-swappable).

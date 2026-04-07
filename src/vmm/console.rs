@@ -80,12 +80,14 @@ impl Serial {
 
     /// Write a byte to a register at the given offset.
     /// Used by MMIO dispatch where the offset is computed externally.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn inner_write(&mut self, offset: u8, byte: u8) {
         let _ = self.inner.write(offset, byte);
     }
 
     /// Read a byte from a register at the given offset.
     /// Used by MMIO dispatch where the offset is computed externally.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn inner_read(&mut self, offset: u8) -> u8 {
         self.inner.read(offset)
     }

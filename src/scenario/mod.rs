@@ -469,8 +469,8 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
         let effective_work_type = if let Some(override_wt) = ctx.work_type_override
             && matches!(cw.work_type, WorkType::CpuSpin)
         {
-            // Skip PipeIo override when num_workers is odd.
-            if matches!(override_wt, WorkType::PipeIo { .. }) && n % 2 != 0 {
+            // Skip paired-worker overrides when num_workers is odd.
+            if override_wt.requires_even_workers() && n % 2 != 0 {
                 cw.work_type
             } else {
                 override_wt

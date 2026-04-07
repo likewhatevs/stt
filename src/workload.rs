@@ -54,6 +54,32 @@ pub enum WorkType {
     PipeIo {
         burst_iters: u64,
     },
+    /// Paired futex wait/wake between partner workers. Each iteration does
+    /// `spin_iters` of CPU work then wakes the partner and waits on the
+    /// shared futex word. Exercises the non-WF_SYNC wake path.
+    /// Requires even num_workers.
+    FutexPingPong {
+        spin_iters: u64,
+    },
+    /// Strided read-modify-write over a buffer, sized to pressure the L1
+    /// cache. Each worker allocates its own buffer post-fork.
+    CachePressure {
+        size_kb: usize,
+        stride: usize,
+    },
+    /// Cache pressure followed by sched_yield(). Tests wake_affine
+    /// placement after voluntary preemption.
+    CacheYield {
+        size_kb: usize,
+        stride: usize,
+    },
+    /// Cache pressure burst then 1-byte pipe exchange with a partner
+    /// worker. Combines cache-hot working set with cross-CPU wake
+    /// placement. Requires even num_workers.
+    CachePipe {
+        size_kb: usize,
+        burst_iters: u64,
+    },
 }
 
 impl WorkType {
@@ -64,6 +90,10 @@ impl WorkType {
         "IoSync",
         "Bursty",
         "PipeIo",
+        "FutexPingPong",
+        "CachePressure",
+        "CacheYield",
+        "CachePipe",
     ];
 
     #[allow(dead_code)]
@@ -75,6 +105,10 @@ impl WorkType {
             WorkType::IoSync => "IoSync",
             WorkType::Bursty { .. } => "Bursty",
             WorkType::PipeIo { .. } => "PipeIo",
+            WorkType::FutexPingPong { .. } => "FutexPingPong",
+            WorkType::CachePressure { .. } => "CachePressure",
+            WorkType::CacheYield { .. } => "CacheYield",
+            WorkType::CachePipe { .. } => "CachePipe",
         }
     }
 
@@ -89,8 +123,161 @@ impl WorkType {
                 sleep_ms: 100,
             }),
             "PipeIo" => Some(WorkType::PipeIo { burst_iters: 1024 }),
+            "FutexPingPong" => Some(WorkType::FutexPingPong { spin_iters: 1024 }),
+            "CachePressure" => Some(WorkType::CachePressure {
+                size_kb: 32,
+                stride: 64,
+            }),
+            "CacheYield" => Some(WorkType::CacheYield {
+                size_kb: 32,
+                stride: 64,
+            }),
+            "CachePipe" => Some(WorkType::CachePipe {
+                size_kb: 32,
+                burst_iters: 1024,
+            }),
             _ => None,
         }
+    }
+
+    /// Whether this work type requires an even number of workers (paired communication).
+    pub fn requires_even_workers(&self) -> bool {
+        matches!(
+            self,
+            WorkType::PipeIo { .. } | WorkType::FutexPingPong { .. } | WorkType::CachePipe { .. }
+        )
+    }
+
+    /// Whether this work type needs a pre-fork shared memory region (MAP_SHARED mmap).
+    pub fn needs_shared_mem(&self) -> bool {
+        matches!(self, WorkType::FutexPingPong { .. })
+    }
+
+    /// Whether this work type allocates a per-worker cache buffer post-fork.
+    pub fn needs_cache_buf(&self) -> bool {
+        matches!(
+            self,
+            WorkType::CachePressure { .. }
+                | WorkType::CacheYield { .. }
+                | WorkType::CachePipe { .. }
+        )
+    }
+}
+
+/// Composable work program that resolves to a [`WorkType`].
+///
+/// Provides named presets for common workload patterns. Resolves to a
+/// concrete `WorkType` via [`resolve()`](Self::resolve). CLI uses preset
+/// names via [`from_name()`](Self::from_name).
+#[derive(Debug, Clone, Copy)]
+pub enum WorkProgram {
+    /// A single work type, used directly.
+    Single(WorkType),
+}
+
+impl WorkProgram {
+    pub const ALL_NAMES: &[&'static str] = &[
+        "cpu_spin",
+        "mixed",
+        "bursty",
+        "yield",
+        "io",
+        "pipe",
+        "cache_l1",
+        "cache_yield",
+        "cache_pipe",
+        "futex",
+    ];
+
+    /// CPU-only spin loop.
+    pub const fn cpu_spin() -> Self {
+        WorkProgram::Single(WorkType::CpuSpin)
+    }
+
+    /// Spin loop interleaved with yield.
+    pub const fn mixed() -> Self {
+        WorkProgram::Single(WorkType::Mixed)
+    }
+
+    /// Burst/sleep cycle.
+    pub const fn bursty() -> Self {
+        WorkProgram::Single(WorkType::Bursty {
+            burst_ms: 50,
+            sleep_ms: 100,
+        })
+    }
+
+    /// Pure yield loop.
+    pub const fn yield_heavy() -> Self {
+        WorkProgram::Single(WorkType::YieldHeavy)
+    }
+
+    /// Synchronous I/O.
+    pub const fn io() -> Self {
+        WorkProgram::Single(WorkType::IoSync)
+    }
+
+    /// Pipe exchange between paired workers.
+    pub const fn pipe() -> Self {
+        WorkProgram::Single(WorkType::PipeIo { burst_iters: 1024 })
+    }
+
+    /// L1-sized cache pressure.
+    pub const fn cache_l1() -> Self {
+        WorkProgram::Single(WorkType::CachePressure {
+            size_kb: 32,
+            stride: 64,
+        })
+    }
+
+    /// Cache pressure then yield.
+    pub const fn cache_yield() -> Self {
+        WorkProgram::Single(WorkType::CacheYield {
+            size_kb: 32,
+            stride: 64,
+        })
+    }
+
+    /// Cache pressure then pipe exchange.
+    pub const fn cache_pipe() -> Self {
+        WorkProgram::Single(WorkType::CachePipe {
+            size_kb: 32,
+            burst_iters: 1024,
+        })
+    }
+
+    /// Futex ping-pong between paired workers.
+    pub const fn futex() -> Self {
+        WorkProgram::Single(WorkType::FutexPingPong { spin_iters: 1024 })
+    }
+
+    /// Resolve a preset name to a WorkProgram.
+    pub fn from_name(s: &str) -> Option<WorkProgram> {
+        match s {
+            "cpu_spin" => Some(Self::cpu_spin()),
+            "mixed" => Some(Self::mixed()),
+            "bursty" => Some(Self::bursty()),
+            "yield" => Some(Self::yield_heavy()),
+            "io" => Some(Self::io()),
+            "pipe" => Some(Self::pipe()),
+            "cache_l1" => Some(Self::cache_l1()),
+            "cache_yield" => Some(Self::cache_yield()),
+            "cache_pipe" => Some(Self::cache_pipe()),
+            "futex" => Some(Self::futex()),
+            _ => None,
+        }
+    }
+
+    /// Resolve to a concrete WorkType.
+    pub fn resolve(&self) -> WorkType {
+        match self {
+            WorkProgram::Single(wt) => *wt,
+        }
+    }
+
+    /// Whether the resolved WorkType requires even workers.
+    pub fn requires_even_workers(&self) -> bool {
+        self.resolve().requires_even_workers()
     }
 }
 
@@ -197,25 +384,37 @@ pub fn set_repro_mode(v: bool) {
 pub struct WorkloadHandle {
     children: Vec<(u32, std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
     started: bool,
+    /// Shared mmap regions for FutexPingPong (one per worker pair). Unmapped on drop.
+    futex_ptrs: Vec<*mut u32>,
 }
+
+// SAFETY: futex_ptrs are MAP_SHARED anonymous pages owned exclusively by this
+// handle. Only the parent process accesses them for munmap on drop.
+unsafe impl Send for WorkloadHandle {}
+unsafe impl Sync for WorkloadHandle {}
 
 impl WorkloadHandle {
     /// Fork worker processes. Workers block on a pipe until [`start()`](Self::start)
     /// is called, allowing the caller to move them into cgroups first.
     pub fn spawn(config: &WorkloadConfig) -> Result<Self> {
-        let is_pipeio = matches!(config.work_type, WorkType::PipeIo { .. });
-        if is_pipeio && !config.num_workers.is_multiple_of(2) {
+        let needs_pipes = matches!(
+            config.work_type,
+            WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
+        );
+        let needs_futex = config.work_type.needs_shared_mem();
+        if config.work_type.requires_even_workers() && !config.num_workers.is_multiple_of(2) {
             anyhow::bail!(
-                "PipeIo requires even num_workers, got {}",
+                "{} requires even num_workers, got {}",
+                config.work_type.name(),
                 config.num_workers
             );
         }
 
-        // For PipeIo, create one pipe per worker pair before forking.
+        // For paired work types, create one pipe per worker pair before forking.
         // pipe_pairs[pair_idx] = (read_fd, write_fd) for the A->B direction,
         // and a second pipe for B->A.
         let mut pipe_pairs: Vec<([i32; 2], [i32; 2])> = Vec::new();
-        if is_pipeio {
+        if needs_pipes {
             for _ in 0..config.num_workers / 2 {
                 let mut ab = [0i32; 2]; // A writes, B reads
                 let mut ba = [0i32; 2]; // B writes, A reads
@@ -228,13 +427,37 @@ impl WorkloadHandle {
             }
         }
 
+        // For FutexPingPong, allocate one shared futex word per worker pair
+        // via MAP_SHARED|MAP_ANONYMOUS so both sides of the fork see the same
+        // physical page.
+        let mut futex_ptrs: Vec<*mut u32> = Vec::new();
+        if needs_futex {
+            for _ in 0..config.num_workers / 2 {
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        std::mem::size_of::<u32>(),
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    anyhow::bail!("mmap failed: {}", std::io::Error::last_os_error());
+                }
+                unsafe { *(ptr as *mut u32) = 0 };
+                futex_ptrs.push(ptr as *mut u32);
+            }
+        }
+
         let mut children = Vec::with_capacity(config.num_workers);
 
         for i in 0..config.num_workers {
             let affinity = resolve_affinity(&config.affinity, i)?;
 
-            // Determine pipe fds for this worker (PipeIo only).
-            let worker_pipe_fds: Option<(i32, i32)> = if is_pipeio {
+            // Determine pipe fds for this worker (PipeIo/CachePipe).
+            let worker_pipe_fds: Option<(i32, i32)> = if needs_pipes {
                 let pair_idx = i / 2;
                 let (ref ab, ref ba) = pipe_pairs[pair_idx];
                 if i % 2 == 0 {
@@ -244,6 +467,15 @@ impl WorkloadHandle {
                     // Worker B: writes to ba[1], reads from ab[0]
                     Some((ab[0], ba[1]))
                 }
+            } else {
+                None
+            };
+
+            // Futex pointer for this worker (FutexPingPong only).
+            let worker_futex: Option<(*mut u32, bool)> = if needs_futex {
+                let pair_idx = i / 2;
+                let is_first = i % 2 == 0;
+                Some((futex_ptrs[pair_idx], is_first))
             } else {
                 None
             };
@@ -276,7 +508,7 @@ impl WorkloadHandle {
                         libc::close(start_fds[1]);
                     }
                     // Close pipe ends belonging to other workers in this pair.
-                    if is_pipeio {
+                    if needs_pipes {
                         let pair_idx = i / 2;
                         let (ref ab, ref ba) = pipe_pairs[pair_idx];
                         if i % 2 == 0 {
@@ -332,6 +564,7 @@ impl WorkloadHandle {
                         config.work_type,
                         config.sched_policy,
                         worker_pipe_fds,
+                        worker_futex,
                     );
                     let json = serde_json::to_vec(&report).unwrap_or_default();
                     let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
@@ -365,6 +598,7 @@ impl WorkloadHandle {
         Ok(Self {
             children,
             started: false,
+            futex_ptrs,
         })
     }
 
@@ -482,6 +716,11 @@ impl Drop for WorkloadHandle {
                 }
             }
         }
+        for &ptr in &self.futex_ptrs {
+            unsafe {
+                libc::munmap(ptr as *mut libc::c_void, std::mem::size_of::<u32>());
+            }
+        }
     }
 }
 
@@ -495,6 +734,7 @@ fn worker_main(
     work_type: WorkType,
     sched_policy: SchedPolicy,
     pipe_fds: Option<(i32, i32)>,
+    futex: Option<(*mut u32, bool)>,
 ) -> WorkerReport {
     let tid = unsafe { libc::getpid() } as u32;
 
@@ -514,12 +754,14 @@ fn worker_main(
     let mut max_gap_ns: u64 = 0;
     let mut max_gap_cpu: usize = last_cpu;
     let mut max_gap_at_ns: u64 = 0;
+    // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe).
+    let mut cache_pressure_buf: Option<Vec<u8>> = None;
 
     while !STOP.load(Ordering::Relaxed) {
         match work_type {
             WorkType::CpuSpin => {
                 for _ in 0..1024 {
-                    work_units = work_units.wrapping_add(1);
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
                     std::hint::spin_loop();
                 }
             }
@@ -529,7 +771,7 @@ fn worker_main(
             }
             WorkType::Mixed => {
                 for _ in 0..1024 {
-                    work_units = work_units.wrapping_add(1);
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
                     std::hint::spin_loop();
                 }
                 std::thread::yield_now();
@@ -561,7 +803,7 @@ fn worker_main(
                 let burst_end = Instant::now() + Duration::from_millis(burst_ms);
                 while Instant::now() < burst_end && !STOP.load(Ordering::Relaxed) {
                     for _ in 0..1024 {
-                        work_units = work_units.wrapping_add(1);
+                        work_units = std::hint::black_box(work_units.wrapping_add(1));
                         std::hint::spin_loop();
                     }
                 }
@@ -576,7 +818,7 @@ fn worker_main(
                 }
                 // CPU burst
                 for _ in 0..burst_iters {
-                    work_units = work_units.wrapping_add(1);
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
                     std::hint::spin_loop();
                 }
                 // Write 1 byte to partner
@@ -601,6 +843,133 @@ fn worker_main(
                         break;
                     }
                 }
+            }
+            WorkType::FutexPingPong { spin_iters } => {
+                let (futex_ptr, is_first) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                // CPU burst
+                for _ in 0..spin_iters {
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
+                    std::hint::spin_loop();
+                }
+                // Worker A waits for 0, wakes partner with 1.
+                // Worker B waits for 1, wakes partner with 0.
+                let my_val: u32 = if is_first { 0 } else { 1 };
+                let partner_val: u32 = if is_first { 1 } else { 0 };
+                // Wake partner
+                unsafe {
+                    std::ptr::write_volatile(futex_ptr, partner_val);
+                    libc::syscall(
+                        libc::SYS_futex,
+                        futex_ptr,
+                        libc::FUTEX_WAKE,
+                        1, // wake one waiter
+                        std::ptr::null::<libc::timespec>(),
+                        std::ptr::null::<u32>(),
+                        0u32,
+                    );
+                }
+                // Wait for partner to set our expected value, with timeout
+                // to avoid blocking forever if partner has stopped.
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 100_000_000, // 100ms
+                };
+                loop {
+                    if STOP.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
+                    if cur == my_val {
+                        break;
+                    }
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_futex,
+                            futex_ptr,
+                            libc::FUTEX_WAIT,
+                            partner_val, // expected value
+                            &ts as *const libc::timespec,
+                            std::ptr::null::<u32>(),
+                            0u32,
+                        );
+                    }
+                }
+                // Reset last_iter_time after blocking step
+                last_iter_time = Instant::now();
+            }
+            WorkType::CachePressure { size_kb, stride } => {
+                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
+                let len = buf.len();
+                if len == 0 || stride == 0 {
+                    break;
+                }
+                let mut idx = 0;
+                for _ in 0..1024 {
+                    buf[idx] = buf[idx].wrapping_add(1);
+                    idx = (idx + stride) % len;
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
+                }
+            }
+            WorkType::CacheYield { size_kb, stride } => {
+                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
+                let len = buf.len();
+                if len == 0 || stride == 0 {
+                    break;
+                }
+                let mut idx = 0;
+                for _ in 0..1024 {
+                    buf[idx] = buf[idx].wrapping_add(1);
+                    idx = (idx + stride) % len;
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
+                }
+                std::thread::yield_now();
+            }
+            WorkType::CachePipe {
+                size_kb,
+                burst_iters,
+            } => {
+                let (read_fd, write_fd) = pipe_fds.unwrap_or((-1, -1));
+                if read_fd < 0 || write_fd < 0 {
+                    break;
+                }
+                let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
+                let len = buf.len();
+                // Cache pressure burst
+                if len > 0 {
+                    let stride = 64;
+                    let mut idx = 0;
+                    for _ in 0..burst_iters {
+                        buf[idx] = buf[idx].wrapping_add(1);
+                        idx = (idx + stride) % len;
+                        work_units = std::hint::black_box(work_units.wrapping_add(1));
+                    }
+                }
+                // Pipe exchange (same as PipeIo)
+                unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) };
+                let mut pfd = libc::pollfd {
+                    fd: read_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                loop {
+                    if STOP.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+                    if ret > 0 {
+                        let mut byte = [0u8; 1];
+                        unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut _, 1) };
+                        break;
+                    }
+                    if ret < 0 {
+                        break;
+                    }
+                }
+                // Reset last_iter_time after blocking step
+                last_iter_time = Instant::now();
             }
         }
 
@@ -746,7 +1115,7 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        assert_eq!(WorkType::ALL_NAMES.len(), 6);
+        assert_eq!(WorkType::ALL_NAMES.len(), 10);
     }
 
     #[test]

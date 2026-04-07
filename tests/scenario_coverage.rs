@@ -236,6 +236,7 @@ fn cover_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
     scheduler = STT_SCHED,
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_jiffies = 60000,
+    max_imbalance_ratio = 10.0,
 )]
 fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::basic::custom_sched_mixed(ctx)

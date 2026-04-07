@@ -56,6 +56,8 @@ All attributes are optional with defaults.
 | `isolation` | inherited | Enable cpuset isolation check (workers must stay on assigned CPUs) |
 | `max_gap_ms` | inherited | Max scheduling gap threshold |
 | `max_spread_pct` | inherited | Max fairness spread threshold |
+| `max_throughput_cv` | inherited | Max coefficient of variation for worker throughput |
+| `min_work_rate` | inherited | Minimum work_units per CPU-second per worker |
 | `max_imbalance_ratio` | inherited | Monitor imbalance ratio |
 | `max_local_dsq_depth` | inherited | Monitor DSQ depth |
 | `fail_on_stall` | inherited | Fail on stall detection |

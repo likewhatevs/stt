@@ -48,6 +48,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut fail_on_stall: Option<bool> = None;
     let mut sustained_samples: Option<usize> = None;
     let mut replicas: u32 = 1;
+    let mut max_throughput_cv: Option<f64> = None;
+    let mut min_work_rate: Option<f64> = None;
     let mut max_fallback_rate: Option<f64> = None;
     let mut max_keep_last_rate: Option<f64> = None;
     let mut extra_sched_args: Vec<String> = Vec::new();
@@ -227,7 +229,9 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "max_imbalance_ratio"
                     | "max_fallback_rate"
                     | "max_keep_last_rate"
-                    | "max_spread_pct" => {
+                    | "max_spread_pct"
+                    | "max_throughput_cv"
+                    | "min_work_rate" => {
                         let lit_float = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Float(lf),
@@ -250,6 +254,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "max_fallback_rate" => max_fallback_rate = Some(v),
                             "max_keep_last_rate" => max_keep_last_rate = Some(v),
                             "max_spread_pct" => max_spread_pct = Some(v),
+                            "max_throughput_cv" => max_throughput_cv = Some(v),
+                            "min_work_rate" => min_work_rate = Some(v),
                             _ => unreachable!(),
                         }
                     }
@@ -308,7 +314,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_jiffies, performance_mode, duration_s, workers_per_cell"),
+                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_jiffies, performance_mode, duration_s, workers_per_cell"),
                         )
                         .to_compile_error()
                         .into();
@@ -403,6 +409,14 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         Some(v) => quote! { Some(#v) },
         None => quote! { None },
     };
+    let throughput_cv_tokens = match max_throughput_cv {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    };
+    let work_rate_tokens = match min_work_rate {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    };
     let fallback_rate_tokens = match max_fallback_rate {
         Some(v) => quote! { Some(#v) },
         None => quote! { None },
@@ -433,6 +447,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 isolation: #isolation_tokens,
                 max_gap_ms: #gap_tokens,
                 max_spread_pct: #spread_tokens,
+                max_throughput_cv: #throughput_cv_tokens,
+                min_work_rate: #work_rate_tokens,
                 max_imbalance_ratio: #imbalance_tokens,
                 max_local_dsq_depth: #dsq_tokens,
                 fail_on_stall: #stall_tokens,

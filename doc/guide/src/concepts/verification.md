@@ -23,6 +23,19 @@ dropped a task. Reports include the gap duration, CPU, and timing.
 **Cpuset isolation** -- workers must only run on CPUs in their assigned
 cpuset. Any execution on an unexpected CPU fails the test.
 
+**Throughput parity** -- `verify_throughput_parity()` checks that
+workers produce similar throughput (work_units per CPU-second). Two
+thresholds:
+- `max_throughput_cv`: coefficient of variation across workers. High
+  CV means the scheduler gives some workers disproportionately less
+  effective CPU. Requires at least 2 workers with nonzero CPU time.
+- `min_work_rate`: minimum work_units per CPU-second per worker.
+  Catches cases where all workers are equally slow (CV passes but
+  absolute throughput is too low).
+
+Neither threshold is set by default; enable via `Verify` setters or
+`#[stt_test]` attributes.
+
 ## Monitor checks
 
 The [host-side monitor](../architecture/monitor.md) reads guest VM
@@ -53,6 +66,10 @@ pub struct Verify {
     pub isolation: Option<bool>,
     pub max_gap_ms: Option<u64>,
     pub max_spread_pct: Option<f64>,
+
+    // Throughput checks
+    pub max_throughput_cv: Option<f64>,
+    pub min_work_rate: Option<f64>,
 
     // Monitor checks
     pub max_imbalance_ratio: Option<f64>,
@@ -124,6 +141,8 @@ pub struct VerificationPlan {
     pub isolation: bool,
     pub max_gap_ms: Option<u64>,
     pub max_spread_pct: Option<f64>,
+    pub max_throughput_cv: Option<f64>,
+    pub min_work_rate: Option<f64>,
 }
 ```
 

@@ -491,6 +491,7 @@ fn cmd_test(args: TestArgs) -> Result<()> {
             git_commit: None,
             replicas: 1,
             rows: rows.clone(),
+            policies: vec![],
         };
         baseline.save(path)?;
         println!(
@@ -720,6 +721,7 @@ fn cmd_gauntlet(args: GauntletArgs) -> Result<()> {
             git_commit: None,
             replicas: 1,
             rows: rows.clone(),
+            policies: vec![],
         };
         baseline.save(path)?;
         println!(

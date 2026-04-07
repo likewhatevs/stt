@@ -3741,7 +3741,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_l0_index_256() {
-        let (buf, cr3_pa, kva, data_pa) = setup_page_table_l0_256();
+        let (buf, cr3_pa, kva, data_pa) = setup_page_table_vmalloc();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let pa = mem.translate_kva(cr3_pa, kva, false);
         assert_eq!(
@@ -3755,7 +3755,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_l0_index_256_with_offset() {
-        let (buf, cr3_pa, kva, data_pa) = setup_page_table_l0_256();
+        let (buf, cr3_pa, kva, data_pa) = setup_page_table_vmalloc();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
         assert_eq!(pa, Some(data_pa + 0x100));
@@ -3764,7 +3764,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_l0_index_256_unmapped_neighbor() {
-        let (buf, cr3_pa, kva, _) = setup_page_table_l0_256();
+        let (buf, cr3_pa, kva, _) = setup_page_table_vmalloc();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let kva_257 = kva + (1u64 << 39);
         assert_eq!(mem.translate_kva(cr3_pa, kva_257, false), None);

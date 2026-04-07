@@ -124,7 +124,9 @@ pub mod prelude {
     pub use crate::stt_test;
     pub use crate::test_support::{Scheduler, SchedulerSpec};
     pub use crate::verify::{VerificationPlan, Verify, VerifyResult};
-    pub use crate::workload::{WorkType, WorkerReport, WorkloadConfig, WorkloadHandle};
+    pub use crate::workload::{
+        WorkProgram, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle,
+    };
 }
 
 /// Find a bootable kernel image on the host.

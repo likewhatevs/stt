@@ -135,6 +135,8 @@ pub struct VerificationPlan {
     pub isolation: bool,
     pub max_gap_ms: Option<u64>,
     pub max_spread_pct: Option<f64>,
+    pub max_throughput_cv: Option<f64>,
+    pub min_work_rate: Option<f64>,
 }
 
 impl VerificationPlan {
@@ -144,6 +146,8 @@ impl VerificationPlan {
             isolation: false,
             max_gap_ms: None,
             max_spread_pct: None,
+            max_throughput_cv: None,
+            min_work_rate: None,
         }
     }
 
@@ -239,6 +243,13 @@ impl VerificationPlan {
         {
             r.merge(verify_isolation(reports, cs));
         }
+        if self.max_throughput_cv.is_some() || self.min_work_rate.is_some() {
+            r.merge(verify_throughput_parity(
+                reports,
+                self.max_throughput_cv,
+                self.min_work_rate,
+            ));
+        }
         r
     }
 }
@@ -262,6 +273,14 @@ pub struct Verify {
     pub max_gap_ms: Option<u64>,
     pub max_spread_pct: Option<f64>,
 
+    // Throughput checks
+    /// Max coefficient of variation for work_units/cpu_time across workers.
+    /// Catches placement unfairness where some workers get less CPU than others.
+    pub max_throughput_cv: Option<f64>,
+    /// Minimum work_units per CPU-second. Catches cases where all workers
+    /// are equally slow (CV passes but absolute throughput is too low).
+    pub min_work_rate: Option<f64>,
+
     // Monitor checks
     pub max_imbalance_ratio: Option<f64>,
     pub max_local_dsq_depth: Option<u32>,
@@ -278,6 +297,8 @@ impl Verify {
         isolation: None,
         max_gap_ms: None,
         max_spread_pct: None,
+        max_throughput_cv: None,
+        min_work_rate: None,
         max_imbalance_ratio: None,
         max_local_dsq_depth: None,
         fail_on_stall: None,
@@ -295,6 +316,8 @@ impl Verify {
             isolation: None,
             max_gap_ms: None,
             max_spread_pct: None,
+            max_throughput_cv: None,
+            min_work_rate: None,
             max_imbalance_ratio: Some(MonitorThresholds::DEFAULT.max_imbalance_ratio),
             max_local_dsq_depth: Some(MonitorThresholds::DEFAULT.max_local_dsq_depth),
             fail_on_stall: Some(MonitorThresholds::DEFAULT.fail_on_stall),
@@ -321,6 +344,16 @@ impl Verify {
 
     pub const fn max_spread_pct(mut self, pct: f64) -> Self {
         self.max_spread_pct = Some(pct);
+        self
+    }
+
+    pub const fn max_throughput_cv(mut self, v: f64) -> Self {
+        self.max_throughput_cv = Some(v);
+        self
+    }
+
+    pub const fn min_work_rate(mut self, v: f64) -> Self {
+        self.min_work_rate = Some(v);
         self
     }
 
@@ -378,6 +411,14 @@ impl Verify {
                 Some(v) => Some(v),
                 None => self.max_spread_pct,
             },
+            max_throughput_cv: match other.max_throughput_cv {
+                Some(v) => Some(v),
+                None => self.max_throughput_cv,
+            },
+            min_work_rate: match other.min_work_rate {
+                Some(v) => Some(v),
+                None => self.min_work_rate,
+            },
             max_imbalance_ratio: match other.max_imbalance_ratio {
                 Some(v) => Some(v),
                 None => self.max_imbalance_ratio,
@@ -412,6 +453,8 @@ impl Verify {
             isolation: self.isolation.unwrap_or(false),
             max_gap_ms: self.max_gap_ms,
             max_spread_pct: self.max_spread_pct,
+            max_throughput_cv: self.max_throughput_cv,
+            min_work_rate: self.min_work_rate,
         }
     }
 
@@ -546,6 +589,68 @@ pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
         worst_gap_ms: gap_ms,
         worst_gap_cpu: gap_cpu,
     };
+
+    r
+}
+
+/// Check throughput parity across workers: coefficient of variation and
+/// minimum work rate.
+///
+/// `max_cv`: maximum allowed coefficient of variation (stddev/mean) for
+/// work_units / cpu_time_ns across workers. `None` skips the CV check.
+///
+/// `min_rate`: minimum work_units per CPU-second. `None` skips the floor check.
+pub fn verify_throughput_parity(
+    reports: &[WorkerReport],
+    max_cv: Option<f64>,
+    min_rate: Option<f64>,
+) -> VerifyResult {
+    let mut r = VerifyResult::pass();
+    if reports.is_empty() {
+        return r;
+    }
+
+    // Compute per-worker throughput: work_units / cpu_seconds
+    let rates: Vec<f64> = reports
+        .iter()
+        .map(|w| {
+            if w.cpu_time_ns == 0 {
+                0.0
+            } else {
+                w.work_units as f64 / (w.cpu_time_ns as f64 / 1e9)
+            }
+        })
+        .collect();
+
+    let n = rates.len() as f64;
+    let mean = rates.iter().sum::<f64>() / n;
+
+    if let Some(cv_limit) = max_cv
+        && mean > 0.0
+        && rates.len() >= 2
+    {
+        let variance = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+        let stddev = variance.sqrt();
+        let cv = stddev / mean;
+        if cv > cv_limit {
+            r.passed = false;
+            r.details.push(format!(
+                "throughput CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0} work/cpu_s)"
+            ));
+        }
+    }
+
+    if let Some(floor) = min_rate {
+        for (i, &rate) in rates.iter().enumerate() {
+            if rate < floor {
+                r.passed = false;
+                r.details.push(format!(
+                    "worker {} throughput {rate:.0} work/cpu_s below floor {floor:.0}",
+                    reports[i].tid
+                ));
+            }
+        }
+    }
 
     r
 }

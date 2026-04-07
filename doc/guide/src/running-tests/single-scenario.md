@@ -34,7 +34,7 @@ the test scenarios (names, flags, duration).
 | `--all-flags` | -- | Run all valid flag combinations |
 | `--verbose` | -- | Verbose output |
 | `--json` | -- | JSON output |
-| `--work-type NAME` | -- | Override work type |
+| `--work-type NAME` | -- | Override work type. Valid names: `CpuSpin`, `YieldHeavy`, `Mixed`, `IoSync`, `Bursty`, `PipeIo`, `FutexPingPong`, `CachePressure`, `CacheYield`, `CachePipe`. WorkProgram presets: `cpu_spin`, `mixed`, `bursty`, `yield`, `io`, `pipe`, `cache_l1`, `cache_yield`, `cache_pipe`, `futex`. |
 
 ## Investigating failures
 

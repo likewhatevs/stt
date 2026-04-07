@@ -1100,6 +1100,9 @@ pub struct GauntletBaseline {
     pub replicas: u32,
     /// The raw row data.
     pub rows: Vec<GauntletRow>,
+    /// Per-cell comparison policies. Cells not matched use `DEFAULTS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<ScopedPolicy>,
 }
 
 impl GauntletBaseline {
@@ -1144,6 +1147,8 @@ struct CellDelta {
     // Pass rate change.
     baseline_pass_rate: f64,
     current_pass_rate: f64,
+    // Resolved thresholds used for this cell.
+    resolved: ResolvedPolicy,
 }
 
 /// Aggregate a group of rows for the same (scenario, flags, topology) into
@@ -1172,26 +1177,168 @@ fn aggregate_cell(rows: &[&GauntletRow]) -> CellAgg {
     }
 }
 
-/// Tolerance thresholds for classifying a delta as regression vs noise.
-/// A metric change is significant only when it exceeds BOTH the absolute
-/// and relative thresholds.
-const SPREAD_ABS_TOL: f64 = 2.0;
-const GAP_MS_ABS_TOL: f64 = 50.0;
-const IMBALANCE_ABS_TOL: f64 = 0.5;
-const DSQ_ABS_TOL: f64 = 5.0;
-const FALLBACK_ABS_TOL: f64 = 10.0;
-const KEEP_LAST_ABS_TOL: f64 = 10.0;
-const PASS_RATE_TOL: f64 = 0.01;
-const RELATIVE_TOL: f64 = 0.10;
+/// Per-metric tolerance thresholds for baseline A/B comparison.
+///
+/// All fields are `Option<f64>`: `None` means "use `DEFAULTS`", `Some(v)`
+/// overrides that metric. A delta is significant when it exceeds BOTH the
+/// absolute and relative thresholds (dual-gate). All metrics treat
+/// increase as regression (higher spread/gap/imbalance = worse).
+///
+/// `Copy` + const-constructible: can live in `const` or `static` items.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ComparisonPolicy {
+    pub spread_abs: Option<f64>,
+    pub spread_rel: Option<f64>,
+    pub gap_ms_abs: Option<f64>,
+    pub gap_ms_rel: Option<f64>,
+    pub imbalance_abs: Option<f64>,
+    pub imbalance_rel: Option<f64>,
+    pub dsq_depth_abs: Option<f64>,
+    pub dsq_depth_rel: Option<f64>,
+    pub fallback_abs: Option<f64>,
+    pub fallback_rel: Option<f64>,
+    pub keep_last_abs: Option<f64>,
+    pub keep_last_rel: Option<f64>,
+    pub pass_rate_tol: Option<f64>,
+}
 
-fn is_significant(delta: f64, abs_tol: f64, baseline: f64) -> bool {
+impl ComparisonPolicy {
+    /// All-`None` policy: inherits every threshold from `DEFAULTS`.
+    pub const EMPTY: Self = Self {
+        spread_abs: None,
+        spread_rel: None,
+        gap_ms_abs: None,
+        gap_ms_rel: None,
+        imbalance_abs: None,
+        imbalance_rel: None,
+        dsq_depth_abs: None,
+        dsq_depth_rel: None,
+        fallback_abs: None,
+        fallback_rel: None,
+        keep_last_abs: None,
+        keep_last_rel: None,
+        pass_rate_tol: None,
+    };
+
+    /// Reproduces the original hardcoded thresholds exactly.
+    pub const DEFAULTS: Self = Self {
+        spread_abs: Some(2.0),
+        spread_rel: Some(0.10),
+        gap_ms_abs: Some(50.0),
+        gap_ms_rel: Some(0.10),
+        imbalance_abs: Some(0.5),
+        imbalance_rel: Some(0.10),
+        dsq_depth_abs: Some(5.0),
+        dsq_depth_rel: Some(0.10),
+        fallback_abs: Some(10.0),
+        fallback_rel: Some(0.10),
+        keep_last_abs: Some(10.0),
+        keep_last_rel: Some(0.10),
+        pass_rate_tol: Some(0.01),
+    };
+
+    /// Merge self over DEFAULTS, returning resolved thresholds for each metric.
+    fn resolved(&self) -> ResolvedPolicy {
+        let d = &Self::DEFAULTS;
+        let r = |mine: Option<f64>, def: Option<f64>| mine.or(def).unwrap_or(0.0);
+        ResolvedPolicy {
+            spread_abs: r(self.spread_abs, d.spread_abs),
+            spread_rel: r(self.spread_rel, d.spread_rel),
+            gap_ms_abs: r(self.gap_ms_abs, d.gap_ms_abs),
+            gap_ms_rel: r(self.gap_ms_rel, d.gap_ms_rel),
+            imbalance_abs: r(self.imbalance_abs, d.imbalance_abs),
+            imbalance_rel: r(self.imbalance_rel, d.imbalance_rel),
+            dsq_depth_abs: r(self.dsq_depth_abs, d.dsq_depth_abs),
+            dsq_depth_rel: r(self.dsq_depth_rel, d.dsq_depth_rel),
+            fallback_abs: r(self.fallback_abs, d.fallback_abs),
+            fallback_rel: r(self.fallback_rel, d.fallback_rel),
+            keep_last_abs: r(self.keep_last_abs, d.keep_last_abs),
+            keep_last_rel: r(self.keep_last_rel, d.keep_last_rel),
+            pass_rate_tol: r(self.pass_rate_tol, d.pass_rate_tol),
+        }
+    }
+}
+
+impl Default for ComparisonPolicy {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// Fully resolved thresholds (no Options). Internal only.
+#[derive(Debug)]
+struct ResolvedPolicy {
+    spread_abs: f64,
+    spread_rel: f64,
+    gap_ms_abs: f64,
+    gap_ms_rel: f64,
+    imbalance_abs: f64,
+    imbalance_rel: f64,
+    dsq_depth_abs: f64,
+    dsq_depth_rel: f64,
+    fallback_abs: f64,
+    fallback_rel: f64,
+    keep_last_abs: f64,
+    keep_last_rel: f64,
+    pass_rate_tol: f64,
+}
+
+/// Dual-gate significance test: exceeds both absolute and relative thresholds.
+fn is_significant(delta: f64, abs_tol: f64, rel_tol: f64, baseline_val: f64) -> bool {
     delta.abs() > abs_tol
-        && (baseline.abs() < f64::EPSILON || delta.abs() / baseline.abs() > RELATIVE_TOL)
+        && (baseline_val.abs() < f64::EPSILON || delta.abs() / baseline_val.abs() > rel_tol)
+}
+
+/// A policy scoped to a subset of cells by scenario, flags, and/or topology.
+/// `None` in a scope field means "match all".
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScopedPolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<String>,
+    #[serde(flatten)]
+    pub policy: ComparisonPolicy,
+}
+
+impl ScopedPolicy {
+    fn matches(&self, scenario: &str, flags: &str, topology: &str) -> bool {
+        self.scenario.as_deref().is_none_or(|s| s == scenario)
+            && self.flags.as_deref().is_none_or(|f| f == flags)
+            && self.topology.as_deref().is_none_or(|t| t == topology)
+    }
+}
+
+/// Find the first scoped policy that matches a cell, or return `DEFAULTS`.
+fn resolve_policy_for_cell(
+    policies: &[ScopedPolicy],
+    scenario: &str,
+    flags: &str,
+    topology: &str,
+) -> ComparisonPolicy {
+    for sp in policies {
+        if sp.matches(scenario, flags, topology) {
+            return sp.policy;
+        }
+    }
+    ComparisonPolicy::EMPTY
 }
 
 /// Compare two sets of gauntlet rows (baseline A vs current B).
-/// Returns a formatted report.
+/// Uses `ComparisonPolicy::DEFAULTS` for all cells.
 pub fn compare_baselines(baseline: &[GauntletRow], current: &[GauntletRow]) -> String {
+    compare_with_policies(baseline, current, &[])
+}
+
+/// Compare two sets of gauntlet rows with per-cell scoped policies.
+/// Cells not matched by any `ScopedPolicy` use `ComparisonPolicy::DEFAULTS`.
+pub fn compare_with_policies(
+    baseline: &[GauntletRow],
+    current: &[GauntletRow],
+    policies: &[ScopedPolicy],
+) -> String {
     use std::collections::BTreeMap;
 
     type Key = (String, String, String, String);
@@ -1224,6 +1371,9 @@ pub fn compare_baselines(baseline: &[GauntletRow], current: &[GauntletRow]) -> S
             let a = aggregate_cell(base_rows);
             let b = aggregate_cell(curr_rows);
 
+            let cell_policy = resolve_policy_for_cell(policies, &key.0, &key.1, &key.2);
+            let r = cell_policy.resolved();
+
             let spread_d = b.spread - a.spread;
             let gap_d = b.gap_ms - a.gap_ms;
             let imb_d = b.imbalance - a.imbalance;
@@ -1232,23 +1382,29 @@ pub fn compare_baselines(baseline: &[GauntletRow], current: &[GauntletRow]) -> S
             let kl_d = b.keep_last - a.keep_last;
             let pass_d = b.pass_rate - a.pass_rate;
 
-            let any_regression = is_significant(spread_d, SPREAD_ABS_TOL, a.spread)
+            let any_regression = is_significant(spread_d, r.spread_abs, r.spread_rel, a.spread)
                 && spread_d > 0.0
-                || is_significant(gap_d, GAP_MS_ABS_TOL, a.gap_ms) && gap_d > 0.0
-                || is_significant(imb_d, IMBALANCE_ABS_TOL, a.imbalance) && imb_d > 0.0
-                || is_significant(dsq_d, DSQ_ABS_TOL, a.dsq_depth) && dsq_d > 0.0
-                || is_significant(fb_d, FALLBACK_ABS_TOL, a.fallback) && fb_d > 0.0
-                || is_significant(kl_d, KEEP_LAST_ABS_TOL, a.keep_last) && kl_d > 0.0
-                || pass_d < -PASS_RATE_TOL;
+                || is_significant(gap_d, r.gap_ms_abs, r.gap_ms_rel, a.gap_ms) && gap_d > 0.0
+                || is_significant(imb_d, r.imbalance_abs, r.imbalance_rel, a.imbalance)
+                    && imb_d > 0.0
+                || is_significant(dsq_d, r.dsq_depth_abs, r.dsq_depth_rel, a.dsq_depth)
+                    && dsq_d > 0.0
+                || is_significant(fb_d, r.fallback_abs, r.fallback_rel, a.fallback) && fb_d > 0.0
+                || is_significant(kl_d, r.keep_last_abs, r.keep_last_rel, a.keep_last)
+                    && kl_d > 0.0
+                || pass_d < -r.pass_rate_tol;
 
-            let any_improvement = is_significant(spread_d, SPREAD_ABS_TOL, a.spread)
+            let any_improvement = is_significant(spread_d, r.spread_abs, r.spread_rel, a.spread)
                 && spread_d < 0.0
-                || is_significant(gap_d, GAP_MS_ABS_TOL, a.gap_ms) && gap_d < 0.0
-                || is_significant(imb_d, IMBALANCE_ABS_TOL, a.imbalance) && imb_d < 0.0
-                || is_significant(dsq_d, DSQ_ABS_TOL, a.dsq_depth) && dsq_d < 0.0
-                || is_significant(fb_d, FALLBACK_ABS_TOL, a.fallback) && fb_d < 0.0
-                || is_significant(kl_d, KEEP_LAST_ABS_TOL, a.keep_last) && kl_d < 0.0
-                || pass_d > PASS_RATE_TOL;
+                || is_significant(gap_d, r.gap_ms_abs, r.gap_ms_rel, a.gap_ms) && gap_d < 0.0
+                || is_significant(imb_d, r.imbalance_abs, r.imbalance_rel, a.imbalance)
+                    && imb_d < 0.0
+                || is_significant(dsq_d, r.dsq_depth_abs, r.dsq_depth_rel, a.dsq_depth)
+                    && dsq_d < 0.0
+                || is_significant(fb_d, r.fallback_abs, r.fallback_rel, a.fallback) && fb_d < 0.0
+                || is_significant(kl_d, r.keep_last_abs, r.keep_last_rel, a.keep_last)
+                    && kl_d < 0.0
+                || pass_d > r.pass_rate_tol;
 
             let change = if any_regression {
                 CellChange::Regression
@@ -1272,6 +1428,7 @@ pub fn compare_baselines(baseline: &[GauntletRow], current: &[GauntletRow]) -> S
                 keep_last_delta: kl_d,
                 baseline_pass_rate: a.pass_rate,
                 current_pass_rate: b.pass_rate,
+                resolved: r,
             });
         } else {
             removed.push(key.clone());
@@ -1354,26 +1511,27 @@ fn format_comparison(
 }
 
 fn format_metric_deltas(out: &mut String, d: &CellDelta) {
+    let r = &d.resolved;
     let mut parts = Vec::new();
-    if d.spread_delta.abs() > SPREAD_ABS_TOL {
+    if d.spread_delta.abs() > r.spread_abs {
         parts.push(format!("spread: {:+.1}%", d.spread_delta));
     }
-    if d.gap_ms_delta.abs() > GAP_MS_ABS_TOL {
+    if d.gap_ms_delta.abs() > r.gap_ms_abs {
         parts.push(format!("gap: {:+.0}ms", d.gap_ms_delta));
     }
-    if d.imbalance_delta.abs() > IMBALANCE_ABS_TOL {
+    if d.imbalance_delta.abs() > r.imbalance_abs {
         parts.push(format!("imbalance: {:+.1}", d.imbalance_delta));
     }
-    if d.dsq_depth_delta.abs() > DSQ_ABS_TOL {
+    if d.dsq_depth_delta.abs() > r.dsq_depth_abs {
         parts.push(format!("dsq: {:+.0}", d.dsq_depth_delta));
     }
-    if d.fallback_delta.abs() > FALLBACK_ABS_TOL {
+    if d.fallback_delta.abs() > r.fallback_abs {
         parts.push(format!("fallback: {:+.0}", d.fallback_delta));
     }
-    if d.keep_last_delta.abs() > KEEP_LAST_ABS_TOL {
+    if d.keep_last_delta.abs() > r.keep_last_abs {
         parts.push(format!("keep_last: {:+.0}", d.keep_last_delta));
     }
-    if (d.current_pass_rate - d.baseline_pass_rate).abs() > PASS_RATE_TOL {
+    if (d.current_pass_rate - d.baseline_pass_rate).abs() > r.pass_rate_tol {
         parts.push(format!(
             "pass: {:.0}%->{:.0}%",
             d.baseline_pass_rate * 100.0,
@@ -1633,6 +1791,7 @@ mod tests {
             git_commit: Some("abc123".into()),
             replicas: 3,
             rows,
+            policies: vec![],
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         let loaded: GauntletBaseline = serde_json::from_str(&json).unwrap();
@@ -1809,25 +1968,25 @@ mod tests {
 
     #[test]
     fn is_significant_below_abs_tol() {
-        assert!(!is_significant(1.0, 2.0, 100.0));
+        assert!(!is_significant(1.0, 2.0, 0.10, 100.0));
     }
 
     #[test]
     fn is_significant_above_abs_below_rel() {
-        // delta=3.0 > abs_tol=2.0, but 3.0/100.0=0.03 < RELATIVE_TOL=0.10
-        assert!(!is_significant(3.0, 2.0, 100.0));
+        // delta=3.0 > abs_tol=2.0, but 3.0/100.0=0.03 < rel_tol=0.10
+        assert!(!is_significant(3.0, 2.0, 0.10, 100.0));
     }
 
     #[test]
     fn is_significant_above_both() {
-        // delta=15.0 > abs_tol=2.0, and 15.0/100.0=0.15 > RELATIVE_TOL=0.10
-        assert!(is_significant(15.0, 2.0, 100.0));
+        // delta=15.0 > abs_tol=2.0, and 15.0/100.0=0.15 > rel_tol=0.10
+        assert!(is_significant(15.0, 2.0, 0.10, 100.0));
     }
 
     #[test]
     fn is_significant_zero_baseline() {
         // Zero baseline: abs_tol check passes, relative check skipped (baseline ~ 0).
-        assert!(is_significant(3.0, 2.0, 0.0));
+        assert!(is_significant(3.0, 2.0, 0.10, 0.0));
     }
 
     // -- extract_worst_degradation tests --
@@ -1874,6 +2033,7 @@ mod tests {
             keep_last_delta: 5.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
+            resolved: ComparisonPolicy::DEFAULTS.resolved(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);
@@ -1896,6 +2056,7 @@ mod tests {
             keep_last_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
+            resolved: ComparisonPolicy::DEFAULTS.resolved(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);
@@ -1947,6 +2108,7 @@ mod tests {
             git_commit: Some("abc123".into()),
             replicas: 3,
             rows,
+            policies: vec![],
         };
 
         baseline.save(path_str).unwrap();
@@ -2384,6 +2546,7 @@ mod tests {
             keep_last_delta: 20.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 0.5,
+            resolved: ComparisonPolicy::DEFAULTS.resolved(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);
