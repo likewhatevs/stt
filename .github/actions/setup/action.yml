@@ -37,12 +37,13 @@ runs:
         sudo apt-get install -y \
           clang-20 \
           llvm-20 \
-          libelf-dev \
-          libcap-dev \
-          binutils-dev \
           gcc \
           make \
-          pkg-config
+          pkg-config \
+          autoconf \
+          automake \
+          libtool \
+          gettext
         sudo apt-get install -y linux-headers-$(uname -r) || true
         sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
         sudo update-alternatives --set clang /usr/bin/clang-20

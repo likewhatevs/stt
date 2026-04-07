@@ -35,7 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 btf-rs = "1.1.1"
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.24"
-libbpf-rs = "0.26"
+libbpf-rs = { version = "0.26", features = ["vendored"] }
 linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
 vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
