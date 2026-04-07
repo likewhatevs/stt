@@ -17,6 +17,9 @@ use std::path::Path;
 pub struct LlcInfo {
     cpus: Vec<usize>,
     numa_node: usize,
+    cache_size_kb: Option<u64>,
+    /// core_id -> sorted list of CPU IDs (SMT siblings).
+    cores: BTreeMap<usize, Vec<usize>>,
 }
 
 impl LlcInfo {
@@ -26,6 +29,27 @@ impl LlcInfo {
     pub fn numa_node(&self) -> usize {
         self.numa_node
     }
+    pub fn cache_size_kb(&self) -> Option<u64> {
+        self.cache_size_kb
+    }
+    pub fn cores(&self) -> &BTreeMap<usize, Vec<usize>> {
+        &self.cores
+    }
+    pub fn num_cores(&self) -> usize {
+        if self.cores.is_empty() {
+            self.cpus.len()
+        } else {
+            self.cores.len()
+        }
+    }
+}
+
+/// Information about a NUMA node.
+#[derive(Debug, Clone)]
+pub struct NumaInfo {
+    pub node_id: usize,
+    pub memory_kb: Option<u64>,
+    pub cpus: Vec<usize>,
 }
 
 /// CPU topology abstraction for test configuration.
@@ -60,12 +84,14 @@ fn parse_cpu_list(s: &str) -> Result<Vec<usize>> {
     Ok(cpus)
 }
 
-/// Read the LLC cache ID for a CPU from sysfs.
-fn read_llc_id(cpu: usize) -> Result<usize> {
-    // Find the highest-level cache index (last-level cache)
+/// Find the sysfs index of the highest-level (last-level) cache for a CPU.
+///
+/// Iterates `/sys/devices/system/cpu/cpuN/cache/indexM/level` entries and
+/// returns the index with the largest level value.
+fn find_llc_index(cpu: usize) -> Result<usize> {
     let cache_dir = format!("/sys/devices/system/cpu/cpu{cpu}/cache");
-    let mut max_level = 0;
-    let mut llc_index = 0;
+    let mut max_level = 0usize;
+    let mut llc_index = 0usize;
     for entry in fs::read_dir(&cache_dir).context("read cache dir")? {
         let entry = entry?;
         let name = entry.file_name();
@@ -86,7 +112,13 @@ fn read_llc_id(cpu: usize) -> Result<usize> {
                 .unwrap_or(0);
         }
     }
-    let id_path = format!("{cache_dir}/index{llc_index}/id");
+    Ok(llc_index)
+}
+
+/// Read the LLC cache ID for a CPU from sysfs.
+fn read_llc_id(cpu: usize) -> Result<usize> {
+    let llc_index = find_llc_index(cpu)?;
+    let id_path = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{llc_index}/id");
     let id_str = fs::read_to_string(&id_path).unwrap_or_else(|_| llc_index.to_string());
     Ok(id_str.trim().parse().unwrap_or(0))
 }
@@ -108,6 +140,90 @@ fn read_numa_node(cpu: usize) -> Result<usize> {
     Ok(0)
 }
 
+/// Read the LLC cache size in KB for a CPU from sysfs.
+fn read_llc_cache_size(cpu: usize) -> Option<u64> {
+    let llc_index = find_llc_index(cpu).ok()?;
+    let size_path = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{llc_index}/size");
+    let size_str = fs::read_to_string(&size_path).ok()?;
+    parse_cache_size(size_str.trim())
+}
+
+/// Parse a cache size string like "32768K" or "32M" into KB.
+fn parse_cache_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(kb) = s.strip_suffix('K') {
+        kb.parse().ok()
+    } else if let Some(mb) = s.strip_suffix('M') {
+        mb.parse::<u64>().ok().map(|v| v * 1024)
+    } else {
+        // Bare number: assume bytes, convert to KB
+        s.parse::<u64>().ok().map(|v| v / 1024)
+    }
+}
+
+/// Read the core_id for a CPU from sysfs.
+fn read_core_id(cpu: usize) -> Option<usize> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_id");
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Read NUMA node memory in KB from /sys/devices/system/node/nodeN/meminfo.
+fn read_numa_memory_kb(node: usize) -> Option<u64> {
+    let path = format!("/sys/devices/system/node/node{node}/meminfo");
+    let content = fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        if line.contains("MemTotal:") {
+            // Format: "Node N MemTotal:     12345678 kB"
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // The KB value is the second-to-last token
+            if parts.len() >= 4 {
+                return parts[parts.len() - 2].parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Read CPUs belonging to a NUMA node from sysfs.
+fn read_numa_cpulist(node: usize) -> Vec<usize> {
+    let path = format!("/sys/devices/system/node/node{node}/cpulist");
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| parse_cpu_list(s.trim()).ok())
+        .unwrap_or_default()
+}
+
+/// Discover all NUMA nodes from sysfs.
+fn discover_numa_nodes() -> Vec<NumaInfo> {
+    let node_dir = "/sys/devices/system/node";
+    let entries = match fs::read_dir(node_dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    let mut nodes = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(id_str) = name.strip_prefix("node")
+            && let Ok(id) = id_str.parse::<usize>()
+        {
+            nodes.push(NumaInfo {
+                node_id: id,
+                memory_kb: read_numa_memory_kb(id),
+                cpus: read_numa_cpulist(id),
+            });
+        }
+    }
+    nodes.sort_by_key(|n| n.node_id);
+    nodes
+}
+
 impl TestTopology {
     /// Discover topology from sysfs (reads `/sys/devices/system/cpu/`).
     pub fn from_system() -> Result<Self> {
@@ -122,6 +238,9 @@ impl TestTopology {
         let mut llc_map: BTreeMap<usize, LlcInfo> = BTreeMap::new();
         let mut numa_nodes = BTreeSet::new();
 
+        // First pass: collect cache size per LLC (read once per LLC, not per CPU).
+        let mut llc_cache_sizes: BTreeMap<usize, Option<u64>> = BTreeMap::new();
+
         for &cpu_id in &online_cpus {
             if !Path::new(&format!("/sys/devices/system/cpu/cpu{cpu_id}")).exists() {
                 continue;
@@ -129,17 +248,37 @@ impl TestTopology {
             cpus.insert(cpu_id);
             let llc_id = read_llc_id(cpu_id).unwrap_or(0);
             let node_id = read_numa_node(cpu_id).unwrap_or(0);
+            let core_id = read_core_id(cpu_id);
             numa_nodes.insert(node_id);
+            llc_cache_sizes
+                .entry(llc_id)
+                .or_insert_with(|| read_llc_cache_size(cpu_id));
             llc_map
                 .entry(llc_id)
-                .and_modify(|info| info.cpus.push(cpu_id))
-                .or_insert_with(|| LlcInfo {
-                    cpus: vec![cpu_id],
-                    numa_node: node_id,
+                .and_modify(|info| {
+                    info.cpus.push(cpu_id);
+                    if let Some(cid) = core_id {
+                        info.cores.entry(cid).or_default().push(cpu_id);
+                    }
+                })
+                .or_insert_with(|| {
+                    let mut cores = BTreeMap::new();
+                    if let Some(cid) = core_id {
+                        cores.insert(cid, vec![cpu_id]);
+                    }
+                    LlcInfo {
+                        cpus: vec![cpu_id],
+                        numa_node: node_id,
+                        cache_size_kb: llc_cache_sizes.get(&llc_id).copied().flatten(),
+                        cores,
+                    }
                 });
         }
         for info in llc_map.values_mut() {
             info.cpus.sort();
+            for siblings in info.cores.values_mut() {
+                siblings.sort();
+            }
         }
         Ok(Self {
             cpus: cpus.into_iter().collect(),
@@ -257,9 +396,17 @@ impl TestTopology {
             .map(|s| {
                 let start = s * cpus_per_socket;
                 let end = start + cpus_per_socket;
+                let mut core_map = BTreeMap::new();
+                for c in 0..cores as usize {
+                    let base = start + c * threads as usize;
+                    let siblings: Vec<usize> = (base..base + threads as usize).collect();
+                    core_map.insert(c, siblings);
+                }
                 LlcInfo {
                     cpus: (start..end).collect(),
                     numa_node: s,
+                    cache_size_kb: None,
+                    cores: core_map,
                 }
             })
             .collect();
@@ -286,6 +433,8 @@ impl TestTopology {
                 LlcInfo {
                     cpus: (start..end).collect(),
                     numa_node: i,
+                    cache_size_kb: None,
+                    cores: BTreeMap::new(),
                 }
             })
             .collect();
@@ -298,23 +447,151 @@ impl TestTopology {
     }
 }
 
+/// Format a size in KB as a human-readable string (e.g. "32 MB", "756 GB").
+///
+/// Rounds to the nearest whole unit (GB or MB). Sub-MB values are exact.
+fn format_size_kb(kb: u64) -> String {
+    if kb >= 1024 * 1024 {
+        let gb = (kb + 1024 * 1024 / 2) / (1024 * 1024);
+        format!("{gb} GB")
+    } else if kb >= 1024 {
+        let mb = (kb + 512) / 1024;
+        format!("{mb} MB")
+    } else {
+        format!("{kb} KB")
+    }
+}
+
+/// Format the LLC header with optional cache size and core count.
+fn format_llc_header(idx: usize, llc: &LlcInfo) -> String {
+    let mut parts = Vec::new();
+    if let Some(kb) = llc.cache_size_kb {
+        parts.push(format_size_kb(kb));
+    }
+    let nc = llc.num_cores();
+    parts.push(format!("{nc} core{}", if nc != 1 { "s" } else { "" }));
+    format!("LLC {idx} ({})", parts.join(", "))
+}
+
+/// Format core->thread mappings as aligned columns.
+fn format_cores(llc: &LlcInfo) -> String {
+    if llc.cores.is_empty() {
+        return String::new();
+    }
+    let entries: Vec<(usize, String)> = llc
+        .cores
+        .iter()
+        .map(|(&cid, threads)| {
+            let tlist = threads
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            (cid, tlist)
+        })
+        .collect();
+
+    // Compute width of widest core ID for alignment.
+    let max_cid = entries.iter().map(|(cid, _)| *cid).max().unwrap_or(0);
+    let cid_width = if max_cid >= 100 {
+        3
+    } else if max_cid >= 10 {
+        2
+    } else {
+        1
+    };
+
+    // 4 columns per row
+    let cols = 4;
+    let mut out = String::new();
+    for row in entries.chunks(cols) {
+        out.push_str("    ");
+        for (i, (cid, tlist)) in row.iter().enumerate() {
+            if i > 0 {
+                out.push_str("    ");
+            }
+            out.push_str(&format!("core {cid:>cid_width$}: {tlist:<12}"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Build the full topo display string (without ANSI colors).
+pub fn format_topo(topo: &TestTopology) -> String {
+    let numa_nodes = discover_numa_nodes();
+    format_topo_inner(topo, &numa_nodes)
+}
+
+/// Build display string from topology and pre-discovered NUMA info.
+fn format_topo_inner(topo: &TestTopology, numa_nodes: &[NumaInfo]) -> String {
+    let mut out = String::new();
+
+    // Group LLCs by NUMA node.
+    let mut llc_by_node: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, llc) in topo.llcs().iter().enumerate() {
+        llc_by_node.entry(llc.numa_node()).or_default().push(i);
+    }
+
+    // Collect all NUMA node IDs: from LLCs + any discovered nodes.
+    // Must be computed before the header so the count includes memory-only nodes.
+    let mut all_nodes: BTreeSet<usize> = llc_by_node.keys().copied().collect();
+    for ni in numa_nodes {
+        all_nodes.insert(ni.node_id);
+    }
+
+    out.push_str(&format!(
+        "{} CPUs, {} LLCs, {} NUMA\n\n",
+        topo.total_cpus(),
+        topo.num_llcs(),
+        all_nodes.len()
+    ));
+
+    for &node_id in &all_nodes {
+        let mem_str = numa_nodes
+            .iter()
+            .find(|n| n.node_id == node_id)
+            .and_then(|n| n.memory_kb)
+            .map(|kb| format!(" ({})", format_size_kb(kb)))
+            .unwrap_or_default();
+
+        let llc_indices = llc_by_node.get(&node_id);
+        let is_memory_only = llc_indices.is_none_or(|v| v.is_empty());
+
+        if is_memory_only {
+            out.push_str(&format!("NUMA node {node_id}{mem_str}, memory only\n"));
+        } else {
+            out.push_str(&format!("NUMA node {node_id}{mem_str}\n"));
+            for &llc_idx in llc_indices.unwrap() {
+                let llc = &topo.llcs()[llc_idx];
+                out.push_str(&format!("  {}\n", format_llc_header(llc_idx, llc)));
+                let cores_str = format_cores(llc);
+                if !cores_str.is_empty() {
+                    out.push_str(&cores_str);
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Print topology summary to stdout.
 pub fn print_topo() -> Result<()> {
     let topo = TestTopology::from_system()?;
-    println!(
-        "{} CPUs, {} LLCs, {} NUMA\n",
-        console::style(topo.total_cpus()).cyan().bold(),
-        console::style(topo.num_llcs()).cyan().bold(),
-        console::style(topo.num_numa_nodes()).cyan().bold()
-    );
-    for (i, llc) in topo.llcs().iter().enumerate() {
-        let cpus = llc
-            .cpus()
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        println!("LLC {i} (NUMA {}): {cpus}", llc.numa_node());
+    let text = format_topo(&topo);
+
+    // Apply colors to the output.
+    for line in text.lines() {
+        if line.starts_with("NUMA node") {
+            println!("{}", console::style(line).cyan().bold());
+        } else if line.starts_with("  LLC") {
+            println!("{}", console::style(line).white().bold());
+        } else if !line.is_empty() {
+            println!("{line}");
+        } else {
+            println!();
+        }
     }
     Ok(())
 }
@@ -558,5 +835,194 @@ mod tests {
         assert_eq!(llcs[0].numa_node(), 0);
         assert_eq!(llcs[1].cpus(), &[4, 5, 6, 7]);
         assert_eq!(llcs[1].numa_node(), 1);
+    }
+
+    #[test]
+    fn from_spec_cores_populated() {
+        let t = TestTopology::from_spec(2, 4, 2);
+        let llc0 = &t.llcs()[0];
+        assert_eq!(llc0.num_cores(), 4);
+        assert_eq!(llc0.cores().len(), 4);
+        assert_eq!(llc0.cores()[&0], vec![0, 1]);
+        assert_eq!(llc0.cores()[&1], vec![2, 3]);
+        assert_eq!(llc0.cores()[&2], vec![4, 5]);
+        assert_eq!(llc0.cores()[&3], vec![6, 7]);
+        let llc1 = &t.llcs()[1];
+        assert_eq!(llc1.cores()[&0], vec![8, 9]);
+    }
+
+    #[test]
+    fn from_spec_no_smt_cores() {
+        let t = TestTopology::from_spec(1, 4, 1);
+        let llc = &t.llcs()[0];
+        assert_eq!(llc.num_cores(), 4);
+        assert_eq!(llc.cores()[&0], vec![0]);
+        assert_eq!(llc.cores()[&3], vec![3]);
+    }
+
+    #[test]
+    fn format_size_kb_values() {
+        assert_eq!(format_size_kb(512), "512 KB");
+        assert_eq!(format_size_kb(1024), "1 MB");
+        assert_eq!(format_size_kb(32768), "32 MB");
+        assert_eq!(format_size_kb(1048576), "1 GB");
+        assert_eq!(format_size_kb(786432), "768 MB");
+        // 792514096 KB = ~755.77 GB, rounds to 756 GB
+        assert_eq!(format_size_kb(792514096), "756 GB");
+        // Exact multiples round correctly
+        assert_eq!(format_size_kb(2 * 1024 * 1024), "2 GB");
+    }
+
+    #[test]
+    fn parse_cache_size_formats() {
+        assert_eq!(parse_cache_size("32768K"), Some(32768));
+        assert_eq!(parse_cache_size("32M"), Some(32768));
+        assert_eq!(parse_cache_size("65536"), Some(64));
+    }
+
+    #[test]
+    fn format_topo_inner_synthetic() {
+        let t = TestTopology::from_spec(2, 4, 2);
+        let out = format_topo_inner(&t, &[]);
+        assert!(out.contains("16 CPUs, 2 LLCs, 2 NUMA"));
+        assert!(out.contains("NUMA node 0"));
+        assert!(out.contains("NUMA node 1"));
+        assert!(out.contains("LLC 0"));
+        assert!(out.contains("LLC 1"));
+        assert!(out.contains("4 cores"));
+        assert!(out.contains("core 0:"));
+    }
+
+    #[test]
+    fn format_topo_inner_with_numa_memory() {
+        let t = TestTopology::from_spec(2, 2, 1);
+        let numa = vec![
+            NumaInfo {
+                node_id: 0,
+                memory_kb: Some(786432 * 1024),
+                cpus: vec![0, 1],
+            },
+            NumaInfo {
+                node_id: 1,
+                memory_kb: Some(262144 * 1024),
+                cpus: vec![2, 3],
+            },
+        ];
+        let out = format_topo_inner(&t, &numa);
+        assert!(out.contains("NUMA node 0 (768 GB)"));
+        assert!(out.contains("NUMA node 1 (256 GB)"));
+    }
+
+    #[test]
+    fn format_topo_inner_memory_only_node() {
+        let t = TestTopology::from_spec(1, 2, 1);
+        let numa = vec![
+            NumaInfo {
+                node_id: 0,
+                memory_kb: Some(1048576),
+                cpus: vec![0, 1],
+            },
+            NumaInfo {
+                node_id: 1,
+                memory_kb: Some(524288),
+                cpus: vec![],
+            },
+        ];
+        let out = format_topo_inner(&t, &numa);
+        // Header counts both CPU-bearing and memory-only nodes.
+        assert!(out.contains("2 NUMA"));
+        assert!(out.contains("NUMA node 1 (512 MB), memory only"));
+    }
+
+    #[test]
+    fn format_llc_header_with_cache() {
+        let llc = LlcInfo {
+            cpus: vec![0, 1, 2, 3],
+            numa_node: 0,
+            cache_size_kb: Some(32768),
+            cores: BTreeMap::from([(0, vec![0, 1]), (1, vec![2, 3])]),
+        };
+        let h = format_llc_header(0, &llc);
+        assert_eq!(h, "LLC 0 (32 MB, 2 cores)");
+    }
+
+    #[test]
+    fn format_llc_header_no_cache() {
+        let llc = LlcInfo {
+            cpus: vec![0, 1, 2, 3],
+            numa_node: 0,
+            cache_size_kb: None,
+            cores: BTreeMap::from([(0, vec![0, 1]), (1, vec![2, 3])]),
+        };
+        let h = format_llc_header(0, &llc);
+        assert_eq!(h, "LLC 0 (2 cores)");
+    }
+
+    #[test]
+    fn format_cores_layout() {
+        let mut cores = BTreeMap::new();
+        cores.insert(0, vec![0, 8]);
+        cores.insert(1, vec![1, 9]);
+        let llc = LlcInfo {
+            cpus: vec![0, 1, 8, 9],
+            numa_node: 0,
+            cache_size_kb: None,
+            cores,
+        };
+        let out = format_cores(&llc);
+        assert!(out.contains("core 0: 0,8"));
+        assert!(out.contains("core 1: 1,9"));
+    }
+
+    #[test]
+    fn format_cores_empty() {
+        let llc = LlcInfo {
+            cpus: vec![0, 1],
+            numa_node: 0,
+            cache_size_kb: None,
+            cores: BTreeMap::new(),
+        };
+        assert!(format_cores(&llc).is_empty());
+    }
+
+    #[test]
+    fn format_cores_aligned_mixed_width() {
+        let mut cores = BTreeMap::new();
+        cores.insert(0, vec![0, 20]);
+        cores.insert(9, vec![9, 29]);
+        cores.insert(10, vec![10, 30]);
+        let llc = LlcInfo {
+            cpus: (0..31).collect(),
+            numa_node: 0,
+            cache_size_kb: None,
+            cores,
+        };
+        let out = format_cores(&llc);
+        // core IDs 0 and 9 should be right-aligned to width 2
+        assert!(out.contains("core  0:"));
+        assert!(out.contains("core  9:"));
+        assert!(out.contains("core 10:"));
+    }
+
+    #[test]
+    fn num_cores_from_cores_map() {
+        let llc = LlcInfo {
+            cpus: vec![0, 1, 2, 3],
+            numa_node: 0,
+            cache_size_kb: None,
+            cores: BTreeMap::from([(0, vec![0, 1]), (1, vec![2, 3])]),
+        };
+        assert_eq!(llc.num_cores(), 2);
+    }
+
+    #[test]
+    fn num_cores_fallback_to_cpus() {
+        let llc = LlcInfo {
+            cpus: vec![0, 1, 2, 3],
+            numa_node: 0,
+            cache_size_kb: None,
+            cores: BTreeMap::new(),
+        };
+        assert_eq!(llc.num_cores(), 4);
     }
 }
