@@ -2050,4 +2050,246 @@ mod tests {
         let has_stuck = r.details.iter().any(|d| d.contains("stuck"));
         assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");
     }
+
+    // -- verify_benchmarks tests --
+
+    fn rpt_with_latencies(
+        tid: u32,
+        latencies: Vec<u64>,
+        iterations: u64,
+        wall_ns: u64,
+    ) -> WorkerReport {
+        WorkerReport {
+            tid,
+            work_units: 1000,
+            cpu_time_ns: wall_ns / 2,
+            wall_time_ns: wall_ns,
+            runnable_ns: wall_ns / 2,
+            migration_count: 0,
+            cpus_used: [0].into_iter().collect(),
+            migrations: vec![],
+            max_gap_ms: 50,
+            max_gap_cpu: 0,
+            max_gap_at_ms: 1000,
+            wake_latencies_ns: latencies,
+            iterations,
+            schedstat_run_delay_ns: 0,
+            schedstat_ctx_switches: 0,
+            schedstat_cpu_time_ns: 0,
+        }
+    }
+
+    #[test]
+    fn verify_benchmarks_empty_reports() {
+        let r = verify_benchmarks(&[], Some(1000), Some(0.5), Some(100.0));
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn verify_benchmarks_no_thresholds() {
+        let reports = [rpt_with_latencies(
+            1,
+            vec![1000, 2000, 3000],
+            10,
+            5_000_000_000,
+        )];
+        let r = verify_benchmarks(&reports, None, None, None);
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn verify_benchmarks_p99_pass() {
+        let reports = [rpt_with_latencies(
+            1,
+            vec![100, 200, 300, 400, 500],
+            10,
+            5_000_000_000,
+        )];
+        let r = verify_benchmarks(&reports, Some(1000), None, None);
+        assert!(r.passed, "p99 500ns < 1000ns limit: {:?}", r.details);
+    }
+
+    #[test]
+    fn verify_benchmarks_p99_fail() {
+        let reports = [rpt_with_latencies(
+            1,
+            vec![100, 200, 300, 400, 2000],
+            10,
+            5_000_000_000,
+        )];
+        let r = verify_benchmarks(&reports, Some(1000), None, None);
+        assert!(!r.passed);
+        assert!(r.details.iter().any(|d| d.contains("p99 wake latency")));
+    }
+
+    #[test]
+    fn verify_benchmarks_cv_pass() {
+        // All same latency -> CV = 0.
+        let reports = [rpt_with_latencies(
+            1,
+            vec![1000, 1000, 1000, 1000],
+            10,
+            5_000_000_000,
+        )];
+        let r = verify_benchmarks(&reports, None, Some(0.5), None);
+        assert!(r.passed, "uniform latencies CV=0: {:?}", r.details);
+    }
+
+    #[test]
+    fn verify_benchmarks_cv_fail() {
+        // High variance latencies.
+        let reports = [rpt_with_latencies(
+            1,
+            vec![100, 100, 100, 100000],
+            10,
+            5_000_000_000,
+        )];
+        let r = verify_benchmarks(&reports, None, Some(0.5), None);
+        assert!(!r.passed);
+        assert!(r.details.iter().any(|d| d.contains("wake latency CV")));
+    }
+
+    #[test]
+    fn verify_benchmarks_iteration_rate_pass() {
+        // 1000 iterations in 5 seconds = 200/s, above 100/s floor.
+        let reports = [rpt_with_latencies(1, vec![], 1000, 5_000_000_000)];
+        let r = verify_benchmarks(&reports, None, None, Some(100.0));
+        assert!(r.passed, "200/s > 100/s floor: {:?}", r.details);
+    }
+
+    #[test]
+    fn verify_benchmarks_iteration_rate_fail() {
+        // 10 iterations in 5 seconds = 2/s, below 100/s floor.
+        let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
+        let r = verify_benchmarks(&reports, None, None, Some(100.0));
+        assert!(!r.passed);
+        assert!(r.details.iter().any(|d| d.contains("iteration rate")));
+    }
+
+    #[test]
+    fn verify_benchmarks_zero_wall_time_skips_rate() {
+        let reports = [rpt_with_latencies(1, vec![], 10, 0)];
+        let r = verify_benchmarks(&reports, None, None, Some(100.0));
+        assert!(r.passed, "zero wall_time should skip rate check");
+    }
+
+    #[test]
+    fn verify_benchmarks_no_latencies_skips_p99() {
+        let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
+        let r = verify_benchmarks(&reports, Some(1000), None, None);
+        assert!(r.passed, "empty latencies should skip p99 check");
+    }
+
+    #[test]
+    fn verify_benchmarks_single_latency_cv_skipped() {
+        // Single sample -> len < 2, CV check skipped.
+        let reports = [rpt_with_latencies(1, vec![1000], 10, 5_000_000_000)];
+        let r = verify_benchmarks(&reports, None, Some(0.1), None);
+        assert!(r.passed, "single sample should skip CV check");
+    }
+
+    // -- wake latency stats in verify_not_starved --
+
+    #[test]
+    fn not_starved_wake_latency_stats() {
+        let reports = [
+            rpt_with_latencies(1, vec![1000, 2000, 3000, 4000, 5000], 100, 5_000_000_000),
+            rpt_with_latencies(2, vec![6000, 7000, 8000, 9000, 10000], 200, 5_000_000_000),
+        ];
+        let r = verify_not_starved(&reports);
+        assert!(r.passed, "{:?}", r.details);
+        let s = &r.stats;
+        // p99 of [1000,2000,3000,4000,5000,6000,7000,8000,9000,10000] in us:
+        // sorted, p99_idx = ceil(10*0.99) = 10, clamped to 9 -> 10000ns = 10.0us
+        assert!(
+            s.p99_wake_latency_us > 9.0,
+            "p99: {}",
+            s.p99_wake_latency_us
+        );
+        // median of 10 samples: index 5 -> 6000ns = 6.0us
+        assert!(
+            (s.median_wake_latency_us - 6.0).abs() < 0.1,
+            "median: {}",
+            s.median_wake_latency_us
+        );
+        assert!(s.wake_latency_cv > 0.0, "cv: {}", s.wake_latency_cv);
+        assert_eq!(s.total_iterations, 300);
+    }
+
+    #[test]
+    fn not_starved_empty_latencies_zero_stats() {
+        let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
+        let r = verify_not_starved(&reports);
+        assert!(r.passed);
+        assert_eq!(r.stats.p99_wake_latency_us, 0.0);
+        assert_eq!(r.stats.median_wake_latency_us, 0.0);
+        assert_eq!(r.stats.wake_latency_cv, 0.0);
+    }
+
+    #[test]
+    fn not_starved_run_delay_stats() {
+        let mut w1 = rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50);
+        w1.schedstat_run_delay_ns = 100_000; // 100us
+        let mut w2 = rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50);
+        w2.schedstat_run_delay_ns = 300_000; // 300us
+        let r = verify_not_starved(&[w1, w2]);
+        assert!(r.passed, "{:?}", r.details);
+        // mean_run_delay = (100 + 300) / 2 = 200us
+        assert!(
+            (r.stats.mean_run_delay_us - 200.0).abs() < 0.1,
+            "mean: {}",
+            r.stats.mean_run_delay_us
+        );
+        // worst_run_delay = 300us
+        assert!(
+            (r.stats.worst_run_delay_us - 300.0).abs() < 0.1,
+            "worst: {}",
+            r.stats.worst_run_delay_us
+        );
+    }
+
+    // -- VerificationPlan benchmarking integration --
+
+    #[test]
+    fn plan_benchmarks_p99_via_verify_cgroup() {
+        let plan = VerificationPlan {
+            not_starved: false,
+            isolation: false,
+            max_gap_ms: None,
+            max_spread_pct: None,
+            max_throughput_cv: None,
+            min_work_rate: None,
+            max_p99_wake_latency_ns: Some(500),
+            max_wake_latency_cv: None,
+            min_iteration_rate: None,
+        };
+        let reports = [rpt_with_latencies(
+            1,
+            vec![100, 200, 300, 400, 1000],
+            10,
+            5_000_000_000,
+        )];
+        let r = plan.verify_cgroup(&reports, None);
+        assert!(!r.passed, "p99 1000ns > 500ns limit");
+        assert!(r.details.iter().any(|d| d.contains("p99 wake latency")));
+    }
+
+    #[test]
+    fn plan_benchmarks_iteration_rate_via_verify_cgroup() {
+        let plan = VerificationPlan {
+            not_starved: false,
+            isolation: false,
+            max_gap_ms: None,
+            max_spread_pct: None,
+            max_throughput_cv: None,
+            min_work_rate: None,
+            max_p99_wake_latency_ns: None,
+            max_wake_latency_cv: None,
+            min_iteration_rate: Some(1000.0),
+        };
+        let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
+        let r = plan.verify_cgroup(&reports, None);
+        assert!(!r.passed, "2/s < 1000/s floor");
+        assert!(r.details.iter().any(|d| d.contains("iteration rate")));
+    }
 }

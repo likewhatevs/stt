@@ -2124,4 +2124,115 @@ mod tests {
         }
         drop(h);
     }
+
+    // -- reservoir_push tests --
+
+    #[test]
+    fn reservoir_push_empty_buf() {
+        let mut buf = Vec::new();
+        let mut count = 0u64;
+        reservoir_push(&mut buf, &mut count, 42, 10);
+        assert_eq!(buf, vec![42]);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn reservoir_push_under_cap() {
+        let mut buf = Vec::new();
+        let mut count = 0u64;
+        for i in 0..5 {
+            reservoir_push(&mut buf, &mut count, i * 100, 10);
+        }
+        assert_eq!(buf.len(), 5);
+        assert_eq!(count, 5);
+        assert_eq!(buf, vec![0, 100, 200, 300, 400]);
+    }
+
+    #[test]
+    fn reservoir_push_at_cap() {
+        let mut buf = Vec::new();
+        let mut count = 0u64;
+        for i in 0..10 {
+            reservoir_push(&mut buf, &mut count, i, 10);
+        }
+        assert_eq!(buf.len(), 10);
+        assert_eq!(count, 10);
+        // All values should be present since we're exactly at cap.
+        for i in 0..10 {
+            assert!(buf.contains(&i), "missing {i}");
+        }
+    }
+
+    #[test]
+    fn reservoir_push_over_cap_maintains_size() {
+        let mut buf = Vec::new();
+        let mut count = 0u64;
+        let cap = 5;
+        for i in 0..1000 {
+            reservoir_push(&mut buf, &mut count, i, cap);
+        }
+        assert_eq!(buf.len(), cap);
+        assert_eq!(count, 1000);
+    }
+
+    #[test]
+    fn reservoir_push_uniform_sampling() {
+        // Statistical test: push 10000 values into cap=100 reservoir.
+        // Each value should have roughly equal probability of being present.
+        // We test that the reservoir contains values from the full range.
+        let mut buf = Vec::new();
+        let mut count = 0u64;
+        let cap = 100;
+        let total = 10_000u64;
+        for i in 0..total {
+            reservoir_push(&mut buf, &mut count, i, cap);
+        }
+        assert_eq!(buf.len(), cap);
+        assert_eq!(count, total);
+        // The reservoir should contain values from different parts of the range.
+        let has_early = buf.iter().any(|&v| v < total / 4);
+        let has_late = buf.iter().any(|&v| v > total * 3 / 4);
+        assert!(has_early, "reservoir should contain early values");
+        assert!(has_late, "reservoir should contain late values");
+    }
+
+    #[test]
+    fn reservoir_push_cap_zero() {
+        // Zero-capacity reservoir: buf.len() < 0 is never true (usize),
+        // falls through to else branch where random_range(0..1) returns 0,
+        // and 0 < 0 is false — sample is discarded.
+        let mut buf = Vec::new();
+        let mut count = 0u64;
+        for i in 0..10 {
+            reservoir_push(&mut buf, &mut count, i, 0);
+        }
+        assert!(buf.is_empty(), "cap=0 should never store samples");
+        assert_eq!(count, 10, "count incremented regardless");
+    }
+
+    #[test]
+    fn reservoir_push_cap_one() {
+        // Single-element reservoir. First sample always stored.
+        // Subsequent samples replace with probability 1/count.
+        let mut buf = Vec::new();
+        let mut count = 0u64;
+        reservoir_push(&mut buf, &mut count, 42, 1);
+        assert_eq!(buf, vec![42]);
+        assert_eq!(count, 1);
+        // Push more — buf stays length 1.
+        for i in 1..100 {
+            reservoir_push(&mut buf, &mut count, i * 100, 1);
+        }
+        assert_eq!(buf.len(), 1);
+        assert_eq!(count, 100);
+    }
+
+    // -- read_schedstat tests --
+
+    #[test]
+    fn read_schedstat_returns_triple() {
+        // Verifies the function parses without panicking.
+        let (cpu_time, run_delay, timeslices) = read_schedstat();
+        let _ = (cpu_time, run_delay, timeslices);
+    }
 }

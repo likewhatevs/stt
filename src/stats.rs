@@ -1192,8 +1192,11 @@ struct CgroupDelta {
     fallback_delta: f64,
     keep_last_delta: f64,
     p99_wake_lat_delta: f64,
+    median_wake_lat_delta: f64,
     wake_cv_delta: f64,
+    total_iterations_delta: f64,
     run_delay_delta: f64,
+    worst_run_delay_delta: f64,
     // Pass rate change.
     baseline_pass_rate: f64,
     current_pass_rate: f64,
@@ -1212,8 +1215,11 @@ struct CgroupAgg {
     fallback: f64,
     keep_last: f64,
     p99_wake_lat: f64,
+    median_wake_lat: f64,
     wake_cv: f64,
+    total_iterations: f64,
     run_delay: f64,
+    worst_run_delay: f64,
 }
 
 fn aggregate_cgroup(rows: &[&GauntletRow]) -> CgroupAgg {
@@ -1228,8 +1234,11 @@ fn aggregate_cgroup(rows: &[&GauntletRow]) -> CgroupAgg {
         fallback: rows.iter().map(|r| r.fallback_count as f64).sum::<f64>() / n,
         keep_last: rows.iter().map(|r| r.keep_last_count as f64).sum::<f64>() / n,
         p99_wake_lat: rows.iter().map(|r| r.p99_wake_latency_us).sum::<f64>() / n,
+        median_wake_lat: rows.iter().map(|r| r.median_wake_latency_us).sum::<f64>() / n,
         wake_cv: rows.iter().map(|r| r.wake_latency_cv).sum::<f64>() / n,
+        total_iterations: rows.iter().map(|r| r.total_iterations as f64).sum::<f64>() / n,
         run_delay: rows.iter().map(|r| r.mean_run_delay_us).sum::<f64>() / n,
+        worst_run_delay: rows.iter().map(|r| r.worst_run_delay_us).sum::<f64>() / n,
     }
 }
 
@@ -1262,13 +1271,25 @@ pub struct ComparisonPolicy {
     #[serde(default)]
     pub p99_wake_lat_rel: Option<f64>,
     #[serde(default)]
+    pub median_wake_lat_abs: Option<f64>,
+    #[serde(default)]
+    pub median_wake_lat_rel: Option<f64>,
+    #[serde(default)]
     pub wake_cv_abs: Option<f64>,
     #[serde(default)]
     pub wake_cv_rel: Option<f64>,
     #[serde(default)]
+    pub total_iterations_abs: Option<f64>,
+    #[serde(default)]
+    pub total_iterations_rel: Option<f64>,
+    #[serde(default)]
     pub run_delay_abs: Option<f64>,
     #[serde(default)]
     pub run_delay_rel: Option<f64>,
+    #[serde(default)]
+    pub worst_run_delay_abs: Option<f64>,
+    #[serde(default)]
+    pub worst_run_delay_rel: Option<f64>,
 }
 
 impl ComparisonPolicy {
@@ -1289,10 +1310,16 @@ impl ComparisonPolicy {
         pass_rate_tol: None,
         p99_wake_lat_abs: None,
         p99_wake_lat_rel: None,
+        median_wake_lat_abs: None,
+        median_wake_lat_rel: None,
         wake_cv_abs: None,
         wake_cv_rel: None,
+        total_iterations_abs: None,
+        total_iterations_rel: None,
         run_delay_abs: None,
         run_delay_rel: None,
+        worst_run_delay_abs: None,
+        worst_run_delay_rel: None,
     };
 
     /// Reproduces the original hardcoded thresholds exactly.
@@ -1310,12 +1337,18 @@ impl ComparisonPolicy {
         keep_last_abs: Some(10.0),
         keep_last_rel: Some(0.10),
         pass_rate_tol: Some(0.01),
-        p99_wake_lat_abs: Some(50.0), // 50us absolute
-        p99_wake_lat_rel: Some(0.20), // 20% relative (higher variance in VM)
-        wake_cv_abs: Some(0.10),      // 0.10 absolute CV delta
+        p99_wake_lat_abs: Some(50.0),    // 50us absolute
+        p99_wake_lat_rel: Some(0.20),    // 20% relative (higher variance in VM)
+        median_wake_lat_abs: Some(30.0), // 30us absolute
+        median_wake_lat_rel: Some(0.20),
+        wake_cv_abs: Some(0.10), // 0.10 absolute CV delta
         wake_cv_rel: Some(0.20),
+        total_iterations_abs: Some(100.0), // 100 iterations absolute
+        total_iterations_rel: Some(0.20),
         run_delay_abs: Some(100.0), // 100us absolute
         run_delay_rel: Some(0.20),
+        worst_run_delay_abs: Some(200.0), // 200us absolute (tail metric, wider tolerance)
+        worst_run_delay_rel: Some(0.30),
     };
 
     /// Merge self over DEFAULTS, returning resolved thresholds for each metric.
@@ -1338,10 +1371,16 @@ impl ComparisonPolicy {
             pass_rate_tol: r(self.pass_rate_tol, d.pass_rate_tol),
             p99_wake_lat_abs: r(self.p99_wake_lat_abs, d.p99_wake_lat_abs),
             p99_wake_lat_rel: r(self.p99_wake_lat_rel, d.p99_wake_lat_rel),
+            median_wake_lat_abs: r(self.median_wake_lat_abs, d.median_wake_lat_abs),
+            median_wake_lat_rel: r(self.median_wake_lat_rel, d.median_wake_lat_rel),
             wake_cv_abs: r(self.wake_cv_abs, d.wake_cv_abs),
             wake_cv_rel: r(self.wake_cv_rel, d.wake_cv_rel),
+            total_iterations_abs: r(self.total_iterations_abs, d.total_iterations_abs),
+            total_iterations_rel: r(self.total_iterations_rel, d.total_iterations_rel),
             run_delay_abs: r(self.run_delay_abs, d.run_delay_abs),
             run_delay_rel: r(self.run_delay_rel, d.run_delay_rel),
+            worst_run_delay_abs: r(self.worst_run_delay_abs, d.worst_run_delay_abs),
+            worst_run_delay_rel: r(self.worst_run_delay_rel, d.worst_run_delay_rel),
         }
     }
 }
@@ -1370,10 +1409,16 @@ struct ResolvedPolicy {
     pass_rate_tol: f64,
     p99_wake_lat_abs: f64,
     p99_wake_lat_rel: f64,
+    median_wake_lat_abs: f64,
+    median_wake_lat_rel: f64,
     wake_cv_abs: f64,
     wake_cv_rel: f64,
+    total_iterations_abs: f64,
+    total_iterations_rel: f64,
     run_delay_abs: f64,
     run_delay_rel: f64,
+    worst_run_delay_abs: f64,
+    worst_run_delay_rel: f64,
 }
 
 /// Dual-gate significance test: exceeds both absolute and relative thresholds.
@@ -1475,8 +1520,11 @@ pub fn compare_with_policies(
             let kl_d = b.keep_last - a.keep_last;
             let pass_d = b.pass_rate - a.pass_rate;
             let p99_d = b.p99_wake_lat - a.p99_wake_lat;
+            let mwl_d = b.median_wake_lat - a.median_wake_lat;
             let wcv_d = b.wake_cv - a.wake_cv;
+            let ti_d = b.total_iterations - a.total_iterations;
             let rd_d = b.run_delay - a.run_delay;
+            let wrd_d = b.worst_run_delay - a.worst_run_delay;
 
             let any_regression = is_significant(spread_d, r.spread_abs, r.spread_rel, a.spread)
                 && spread_d > 0.0
@@ -1494,9 +1542,27 @@ pub fn compare_with_policies(
                     r.p99_wake_lat_rel,
                     a.p99_wake_lat,
                 ) && p99_d > 0.0
+                || is_significant(
+                    mwl_d,
+                    r.median_wake_lat_abs,
+                    r.median_wake_lat_rel,
+                    a.median_wake_lat,
+                ) && mwl_d > 0.0
                 || is_significant(wcv_d, r.wake_cv_abs, r.wake_cv_rel, a.wake_cv) && wcv_d > 0.0
+                || is_significant(
+                    ti_d,
+                    r.total_iterations_abs,
+                    r.total_iterations_rel,
+                    a.total_iterations,
+                ) && ti_d < 0.0 // fewer iterations = regression
                 || is_significant(rd_d, r.run_delay_abs, r.run_delay_rel, a.run_delay)
                     && rd_d > 0.0
+                || is_significant(
+                    wrd_d,
+                    r.worst_run_delay_abs,
+                    r.worst_run_delay_rel,
+                    a.worst_run_delay,
+                ) && wrd_d > 0.0
                 || pass_d < -r.pass_rate_tol;
 
             let any_improvement = is_significant(spread_d, r.spread_abs, r.spread_rel, a.spread)
@@ -1515,9 +1581,27 @@ pub fn compare_with_policies(
                     r.p99_wake_lat_rel,
                     a.p99_wake_lat,
                 ) && p99_d < 0.0
+                || is_significant(
+                    mwl_d,
+                    r.median_wake_lat_abs,
+                    r.median_wake_lat_rel,
+                    a.median_wake_lat,
+                ) && mwl_d < 0.0
                 || is_significant(wcv_d, r.wake_cv_abs, r.wake_cv_rel, a.wake_cv) && wcv_d < 0.0
+                || is_significant(
+                    ti_d,
+                    r.total_iterations_abs,
+                    r.total_iterations_rel,
+                    a.total_iterations,
+                ) && ti_d > 0.0 // more iterations = improvement
                 || is_significant(rd_d, r.run_delay_abs, r.run_delay_rel, a.run_delay)
                     && rd_d < 0.0
+                || is_significant(
+                    wrd_d,
+                    r.worst_run_delay_abs,
+                    r.worst_run_delay_rel,
+                    a.worst_run_delay,
+                ) && wrd_d < 0.0
                 || pass_d > r.pass_rate_tol;
 
             let change = if any_regression {
@@ -1541,8 +1625,11 @@ pub fn compare_with_policies(
                 fallback_delta: fb_d,
                 keep_last_delta: kl_d,
                 p99_wake_lat_delta: p99_d,
+                median_wake_lat_delta: mwl_d,
                 wake_cv_delta: wcv_d,
+                total_iterations_delta: ti_d,
                 run_delay_delta: rd_d,
+                worst_run_delay_delta: wrd_d,
                 baseline_pass_rate: a.pass_rate,
                 current_pass_rate: b.pass_rate,
                 resolved: r,
@@ -1651,11 +1738,23 @@ fn format_metric_deltas(out: &mut String, d: &CgroupDelta) {
     if d.p99_wake_lat_delta.abs() > r.p99_wake_lat_abs {
         parts.push(format!("p99_wake: {:+.1}us", d.p99_wake_lat_delta));
     }
+    if d.median_wake_lat_delta.abs() > r.median_wake_lat_abs {
+        parts.push(format!("median_wake: {:+.1}us", d.median_wake_lat_delta));
+    }
     if d.wake_cv_delta.abs() > r.wake_cv_abs {
         parts.push(format!("wake_cv: {:+.3}", d.wake_cv_delta));
     }
+    if d.total_iterations_delta.abs() > r.total_iterations_abs {
+        parts.push(format!("iterations: {:+.0}", d.total_iterations_delta));
+    }
     if d.run_delay_delta.abs() > r.run_delay_abs {
         parts.push(format!("run_delay: {:+.1}us", d.run_delay_delta));
+    }
+    if d.worst_run_delay_delta.abs() > r.worst_run_delay_abs {
+        parts.push(format!(
+            "worst_run_delay: {:+.1}us",
+            d.worst_run_delay_delta
+        ));
     }
     if (d.current_pass_rate - d.baseline_pass_rate).abs() > r.pass_rate_tol {
         parts.push(format!(
@@ -2165,8 +2264,11 @@ mod tests {
             fallback_delta: 5.0,
             keep_last_delta: 5.0,
             p99_wake_lat_delta: 0.0,
+            median_wake_lat_delta: 0.0,
             wake_cv_delta: 0.0,
+            total_iterations_delta: 0.0,
             run_delay_delta: 0.0,
+            worst_run_delay_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
@@ -2191,8 +2293,11 @@ mod tests {
             fallback_delta: 0.0,
             keep_last_delta: 0.0,
             p99_wake_lat_delta: 0.0,
+            median_wake_lat_delta: 0.0,
             wake_cv_delta: 0.0,
+            total_iterations_delta: 0.0,
             run_delay_delta: 0.0,
+            worst_run_delay_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
@@ -2685,8 +2790,11 @@ mod tests {
             fallback_delta: 0.0,
             keep_last_delta: 20.0,
             p99_wake_lat_delta: 0.0,
+            median_wake_lat_delta: 0.0,
             wake_cv_delta: 0.0,
+            total_iterations_delta: 0.0,
             run_delay_delta: 0.0,
+            worst_run_delay_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 0.5,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
@@ -2834,5 +2942,256 @@ mod tests {
         assert_eq!(row.topology, "tiny-1llc");
         assert_eq!(row.scenario, "proportional");
         assert_eq!(row.flags, "borrow");
+    }
+
+    // -- CgroupAgg new fields --
+
+    #[test]
+    fn aggregate_cgroup_includes_all_benchmarking_fields() {
+        let mut r1 = make_row("a", "f", "t", true, 5.0);
+        r1.median_wake_latency_us = 10.0;
+        r1.worst_run_delay_us = 200.0;
+        r1.total_iterations = 1000;
+        r1.mean_run_delay_us = 50.0;
+        let mut r2 = make_row("a", "f", "t", true, 5.0);
+        r2.median_wake_latency_us = 20.0;
+        r2.worst_run_delay_us = 400.0;
+        r2.total_iterations = 2000;
+        r2.mean_run_delay_us = 100.0;
+        let rows: Vec<&GauntletRow> = vec![&r1, &r2];
+        let agg = aggregate_cgroup(&rows);
+        assert!((agg.median_wake_lat - 15.0).abs() < 0.01);
+        assert!((agg.worst_run_delay - 300.0).abs() < 0.01);
+        assert!((agg.total_iterations - 1500.0).abs() < 0.01);
+        assert!((agg.run_delay - 75.0).abs() < 0.01);
+    }
+
+    // -- CgroupDelta new fields in comparison --
+
+    #[test]
+    fn compare_worst_run_delay_regression() {
+        let mut baseline = vec![make_row("a", "f1", "t1", true, 5.0)];
+        baseline[0].worst_run_delay_us = 100.0;
+        let mut current = vec![make_row("a", "f1", "t1", true, 5.0)];
+        current[0].worst_run_delay_us = 500.0;
+        let report = compare_baselines(&baseline, &current);
+        assert!(
+            report.contains("Regressions (1)"),
+            "worst_run_delay regression, got:\n{report}"
+        );
+        assert!(
+            report.contains("worst_run_delay:"),
+            "should show worst_run_delay delta, got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn compare_worst_run_delay_improvement() {
+        let mut baseline = vec![make_row("a", "f1", "t1", true, 5.0)];
+        baseline[0].worst_run_delay_us = 500.0;
+        let mut current = vec![make_row("a", "f1", "t1", true, 5.0)];
+        current[0].worst_run_delay_us = 100.0;
+        let report = compare_baselines(&baseline, &current);
+        assert!(
+            report.contains("Improvements (1)"),
+            "worst_run_delay improvement, got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn compare_median_wake_lat_regression() {
+        let mut baseline = vec![make_row("a", "f1", "t1", true, 5.0)];
+        baseline[0].median_wake_latency_us = 10.0;
+        let mut current = vec![make_row("a", "f1", "t1", true, 5.0)];
+        current[0].median_wake_latency_us = 100.0;
+        let report = compare_baselines(&baseline, &current);
+        assert!(
+            report.contains("Regressions (1)"),
+            "median_wake_lat regression, got:\n{report}"
+        );
+        assert!(
+            report.contains("median_wake:"),
+            "should show median_wake delta, got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn compare_median_wake_lat_improvement() {
+        let mut baseline = vec![make_row("a", "f1", "t1", true, 5.0)];
+        baseline[0].median_wake_latency_us = 100.0;
+        let mut current = vec![make_row("a", "f1", "t1", true, 5.0)];
+        current[0].median_wake_latency_us = 10.0;
+        let report = compare_baselines(&baseline, &current);
+        assert!(
+            report.contains("Improvements (1)"),
+            "median_wake_lat improvement, got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn compare_total_iterations_regression() {
+        let mut baseline = vec![make_row("a", "f1", "t1", true, 5.0)];
+        baseline[0].total_iterations = 10000;
+        let mut current = vec![make_row("a", "f1", "t1", true, 5.0)];
+        current[0].total_iterations = 5000;
+        let report = compare_baselines(&baseline, &current);
+        assert!(
+            report.contains("Regressions (1)"),
+            "total_iterations regression (fewer = worse), got:\n{report}"
+        );
+        assert!(
+            report.contains("iterations:"),
+            "should show iterations delta, got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn compare_total_iterations_improvement() {
+        let mut baseline = vec![make_row("a", "f1", "t1", true, 5.0)];
+        baseline[0].total_iterations = 5000;
+        let mut current = vec![make_row("a", "f1", "t1", true, 5.0)];
+        current[0].total_iterations = 10000;
+        let report = compare_baselines(&baseline, &current);
+        assert!(
+            report.contains("Improvements (1)"),
+            "total_iterations improvement (more = better), got:\n{report}"
+        );
+    }
+
+    // -- ComparisonPolicy new fields --
+
+    #[test]
+    fn comparison_policy_new_fields_in_defaults() {
+        let d = ComparisonPolicy::DEFAULTS;
+        assert!(d.median_wake_lat_abs.is_some());
+        assert!(d.median_wake_lat_rel.is_some());
+        assert!(d.worst_run_delay_abs.is_some());
+        assert!(d.worst_run_delay_rel.is_some());
+        assert!(d.total_iterations_abs.is_some());
+        assert!(d.total_iterations_rel.is_some());
+    }
+
+    #[test]
+    fn comparison_policy_new_fields_in_empty() {
+        let e = ComparisonPolicy::EMPTY;
+        assert!(e.median_wake_lat_abs.is_none());
+        assert!(e.median_wake_lat_rel.is_none());
+        assert!(e.worst_run_delay_abs.is_none());
+        assert!(e.worst_run_delay_rel.is_none());
+        assert!(e.total_iterations_abs.is_none());
+        assert!(e.total_iterations_rel.is_none());
+    }
+
+    #[test]
+    fn resolved_policy_includes_new_fields() {
+        let r = ComparisonPolicy::DEFAULTS.resolved();
+        assert!(r.median_wake_lat_abs > 0.0);
+        assert!(r.median_wake_lat_rel > 0.0);
+        assert!(r.worst_run_delay_abs > 0.0);
+        assert!(r.worst_run_delay_rel > 0.0);
+        assert!(r.total_iterations_abs > 0.0);
+        assert!(r.total_iterations_rel > 0.0);
+    }
+
+    #[test]
+    fn comparison_policy_serde_new_fields() {
+        let mut p = ComparisonPolicy::EMPTY;
+        p.median_wake_lat_abs = Some(25.0);
+        p.worst_run_delay_abs = Some(300.0);
+        p.total_iterations_abs = Some(50.0);
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: ComparisonPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(p2.median_wake_lat_abs, Some(25.0));
+        assert_eq!(p2.worst_run_delay_abs, Some(300.0));
+        assert_eq!(p2.total_iterations_abs, Some(50.0));
+    }
+
+    // -- format_metric_deltas new fields --
+
+    #[test]
+    fn format_metric_deltas_worst_run_delay() {
+        let d = CgroupDelta {
+            scenario: "a".into(),
+            flags: "f".into(),
+            topology: "t".into(),
+            work_type: "CpuSpin".into(),
+            change: CgroupChange::Regression,
+            spread_delta: 0.0,
+            gap_ms_delta: 0.0,
+            imbalance_delta: 0.0,
+            dsq_depth_delta: 0.0,
+            fallback_delta: 0.0,
+            keep_last_delta: 0.0,
+            p99_wake_lat_delta: 0.0,
+            median_wake_lat_delta: 0.0,
+            wake_cv_delta: 0.0,
+            total_iterations_delta: 0.0,
+            run_delay_delta: 0.0,
+            worst_run_delay_delta: 500.0,
+            baseline_pass_rate: 1.0,
+            current_pass_rate: 1.0,
+            resolved: ComparisonPolicy::DEFAULTS.resolved(),
+        };
+        let mut out = String::new();
+        format_metric_deltas(&mut out, &d);
+        assert!(out.contains("worst_run_delay: +500.0us"), "got:\n{out}");
+    }
+
+    #[test]
+    fn format_metric_deltas_median_wake() {
+        let d = CgroupDelta {
+            scenario: "a".into(),
+            flags: "f".into(),
+            topology: "t".into(),
+            work_type: "CpuSpin".into(),
+            change: CgroupChange::Regression,
+            spread_delta: 0.0,
+            gap_ms_delta: 0.0,
+            imbalance_delta: 0.0,
+            dsq_depth_delta: 0.0,
+            fallback_delta: 0.0,
+            keep_last_delta: 0.0,
+            p99_wake_lat_delta: 0.0,
+            median_wake_lat_delta: 100.0,
+            wake_cv_delta: 0.0,
+            total_iterations_delta: 0.0,
+            run_delay_delta: 0.0,
+            worst_run_delay_delta: 0.0,
+            baseline_pass_rate: 1.0,
+            current_pass_rate: 1.0,
+            resolved: ComparisonPolicy::DEFAULTS.resolved(),
+        };
+        let mut out = String::new();
+        format_metric_deltas(&mut out, &d);
+        assert!(out.contains("median_wake: +100.0us"), "got:\n{out}");
+    }
+
+    #[test]
+    fn format_metric_deltas_iterations() {
+        let d = CgroupDelta {
+            scenario: "a".into(),
+            flags: "f".into(),
+            topology: "t".into(),
+            work_type: "CpuSpin".into(),
+            change: CgroupChange::Regression,
+            spread_delta: 0.0,
+            gap_ms_delta: 0.0,
+            imbalance_delta: 0.0,
+            dsq_depth_delta: 0.0,
+            fallback_delta: 0.0,
+            keep_last_delta: 0.0,
+            p99_wake_lat_delta: 0.0,
+            median_wake_lat_delta: 0.0,
+            wake_cv_delta: 0.0,
+            total_iterations_delta: -500.0,
+            run_delay_delta: 0.0,
+            worst_run_delay_delta: 0.0,
+            baseline_pass_rate: 1.0,
+            current_pass_rate: 1.0,
+            resolved: ComparisonPolicy::DEFAULTS.resolved(),
+        };
+        let mut out = String::new();
+        format_metric_deltas(&mut out, &d);
+        assert!(out.contains("iterations: -500"), "got:\n{out}");
     }
 }
