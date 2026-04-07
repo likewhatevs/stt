@@ -1,16 +1,32 @@
-pub mod acpi;
-pub mod boot;
 pub mod console;
 pub mod host_topology;
 pub mod initramfs;
-pub mod kvm;
-pub mod mptable;
 pub mod shm_ring;
 pub mod topology;
+
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::acpi;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::boot;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::kvm;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::mptable;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::boot;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::kvm;
 
 pub use topology::Topology;
 
 use anyhow::{Context, Result};
+#[cfg(target_arch = "x86_64")]
 use kvm_ioctls::VcpuExit;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -504,6 +520,7 @@ pub struct VmResult {
 // ---------------------------------------------------------------------------
 
 /// Address where initramfs is loaded in guest memory.
+#[cfg(target_arch = "x86_64")]
 const INITRD_ADDR: u64 = 0x800_0000; // 128 MB
 
 // ---------------------------------------------------------------------------
@@ -611,6 +628,7 @@ impl SttVm {
     }
 
     /// Boot the VM, run until halt/shutdown/timeout, return captured output.
+    #[cfg(target_arch = "x86_64")]
     pub fn run(&self) -> Result<VmResult> {
         let start = Instant::now();
 
@@ -649,6 +667,7 @@ impl SttVm {
 
     /// Create the KVM VM and load the kernel. Returns the VM and kernel
     /// load result. Spawns the initramfs-resolve thread to run in parallel.
+    #[cfg(target_arch = "x86_64")]
     fn create_vm_and_load_kernel(&self) -> Result<(kvm::SttKvm, boot::KernelLoadResult)> {
         let t0 = Instant::now();
         let use_hugepages = self.performance_mode
@@ -689,6 +708,7 @@ impl SttVm {
     }
 
     /// Join the initramfs thread and load the result into guest memory.
+    #[cfg(target_arch = "x86_64")]
     fn join_and_load_initramfs(
         &self,
         vm: &kvm::SttKvm,
@@ -726,6 +746,7 @@ impl SttVm {
     }
 
     /// Write cmdline, boot params, SHM header, and topology tables to guest memory.
+    #[cfg(target_arch = "x86_64")]
     fn setup_memory(
         &self,
         vm: &kvm::SttKvm,
@@ -810,6 +831,7 @@ impl SttVm {
     }
 
     /// Configure BSP and AP vCPUs.
+    #[cfg(target_arch = "x86_64")]
     fn setup_vcpus(&self, vm: &kvm::SttKvm, kernel_entry: u64) -> Result<()> {
         let t0 = Instant::now();
         boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], vm.split_irqchip)?;
@@ -844,6 +866,7 @@ impl SttVm {
 
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
+    #[cfg(target_arch = "x86_64")]
     #[allow(clippy::type_complexity)]
     fn run_vm(
         &self,
@@ -1020,6 +1043,7 @@ impl SttVm {
 
     /// Spawn AP vCPU threads. Each thread optionally pins itself to a
     /// host CPU from `pin_targets` (indexed by AP order, 0-based).
+    #[cfg(target_arch = "x86_64")]
     fn spawn_ap_threads(
         &self,
         vcpus: Vec<kvm_ioctls::VcpuFd>,
@@ -1071,6 +1095,7 @@ impl SttVm {
     }
 
     /// Start the monitor thread if vmlinux is available.
+    #[cfg(target_arch = "x86_64")]
     fn start_monitor(
         &self,
         vm: &kvm::SttKvm,
@@ -1186,6 +1211,7 @@ impl SttVm {
     /// 1. Poll `find_map` until the scheduler's BPF maps are discoverable
     /// 2. Poll the SHM ring for MSG_TYPE_SCENARIO_START
     /// 3. Write the crash value
+    #[cfg(target_arch = "x86_64")]
     fn start_bpf_map_write(
         &self,
         vm: &kvm::SttKvm,
@@ -1325,6 +1351,7 @@ impl SttVm {
     }
 
     /// BSP KVM_RUN loop. Returns (exit_code, timed_out).
+    #[cfg(target_arch = "x86_64")]
     fn run_bsp(
         &self,
         bsp: &mut kvm_ioctls::VcpuFd,
@@ -1403,6 +1430,7 @@ impl SttVm {
     }
 
     /// Shutdown threads and collect output.
+    #[cfg(target_arch = "x86_64")]
     #[allow(clippy::too_many_arguments)]
     fn collect_results(
         &self,
@@ -1499,19 +1527,24 @@ impl SttVm {
 // I/O dispatch — shared between BSP and AP run loops
 // ---------------------------------------------------------------------------
 
+#[cfg(target_arch = "x86_64")]
 const KVM_SYSTEM_EVENT_SHUTDOWN: u32 = 1;
+#[cfg(target_arch = "x86_64")]
 const KVM_SYSTEM_EVENT_RESET: u32 = 2;
 
-/// I8042 ports and commands — minimal emulation for guest reboot.
-/// Reference: firecracker and cloud-hypervisor both emulate i8042 for
-/// x86 guest shutdown. The kernel's default reboot method (`reboot=k`)
-/// writes CMD_RESET_CPU (0xFE) to the i8042 command port (0x64).
+/// I8042 ports and commands — minimal emulation for x86 guest reboot.
+/// The kernel's default reboot method (`reboot=k`) writes CMD_RESET_CPU
+/// (0xFE) to the i8042 command port (0x64).
+#[cfg(target_arch = "x86_64")]
 const I8042_DATA_PORT: u16 = 0x60;
+#[cfg(target_arch = "x86_64")]
 const I8042_CMD_PORT: u16 = 0x64;
+#[cfg(target_arch = "x86_64")]
 const I8042_CMD_RESET_CPU: u8 = 0xFE;
 
 /// Dispatch an I/O out to serial ports or system devices.
 /// Returns `true` if the caller should exit (system reset detected).
+#[cfg(target_arch = "x86_64")]
 fn dispatch_io_out(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
@@ -1533,6 +1566,7 @@ fn dispatch_io_out(
 
 /// Dispatch an I/O in from serial ports or system devices.
 /// Handles i8042 reads to satisfy the kernel's keyboard probe.
+#[cfg(target_arch = "x86_64")]
 fn dispatch_io_in(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
@@ -1572,6 +1606,7 @@ fn dispatch_io_in(
 /// On EINTR: clears immediate_exit (QEMU kvm_eat_signals pattern) and
 /// re-checks kill flag before re-entering KVM_RUN.
 /// HLT for APs is normal — KVM wakes them on SIPI/interrupt delivery.
+#[cfg(target_arch = "x86_64")]
 fn vcpu_run_loop(
     vcpu: &mut kvm_ioctls::VcpuFd,
     com1: &Arc<PiMutex<console::Serial>>,
@@ -1641,10 +1676,11 @@ fn vcpu_run_loop(
 // vmlinux discovery
 // ---------------------------------------------------------------------------
 
-/// Find the vmlinux ELF next to a kernel bzImage path.
+/// Find the vmlinux ELF next to a kernel image path.
 ///
-/// Checks the bzImage's parent directory and, if the path looks like
-/// `<root>/arch/x86/boot/bzImage`, checks `<root>/vmlinux` as well.
+/// On x86_64, checks the bzImage's parent directory and, if the path
+/// looks like `<root>/arch/x86/boot/bzImage`, checks `<root>/vmlinux`.
+#[cfg(target_arch = "x86_64")]
 fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
     let dir = kernel_path.parent()?;
     let candidate = dir.join("vmlinux");
@@ -1666,6 +1702,17 @@ fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
             return Some(debug);
         }
     }
+    None
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
+    let dir = kernel_path.parent()?;
+    let candidate = dir.join("vmlinux");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    // TODO: aarch64 kernel image path heuristics
     None
 }
 
@@ -1749,7 +1796,15 @@ impl SttVmBuilder {
     #[allow(dead_code)]
     pub fn kernel_dir(mut self, path: impl Into<PathBuf>) -> Self {
         let dir: PathBuf = path.into();
-        self.kernel = Some(dir.join("arch/x86/boot/bzImage"));
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.kernel = Some(dir.join("arch/x86/boot/bzImage"));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = dir;
+            todo!("aarch64: resolve kernel image path");
+        }
         self
     }
 
@@ -2004,6 +2059,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn builder_kernel_dir_resolves_bzimage() {
         let b = SttVmBuilder::default().kernel_dir("/some/linux");
         assert_eq!(
@@ -2074,6 +2130,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn ap_mp_state_set_correctly() {
         let topo = Topology {
             sockets: 2,
@@ -2102,6 +2159,7 @@ mod tests {
     /// No initramfs — the kernel boots to panic, which is enough to
     /// confirm KVM, kernel loading, and serial console all work.
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn boot_kernel_produces_output() {
         let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(kernel) = crate::find_kernel() else {
@@ -2124,6 +2182,7 @@ mod tests {
 
     /// Boot with SMP topology and verify kernel detects multiple CPUs.
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn boot_kernel_smp_topology() {
         let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(kernel) = crate::find_kernel() else {
@@ -2146,6 +2205,7 @@ mod tests {
     /// IS the boot time. With `panic=-1`, the kernel halts immediately
     /// on panic, causing KVM_EXIT_HLT which returns to userspace.
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn bench_boot_time() {
         let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(kernel) = crate::find_kernel() else {
@@ -2189,6 +2249,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn kvm_has_immediate_exit_cap() {
         let topo = Topology {
             sockets: 1,
@@ -2204,6 +2265,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn immediate_exit_handle_set_clear() {
         let topo = Topology {
             sockets: 1,
@@ -2238,6 +2300,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn immediate_exit_handle_cross_vcpu() {
         let topo = Topology {
             sockets: 1,
@@ -2268,6 +2331,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn vcpu_thread_kick_sets_immediate_exit() {
         let topo = Topology {
             sockets: 1,
@@ -2290,6 +2354,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_vmlinux_from_bzimage_path() {
         // Create a temp dir simulating <root>/arch/x86/boot/bzImage with vmlinux at <root>.
         let tmp = std::env::temp_dir().join("stt-find-vmlinux-test");
@@ -2438,6 +2503,7 @@ mod tests {
 
     /// Boot a kernel with vmlinux available and verify the monitor produces samples.
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
         let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(kernel) = crate::find_kernel() else {
@@ -2557,6 +2623,7 @@ mod tests {
     // -- dispatch_io_out / dispatch_io_in tests --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn dispatch_io_out_i8042_reset() {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
@@ -2569,6 +2636,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn dispatch_io_out_i8042_non_reset() {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
@@ -2576,6 +2644,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn dispatch_io_out_serial_com1() {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
@@ -2584,6 +2653,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn dispatch_io_out_serial_com2() {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
@@ -2593,6 +2663,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn dispatch_io_out_unknown_port() {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
@@ -2600,6 +2671,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn dispatch_io_in_i8042_status() {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
@@ -2609,6 +2681,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn dispatch_io_in_i8042_data() {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
@@ -2618,6 +2691,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn dispatch_io_in_unknown_port() {
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));

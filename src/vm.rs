@@ -47,7 +47,11 @@ impl Default for VmConfig {
 pub fn run_in_vm(cfg: &VmConfig, stt_args: &[String]) -> Result<VmResult> {
     // Resolve kernel
     let kernel = if let Some(ref kd) = cfg.kernel_dir {
-        PathBuf::from(kd).join("arch/x86/boot/bzImage")
+        #[cfg(target_arch = "x86_64")]
+        let image = PathBuf::from(kd).join("arch/x86/boot/bzImage");
+        #[cfg(target_arch = "aarch64")]
+        let image = PathBuf::from(kd).join("arch/arm64/boot/Image");
+        image
     } else if let Some(ref k) = cfg.kernel {
         PathBuf::from(k)
     } else {

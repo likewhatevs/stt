@@ -4,7 +4,8 @@
 use anyhow::{Context, Result};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::topology::Topology;
+use super::topology::apic_id;
+use crate::vmm::topology::Topology;
 
 const MPTABLE_START: u64 = 0x9fc00;
 
@@ -65,7 +66,7 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, topo: &Topology) -> Result<()> {
     for cpu_id in 0..num_cpus {
         // MP table spec uses 8-bit APIC IDs. For topologies with IDs > 255,
         // the kernel uses ACPI MADT (which handles x2APIC) as authoritative.
-        let apic_id = topo.apic_id(cpu_id) as u8;
+        let apic_id = apic_id(topo, cpu_id) as u8;
         let mut entry = [0u8; 20];
         entry[0] = MP_PROCESSOR;
         entry[1] = apic_id;
@@ -276,12 +277,9 @@ mod tests {
             let mut entry = [0u8; 20];
             mem.read_slice(&mut entry, entry_addr).unwrap();
             assert_eq!(entry[0], MP_PROCESSOR, "entry type should be processor");
-            let apic_id = entry[1];
-            let expected = topo.apic_id(i) as u8;
-            assert_eq!(
-                apic_id, expected,
-                "CPU {i}: APIC ID {apic_id} != expected {expected}"
-            );
+            let id = entry[1];
+            let expected = apic_id(&topo, i) as u8;
+            assert_eq!(id, expected, "CPU {i}: APIC ID {id} != expected {expected}");
         }
     }
 

@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 /// Shell init script that mounts proc/sys/dev/cgroup, runs the payload,
 /// captures the exit code via serial, and powers off.
 ///
-/// Payload stdout/stderr and STT_EXIT are directed to /dev/ttyS1 (COM2)
-/// to separate them from kernel console output on /dev/ttyS0 (COM1).
+/// Payload stdout/stderr and STT_EXIT are directed to the app tty
+/// to separate them from kernel console output on the console tty.
+/// x86_64: 8250 UART (ttyS0/ttyS1). aarch64: PL011 AMBA (ttyAMA0/ttyAMA1).
+#[cfg(target_arch = "x86_64")]
 const INIT_SCRIPT: &str = r#"#!/bin/sh
 export PATH=/bin
 busybox mkdir -p /proc /sys /dev /tmp
@@ -95,6 +97,91 @@ if [ -f /sched_disable ]; then
     . /sched_disable
 fi
 echo "STT_EXIT=$RC" > /dev/ttyS1
+# Let serial buffers drain before reboot.
+busybox usleep 100000
+busybox reboot -f
+"#;
+
+#[cfg(target_arch = "aarch64")]
+const INIT_SCRIPT: &str = r#"#!/bin/sh
+export PATH=/bin
+busybox mkdir -p /proc /sys /dev /tmp
+busybox mount -t proc proc /proc
+busybox mount -t sysfs sys /sys
+busybox mount -t devtmpfs dev /dev
+busybox mkdir -p /sys/kernel/debug
+busybox mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+busybox mkdir -p /sys/kernel/tracing
+busybox mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
+busybox mkdir -p /sys/fs/bpf
+busybox mount -t bpf bpffs /sys/fs/bpf 2>/dev/null
+echo "STT_INIT_STARTED" > /dev/ttyAMA1
+busybox mkdir -p /sys/fs/cgroup
+busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
+busybox mount -t tmpfs tmpfs /tmp
+if [ -f /sched_enable ]; then
+    . /sched_enable
+fi
+if [ -x /scheduler ]; then
+    SCHED_ARGS=$(busybox cat /sched_args 2>/dev/null)
+    /scheduler $SCHED_ARGS >/tmp/sched.log 2>&1 &
+    SCHED_PID=$!
+    export SCHED_PID
+    busybox sleep 1
+    if ! busybox kill -0 $SCHED_PID 2>/dev/null; then
+        echo "===SCHED_OUTPUT_START===" > /dev/ttyAMA1
+        busybox cat /tmp/sched.log > /dev/ttyAMA1 2>/dev/null
+        echo "===SCHED_OUTPUT_END===" > /dev/ttyAMA1
+        echo "SCHEDULER_DIED" > /dev/ttyAMA1
+        echo "STT_EXIT=1" > /dev/ttyAMA1
+        busybox reboot -f
+    fi
+fi
+TRACE_EVENTS=/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable
+if [ -f "$TRACE_EVENTS" ]; then
+    echo 1 > "$TRACE_EVENTS"
+    busybox cat /sys/kernel/tracing/trace_pipe > /dev/ttyAMA0 &
+fi
+SHM_BASE=
+for _w in $(busybox cat /proc/cmdline); do
+    case $_w in STT_SHM_BASE=*) SHM_BASE=${_w#STT_SHM_BASE=} ;; esac
+done
+if [ -n "$SHM_BASE" ]; then
+    DUMP_ADDR=$(( SHM_BASE + 12 ))
+    STALL_ADDR=$(( SHM_BASE + 13 ))
+    printf 'D' > /tmp/dump_req
+    printf 'S' > /tmp/stall_req
+    while true; do
+        busybox dd if=/dev/mem bs=1 count=1 skip=$DUMP_ADDR of=/tmp/dump_byte 2>/dev/null
+        if busybox cmp -s /tmp/dump_byte /tmp/dump_req; then
+            echo D > /proc/sysrq-trigger
+            printf '\0' | busybox dd of=/dev/mem bs=1 count=1 seek=$DUMP_ADDR conv=notrunc 2>/dev/null
+        fi
+        busybox dd if=/dev/mem bs=1 count=1 skip=$STALL_ADDR of=/tmp/stall_byte 2>/dev/null
+        if busybox cmp -s /tmp/stall_byte /tmp/stall_req; then
+            busybox touch /tmp/stt_stall
+            printf '\0' | busybox dd of=/dev/mem bs=1 count=1 seek=$STALL_ADDR conv=notrunc 2>/dev/null
+        fi
+        busybox sleep 1
+    done &
+fi
+ARGS=$(busybox cat /args 2>/dev/null)
+echo "STT_PAYLOAD_STARTING" > /dev/ttyAMA1
+echo "===STT_JSON_START===" > /dev/ttyAMA1
+/payload $ARGS >/dev/ttyAMA1 2>&1
+RC=$?
+echo "===STT_JSON_END===" > /dev/ttyAMA1
+if [ -n "$SCHED_PID" ]; then
+    busybox kill $SCHED_PID 2>/dev/null
+    busybox wait $SCHED_PID 2>/dev/null
+    echo "===SCHED_OUTPUT_START===" > /dev/ttyAMA1
+    busybox cat /tmp/sched.log > /dev/ttyAMA1 2>/dev/null
+    echo "===SCHED_OUTPUT_END===" > /dev/ttyAMA1
+fi
+if [ -f /sched_disable ]; then
+    . /sched_disable
+fi
+echo "STT_EXIT=$RC" > /dev/ttyAMA1
 # Let serial buffers drain before reboot.
 busybox usleep 100000
 busybox reboot -f

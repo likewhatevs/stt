@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
 
-use super::topology::Topology;
+use super::topology::apic_id;
+use crate::vmm::topology::Topology;
 
 // RSDP at fixed address in BIOS ROM area — firmware scans for it here.
 const RSDP_ADDR: u64 = 0x000E_0000;
@@ -428,7 +429,7 @@ fn write_srat(
             entry_type: 2,
             length: std::mem::size_of::<SratCpuAffinity>() as u8,
             proximity_domain: socket_id,
-            x2apic_id: topo.apic_id(cpu_id),
+            x2apic_id: apic_id(topo, cpu_id),
             flags: 1,
             ..Default::default()
         };
@@ -502,7 +503,7 @@ fn compute_madt_size(topo: &Topology) -> u32 {
     let mut has_x2apic = false;
     let mut has_lapic = false;
     for cpu_id in 0..num_cpus {
-        if use_x2apic_entry(topo.apic_id(cpu_id)) {
+        if use_x2apic_entry(apic_id(topo, cpu_id)) {
             cpu_entries_size += std::mem::size_of::<MadtX2Apic>() as u32;
             has_x2apic = true;
         } else {
@@ -532,7 +533,7 @@ fn write_madt(mem: &GuestMemoryMmap, topo: &Topology, addr: u64) -> Result<()> {
     let mut has_x2apic = false;
     let mut has_lapic = false;
     for cpu_id in 0..num_cpus {
-        if use_x2apic_entry(topo.apic_id(cpu_id)) {
+        if use_x2apic_entry(apic_id(topo, cpu_id)) {
             has_x2apic = true;
         } else {
             has_lapic = true;
@@ -554,12 +555,12 @@ fn write_madt(mem: &GuestMemoryMmap, topo: &Topology, addr: u64) -> Result<()> {
 
     // CPU entries
     for cpu_id in 0..num_cpus {
-        let apic_id = topo.apic_id(cpu_id);
-        if use_x2apic_entry(apic_id) {
+        let id = apic_id(topo, cpu_id);
+        if use_x2apic_entry(id) {
             let entry = MadtX2Apic {
                 entry_type: 9,
                 length: std::mem::size_of::<MadtX2Apic>() as u8,
-                x2apic_id: apic_id,
+                x2apic_id: id,
                 flags: 1,
                 processor_uid: cpu_id,
                 ..Default::default()
@@ -572,7 +573,7 @@ fn write_madt(mem: &GuestMemoryMmap, topo: &Topology, addr: u64) -> Result<()> {
                 entry_type: 0,
                 length: std::mem::size_of::<MadtLocalApic>() as u8,
                 processor_id: cpu_id as u8,
-                apic_id: apic_id as u8,
+                apic_id: id as u8,
                 flags: 1,
             };
             let bytes = entry.as_bytes();
@@ -771,13 +772,13 @@ mod tests {
         for (entry_type, _, data) in &entries {
             match *entry_type {
                 0 => {
-                    assert_eq!(data[3] as u32, topo.apic_id(cpu_idx));
+                    assert_eq!(data[3] as u32, apic_id(&topo, cpu_idx));
                     cpu_idx += 1;
                 }
                 9 => {
                     assert_eq!(
                         u32::from_le_bytes(data[4..8].try_into().unwrap()),
-                        topo.apic_id(cpu_idx)
+                        apic_id(&topo, cpu_idx)
                     );
                     cpu_idx += 1;
                 }
@@ -900,8 +901,8 @@ mod tests {
         let mut has_low = false;
         let mut has_high = false;
         for cpu_id in 0..topo.total_cpus() {
-            let apic_id = topo.apic_id(cpu_id);
-            if apic_id < 255 {
+            let id = apic_id(&topo, cpu_id);
+            if id < 255 {
                 has_low = true;
             } else {
                 has_high = true;
@@ -1016,15 +1017,15 @@ mod tests {
             for (entry_type, _, data) in &entries {
                 match *entry_type {
                     0 => {
-                        let apic_id = data[3] as u32;
-                        assert!(apic_id < 255);
-                        assert_eq!(apic_id, topo.apic_id(cpu_idx));
+                        let id = data[3] as u32;
+                        assert!(id < 255);
+                        assert_eq!(id, apic_id(&topo, cpu_idx));
                         cpu_idx += 1;
                     }
                     9 => {
-                        let apic_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                        assert!(apic_id >= 255);
-                        assert_eq!(apic_id, topo.apic_id(cpu_idx));
+                        let id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+                        assert!(id >= 255);
+                        assert_eq!(id, apic_id(&topo, cpu_idx));
                         cpu_idx += 1;
                     }
                     _ => {}

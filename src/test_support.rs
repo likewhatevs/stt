@@ -958,7 +958,16 @@ fn attempt_auto_repro(
     let kernel_dir = canon_kernel
         .as_ref()
         .and_then(|p| p.to_str())
-        .and_then(|p| p.strip_suffix("/arch/x86/boot/bzImage"))
+        .and_then(|p| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                p.strip_suffix("/arch/x86/boot/bzImage")
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                p.strip_suffix("/arch/arm64/boot/Image")
+            }
+        })
         .map(|s| s.to_string());
     let kernel_dir_str = kernel_dir.as_deref();
     extract_probe_output(&repro_result.output, kernel_dir_str)

@@ -7,7 +7,8 @@ use kvm_bindings::{
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
-use super::topology::{Topology, generate_cpuid};
+use super::topology::{generate_cpuid, max_apic_id};
+use crate::vmm::topology::Topology;
 
 /// Physical address where the kernel is loaded.
 pub(crate) const KERNEL_LOAD_ADDR: u64 = 0x100000; // 1 MB
@@ -140,7 +141,7 @@ impl SttKvm {
 
         // Determine whether any APIC ID exceeds the 8-bit xAPIC limit.
         // If so, use split IRQ chip (LAPIC-only in kernel) + x2APIC API.
-        let max_apic_id = topo.max_apic_id();
+        let max_apic_id = max_apic_id(&topo);
         let split_irqchip = max_apic_id > MAX_XAPIC_ID;
 
         if split_irqchip {
@@ -385,7 +386,7 @@ mod tests {
             threads_per_core: 2,
         };
         // max APIC ID = apic_id(15) = 1<<3 | 3<<1 | 1 = 15, well under 254
-        assert!(topo.max_apic_id() <= MAX_XAPIC_ID);
+        assert!(max_apic_id(&topo) <= MAX_XAPIC_ID);
         let vm = SttKvm::new(topo, 256).unwrap();
         assert!(!vm.split_irqchip, "small topology should use full IRQ chip");
     }
@@ -403,9 +404,9 @@ mod tests {
             threads_per_core: 2,
         };
         assert!(
-            topo.max_apic_id() > MAX_XAPIC_ID,
+            max_apic_id(&topo) > MAX_XAPIC_ID,
             "max APIC ID {} should exceed {}",
-            topo.max_apic_id(),
+            max_apic_id(&topo),
             MAX_XAPIC_ID,
         );
         let vm = SttKvm::new(topo, 4096);
@@ -425,9 +426,9 @@ mod tests {
             threads_per_core: 2,
         };
         assert!(
-            small.max_apic_id() <= MAX_XAPIC_ID,
+            max_apic_id(&small) <= MAX_XAPIC_ID,
             "8s/8c/2t max APIC ID {} should be <= 254",
-            small.max_apic_id(),
+            max_apic_id(&small),
         );
         let vm = SttKvm::new(small, 2048).unwrap();
         assert!(!vm.split_irqchip);
@@ -439,9 +440,9 @@ mod tests {
             threads_per_core: 2,
         };
         assert!(
-            still_small.max_apic_id() <= MAX_XAPIC_ID,
+            max_apic_id(&still_small) <= MAX_XAPIC_ID,
             "15s/8c/2t max APIC ID {} should be <= 254",
-            still_small.max_apic_id(),
+            max_apic_id(&still_small),
         );
         let vm = SttKvm::new(still_small, 4096).unwrap();
         assert!(!vm.split_irqchip);

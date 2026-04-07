@@ -3,7 +3,7 @@ use kvm_bindings::{kvm_regs, kvm_sregs};
 use kvm_ioctls::VcpuFd;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::kvm::{
+use crate::vmm::kvm::{
     BOOT_PARAMS_ADDR, CMDLINE_ADDR, CMDLINE_MAX, E820_RAM, EBDA_START, HIMEM_START,
     KERNEL_LOAD_ADDR, MMIO_GAP_END, MMIO_GAP_START, STARTUP64_OFFSET,
 };
@@ -621,8 +621,8 @@ mod tests {
 
     #[test]
     fn setup_sregs_with_kvm() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
@@ -639,8 +639,8 @@ mod tests {
 
     #[test]
     fn setup_regs_with_kvm() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
@@ -657,8 +657,8 @@ mod tests {
 
     #[test]
     fn setup_fpu_with_kvm() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
@@ -672,8 +672,8 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_kvm() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
@@ -699,8 +699,8 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_extra_override() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
@@ -730,8 +730,8 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_extra_append() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
@@ -756,8 +756,8 @@ mod tests {
 
     #[test]
     fn setup_lapic_bsp() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 2,
@@ -782,8 +782,8 @@ mod tests {
 
     #[test]
     fn setup_lapic_ap_masked() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 2,
@@ -862,8 +862,8 @@ mod tests {
 
     #[test]
     fn cr0_no_host_bits() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
@@ -891,8 +891,8 @@ mod tests {
 
     #[test]
     fn setup_sregs_x2apic_disabled() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
@@ -910,8 +910,8 @@ mod tests {
 
     #[test]
     fn setup_sregs_x2apic_enabled() {
-        use super::super::kvm::SttKvm;
-        use super::super::topology::Topology;
+        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,

@@ -146,8 +146,16 @@ pub fn find_kernel() -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
     // Build-tree kernels (for development)
-    candidates.push("./linux/arch/x86/boot/bzImage".into());
-    candidates.push("../linux/arch/x86/boot/bzImage".into());
+    #[cfg(target_arch = "x86_64")]
+    {
+        candidates.push("./linux/arch/x86/boot/bzImage".into());
+        candidates.push("../linux/arch/x86/boot/bzImage".into());
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        candidates.push("./linux/arch/arm64/boot/Image".into());
+        candidates.push("../linux/arch/arm64/boot/Image".into());
+    }
 
     // Versioned paths (usually world-readable)
     if let Some(ref r) = rel {
