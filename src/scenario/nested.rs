@@ -1,5 +1,5 @@
 use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
-use super::{CgroupGroup, Ctx, collect_all, dfl_wl, setup_cells};
+use super::{CgroupGroup, Ctx, collect_all, dfl_wl, setup_cgroups};
 use crate::verify::{self, VerifyResult};
 use crate::workload::*;
 use anyhow::Result;
@@ -10,18 +10,18 @@ use std::time::{Duration, Instant};
 pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cell_0/sub_a"),
-            CgroupDef::named("cell_0/sub_b"),
-            CgroupDef::named("cell_1/sub_a"),
-            CgroupDef::named("cell_1/sub_a/deep"),
+            CgroupDef::named("cg_0/sub_a"),
+            CgroupDef::named("cg_0/sub_b"),
+            CgroupDef::named("cg_1/sub_a"),
+            CgroupDef::named("cg_1/sub_a/deep"),
         ]
         .into(),
         ops: vec![
             Op::AddCgroup {
-                name: "cell_0".into(),
+                name: "cg_0".into(),
             },
             Op::AddCgroup {
-                name: "cell_1".into(),
+                name: "cg_1".into(),
             },
         ],
         hold: HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration),
@@ -33,17 +33,17 @@ pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<VerifyResult> {
 pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
-            setup: vec![CgroupDef::named("cell_0/sub")].into(),
+            setup: vec![CgroupDef::named("cg_0/sub")].into(),
             ops: vec![
                 // Create parents and empty targets for MoveAllTasks.
                 Op::AddCgroup {
-                    name: "cell_0".into(),
+                    name: "cg_0".into(),
                 },
                 Op::AddCgroup {
-                    name: "cell_1".into(),
+                    name: "cg_1".into(),
                 },
                 Op::AddCgroup {
-                    name: "cell_1/sub".into(),
+                    name: "cg_1/sub".into(),
                 },
             ],
             hold: HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration / 4),
@@ -51,24 +51,24 @@ pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<VerifyResult> {
         Step {
             setup: vec![].into(),
             ops: vec![Op::MoveAllTasks {
-                from: "cell_0/sub".into(),
-                to: "cell_0".into(),
+                from: "cg_0/sub".into(),
+                to: "cg_0".into(),
             }],
             hold: HoldSpec::Frac(0.25),
         },
         Step {
             setup: vec![].into(),
             ops: vec![Op::MoveAllTasks {
-                from: "cell_0".into(),
-                to: "cell_1/sub".into(),
+                from: "cg_0".into(),
+                to: "cg_1/sub".into(),
             }],
             hold: HoldSpec::Frac(0.25),
         },
         Step {
             setup: vec![].into(),
             ops: vec![Op::MoveAllTasks {
-                from: "cell_1/sub".into(),
-                to: "cell_1".into(),
+                from: "cg_1/sub".into(),
+                to: "cg_1".into(),
             }],
             hold: HoldSpec::Frac(0.25),
         },
@@ -80,20 +80,20 @@ pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<VerifyResult> {
 /// Rapid nested cgroup create/destroy with dynamic names. Custom logic
 /// for dynamic naming.
 pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<VerifyResult> {
-    let (handles, _guard) = setup_cells(ctx, 2, &dfl_wl(ctx))?;
+    let (handles, _guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
     let deadline = Instant::now() + ctx.duration;
     let mut i = 0;
     while Instant::now() < deadline {
-        let path = format!("cell_0/churn_{i}");
-        ctx.cgroups.create_cell(&path)?;
+        let path = format!("cg_0/churn_{i}");
+        ctx.cgroups.create_cgroup(&path)?;
         if i % 3 == 0 {
             let deep = format!("{path}/deep");
-            ctx.cgroups.create_cell(&deep)?;
+            ctx.cgroups.create_cgroup(&deep)?;
             thread::sleep(Duration::from_millis(50));
-            let _ = ctx.cgroups.remove_cell(&deep);
+            let _ = ctx.cgroups.remove_cgroup(&deep);
         }
         thread::sleep(Duration::from_millis(50));
-        let _ = ctx.cgroups.remove_cell(&path);
+        let _ = ctx.cgroups.remove_cgroup(&path);
         i += 1;
     }
     Ok(collect_all(handles))
@@ -114,21 +114,21 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<VerifyResult> {
     let set_a: BTreeSet<usize> = all[..mid].iter().copied().collect();
 
     let mut _guard = CgroupGroup::new(ctx.cgroups);
-    _guard.add_cgroup("cell_0", &set_a)?;
+    _guard.add_cgroup("cg_0", &set_a)?;
     thread::sleep(Duration::from_secs(2));
 
-    let sc = std::path::Path::new(&ctx.cgroups.parent_path()).join("cell_0/cgroup.subtree_control");
+    let sc = std::path::Path::new(&ctx.cgroups.parent_path()).join("cg_0/cgroup.subtree_control");
     let _ = std::fs::write(&sc, "+cpuset");
 
     let sub_set: BTreeSet<usize> = all[..mid / 2].iter().copied().collect();
-    _guard.add_cgroup("cell_0/narrow", &sub_set)?;
+    _guard.add_cgroup("cg_0/narrow", &sub_set)?;
 
     let wl = WorkloadConfig {
-        num_workers: ctx.workers_per_cell,
+        num_workers: ctx.workers_per_cgroup,
         ..Default::default()
     };
     let mut h = WorkloadHandle::spawn(&wl)?;
-    ctx.cgroups.move_tasks("cell_0/narrow", &h.tids())?;
+    ctx.cgroups.move_tasks("cg_0/narrow", &h.tids())?;
     h.start();
 
     thread::sleep(ctx.duration);
@@ -142,8 +142,8 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<VerifyResult> {
 pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cell_0/sub_a").workers(8),
-            CgroupDef::named("cell_1/sub_b")
+            CgroupDef::named("cg_0/sub_a").workers(8),
+            CgroupDef::named("cg_1/sub_b")
                 .workers(2)
                 .work_type(WorkType::Bursty {
                     burst_ms: 50,
@@ -153,10 +153,10 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
         .into(),
         ops: vec![
             Op::AddCgroup {
-                name: "cell_0".into(),
+                name: "cg_0".into(),
             },
             Op::AddCgroup {
-                name: "cell_1".into(),
+                name: "cg_1".into(),
             },
         ],
         hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration),
@@ -168,19 +168,19 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
 pub fn custom_nested_cgroup_noctrl(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cell_0/sub_a/deep"),
-            CgroupDef::named("cell_1/sub_b"),
+            CgroupDef::named("cg_0/sub_a/deep"),
+            CgroupDef::named("cg_1/sub_b"),
         ]
         .into(),
         ops: vec![
             Op::AddCgroup {
-                name: "cell_0".into(),
+                name: "cg_0".into(),
             },
             Op::AddCgroup {
-                name: "cell_0/sub_a".into(),
+                name: "cg_0/sub_a".into(),
             },
             Op::AddCgroup {
-                name: "cell_1".into(),
+                name: "cg_1".into(),
             },
         ],
         hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration),

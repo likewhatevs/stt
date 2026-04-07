@@ -14,10 +14,10 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<VerifyResult> {
         // Phase 1: two disjoint cgroups, hold for half the duration
         Step {
             setup: vec![
-                CgroupDef::named("cell_0")
+                CgroupDef::named("cg_0")
                     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
                     .workers(4),
-                CgroupDef::named("cell_1")
+                CgroupDef::named("cg_1")
                     .with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 })
                     .workers(4),
             ].into(),
@@ -29,11 +29,11 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::SetCpuset {
-                    cgroup: "cell_0".into(),
+                    cgroup: "cg_0".into(),
                     cpus: CpusetSpec::Overlap { index: 0, of: 2, frac: 0.5 },
                 },
                 Op::SetCpuset {
-                    cgroup: "cell_1".into(),
+                    cgroup: "cg_1".into(),
                     cpus: CpusetSpec::Overlap { index: 1, of: 2, frac: 0.5 },
                 },
             ],
@@ -58,8 +58,8 @@ fn my_traverse_scenario(ctx: &Ctx) -> Result<VerifyResult> {
         phases: 5,
         phase_duration: std::time::Duration::from_millis(500),
         settle: std::time::Duration::from_millis(200),
-        persistent_cells: 1,
-        cell_workloads: vec![WorkloadConfig::default()],
+        persistent_cgroups: 1,
+        cgroup_workloads: vec![WorkloadConfig::default()],
     };
     let steps = traverse.generate(ctx);
     execute_steps(ctx, steps)
@@ -68,7 +68,7 @@ fn my_traverse_scenario(ctx: &Ctx) -> Result<VerifyResult> {
 
 ## Registering
 
-Register the scenario in `all_scenarios()`. Set `num_cells` to 0 and
+Register the scenario in `all_scenarios()`. Set `num_cgroups` to 0 and
 `action` to `Custom` -- the step executor handles all cgroup creation
 via `CgroupDef`:
 
@@ -79,9 +79,9 @@ Scenario {
     description: "Resize cpusets from disjoint to overlapping",
     required_flags: &[],
     excluded_flags: &[],
-    num_cells: 0,
+    num_cgroups: 0,
     cpuset_mode: CpusetMode::None,
-    cell_works: vec![],
+    cgroup_works: vec![],
     action: Action::Custom(my_resize_scenario),
 }
 ```

@@ -69,7 +69,7 @@ use stt::scenario::*;
 #[stt_test(sockets = 2, cores = 4, threads = 2, scheduler = MY_SCHED)]
 fn basic_proportional(ctx: &Ctx) -> Result<VerifyResult> {
     let wl = dfl_wl(ctx);
-    let (handles, _guard) = setup_cells(ctx, 2, &wl)?;
+    let (handles, _guard) = setup_cgroups(ctx, 2, &wl)?;
     std::thread::sleep(ctx.duration);
     Ok(collect_all(handles))
 }

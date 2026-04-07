@@ -7,7 +7,7 @@ use std::time::Duration;
 
 pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<VerifyResult> {
     let mut steps = vec![Step {
-        setup: vec![CgroupDef::named("cell_0"), CgroupDef::named("cell_1")].into(),
+        setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
         ops: vec![],
         hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 5),
     }];
@@ -17,10 +17,10 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::RandomizeAffinity {
-                    cgroup: "cell_0".into(),
+                    cgroup: "cg_0".into(),
                 },
                 Op::RandomizeAffinity {
-                    cgroup: "cell_1".into(),
+                    cgroup: "cg_1".into(),
                 },
             ],
             hold: HoldSpec::Frac(0.2),
@@ -39,14 +39,14 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<VerifyResult> {
     };
 
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cell_0"), CgroupDef::named("cell_1")].into(),
+        setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
         ops: vec![
             Op::SetAffinity {
-                cgroup: "cell_0".into(),
+                cgroup: "cg_0".into(),
                 cpus: pin_cpus.clone(),
             },
             Op::SetAffinity {
-                cgroup: "cell_1".into(),
+                cgroup: "cg_1".into(),
                 cpus: pin_cpus,
             },
         ],
@@ -67,17 +67,17 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<VerifyResult> {
 
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cell_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-            CgroupDef::named("cell_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
         ]
         .into(),
         ops: vec![
             Op::SetAffinity {
-                cgroup: "cell_0".into(),
+                cgroup: "cg_0".into(),
                 cpus: pin_a,
             },
             Op::SetAffinity {
-                cgroup: "cell_1".into(),
+                cgroup: "cg_1".into(),
                 cpus: pin_b,
             },
         ],

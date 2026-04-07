@@ -13,16 +13,16 @@ static F_NO_CTRL_BORROW: &[&flags::FlagDecl] = &[&flags::NO_CTRL_DECL, &flags::B
 static F_NO_CTRL_REBAL: &[&flags::FlagDecl] = &[&flags::NO_CTRL_DECL, &flags::REBAL_DECL];
 
 macro_rules! s {
-    ($name:expr, $cat:expr, $desc:expr, $cells:expr, $cpuset:expr, $works:expr) => {
+    ($name:expr, $cat:expr, $desc:expr, $cgroups:expr, $cpuset:expr, $works:expr) => {
         Scenario {
             name: $name,
             category: $cat,
             description: $desc,
             required_flags: &[],
             excluded_flags: &[],
-            num_cells: $cells,
+            num_cgroups: $cgroups,
             cpuset_mode: $cpuset,
-            cell_works: $works,
+            cgroup_works: $works,
             action: Action::Steady,
         }
     };
@@ -36,9 +36,9 @@ macro_rules! custom {
             description: $desc,
             required_flags: &[],
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom($fn),
         }
     };
@@ -153,7 +153,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "Affinity mask covers all CPUs",
             2,
             CpusetMode::SplitHalf,
-            aff(AffinityKind::CrossCell)
+            aff(AffinityKind::CrossCgroup)
         ),
         s!(
             "cgroup_affinity_pinned",
@@ -219,9 +219,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "One cgroup idle, other overloaded",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 2,
+            num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![CgroupWork {
+            cgroup_works: vec![CgroupWork {
                 workers: 16,
                 ..Default::default()
             }],
@@ -233,9 +233,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "All cgroups loaded, idle CPUs contested",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 2,
+            num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![CgroupWork {
+            cgroup_works: vec![CgroupWork {
                 workers: 16,
                 ..Default::default()
             }],
@@ -248,9 +248,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Single overloaded cgroup, cross-LLC migration",
             required_flags: F_LLC_STEAL,
             excluded_flags: &[],
-            num_cells: 1,
+            num_cgroups: 1,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![CgroupWork {
+            cgroup_works: vec![CgroupWork {
                 workers: 8,
                 ..Default::default()
             }],
@@ -263,9 +263,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Heavy + light cgroups",
             required_flags: F_REBAL,
             excluded_flags: &[],
-            num_cells: 2,
+            num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![
+            cgroup_works: vec![
                 CgroupWork {
                     workers: 16,
                     ..Default::default()
@@ -285,9 +285,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Overloaded single cgroup",
             required_flags: &[],
             excluded_flags: &[],
-            num_cells: 1,
+            num_cgroups: 1,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![CgroupWork {
+            cgroup_works: vec![CgroupWork {
                 workers: 16,
                 ..Default::default()
             }],
@@ -300,9 +300,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "LLC-aligned affinity + cpusets",
             required_flags: F_LLC,
             excluded_flags: &[],
-            num_cells: 2,
+            num_cgroups: 2,
             cpuset_mode: CpusetMode::LlcAligned,
-            cell_works: aff(AffinityKind::LlcAligned),
+            cgroup_works: aff(AffinityKind::LlcAligned),
             action: Action::Steady,
         },
         Scenario {
@@ -311,9 +311,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Affinities randomized mid-run",
             required_flags: &[],
             excluded_flags: F_REJECT_PIN,
-            num_cells: 2,
+            num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
-            cell_works: dfl(),
+            cgroup_works: dfl(),
             action: Action::Custom(custom_cgroup_affinity_change),
         },
         // Cgroup lifecycle
@@ -393,9 +393,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Scheduler restart recovery",
             required_flags: &[],
             excluded_flags: &[],
-            num_cells: 2,
+            num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![CgroupWork {
+            cgroup_works: vec![CgroupWork {
                 workers: 16,
                 ..Default::default()
             }],
@@ -433,9 +433,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Imbalanced load with cpuset-constrained cgroups",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_workload_imbalance),
         },
         // Load rebalancing + cpusets
@@ -445,9 +445,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Imbalanced load with cpusets, then add heavy",
             required_flags: F_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_load_shift),
         },
         // Load rebalancing + dynamic cgroup add
@@ -457,9 +457,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Light cgroups then heavy added mid-run",
             required_flags: F_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_add_load_imbalance),
         },
         // Work conservation + rebalancing
@@ -469,9 +469,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Heavy + bursty + IO cgroups",
             required_flags: F_BORROW_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_imbalance_mixed_workload),
         },
         // Affinity rejection
@@ -481,9 +481,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Workers pinned to 2 CPUs each",
             required_flags: F_REJECT_PIN,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_multicpu_pin),
         },
         // No controller + rapid cgroup moves
@@ -493,9 +493,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Rapid per-task moves without controller",
             required_flags: F_NO_CTRL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_noctrl_task_migration),
         },
         // Work conservation + cpuset change
@@ -505,9 +505,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Cpuset resize during imbalanced load",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_change_imbalance),
         },
         // Load oscillation
@@ -517,9 +517,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Alternating heavy/light cgroups",
             required_flags: F_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_load_oscillation),
         },
         // No controller + nested cgroups
@@ -529,9 +529,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Nested cgroups without controller",
             required_flags: F_NO_CTRL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_nested_cgroup_noctrl),
         },
         // Cpuset swap to disjoint range
@@ -541,9 +541,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Swap cpusets to non-overlapping ranges",
             required_flags: &[],
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_swap_disjoint),
         },
         // IO + work conservation
@@ -553,9 +553,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "IO cgroup frees CPUs for compute cgroup",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_io_compute_imbalance),
         },
         // 4-way load imbalance
@@ -565,9 +565,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "4 cgroups with asymmetric demand",
             required_flags: F_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_4way_load_imbalance),
         },
         // Work conservation + overlapping cpusets
@@ -577,9 +577,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Imbalanced load with overlapping cpusets",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 3,
+            num_cgroups: 3,
             cpuset_mode: CpusetMode::Overlap(0.5),
-            cell_works: vec![
+            cgroup_works: vec![
                 CgroupWork {
                     workers: 8,
                     ..Default::default()
@@ -607,9 +607,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Imbalanced load with overlapping cpusets",
             required_flags: F_REBAL,
             excluded_flags: &[],
-            num_cells: 3,
+            num_cgroups: 3,
             cpuset_mode: CpusetMode::Overlap(0.5),
-            cell_works: vec![
+            cgroup_works: vec![
                 CgroupWork {
                     workers: 16,
                     ..Default::default()
@@ -633,9 +633,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Steady + bursty cgroups",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 2,
+            num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![
+            cgroup_works: vec![
                 CgroupWork {
                     workers: 8,
                     ..Default::default()
@@ -658,9 +658,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Bursty heavy + steady light cgroups",
             required_flags: F_REBAL,
             excluded_flags: &[],
-            num_cells: 2,
+            num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![
+            cgroup_works: vec![
                 CgroupWork {
                     workers: 12,
                     work_type: WorkType::Bursty {
@@ -683,9 +683,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Imbalanced load with cpusets, work conservation + rebalancing",
             required_flags: F_BORROW_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_imbalance_combined),
         },
         Scenario {
@@ -694,9 +694,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Imbalanced load with overlapping cpusets, work conservation + rebalancing",
             required_flags: F_BORROW_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_overlap_imbalance_combined),
         },
         // No controller + work conservation
@@ -706,9 +706,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Per-task moves during imbalanced load without controller",
             required_flags: F_NO_CTRL_BORROW,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_noctrl_imbalance),
         },
         // No controller + cpusets
@@ -718,9 +718,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Cpuset add/clear without controller",
             required_flags: F_NO_CTRL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_noctrl_cpuset_change),
         },
         // No controller + rebalancing
@@ -730,9 +730,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Heavy + light cgroups without controller",
             required_flags: F_NO_CTRL_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_noctrl_load_imbalance),
         },
         // Affinity rejection + cpusets
@@ -742,9 +742,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Multi-CPU pin within cpuset-constrained cgroups",
             required_flags: F_REJECT_PIN,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_multicpu_pin),
         },
         // Cgroup add/remove + cpusets
@@ -754,9 +754,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Add/remove cpuset-constrained cgroups",
             required_flags: &[],
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_add_remove),
         },
         // Cgroup add during imbalance
@@ -766,9 +766,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Add cgroup during imbalanced load",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_add_during_imbalance),
         },
         // Nested + work conservation
@@ -778,9 +778,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Nested cgroups with imbalanced load",
             required_flags: F_BORROW,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_nested_cgroup_imbalance),
         },
         // Dispatch contention
@@ -816,9 +816,9 @@ pub fn all_scenarios() -> Vec<Scenario> {
             description: "Rapid cpuset flips across LLC boundaries",
             required_flags: F_LLC_REBAL,
             excluded_flags: &[],
-            num_cells: 0,
+            num_cgroups: 0,
             cpuset_mode: CpusetMode::None,
-            cell_works: vec![],
+            cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_crossllc_race),
         },
     ]

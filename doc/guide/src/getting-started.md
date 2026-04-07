@@ -66,7 +66,7 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<VerifyResult> {
 
     // Verify: no worker was starved.
     let plan = VerificationPlan::new().check_not_starved();
-    Ok(plan.verify_cell(&reports, None))
+    Ok(plan.verify_cgroup(&reports, None))
 }
 ```
 

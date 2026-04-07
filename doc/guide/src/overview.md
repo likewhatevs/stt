@@ -83,7 +83,7 @@ fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
     let reports = handle.stop_and_collect();
 
     let plan = VerificationPlan::new().check_not_starved();
-    Ok(plan.verify_cell(&reports, None))
+    Ok(plan.verify_cgroup(&reports, None))
 }
 ```
 

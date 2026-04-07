@@ -1,4 +1,4 @@
-//! Cgroup v2 filesystem operations for test cell management.
+//! Cgroup v2 filesystem operations for test cgroup management.
 //!
 //! Creates, configures, and removes cgroups under a parent path
 //! (default `/sys/fs/cgroup/stt`). Provides cpuset assignment,
@@ -93,7 +93,7 @@ impl CgroupManager {
     }
 
     /// Create a child cgroup directory.
-    pub fn create_cell(&self, name: &str) -> Result<()> {
+    pub fn create_cgroup(&self, name: &str) -> Result<()> {
         let p = self.parent.join(name);
         if !p.exists() {
             fs::create_dir_all(&p).with_context(|| format!("mkdir {}", p.display()))?;
@@ -102,7 +102,7 @@ impl CgroupManager {
     }
 
     /// Drain tasks from a child cgroup and remove it.
-    pub fn remove_cell(&self, name: &str) -> Result<()> {
+    pub fn remove_cgroup(&self, name: &str) -> Result<()> {
         let p = self.parent.join(name);
         if !p.exists() {
             return Ok(());
@@ -130,7 +130,7 @@ impl CgroupManager {
         write_with_timeout(&p, &tid.to_string(), CGROUP_WRITE_TIMEOUT)
     }
 
-    /// Move all tasks from a workload handle into a cgroup cell.
+    /// Move all tasks from a workload handle into a cgroup.
     pub fn move_tasks(&self, name: &str, tids: &[u32]) -> Result<()> {
         for &t in tids {
             self.move_task(name, t)?;
@@ -209,25 +209,25 @@ mod tests {
     }
 
     #[test]
-    fn create_cell_in_tmpdir() {
+    fn create_cgroup_in_tmpdir() {
         let dir = std::env::temp_dir().join(format!("stt-cg-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
-        cg.create_cell("test_cell").unwrap();
-        assert!(dir.join("test_cell").exists());
-        cg.create_cell("nested/deep").unwrap();
+        cg.create_cgroup("test_cg").unwrap();
+        assert!(dir.join("test_cg").exists());
+        cg.create_cgroup("nested/deep").unwrap();
         assert!(dir.join("nested/deep").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn create_cell_idempotent() {
+    fn create_cgroup_idempotent() {
         let dir = std::env::temp_dir().join(format!("stt-cg-idem-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
-        cg.create_cell("cell_0").unwrap();
-        cg.create_cell("cell_0").unwrap(); // should not error
-        assert!(dir.join("cell_0").exists());
+        cg.create_cgroup("cg_0").unwrap();
+        cg.create_cgroup("cg_0").unwrap(); // should not error
+        assert!(dir.join("cg_0").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -238,9 +238,9 @@ mod tests {
     }
 
     #[test]
-    fn remove_cell_nonexistent() {
+    fn remove_cgroup_nonexistent() {
         let cg = CgroupManager::new("/nonexistent/stt-test-path");
-        assert!(cg.remove_cell("no_such_cell").is_ok());
+        assert!(cg.remove_cgroup("no_such_cgroup").is_ok());
     }
 
     #[test]
@@ -248,9 +248,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("stt-cg-clean-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
-        cg.create_cell("a").unwrap();
-        cg.create_cell("b").unwrap();
-        cg.create_cell("c/deep").unwrap();
+        cg.create_cgroup("a").unwrap();
+        cg.create_cgroup("b").unwrap();
+        cg.create_cgroup("c/deep").unwrap();
         assert!(dir.join("a").exists());
         assert!(dir.join("c/deep").exists());
         // cleanup_all removes child dirs (not real cgroups, so drain_tasks is a no-op)
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn drain_tasks_nonexistent_source() {
         let cg = CgroupManager::new("/nonexistent/stt-drain-test");
-        assert!(cg.drain_tasks("missing_cell").is_ok());
+        assert!(cg.drain_tasks("missing_cgroup").is_ok());
     }
 
     #[test]
@@ -296,18 +296,18 @@ mod tests {
     #[test]
     fn move_task_nonexistent_cgroup() {
         let cg = CgroupManager::new("/nonexistent/stt-move-test");
-        assert!(cg.move_task("no_cell", 1).is_err());
+        assert!(cg.move_task("no_cgroup", 1).is_err());
     }
 
     #[test]
     fn set_cpuset_empty() {
         let dir = std::env::temp_dir().join(format!("stt-cg-cpuset-{}", std::process::id()));
-        let cell = dir.join("cell_a");
-        fs::create_dir_all(&cell).unwrap();
+        let dir_a = dir.join("cg_a");
+        fs::create_dir_all(&dir_a).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         // Empty BTreeSet → writes empty string via cpuset_string
-        cg.set_cpuset("cell_a", &BTreeSet::new()).unwrap();
-        assert_eq!(fs::read_to_string(cell.join("cpuset.cpus")).unwrap(), "");
+        cg.set_cpuset("cg_a", &BTreeSet::new()).unwrap();
+        assert_eq!(fs::read_to_string(dir_a.join("cpuset.cpus")).unwrap(), "");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -315,7 +315,7 @@ mod tests {
     fn move_tasks_partial_failure() {
         // move_tasks iterates and returns early on first error
         let cg = CgroupManager::new("/nonexistent/stt-partial");
-        let err = cg.move_tasks("cell", &[1, 2, 3]).unwrap_err();
+        let err = cg.move_tasks("cg", &[1, 2, 3]).unwrap_err();
         // The error comes from the first tid (write to nonexistent path)
         let msg = format!("{err:#}");
         assert!(msg.contains("cgroup.procs"), "unexpected error: {msg}");
@@ -324,15 +324,15 @@ mod tests {
     #[test]
     fn drain_tasks_empty_cgroup() {
         let dir = std::env::temp_dir().join(format!("stt-cg-drain-{}", std::process::id()));
-        let cell = dir.join("cell_d");
-        fs::create_dir_all(&cell).unwrap();
+        let dir_d = dir.join("cg_d");
+        fs::create_dir_all(&dir_d).unwrap();
         // Create an empty cgroup.procs file
-        fs::write(cell.join("cgroup.procs"), "").unwrap();
+        fs::write(dir_d.join("cgroup.procs"), "").unwrap();
         // Parent also needs cgroup.procs
         fs::write(dir.join("cgroup.procs"), "").unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         // drain_tasks on a cgroup with empty procs file should succeed
-        assert!(cg.drain_tasks("cell_d").is_ok());
+        assert!(cg.drain_tasks("cg_d").is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 

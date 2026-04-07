@@ -9,7 +9,7 @@ use std::time::Duration;
 pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
-            setup: vec![CgroupDef::named("cell_0"), CgroupDef::named("cell_1")].into(),
+            setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
             ops: vec![],
             hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
         },
@@ -17,11 +17,11 @@ pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::SetCpuset {
-                    cgroup: "cell_0".into(),
+                    cgroup: "cg_0".into(),
                     cpus: CpusetSpec::Disjoint { index: 0, of: 2 },
                 },
                 Op::SetCpuset {
-                    cgroup: "cell_1".into(),
+                    cgroup: "cg_1".into(),
                     cpus: CpusetSpec::Disjoint { index: 1, of: 2 },
                 },
             ],
@@ -36,8 +36,8 @@ pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
             setup: vec![
-                CgroupDef::named("cell_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-                CgroupDef::named("cell_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
             ]
             .into(),
             ops: vec![],
@@ -47,10 +47,10 @@ pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::ClearCpuset {
-                    cgroup: "cell_0".into(),
+                    cgroup: "cg_0".into(),
                 },
                 Op::ClearCpuset {
-                    cgroup: "cell_1".into(),
+                    cgroup: "cg_1".into(),
                 },
             ],
             hold: HoldSpec::Frac(0.5),
@@ -72,11 +72,11 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
             setup: vec![
-                CgroupDef::named("cell_0").with_cpuset(CpusetSpec::Range {
+                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Range {
                     start_frac: 0.0,
                     end_frac: 0.5,
                 }),
-                CgroupDef::named("cell_1").with_cpuset(CpusetSpec::Range {
+                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Range {
                     start_frac: 0.5,
                     end_frac: 1.0,
                 }),
@@ -89,14 +89,14 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::SetCpuset {
-                    cgroup: "cell_0".into(),
+                    cgroup: "cg_0".into(),
                     cpus: CpusetSpec::Range {
                         start_frac: 0.0,
                         end_frac: 0.25,
                     },
                 },
                 Op::SetCpuset {
-                    cgroup: "cell_1".into(),
+                    cgroup: "cg_1".into(),
                     cpus: CpusetSpec::Range {
                         start_frac: 0.25,
                         end_frac: 1.0,
@@ -109,14 +109,14 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::SetCpuset {
-                    cgroup: "cell_0".into(),
+                    cgroup: "cg_0".into(),
                     cpus: CpusetSpec::Range {
                         start_frac: 0.0,
                         end_frac: 0.75,
                     },
                 },
                 Op::SetCpuset {
-                    cgroup: "cell_1".into(),
+                    cgroup: "cg_1".into(),
                     cpus: CpusetSpec::Range {
                         start_frac: 0.75,
                         end_frac: 1.0,
@@ -142,11 +142,11 @@ pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
             setup: vec![
-                CgroupDef::named("cell_0").with_cpuset(CpusetSpec::Range {
+                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Range {
                     start_frac: 0.0,
                     end_frac: 0.5,
                 }),
-                CgroupDef::named("cell_1").with_cpuset(CpusetSpec::Range {
+                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Range {
                     start_frac: 0.5,
                     end_frac: 1.0,
                 }),
@@ -159,14 +159,14 @@ pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::SetCpuset {
-                    cgroup: "cell_0".into(),
+                    cgroup: "cg_0".into(),
                     cpus: CpusetSpec::Range {
                         start_frac: 0.5,
                         end_frac: 1.0,
                     },
                 },
                 Op::SetCpuset {
-                    cgroup: "cell_1".into(),
+                    cgroup: "cg_1".into(),
                     cpus: CpusetSpec::Range {
                         start_frac: 0.0,
                         end_frac: 0.5,
@@ -179,14 +179,14 @@ pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::SetCpuset {
-                    cgroup: "cell_0".into(),
+                    cgroup: "cg_0".into(),
                     cpus: CpusetSpec::Range {
                         start_frac: 0.0,
                         end_frac: 0.5,
                     },
                 },
                 Op::SetCpuset {
-                    cgroup: "cell_1".into(),
+                    cgroup: "cg_1".into(),
                     cpus: CpusetSpec::Range {
                         start_frac: 0.5,
                         end_frac: 1.0,
@@ -205,10 +205,10 @@ pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<VerifyResult
 
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cell_0")
+            CgroupDef::named("cg_0")
                 .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
                 .workers(mid * 2),
-            CgroupDef::named("cell_1")
+            CgroupDef::named("cg_1")
                 .with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 })
                 .work_type(WorkType::Bursty {
                     burst_ms: 50,
@@ -241,13 +241,13 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<VerifyResult> 
     let steps = vec![
         Step {
             setup: vec![
-                CgroupDef::named("cell_0")
+                CgroupDef::named("cg_0")
                     .with_cpuset(CpusetSpec::Range {
                         start_frac: 0.0,
                         end_frac: 0.5,
                     })
                     .workers(mid * 2),
-                CgroupDef::named("cell_1")
+                CgroupDef::named("cg_1")
                     .with_cpuset(CpusetSpec::Range {
                         start_frac: 0.5,
                         end_frac: 1.0,
@@ -265,7 +265,7 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<VerifyResult> 
         Step {
             setup: vec![].into(),
             ops: vec![Op::SetCpuset {
-                cgroup: "cell_1".into(),
+                cgroup: "cg_1".into(),
                 cpus: CpusetSpec::Exact(narrow),
             }],
             hold: HoldSpec::Frac(1.0 / 3.0),
@@ -273,7 +273,7 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<VerifyResult> 
         Step {
             setup: vec![].into(),
             ops: vec![Op::SetCpuset {
-                cgroup: "cell_1".into(),
+                cgroup: "cg_1".into(),
                 cpus: CpusetSpec::Range {
                     start_frac: 0.5,
                     end_frac: 1.0,
@@ -290,10 +290,10 @@ pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
             setup: vec![
-                CgroupDef::named("cell_0")
+                CgroupDef::named("cg_0")
                     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
                     .workers(16),
-                CgroupDef::named("cell_1")
+                CgroupDef::named("cg_1")
                     .with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 })
                     .workers(1)
                     .work_type(WorkType::YieldHeavy),
@@ -302,11 +302,11 @@ pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<VerifyResult> {
             ops: vec![],
             hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration / 2),
         },
-        // Phase 2: add heavy load to cell_1
+        // Phase 2: add heavy load to cg_1
         Step {
             setup: vec![].into(),
             ops: vec![Op::Spawn {
-                cgroup: "cell_1".into(),
+                cgroup: "cg_1".into(),
                 workload: WorkloadConfig {
                     num_workers: 16,
                     ..Default::default()

@@ -42,7 +42,7 @@ pub struct StimulusEvent {
     pub label: String,
     /// What kind of operation triggered this event.
     pub op_kind: Option<String>,
-    /// Additional context (e.g. "4 cpus", "cgroup=cell_0").
+    /// Additional context (e.g. "4 cpus", "cgroup=cg_0").
     pub detail: Option<String>,
 }
 

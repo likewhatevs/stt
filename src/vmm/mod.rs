@@ -836,7 +836,8 @@ impl SttVm {
             "random.trust_cpu=on swiotlb=noforce ",
             "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
             "pci=off reboot=k panic=-1 iomem=relaxed nokaslr lockdown=none ",
-            "sysctl.kernel.unprivileged_bpf_disabled=0",
+            "sysctl.kernel.unprivileged_bpf_disabled=0 ",
+            "sysctl.kernel.sched_schedstats=1",
         )
         .to_string();
         if self.init_binary.is_some() {
@@ -1668,6 +1669,7 @@ impl SttVm {
             "random.trust_cpu=on swiotlb=noforce ",
             "pci=off reboot=k panic=-1 nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
+            "sysctl.kernel.sched_schedstats=1 ",
             "kfence.sample_interval=0",
         )
         .to_string();

@@ -7,7 +7,7 @@ telemetry and host-side monitoring.
 
 After each scenario, stt collects
 [`WorkerReport`](../architecture/workers.md#telemetry) from every worker
-process. Three checks run against these reports:
+process. Several checks run against these reports:
 
 **Starvation** -- any worker with `work_units == 0` fails the test.
 
@@ -35,6 +35,20 @@ thresholds:
 
 Neither threshold is set by default; enable via `Verify` setters or
 `#[stt_test]` attributes.
+
+**Benchmarking** -- `verify_benchmarks()` checks per-wakeup latency
+and iteration throughput. Three thresholds:
+- `max_p99_wake_latency_ns`: p99 of all `wake_latencies_ns` samples
+  across workers in a cgroup. Populated only for blocking work types
+  (FutexPingPong, CachePipe, Bursty, CacheYield, PipeIo).
+- `max_wake_latency_cv`: coefficient of variation of wake latency
+  samples. High CV means inconsistent scheduling latency.
+- `min_iteration_rate`: minimum outer-loop iterations per wall-clock
+  second per worker.
+
+None are set by default. Set via `Verify` setters or
+`VerificationPlan` builder methods. The `#[stt_test]` macro does not
+yet expose these attributes.
 
 ## Monitor checks
 
@@ -70,6 +84,11 @@ pub struct Verify {
     // Throughput checks
     pub max_throughput_cv: Option<f64>,
     pub min_work_rate: Option<f64>,
+
+    // Benchmarking checks
+    pub max_p99_wake_latency_ns: Option<u64>,
+    pub max_wake_latency_cv: Option<f64>,
+    pub min_iteration_rate: Option<f64>,
 
     // Monitor checks
     pub max_imbalance_ratio: Option<f64>,
@@ -143,11 +162,14 @@ pub struct VerificationPlan {
     pub max_spread_pct: Option<f64>,
     pub max_throughput_cv: Option<f64>,
     pub min_work_rate: Option<f64>,
+    pub max_p99_wake_latency_ns: Option<u64>,
+    pub max_wake_latency_cv: Option<f64>,
+    pub min_iteration_rate: Option<f64>,
 }
 ```
 
 Use `VerificationPlan` when writing custom scenarios that call
-`plan.verify_cell(reports, cpuset)` directly. Use `Verify` for the
+`plan.verify_cgroup(reports, cpuset)` directly. Use `Verify` for the
 merge chain (`#[stt_test]` attributes, `Scheduler.verify`,
 `execute_steps_with`).
 

@@ -77,7 +77,7 @@ struct VmArgs {
     /// Build and use scheduler from this cargo package
     #[clap(long, short)]
     package: Option<String>,
-    /// Replica multiplier for gauntlet cells
+    /// Replica multiplier for gauntlet cgroups
     #[clap(long, default_value = "1")]
     replicas: usize,
     /// Linux source tree with built kernel

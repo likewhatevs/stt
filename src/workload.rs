@@ -354,6 +354,22 @@ pub struct WorkerReport {
     pub max_gap_cpu: usize,
     /// When the longest gap happened (ms from start).
     pub max_gap_at_ms: u64,
+    /// Per-wakeup latency samples (ns). Populated for blocking work types
+    /// (FutexPingPong, CachePipe, Bursty, CacheYield, PipeIo).
+    #[serde(default)]
+    pub wake_latencies_ns: Vec<u64>,
+    /// Outer-loop iteration count.
+    #[serde(default)]
+    pub iterations: u64,
+    /// Delta of /proc/self/schedstat field 2 (run_delay) over the work loop.
+    #[serde(default)]
+    pub schedstat_run_delay_ns: u64,
+    /// Delta of /proc/self/schedstat field 3 (timeslices/context switches).
+    #[serde(default)]
+    pub schedstat_ctx_switches: u64,
+    /// Delta of /proc/self/schedstat field 1 (cpu_time) over the work loop.
+    #[serde(default)]
+    pub schedstat_cpu_time_ns: u64,
 }
 
 /// PID of the scheduler process. Workers kill it on stall to trigger dump.
@@ -756,6 +772,13 @@ fn worker_main(
     let mut max_gap_at_ns: u64 = 0;
     // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe).
     let mut cache_pressure_buf: Option<Vec<u8>> = None;
+    // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
+    const MAX_WAKE_SAMPLES: usize = 100_000;
+    let mut wake_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
+    let mut wake_sample_count: u64 = 0;
+    let mut iterations: u64 = 0;
+    // schedstat snapshot at work-loop start.
+    let (ss_cpu_start, ss_delay_start, ss_ts_start) = read_schedstat();
 
     while !STOP.load(Ordering::Relaxed) {
         match work_type {
@@ -764,10 +787,12 @@ fn worker_main(
                     work_units = std::hint::black_box(work_units.wrapping_add(1));
                     std::hint::spin_loop();
                 }
+                iterations += 1;
             }
             WorkType::YieldHeavy => {
                 work_units = work_units.wrapping_add(1);
                 std::thread::yield_now();
+                iterations += 1;
             }
             WorkType::Mixed => {
                 for _ in 0..1024 {
@@ -775,6 +800,7 @@ fn worker_main(
                     std::hint::spin_loop();
                 }
                 std::thread::yield_now();
+                iterations += 1;
             }
             WorkType::IoSync => {
                 let path = std::env::temp_dir()
@@ -798,6 +824,7 @@ fn worker_main(
                 let _ = f.sync_all();
                 drop(f);
                 let _ = std::fs::remove_file(&path);
+                iterations += 1;
             }
             WorkType::Bursty { burst_ms, sleep_ms } => {
                 let burst_end = Instant::now() + Duration::from_millis(burst_ms);
@@ -808,8 +835,16 @@ fn worker_main(
                     }
                 }
                 if !STOP.load(Ordering::Relaxed) {
+                    let before_sleep = Instant::now();
                     std::thread::sleep(Duration::from_millis(sleep_ms));
+                    reservoir_push(
+                        &mut wake_latencies_ns,
+                        &mut wake_sample_count,
+                        before_sleep.elapsed().as_nanos() as u64,
+                        MAX_WAKE_SAMPLES,
+                    );
                 }
+                iterations += 1;
             }
             WorkType::PipeIo { burst_iters } => {
                 let (read_fd, write_fd) = pipe_fds.unwrap_or((-1, -1));
@@ -823,6 +858,7 @@ fn worker_main(
                 }
                 // Write 1 byte to partner
                 unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) };
+                let before_block = Instant::now();
                 // Poll for partner's response, checking STOP between polls
                 let mut pfd = libc::pollfd {
                     fd: read_fd,
@@ -837,12 +873,19 @@ fn worker_main(
                     if ret > 0 {
                         let mut byte = [0u8; 1];
                         unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut _, 1) };
+                        reservoir_push(
+                            &mut wake_latencies_ns,
+                            &mut wake_sample_count,
+                            before_block.elapsed().as_nanos() as u64,
+                            MAX_WAKE_SAMPLES,
+                        );
                         break;
                     }
                     if ret < 0 {
                         break;
                     }
                 }
+                iterations += 1;
             }
             WorkType::FutexPingPong { spin_iters } => {
                 let (futex_ptr, is_first) = match futex {
@@ -873,6 +916,7 @@ fn worker_main(
                 }
                 // Wait for partner to set our expected value, with timeout
                 // to avoid blocking forever if partner has stopped.
+                let before_block = Instant::now();
                 let ts = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 100_000_000, // 100ms
@@ -883,6 +927,12 @@ fn worker_main(
                     }
                     let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
                     if cur == my_val {
+                        reservoir_push(
+                            &mut wake_latencies_ns,
+                            &mut wake_sample_count,
+                            before_block.elapsed().as_nanos() as u64,
+                            MAX_WAKE_SAMPLES,
+                        );
                         break;
                     }
                     unsafe {
@@ -899,6 +949,7 @@ fn worker_main(
                 }
                 // Reset last_iter_time after blocking step
                 last_iter_time = Instant::now();
+                iterations += 1;
             }
             WorkType::CachePressure { size_kb, stride } => {
                 let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
@@ -912,6 +963,7 @@ fn worker_main(
                     idx = (idx + stride) % len;
                     work_units = std::hint::black_box(work_units.wrapping_add(1));
                 }
+                iterations += 1;
             }
             WorkType::CacheYield { size_kb, stride } => {
                 let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
@@ -925,7 +977,15 @@ fn worker_main(
                     idx = (idx + stride) % len;
                     work_units = std::hint::black_box(work_units.wrapping_add(1));
                 }
+                let before_yield = Instant::now();
                 std::thread::yield_now();
+                reservoir_push(
+                    &mut wake_latencies_ns,
+                    &mut wake_sample_count,
+                    before_yield.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
+                iterations += 1;
             }
             WorkType::CachePipe {
                 size_kb,
@@ -949,6 +1009,7 @@ fn worker_main(
                 }
                 // Pipe exchange (same as PipeIo)
                 unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) };
+                let before_block = Instant::now();
                 let mut pfd = libc::pollfd {
                     fd: read_fd,
                     events: libc::POLLIN,
@@ -962,6 +1023,12 @@ fn worker_main(
                     if ret > 0 {
                         let mut byte = [0u8; 1];
                         unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut _, 1) };
+                        reservoir_push(
+                            &mut wake_latencies_ns,
+                            &mut wake_sample_count,
+                            before_block.elapsed().as_nanos() as u64,
+                            MAX_WAKE_SAMPLES,
+                        );
                         break;
                     }
                     if ret < 0 {
@@ -970,6 +1037,7 @@ fn worker_main(
                 }
                 // Reset last_iter_time after blocking step
                 last_iter_time = Instant::now();
+                iterations += 1;
             }
         }
 
@@ -1013,6 +1081,9 @@ fn worker_main(
     let cpu_time_ns = thread_cpu_time_ns();
     let wall_time_ns = wall_time.as_nanos() as u64;
 
+    // schedstat snapshot at work-loop end; compute deltas.
+    let (ss_cpu_end, ss_delay_end, ss_ts_end) = read_schedstat();
+
     WorkerReport {
         tid,
         work_units,
@@ -1025,6 +1096,11 @@ fn worker_main(
         max_gap_ms: max_gap_ns / 1_000_000,
         max_gap_cpu,
         max_gap_at_ms: max_gap_at_ns / 1_000_000,
+        wake_latencies_ns,
+        iterations,
+        schedstat_run_delay_ns: ss_delay_end.saturating_sub(ss_delay_start),
+        schedstat_ctx_switches: ss_ts_end.saturating_sub(ss_ts_start),
+        schedstat_cpu_time_ns: ss_cpu_end.saturating_sub(ss_cpu_start),
     }
 }
 
@@ -1050,6 +1126,46 @@ fn resolve_affinity(mode: &AffinityMode, _idx: usize) -> Result<Option<BTreeSet<
 
 fn sched_getcpu() -> usize {
     nix::sched::sched_getcpu().unwrap_or(0)
+}
+
+/// Record a wake latency sample using reservoir sampling (Algorithm R).
+/// Maintains a uniform random sample of at most `cap` entries from all
+/// observed latencies.
+fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, cap: usize) {
+    *count += 1;
+    if buf.len() < cap {
+        buf.push(sample);
+    } else {
+        // Replace a random element with probability cap/count.
+        use rand::RngExt;
+        let idx = rand::rng().random_range(0..*count) as usize;
+        if idx < cap {
+            buf[idx] = sample;
+        }
+    }
+}
+
+/// Read /proc/self/schedstat and return (cpu_time_ns, run_delay_ns, timeslices).
+/// Returns (0, 0, 0) on failure (e.g. schedstats not enabled).
+fn read_schedstat() -> (u64, u64, u64) {
+    let data = match std::fs::read_to_string("/proc/self/schedstat") {
+        Ok(d) => d,
+        Err(_) => return (0, 0, 0),
+    };
+    let mut parts = data.split_whitespace();
+    let cpu_time = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let run_delay = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let timeslices = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    (cpu_time, run_delay, timeslices)
 }
 
 fn thread_cpu_time_ns() -> u64 {
@@ -1180,6 +1296,11 @@ mod tests {
             max_gap_ms: 50,
             max_gap_cpu: 1,
             max_gap_at_ms: 500,
+            wake_latencies_ns: vec![1000, 2000],
+            iterations: 10,
+            schedstat_run_delay_ns: 500_000,
+            schedstat_ctx_switches: 20,
+            schedstat_cpu_time_ns: 4_000_000_000,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -1462,6 +1583,11 @@ mod tests {
             max_gap_ms: 0,
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
+            wake_latencies_ns: vec![],
+            iterations: 0,
+            schedstat_run_delay_ns: 0,
+            schedstat_ctx_switches: 0,
+            schedstat_cpu_time_ns: 0,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -1482,6 +1608,11 @@ mod tests {
             max_gap_ms: u64::MAX,
             max_gap_cpu: usize::MAX,
             max_gap_at_ms: u64::MAX,
+            wake_latencies_ns: vec![],
+            iterations: u64::MAX,
+            schedstat_run_delay_ns: u64::MAX,
+            schedstat_ctx_switches: u64::MAX,
+            schedstat_cpu_time_ns: u64::MAX,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -1861,6 +1992,11 @@ mod tests {
             max_gap_ms: 77,
             max_gap_cpu: 5,
             max_gap_at_ms: 500,
+            wake_latencies_ns: vec![],
+            iterations: 0,
+            schedstat_run_delay_ns: 0,
+            schedstat_ctx_switches: 0,
+            schedstat_cpu_time_ns: 0,
         };
         let s = format!("{:?}", r);
         assert!(s.contains("42"), "must show tid value");
@@ -1907,6 +2043,11 @@ mod tests {
             max_gap_ms: 0,
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
+            wake_latencies_ns: vec![],
+            iterations: 0,
+            schedstat_run_delay_ns: 0,
+            schedstat_ctx_switches: 0,
+            schedstat_cpu_time_ns: 0,
         };
         assert_eq!(r.runnable_ns, r.wall_time_ns - r.cpu_time_ns);
     }

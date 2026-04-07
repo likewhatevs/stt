@@ -52,6 +52,19 @@ pub struct GauntletRow {
     pub stall_count: usize,
     pub fallback_count: i64,
     pub keep_last_count: i64,
+    // Benchmarking fields.
+    #[serde(default)]
+    pub p99_wake_latency_us: f64,
+    #[serde(default)]
+    pub median_wake_latency_us: f64,
+    #[serde(default)]
+    pub wake_latency_cv: f64,
+    #[serde(default)]
+    pub total_iterations: u64,
+    #[serde(default)]
+    pub mean_run_delay_us: f64,
+    #[serde(default)]
+    pub worst_run_delay_us: f64,
     // Timeline degradation fields.
     pub worst_degradation_op: String,
     pub worst_imbalance_delta: f64,
@@ -100,6 +113,12 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .and_then(|m| m.event_deltas.as_ref())
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
+        p99_wake_latency_us: sc.stats.p99_wake_latency_us,
+        median_wake_latency_us: sc.stats.median_wake_latency_us,
+        wake_latency_cv: sc.stats.wake_latency_cv,
+        total_iterations: sc.stats.total_iterations,
+        mean_run_delay_us: sc.stats.mean_run_delay_us,
+        worst_run_delay_us: sc.stats.worst_run_delay_us,
         worst_degradation_op: String::new(),
         worst_imbalance_delta: 0.0,
         worst_dsq_delta: 0.0,
@@ -159,6 +178,12 @@ pub fn sidecar_to_row_labeled(sc: &crate::test_support::SidecarResult, label: &s
             .and_then(|m| m.event_deltas.as_ref())
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
+        p99_wake_latency_us: sc.stats.p99_wake_latency_us,
+        median_wake_latency_us: sc.stats.median_wake_latency_us,
+        wake_latency_cv: sc.stats.wake_latency_cv,
+        total_iterations: sc.stats.total_iterations,
+        mean_run_delay_us: sc.stats.mean_run_delay_us,
+        worst_run_delay_us: sc.stats.worst_run_delay_us,
         worst_degradation_op: String::new(),
         worst_imbalance_delta: 0.0,
         worst_dsq_delta: 0.0,
@@ -328,6 +353,12 @@ pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
                 .and_then(|m| m.event_deltas.as_ref())
                 .map(|e| e.total_dispatch_keep_last)
                 .unwrap_or(0),
+            p99_wake_latency_us: stats.map(|s| s.p99_wake_latency_us).unwrap_or(0.0),
+            median_wake_latency_us: stats.map(|s| s.median_wake_latency_us).unwrap_or(0.0),
+            wake_latency_cv: stats.map(|s| s.wake_latency_cv).unwrap_or(0.0),
+            total_iterations: stats.map(|s| s.total_iterations).unwrap_or(0),
+            mean_run_delay_us: stats.map(|s| s.mean_run_delay_us).unwrap_or(0.0),
+            worst_run_delay_us: stats.map(|s| s.worst_run_delay_us).unwrap_or(0.0),
             worst_degradation_op: worst_deg_op,
             worst_imbalance_delta: worst_imb_delta,
             worst_dsq_delta,
@@ -355,6 +386,12 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let stalls: Vec<f64> = rows.iter().map(|r| r.stall_count as f64).collect();
     let fallback: Vec<f64> = rows.iter().map(|r| r.fallback_count as f64).collect();
     let keep_last: Vec<f64> = rows.iter().map(|r| r.keep_last_count as f64).collect();
+    let p99_wake_lat: Vec<f64> = rows.iter().map(|r| r.p99_wake_latency_us).collect();
+    let median_wake_lat: Vec<f64> = rows.iter().map(|r| r.median_wake_latency_us).collect();
+    let wake_cv: Vec<f64> = rows.iter().map(|r| r.wake_latency_cv).collect();
+    let total_iters: Vec<f64> = rows.iter().map(|r| r.total_iterations as f64).collect();
+    let mean_run_delay: Vec<f64> = rows.iter().map(|r| r.mean_run_delay_us).collect();
+    let worst_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_run_delay_us).collect();
     let worst_deg_op: Vec<&str> = rows
         .iter()
         .map(|r| r.worst_degradation_op.as_str())
@@ -380,6 +417,12 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "stalls" => &stalls,
         "fallback" => &fallback,
         "keep_last" => &keep_last,
+        "p99_wake_lat_us" => &p99_wake_lat,
+        "median_wake_lat_us" => &median_wake_lat,
+        "wake_latency_cv" => &wake_cv,
+        "total_iterations" => &total_iters,
+        "mean_run_delay_us" => &mean_run_delay,
+        "worst_run_delay_us" => &worst_run_delay,
         "worst_deg_op" => &worst_deg_op,
         "imbalance_delta" => &imbalance_delta,
         "dsq_delta" => &dsq_delta,
@@ -458,6 +501,10 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
         "stalls",
         "fallback",
         "keep_last",
+        "p99_wake_lat_us",
+        "wake_latency_cv",
+        "mean_run_delay_us",
+        "worst_run_delay_us",
     ];
     let mut outliers = Vec::new();
 
@@ -920,8 +967,8 @@ fn format_stimulus_crosstab(df: &DataFrame) -> String {
     out
 }
 
-/// Format per-cell pass rates, flagging cells below 100%.
-fn format_cell_pass_rates(df: &DataFrame) -> String {
+/// Format per-cgroup pass rates, flagging cgroups below 100%.
+fn format_cgroup_pass_rates(df: &DataFrame) -> String {
     let grouped = df
         .clone()
         .lazy()
@@ -1014,9 +1061,9 @@ fn format_cell_pass_rates(df: &DataFrame) -> String {
     }
 
     if all_pass {
-        "All cells passed across all replicas.\n\n".to_string()
+        "All cgroups passed across all replicas.\n\n".to_string()
     } else {
-        format!("Cells with <100% pass rate:\n{flaky}\n")
+        format!("Cgroups with <100% pass rate:\n{flaky}\n")
     }
 }
 
@@ -1038,7 +1085,7 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
         .unwrap_or(false);
 
     if has_replicas {
-        report.push_str(&format_cell_pass_rates(&df));
+        report.push_str(&format_cgroup_pass_rates(&df));
     }
 
     let outliers = find_outliers(&df);
@@ -1096,11 +1143,11 @@ pub struct GauntletBaseline {
     /// Git commit hash of the scheduler source, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_commit: Option<String>,
-    /// Number of replicas per cell.
+    /// Number of replicas per cgroup.
     pub replicas: u32,
     /// The raw row data.
     pub rows: Vec<GauntletRow>,
-    /// Per-cell comparison policies. Cells not matched use `DEFAULTS`.
+    /// Per-cgroup comparison policies. Cgroups not matched use `DEFAULTS`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policies: Vec<ScopedPolicy>,
 }
@@ -1121,22 +1168,22 @@ impl GauntletBaseline {
     }
 }
 
-/// Classification of a cell comparison.
+/// Classification of a cgroup comparison.
 #[derive(Debug, PartialEq)]
-enum CellChange {
+enum CgroupChange {
     Regression,
     Improvement,
     Unchanged,
 }
 
-/// Per-metric delta between baseline and current for a single cell.
+/// Per-metric delta between baseline and current for a single cgroup.
 #[derive(Debug)]
-struct CellDelta {
+struct CgroupDelta {
     scenario: String,
     flags: String,
     topology: String,
     work_type: String,
-    change: CellChange,
+    change: CgroupChange,
     // Metric deltas: current - baseline. Positive = worse for most metrics.
     spread_delta: f64,
     gap_ms_delta: f64,
@@ -1144,16 +1191,19 @@ struct CellDelta {
     dsq_depth_delta: f64,
     fallback_delta: f64,
     keep_last_delta: f64,
+    p99_wake_lat_delta: f64,
+    wake_cv_delta: f64,
+    run_delay_delta: f64,
     // Pass rate change.
     baseline_pass_rate: f64,
     current_pass_rate: f64,
-    // Resolved thresholds used for this cell.
+    // Resolved thresholds used for this cgroup.
     resolved: ResolvedPolicy,
 }
 
 /// Aggregate a group of rows for the same (scenario, flags, topology) into
 /// mean values for comparison.
-struct CellAgg {
+struct CgroupAgg {
     pass_rate: f64,
     spread: f64,
     gap_ms: f64,
@@ -1161,12 +1211,15 @@ struct CellAgg {
     dsq_depth: f64,
     fallback: f64,
     keep_last: f64,
+    p99_wake_lat: f64,
+    wake_cv: f64,
+    run_delay: f64,
 }
 
-fn aggregate_cell(rows: &[&GauntletRow]) -> CellAgg {
+fn aggregate_cgroup(rows: &[&GauntletRow]) -> CgroupAgg {
     let n = rows.len() as f64;
     let pass_count = rows.iter().filter(|r| r.passed).count() as f64;
-    CellAgg {
+    CgroupAgg {
         pass_rate: pass_count / n,
         spread: rows.iter().map(|r| r.spread).sum::<f64>() / n,
         gap_ms: rows.iter().map(|r| r.gap_ms as f64).sum::<f64>() / n,
@@ -1174,6 +1227,9 @@ fn aggregate_cell(rows: &[&GauntletRow]) -> CellAgg {
         dsq_depth: rows.iter().map(|r| r.max_dsq_depth as f64).sum::<f64>() / n,
         fallback: rows.iter().map(|r| r.fallback_count as f64).sum::<f64>() / n,
         keep_last: rows.iter().map(|r| r.keep_last_count as f64).sum::<f64>() / n,
+        p99_wake_lat: rows.iter().map(|r| r.p99_wake_latency_us).sum::<f64>() / n,
+        wake_cv: rows.iter().map(|r| r.wake_latency_cv).sum::<f64>() / n,
+        run_delay: rows.iter().map(|r| r.mean_run_delay_us).sum::<f64>() / n,
     }
 }
 
@@ -1200,6 +1256,19 @@ pub struct ComparisonPolicy {
     pub keep_last_abs: Option<f64>,
     pub keep_last_rel: Option<f64>,
     pub pass_rate_tol: Option<f64>,
+    // Benchmarking metrics.
+    #[serde(default)]
+    pub p99_wake_lat_abs: Option<f64>,
+    #[serde(default)]
+    pub p99_wake_lat_rel: Option<f64>,
+    #[serde(default)]
+    pub wake_cv_abs: Option<f64>,
+    #[serde(default)]
+    pub wake_cv_rel: Option<f64>,
+    #[serde(default)]
+    pub run_delay_abs: Option<f64>,
+    #[serde(default)]
+    pub run_delay_rel: Option<f64>,
 }
 
 impl ComparisonPolicy {
@@ -1218,6 +1287,12 @@ impl ComparisonPolicy {
         keep_last_abs: None,
         keep_last_rel: None,
         pass_rate_tol: None,
+        p99_wake_lat_abs: None,
+        p99_wake_lat_rel: None,
+        wake_cv_abs: None,
+        wake_cv_rel: None,
+        run_delay_abs: None,
+        run_delay_rel: None,
     };
 
     /// Reproduces the original hardcoded thresholds exactly.
@@ -1235,6 +1310,12 @@ impl ComparisonPolicy {
         keep_last_abs: Some(10.0),
         keep_last_rel: Some(0.10),
         pass_rate_tol: Some(0.01),
+        p99_wake_lat_abs: Some(50.0), // 50us absolute
+        p99_wake_lat_rel: Some(0.20), // 20% relative (higher variance in VM)
+        wake_cv_abs: Some(0.10),      // 0.10 absolute CV delta
+        wake_cv_rel: Some(0.20),
+        run_delay_abs: Some(100.0), // 100us absolute
+        run_delay_rel: Some(0.20),
     };
 
     /// Merge self over DEFAULTS, returning resolved thresholds for each metric.
@@ -1255,6 +1336,12 @@ impl ComparisonPolicy {
             keep_last_abs: r(self.keep_last_abs, d.keep_last_abs),
             keep_last_rel: r(self.keep_last_rel, d.keep_last_rel),
             pass_rate_tol: r(self.pass_rate_tol, d.pass_rate_tol),
+            p99_wake_lat_abs: r(self.p99_wake_lat_abs, d.p99_wake_lat_abs),
+            p99_wake_lat_rel: r(self.p99_wake_lat_rel, d.p99_wake_lat_rel),
+            wake_cv_abs: r(self.wake_cv_abs, d.wake_cv_abs),
+            wake_cv_rel: r(self.wake_cv_rel, d.wake_cv_rel),
+            run_delay_abs: r(self.run_delay_abs, d.run_delay_abs),
+            run_delay_rel: r(self.run_delay_rel, d.run_delay_rel),
         }
     }
 }
@@ -1281,6 +1368,12 @@ struct ResolvedPolicy {
     keep_last_abs: f64,
     keep_last_rel: f64,
     pass_rate_tol: f64,
+    p99_wake_lat_abs: f64,
+    p99_wake_lat_rel: f64,
+    wake_cv_abs: f64,
+    wake_cv_rel: f64,
+    run_delay_abs: f64,
+    run_delay_rel: f64,
 }
 
 /// Dual-gate significance test: exceeds both absolute and relative thresholds.
@@ -1289,7 +1382,7 @@ fn is_significant(delta: f64, abs_tol: f64, rel_tol: f64, baseline_val: f64) -> 
         && (baseline_val.abs() < f64::EPSILON || delta.abs() / baseline_val.abs() > rel_tol)
 }
 
-/// A policy scoped to a subset of cells by scenario, flags, and/or topology.
+/// A policy scoped to a subset of cgroups by scenario, flags, and/or topology.
 /// `None` in a scope field means "match all".
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScopedPolicy {
@@ -1311,8 +1404,8 @@ impl ScopedPolicy {
     }
 }
 
-/// Find the first scoped policy that matches a cell, or return `DEFAULTS`.
-fn resolve_policy_for_cell(
+/// Find the first scoped policy that matches a cgroup, or return `DEFAULTS`.
+fn resolve_policy_for_cgroup(
     policies: &[ScopedPolicy],
     scenario: &str,
     flags: &str,
@@ -1327,12 +1420,12 @@ fn resolve_policy_for_cell(
 }
 
 /// Compare two sets of gauntlet rows (baseline A vs current B).
-/// Uses `ComparisonPolicy::DEFAULTS` for all cells.
+/// Uses `ComparisonPolicy::DEFAULTS` for all cgroups.
 pub fn compare_baselines(baseline: &[GauntletRow], current: &[GauntletRow]) -> String {
     compare_with_policies(baseline, current, &[])
 }
 
-/// Compare two sets of gauntlet rows with per-cell scoped policies.
+/// Compare two sets of gauntlet rows with per-cgroup scoped policies.
 /// Cells not matched by any `ScopedPolicy` use `ComparisonPolicy::DEFAULTS`.
 pub fn compare_with_policies(
     baseline: &[GauntletRow],
@@ -1368,11 +1461,11 @@ pub fn compare_with_policies(
     // Cells in both.
     for (key, base_rows) in &base_groups {
         if let Some(curr_rows) = curr_groups.get(key) {
-            let a = aggregate_cell(base_rows);
-            let b = aggregate_cell(curr_rows);
+            let a = aggregate_cgroup(base_rows);
+            let b = aggregate_cgroup(curr_rows);
 
-            let cell_policy = resolve_policy_for_cell(policies, &key.0, &key.1, &key.2);
-            let r = cell_policy.resolved();
+            let cgroup_policy = resolve_policy_for_cgroup(policies, &key.0, &key.1, &key.2);
+            let r = cgroup_policy.resolved();
 
             let spread_d = b.spread - a.spread;
             let gap_d = b.gap_ms - a.gap_ms;
@@ -1381,6 +1474,9 @@ pub fn compare_with_policies(
             let fb_d = b.fallback - a.fallback;
             let kl_d = b.keep_last - a.keep_last;
             let pass_d = b.pass_rate - a.pass_rate;
+            let p99_d = b.p99_wake_lat - a.p99_wake_lat;
+            let wcv_d = b.wake_cv - a.wake_cv;
+            let rd_d = b.run_delay - a.run_delay;
 
             let any_regression = is_significant(spread_d, r.spread_abs, r.spread_rel, a.spread)
                 && spread_d > 0.0
@@ -1392,6 +1488,15 @@ pub fn compare_with_policies(
                 || is_significant(fb_d, r.fallback_abs, r.fallback_rel, a.fallback) && fb_d > 0.0
                 || is_significant(kl_d, r.keep_last_abs, r.keep_last_rel, a.keep_last)
                     && kl_d > 0.0
+                || is_significant(
+                    p99_d,
+                    r.p99_wake_lat_abs,
+                    r.p99_wake_lat_rel,
+                    a.p99_wake_lat,
+                ) && p99_d > 0.0
+                || is_significant(wcv_d, r.wake_cv_abs, r.wake_cv_rel, a.wake_cv) && wcv_d > 0.0
+                || is_significant(rd_d, r.run_delay_abs, r.run_delay_rel, a.run_delay)
+                    && rd_d > 0.0
                 || pass_d < -r.pass_rate_tol;
 
             let any_improvement = is_significant(spread_d, r.spread_abs, r.spread_rel, a.spread)
@@ -1404,17 +1509,26 @@ pub fn compare_with_policies(
                 || is_significant(fb_d, r.fallback_abs, r.fallback_rel, a.fallback) && fb_d < 0.0
                 || is_significant(kl_d, r.keep_last_abs, r.keep_last_rel, a.keep_last)
                     && kl_d < 0.0
+                || is_significant(
+                    p99_d,
+                    r.p99_wake_lat_abs,
+                    r.p99_wake_lat_rel,
+                    a.p99_wake_lat,
+                ) && p99_d < 0.0
+                || is_significant(wcv_d, r.wake_cv_abs, r.wake_cv_rel, a.wake_cv) && wcv_d < 0.0
+                || is_significant(rd_d, r.run_delay_abs, r.run_delay_rel, a.run_delay)
+                    && rd_d < 0.0
                 || pass_d > r.pass_rate_tol;
 
             let change = if any_regression {
-                CellChange::Regression
+                CgroupChange::Regression
             } else if any_improvement {
-                CellChange::Improvement
+                CgroupChange::Improvement
             } else {
-                CellChange::Unchanged
+                CgroupChange::Unchanged
             };
 
-            deltas.push(CellDelta {
+            deltas.push(CgroupDelta {
                 scenario: key.0.clone(),
                 flags: key.1.clone(),
                 topology: key.2.clone(),
@@ -1426,6 +1540,9 @@ pub fn compare_with_policies(
                 dsq_depth_delta: dsq_d,
                 fallback_delta: fb_d,
                 keep_last_delta: kl_d,
+                p99_wake_lat_delta: p99_d,
+                wake_cv_delta: wcv_d,
+                run_delay_delta: rd_d,
                 baseline_pass_rate: a.pass_rate,
                 current_pass_rate: b.pass_rate,
                 resolved: r,
@@ -1446,21 +1563,21 @@ pub fn compare_with_policies(
 }
 
 fn format_comparison(
-    deltas: &[CellDelta],
+    deltas: &[CgroupDelta],
     removed: &[(String, String, String, String)],
     added: &[(String, String, String, String)],
 ) -> String {
     let regressions: Vec<_> = deltas
         .iter()
-        .filter(|d| d.change == CellChange::Regression)
+        .filter(|d| d.change == CgroupChange::Regression)
         .collect();
     let improvements: Vec<_> = deltas
         .iter()
-        .filter(|d| d.change == CellChange::Improvement)
+        .filter(|d| d.change == CgroupChange::Improvement)
         .collect();
     let unchanged_count = deltas
         .iter()
-        .filter(|d| d.change == CellChange::Unchanged)
+        .filter(|d| d.change == CgroupChange::Unchanged)
         .count();
     let total = deltas.len() + removed.len() + added.len();
 
@@ -1503,14 +1620,14 @@ fn format_comparison(
     }
 
     out.push_str(&format!(
-        "\nUnchanged: {}/{} cells within tolerance\n",
+        "\nUnchanged: {}/{} cgroups within tolerance\n",
         unchanged_count, total
     ));
 
     out
 }
 
-fn format_metric_deltas(out: &mut String, d: &CellDelta) {
+fn format_metric_deltas(out: &mut String, d: &CgroupDelta) {
     let r = &d.resolved;
     let mut parts = Vec::new();
     if d.spread_delta.abs() > r.spread_abs {
@@ -1530,6 +1647,15 @@ fn format_metric_deltas(out: &mut String, d: &CellDelta) {
     }
     if d.keep_last_delta.abs() > r.keep_last_abs {
         parts.push(format!("keep_last: {:+.0}", d.keep_last_delta));
+    }
+    if d.p99_wake_lat_delta.abs() > r.p99_wake_lat_abs {
+        parts.push(format!("p99_wake: {:+.1}us", d.p99_wake_lat_delta));
+    }
+    if d.wake_cv_delta.abs() > r.wake_cv_abs {
+        parts.push(format!("wake_cv: {:+.3}", d.wake_cv_delta));
+    }
+    if d.run_delay_delta.abs() > r.run_delay_abs {
+        parts.push(format!("run_delay: {:+.1}us", d.run_delay_delta));
     }
     if (d.current_pass_rate - d.baseline_pass_rate).abs() > r.pass_rate_tol {
         parts.push(format!(
@@ -1569,6 +1695,7 @@ mod tests {
                 worst_spread: spread,
                 worst_gap_ms: gap_ms,
                 worst_gap_cpu: 0,
+                ..Default::default()
             },
         };
         (
@@ -1647,15 +1774,15 @@ mod tests {
     }
 
     #[test]
-    fn replicated_cell_pass_rate() {
-        // 3 replicas of a cell, 2 pass 1 fails.
+    fn replicated_cgroup_pass_rate() {
+        // 3 replicas of a cgroup, 2 pass 1 fails.
         let results = vec![
             make_result("tiny/a/flags#1", true, 5.0, 50, 10),
             make_result("tiny/a/flags#2", false, 25.0, 3000, 5),
             make_result("tiny/a/flags#3", true, 8.0, 100, 12),
         ];
         let report = analyze_gauntlet(&results);
-        assert!(report.contains("Cells with <100% pass rate"));
+        assert!(report.contains("Cgroups with <100% pass rate"));
         assert!(report.contains("2/3"));
     }
 
@@ -1667,7 +1794,7 @@ mod tests {
             make_result("tiny/a/flags#3", true, 7.0, 55, 9),
         ];
         let report = analyze_gauntlet(&results);
-        assert!(report.contains("All cells passed across all replicas"));
+        assert!(report.contains("All cgroups passed across all replicas"));
     }
 
     #[test]
@@ -1679,7 +1806,7 @@ mod tests {
         let rows = extract_rows(&results);
         let df = build_dataframe(&rows).unwrap();
         assert_eq!(df.height(), 2);
-        assert_eq!(df.width(), 20);
+        assert_eq!(df.width(), 26);
     }
 
     #[test]
@@ -1770,6 +1897,12 @@ mod tests {
             stall_count: 0,
             fallback_count: 0,
             keep_last_count: 0,
+            p99_wake_latency_us: 0.0,
+            median_wake_latency_us: 0.0,
+            wake_latency_cv: 0.0,
+            total_iterations: 0,
+            mean_run_delay_us: 0.0,
+            worst_run_delay_us: 0.0,
             worst_degradation_op: String::new(),
             worst_imbalance_delta: 0.0,
             worst_dsq_delta: 0.0,
@@ -2019,18 +2152,21 @@ mod tests {
 
     #[test]
     fn format_metric_deltas_all_below_thresholds() {
-        let d = CellDelta {
+        let d = CgroupDelta {
             scenario: "a".into(),
             flags: "f".into(),
             topology: "t".into(),
             work_type: "CpuSpin".into(),
-            change: CellChange::Unchanged,
+            change: CgroupChange::Unchanged,
             spread_delta: 1.0,
             gap_ms_delta: 10.0,
             imbalance_delta: 0.1,
             dsq_depth_delta: 1.0,
             fallback_delta: 5.0,
             keep_last_delta: 5.0,
+            p99_wake_lat_delta: 0.0,
+            wake_cv_delta: 0.0,
+            run_delay_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
@@ -2042,18 +2178,21 @@ mod tests {
 
     #[test]
     fn format_metric_deltas_spread_above() {
-        let d = CellDelta {
+        let d = CgroupDelta {
             scenario: "a".into(),
             flags: "f".into(),
             topology: "t".into(),
             work_type: "CpuSpin".into(),
-            change: CellChange::Regression,
+            change: CgroupChange::Regression,
             spread_delta: 10.0,
             gap_ms_delta: 0.0,
             imbalance_delta: 0.0,
             dsq_depth_delta: 0.0,
             fallback_delta: 0.0,
             keep_last_delta: 0.0,
+            p99_wake_lat_delta: 0.0,
+            wake_cv_delta: 0.0,
+            run_delay_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
@@ -2310,21 +2449,21 @@ mod tests {
         );
     }
 
-    // -- format_cell_pass_rates tests --
+    // -- format_cgroup_pass_rates tests --
 
     #[test]
-    fn format_cell_pass_rates_all_pass() {
+    fn format_cgroup_pass_rates_all_pass() {
         let rows = vec![
             make_row("a", "f1", "t1", true, 5.0),
             make_row("a", "f1", "t1", true, 6.0),
         ];
         let df = build_dataframe(&rows).unwrap();
-        let out = format_cell_pass_rates(&df);
-        assert_eq!(out, "All cells passed across all replicas.\n\n");
+        let out = format_cgroup_pass_rates(&df);
+        assert_eq!(out, "All cgroups passed across all replicas.\n\n");
     }
 
     #[test]
-    fn format_cell_pass_rates_computed_values() {
+    fn format_cgroup_pass_rates_computed_values() {
         // 3 replicas: spread 10.0, 20.0, 30.0 -> avg=20.0, std>0.
         // gap_ms: 100, 200, 300 -> avg=200, min=100, max=300.
         // 2 pass, 1 fail.
@@ -2337,7 +2476,7 @@ mod tests {
         rows[1].gap_ms = 200;
         rows[2].gap_ms = 300;
         let df = build_dataframe(&rows).unwrap();
-        let out = format_cell_pass_rates(&df);
+        let out = format_cgroup_pass_rates(&df);
         // Format: "  {tp}/{sc}/{fl}  {pass}/{total}  spread={avg}  gap={avg}[{min}-{max}]"
         assert!(out.contains("2/3"), "2/3 pass rate, got:\n{out}");
         assert!(out.contains("spread=20.0"), "avg spread=20.0, got:\n{out}");
@@ -2351,14 +2490,14 @@ mod tests {
     }
 
     #[test]
-    fn format_cell_pass_rates_no_gap_range_when_equal() {
+    fn format_cgroup_pass_rates_no_gap_range_when_equal() {
         // All same gap_ms -> no range shown.
         let rows = vec![
             make_row("a", "f1", "t1", true, 5.0),
             make_row("a", "f1", "t1", false, 5.0),
         ];
         let df = build_dataframe(&rows).unwrap();
-        let out = format_cell_pass_rates(&df);
+        let out = format_cgroup_pass_rates(&df);
         assert!(out.contains("1/2"), "1/2, got:\n{out}");
         // gap_ms=50 for both via make_row -> no range brackets
         assert!(
@@ -2465,6 +2604,7 @@ mod tests {
                 worst_spread: 15.0,
                 worst_gap_ms: 200,
                 worst_gap_cpu: 3,
+                ..Default::default()
             },
             monitor: None,
             stimulus_events: vec![],
@@ -2532,18 +2672,21 @@ mod tests {
 
     #[test]
     fn format_metric_deltas_multiple_above_thresholds() {
-        let d = CellDelta {
+        let d = CgroupDelta {
             scenario: "a".into(),
             flags: "f".into(),
             topology: "t".into(),
             work_type: "CpuSpin".into(),
-            change: CellChange::Regression,
+            change: CgroupChange::Regression,
             spread_delta: 15.5,
             gap_ms_delta: 150.0,
             imbalance_delta: 3.2,
             dsq_depth_delta: 0.0,
             fallback_delta: 0.0,
             keep_last_delta: 20.0,
+            p99_wake_lat_delta: 0.0,
+            wake_cv_delta: 0.0,
+            run_delay_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 0.5,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
@@ -2588,6 +2731,7 @@ mod tests {
                 worst_spread: 15.0,
                 worst_gap_ms: 200,
                 worst_gap_cpu: 3,
+                ..Default::default()
             },
             monitor: Some(monitor::MonitorSummary {
                 total_samples: 10,

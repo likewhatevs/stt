@@ -277,7 +277,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         scheduler_args: args.scheduler_arg,
         parent_cgroup: args.parent_cgroup,
         duration_s: args.duration_s,
-        workers_per_cell: args.workers,
+        workers_per_cgroup: args.workers,
         json: args.json,
         verbose: args.verbose,
         active_flags,
@@ -587,14 +587,14 @@ mod tests {
             false,
             6.7,
             vec![
-                "unfair cell: spread=85%",
+                "unfair cgroup: spread=85%",
                 "stuck 2448ms on cpu4",
                 "sched_ext: mitosis disabled (stall)",
             ],
         )]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "FAIL proportional/default (6.7s)");
-        assert_eq!(lines[1], "  unfair cell: spread=85%");
+        assert_eq!(lines[1], "  unfair cgroup: spread=85%");
         assert_eq!(lines[2], "  stuck 2448ms on cpu4");
         assert_eq!(lines[3], "  sched_ext: mitosis disabled (stall)");
     }
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn extract_auto_repro_functions_no_match() {
-        let results = vec![sr("test", false, 1.0, vec!["unfair cell: spread=85%"])];
+        let results = vec![sr("test", false, 1.0, vec!["unfair cgroup: spread=85%"])];
         let names = extract_auto_repro_functions(&results);
         assert!(names.is_none());
     }
@@ -1040,6 +1040,7 @@ mod tests {
                 worst_spread: 15.0,
                 worst_gap_ms: 200,
                 worst_gap_cpu: 3,
+                ..Default::default()
             },
             monitor: Some(monitor::MonitorSummary {
                 total_samples: 10,

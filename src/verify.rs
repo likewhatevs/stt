@@ -84,6 +84,18 @@ pub struct CgroupStats {
     pub max_gap_ms: u64,
     pub max_gap_cpu: usize,
     pub total_migrations: u64,
+    #[serde(default)]
+    pub p99_wake_latency_us: f64,
+    #[serde(default)]
+    pub median_wake_latency_us: f64,
+    #[serde(default)]
+    pub wake_latency_cv: f64,
+    #[serde(default)]
+    pub total_iterations: u64,
+    #[serde(default)]
+    pub mean_run_delay_us: f64,
+    #[serde(default)]
+    pub worst_run_delay_us: f64,
 }
 
 /// Aggregated statistics across all cgroups in a scenario.
@@ -98,6 +110,18 @@ pub struct ScenarioStats {
     /// Worst gap across any cgroup (ms).
     pub worst_gap_ms: u64,
     pub worst_gap_cpu: usize,
+    #[serde(default)]
+    pub p99_wake_latency_us: f64,
+    #[serde(default)]
+    pub median_wake_latency_us: f64,
+    #[serde(default)]
+    pub wake_latency_cv: f64,
+    #[serde(default)]
+    pub total_iterations: u64,
+    #[serde(default)]
+    pub mean_run_delay_us: f64,
+    #[serde(default)]
+    pub worst_run_delay_us: f64,
 }
 
 impl VerifyResult {
@@ -124,6 +148,23 @@ impl VerifyResult {
             self.stats.worst_gap_ms = other.stats.worst_gap_ms;
             self.stats.worst_gap_cpu = other.stats.worst_gap_cpu;
         }
+        if other.stats.p99_wake_latency_us > self.stats.p99_wake_latency_us {
+            self.stats.p99_wake_latency_us = other.stats.p99_wake_latency_us;
+        }
+        if other.stats.median_wake_latency_us > self.stats.median_wake_latency_us {
+            self.stats.median_wake_latency_us = other.stats.median_wake_latency_us;
+        }
+        if other.stats.wake_latency_cv > self.stats.wake_latency_cv {
+            self.stats.wake_latency_cv = other.stats.wake_latency_cv;
+        }
+        self.stats.total_iterations += other.stats.total_iterations;
+        if other.stats.worst_run_delay_us > self.stats.worst_run_delay_us {
+            self.stats.worst_run_delay_us = other.stats.worst_run_delay_us;
+        }
+        // mean_run_delay: take worst across cgroups for scenario-level stat.
+        if other.stats.mean_run_delay_us > self.stats.mean_run_delay_us {
+            self.stats.mean_run_delay_us = other.stats.mean_run_delay_us;
+        }
     }
 }
 
@@ -137,6 +178,9 @@ pub struct VerificationPlan {
     pub max_spread_pct: Option<f64>,
     pub max_throughput_cv: Option<f64>,
     pub min_work_rate: Option<f64>,
+    pub max_p99_wake_latency_ns: Option<u64>,
+    pub max_wake_latency_cv: Option<f64>,
+    pub min_iteration_rate: Option<f64>,
 }
 
 impl VerificationPlan {
@@ -148,6 +192,9 @@ impl VerificationPlan {
             max_spread_pct: None,
             max_throughput_cv: None,
             min_work_rate: None,
+            max_p99_wake_latency_ns: None,
+            max_wake_latency_cv: None,
+            min_iteration_rate: None,
         }
     }
 
@@ -158,7 +205,7 @@ impl VerificationPlan {
     }
 
     /// Enable cpuset isolation check. Only applied when a cpuset is provided
-    /// to `verify_cell`.
+    /// to `verify_cgroup`.
     pub fn check_isolation(mut self) -> Self {
         self.isolation = true;
         self
@@ -180,31 +227,31 @@ impl VerificationPlan {
     ///
     /// `cpuset` is the expected CPU set for isolation checks. Pass `None`
     /// when there is no cpuset constraint (isolation check is skipped).
-    pub fn verify_cell(
+    pub fn verify_cgroup(
         &self,
         reports: &[WorkerReport],
         cpuset: Option<&BTreeSet<usize>>,
     ) -> VerifyResult {
         let mut r = VerifyResult::pass();
         if self.not_starved {
-            let mut cell_result = verify_not_starved(reports);
+            let mut cgroup_result = verify_not_starved(reports);
             // Apply custom spread threshold if set.
             if let Some(spread_limit) = self.max_spread_pct {
                 // Re-check spread against custom threshold. The default
                 // verify_not_starved uses spread_threshold_pct(); clear
                 // those failures and re-evaluate.
-                cell_result.details.retain(|d| !d.contains("unfair"));
-                if let Some(cg) = cell_result.stats.cgroups.first() {
+                cgroup_result.details.retain(|d| !d.contains("unfair"));
+                if let Some(cg) = cgroup_result.stats.cgroups.first() {
                     if cg.spread > spread_limit && cg.num_workers >= 2 {
-                        cell_result.passed = false;
-                        cell_result.details.push(format!(
+                        cgroup_result.passed = false;
+                        cgroup_result.details.push(format!(
                             "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
                             cg.spread, cg.min_runnable_pct, cg.max_runnable_pct,
                             cg.num_workers, cg.num_cpus, spread_limit
                         ));
                     } else {
                         // Re-derive passed: only non-spread failures matter.
-                        cell_result.passed = !cell_result
+                        cgroup_result.passed = !cgroup_result
                             .details
                             .iter()
                             .any(|d| d.contains("starved") || d.contains("stuck"));
@@ -216,13 +263,13 @@ impl VerificationPlan {
                 // Re-check gaps against custom threshold. The default
                 // verify_not_starved uses 2000ms; clear those failures
                 // and re-evaluate.
-                cell_result.details.retain(|d| !d.contains("stuck"));
+                cgroup_result.details.retain(|d| !d.contains("stuck"));
                 let had_gap_failure = reports.iter().any(|w| w.max_gap_ms > threshold);
                 if had_gap_failure {
-                    cell_result.passed = false;
+                    cgroup_result.passed = false;
                     for w in reports {
                         if w.max_gap_ms > threshold {
-                            cell_result.details.push(format!(
+                            cgroup_result.details.push(format!(
                                 "stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
                                 w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold
                             ));
@@ -230,13 +277,13 @@ impl VerificationPlan {
                     }
                 } else {
                     // Re-derive passed: only non-gap failures matter.
-                    cell_result.passed = !cell_result
+                    cgroup_result.passed = !cgroup_result
                         .details
                         .iter()
                         .any(|d| d.contains("starved") || d.contains("unfair"));
                 }
             }
-            r.merge(cell_result);
+            r.merge(cgroup_result);
         }
         if self.isolation
             && let Some(cs) = cpuset
@@ -248,6 +295,17 @@ impl VerificationPlan {
                 reports,
                 self.max_throughput_cv,
                 self.min_work_rate,
+            ));
+        }
+        if self.max_p99_wake_latency_ns.is_some()
+            || self.max_wake_latency_cv.is_some()
+            || self.min_iteration_rate.is_some()
+        {
+            r.merge(verify_benchmarks(
+                reports,
+                self.max_p99_wake_latency_ns,
+                self.max_wake_latency_cv,
+                self.min_iteration_rate,
             ));
         }
         r
@@ -281,6 +339,14 @@ pub struct Verify {
     /// are equally slow (CV passes but absolute throughput is too low).
     pub min_work_rate: Option<f64>,
 
+    // Benchmarking checks
+    /// Max p99 wake latency (ns). Fails if any cgroup's p99 exceeds this.
+    pub max_p99_wake_latency_ns: Option<u64>,
+    /// Max wake latency coefficient of variation. Fails if CV exceeds this.
+    pub max_wake_latency_cv: Option<f64>,
+    /// Minimum iterations per wall-clock second. Fails if any worker is below.
+    pub min_iteration_rate: Option<f64>,
+
     // Monitor checks
     pub max_imbalance_ratio: Option<f64>,
     pub max_local_dsq_depth: Option<u32>,
@@ -299,6 +365,9 @@ impl Verify {
         max_spread_pct: None,
         max_throughput_cv: None,
         min_work_rate: None,
+        max_p99_wake_latency_ns: None,
+        max_wake_latency_cv: None,
+        min_iteration_rate: None,
         max_imbalance_ratio: None,
         max_local_dsq_depth: None,
         fail_on_stall: None,
@@ -318,6 +387,9 @@ impl Verify {
             max_spread_pct: None,
             max_throughput_cv: None,
             min_work_rate: None,
+            max_p99_wake_latency_ns: None,
+            max_wake_latency_cv: None,
+            min_iteration_rate: None,
             max_imbalance_ratio: Some(MonitorThresholds::DEFAULT.max_imbalance_ratio),
             max_local_dsq_depth: Some(MonitorThresholds::DEFAULT.max_local_dsq_depth),
             fail_on_stall: Some(MonitorThresholds::DEFAULT.fail_on_stall),
@@ -354,6 +426,21 @@ impl Verify {
 
     pub const fn min_work_rate(mut self, v: f64) -> Self {
         self.min_work_rate = Some(v);
+        self
+    }
+
+    pub const fn max_p99_wake_latency_ns(mut self, v: u64) -> Self {
+        self.max_p99_wake_latency_ns = Some(v);
+        self
+    }
+
+    pub const fn max_wake_latency_cv(mut self, v: f64) -> Self {
+        self.max_wake_latency_cv = Some(v);
+        self
+    }
+
+    pub const fn min_iteration_rate(mut self, v: f64) -> Self {
+        self.min_iteration_rate = Some(v);
         self
     }
 
@@ -419,6 +506,18 @@ impl Verify {
                 Some(v) => Some(v),
                 None => self.min_work_rate,
             },
+            max_p99_wake_latency_ns: match other.max_p99_wake_latency_ns {
+                Some(v) => Some(v),
+                None => self.max_p99_wake_latency_ns,
+            },
+            max_wake_latency_cv: match other.max_wake_latency_cv {
+                Some(v) => Some(v),
+                None => self.max_wake_latency_cv,
+            },
+            min_iteration_rate: match other.min_iteration_rate {
+                Some(v) => Some(v),
+                None => self.min_iteration_rate,
+            },
             max_imbalance_ratio: match other.max_imbalance_ratio {
                 Some(v) => Some(v),
                 None => self.max_imbalance_ratio,
@@ -455,18 +554,21 @@ impl Verify {
             max_spread_pct: self.max_spread_pct,
             max_throughput_cv: self.max_throughput_cv,
             min_work_rate: self.min_work_rate,
+            max_p99_wake_latency_ns: self.max_p99_wake_latency_ns,
+            max_wake_latency_cv: self.max_wake_latency_cv,
+            min_iteration_rate: self.min_iteration_rate,
         }
     }
 
     /// Run worker checks against one cgroup's reports.
     ///
-    /// Equivalent to `self.worker_plan().verify_cell(reports, cpuset)`.
-    pub fn verify_cell(
+    /// Equivalent to `self.worker_plan().verify_cgroup(reports, cpuset)`.
+    pub fn verify_cgroup(
         &self,
         reports: &[crate::workload::WorkerReport],
         cpuset: Option<&BTreeSet<usize>>,
     ) -> VerifyResult {
-        self.worker_plan().verify_cell(reports, cpuset)
+        self.worker_plan().verify_cgroup(reports, cpuset)
     }
 
     /// Extract `MonitorThresholds` for monitor-side evaluation.
@@ -539,6 +641,46 @@ pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
         .map(|w| (w.max_gap_ms, w.max_gap_cpu))
         .unwrap_or((0, 0));
 
+    // Compute benchmarking stats from worker reports.
+    let all_latencies: Vec<u64> = reports
+        .iter()
+        .flat_map(|w| w.wake_latencies_ns.iter().copied())
+        .collect();
+    let (p99_us, median_us, lat_cv) = if all_latencies.is_empty() {
+        (0.0, 0.0, 0.0)
+    } else {
+        let mut sorted = all_latencies.clone();
+        sorted.sort_unstable();
+        let p99_idx = (sorted.len() as f64 * 0.99).ceil() as usize;
+        let p99 = sorted[p99_idx.min(sorted.len() - 1)] as f64 / 1000.0;
+        let median = sorted[sorted.len() / 2] as f64 / 1000.0;
+        let n = all_latencies.len() as f64;
+        let mean_ns = all_latencies.iter().sum::<u64>() as f64 / n;
+        let cv = if mean_ns > 0.0 {
+            let variance = all_latencies
+                .iter()
+                .map(|&v| (v as f64 - mean_ns).powi(2))
+                .sum::<f64>()
+                / n;
+            variance.sqrt() / mean_ns
+        } else {
+            0.0
+        };
+        (p99, median, cv)
+    };
+
+    let total_iters: u64 = reports.iter().map(|w| w.iterations).sum();
+    let run_delays: Vec<f64> = reports
+        .iter()
+        .map(|w| w.schedstat_run_delay_ns as f64 / 1000.0)
+        .collect();
+    let mean_run_delay = if run_delays.is_empty() {
+        0.0
+    } else {
+        run_delays.iter().sum::<f64>() / run_delays.len() as f64
+    };
+    let worst_run_delay = run_delays.iter().cloned().reduce(f64::max).unwrap_or(0.0);
+
     let cg = CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
@@ -549,6 +691,12 @@ pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
         max_gap_ms: gap_ms,
         max_gap_cpu: gap_cpu,
         total_migrations: reports.iter().map(|w| w.migration_count).sum(),
+        p99_wake_latency_us: p99_us,
+        median_wake_latency_us: median_us,
+        wake_latency_cv: lat_cv,
+        total_iterations: total_iters,
+        mean_run_delay_us: mean_run_delay,
+        worst_run_delay_us: worst_run_delay,
     };
 
     // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup
@@ -581,13 +729,19 @@ pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
 
     // Store this cgroup's stats - merge accumulates cgroups
     r.stats = ScenarioStats {
-        cgroups: vec![cg],
+        cgroups: vec![cg.clone()],
         total_workers: reports.len(),
         total_cpus: cpus.len(),
         total_migrations: reports.iter().map(|w| w.migration_count).sum(),
         worst_spread: spread,
         worst_gap_ms: gap_ms,
         worst_gap_cpu: gap_cpu,
+        p99_wake_latency_us: cg.p99_wake_latency_us,
+        median_wake_latency_us: cg.median_wake_latency_us,
+        wake_latency_cv: cg.wake_latency_cv,
+        total_iterations: cg.total_iterations,
+        mean_run_delay_us: cg.mean_run_delay_us,
+        worst_run_delay_us: cg.worst_run_delay_us,
     };
 
     r
@@ -655,6 +809,81 @@ pub fn verify_throughput_parity(
     r
 }
 
+/// Check benchmarking metrics: p99 wake latency, wake latency CV,
+/// and minimum iteration rate.
+pub fn verify_benchmarks(
+    reports: &[WorkerReport],
+    max_p99_ns: Option<u64>,
+    max_cv: Option<f64>,
+    min_iter_rate: Option<f64>,
+) -> VerifyResult {
+    let mut r = VerifyResult::pass();
+    if reports.is_empty() {
+        return r;
+    }
+
+    // Collect all wake latencies across workers.
+    let all_latencies: Vec<u64> = reports
+        .iter()
+        .flat_map(|w| w.wake_latencies_ns.iter().copied())
+        .collect();
+
+    if let Some(p99_limit) = max_p99_ns
+        && !all_latencies.is_empty()
+    {
+        let mut sorted = all_latencies.clone();
+        sorted.sort_unstable();
+        let p99_idx = (sorted.len() as f64 * 0.99).ceil() as usize;
+        let p99 = sorted[p99_idx.min(sorted.len() - 1)];
+        if p99 > p99_limit {
+            r.passed = false;
+            r.details.push(format!(
+                "p99 wake latency {p99}ns exceeds limit {p99_limit}ns ({} samples)",
+                sorted.len()
+            ));
+        }
+    }
+
+    if let Some(cv_limit) = max_cv
+        && all_latencies.len() >= 2
+    {
+        let n = all_latencies.len() as f64;
+        let mean = all_latencies.iter().sum::<u64>() as f64 / n;
+        if mean > 0.0 {
+            let variance = all_latencies
+                .iter()
+                .map(|&v| (v as f64 - mean).powi(2))
+                .sum::<f64>()
+                / n;
+            let cv = variance.sqrt() / mean;
+            if cv > cv_limit {
+                r.passed = false;
+                r.details.push(format!(
+                    "wake latency CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0}ns)"
+                ));
+            }
+        }
+    }
+
+    if let Some(rate_floor) = min_iter_rate {
+        for w in reports {
+            if w.wall_time_ns == 0 {
+                continue;
+            }
+            let rate = w.iterations as f64 / (w.wall_time_ns as f64 / 1e9);
+            if rate < rate_floor {
+                r.passed = false;
+                r.details.push(format!(
+                    "worker {} iteration rate {rate:.1}/s below floor {rate_floor:.1}/s",
+                    w.tid
+                ));
+            }
+        }
+    }
+
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +913,11 @@ mod tests {
             max_gap_ms: gap_ms,
             max_gap_cpu: cpus.first().copied().unwrap_or(0),
             max_gap_at_ms: 1000,
+            wake_latencies_ns: vec![],
+            iterations: 0,
+            schedstat_run_delay_ns: 0,
+            schedstat_ctx_switches: 0,
+            schedstat_cpu_time_ns: 0,
         }
     }
 
@@ -915,6 +1149,7 @@ mod tests {
                 max_gap_ms: 150,
                 max_gap_cpu: 3,
                 total_migrations: 10,
+                ..Default::default()
             }],
             total_workers: 4,
             total_cpus: 2,
@@ -922,6 +1157,7 @@ mod tests {
             worst_spread: 20.0,
             worst_gap_ms: 150,
             worst_gap_cpu: 3,
+            ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         let s2: ScenarioStats = serde_json::from_str(&json).unwrap();
@@ -979,7 +1215,7 @@ mod tests {
     fn plan_check_not_starved() {
         let plan = VerificationPlan::new().check_not_starved();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         assert!(r.passed);
         assert_eq!(r.stats.total_workers, 1);
     }
@@ -991,7 +1227,7 @@ mod tests {
             .check_isolation();
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
-        let r = plan.verify_cell(&reports, Some(&expected));
+        let r = plan.verify_cgroup(&reports, Some(&expected));
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("unexpected")));
     }
@@ -1001,7 +1237,7 @@ mod tests {
         let plan = VerificationPlan::new().check_isolation();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
         // No cpuset provided -- isolation check is skipped.
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         assert!(r.passed);
     }
 
@@ -1010,7 +1246,7 @@ mod tests {
         let plan = VerificationPlan::new().check_not_starved().max_gap_ms(3000);
         // 2500ms gap: passes with 3000ms threshold.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2500)];
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         assert!(r.passed, "2500ms < 3000ms threshold: {:?}", r.details);
     }
 
@@ -1019,7 +1255,7 @@ mod tests {
         let plan = VerificationPlan::new().check_not_starved().max_gap_ms(1500);
         // 2000ms gap: fails with 1500ms threshold.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("stuck")));
         assert!(r.details.iter().any(|d| d.contains("threshold 1500ms")));
@@ -1029,7 +1265,7 @@ mod tests {
     fn plan_no_checks_always_passes() {
         let plan = VerificationPlan::new();
         let reports = [rpt(1, 0, 0, 0, &[], 5000)]; // starved + stuck
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         assert!(r.passed, "no checks enabled should pass");
     }
 
@@ -1050,14 +1286,14 @@ mod tests {
         );
         // A plan with all checks disabled must pass even pathological input.
         let reports = [rpt(1, 0, 0, 0, &[], 99999)];
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         assert!(r.passed, "all-disabled plan must pass any input");
     }
 
     #[test]
     fn verification_plan_default_equals_new() {
         // Default impl calls new(). Verify field-by-field equivalence
-        // and that both produce identical verify_cell results.
+        // and that both produce identical verify_cgroup results.
         let d = VerificationPlan::default();
         let n = VerificationPlan::new();
         assert_eq!(d.not_starved, n.not_starved);
@@ -1066,8 +1302,8 @@ mod tests {
         assert_eq!(d.max_spread_pct, n.max_spread_pct);
         // Both should produce identical pass/fail on the same input.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let rd = d.verify_cell(&reports, None);
-        let rn = n.verify_cell(&reports, None);
+        let rd = d.verify_cgroup(&reports, None);
+        let rn = n.verify_cgroup(&reports, None);
         assert_eq!(rd.passed, rn.passed);
     }
 
@@ -1183,7 +1419,7 @@ mod tests {
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100), // healthy
             rpt(2, 0, 5e9 as u64, 0, &[1], 1500),            // starved, gap < threshold
         ];
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         assert!(
             !r.passed,
             "starved worker must fail even with relaxed gap threshold"
@@ -1311,10 +1547,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_verify_cell_delegates_to_plan() {
+    fn verify_verify_cgroup_delegates_to_plan() {
         let v = Verify::NONE.check_not_starved();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let r = v.verify_cell(&reports, None);
+        let r = v.verify_cgroup(&reports, None);
         assert!(r.passed);
         assert_eq!(r.stats.total_workers, 1);
     }
@@ -1604,7 +1840,7 @@ mod tests {
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
         ];
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         assert!(!r.passed, "custom 500ms threshold must catch 1000ms gap");
         // Format: "stuck 1000ms on cpu1 at +1000ms (threshold 500ms)"
         let detail = r.details.iter().find(|d| d.contains("stuck")).unwrap();
@@ -1631,7 +1867,7 @@ mod tests {
             rpt(1, 0, 5e9 as u64, 0, &[0], 0),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[4, 5], 50),
         ];
-        let r = plan.verify_cell(&reports, Some(&expected));
+        let r = plan.verify_cgroup(&reports, Some(&expected));
         assert!(!r.passed);
         // Starvation detail must name tid 1 with "0 work units".
         let starved_detail = r.details.iter().find(|d| d.contains("starved")).unwrap();
@@ -1651,12 +1887,15 @@ mod tests {
     }
 
     #[test]
-    fn neg_verify_cell_via_verify_struct() {
+    fn neg_verify_cgroup_via_verify_struct() {
         let v = Verify::NONE.check_not_starved().check_isolation();
         let expected: BTreeSet<usize> = [0].into_iter().collect();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2], 50)];
-        let r = v.verify_cell(&reports, Some(&expected));
-        assert!(!r.passed, "Verify.verify_cell must catch isolation failure");
+        let r = v.verify_cgroup(&reports, Some(&expected));
+        assert!(
+            !r.passed,
+            "Verify.verify_cgroup must catch isolation failure"
+        );
         let detail = r.details.iter().find(|d| d.contains("unexpected")).unwrap();
         assert!(detail.contains("tid 1"), "must name tid: {detail}");
         assert!(detail.contains("1"), "must list CPU 1: {detail}");
@@ -1771,6 +2010,7 @@ mod tests {
                 worst_spread: 5.0,
                 worst_gap_ms: 100,
                 worst_gap_cpu: 0,
+                ..Default::default()
             },
         };
         let b = VerifyResult {
@@ -1784,6 +2024,7 @@ mod tests {
                 worst_spread: 15.0,
                 worst_gap_ms: 500,
                 worst_gap_cpu: 2,
+                ..Default::default()
             },
         };
         a.merge(b);
@@ -1804,7 +2045,7 @@ mod tests {
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
         ];
-        let r = plan.verify_cell(&reports, None);
+        let r = plan.verify_cgroup(&reports, None);
         // 1000ms gap < 5000ms threshold, so it passes.
         let has_stuck = r.details.iter().any(|d| d.contains("stuck"));
         assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");

@@ -30,7 +30,7 @@ pub struct RunConfig {
     pub scheduler_args: Vec<String>,
     pub parent_cgroup: String,
     pub duration_s: u64,
-    pub workers_per_cell: usize,
+    pub workers_per_cgroup: usize,
     pub json: bool,
     pub verbose: bool,
     pub active_flags: Option<Vec<&'static str>>,
@@ -42,13 +42,13 @@ pub struct RunConfig {
     pub kernel_dir: Option<String>,
     /// Include bootlin URLs in source line output.
     pub bootlin: bool,
-    /// Sleep after cell creation to let scheduler apply config (ms).
+    /// Sleep after cgroup creation to let scheduler apply config (ms).
     pub settle_ms: u64,
     /// Sleep after scheduler process start to let it initialize (ms).
     pub scheduler_startup_ms: u64,
     /// Sleep after cgroup cleanup before next scenario (ms).
     pub cleanup_ms: u64,
-    /// Override work_type for all swappable CgroupDefs and steady-state cells.
+    /// Override work_type for all swappable CgroupDefs and steady-state cgroups.
     pub work_type_override: Option<crate::workload::WorkType>,
 }
 
@@ -151,7 +151,7 @@ impl Runner {
                 cgroups: &cgroups,
                 topo: &self.topo,
                 duration: Duration::from_secs(self.config.duration_s),
-                workers_per_cell: self.config.workers_per_cell,
+                workers_per_cgroup: self.config.workers_per_cgroup,
                 sched_pid,
                 settle_ms: self.config.settle_ms,
                 work_type_override: self.config.work_type_override,
@@ -446,6 +446,7 @@ mod tests {
                 worst_spread: 25.0,
                 worst_gap_ms: 3000,
                 worst_gap_cpu: 5,
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&r).unwrap();
@@ -485,6 +486,7 @@ mod tests {
                         max_gap_ms: 50,
                         max_gap_cpu: 0,
                         total_migrations: 3,
+                        ..Default::default()
                     },
                     crate::verify::CgroupStats {
                         num_workers: 4,
@@ -496,6 +498,7 @@ mod tests {
                         max_gap_ms: 30,
                         max_gap_cpu: 4,
                         total_migrations: 2,
+                        ..Default::default()
                     },
                 ],
                 total_workers: 8,
@@ -504,6 +507,7 @@ mod tests {
                 worst_spread: 10.0,
                 worst_gap_ms: 50,
                 worst_gap_cpu: 0,
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&r).unwrap();
@@ -734,7 +738,7 @@ mod tests {
             scenario_name: "test/borrow".into(),
             passed: false,
             duration_s: 12.5,
-            details: vec!["stuck 3000ms on cpu2".into(), "unfair cell".into()],
+            details: vec!["stuck 3000ms on cpu2".into(), "unfair cgroup".into()],
             stats: crate::verify::ScenarioStats {
                 cgroups: vec![crate::verify::CgroupStats {
                     num_workers: 4,
@@ -746,6 +750,7 @@ mod tests {
                     max_gap_ms: 3000,
                     max_gap_cpu: 2,
                     total_migrations: 7,
+                    ..Default::default()
                 }],
                 total_workers: 4,
                 total_cpus: 2,
@@ -753,6 +758,7 @@ mod tests {
                 worst_spread: 20.0,
                 worst_gap_ms: 3000,
                 worst_gap_cpu: 2,
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&r).unwrap();
@@ -822,7 +828,7 @@ mod tests {
             scheduler_args: vec!["--verbose".into()],
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 30,
-            workers_per_cell: 8,
+            workers_per_cgroup: 8,
             json: true,
             verbose: true,
             active_flags: Some(vec![flags::BORROW, flags::LLC]),
@@ -843,7 +849,7 @@ mod tests {
         assert_eq!(runner.config.scheduler_bin.as_deref(), Some("scx_mitosis"));
         assert_eq!(runner.config.scheduler_args, vec!["--verbose"]);
         assert_eq!(runner.config.duration_s, 30);
-        assert_eq!(runner.config.workers_per_cell, 8);
+        assert_eq!(runner.config.workers_per_cgroup, 8);
         assert!(runner.config.json);
         assert!(runner.config.verbose);
         assert_eq!(runner.config.settle_ms, 500);
@@ -859,7 +865,7 @@ mod tests {
             scheduler_args: vec![],
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 5,
-            workers_per_cell: 2,
+            workers_per_cgroup: 2,
             json: false,
             verbose: false,
             active_flags: None,
@@ -910,7 +916,7 @@ mod tests {
             scheduler_args: vec![],
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 30,
-            workers_per_cell: 4,
+            workers_per_cgroup: 4,
             json: false,
             verbose: true,
             active_flags: None,
@@ -927,7 +933,7 @@ mod tests {
         let s = format!("{:?}", config);
         assert!(s.contains("scx_mitosis"), "must show scheduler_bin value");
         assert!(s.contains("30"), "must show duration_s value");
-        assert!(s.contains("4"), "must show workers_per_cell value");
+        assert!(s.contains("4"), "must show workers_per_cgroup value");
     }
 
     #[test]
@@ -937,7 +943,7 @@ mod tests {
             scheduler_args: vec!["--arg".into()],
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 10,
-            workers_per_cell: 4,
+            workers_per_cgroup: 4,
             json: true,
             verbose: true,
             active_flags: Some(vec![flags::LLC]),
@@ -955,7 +961,7 @@ mod tests {
         assert_eq!(c2.scheduler_bin, config.scheduler_bin);
         assert_eq!(c2.scheduler_args, config.scheduler_args);
         assert_eq!(c2.duration_s, config.duration_s);
-        assert_eq!(c2.workers_per_cell, config.workers_per_cell);
+        assert_eq!(c2.workers_per_cgroup, config.workers_per_cgroup);
         assert_eq!(c2.json, config.json);
         assert_eq!(c2.verbose, config.verbose);
         assert_eq!(c2.repro, config.repro);
@@ -981,6 +987,7 @@ mod tests {
                 worst_spread: 25.0,
                 worst_gap_ms: 3000,
                 worst_gap_cpu: 5,
+                ..Default::default()
             },
         };
         let r2 = r.clone();

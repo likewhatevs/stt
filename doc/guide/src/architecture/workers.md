@@ -48,6 +48,11 @@ pub struct WorkerReport {
     pub max_gap_ms: u64,
     pub max_gap_cpu: usize,
     pub max_gap_at_ms: u64,
+    pub wake_latencies_ns: Vec<u64>,
+    pub iterations: u64,
+    pub schedstat_run_delay_ns: u64,
+    pub schedstat_ctx_switches: u64,
+    pub schedstat_cpu_time_ns: u64,
 }
 ```
 
@@ -60,6 +65,25 @@ pub struct WorkerReport {
   inner spin batch for Bursty (1024 units per batch), and after each
   burst for PipeIo (`burst_iters` units per batch, 1024 by default)
 - Scheduling gaps are the longest intervals between iterations
+
+### Benchmarking fields
+
+Workers collect two categories of timing data:
+
+**Per-wakeup latency** (`wake_latencies_ns`): timestamp-based samples
+recorded around blocking operations. Populated for work types with a
+blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
+(futex wait), CacheYield (yield), CachePipe (pipe read). Each sample
+is `Instant::elapsed()` across the blocking call, in nanoseconds.
+
+**schedstat deltas**: read from `/proc/self/schedstat` at work-loop
+start and end. Three fields:
+- `schedstat_cpu_time_ns` -- delta of field 1 (on-CPU time)
+- `schedstat_run_delay_ns` -- delta of field 2 (time spent waiting
+  for a CPU)
+- `schedstat_ctx_switches` -- delta of field 3 (timeslice count)
+
+`iterations` counts outer-loop iterations.
 
 ## Work-conservation watchdog
 

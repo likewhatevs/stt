@@ -10,9 +10,9 @@ pub struct Scenario {
     pub description: &'static str,
     pub required_flags: &'static [&'static flags::FlagDecl],
     pub excluded_flags: &'static [&'static flags::FlagDecl],
-    pub num_cells: usize,
+    pub num_cgroups: usize,
     pub cpuset_mode: CpusetMode,
-    pub cell_works: Vec<CgroupWork>,
+    pub cgroup_works: Vec<CgroupWork>,
     pub action: Action,
 }
 ```
@@ -29,7 +29,7 @@ references that constrain which flag profiles are valid. Import path:
 `stt::scenario::flags::FlagDecl`. Example with constraints:
 `required_flags: &[&flags::LLC_DECL]`.
 
-**`num_cells`** -- number of cgroups to create.
+**`num_cgroups`** -- number of cgroups to create.
 
 **`cpuset_mode`** -- how to partition CPUs across cgroups:
 
@@ -44,16 +44,16 @@ references that constrain which flag profiles are valid. Import path:
 | `Holdback(f64)` | Reserve a fraction of CPUs, split the rest |
 
 **CPU pools**: `SplitHalf`, `Uneven`, and `SplitMisaligned` partition
-`usable_cpus()`, which reserves the last CPU for the root cell when
+`usable_cpus()`, which reserves the last CPU for the root cgroup when
 the topology has more than 2 CPUs (on 8 CPUs: usable = 0-6, CPU 7
 reserved). `Holdback` operates on `all_cpus()` (no reservation) --
 it applies its own holdback fraction to the full CPU set.
 
-**`cell_works`** -- per-cgroup workload definition:
+**`cgroup_works`** -- per-cgroup workload definition:
 
 ```rust,ignore
 pub struct CgroupWork {
-    pub workers: usize,          // 0 = use ctx.workers_per_cell
+    pub workers: usize,          // 0 = use ctx.workers_per_cgroup
     pub work_type: WorkType,
     pub policy: SchedPolicy,
     pub affinity: AffinityKind,
@@ -67,7 +67,7 @@ pub struct CgroupWork {
 | `Inherit` | No constraint (inherit from cgroup) |
 | `RandomSubset` | Random subset of cgroup's cpuset |
 | `LlcAligned` | CPUs in the worker's LLC |
-| `CrossCell` | All CPUs (crosses cgroup boundaries) |
+| `CrossCgroup` | All CPUs (crosses cgroup boundaries) |
 | `SingleCpu` | Pin to one CPU |
 
 **`action`** -- `Steady` (run workers for the duration) or

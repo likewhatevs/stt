@@ -309,7 +309,7 @@ impl TestTopology {
     }
 
     /// CPUs available for workload placement. Reserves the last CPU for
-    /// the root cell (cell 0) when the topology has more than 2 CPUs.
+    /// the root cgroup (cgroup 0) when the topology has more than 2 CPUs.
     pub fn usable_cpus(&self) -> &[usize] {
         if self.cpus.len() > 2 {
             &self.cpus[..self.cpus.len() - 1]

@@ -11,8 +11,8 @@ const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::N
 fn sched_basic_proportional(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cell_0").workers(ctx.workers_per_cell),
-            CgroupDef::named("cell_1").workers(ctx.workers_per_cell),
+            CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
+            CgroupDef::named("cg_1").workers(ctx.workers_per_cgroup),
         ]
         .into(),
         ops: vec![],
@@ -25,8 +25,8 @@ fn sched_basic_proportional(ctx: &Ctx) -> Result<VerifyResult> {
 fn sched_cpuset_split(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cell_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-            CgroupDef::named("cell_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
         ]
         .into(),
         ops: vec![],
@@ -39,12 +39,12 @@ fn sched_cpuset_split(ctx: &Ctx) -> Result<VerifyResult> {
 fn sched_dynamic_add(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
-            setup: vec![CgroupDef::named("cell_0")].into(),
+            setup: vec![CgroupDef::named("cg_0")].into(),
             ops: vec![],
             hold: HoldSpec::Frac(0.5),
         },
         Step {
-            setup: vec![CgroupDef::named("cell_1")].into(),
+            setup: vec![CgroupDef::named("cg_1")].into(),
             ops: vec![],
             hold: HoldSpec::Frac(0.5),
         },
@@ -65,7 +65,7 @@ fn sched_bpf_map_api_integration() {
 
     fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
         let steps = vec![Step {
-            setup: vec![CgroupDef::named("cell_0").workers(ctx.workers_per_cell)].into(),
+            setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
             ops: vec![],
             hold: HoldSpec::Frac(1.0),
         }];
@@ -105,7 +105,7 @@ fn sched_bpf_map_api_integration() {
         bpf_map_write: Some(&BPF_NOOP),
         performance_mode: false,
         duration_s: 0,
-        workers_per_cell: 0,
+        workers_per_cgroup: 0,
     };
 
     // The bpf_map_write thread exercises the full API:

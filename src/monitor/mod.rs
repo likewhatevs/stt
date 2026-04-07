@@ -488,7 +488,7 @@ impl MonitorThresholds {
     /// - imbalance 4.0: a scheduler that can't keep CPUs within 4x
     ///   load for `sustained_samples` consecutive reads has a real
     ///   balancing problem. Lower ratios (2-3) false-positive during
-    ///   cpuset transitions when cells are being created/destroyed.
+    ///   cpuset transitions when cgroups are being created/destroyed.
     /// - DSQ depth 50: local DSQ is a per-CPU overflow queue. Sustained
     ///   depth > 50 means the scheduler is not consuming dispatched tasks.
     ///   Transient spikes during cpuset changes are filtered by the

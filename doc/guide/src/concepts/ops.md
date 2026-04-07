@@ -38,7 +38,7 @@ pub enum CpusetSpec {
 ```
 
 All fractional specs operate on `usable_cpus()`, which reserves the
-last CPU for the root cell when the topology has more than 2 CPUs.
+last CPU for the root cgroup when the topology has more than 2 CPUs.
 
 ## CgroupDef
 
@@ -47,7 +47,7 @@ set cpuset, spawn workers. It is the primary way to define cgroups in
 ops-based scenarios.
 
 ```rust,ignore
-let def = CgroupDef::named("cell_0")
+let def = CgroupDef::named("cg_0")
     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
     .workers(4)
     .work_type(WorkType::CpuSpin);
@@ -153,15 +153,15 @@ let traverse = Traverse {
     phases: 5,
     phase_duration: Duration::from_millis(500),
     settle: Duration::from_millis(100),
-    persistent_cells: 1,
-    cell_workloads: vec![WorkloadConfig::default()],
+    persistent_cgroups: 1,
+    cgroup_workloads: vec![WorkloadConfig::default()],
 };
 let steps = traverse.generate(&ctx);
 execute_steps(&ctx, steps)?;
 ```
 
-Each phase randomly picks a cell count, adds/removes cgroups to reach
-it, applies a layout, and holds. `persistent_cells` cgroups are never
+Each phase randomly picks a cgroup count, adds/removes cgroups to reach
+it, applies a layout, and holds. `persistent_cgroups` cgroups are never
 removed.
 
 For a complete example using ops/steps and `Traverse`, see

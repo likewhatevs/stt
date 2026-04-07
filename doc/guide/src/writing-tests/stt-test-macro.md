@@ -119,7 +119,7 @@ attributes to filter which presets each test runs on. See
 | `replicas` | 1 | Number of times to run |
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages |
 | `duration_s` | 0 | Per-scenario duration override (0 = use default 2s) |
-| `workers_per_cell` | 0 | Workers per cgroup override (0 = use default 2) |
+| `workers_per_cgroup` | 0 | Workers per cgroup override (0 = use default 2) |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
 what `performance_mode` enables, prerequisites, and validation behavior.

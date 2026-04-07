@@ -113,11 +113,11 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<VerifyResult> {
     let last = all.len() - 1;
 
     let mut _guard = CgroupGroup::new(ctx.cgroups);
-    _guard.add_cgroup("cell_0", &all[..last].iter().copied().collect())?;
+    _guard.add_cgroup("cg_0", &all[..last].iter().copied().collect())?;
     thread::sleep(Duration::from_secs(3));
 
     let n_unpinned = (last * 3).max(8);
-    let mut h_cell = WorkloadHandle::spawn(&WorkloadConfig {
+    let mut h_cgroup = WorkloadHandle::spawn(&WorkloadConfig {
         num_workers: n_unpinned,
         work_type: WorkType::Bursty {
             burst_ms: 10,
@@ -125,7 +125,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<VerifyResult> {
         },
         ..Default::default()
     })?;
-    ctx.cgroups.move_tasks("cell_0", &h_cell.tids())?;
+    ctx.cgroups.move_tasks("cg_0", &h_cgroup.tids())?;
 
     let n_pinned = last.min(4);
     let mut pinned_handles = Vec::new();
@@ -139,18 +139,18 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<VerifyResult> {
             },
             ..Default::default()
         })?;
-        ctx.cgroups.move_tasks("cell_0", &h.tids())?;
+        ctx.cgroups.move_tasks("cg_0", &h.tids())?;
         pinned_handles.push(h);
     }
 
-    h_cell.start();
+    h_cgroup.start();
     for h in &mut pinned_handles {
         h.start();
     }
     thread::sleep(ctx.duration);
 
     let mut r = VerifyResult::pass();
-    r.merge(verify::verify_not_starved(&h_cell.stop_and_collect()));
+    r.merge(verify::verify_not_starved(&h_cgroup.stop_and_collect()));
     for h in pinned_handles {
         let reports = h.stop_and_collect();
         for w in &reports {
@@ -169,18 +169,18 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<VerifyResult> {
     Ok(r)
 }
 
-/// Uses spawn_diverse helper for 5 different workload types across cells.
-/// Dynamic cell count and workload rotation logic is not Op/Step compatible.
+/// Uses spawn_diverse helper for 5 different workload types across cgroups.
+/// Dynamic cgroup count and workload rotation logic is not Op/Step compatible.
 pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
-    // All workload types across 5 cells, no flags. Exercises base dispatch with every work pattern.
+    // All workload types across 5 cgroups, no flags. Exercises base dispatch with every work pattern.
     if ctx.topo.all_cpus().len() < 6 {
         return Ok(VerifyResult {
             passed: true,
-            details: vec!["skipped: need >=6 CPUs for 5 cells".into()],
+            details: vec!["skipped: need >=6 CPUs for 5 cgroups".into()],
             stats: Default::default(),
         });
     }
-    let names: Vec<String> = (0..5).map(|i| format!("cell_{i}")).collect();
+    let names: Vec<String> = (0..5).map(|i| format!("cg_{i}")).collect();
     let mut _guard = CgroupGroup::new(ctx.cgroups);
     for n in &names {
         _guard.add_cgroup_no_cpuset(n)?;
@@ -205,7 +205,7 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<VerifyResult> 
     }
     let last = all.len() - 1;
     let chunk = last / 3;
-    let names = ["cell_0", "cell_1", "cell_2"];
+    let names = ["cg_0", "cg_1", "cg_2"];
     let mut _guard = CgroupGroup::new(ctx.cgroups);
     for (i, n) in names.iter().enumerate() {
         let start = i * chunk;
@@ -218,17 +218,17 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<VerifyResult> 
     Ok(collect_all(handles))
 }
 
-/// spawn_diverse + dynamic cell add/remove mid-run.
+/// spawn_diverse + dynamic cgroup add/remove mid-run.
 pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
-    // Dynamic cell ops with diverse workloads.
+    // Dynamic cgroup ops with diverse workloads.
     if ctx.topo.all_cpus().len() < 5 {
         return Ok(VerifyResult {
             passed: true,
-            details: vec!["skipped: need >=5 CPUs for dynamic cell add".into()],
+            details: vec!["skipped: need >=5 CPUs for dynamic cgroup add".into()],
             stats: Default::default(),
         });
     }
-    let names: Vec<String> = (0..3).map(|i| format!("cell_{i}")).collect();
+    let names: Vec<String> = (0..3).map(|i| format!("cg_{i}")).collect();
     let mut _guard = CgroupGroup::new(ctx.cgroups);
     for n in &names {
         _guard.add_cgroup_no_cpuset(n)?;
@@ -237,8 +237,8 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<VerifyResult>
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let mut handles = spawn_diverse(ctx, &name_refs)?;
     thread::sleep(ctx.duration / 3);
-    // Add cells with more workload types
-    _guard.add_cgroup_no_cpuset("cell_3")?;
+    // Add cgroups with more workload types
+    _guard.add_cgroup_no_cpuset("cg_3")?;
     let mut h = WorkloadHandle::spawn(&WorkloadConfig {
         num_workers: 4,
         work_type: WorkType::Bursty {
@@ -247,16 +247,16 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<VerifyResult>
         },
         ..Default::default()
     })?;
-    ctx.cgroups.move_tasks("cell_3", &h.tids())?;
+    ctx.cgroups.move_tasks("cg_3", &h.tids())?;
     h.start();
     handles.push(h);
     thread::sleep(ctx.duration / 3);
-    // Remove cell_3 — guard still tracks it, but explicit removal
-    // during the scenario is fine; guard's drop will skip missing cells.
+    // Remove cg_3 — guard still tracks it, but explicit removal
+    // during the scenario is fine; guard's drop will skip missing cgroups.
     if let Some(h) = handles.pop() {
         h.stop_and_collect();
     }
-    let _ = ctx.cgroups.remove_cell("cell_3");
+    let _ = ctx.cgroups.remove_cgroup("cg_3");
     thread::sleep(ctx.duration / 3);
     Ok(collect_all(handles))
 }
@@ -282,7 +282,7 @@ pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
         });
     }
 
-    // Reserve one CPU from LLC0 for cell 0 to avoid cell-0-starvation.
+    // Reserve one CPU from LLC0 for cg_0 to avoid cg_0-starvation.
     let reserved = *llc0_full.iter().next().unwrap();
     let llc0: BTreeSet<usize> = llc0_full
         .iter()
@@ -293,31 +293,31 @@ pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
     if llc0.is_empty() {
         return Ok(VerifyResult {
             passed: true,
-            details: vec!["skipped: LLC0 too small after reserving for cell 0".into()],
+            details: vec!["skipped: LLC0 too small after reserving for cg_0".into()],
             stats: Default::default(),
         });
     }
 
-    // Two cells, initially each on its own LLC.
+    // Two cgroups, initially each on its own LLC.
     let mut _guard = CgroupGroup::new(ctx.cgroups);
-    _guard.add_cgroup("cell_0", &llc0)?;
-    _guard.add_cgroup("cell_1", &llc1)?;
+    _guard.add_cgroup("cg_0", &llc0)?;
+    _guard.add_cgroup("cg_1", &llc1)?;
     thread::sleep(Duration::from_secs(2));
 
-    // Oversubscribe both cells — lots of enqueue pressure.
+    // Oversubscribe both cgroups — lots of enqueue pressure.
     let n = llc0.len().max(4) * 8;
     let mut h0 = WorkloadHandle::spawn(&WorkloadConfig {
         num_workers: n,
         work_type: WorkType::Mixed,
         ..Default::default()
     })?;
-    ctx.cgroups.move_tasks("cell_0", &h0.tids())?;
+    ctx.cgroups.move_tasks("cg_0", &h0.tids())?;
     let mut h1 = WorkloadHandle::spawn(&WorkloadConfig {
         num_workers: n,
         work_type: WorkType::Mixed,
         ..Default::default()
     })?;
-    ctx.cgroups.move_tasks("cell_1", &h1.tids())?;
+    ctx.cgroups.move_tasks("cg_1", &h1.tids())?;
     h0.start();
     h1.start();
 
@@ -329,13 +329,13 @@ pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
     let mut flip = false;
     while Instant::now() < deadline {
         if flip {
-            // cell_0 on LLC1 CPUs, cell_1 on LLC0 CPUs — cross-LLC
-            let _ = ctx.cgroups.set_cpuset("cell_0", &cross0);
-            let _ = ctx.cgroups.set_cpuset("cell_1", &cross1);
+            // cg_0 on LLC1 CPUs, cg_1 on LLC0 CPUs — cross-LLC
+            let _ = ctx.cgroups.set_cpuset("cg_0", &cross0);
+            let _ = ctx.cgroups.set_cpuset("cg_1", &cross1);
         } else {
-            // cell_0 on LLC0 CPUs, cell_1 on LLC1 CPUs — aligned
-            let _ = ctx.cgroups.set_cpuset("cell_0", &llc0);
-            let _ = ctx.cgroups.set_cpuset("cell_1", &llc1);
+            // cg_0 on LLC0 CPUs, cg_1 on LLC1 CPUs — aligned
+            let _ = ctx.cgroups.set_cpuset("cg_0", &llc0);
+            let _ = ctx.cgroups.set_cpuset("cg_1", &llc1);
         }
         flip = !flip;
         // Short sleep to let rebalancing/reconfiguration run between flips.

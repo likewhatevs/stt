@@ -366,7 +366,7 @@ pub struct SttTestEntry {
     /// Override workload duration in seconds. 0 = use default (2s).
     pub duration_s: u64,
     /// Override workers per cgroup. 0 = use default (2).
-    pub workers_per_cell: u32,
+    pub workers_per_cgroup: u32,
 }
 
 /// Distributed slice collecting all `#[stt_test]` entries via linkme.
@@ -1153,8 +1153,8 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
     } else {
         Duration::from_secs(2)
     };
-    let workers_per_cell = if entry.workers_per_cell > 0 {
-        entry.workers_per_cell as usize
+    let workers_per_cgroup = if entry.workers_per_cgroup > 0 {
+        entry.workers_per_cgroup as usize
     } else {
         2
     };
@@ -1162,7 +1162,7 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
         cgroups: &cgroups,
         topo: &topo,
         duration,
-        workers_per_cell,
+        workers_per_cgroup,
         sched_pid,
         settle_ms: 500,
         work_type_override,
@@ -1847,7 +1847,7 @@ mod tests {
         bpf_map_write: None,
         performance_mode: false,
         duration_s: 0,
-        workers_per_cell: 0,
+        workers_per_cgroup: 0,
     };
 
     #[test]
@@ -2679,6 +2679,7 @@ mod tests {
                     max_gap_ms: 100,
                     max_gap_cpu: 1,
                     total_migrations: 5,
+                    ..Default::default()
                 }],
                 total_workers: 4,
                 total_cpus: 2,
@@ -2686,6 +2687,7 @@ mod tests {
                 worst_spread: 20.0,
                 worst_gap_ms: 100,
                 worst_gap_cpu: 1,
+                ..Default::default()
             },
             monitor: Some(MonitorSummary {
                 total_samples: 10,
@@ -3119,7 +3121,7 @@ mod tests {
             bpf_map_write: None,
             performance_mode: false,
             duration_s: 0,
-            workers_per_cell: 0,
+            workers_per_cgroup: 0,
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -3176,7 +3178,7 @@ mod tests {
             bpf_map_write: None,
             performance_mode: false,
             duration_s: 0,
-            workers_per_cell: 0,
+            workers_per_cgroup: 0,
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -3260,7 +3262,7 @@ mod tests {
             bpf_map_write: None,
             performance_mode: false,
             duration_s: 0,
-            workers_per_cell: 0,
+            workers_per_cgroup: 0,
         }
     }
 
@@ -3296,7 +3298,7 @@ mod tests {
             bpf_map_write: None,
             performance_mode: false,
             duration_s: 0,
-            workers_per_cell: 0,
+            workers_per_cgroup: 0,
         }
     }
 

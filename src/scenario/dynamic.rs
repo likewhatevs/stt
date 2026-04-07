@@ -1,5 +1,5 @@
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
-use super::{Ctx, collect_all, dfl_wl, setup_cells};
+use super::{Ctx, collect_all, dfl_wl, setup_cgroups};
 use crate::verify::VerifyResult;
 use crate::workload::*;
 use anyhow::Result;
@@ -16,7 +16,7 @@ pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<VerifyResult> {
         });
     }
 
-    let extra_names: &[&str] = &["cell_2", "cell_3"];
+    let extra_names: &[&str] = &["cg_2", "cg_3"];
     let phase2_setup: Vec<CgroupDef> = extra_names[..max_new]
         .iter()
         .map(|&name| CgroupDef::named(name))
@@ -24,7 +24,7 @@ pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<VerifyResult> {
 
     let steps = vec![
         Step {
-            setup: vec![CgroupDef::named("cell_0"), CgroupDef::named("cell_1")].into(),
+            setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
             ops: vec![],
             hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
         },
@@ -49,14 +49,14 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<VerifyResult> {
     }
     let half = n / 2;
 
-    let cell_names: &[&str] = &["cell_0", "cell_1", "cell_2", "cell_3"];
-    let phase1_setup: Vec<CgroupDef> = cell_names[..n]
+    let cgroup_names: &[&str] = &["cg_0", "cg_1", "cg_2", "cg_3"];
+    let phase1_setup: Vec<CgroupDef> = cgroup_names[..n]
         .iter()
         .map(|&name| CgroupDef::named(name))
         .collect();
 
     let mut phase2_ops = Vec::new();
-    for &name in &cell_names[half..n] {
+    for &name in &cgroup_names[half..n] {
         phase2_ops.push(Op::StopCgroup {
             cgroup: name.into(),
         });
@@ -81,14 +81,14 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<VerifyResult> {
 
 /// Rapid create/destroy cycling. Custom logic for dynamic naming.
 pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<VerifyResult> {
-    let (handles, _guard) = setup_cells(ctx, 2, &dfl_wl(ctx))?;
+    let (handles, _guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
     let deadline = Instant::now() + ctx.duration;
     let mut i = 0;
     while Instant::now() < deadline {
         let n = format!("ephemeral_{i}");
-        ctx.cgroups.create_cell(&n)?;
+        ctx.cgroups.create_cgroup(&n)?;
         thread::sleep(Duration::from_millis(100));
-        let _ = ctx.cgroups.remove_cell(&n);
+        let _ = ctx.cgroups.remove_cgroup(&n);
         i += 1;
     }
     Ok(collect_all(handles))
@@ -106,8 +106,8 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
             setup: vec![
-                CgroupDef::named("cell_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 3 }),
-                CgroupDef::named("cell_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 3 }),
+                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 3 }),
+                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 3 }),
             ]
             .into(),
             ops: vec![],
@@ -115,7 +115,7 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<VerifyResult> {
         },
         Step {
             setup: vec![
-                CgroupDef::named("cell_2").with_cpuset(CpusetSpec::Disjoint { index: 2, of: 3 }),
+                CgroupDef::named("cg_2").with_cpuset(CpusetSpec::Disjoint { index: 2, of: 3 }),
             ]
             .into(),
             ops: vec![],
@@ -125,10 +125,10 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<VerifyResult> {
             setup: vec![].into(),
             ops: vec![
                 Op::StopCgroup {
-                    cgroup: "cell_2".into(),
+                    cgroup: "cg_2".into(),
                 },
                 Op::RemoveCgroup {
-                    name: "cell_2".into(),
+                    name: "cg_2".into(),
                 },
             ],
             hold: HoldSpec::Frac(1.0 / 3.0),
@@ -142,8 +142,8 @@ pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     let steps = vec![
         Step {
             setup: vec![
-                CgroupDef::named("cell_0").workers(8),
-                CgroupDef::named("cell_1")
+                CgroupDef::named("cg_0").workers(8),
+                CgroupDef::named("cg_1")
                     .workers(2)
                     .work_type(WorkType::Bursty {
                         burst_ms: 50,
@@ -155,7 +155,7 @@ pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
             hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration / 2),
         },
         Step {
-            setup: vec![CgroupDef::named("cell_2").workers(4)].into(),
+            setup: vec![CgroupDef::named("cg_2").workers(4)].into(),
             ops: vec![],
             hold: HoldSpec::Frac(0.5),
         },

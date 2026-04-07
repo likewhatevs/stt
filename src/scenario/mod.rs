@@ -231,11 +231,11 @@ pub enum Action {
 /// Specifies the number of workers, their [`WorkType`], scheduling
 /// policy, and affinity for a single cgroup in a [`Scenario`].
 ///
-/// When a scenario has fewer `CgroupWork` entries than `num_cells`,
-/// the first entry is reused for remaining cells.
+/// When a scenario has fewer `CgroupWork` entries than `num_cgroups`,
+/// the first entry is reused for remaining cgroups.
 #[derive(Clone)]
 pub struct CgroupWork {
-    /// Number of workers. 0 means use `Ctx::workers_per_cell`.
+    /// Number of workers. 0 means use `Ctx::workers_per_cgroup`.
     pub workers: usize,
     /// What each worker process does.
     pub work_type: WorkType,
@@ -258,7 +258,7 @@ pub enum AffinityKind {
     /// Pin to the CPUs in the worker's LLC.
     LlcAligned,
     /// Pin to all CPUs (crosses cgroup boundaries).
-    CrossCell,
+    CrossCgroup,
     /// Pin to a single CPU.
     SingleCpu,
 }
@@ -298,11 +298,11 @@ pub struct Scenario {
     /// Flags that must not be present in any run.
     pub excluded_flags: &'static [&'static flags::FlagDecl],
     /// Number of cgroups to create.
-    pub num_cells: usize,
+    pub num_cgroups: usize,
     /// How to partition CPUs across cgroups.
     pub cpuset_mode: CpusetMode,
     /// Per-cgroup workload definitions.
-    pub cell_works: Vec<CgroupWork>,
+    pub cgroup_works: Vec<CgroupWork>,
     /// Execution mode: steady-state or custom logic.
     pub action: Action,
 }
@@ -335,7 +335,7 @@ impl Scenario {
 }
 
 // ---------------------------------------------------------------------------
-// RAII cell group
+// RAII cgroup group
 // ---------------------------------------------------------------------------
 
 /// RAII guard that removes cgroups on drop.
@@ -344,7 +344,7 @@ impl Scenario {
 /// between cgroup creation and cleanup.
 pub struct CgroupGroup<'a> {
     cgroups: &'a CgroupManager,
-    cells: Vec<String>,
+    names: Vec<String>,
 }
 
 impl<'a> CgroupGroup<'a> {
@@ -353,37 +353,37 @@ impl<'a> CgroupGroup<'a> {
     pub fn new(cgroups: &'a CgroupManager) -> Self {
         Self {
             cgroups,
-            cells: Vec::new(),
+            names: Vec::new(),
         }
     }
 
     /// Create a cgroup and set its cpuset. The cgroup is tracked for cleanup on drop.
     #[allow(dead_code)]
     pub fn add_cgroup(&mut self, name: &str, cpuset: &BTreeSet<usize>) -> Result<()> {
-        self.cgroups.create_cell(name)?;
+        self.cgroups.create_cgroup(name)?;
         self.cgroups.set_cpuset(name, cpuset)?;
-        self.cells.push(name.to_string());
+        self.names.push(name.to_string());
         Ok(())
     }
 
     /// Create a cgroup without a cpuset. The cgroup is tracked for cleanup on drop.
     pub fn add_cgroup_no_cpuset(&mut self, name: &str) -> Result<()> {
-        self.cgroups.create_cell(name)?;
-        self.cells.push(name.to_string());
+        self.cgroups.create_cgroup(name)?;
+        self.names.push(name.to_string());
         Ok(())
     }
 
     /// Names of all tracked cgroups.
     #[allow(dead_code)]
     pub fn names(&self) -> &[String] {
-        &self.cells
+        &self.names
     }
 }
 
 impl Drop for CgroupGroup<'_> {
     fn drop(&mut self) {
-        for name in &self.cells {
-            let _ = self.cgroups.remove_cell(name);
+        for name in &self.names {
+            let _ = self.cgroups.remove_cgroup(name);
         }
     }
 }
@@ -398,14 +398,14 @@ impl Drop for CgroupGroup<'_> {
 /// test configuration. Custom scenarios (`Action::Custom`) receive
 /// this as their sole parameter.
 pub struct Ctx<'a> {
-    /// Cgroup filesystem manager for creating/removing cells.
+    /// Cgroup filesystem manager for creating/removing cgroups.
     pub cgroups: &'a CgroupManager,
     /// VM CPU topology.
     pub topo: &'a TestTopology,
     /// How long to run the workload.
     pub duration: Duration,
     /// Default number of workers per cgroup.
-    pub workers_per_cell: usize,
+    pub workers_per_cgroup: usize,
     /// PID of the running scheduler (for liveness checks).
     pub sched_pid: u32,
     /// Milliseconds to wait after cgroup creation for scheduler stabilization.
@@ -421,7 +421,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
         return f(ctx);
     }
 
-    let cpusets = resolve_cpusets(&scenario.cpuset_mode, scenario.num_cells, ctx.topo);
+    let cpusets = resolve_cpusets(&scenario.cpuset_mode, scenario.num_cgroups, ctx.topo);
 
     // Skip if topology doesn't support the test
     if let Some(ref cs) = cpusets
@@ -434,8 +434,8 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
         });
     }
 
-    let names: Vec<String> = (0..scenario.num_cells)
-        .map(|i| format!("cell_{i}"))
+    let names: Vec<String> = (0..scenario.num_cgroups)
+        .map(|i| format!("cg_{i}"))
         .collect();
     let mut cgroup_guard = CgroupGroup::new(ctx.cgroups);
     for (i, name) in names.iter().enumerate() {
@@ -444,24 +444,24 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
             ctx.cgroups.set_cpuset(name, &cs[i])?;
         }
     }
-    tracing::debug!(cells = scenario.num_cells, "cells created, settling");
+    tracing::debug!(cgroups = scenario.num_cgroups, "cgroups created, settling");
     thread::sleep(Duration::from_millis(ctx.settle_ms));
 
-    // Bail early if the scheduler died (e.g. apply_cell_config failure)
+    // Bail early if the scheduler died after cgroup creation
     if !process_alive(ctx.sched_pid) {
-        anyhow::bail!("scheduler died after cell creation");
+        anyhow::bail!("scheduler died after cgroup creation");
     }
 
     let mut handles = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let cw = scenario
-            .cell_works
+            .cgroup_works
             .get(i)
-            .or(scenario.cell_works.first())
+            .or(scenario.cgroup_works.first())
             .cloned()
             .unwrap_or_default();
         let n = if cw.workers == 0 {
-            ctx.workers_per_cell
+            ctx.workers_per_cgroup
         } else {
             cw.workers
         };
@@ -485,7 +485,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
             sched_policy: cw.policy,
         };
         let h = WorkloadHandle::spawn(&wl)?;
-        tracing::debug!(cell = %name, workers = n, tids = h.tids().len(), "spawned workers");
+        tracing::debug!(cgroup = %name, workers = n, tids = h.tids().len(), "spawned workers");
         for tid in h.tids() {
             ctx.cgroups.move_task(name, tid)?;
         }
@@ -560,7 +560,7 @@ fn resolve_cpusets(
             if llcs.len() < 2 {
                 return Some(vec![BTreeSet::new()]);
             }
-            // Remove last CPU from last LLC to reserve for cell 0
+            // Remove last CPU from last LLC to reserve for cgroup 0
             let mut sets: Vec<BTreeSet<usize>> = llcs[..n.min(llcs.len())].to_vec();
             if let Some(last) = sets.last_mut()
                 && last.len() > 1
@@ -609,25 +609,25 @@ fn resolve_cpusets(
 fn resolve_affinity_kind(
     kind: &AffinityKind,
     cpusets: Option<&[BTreeSet<usize>]>,
-    cell_idx: usize,
+    cgroup_idx: usize,
     topo: &TestTopology,
 ) -> AffinityMode {
     match kind {
         AffinityKind::Inherit => AffinityMode::None,
         AffinityKind::RandomSubset => {
             let pool = cpusets
-                .map(|cs| cs[cell_idx].clone())
+                .map(|cs| cs[cgroup_idx].clone())
                 .unwrap_or_else(|| topo.all_cpus().iter().copied().collect());
             let count = (pool.len() / 2).max(1);
             AffinityMode::Random { from: pool, count }
         }
         AffinityKind::LlcAligned => {
-            let idx = cell_idx % topo.num_llcs();
+            let idx = cgroup_idx % topo.num_llcs();
             AffinityMode::Fixed(topo.llc_aligned_cpuset(idx))
         }
-        AffinityKind::CrossCell => AffinityMode::Fixed(topo.all_cpus().iter().copied().collect()),
+        AffinityKind::CrossCgroup => AffinityMode::Fixed(topo.all_cpus().iter().copied().collect()),
         AffinityKind::SingleCpu => {
-            let cpu = topo.all_cpus()[cell_idx % topo.total_cpus()];
+            let cpu = topo.all_cpus()[cgroup_idx % topo.total_cpus()];
             AffinityMode::SingleCpu(cpu)
         }
     }
@@ -642,23 +642,23 @@ fn resolve_affinity_kind(
 /// Returns the worker handles and an RAII [`CgroupGroup`] that removes
 /// the cgroups on drop. Workers are moved into their target cgroups
 /// before being signaled to start.
-pub fn setup_cells<'a>(
+pub fn setup_cgroups<'a>(
     ctx: &'a Ctx,
     n: usize,
     wl: &WorkloadConfig,
 ) -> Result<(Vec<WorkloadHandle>, CgroupGroup<'a>)> {
     let mut guard = CgroupGroup::new(ctx.cgroups);
     for i in 0..n {
-        guard.add_cgroup_no_cpuset(&format!("cell_{i}"))?;
+        guard.add_cgroup_no_cpuset(&format!("cg_{i}"))?;
     }
     thread::sleep(Duration::from_millis(ctx.settle_ms));
     if !process_alive(ctx.sched_pid) {
-        anyhow::bail!("scheduler died after cell creation");
+        anyhow::bail!("scheduler died after cgroup creation");
     }
     let handles: Result<Vec<_>> = (0..n)
         .map(|i| {
             let h = WorkloadHandle::spawn(wl)?;
-            ctx.cgroups.move_tasks(&format!("cell_{i}"), &h.tids())?;
+            ctx.cgroups.move_tasks(&format!("cg_{i}"), &h.tids())?;
             Ok(h)
         })
         .collect();
@@ -680,10 +680,10 @@ pub fn collect_all(handles: Vec<WorkloadHandle>) -> VerifyResult {
     r
 }
 
-/// Default [`WorkloadConfig`] with `ctx.workers_per_cell` workers.
+/// Default [`WorkloadConfig`] with `ctx.workers_per_cgroup` workers.
 pub fn dfl_wl(ctx: &Ctx) -> WorkloadConfig {
     WorkloadConfig {
-        num_workers: ctx.workers_per_cell,
+        num_workers: ctx.workers_per_cgroup,
         ..Default::default()
     }
 }
@@ -698,8 +698,8 @@ pub fn split_half(ctx: &Ctx) -> (BTreeSet<usize>, BTreeSet<usize>) {
     )
 }
 
-/// Spawn diverse workloads across N cells: CpuSpin, Bursty, IoSync, Mixed, YieldHeavy.
-pub fn spawn_diverse(ctx: &Ctx, cell_names: &[&str]) -> Result<Vec<WorkloadHandle>> {
+/// Spawn diverse workloads across N cgroups: CpuSpin, Bursty, IoSync, Mixed, YieldHeavy.
+pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHandle>> {
     let types = [
         WorkType::CpuSpin,
         WorkType::Bursty {
@@ -711,12 +711,12 @@ pub fn spawn_diverse(ctx: &Ctx, cell_names: &[&str]) -> Result<Vec<WorkloadHandl
         WorkType::YieldHeavy,
     ];
     let mut handles = Vec::new();
-    for (i, name) in cell_names.iter().enumerate() {
+    for (i, name) in cgroup_names.iter().enumerate() {
         let wt = types[i % types.len()];
         let n = if matches!(wt, WorkType::IoSync) {
             2
         } else {
-            ctx.workers_per_cell
+            ctx.workers_per_cgroup
         };
         let mut h = WorkloadHandle::spawn(&WorkloadConfig {
             num_workers: n,
@@ -839,7 +839,7 @@ mod tests {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         let r = resolve_cpusets(&CpusetMode::SplitHalf, 2, &t).unwrap();
         assert_eq!(r.len(), 2);
-        // Last CPU reserved for cell 0 → 7 usable
+        // Last CPU reserved for cgroup 0 → 7 usable
         let total: usize = r.iter().map(|s| s.len()).sum();
         assert_eq!(total, 7);
     }
@@ -895,9 +895,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_affinity_cross_cell() {
+    fn resolve_affinity_cross_cgroup() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_kind(&AffinityKind::CrossCell, None, 0, &t) {
+        match resolve_affinity_kind(&AffinityKind::CrossCgroup, None, 0, &t) {
             AffinityMode::Fixed(cpus) => assert_eq!(cpus.len(), 8),
             other => panic!("expected Fixed, got {:?}", other),
         }
@@ -1092,13 +1092,13 @@ mod tests {
             cgroups: &ctx_cg,
             topo: &t,
             duration: std::time::Duration::from_secs(1),
-            workers_per_cell: 4,
+            workers_per_cgroup: 4,
             sched_pid: 0,
             settle_ms: 3000,
             work_type_override: None,
         };
         let (a, b) = split_half(&ctx);
-        // Last CPU reserved for cell 0 → 7 usable, split 3/4
+        // Last CPU reserved for cgroup 0 → 7 usable, split 3/4
         assert_eq!(a.len() + b.len(), 7);
         assert!(a.intersection(&b).count() == 0, "halves should not overlap");
     }
@@ -1111,7 +1111,7 @@ mod tests {
             cgroups: &ctx_cg,
             topo: &t,
             duration: std::time::Duration::from_secs(1),
-            workers_per_cell: 1,
+            workers_per_cgroup: 1,
             sched_pid: 0,
             settle_ms: 3000,
             work_type_override: None,
@@ -1128,7 +1128,7 @@ mod tests {
             cgroups: &ctx_cg,
             topo: &t,
             duration: std::time::Duration::from_secs(1),
-            workers_per_cell: 7,
+            workers_per_cgroup: 7,
             sched_pid: 0,
             settle_ms: 3000,
             work_type_override: None,
@@ -1271,7 +1271,7 @@ mod tests {
     #[test]
     fn resolve_affinity_single_cpu_wraps() {
         let t = crate::topology::TestTopology::synthetic(4, 1);
-        // cell_idx=5 with 4 CPUs should wrap via modulo
+        // cgroup_idx=5 with 4 CPUs should wrap via modulo
         match resolve_affinity_kind(&AffinityKind::SingleCpu, None, 5, &t) {
             AffinityMode::SingleCpu(c) => assert_eq!(c, 1), // 5 % 4 = 1
             other => panic!("expected SingleCpu, got {:?}", other),
@@ -1281,7 +1281,7 @@ mod tests {
     #[test]
     fn resolve_affinity_llc_aligned_wraps() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        // cell_idx=3 with 2 LLCs should wrap via modulo
+        // cgroup_idx=3 with 2 LLCs should wrap via modulo
         match resolve_affinity_kind(&AffinityKind::LlcAligned, None, 3, &t) {
             AffinityMode::Fixed(cpus) => {
                 // 3 % 2 = 1 -> LLC 1

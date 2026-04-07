@@ -64,7 +64,7 @@ pub enum Op {
         cgroup: Cow<'static, str>,
         cpus: BTreeSet<usize>,
     },
-    /// Spawn workers in the parent cgroup (not in a managed cell).
+    /// Spawn workers in the parent cgroup (not in a managed cgroup).
     SpawnHost {
         workload: WorkloadConfig,
     },
@@ -119,7 +119,7 @@ pub struct CgroupDef {
 
 impl CgroupDef {
     /// Create a CgroupDef with defaults (CpuSpin, Normal, 0 workers).
-    /// 0 workers means use ctx.workers_per_cell at execution time.
+    /// 0 workers means use ctx.workers_per_cgroup at execution time.
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),
@@ -134,7 +134,7 @@ impl CgroupDef {
         self
     }
 
-    /// Set the number of workers. 0 means use `ctx.workers_per_cell`.
+    /// Set the number of workers. 0 means use `ctx.workers_per_cgroup`.
     pub fn workers(mut self, n: usize) -> Self {
         self.num_workers = n;
         self
@@ -164,7 +164,7 @@ impl CgroupDef {
 impl Default for CgroupDef {
     fn default() -> Self {
         Self {
-            name: Cow::Borrowed("cell_0"),
+            name: Cow::Borrowed("cg_0"),
             cpuset: None,
             num_workers: 0,
             work_type: WorkType::CpuSpin,
@@ -565,7 +565,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
         }
         let n = if def.num_workers == 0 {
-            ctx.workers_per_cell
+            ctx.workers_per_cgroup
         } else {
             def.num_workers
         };
@@ -605,7 +605,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
             Op::RemoveCgroup { name } => {
                 // Stop workers in this cgroup first.
                 state.handles.retain(|(n, _)| n.as_str() != *name);
-                let _ = ctx.cgroups.remove_cell(name);
+                let _ = ctx.cgroups.remove_cgroup(name);
             }
             Op::SetCpuset { cgroup, cpus } => {
                 let resolved = cpus.resolve(ctx);
@@ -662,7 +662,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
             Op::SpawnHost { workload } => {
                 let mut h = WorkloadHandle::spawn(workload)?;
                 h.start();
-                // Empty string key: workers in parent cgroup, not a managed cell.
+                // Empty string key: workers in parent cgroup, not a managed cgroup.
                 state.handles.push((String::new(), h));
             }
             Op::MoveAllTasks { from, to } => {
@@ -729,7 +729,7 @@ fn collect_result(
     for (_name, h) in handles {
         let reports = h.stop_and_collect();
         match verify {
-            Some(v) => result.merge(v.verify_cell(&reports, None)),
+            Some(v) => result.merge(v.verify_cgroup(&reports, None)),
             None => result.merge(verify::verify_not_starved(&reports)),
         }
     }
@@ -750,16 +750,16 @@ pub enum Layout {
 
 /// Generates a random walk of cgroup topology changes across phases.
 ///
-/// Each phase picks a random (cell_count, layout) pair, generates SetCpuset
+/// Each phase picks a random (cgroup_count, layout) pair, generates SetCpuset
 /// ops, spawns workers in new cgroups, and holds for phase_duration.
 ///
-/// `persistent_cells` cells are created in phase 0 and never removed.
-/// Only cells at index >= `persistent_cells` are added/removed by the
-/// random walk. The `cgroup_count` range applies to the total cell count
+/// `persistent_cgroups` cgroups are created in phase 0 and never removed.
+/// Only cgroups at index >= `persistent_cgroups` are added/removed by the
+/// random walk. The `cgroup_count` range applies to the total cgroup count
 /// (persistent + ephemeral).
 ///
-/// `cell_workloads` controls the workload for each cell index. If the
-/// vec has fewer entries than the cell index, the last entry repeats.
+/// `cgroup_workloads` controls the workload for each cgroup index. If the
+/// vec has fewer entries than the cgroup index, the last entry repeats.
 #[allow(dead_code)]
 pub struct Traverse {
     pub seed: Option<u64>,
@@ -768,10 +768,10 @@ pub struct Traverse {
     pub phases: usize,
     pub phase_duration: Duration,
     pub settle: Duration,
-    /// Cells [0..persistent_cells) are created once and never removed.
-    pub persistent_cells: usize,
-    /// Workload config per cell index. Last entry repeats for higher indices.
-    pub cell_workloads: Vec<WorkloadConfig>,
+    /// Cgroups [0..persistent_cgroups) are created once and never removed.
+    pub persistent_cgroups: usize,
+    /// Workload config per cgroup index. Last entry repeats for higher indices.
+    pub cgroup_workloads: Vec<WorkloadConfig>,
 }
 
 #[allow(dead_code)]
@@ -791,7 +791,7 @@ impl Traverse {
         let mut live_cgroups: Vec<Cow<'static, str>> = Vec::new();
 
         let names: Vec<Cow<'static, str>> = (0..max_cgroups)
-            .map(|i| Cow::Owned(format!("cell_{i}")))
+            .map(|i| Cow::Owned(format!("cg_{i}")))
             .collect();
 
         for phase in 0..self.phases {
@@ -807,9 +807,9 @@ impl Traverse {
                 let idx = live_cgroups.len();
                 let name = names[idx].clone();
                 let wl = self
-                    .cell_workloads
+                    .cgroup_workloads
                     .get(idx)
-                    .or(self.cell_workloads.last())
+                    .or(self.cgroup_workloads.last())
                     .cloned()
                     .unwrap_or_default();
                 ops.push(Op::AddCgroup { name: name.clone() });
@@ -820,8 +820,9 @@ impl Traverse {
                 live_cgroups.push(name);
             }
 
-            // Remove cgroups if needed (never remove persistent cells).
-            while live_cgroups.len() > target_count && live_cgroups.len() > self.persistent_cells {
+            // Remove cgroups if needed (never remove persistent cgroups).
+            while live_cgroups.len() > target_count && live_cgroups.len() > self.persistent_cgroups
+            {
                 if let Some(name) = live_cgroups.pop() {
                     ops.push(Op::StopCgroup {
                         cgroup: name.clone(),
@@ -1026,7 +1027,7 @@ mod tests {
             cgroups: &cgroups,
             topo: &topo,
             duration: Duration::from_secs(10),
-            workers_per_cell: 4,
+            workers_per_cgroup: 4,
             sched_pid: 0,
             settle_ms: 1000,
             work_type_override: None,
@@ -1070,7 +1071,7 @@ mod tests {
             cgroups,
             topo,
             duration: Duration::from_secs(10),
-            workers_per_cell: 4,
+            workers_per_cgroup: 4,
             sched_pid: 0,
             settle_ms: 0,
             work_type_override: None,
@@ -1301,8 +1302,8 @@ mod tests {
             phases: 3,
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
-            persistent_cells: 0,
-            cell_workloads: vec![WorkloadConfig::default()],
+            persistent_cgroups: 0,
+            cgroup_workloads: vec![WorkloadConfig::default()],
         };
         let steps = t.generate(&ctx);
         assert_eq!(steps.len(), 3);
@@ -1322,8 +1323,8 @@ mod tests {
             phases: 5,
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
-            persistent_cells: 1,
-            cell_workloads: vec![WorkloadConfig::default()],
+            persistent_cgroups: 1,
+            cgroup_workloads: vec![WorkloadConfig::default()],
         };
         let steps1 = t.generate(&ctx);
         let steps2 = t.generate(&ctx);
@@ -1338,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn traverse_generate_persistent_cells_preserved() {
+    fn traverse_generate_persistent_cgroups_preserved() {
         let (cg, topo) = make_ctx(1, 8, 1);
         let ctx = ctx_from(&cg, &topo);
         let t = Traverse {
@@ -1348,19 +1349,19 @@ mod tests {
             phases: 5,
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
-            persistent_cells: 2,
-            cell_workloads: vec![WorkloadConfig::default()],
+            persistent_cgroups: 2,
+            cgroup_workloads: vec![WorkloadConfig::default()],
         };
         let steps = t.generate(&ctx);
-        // Every phase should have at least persistent_cells worth of SetCpuset ops
-        // (cell_0, cell_1 are never removed).
+        // Every phase should have at least persistent_cgroups worth of SetCpuset ops
+        // (cg_0, cg_1 are never removed).
         for step in &steps {
             let remove_ops: Vec<&Op> = step.ops.iter()
-                .filter(|op| matches!(op, Op::RemoveCgroup { name } if name == "cell_0" || name == "cell_1"))
+                .filter(|op| matches!(op, Op::RemoveCgroup { name } if name == "cg_0" || name == "cg_1"))
                 .collect();
             assert!(
                 remove_ops.is_empty(),
-                "persistent cells should never be removed"
+                "persistent cgroups should never be removed"
             );
         }
     }
@@ -1387,7 +1388,7 @@ mod tests {
     #[test]
     fn cgroup_def_default() {
         let d = CgroupDef::default();
-        assert_eq!(d.name, "cell_0");
+        assert_eq!(d.name, "cg_0");
         assert!(d.cpuset.is_none());
         assert_eq!(d.num_workers, 0);
         assert!(!d.swappable);

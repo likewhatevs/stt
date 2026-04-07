@@ -62,7 +62,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut watchdog_timeout_jiffies: u64 = 0;
     let mut performance_mode: bool = false;
     let mut duration_s: u64 = 0;
-    let mut workers_per_cell: u32 = 0;
+    let mut workers_per_cgroup: u32 = 0;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -130,7 +130,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "max_gap_ms"
                     | "watchdog_timeout_jiffies"
                     | "duration_s"
-                    | "workers_per_cell"
+                    | "workers_per_cgroup"
                     | "max_local_dsq_depth"
                     | "min_sockets"
                     | "min_llcs"
@@ -196,8 +196,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .base10_parse::<u64>()
                                     .unwrap_or_else(|e| panic!("{e}"))
                             }
-                            "workers_per_cell" => {
-                                workers_per_cell = lit_int
+                            "workers_per_cgroup" => {
+                                workers_per_cgroup = lit_int
                                     .base10_parse::<u32>()
                                     .unwrap_or_else(|e| panic!("{e}"))
                             }
@@ -314,7 +314,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_jiffies, performance_mode, duration_s, workers_per_cell"),
+                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_jiffies, performance_mode, duration_s, workers_per_cgroup"),
                         )
                         .to_compile_error()
                         .into();
@@ -449,6 +449,9 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 max_spread_pct: #spread_tokens,
                 max_throughput_cv: #throughput_cv_tokens,
                 min_work_rate: #work_rate_tokens,
+                max_p99_wake_latency_ns: None,
+                max_wake_latency_cv: None,
+                min_iteration_rate: None,
                 max_imbalance_ratio: #imbalance_tokens,
                 max_local_dsq_depth: #dsq_tokens,
                 fail_on_stall: #stall_tokens,
@@ -467,7 +470,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             bpf_map_write: None,
             performance_mode: #performance_mode,
             duration_s: #duration_s,
-            workers_per_cell: #workers_per_cell,
+            workers_per_cgroup: #workers_per_cgroup,
         };
 
         #[test]
