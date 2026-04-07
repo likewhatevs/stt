@@ -37,10 +37,8 @@ enum Command {
     Cleanup(CleanupArgs),
     /// Run integration tests via nextest with sidecar collection
     Test(TestArgs),
-    /// Build a kernel with stt's config fragment
-    BuildKernel(BuildKernelArgs),
-    /// Clean a kernel source tree (make mrproper)
-    CleanKernel(CleanKernelArgs),
+    /// Kernel build, clean, and config management
+    Kernel(KernelArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -199,14 +197,23 @@ struct TestArgs {
 }
 
 #[derive(Debug, Parser)]
-struct BuildKernelArgs {
-    /// Path to linux source tree (default: current directory)
-    #[clap(default_value = ".")]
-    path: String,
+struct KernelArgs {
+    #[clap(subcommand)]
+    action: KernelAction,
 }
 
 #[derive(Debug, Parser)]
-struct CleanKernelArgs {
+enum KernelAction {
+    /// Build a kernel with stt's config fragment
+    Build(KernelPathArg),
+    /// Clean a kernel source tree (make mrproper)
+    Clean(KernelPathArg),
+    /// Print stt's kernel config fragment to stdout
+    Kconfig,
+}
+
+#[derive(Debug, Parser)]
+struct KernelPathArg {
     /// Path to linux source tree (default: current directory)
     #[clap(default_value = ".")]
     path: String,
@@ -385,8 +392,14 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Test(a) => cmd_test(a),
-        Command::BuildKernel(a) => cmd_build_kernel(a),
-        Command::CleanKernel(a) => cmd_clean_kernel(a),
+        Command::Kernel(k) => match k.action {
+            KernelAction::Build(a) => cmd_build_kernel(a),
+            KernelAction::Clean(a) => cmd_clean_kernel(a),
+            KernelAction::Kconfig => {
+                print!("{KERNEL_CONFIG}");
+                Ok(())
+            }
+        },
     }
 }
 
@@ -1336,7 +1349,7 @@ fn run_step(label: &str, cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_build_kernel(args: BuildKernelArgs) -> Result<()> {
+fn cmd_build_kernel(args: KernelPathArg) -> Result<()> {
     let path = std::path::Path::new(&args.path)
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("{}: {e}", args.path))?;
@@ -1373,7 +1386,7 @@ fn cmd_build_kernel(args: BuildKernelArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_clean_kernel(args: CleanKernelArgs) -> Result<()> {
+fn cmd_clean_kernel(args: KernelPathArg) -> Result<()> {
     let path = std::path::Path::new(&args.path)
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("{}: {e}", args.path))?;
