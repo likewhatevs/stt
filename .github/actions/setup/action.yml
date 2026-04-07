@@ -44,6 +44,7 @@ runs:
           automake \
           libtool \
           gettext \
+          autopoint \
           libelf-dev \
           libcap-dev \
           binutils-dev \
