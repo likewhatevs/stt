@@ -2,7 +2,7 @@
 
 `WorkType` controls what each worker process does during a scenario.
 
-```rust
+```rust,ignore
 pub enum WorkType {
     CpuSpin,
     YieldHeavy,
@@ -45,7 +45,7 @@ even `num_workers`.
 
 Workers can run under different Linux scheduling policies:
 
-```rust
+```rust,ignore
 pub enum SchedPolicy {
     Normal,
     Batch,

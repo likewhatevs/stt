@@ -17,8 +17,20 @@ Saves `GauntletBaseline` (a set of `GauntletRow` entries) as JSON.
 cargo stt vm --gauntlet --compare before.json
 ```
 
-`compare_baselines()` diffs two sets of gauntlet rows, showing
-regressions and improvements.
+`compare_baselines()` diffs two sets of gauntlet rows. The output
+groups cells into four categories:
+
+- **Regressions** -- pass rate dropped, spread increased, or gap
+  increased beyond tolerance thresholds.
+- **Improvements** -- pass rate increased or metrics improved beyond
+  tolerance.
+- **Removed** -- cells present in the baseline but missing from the
+  current run.
+- **New** -- cells present in the current run but missing from the
+  baseline.
+
+The summary line shows how many cells were unchanged (within
+tolerance).
 
 ## Integration tests
 

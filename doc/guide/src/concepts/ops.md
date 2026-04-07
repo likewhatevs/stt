@@ -27,7 +27,7 @@ An `Op` is an atomic operation on the cgroup topology:
 
 `CpusetSpec` computes a cpuset from the topology at runtime:
 
-```rust
+```rust,ignore
 pub enum CpusetSpec {
     Llc(usize),                          // All CPUs in an LLC
     Range { start_frac: f64, end_frac: f64 }, // Fraction of usable CPUs
@@ -46,7 +46,7 @@ last CPU for the root cell when the topology has more than 2 CPUs.
 set cpuset, spawn workers. It is the primary way to define cgroups in
 ops-based scenarios.
 
-```rust
+```rust,ignore
 let def = CgroupDef::named("cell_0")
     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
     .workers(4)
@@ -72,7 +72,7 @@ Both skip `PipeIo` overrides when the worker count is odd.
 
 A `Step` is a sequence of ops with a hold period:
 
-```rust
+```rust,ignore
 pub struct Step {
     pub setup: Setup,   // CgroupDefs to create before ops
     pub ops: Vec<Op>,   // Operations to apply
@@ -81,6 +81,8 @@ pub struct Step {
 ```
 
 `Setup` is either `Defs(Vec<CgroupDef>)` or `Factory(fn(&Ctx) -> Vec<CgroupDef>)`.
+`Vec<CgroupDef>` implements `Into<Setup>`, so you can write
+`setup: vec![...].into()` instead of `setup: Setup::Defs(vec![...])`.
 
 ## HoldSpec
 
@@ -143,7 +145,7 @@ back to `verify_not_starved()` with the default thresholds.
 
 `Traverse` generates a random walk of topology changes:
 
-```rust
+```rust,ignore
 let traverse = Traverse {
     seed: Some(42),
     cgroup_count: 2..=4,

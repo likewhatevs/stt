@@ -5,7 +5,7 @@ inside a VM.
 
 ## Basic usage
 
-```rust
+```rust,ignore
 use stt::prelude::*;
 
 #[stt_test(sockets = 2, cores = 4, threads = 2)]
@@ -71,6 +71,44 @@ Each threshold can be overridden independently. See
 override examples and [Verification](../concepts/verification.md) for
 the merge chain.
 
+### Flag constraints
+
+| Attribute | Default | Description |
+|---|---|---|
+| `required_flags = [...]` | `[]` | Flags that must be present in every flag profile |
+| `excluded_flags = [...]` | `[]` | Flags that must not be present in any flag profile |
+
+Values are string arrays of flag names:
+
+```rust,ignore
+#[stt_test(
+    required_flags = ["llc", "borrow"],
+    excluded_flags = ["no-ctrl"],
+)]
+```
+
+These constrain `generate_profiles()`: `required_flags` are always
+included, `excluded_flags` are never included. Invalid combinations
+(e.g. `steal` without `llc`) are still rejected by dependency checks.
+`cargo stt gauntlet` reads these attributes to determine which flag
+profiles each test runs with. See
+[Gauntlet](../running-tests/gauntlet.md#flag-profiles).
+
+### Topology constraints
+
+| Attribute | Default | Description |
+|---|---|---|
+| `min_sockets` | 1 | Minimum sockets for gauntlet topology filtering |
+| `min_llcs` | 1 | Minimum LLCs for gauntlet topology filtering |
+| `requires_smt` | `false` | Require SMT (threads > 1) topologies |
+| `min_cpus` | 1 | Minimum total CPU count for gauntlet topology filtering |
+
+The gauntlet skips topology presets that do not satisfy these
+constraints. A test with `min_llcs = 3` will not run on `tiny-1llc`
+(1 LLC) or `tiny-2llc` (2 LLCs). `cargo stt gauntlet` reads these
+attributes to filter which presets each test runs on. See
+[Gauntlet](../running-tests/gauntlet.md#topology-presets).
+
 ### Execution
 
 | Attribute | Default | Description |
@@ -86,7 +124,7 @@ what `performance_mode` enables, prerequisites, and validation behavior.
 
 ## Example with custom scheduler
 
-```rust
+```rust,ignore
 use stt::prelude::*;
 
 const MITOSIS: Scheduler = Scheduler::new("mitosis")

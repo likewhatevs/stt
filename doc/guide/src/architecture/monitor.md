@@ -29,7 +29,7 @@ statistics.
 
 `MonitorThresholds` defines pass/fail conditions:
 
-```rust
+```rust,ignore
 pub struct MonitorThresholds {
     pub max_imbalance_ratio: f64,
     pub max_local_dsq_depth: u32,

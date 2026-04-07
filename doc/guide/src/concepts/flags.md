@@ -5,13 +5,19 @@ declaration with dependency constraints.
 
 ## Flag declarations
 
-```rust
+```rust,ignore
 pub struct FlagDecl {
     pub name: &'static str,
     pub args: &'static [&'static str],
     pub requires: &'static [&'static FlagDecl],
+    pub shell_cmds: &'static [&'static str],
 }
 ```
+
+`shell_cmds` are shell commands run in the guest to enable this flag.
+This is used with `SchedulerSpec::KernelBuiltin` schedulers where
+flags are activated via debugfs writes or sysctl changes rather than
+CLI arguments. For schedulers with a binary, flags use `args` instead.
 
 Six flags are defined:
 
@@ -28,11 +34,12 @@ Six flags are defined:
 
 `steal` requires `llc`. This is encoded in the `FlagDecl`:
 
-```rust
+```rust,ignore
 pub static STEAL_DECL: FlagDecl = FlagDecl {
     name: "steal",
     args: &[],
     requires: &[&LLC_DECL],
+    shell_cmds: &[],
 };
 ```
 
@@ -55,7 +62,7 @@ scenarios.
 
 A `FlagProfile` is a sorted set of active flags:
 
-```rust
+```rust,ignore
 pub struct FlagProfile {
     pub flags: Vec<&'static str>,
 }

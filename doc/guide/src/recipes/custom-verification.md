@@ -8,7 +8,7 @@ or relaxed event rates.
 
 Define a `Scheduler` with custom verification:
 
-```rust
+```rust,ignore
 const RELAXED: Scheduler = Scheduler::new("relaxed_sched")
     .binary(SchedulerSpec::Name("scx_relaxed"))
     .flags(&[&LLC_DECL, &BORROW_DECL])
@@ -25,7 +25,7 @@ overrides in the merge chain.
 
 ## Per-test overrides via #[stt_test]
 
-```rust
+```rust,ignore
 #[stt_test(
     sockets = 2,
     cores = 4,
@@ -69,7 +69,7 @@ the lower. A scheduler or test can disable a check by setting
 
 ## Using Verify directly in ops scenarios
 
-```rust
+```rust,ignore
 fn my_scenario(ctx: &Ctx) -> Result<VerifyResult> {
     let verify = Verify::NONE
         .check_not_starved()

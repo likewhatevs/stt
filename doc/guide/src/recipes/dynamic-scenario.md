@@ -5,7 +5,7 @@ without hand-written `Action::Custom` functions.
 
 ## Basic: two phases with cpuset resize
 
-```rust
+```rust,ignore
 use stt::prelude::*;
 use stt::scenario::ops::*;
 
@@ -46,7 +46,7 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<VerifyResult> {
 
 ## Using Traverse for random topology walks
 
-```rust
+```rust,ignore
 use stt::prelude::*;
 use stt::scenario::ops::*;
 
@@ -72,7 +72,7 @@ Register the scenario in `all_scenarios()`. Set `num_cells` to 0 and
 `action` to `Custom` -- the step executor handles all cgroup creation
 via `CgroupDef`:
 
-```rust
+```rust,ignore
 Scenario {
     name: "my_resize",
     category: "dynamic",

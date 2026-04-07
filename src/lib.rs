@@ -44,10 +44,10 @@
 //! }
 //! ```
 //!
-//! Run with `cargo test` (requires `/dev/kvm`), or target a scheduler:
+//! Run with `cargo test` (requires `/dev/kvm`), or via the CLI:
 //!
 //! ```sh
-//! cargo stt test -- my_scheduler_test
+//! cargo stt test --filter my_scheduler_test
 //! ```
 //!
 //! See the [`prelude`] module for the full set of re-exports.

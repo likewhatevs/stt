@@ -35,7 +35,7 @@ main work loop checks this flag each iteration. On stop:
 
 Each worker produces a `WorkerReport`:
 
-```rust
+```rust,ignore
 pub struct WorkerReport {
     pub tid: u32,
     pub work_units: u64,

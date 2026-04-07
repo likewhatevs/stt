@@ -40,4 +40,5 @@
 
 # Reference
 
+- [CLI Reference](cli-reference.md)
 - [Troubleshooting](troubleshooting.md)

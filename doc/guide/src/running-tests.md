@@ -17,10 +17,13 @@ cargo stt vm --sockets 2 --cores 4 --threads 2
 cargo stt vm --sockets 2 --cores 4 --threads 2 \
   -- cgroup_steady --flags=borrow,rebal --duration-s 30
 
-# Run all scenarios x all topologies
+# Run catalog scenarios x all topologies
 cargo stt vm --gauntlet
 
-# Run integration tests
+# Run #[stt_test] integration tests x all topologies
+cargo stt gauntlet
+
+# Run integration tests via nextest
 cargo stt test
 ```
 

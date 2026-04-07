@@ -3,7 +3,23 @@
 ## Prerequisites
 
 - Linux host with KVM access (`/dev/kvm`)
-- Rust toolchain (stable)
+- Rust toolchain (stable, >= 1.88)
+- clang and BPF toolchain (builds BPF skeletons via libbpf-cargo)
+- libelf development headers
+- pkg-config
+- bpftool (generates vmlinux.h from the running kernel's BTF)
+
+**Ubuntu/Debian:**
+
+```sh
+sudo apt install clang libelf-dev pkg-config bpftool
+```
+
+**Fedora:**
+
+```sh
+sudo dnf install clang elfutils-libelf-devel pkgconf bpftool
+```
 
 ## Add the dependency
 
@@ -20,7 +36,7 @@ Write an `#[stt_test]` function. The
 [`prelude`](https://likewhatevs.github.io/stt/api/stt/prelude/index.html)
 module re-exports the types you need:
 
-```rust
+```rust,ignore
 use stt::prelude::*;
 use std::collections::BTreeSet;
 
@@ -56,11 +72,29 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<VerifyResult> {
 
 Run with `cargo test` (requires `/dev/kvm`).
 
-## Install the CLI
+## CLI installation
 
-```sh
-cargo install --path cargo-stt
-```
+The stt workspace has two binaries:
+
+- **`stt`** -- the core binary (host-side VM management, guest-side
+  test runner, kernel builds, topology display). Build it with:
+
+  ```sh
+  cargo build -p stt
+  ```
+
+  Or install it:
+
+  ```sh
+  cargo install --path .
+  ```
+
+- **`cargo-stt`** -- cargo plugin that wraps `stt` with test discovery,
+  scheduler builds, and gauntlet orchestration. Install it with:
+
+  ```sh
+  cargo install --path cargo-stt
+  ```
 
 ## Build a kernel
 
@@ -69,14 +103,20 @@ stt embeds a kernel config fragment tuned for scheduler testing
 Linux source tree:
 
 ```sh
-stt build-kernel ~/linux
+stt kernel build ~/linux
 ```
 
 This runs `make defconfig`, merges the stt config fragment, and
 builds with `make -j$(nproc)`. To clean:
 
 ```sh
-stt clean-kernel ~/linux
+stt kernel clean ~/linux
+```
+
+Print the config fragment to stdout:
+
+```sh
+stt kernel kconfig
 ```
 
 ## Run a scenario
@@ -87,7 +127,8 @@ cargo stt vm --sockets 2 --cores 4 --threads 2 \
 ```
 
 `vm` boots a KVM virtual machine with the specified CPU topology.
-Arguments after `--` are passed to `stt run` inside the VM.
+Arguments after `--` configure the test scenarios (names, flags,
+duration).
 
 To test with a scheduler, use `-p` to build and inject it:
 
@@ -111,12 +152,6 @@ cargo stt vm --sockets 2 --cores 4 --threads 2
 ```
 
 ## List scenarios
-
-List catalog scenarios (data-driven):
-
-```sh
-stt list
-```
 
 List `#[stt_test]` integration tests:
 

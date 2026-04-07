@@ -10,7 +10,7 @@ cannot express.
 
 ## Writing a custom scenario
 
-```rust
+```rust,ignore
 use stt::prelude::*;
 use stt::scenario::*;
 
@@ -32,7 +32,8 @@ each, starts them. Returns `(Vec<WorkloadHandle>, CgroupGroup)`. The
 `CgroupGroup` is an RAII guard that removes cgroups on drop.
 
 **`collect_all(handles)`** -- stops all workers, collects reports, runs
-`verify_not_starved()` on each. Returns a merged `VerifyResult`.
+`verify_not_starved()` on each. Merges results: if any worker group
+fails, the overall result fails. Details from all groups are combined.
 
 **`dfl_wl(ctx)`** -- creates a `WorkloadConfig` with
 `ctx.workers_per_cell` workers and default settings.
@@ -44,7 +45,7 @@ each, starts them. Returns `(Vec<WorkloadHandle>, CgroupGroup)`. The
 
 Custom scenarios receive a `Ctx` reference:
 
-```rust
+```rust,ignore
 pub struct Ctx<'a> {
     pub cgroups: &'a CgroupManager,
     pub topo: &'a TestTopology,
@@ -69,7 +70,7 @@ to stabilize.
 
 Add it to `all_scenarios()` in `src/scenario/catalog.rs`:
 
-```rust
+```rust,ignore
 Scenario {
     name: "my_scenario",
     category: "dynamic",

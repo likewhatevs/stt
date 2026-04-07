@@ -7,8 +7,8 @@ cargo stt vm --sockets 2 --cores 4 --threads 2 \
   -- cgroup_steady --duration-s 30
 ```
 
-Arguments before `--` configure the VM. Arguments after `--` are passed
-to `stt run` inside the VM.
+Arguments before `--` configure the VM. Arguments after `--` configure
+the test scenarios (names, flags, duration).
 
 ## VM arguments
 

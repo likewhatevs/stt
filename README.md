@@ -72,8 +72,11 @@ cargo stt vm --sockets 2 --cores 4 --threads 2 -- cgroup_steady
 # with a scheduler
 cargo stt vm -p scx_mitosis --sockets 2 --cores 4 --threads 2 -- cgroup_steady
 
-# gauntlet
+# gauntlet (catalog scenarios)
 cargo stt vm --gauntlet --parallel 4
+
+# gauntlet (#[stt_test] integration tests)
+cargo stt gauntlet --parallel 4
 ```
 
 ## Documentation

@@ -39,12 +39,19 @@ cargo stt vm --gauntlet -p scx_my_scheduler \
 See [Baselines](../running-tests/baselines.md) for details on save and
 compare.
 
-## 5. Write integration tests
+## 5. Run integration tests through the gauntlet
 
-Once the scheduler passes the gauntlet, write `#[stt_test]` tests for
-CI. Define the scheduler for `#[stt_test]`:
+Once you have `#[stt_test]` tests, run them across topology presets:
 
-```rust
+```sh
+cargo stt gauntlet --parallel 4
+```
+
+## 6. Write integration tests
+
+Define the scheduler for `#[stt_test]`:
+
+```rust,ignore
 use stt::prelude::*;
 use stt::scenario::flags::*;
 
@@ -55,7 +62,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
 
 Write a test:
 
-```rust
+```rust,ignore
 use stt::prelude::*;
 use stt::scenario::*;
 

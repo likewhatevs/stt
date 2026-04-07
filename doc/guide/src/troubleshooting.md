@@ -34,7 +34,7 @@ stt needs a bootable Linux kernel image (bzImage). It searches:
 
 **Fixes:**
 
-- Build a kernel with `stt build-kernel ~/linux` (see
+- Build a kernel with `stt kernel build ~/linux` (see
   [Getting Started](getting-started.md#build-a-kernel)).
 - Set `STT_TEST_KERNEL` to an explicit path.
 - Build a kernel in a sibling `linux/` directory.

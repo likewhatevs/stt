@@ -46,7 +46,7 @@ A violation must persist for N consecutive samples before failing.
 `Verify` is a composable configuration that carries both worker checks
 and monitor thresholds:
 
-```rust
+```rust,ignore
 pub struct Verify {
     // Worker checks
     pub not_starved: Option<bool>,
@@ -79,7 +79,7 @@ Verification uses a three-layer merge:
 All fields use last-`Some`-wins semantics. A `Some(false)` in a
 higher layer can disable a check that a lower layer enabled.
 
-```rust
+```rust,ignore
 let final_verify = Verify::default_checks()
     .merge(&scheduler.verify)
     .merge(&test_verify);
@@ -112,6 +112,28 @@ instrumented builds.
 
 All monitor thresholds use the `sustained_samples` window -- a
 violation must persist for N consecutive samples before failing.
+
+## VerificationPlan
+
+`VerificationPlan` is the worker-side check configuration used in
+custom scenarios. It has concrete bool/threshold fields (not `Option`):
+
+```rust,ignore
+pub struct VerificationPlan {
+    pub not_starved: bool,
+    pub isolation: bool,
+    pub max_gap_ms: Option<u64>,
+    pub max_spread_pct: Option<f64>,
+}
+```
+
+Use `VerificationPlan` when writing custom scenarios that call
+`plan.verify_cell(reports, cpuset)` directly. Use `Verify` for the
+merge chain (`#[stt_test]` attributes, `Scheduler.verify`,
+`execute_steps_with`).
+
+`Verify::worker_plan()` extracts a `VerificationPlan` from a `Verify`,
+resolving `Option` fields to concrete values.
 
 ## Constants
 

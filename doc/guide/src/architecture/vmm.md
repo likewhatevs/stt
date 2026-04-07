@@ -5,7 +5,7 @@ Linux kernels in KVM for testing.
 
 ## SttVm builder
 
-```rust
+```rust,ignore
 let result = vmm::SttVm::builder()
     .kernel(&kernel_path)
     .init_binary(&stt_binary)
@@ -23,7 +23,7 @@ threads_per_core)`. The VMM creates the appropriate ACPI tables
 (MADT, SRAT) and MP tables so the guest kernel sees the specified
 topology.
 
-```rust
+```rust,ignore
 pub struct Topology {
     pub sockets: u32,
     pub cores_per_socket: u32,

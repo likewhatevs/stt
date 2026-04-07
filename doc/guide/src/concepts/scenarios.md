@@ -3,7 +3,7 @@
 A `Scenario` is a data-driven test case. It declares the test topology
 (cgroups, CPU partitioning, workloads) as data, and stt interprets it.
 
-```rust
+```rust,ignore
 pub struct Scenario {
     pub name: &'static str,
     pub category: &'static str,
@@ -51,7 +51,7 @@ it applies its own holdback fraction to the full CPU set.
 
 **`cell_works`** -- per-cgroup workload definition:
 
-```rust
+```rust,ignore
 pub struct CgroupWork {
     pub workers: usize,          // 0 = use ctx.workers_per_cell
     pub work_type: WorkType,
@@ -85,7 +85,8 @@ For `Steady` scenarios, `run_scenario()`:
 5. Signals workers to start (two-phase start protocol).
 6. Polls scheduler liveness during the workload phase.
 7. Stops workers, collects `WorkerReport` telemetry.
-8. Runs [`verify_not_starved()` and `verify_isolation()`](verification.md).
+8. Runs starvation, fairness, gap, and cpuset isolation checks (see
+   [Worker checks](verification.md#worker-checks)).
 
 `Custom` scenarios get a `Ctx` reference and implement their own logic
 using the same building blocks. See
@@ -95,11 +96,7 @@ struct and helper functions.
 ## Scenario catalog
 
 All scenarios are registered in `all_scenarios()`. The catalog has
-scenarios across 10 categories. List them with:
-
-```sh
-stt list
-```
+scenarios across 10 categories.
 
 ## Flag profiles
 
