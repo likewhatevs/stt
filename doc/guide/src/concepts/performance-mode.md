@@ -1,12 +1,12 @@
 # Performance Mode
 
-Performance mode reduces host-side noise during VM execution by pinning
-vCPU threads to dedicated host cores and allocating guest memory with
-hugepages.
+Performance mode reduces host-side noise during VM execution by
+applying host-side isolation: vCPU pinning, hugepages, NUMA mbind,
+and RT scheduling.
 
 ## What it does
 
-Two host-side optimizations are applied when `performance_mode` is
+Four host-side optimizations are applied when `performance_mode` is
 enabled:
 
 **vCPU pinning** -- each virtual socket is mapped to a physical LLC
@@ -18,6 +18,11 @@ thrashing noise to measurements.
 **Hugepages** -- guest memory is allocated with 2MB hugepages
 (`MAP_HUGETLB`) when sufficient free hugepages exist. This eliminates
 TLB pressure from host-side page walks during guest execution.
+
+**NUMA mbind** -- guest memory is bound to the NUMA node(s) of the
+pinned vCPUs via `mbind(MPOL_BIND)`. This ensures memory allocations
+are local to the CPUs executing vCPU threads, avoiding cross-node
+memory access latency.
 
 **RT scheduling** -- vCPU threads are set to `SCHED_FIFO` priority 1.
 The watchdog and monitor threads run at priority 2 on a dedicated
@@ -70,9 +75,9 @@ In `#[stt_test]`:
     threads = 2,
     performance_mode = true,
 )]
-fn my_perf_test(ctx: &Ctx) -> Result<VerifyResult> {
+fn my_perf_test(ctx: &Ctx) -> Result<AssertResult> {
     // vCPUs are pinned, hugepage-backed
-    Ok(VerifyResult::pass())
+    Ok(AssertResult::pass())
 }
 ```
 
@@ -97,5 +102,64 @@ imbalance ratio checks. It is not needed for correctness tests (cpuset
 isolation, starvation detection) where pass/fail is binary.
 
 The gauntlet runs many VMs in parallel. Performance mode on
-parallel VMs can oversubscribe the host. Use it for targeted
-single-scenario runs, not for gauntlet sweeps.
+parallel VMs can oversubscribe the host if scheduled naively.
+`cargo stt test` handles this automatically (see below). For
+gauntlet sweeps, avoid `performance_mode` unless the host has
+enough CPUs for the topology matrix.
+
+## Automatic concurrency scheduling
+
+`cargo stt test` generates a nextest tool config that assigns
+`threads-required` to each `performance_mode` test based on host LLC
+topology. The formula sums the actual CPU count of each LLC group used
+by the test's virtual sockets, plus one for the service CPU:
+`sum(llc_groups[i].cpus.len() for i in 0..sockets) + 1`. This handles
+asymmetric LLC sizes correctly. Nextest uses this to limit concurrency
+so pinned vCPU LLC groups never overlap on the host. Falls back to
+`vcpus + 1` when host topology is unavailable. Non-performance tests
+are unaffected and run at full parallelism.
+
+## Two dimensions
+
+Performance mode serves two purposes:
+
+**Noise reduction** -- pinning, hugepages, and RT scheduling reduce
+measurement variance. Scheduling gaps, spread, and throughput checks
+become meaningful because host jitter is controlled. Without
+performance mode, a 50ms gap could be host noise; with it, the same
+gap indicates a scheduler problem.
+
+**Performance assertions** -- with stable measurements, tests can set
+tight thresholds (`max_gap_ms`, `min_iteration_rate`,
+`max_p99_wake_latency_ns`) to detect scheduling regressions. A test
+using `execute_steps_with` can pass custom `Assert` checks that are
+evaluated inside the guest against worker telemetry. These thresholds
+are only meaningful under performance mode's controlled environment.
+
+## super_perf_mode
+
+`super_perf_mode` implies `performance_mode` and additionally
+validates LLC exclusivity at build time. Each virtual socket must
+reserve the entire physical LLC group it maps to. The validation
+sums the actual CPU count of each LLC group and checks the total
+(plus service CPU) fits within the host's online CPUs.
+
+`super_perf_mode` validates at build time that sufficient LLC groups
+exist for the test topology. Scheduling reserves the LLC groups' total
+CPU count via nextest `threads-required`, which prevents overcommit
+but does not enforce per-LLC mutual exclusion between concurrent tests.
+Both modes apply the same runtime optimizations (pinning, hugepages,
+NUMA mbind, RT scheduling) and the same LLC-aware `threads-required`
+formula.
+
+```rust,ignore
+#[stt_test(
+    sockets = 2,
+    cores = 4,
+    threads = 2,
+    super_perf_mode = true,
+)]
+fn my_exclusive_perf_test(ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+```

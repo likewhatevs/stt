@@ -1,19 +1,19 @@
 //! Pass/fail evaluation of scenario results.
 //!
 //! Key types:
-//! - [`VerifyResult`] -- pass/fail status with diagnostics and statistics
-//! - [`Verify`] -- composable verification config (worker + monitor checks)
-//! - [`VerificationPlan`] -- worker-side check configuration
+//! - [`AssertResult`] -- pass/fail status with diagnostics and statistics
+//! - [`Assert`] -- composable assertion config (worker + monitor checks)
+//! - [`AssertPlan`] -- worker-side check configuration
 //! - [`ScenarioStats`] / [`CgroupStats`] -- aggregated telemetry
 //!
-//! Verification uses a three-layer merge: [`Verify::default_checks()`] ->
-//! `Scheduler.verify` -> per-test `verify`.
+//! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->
+//! `Scheduler.assert` -> per-test `assert`.
 //!
 //! See the [Verification](https://sched-ext.github.io/scx/stt/concepts/verification.html)
 //! chapter of the guide.
 
 use crate::workload::WorkerReport;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static WARN_UNFAIR: AtomicBool = AtomicBool::new(false);
@@ -56,13 +56,27 @@ fn spread_threshold_pct() -> f64 {
     if cfg!(debug_assertions) { 35.0 } else { 15.0 }
 }
 
-/// Result of verifying a scenario run.
+/// Result of checking a scenario run.
 ///
 /// Contains pass/fail status, human-readable detail messages, and
 /// aggregated statistics. Multiple results can be combined with
-/// [`merge()`](VerifyResult::merge).
+/// [`merge()`](AssertResult::merge).
+///
+/// ```
+/// # use stt::assert::AssertResult;
+/// let mut a = AssertResult::pass();
+/// assert!(a.passed);
+///
+/// let mut b = AssertResult::pass();
+/// b.passed = false;
+/// b.details.push("worker starved".into());
+///
+/// a.merge(b);
+/// assert!(!a.passed);
+/// assert!(a.details.iter().any(|d| d.contains("starved")));
+/// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct VerifyResult {
+pub struct AssertResult {
     /// Whether all checks passed.
     pub passed: bool,
     /// Human-readable diagnostic messages (failures, warnings).
@@ -84,6 +98,9 @@ pub struct CgroupStats {
     pub max_gap_ms: u64,
     pub max_gap_cpu: usize,
     pub total_migrations: u64,
+    /// Migrations per iteration (total_migrations / total_iterations).
+    #[serde(default)]
+    pub migration_ratio: f64,
     #[serde(default)]
     pub p99_wake_latency_us: f64,
     #[serde(default)]
@@ -96,6 +113,9 @@ pub struct CgroupStats {
     pub mean_run_delay_us: f64,
     #[serde(default)]
     pub worst_run_delay_us: f64,
+    /// Extensible metrics for the generic comparison pipeline.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ext_metrics: BTreeMap<String, f64>,
 }
 
 /// Aggregated statistics across all cgroups in a scenario.
@@ -110,6 +130,9 @@ pub struct ScenarioStats {
     /// Worst gap across any cgroup (ms).
     pub worst_gap_ms: u64,
     pub worst_gap_cpu: usize,
+    /// Worst migration ratio across any cgroup.
+    #[serde(default)]
+    pub worst_migration_ratio: f64,
     #[serde(default)]
     pub p99_wake_latency_us: f64,
     #[serde(default)]
@@ -122,9 +145,13 @@ pub struct ScenarioStats {
     pub mean_run_delay_us: f64,
     #[serde(default)]
     pub worst_run_delay_us: f64,
+    /// Extensible metrics for the generic comparison pipeline.
+    /// Populated from per-cgroup ext_metrics (worst value across cgroups).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ext_metrics: BTreeMap<String, f64>,
 }
 
-impl VerifyResult {
+impl AssertResult {
     pub fn pass() -> Self {
         Self {
             passed: true,
@@ -132,7 +159,7 @@ impl VerifyResult {
             stats: Default::default(),
         }
     }
-    pub fn merge(&mut self, other: VerifyResult) {
+    pub fn merge(&mut self, other: AssertResult) {
         if !other.passed {
             self.passed = false;
         }
@@ -147,6 +174,9 @@ impl VerifyResult {
         if other.stats.worst_gap_ms > self.stats.worst_gap_ms {
             self.stats.worst_gap_ms = other.stats.worst_gap_ms;
             self.stats.worst_gap_cpu = other.stats.worst_gap_cpu;
+        }
+        if other.stats.worst_migration_ratio > self.stats.worst_migration_ratio {
+            self.stats.worst_migration_ratio = other.stats.worst_migration_ratio;
         }
         if other.stats.p99_wake_latency_us > self.stats.p99_wake_latency_us {
             self.stats.p99_wake_latency_us = other.stats.p99_wake_latency_us;
@@ -165,13 +195,32 @@ impl VerifyResult {
         if other.stats.mean_run_delay_us > self.stats.mean_run_delay_us {
             self.stats.mean_run_delay_us = other.stats.mean_run_delay_us;
         }
+        // Merge extensible metrics: take worst (max) value per key.
+        for (k, v) in &other.stats.ext_metrics {
+            let entry = self.stats.ext_metrics.entry(k.clone()).or_insert(0.0);
+            if *v > *entry {
+                *entry = *v;
+            }
+        }
     }
 }
 
-/// Composable verification plan. Specifies which checks to run on worker
+/// Composable assertion plan. Specifies which checks to run on worker
 /// reports after collection.
+///
+/// ```
+/// # use stt::assert::AssertPlan;
+/// let plan = AssertPlan::new()
+///     .check_not_starved()
+///     .check_isolation()
+///     .max_gap_ms(5000);
+///
+/// assert!(plan.not_starved);
+/// assert!(plan.isolation);
+/// assert_eq!(plan.max_gap_ms, Some(5000));
+/// ```
 #[derive(Clone, Debug)]
-pub struct VerificationPlan {
+pub struct AssertPlan {
     pub not_starved: bool,
     pub isolation: bool,
     pub max_gap_ms: Option<u64>,
@@ -181,9 +230,10 @@ pub struct VerificationPlan {
     pub max_p99_wake_latency_ns: Option<u64>,
     pub max_wake_latency_cv: Option<f64>,
     pub min_iteration_rate: Option<f64>,
+    pub max_migration_ratio: Option<f64>,
 }
 
-impl VerificationPlan {
+impl AssertPlan {
     pub fn new() -> Self {
         Self {
             not_starved: false,
@@ -195,6 +245,7 @@ impl VerificationPlan {
             max_p99_wake_latency_ns: None,
             max_wake_latency_cv: None,
             min_iteration_rate: None,
+            max_migration_ratio: None,
         }
     }
 
@@ -205,7 +256,7 @@ impl VerificationPlan {
     }
 
     /// Enable cpuset isolation check. Only applied when a cpuset is provided
-    /// to `verify_cgroup`.
+    /// to `assert_cgroup`.
     pub fn check_isolation(mut self) -> Self {
         self.isolation = true;
         self
@@ -227,18 +278,36 @@ impl VerificationPlan {
     ///
     /// `cpuset` is the expected CPU set for isolation checks. Pass `None`
     /// when there is no cpuset constraint (isolation check is skipped).
-    pub fn verify_cgroup(
+    ///
+    /// ```
+    /// use stt::assert::AssertPlan;
+    /// # use stt::workload::WorkerReport;
+    /// # let report = WorkerReport {
+    /// #     tid: 1, cpus_used: [0].into_iter().collect(),
+    /// #     work_units: 100, cpu_time_ns: 1_000_000,
+    /// #     wall_time_ns: 5_000_000_000, runnable_ns: 500_000_000,
+    /// #     migration_count: 0, migrations: vec![],
+    /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
+    /// #     wake_latencies_ns: vec![], iterations: 0,
+    /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
+    /// #     schedstat_cpu_time_ns: 0,
+    /// # };
+    /// let plan = AssertPlan::new().check_not_starved();
+    /// let r = plan.assert_cgroup(&[report], None);
+    /// assert!(r.passed);
+    /// ```
+    pub fn assert_cgroup(
         &self,
         reports: &[WorkerReport],
         cpuset: Option<&BTreeSet<usize>>,
-    ) -> VerifyResult {
-        let mut r = VerifyResult::pass();
+    ) -> AssertResult {
+        let mut r = AssertResult::pass();
         if self.not_starved {
-            let mut cgroup_result = verify_not_starved(reports);
+            let mut cgroup_result = assert_not_starved(reports);
             // Apply custom spread threshold if set.
             if let Some(spread_limit) = self.max_spread_pct {
                 // Re-check spread against custom threshold. The default
-                // verify_not_starved uses spread_threshold_pct(); clear
+                // assert_not_starved uses spread_threshold_pct(); clear
                 // those failures and re-evaluate.
                 cgroup_result.details.retain(|d| !d.contains("unfair"));
                 if let Some(cg) = cgroup_result.stats.cgroups.first() {
@@ -261,7 +330,7 @@ impl VerificationPlan {
             // Apply custom gap threshold if set.
             if let Some(threshold) = self.max_gap_ms {
                 // Re-check gaps against custom threshold. The default
-                // verify_not_starved uses 2000ms; clear those failures
+                // assert_not_starved uses 2000ms; clear those failures
                 // and re-evaluate.
                 cgroup_result.details.retain(|d| !d.contains("stuck"));
                 let had_gap_failure = reports.iter().any(|w| w.max_gap_ms > threshold);
@@ -288,10 +357,10 @@ impl VerificationPlan {
         if self.isolation
             && let Some(cs) = cpuset
         {
-            r.merge(verify_isolation(reports, cs));
+            r.merge(assert_isolation(reports, cs));
         }
         if self.max_throughput_cv.is_some() || self.min_work_rate.is_some() {
-            r.merge(verify_throughput_parity(
+            r.merge(assert_throughput_parity(
                 reports,
                 self.max_throughput_cv,
                 self.min_work_rate,
@@ -301,30 +370,71 @@ impl VerificationPlan {
             || self.max_wake_latency_cv.is_some()
             || self.min_iteration_rate.is_some()
         {
-            r.merge(verify_benchmarks(
+            r.merge(assert_benchmarks(
                 reports,
                 self.max_p99_wake_latency_ns,
                 self.max_wake_latency_cv,
                 self.min_iteration_rate,
             ));
         }
+        if let Some(max_ratio) = self.max_migration_ratio {
+            let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
+            let total_iters: u64 = reports.iter().map(|w| w.iterations).sum();
+            let ratio = if total_iters > 0 {
+                total_mig as f64 / total_iters as f64
+            } else {
+                0.0
+            };
+            if ratio > max_ratio {
+                r.passed = false;
+                r.details.push(format!(
+                    "migration ratio {:.4} exceeds threshold {:.4} ({} migrations / {} iterations)",
+                    ratio, max_ratio, total_mig, total_iters,
+                ));
+            }
+        }
         r
+    }
+
+    /// Backward-compatible alias for [`assert_cgroup`](Self::assert_cgroup).
+    #[doc(hidden)]
+    pub fn verify_cgroup(
+        &self,
+        reports: &[WorkerReport],
+        cpuset: Option<&BTreeSet<usize>>,
+    ) -> AssertResult {
+        self.assert_cgroup(reports, cpuset)
     }
 }
 
-impl Default for VerificationPlan {
+impl Default for AssertPlan {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Unified verification configuration. Carries both worker checks and
+/// Unified assertion configuration. Carries both worker checks and
 /// monitor thresholds as a single composable type. Each `Option` field
 /// acts as an override — `None` means "inherit from parent layer".
 ///
-/// Merge order: `Verify::default_checks()` -> `Scheduler.verify` -> per-test `verify`.
+/// Merge order: `Assert::default_checks()` -> `Scheduler.assert` -> per-test `assert`.
+///
+/// ```
+/// # use stt::assert::Assert;
+/// // Start from defaults, override imbalance threshold.
+/// let sched_assert = Assert::NONE.max_imbalance_ratio(5.0);
+///
+/// // Merge: defaults <- scheduler <- test.
+/// let merged = Assert::default_checks()
+///     .merge(&sched_assert)
+///     .merge(&Assert::NONE.max_gap_ms(5000));
+///
+/// assert_eq!(merged.not_starved, Some(true));   // from default_checks
+/// assert_eq!(merged.max_imbalance_ratio, Some(5.0)); // from sched
+/// assert_eq!(merged.max_gap_ms, Some(5000));    // from test
+/// ```
 #[derive(Clone, Copy, Debug)]
-pub struct Verify {
+pub struct Assert {
     // Worker checks
     pub not_starved: Option<bool>,
     pub isolation: Option<bool>,
@@ -346,6 +456,8 @@ pub struct Verify {
     pub max_wake_latency_cv: Option<f64>,
     /// Minimum iterations per wall-clock second. Fails if any worker is below.
     pub min_iteration_rate: Option<f64>,
+    /// Max migration ratio (migrations/iterations). Fails if any cgroup exceeds this.
+    pub max_migration_ratio: Option<f64>,
 
     // Monitor checks
     pub max_imbalance_ratio: Option<f64>,
@@ -356,9 +468,9 @@ pub struct Verify {
     pub max_keep_last_rate: Option<f64>,
 }
 
-impl Verify {
-    /// Empty verify — no checks enabled, all overrides None.
-    pub const NONE: Verify = Verify {
+impl Assert {
+    /// Empty assert — no checks enabled, all overrides None.
+    pub const NONE: Assert = Assert {
         not_starved: None,
         isolation: None,
         max_gap_ms: None,
@@ -368,6 +480,7 @@ impl Verify {
         max_p99_wake_latency_ns: None,
         max_wake_latency_cv: None,
         min_iteration_rate: None,
+        max_migration_ratio: None,
         max_imbalance_ratio: None,
         max_local_dsq_depth: None,
         fail_on_stall: None,
@@ -378,9 +491,9 @@ impl Verify {
 
     /// Default checks: not_starved enabled, monitor thresholds from
     /// `MonitorThresholds::DEFAULT`.
-    pub const fn default_checks() -> Verify {
+    pub const fn default_checks() -> Assert {
         use crate::monitor::MonitorThresholds;
-        Verify {
+        Assert {
             not_starved: Some(true),
             isolation: None,
             max_gap_ms: None,
@@ -390,6 +503,7 @@ impl Verify {
             max_p99_wake_latency_ns: None,
             max_wake_latency_cv: None,
             min_iteration_rate: None,
+            max_migration_ratio: None,
             max_imbalance_ratio: Some(MonitorThresholds::DEFAULT.max_imbalance_ratio),
             max_local_dsq_depth: Some(MonitorThresholds::DEFAULT.max_local_dsq_depth),
             fail_on_stall: Some(MonitorThresholds::DEFAULT.fail_on_stall),
@@ -444,6 +558,11 @@ impl Verify {
         self
     }
 
+    pub const fn max_migration_ratio(mut self, v: f64) -> Self {
+        self.max_migration_ratio = Some(v);
+        self
+    }
+
     pub const fn max_imbalance_ratio(mut self, v: f64) -> Self {
         self.max_imbalance_ratio = Some(v);
         self
@@ -479,9 +598,9 @@ impl Verify {
     /// inherit from `self`.
     ///
     /// Use when composing scheduler-level and test-level overrides:
-    /// `Verify::default_checks().merge(&scheduler.verify).merge(&test.verify)`.
-    pub const fn merge(&self, other: &Verify) -> Verify {
-        Verify {
+    /// `Assert::default_checks().merge(&scheduler.assert).merge(&test.assert)`.
+    pub const fn merge(&self, other: &Assert) -> Assert {
+        Assert {
             not_starved: match other.not_starved {
                 Some(v) => Some(v),
                 None => self.not_starved,
@@ -518,6 +637,10 @@ impl Verify {
                 Some(v) => Some(v),
                 None => self.min_iteration_rate,
             },
+            max_migration_ratio: match other.max_migration_ratio {
+                Some(v) => Some(v),
+                None => self.max_migration_ratio,
+            },
             max_imbalance_ratio: match other.max_imbalance_ratio {
                 Some(v) => Some(v),
                 None => self.max_imbalance_ratio,
@@ -545,9 +668,9 @@ impl Verify {
         }
     }
 
-    /// Extract a `VerificationPlan` for worker-side checks.
-    pub fn worker_plan(&self) -> VerificationPlan {
-        VerificationPlan {
+    /// Extract an `AssertPlan` for worker-side checks.
+    pub fn worker_plan(&self) -> AssertPlan {
+        AssertPlan {
             not_starved: self.not_starved.unwrap_or(false),
             isolation: self.isolation.unwrap_or(false),
             max_gap_ms: self.max_gap_ms,
@@ -557,18 +680,29 @@ impl Verify {
             max_p99_wake_latency_ns: self.max_p99_wake_latency_ns,
             max_wake_latency_cv: self.max_wake_latency_cv,
             min_iteration_rate: self.min_iteration_rate,
+            max_migration_ratio: self.max_migration_ratio,
         }
     }
 
     /// Run worker checks against one cgroup's reports.
     ///
-    /// Equivalent to `self.worker_plan().verify_cgroup(reports, cpuset)`.
+    /// Equivalent to `self.worker_plan().assert_cgroup(reports, cpuset)`.
+    pub fn assert_cgroup(
+        &self,
+        reports: &[crate::workload::WorkerReport],
+        cpuset: Option<&BTreeSet<usize>>,
+    ) -> AssertResult {
+        self.worker_plan().assert_cgroup(reports, cpuset)
+    }
+
+    /// Backward-compatible alias for [`assert_cgroup`](Self::assert_cgroup).
+    #[doc(hidden)]
     pub fn verify_cgroup(
         &self,
         reports: &[crate::workload::WorkerReport],
         cpuset: Option<&BTreeSet<usize>>,
-    ) -> VerifyResult {
-        self.worker_plan().verify_cgroup(reports, cpuset)
+    ) -> AssertResult {
+        self.assert_cgroup(reports, cpuset)
     }
 
     /// Extract `MonitorThresholds` for monitor-side evaluation.
@@ -590,8 +724,25 @@ impl Verify {
 ///
 /// Any worker that used a CPU outside the expected set produces a
 /// failure with the unexpected CPU IDs listed.
-pub fn verify_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) -> VerifyResult {
-    let mut r = VerifyResult::pass();
+///
+/// ```
+/// # use stt::assert::assert_isolation;
+/// # use stt::workload::WorkerReport;
+/// # use std::collections::BTreeSet;
+/// # let report = WorkerReport {
+/// #     tid: 1, cpus_used: [0, 1].into_iter().collect(),
+/// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 2_000_000,
+/// #     runnable_ns: 1_000_000, migration_count: 0, migrations: vec![],
+/// #     max_gap_ms: 0, max_gap_cpu: 0, max_gap_at_ms: 0,
+/// #     wake_latencies_ns: vec![], iterations: 0,
+/// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
+/// #     schedstat_cpu_time_ns: 0,
+/// # };
+/// let expected: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
+/// assert!(assert_isolation(&[report], &expected).passed);
+/// ```
+pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) -> AssertResult {
+    let mut r = AssertResult::pass();
     for w in reports {
         let bad: BTreeSet<usize> = w.cpus_used.difference(expected).copied().collect();
         if !bad.is_empty() {
@@ -603,9 +754,26 @@ pub fn verify_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
     r
 }
 
-/// Verify one cgroup's workers. Returns per-cgroup stats.
-pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
-    let mut r = VerifyResult::pass();
+/// Check one cgroup's workers. Returns per-cgroup stats.
+///
+/// ```
+/// # use stt::assert::assert_not_starved;
+/// # use stt::workload::WorkerReport;
+/// # let report = WorkerReport {
+/// #     tid: 1, cpus_used: [0].into_iter().collect(),
+/// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 5_000_000_000,
+/// #     runnable_ns: 500_000_000, migration_count: 0, migrations: vec![],
+/// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
+/// #     wake_latencies_ns: vec![], iterations: 0,
+/// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
+/// #     schedstat_cpu_time_ns: 0,
+/// # };
+/// let r = assert_not_starved(&[report]);
+/// assert!(r.passed);
+/// assert_eq!(r.stats.total_workers, 1);
+/// ```
+pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
+    let mut r = AssertResult::pass();
     if reports.is_empty() {
         return r;
     }
@@ -681,6 +849,15 @@ pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
     };
     let worst_run_delay = run_delays.iter().cloned().reduce(f64::max).unwrap_or(0.0);
 
+    let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
+    let mig_ratio = if total_iters > 0 {
+        total_mig as f64 / total_iters as f64
+    } else {
+        0.0
+    };
+
+    let cg_ext = BTreeMap::new();
+
     let cg = CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
@@ -690,13 +867,15 @@ pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
         spread,
         max_gap_ms: gap_ms,
         max_gap_cpu: gap_cpu,
-        total_migrations: reports.iter().map(|w| w.migration_count).sum(),
+        total_migrations: total_mig,
+        migration_ratio: mig_ratio,
         p99_wake_latency_us: p99_us,
         median_wake_latency_us: median_us,
         wake_latency_cv: lat_cv,
         total_iterations: total_iters,
         mean_run_delay_us: mean_run_delay,
         worst_run_delay_us: worst_run_delay,
+        ext_metrics: cg_ext,
     };
 
     // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup
@@ -736,12 +915,14 @@ pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
         worst_spread: spread,
         worst_gap_ms: gap_ms,
         worst_gap_cpu: gap_cpu,
+        worst_migration_ratio: cg.migration_ratio,
         p99_wake_latency_us: cg.p99_wake_latency_us,
         median_wake_latency_us: cg.median_wake_latency_us,
         wake_latency_cv: cg.wake_latency_cv,
         total_iterations: cg.total_iterations,
         mean_run_delay_us: cg.mean_run_delay_us,
         worst_run_delay_us: cg.worst_run_delay_us,
+        ext_metrics: cg.ext_metrics.clone(),
     };
 
     r
@@ -754,12 +935,29 @@ pub fn verify_not_starved(reports: &[WorkerReport]) -> VerifyResult {
 /// work_units / cpu_time_ns across workers. `None` skips the CV check.
 ///
 /// `min_rate`: minimum work_units per CPU-second. `None` skips the floor check.
-pub fn verify_throughput_parity(
+///
+/// ```
+/// # use stt::assert::assert_throughput_parity;
+/// # use stt::workload::WorkerReport;
+/// # let mk = |units, cpu_ns| WorkerReport {
+/// #     tid: 1, cpus_used: [0].into_iter().collect(),
+/// #     work_units: units, cpu_time_ns: cpu_ns, wall_time_ns: cpu_ns,
+/// #     runnable_ns: cpu_ns, migration_count: 0, migrations: vec![],
+/// #     max_gap_ms: 0, max_gap_cpu: 0, max_gap_at_ms: 0,
+/// #     wake_latencies_ns: vec![], iterations: 0,
+/// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
+/// #     schedstat_cpu_time_ns: 0,
+/// # };
+/// // Equal throughput -> low CV -> passes.
+/// let reports = [mk(1000, 1_000_000_000), mk(1000, 1_000_000_000)];
+/// assert!(assert_throughput_parity(&reports, Some(0.5), None).passed);
+/// ```
+pub fn assert_throughput_parity(
     reports: &[WorkerReport],
     max_cv: Option<f64>,
     min_rate: Option<f64>,
-) -> VerifyResult {
-    let mut r = VerifyResult::pass();
+) -> AssertResult {
+    let mut r = AssertResult::pass();
     if reports.is_empty() {
         return r;
     }
@@ -811,13 +1009,31 @@ pub fn verify_throughput_parity(
 
 /// Check benchmarking metrics: p99 wake latency, wake latency CV,
 /// and minimum iteration rate.
-pub fn verify_benchmarks(
+///
+/// ```
+/// # use stt::assert::assert_benchmarks;
+/// # use stt::workload::WorkerReport;
+/// # let report = WorkerReport {
+/// #     tid: 1, cpus_used: [0].into_iter().collect(),
+/// #     work_units: 1000, cpu_time_ns: 2_500_000_000,
+/// #     wall_time_ns: 5_000_000_000, runnable_ns: 2_500_000_000,
+/// #     migration_count: 0, migrations: vec![],
+/// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
+/// #     wake_latencies_ns: vec![100, 200, 300, 400, 500],
+/// #     iterations: 1000,
+/// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
+/// #     schedstat_cpu_time_ns: 0,
+/// # };
+/// // p99 = 500ns, well under 10000ns limit.
+/// assert!(assert_benchmarks(&[report], Some(10000), None, None).passed);
+/// ```
+pub fn assert_benchmarks(
     reports: &[WorkerReport],
     max_p99_ns: Option<u64>,
     max_cv: Option<f64>,
     min_iter_rate: Option<f64>,
-) -> VerifyResult {
-    let mut r = VerifyResult::pass();
+) -> AssertResult {
+    let mut r = AssertResult::pass();
     if reports.is_empty() {
         return r;
     }
@@ -884,6 +1100,23 @@ pub fn verify_benchmarks(
     r
 }
 
+// Backward-compatible aliases for the pre-rename API.
+#[doc(hidden)]
+pub type VerifyResult = AssertResult;
+#[doc(hidden)]
+pub type VerificationPlan = AssertPlan;
+#[doc(hidden)]
+pub type Verify = Assert;
+
+#[doc(hidden)]
+pub use assert_benchmarks as verify_benchmarks;
+#[doc(hidden)]
+pub use assert_isolation as verify_isolation;
+#[doc(hidden)]
+pub use assert_not_starved as verify_not_starved;
+#[doc(hidden)]
+pub use assert_throughput_parity as verify_throughput_parity;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,7 +1156,7 @@ mod tests {
 
     #[test]
     fn healthy_pass() {
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5_000_000_000, 500_000_000, &[0, 1], 50),
             rpt(2, 1000, 5_000_000_000, 600_000_000, &[0, 1], 60),
             rpt(3, 1000, 5_000_000_000, 550_000_000, &[0, 1], 45),
@@ -933,7 +1166,7 @@ mod tests {
 
     #[test]
     fn starved_fail() {
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 0, 5e9 as u64, 5e9 as u64, &[0], 50),
         ]);
@@ -944,7 +1177,7 @@ mod tests {
     #[test]
     fn unfair_spread_fail() {
         let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50), // 10%
             rpt(2, 500, 5e9 as u64, 4e9 as u64, &[0, 1], 50),  // 80%
             rpt(3, 800, 5e9 as u64, 2e9 as u64, &[0, 1], 50),  // 40%
@@ -955,7 +1188,7 @@ mod tests {
 
     #[test]
     fn fair_oversubscribed_pass() {
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 100, 5e9 as u64, (3.75e9) as u64, &[0], 50),
             rpt(2, 100, 5e9 as u64, (3.70e9) as u64, &[0], 50),
             rpt(3, 100, 5e9 as u64, (3.80e9) as u64, &[0], 50),
@@ -967,7 +1200,7 @@ mod tests {
     #[test]
     fn stuck_fail() {
         let threshold = gap_threshold_ms();
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 500),
         ]);
@@ -978,7 +1211,7 @@ mod tests {
     #[test]
     fn isolation_pass() {
         let expected: BTreeSet<usize> = [0, 1, 2, 3].into_iter().collect();
-        let r = verify_isolation(
+        let r = assert_isolation(
             &[
                 rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
                 rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[2, 3], 50),
@@ -991,7 +1224,7 @@ mod tests {
     #[test]
     fn isolation_fail() {
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
-        let r = verify_isolation(
+        let r = assert_isolation(
             &[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)],
             &expected,
         );
@@ -1001,11 +1234,11 @@ mod tests {
 
     #[test]
     fn merge_cgroups() {
-        let r1 = verify_not_starved(&[
+        let r1 = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
             rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[0, 1], 60),
         ]);
-        let r2 = verify_not_starved(&[
+        let r2 = assert_not_starved(&[
             rpt(3, 1000, 5e9 as u64, 25e8 as u64, &[2, 3], 50),
             rpt(4, 1000, 5e9 as u64, 26e8 as u64, &[2, 3], 50),
         ]);
@@ -1023,7 +1256,7 @@ mod tests {
         // At threshold exactly - pass
         // Worker 1: 10% runnable, Worker 2: 10%+threshold runnable
         let at_threshold_ns = ((10.0 + threshold) / 100.0 * 5e9) as u64;
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50), // 10%
             rpt(2, 1000, 5e9 as u64, at_threshold_ns, &[0], 50), // 10% + threshold
         ]);
@@ -1034,7 +1267,7 @@ mod tests {
         );
         // Above threshold - fail
         let above_ns = ((15.0 + threshold) / 100.0 * 5e9) as u64;
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50), // 10%
             rpt(2, 1000, 5e9 as u64, above_ns, &[0], 50),   // 10% + threshold + 5%
         ]);
@@ -1043,12 +1276,12 @@ mod tests {
 
     #[test]
     fn empty_pass() {
-        assert!(verify_not_starved(&[]).passed);
+        assert!(assert_not_starved(&[]).passed);
     }
 
     #[test]
     fn zero_wall_time() {
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 0, 0, 0, &[], 0),
         ]);
@@ -1058,7 +1291,7 @@ mod tests {
 
     #[test]
     fn single_worker_always_pass() {
-        let r = verify_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50)]);
+        let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50)]);
         assert!(r.passed);
         assert_eq!(r.stats.total_workers, 1);
         assert_eq!(r.stats.cgroups.len(), 1);
@@ -1066,7 +1299,7 @@ mod tests {
 
     #[test]
     fn stats_accuracy() {
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 1e9 as u64, &[0], 50),  // 20%
             rpt(2, 1000, 5e9 as u64, 15e8 as u64, &[1], 60), // 30%
         ]);
@@ -1082,8 +1315,8 @@ mod tests {
 
     #[test]
     fn merge_takes_worst_gap() {
-        let r1 = verify_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100)]);
-        let r2 = verify_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 500)]);
+        let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100)]);
+        let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 500)]);
         let mut m = r1;
         m.merge(r2);
         assert_eq!(m.stats.worst_gap_ms, 500);
@@ -1092,11 +1325,11 @@ mod tests {
 
     #[test]
     fn merge_takes_worst_spread() {
-        let r1 = verify_not_starved(&[
+        let r1 = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 1e9 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 12e8 as u64, &[0], 50),
         ]); // spread = 4%
-        let r2 = verify_not_starved(&[
+        let r2 = assert_not_starved(&[
             rpt(3, 1000, 5e9 as u64, 1e9 as u64, &[1], 50),
             rpt(4, 1000, 5e9 as u64, 15e8 as u64, &[1], 50),
         ]); // spread = 10%
@@ -1107,8 +1340,8 @@ mod tests {
 
     #[test]
     fn merge_accumulates_totals() {
-        let r1 = verify_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)]);
-        let r2 = verify_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50)]);
+        let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)]);
+        let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50)]);
         let mut m = r1;
         m.merge(r2);
         assert_eq!(m.stats.total_workers, 2);
@@ -1118,20 +1351,20 @@ mod tests {
     #[test]
     fn isolation_empty_reports() {
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
-        assert!(verify_isolation(&[], &expected).passed);
+        assert!(assert_isolation(&[], &expected).passed);
     }
 
     #[test]
     fn gap_boundary_at_threshold_pass() {
         let threshold = gap_threshold_ms();
-        let r = verify_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold)]);
+        let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold)]);
         assert!(r.passed, "gap at threshold should pass: {:?}", r.details);
     }
 
     #[test]
     fn gap_boundary_above_threshold_fail() {
         let threshold = gap_threshold_ms();
-        let r = verify_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 1)]);
+        let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 1)]);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("stuck")));
     }
@@ -1168,14 +1401,14 @@ mod tests {
     }
 
     #[test]
-    fn verify_result_serde_roundtrip() {
-        let r = VerifyResult {
+    fn assert_result_serde_roundtrip() {
+        let r = AssertResult {
             passed: false,
             details: vec!["test".into()],
             stats: Default::default(),
         };
         let json = serde_json::to_string(&r).unwrap();
-        let r2: VerifyResult = serde_json::from_str(&json).unwrap();
+        let r2: AssertResult = serde_json::from_str(&json).unwrap();
         assert_eq!(r.passed, r2.passed);
         assert_eq!(r.details, r2.details);
     }
@@ -1183,7 +1416,7 @@ mod tests {
     #[test]
     fn multiple_stuck_workers() {
         let threshold = gap_threshold_ms();
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 500),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], threshold + 1500),
         ]);
@@ -1196,15 +1429,15 @@ mod tests {
     fn migration_tracking() {
         let mut report = rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2], 50);
         report.migration_count = 5;
-        let r = verify_not_starved(&[report]);
+        let r = assert_not_starved(&[report]);
         assert_eq!(r.stats.total_migrations, 5);
     }
 
-    // VerificationPlan tests
+    // AssertPlan tests
 
     #[test]
     fn plan_default_empty() {
-        let plan = VerificationPlan::new();
+        let plan = AssertPlan::new();
         assert!(!plan.not_starved);
         assert!(!plan.isolation);
         assert!(plan.max_gap_ms.is_none());
@@ -1213,49 +1446,47 @@ mod tests {
 
     #[test]
     fn plan_check_not_starved() {
-        let plan = VerificationPlan::new().check_not_starved();
+        let plan = AssertPlan::new().check_not_starved();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(r.passed);
         assert_eq!(r.stats.total_workers, 1);
     }
 
     #[test]
     fn plan_check_isolation_with_cpuset() {
-        let plan = VerificationPlan::new()
-            .check_not_starved()
-            .check_isolation();
+        let plan = AssertPlan::new().check_not_starved().check_isolation();
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
-        let r = plan.verify_cgroup(&reports, Some(&expected));
+        let r = plan.assert_cgroup(&reports, Some(&expected));
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("unexpected")));
     }
 
     #[test]
     fn plan_isolation_skipped_without_cpuset() {
-        let plan = VerificationPlan::new().check_isolation();
+        let plan = AssertPlan::new().check_isolation();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
         // No cpuset provided -- isolation check is skipped.
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(r.passed);
     }
 
     #[test]
     fn plan_custom_gap_threshold_pass() {
-        let plan = VerificationPlan::new().check_not_starved().max_gap_ms(3000);
+        let plan = AssertPlan::new().check_not_starved().max_gap_ms(3000);
         // 2500ms gap: passes with 3000ms threshold.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2500)];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(r.passed, "2500ms < 3000ms threshold: {:?}", r.details);
     }
 
     #[test]
     fn plan_custom_gap_threshold_fail() {
-        let plan = VerificationPlan::new().check_not_starved().max_gap_ms(1500);
+        let plan = AssertPlan::new().check_not_starved().max_gap_ms(1500);
         // 2000ms gap: fails with 1500ms threshold.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("stuck")));
         assert!(r.details.iter().any(|d| d.contains("threshold 1500ms")));
@@ -1263,9 +1494,9 @@ mod tests {
 
     #[test]
     fn plan_no_checks_always_passes() {
-        let plan = VerificationPlan::new();
+        let plan = AssertPlan::new();
         let reports = [rpt(1, 0, 0, 0, &[], 5000)]; // starved + stuck
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(r.passed, "no checks enabled should pass");
     }
 
@@ -1273,7 +1504,7 @@ mod tests {
     fn plan_default_all_checks_disabled() {
         // Default::default() must produce the same state as new() —
         // all checks disabled, no gap override.
-        let plan = VerificationPlan::default();
+        let plan = AssertPlan::default();
         assert!(!plan.not_starved, "default must not enable not_starved");
         assert!(!plan.isolation, "default must not enable isolation");
         assert!(
@@ -1286,30 +1517,30 @@ mod tests {
         );
         // A plan with all checks disabled must pass even pathological input.
         let reports = [rpt(1, 0, 0, 0, &[], 99999)];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(r.passed, "all-disabled plan must pass any input");
     }
 
     #[test]
-    fn verification_plan_default_equals_new() {
-        // Default impl calls new(). Verify field-by-field equivalence
-        // and that both produce identical verify_cgroup results.
-        let d = VerificationPlan::default();
-        let n = VerificationPlan::new();
+    fn assert_plan_default_equals_new() {
+        // Default impl calls new(). Check field-by-field equivalence
+        // and that both produce identical assert_cgroup results.
+        let d = AssertPlan::default();
+        let n = AssertPlan::new();
         assert_eq!(d.not_starved, n.not_starved);
         assert_eq!(d.isolation, n.isolation);
         assert_eq!(d.max_gap_ms, n.max_gap_ms);
         assert_eq!(d.max_spread_pct, n.max_spread_pct);
         // Both should produce identical pass/fail on the same input.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let rd = d.verify_cgroup(&reports, None);
-        let rn = n.verify_cgroup(&reports, None);
+        let rd = d.assert_cgroup(&reports, None);
+        let rn = n.assert_cgroup(&reports, None);
         assert_eq!(rd.passed, rn.passed);
     }
 
     #[test]
     fn single_worker_spread_zero() {
-        let r = verify_not_starved(&[rpt(1, 500, 5e9 as u64, 25e8 as u64, &[0, 1], 50)]);
+        let r = assert_not_starved(&[rpt(1, 500, 5e9 as u64, 25e8 as u64, &[0, 1], 50)]);
         assert!(r.passed);
         let c = &r.stats.cgroups[0];
         assert!((c.spread - 0.0).abs() < f64::EPSILON);
@@ -1320,7 +1551,7 @@ mod tests {
         // wall_time=0 but work_units>0: the worker did work but the timer
         // didn't advance. Should not produce a starved failure since work was done.
         // The runnable_pct computation skips this worker (no pcts entry).
-        let r = verify_not_starved(&[rpt(1, 100, 0, 0, &[0], 0)]);
+        let r = assert_not_starved(&[rpt(1, 100, 0, 0, &[0], 0)]);
         assert!(
             r.passed,
             "nonzero work with zero wall_time: {:?}",
@@ -1333,7 +1564,7 @@ mod tests {
         // Empty expected set means no CPUs are "expected", so any CPU
         // used by the worker is unexpected. difference(empty) == worker's set.
         let expected: BTreeSet<usize> = BTreeSet::new();
-        let r = verify_isolation(
+        let r = assert_isolation(
             &[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50)],
             &expected,
         );
@@ -1346,14 +1577,14 @@ mod tests {
     fn isolation_worker_used_no_cpus() {
         // Worker used no CPUs -- difference with expected is empty, so passes.
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
-        let r = verify_isolation(&[rpt(1, 0, 0, 0, &[], 0)], &expected);
+        let r = assert_isolation(&[rpt(1, 0, 0, 0, &[], 0)], &expected);
         assert!(r.passed);
     }
 
     #[test]
     fn isolation_all_unexpected_cpus() {
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
-        let r = verify_isolation(
+        let r = assert_isolation(
             &[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[4, 5, 6], 50)],
             &expected,
         );
@@ -1363,8 +1594,8 @@ mod tests {
 
     #[test]
     fn merge_pass_and_fail() {
-        let pass = VerifyResult::pass();
-        let mut fail = VerifyResult::pass();
+        let pass = AssertResult::pass();
+        let mut fail = AssertResult::pass();
         fail.passed = false;
         fail.details.push("something failed".into());
 
@@ -1381,10 +1612,10 @@ mod tests {
 
     #[test]
     fn merge_fail_and_pass() {
-        let mut fail = VerifyResult::pass();
+        let mut fail = AssertResult::pass();
         fail.passed = false;
         fail.details.push("first failed".into());
-        let pass = VerifyResult::pass();
+        let pass = AssertResult::pass();
 
         let mut merged = fail;
         merged.merge(pass);
@@ -1397,7 +1628,7 @@ mod tests {
         // With WARN_UNFAIR=true, unfair spread should NOT fail the result
         // (it still adds the detail string but passed stays true).
         set_warn_unfair(true);
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50), // 10%
             rpt(2, 500, 5e9 as u64, 4e9 as u64, &[0, 1], 50),  // 80%
         ]);
@@ -1414,12 +1645,12 @@ mod tests {
         // A starved worker (work_units=0) must still cause failure even
         // when the custom max_gap_ms threshold is high enough that the
         // gap check passes.
-        let plan = VerificationPlan::new().check_not_starved().max_gap_ms(5000);
+        let plan = AssertPlan::new().check_not_starved().max_gap_ms(5000);
         let reports = [
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100), // healthy
             rpt(2, 0, 5e9 as u64, 0, &[1], 1500),            // starved, gap < threshold
         ];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(
             !r.passed,
             "starved worker must fail even with relaxed gap threshold"
@@ -1434,7 +1665,7 @@ mod tests {
         let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
         // With WARN_UNFAIR=false (default), unfair spread fails.
         set_warn_unfair(false);
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50), // 10%
             rpt(2, 500, 5e9 as u64, 4e9 as u64, &[0, 1], 50),  // 80%
         ]);
@@ -1442,11 +1673,11 @@ mod tests {
         assert!(r.details.iter().any(|d| d.contains("unfair")));
     }
 
-    // -- Verify merge tests --
+    // -- Assert merge tests --
 
     #[test]
-    fn verify_none_has_no_checks() {
-        let v = Verify::NONE;
+    fn assert_none_has_no_checks() {
+        let v = Assert::NONE;
         assert!(v.not_starved.is_none());
         assert!(v.isolation.is_none());
         assert!(v.max_gap_ms.is_none());
@@ -1455,8 +1686,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_default_checks_enables_not_starved() {
-        let v = Verify::default_checks();
+    fn assert_default_checks_enables_not_starved() {
+        let v = Assert::default_checks();
         assert_eq!(v.not_starved, Some(true));
         assert!(v.isolation.is_none());
         assert!(v.max_imbalance_ratio.is_some());
@@ -1468,9 +1699,9 @@ mod tests {
     }
 
     #[test]
-    fn verify_merge_other_overrides_self() {
-        let base = Verify::NONE;
-        let other = Verify::NONE
+    fn assert_merge_other_overrides_self() {
+        let base = Assert::NONE;
+        let other = Assert::NONE
             .check_not_starved()
             .max_gap_ms(5000)
             .max_imbalance_ratio(2.0);
@@ -1481,37 +1712,37 @@ mod tests {
     }
 
     #[test]
-    fn verify_merge_preserves_self_when_other_is_none() {
-        let base = Verify::default_checks();
-        let merged = base.merge(&Verify::NONE);
+    fn assert_merge_preserves_self_when_other_is_none() {
+        let base = Assert::default_checks();
+        let merged = base.merge(&Assert::NONE);
         assert_eq!(merged.not_starved, Some(true));
         assert!(merged.max_imbalance_ratio.is_some());
         assert!(merged.max_local_dsq_depth.is_some());
     }
 
     #[test]
-    fn verify_merge_other_takes_precedence() {
-        let base = Verify::NONE.max_imbalance_ratio(4.0);
-        let other = Verify::NONE.max_imbalance_ratio(2.0);
+    fn assert_merge_other_takes_precedence() {
+        let base = Assert::NONE.max_imbalance_ratio(4.0);
+        let other = Assert::NONE.max_imbalance_ratio(2.0);
         let merged = base.merge(&other);
         assert_eq!(merged.max_imbalance_ratio, Some(2.0));
     }
 
     #[test]
-    fn verify_merge_last_some_wins() {
-        let base = Verify::NONE.check_not_starved();
-        let other = Verify::NONE.check_isolation();
+    fn assert_merge_last_some_wins() {
+        let base = Assert::NONE.check_not_starved();
+        let other = Assert::NONE.check_isolation();
         let merged = base.merge(&other);
         assert_eq!(merged.not_starved, Some(true));
         assert_eq!(merged.isolation, Some(true));
     }
 
     #[test]
-    fn verify_merge_child_disables_not_starved() {
-        let base = Verify::default_checks(); // not_starved = Some(true)
-        let other = Verify {
+    fn assert_merge_child_disables_not_starved() {
+        let base = Assert::default_checks(); // not_starved = Some(true)
+        let other = Assert {
             not_starved: Some(false),
-            ..Verify::NONE
+            ..Assert::NONE
         };
         let merged = base.merge(&other);
         assert_eq!(merged.not_starved, Some(false));
@@ -1519,11 +1750,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_merge_child_disables_isolation() {
-        let base = Verify::NONE.check_isolation(); // isolation = Some(true)
-        let other = Verify {
+    fn assert_merge_child_disables_isolation() {
+        let base = Assert::NONE.check_isolation(); // isolation = Some(true)
+        let other = Assert {
             isolation: Some(false),
-            ..Verify::NONE
+            ..Assert::NONE
         };
         let merged = base.merge(&other);
         assert_eq!(merged.isolation, Some(false));
@@ -1531,8 +1762,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_worker_plan_extraction() {
-        let v = Verify::NONE
+    fn assert_worker_plan_extraction() {
+        let v = Assert::NONE
             .check_not_starved()
             .check_isolation()
             .max_gap_ms(3000)
@@ -1547,17 +1778,17 @@ mod tests {
     }
 
     #[test]
-    fn verify_verify_cgroup_delegates_to_plan() {
-        let v = Verify::NONE.check_not_starved();
+    fn assert_cgroup_delegates_to_plan() {
+        let v = Assert::NONE.check_not_starved();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let r = v.verify_cgroup(&reports, None);
+        let r = v.assert_cgroup(&reports, None);
         assert!(r.passed);
         assert_eq!(r.stats.total_workers, 1);
     }
 
     #[test]
-    fn verify_monitor_thresholds_extraction() {
-        let v = Verify::NONE
+    fn assert_monitor_thresholds_extraction() {
+        let v = Assert::NONE
             .max_imbalance_ratio(2.5)
             .max_local_dsq_depth(100)
             .fail_on_stall(false)
@@ -1574,8 +1805,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_monitor_thresholds_defaults_when_none() {
-        let v = Verify::NONE;
+    fn assert_monitor_thresholds_defaults_when_none() {
+        let v = Assert::NONE;
         let t = v.monitor_thresholds();
         let d = crate::monitor::MonitorThresholds::DEFAULT;
         assert!((t.max_imbalance_ratio - d.max_imbalance_ratio).abs() < f64::EPSILON);
@@ -1583,8 +1814,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_chain_all_setters() {
-        let v = Verify::NONE
+    fn assert_chain_all_setters() {
+        let v = Assert::NONE
             .check_not_starved()
             .check_isolation()
             .max_gap_ms(1000)
@@ -1633,78 +1864,78 @@ mod tests {
     }
 
     #[test]
-    fn verify_result_pass_defaults() {
-        let r = VerifyResult::pass();
+    fn assert_result_pass_defaults() {
+        let r = AssertResult::pass();
         assert!(r.passed);
         assert!(r.details.is_empty());
         assert_eq!(r.stats.total_workers, 0);
     }
 
-    // -- Verify::merge per-field tests --
+    // -- Assert::merge per-field tests --
 
     #[test]
-    fn verify_merge_max_spread_pct() {
-        let base = Verify::NONE.max_spread_pct(10.0);
-        let other = Verify::NONE.max_spread_pct(5.0);
+    fn assert_merge_max_spread_pct() {
+        let base = Assert::NONE.max_spread_pct(10.0);
+        let other = Assert::NONE.max_spread_pct(5.0);
         assert_eq!(base.merge(&other).max_spread_pct, Some(5.0));
-        assert_eq!(base.merge(&Verify::NONE).max_spread_pct, Some(10.0));
+        assert_eq!(base.merge(&Assert::NONE).max_spread_pct, Some(10.0));
     }
 
     #[test]
-    fn verify_merge_fail_on_stall() {
-        let base = Verify::NONE.fail_on_stall(true);
-        let other = Verify::NONE.fail_on_stall(false);
+    fn assert_merge_fail_on_stall() {
+        let base = Assert::NONE.fail_on_stall(true);
+        let other = Assert::NONE.fail_on_stall(false);
         assert_eq!(base.merge(&other).fail_on_stall, Some(false));
-        assert_eq!(base.merge(&Verify::NONE).fail_on_stall, Some(true));
+        assert_eq!(base.merge(&Assert::NONE).fail_on_stall, Some(true));
     }
 
     #[test]
-    fn verify_merge_sustained_samples() {
-        let base = Verify::NONE.sustained_samples(5);
-        let other = Verify::NONE.sustained_samples(10);
+    fn assert_merge_sustained_samples() {
+        let base = Assert::NONE.sustained_samples(5);
+        let other = Assert::NONE.sustained_samples(10);
         assert_eq!(base.merge(&other).sustained_samples, Some(10));
-        assert_eq!(base.merge(&Verify::NONE).sustained_samples, Some(5));
+        assert_eq!(base.merge(&Assert::NONE).sustained_samples, Some(5));
     }
 
     #[test]
-    fn verify_merge_max_fallback_rate() {
-        let base = Verify::NONE.max_fallback_rate(200.0);
-        let other = Verify::NONE.max_fallback_rate(50.0);
+    fn assert_merge_max_fallback_rate() {
+        let base = Assert::NONE.max_fallback_rate(200.0);
+        let other = Assert::NONE.max_fallback_rate(50.0);
         assert_eq!(base.merge(&other).max_fallback_rate, Some(50.0));
-        assert_eq!(base.merge(&Verify::NONE).max_fallback_rate, Some(200.0));
+        assert_eq!(base.merge(&Assert::NONE).max_fallback_rate, Some(200.0));
     }
 
     #[test]
-    fn verify_merge_max_keep_last_rate() {
-        let base = Verify::NONE.max_keep_last_rate(100.0);
-        let other = Verify::NONE.max_keep_last_rate(25.0);
+    fn assert_merge_max_keep_last_rate() {
+        let base = Assert::NONE.max_keep_last_rate(100.0);
+        let other = Assert::NONE.max_keep_last_rate(25.0);
         assert_eq!(base.merge(&other).max_keep_last_rate, Some(25.0));
-        assert_eq!(base.merge(&Verify::NONE).max_keep_last_rate, Some(100.0));
+        assert_eq!(base.merge(&Assert::NONE).max_keep_last_rate, Some(100.0));
     }
 
     #[test]
-    fn verify_merge_max_local_dsq_depth() {
-        let base = Verify::NONE.max_local_dsq_depth(50);
-        let other = Verify::NONE.max_local_dsq_depth(100);
+    fn assert_merge_max_local_dsq_depth() {
+        let base = Assert::NONE.max_local_dsq_depth(50);
+        let other = Assert::NONE.max_local_dsq_depth(100);
         assert_eq!(base.merge(&other).max_local_dsq_depth, Some(100));
-        assert_eq!(base.merge(&Verify::NONE).max_local_dsq_depth, Some(50));
+        assert_eq!(base.merge(&Assert::NONE).max_local_dsq_depth, Some(50));
     }
 
     #[test]
-    fn verify_merge_max_gap_ms() {
-        let base = Verify::NONE.max_gap_ms(2000);
-        let other = Verify::NONE.max_gap_ms(5000);
+    fn assert_merge_max_gap_ms() {
+        let base = Assert::NONE.max_gap_ms(2000);
+        let other = Assert::NONE.max_gap_ms(5000);
         assert_eq!(base.merge(&other).max_gap_ms, Some(5000));
-        assert_eq!(base.merge(&Verify::NONE).max_gap_ms, Some(2000));
+        assert_eq!(base.merge(&Assert::NONE).max_gap_ms, Some(2000));
     }
 
     #[test]
-    fn verify_merge_three_layers() {
-        let defaults = Verify::default_checks();
-        let sched = Verify::NONE
+    fn assert_merge_three_layers() {
+        let defaults = Assert::default_checks();
+        let sched = Assert::NONE
             .max_imbalance_ratio(2.0)
             .max_fallback_rate(50.0);
-        let test = Verify::NONE.max_gap_ms(5000);
+        let test = Assert::NONE.max_gap_ms(5000);
         let merged = defaults.merge(&sched).merge(&test);
         assert_eq!(merged.not_starved, Some(true));
         assert_eq!(merged.max_imbalance_ratio, Some(2.0));
@@ -1714,12 +1945,12 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Negative tests: verify that diagnostics catch controlled failures
+    // Negative tests: check that diagnostics catch controlled failures
     // ---------------------------------------------------------------
 
     #[test]
     fn neg_starvation_zero_work_detected() {
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
             rpt(2, 0, 5e9 as u64, 0, &[0], 0), // starved
             rpt(3, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
@@ -1746,7 +1977,7 @@ mod tests {
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2, 3], 50),
         ];
-        let r = verify_isolation(&reports, &expected);
+        let r = assert_isolation(&reports, &expected);
         assert!(!r.passed, "isolation violation must be caught");
         // Format: "tid 2 ran on unexpected CPUs {2, 3}"
         let detail = r
@@ -1768,7 +1999,7 @@ mod tests {
     fn neg_unfairness_extreme_spread_detected() {
         let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
         set_warn_unfair(false);
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 100, 5e9 as u64, 25e7 as u64, &[0, 1], 50), // 5%
             rpt(2, 5000, 5e9 as u64, 475e7 as u64, &[0, 1], 50), // 95%
         ]);
@@ -1808,7 +2039,7 @@ mod tests {
     fn neg_scheduling_gap_exceeds_threshold() {
         let threshold = gap_threshold_ms();
         let gap = threshold + 2000;
-        let r = verify_not_starved(&[
+        let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], gap),
         ]);
@@ -1835,12 +2066,12 @@ mod tests {
 
     #[test]
     fn neg_plan_custom_gap_catches_lower_threshold() {
-        let plan = VerificationPlan::new().check_not_starved().max_gap_ms(500);
+        let plan = AssertPlan::new().check_not_starved().max_gap_ms(500);
         let reports = [
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
         ];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(!r.passed, "custom 500ms threshold must catch 1000ms gap");
         // Format: "stuck 1000ms on cpu1 at +1000ms (threshold 500ms)"
         let detail = r.details.iter().find(|d| d.contains("stuck")).unwrap();
@@ -1859,15 +2090,13 @@ mod tests {
     fn neg_isolation_plus_starvation_both_reported() {
         let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
         set_warn_unfair(false);
-        let plan = VerificationPlan::new()
-            .check_not_starved()
-            .check_isolation();
+        let plan = AssertPlan::new().check_not_starved().check_isolation();
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
         let reports = [
             rpt(1, 0, 5e9 as u64, 0, &[0], 0),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[4, 5], 50),
         ];
-        let r = plan.verify_cgroup(&reports, Some(&expected));
+        let r = plan.assert_cgroup(&reports, Some(&expected));
         assert!(!r.passed);
         // Starvation detail must name tid 1 with "0 work units".
         let starved_detail = r.details.iter().find(|d| d.contains("starved")).unwrap();
@@ -1887,14 +2116,14 @@ mod tests {
     }
 
     #[test]
-    fn neg_verify_cgroup_via_verify_struct() {
-        let v = Verify::NONE.check_not_starved().check_isolation();
+    fn neg_assert_cgroup_via_assert_struct() {
+        let v = Assert::NONE.check_not_starved().check_isolation();
         let expected: BTreeSet<usize> = [0].into_iter().collect();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2], 50)];
-        let r = v.verify_cgroup(&reports, Some(&expected));
+        let r = v.assert_cgroup(&reports, Some(&expected));
         assert!(
             !r.passed,
-            "Verify.verify_cgroup must catch isolation failure"
+            "Assert.assert_cgroup must catch isolation failure"
         );
         let detail = r.details.iter().find(|d| d.contains("unexpected")).unwrap();
         assert!(detail.contains("tid 1"), "must name tid: {detail}");
@@ -1903,18 +2132,18 @@ mod tests {
     }
 
     #[test]
-    fn verify_merge_none_preserves_base() {
-        let base = Verify::default_checks();
-        let merged = base.merge(&Verify::NONE);
+    fn assert_merge_none_preserves_base() {
+        let base = Assert::default_checks();
+        let merged = base.merge(&Assert::NONE);
         assert_eq!(merged.not_starved, Some(true));
         assert!(merged.max_imbalance_ratio.is_some());
         assert!(merged.fail_on_stall.is_some());
     }
 
     #[test]
-    fn verify_merge_overrides_fields() {
-        let base = Verify::NONE;
-        let overrides = Verify::NONE
+    fn assert_merge_overrides_fields() {
+        let base = Assert::NONE;
+        let overrides = Assert::NONE
             .max_imbalance_ratio(5.0)
             .max_gap_ms(1000)
             .check_not_starved();
@@ -1925,16 +2154,16 @@ mod tests {
     }
 
     #[test]
-    fn verify_merge_later_overrides_earlier() {
-        let a = Verify::NONE.max_imbalance_ratio(2.0);
-        let b = Verify::NONE.max_imbalance_ratio(10.0);
+    fn assert_merge_later_overrides_earlier() {
+        let a = Assert::NONE.max_imbalance_ratio(2.0);
+        let b = Assert::NONE.max_imbalance_ratio(10.0);
         let merged = a.merge(&b);
         assert_eq!(merged.max_imbalance_ratio, Some(10.0));
     }
 
     #[test]
-    fn verify_worker_plan_extracts_fields() {
-        let v = Verify::NONE
+    fn assert_worker_plan_extracts_fields() {
+        let v = Assert::NONE
             .check_not_starved()
             .check_isolation()
             .max_gap_ms(500)
@@ -1949,8 +2178,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_monitor_thresholds_defaults() {
-        let v = Verify::NONE;
+    fn assert_monitor_thresholds_defaults() {
+        let v = Assert::NONE;
         let t = v.monitor_thresholds();
         // Should use MonitorThresholds::DEFAULT values.
         let d = crate::monitor::MonitorThresholds::DEFAULT;
@@ -1959,8 +2188,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_monitor_thresholds_overridden() {
-        let v = Verify::NONE
+    fn assert_monitor_thresholds_overridden() {
+        let v = Assert::NONE
             .max_imbalance_ratio(99.0)
             .max_local_dsq_depth(42)
             .fail_on_stall(false)
@@ -1977,8 +2206,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_max_spread_pct() {
-        let v = Verify::NONE.max_spread_pct(25.0);
+    fn assert_max_spread_pct() {
+        let v = Assert::NONE.max_spread_pct(25.0);
         assert_eq!(v.max_spread_pct, Some(25.0));
     }
 
@@ -1998,8 +2227,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_result_merge_combines_stats() {
-        let mut a = VerifyResult {
+    fn assert_result_merge_combines_stats() {
+        let mut a = AssertResult {
             passed: true,
             details: vec!["a".into()],
             stats: ScenarioStats {
@@ -2013,7 +2242,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let b = VerifyResult {
+        let b = AssertResult {
             passed: false,
             details: vec!["b".into()],
             stats: ScenarioStats {
@@ -2040,18 +2269,18 @@ mod tests {
 
     #[test]
     fn neg_plan_custom_gap_passes_below_threshold() {
-        let plan = VerificationPlan::new().check_not_starved().max_gap_ms(5000);
+        let plan = AssertPlan::new().check_not_starved().max_gap_ms(5000);
         let reports = [
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
         ];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         // 1000ms gap < 5000ms threshold, so it passes.
         let has_stuck = r.details.iter().any(|d| d.contains("stuck"));
         assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");
     }
 
-    // -- verify_benchmarks tests --
+    // -- assert_benchmarks tests --
 
     fn rpt_with_latencies(
         tid: u32,
@@ -2080,50 +2309,50 @@ mod tests {
     }
 
     #[test]
-    fn verify_benchmarks_empty_reports() {
-        let r = verify_benchmarks(&[], Some(1000), Some(0.5), Some(100.0));
+    fn assert_benchmarks_empty_reports() {
+        let r = assert_benchmarks(&[], Some(1000), Some(0.5), Some(100.0));
         assert!(r.passed);
     }
 
     #[test]
-    fn verify_benchmarks_no_thresholds() {
+    fn assert_benchmarks_no_thresholds() {
         let reports = [rpt_with_latencies(
             1,
             vec![1000, 2000, 3000],
             10,
             5_000_000_000,
         )];
-        let r = verify_benchmarks(&reports, None, None, None);
+        let r = assert_benchmarks(&reports, None, None, None);
         assert!(r.passed);
     }
 
     #[test]
-    fn verify_benchmarks_p99_pass() {
+    fn assert_benchmarks_p99_pass() {
         let reports = [rpt_with_latencies(
             1,
             vec![100, 200, 300, 400, 500],
             10,
             5_000_000_000,
         )];
-        let r = verify_benchmarks(&reports, Some(1000), None, None);
+        let r = assert_benchmarks(&reports, Some(1000), None, None);
         assert!(r.passed, "p99 500ns < 1000ns limit: {:?}", r.details);
     }
 
     #[test]
-    fn verify_benchmarks_p99_fail() {
+    fn assert_benchmarks_p99_fail() {
         let reports = [rpt_with_latencies(
             1,
             vec![100, 200, 300, 400, 2000],
             10,
             5_000_000_000,
         )];
-        let r = verify_benchmarks(&reports, Some(1000), None, None);
+        let r = assert_benchmarks(&reports, Some(1000), None, None);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("p99 wake latency")));
     }
 
     #[test]
-    fn verify_benchmarks_cv_pass() {
+    fn assert_benchmarks_cv_pass() {
         // All same latency -> CV = 0.
         let reports = [rpt_with_latencies(
             1,
@@ -2131,12 +2360,12 @@ mod tests {
             10,
             5_000_000_000,
         )];
-        let r = verify_benchmarks(&reports, None, Some(0.5), None);
+        let r = assert_benchmarks(&reports, None, Some(0.5), None);
         assert!(r.passed, "uniform latencies CV=0: {:?}", r.details);
     }
 
     #[test]
-    fn verify_benchmarks_cv_fail() {
+    fn assert_benchmarks_cv_fail() {
         // High variance latencies.
         let reports = [rpt_with_latencies(
             1,
@@ -2144,51 +2373,51 @@ mod tests {
             10,
             5_000_000_000,
         )];
-        let r = verify_benchmarks(&reports, None, Some(0.5), None);
+        let r = assert_benchmarks(&reports, None, Some(0.5), None);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("wake latency CV")));
     }
 
     #[test]
-    fn verify_benchmarks_iteration_rate_pass() {
+    fn assert_benchmarks_iteration_rate_pass() {
         // 1000 iterations in 5 seconds = 200/s, above 100/s floor.
         let reports = [rpt_with_latencies(1, vec![], 1000, 5_000_000_000)];
-        let r = verify_benchmarks(&reports, None, None, Some(100.0));
+        let r = assert_benchmarks(&reports, None, None, Some(100.0));
         assert!(r.passed, "200/s > 100/s floor: {:?}", r.details);
     }
 
     #[test]
-    fn verify_benchmarks_iteration_rate_fail() {
+    fn assert_benchmarks_iteration_rate_fail() {
         // 10 iterations in 5 seconds = 2/s, below 100/s floor.
         let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
-        let r = verify_benchmarks(&reports, None, None, Some(100.0));
+        let r = assert_benchmarks(&reports, None, None, Some(100.0));
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("iteration rate")));
     }
 
     #[test]
-    fn verify_benchmarks_zero_wall_time_skips_rate() {
+    fn assert_benchmarks_zero_wall_time_skips_rate() {
         let reports = [rpt_with_latencies(1, vec![], 10, 0)];
-        let r = verify_benchmarks(&reports, None, None, Some(100.0));
+        let r = assert_benchmarks(&reports, None, None, Some(100.0));
         assert!(r.passed, "zero wall_time should skip rate check");
     }
 
     #[test]
-    fn verify_benchmarks_no_latencies_skips_p99() {
+    fn assert_benchmarks_no_latencies_skips_p99() {
         let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
-        let r = verify_benchmarks(&reports, Some(1000), None, None);
+        let r = assert_benchmarks(&reports, Some(1000), None, None);
         assert!(r.passed, "empty latencies should skip p99 check");
     }
 
     #[test]
-    fn verify_benchmarks_single_latency_cv_skipped() {
+    fn assert_benchmarks_single_latency_cv_skipped() {
         // Single sample -> len < 2, CV check skipped.
         let reports = [rpt_with_latencies(1, vec![1000], 10, 5_000_000_000)];
-        let r = verify_benchmarks(&reports, None, Some(0.1), None);
+        let r = assert_benchmarks(&reports, None, Some(0.1), None);
         assert!(r.passed, "single sample should skip CV check");
     }
 
-    // -- wake latency stats in verify_not_starved --
+    // -- wake latency stats in assert_not_starved --
 
     #[test]
     fn not_starved_wake_latency_stats() {
@@ -2196,7 +2425,7 @@ mod tests {
             rpt_with_latencies(1, vec![1000, 2000, 3000, 4000, 5000], 100, 5_000_000_000),
             rpt_with_latencies(2, vec![6000, 7000, 8000, 9000, 10000], 200, 5_000_000_000),
         ];
-        let r = verify_not_starved(&reports);
+        let r = assert_not_starved(&reports);
         assert!(r.passed, "{:?}", r.details);
         let s = &r.stats;
         // p99 of [1000,2000,3000,4000,5000,6000,7000,8000,9000,10000] in us:
@@ -2219,7 +2448,7 @@ mod tests {
     #[test]
     fn not_starved_empty_latencies_zero_stats() {
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let r = verify_not_starved(&reports);
+        let r = assert_not_starved(&reports);
         assert!(r.passed);
         assert_eq!(r.stats.p99_wake_latency_us, 0.0);
         assert_eq!(r.stats.median_wake_latency_us, 0.0);
@@ -2232,7 +2461,7 @@ mod tests {
         w1.schedstat_run_delay_ns = 100_000; // 100us
         let mut w2 = rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50);
         w2.schedstat_run_delay_ns = 300_000; // 300us
-        let r = verify_not_starved(&[w1, w2]);
+        let r = assert_not_starved(&[w1, w2]);
         assert!(r.passed, "{:?}", r.details);
         // mean_run_delay = (100 + 300) / 2 = 200us
         assert!(
@@ -2248,11 +2477,11 @@ mod tests {
         );
     }
 
-    // -- VerificationPlan benchmarking integration --
+    // -- AssertPlan benchmarking integration --
 
     #[test]
-    fn plan_benchmarks_p99_via_verify_cgroup() {
-        let plan = VerificationPlan {
+    fn plan_benchmarks_p99_via_assert_cgroup() {
+        let plan = AssertPlan {
             not_starved: false,
             isolation: false,
             max_gap_ms: None,
@@ -2262,6 +2491,7 @@ mod tests {
             max_p99_wake_latency_ns: Some(500),
             max_wake_latency_cv: None,
             min_iteration_rate: None,
+            max_migration_ratio: None,
         };
         let reports = [rpt_with_latencies(
             1,
@@ -2269,14 +2499,59 @@ mod tests {
             10,
             5_000_000_000,
         )];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(!r.passed, "p99 1000ns > 500ns limit");
         assert!(r.details.iter().any(|d| d.contains("p99 wake latency")));
     }
 
     #[test]
-    fn plan_benchmarks_iteration_rate_via_verify_cgroup() {
-        let plan = VerificationPlan {
+    fn plan_migration_ratio_gate() {
+        let mut w = rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50);
+        w.migration_count = 10;
+        w.iterations = 100;
+        // ratio = 10/100 = 0.10, threshold 0.05 → fail
+        let plan = AssertPlan {
+            not_starved: false,
+            isolation: false,
+            max_gap_ms: None,
+            max_spread_pct: None,
+            max_throughput_cv: None,
+            min_work_rate: None,
+            max_p99_wake_latency_ns: None,
+            max_wake_latency_cv: None,
+            min_iteration_rate: None,
+            max_migration_ratio: Some(0.05),
+        };
+        let r = plan.assert_cgroup(&[w], None);
+        assert!(!r.passed);
+        assert!(r.details.iter().any(|d| d.contains("migration ratio")));
+    }
+
+    #[test]
+    fn plan_migration_ratio_gate_pass() {
+        let mut w = rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50);
+        w.migration_count = 2;
+        w.iterations = 100;
+        // ratio = 2/100 = 0.02, threshold 0.05 → pass
+        let plan = AssertPlan {
+            not_starved: false,
+            isolation: false,
+            max_gap_ms: None,
+            max_spread_pct: None,
+            max_throughput_cv: None,
+            min_work_rate: None,
+            max_p99_wake_latency_ns: None,
+            max_wake_latency_cv: None,
+            min_iteration_rate: None,
+            max_migration_ratio: Some(0.05),
+        };
+        let r = plan.assert_cgroup(&[w], None);
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    #[test]
+    fn plan_benchmarks_iteration_rate_via_assert_cgroup() {
+        let plan = AssertPlan {
             not_starved: false,
             isolation: false,
             max_gap_ms: None,
@@ -2286,9 +2561,10 @@ mod tests {
             max_p99_wake_latency_ns: None,
             max_wake_latency_cv: None,
             min_iteration_rate: Some(1000.0),
+            max_migration_ratio: None,
         };
         let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
-        let r = plan.verify_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None);
         assert!(!r.passed, "2/s < 1000/s floor");
         assert!(r.details.iter().any(|d| d.contains("iteration rate")));
     }

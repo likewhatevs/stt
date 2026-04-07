@@ -22,7 +22,8 @@ pub struct Scenario {
 **`name`** -- unique identifier (e.g. `"cgroup_steady"`).
 
 **`category`** -- one of: `basic`, `cpuset`, `affinity`, `sched_class`,
-`dynamic`, `stress`, `stall`, `advanced`, `nested`, `interaction`.
+`dynamic`, `stress`, `stall`, `advanced`, `nested`, `interaction`,
+`performance`.
 
 **`required_flags` / `excluded_flags`** -- typed `&[&flags::FlagDecl]`
 references that constrain which flag profiles are valid. Import path:
@@ -71,7 +72,7 @@ pub struct CgroupWork {
 | `SingleCpu` | Pin to one CPU |
 
 **`action`** -- `Steady` (run workers for the duration) or
-`Custom(fn(&Ctx) -> Result<VerifyResult>)` for scenarios with custom
+`Custom(fn(&Ctx) -> Result<AssertResult>)` for scenarios with custom
 logic (dynamic cgroup operations, topology changes, etc.).
 
 ## How scenarios run
@@ -96,7 +97,7 @@ struct and helper functions.
 ## Scenario catalog
 
 All scenarios are registered in `all_scenarios()`. The catalog has
-scenarios across 10 categories.
+scenarios across 11 categories.
 
 ## Flag profiles
 

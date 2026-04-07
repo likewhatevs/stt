@@ -12,3 +12,5 @@ Standalone examples for common tasks. Each recipe is self-contained.
   with CgroupDef and Traverse
 - [Customize verification](recipes/custom-verification.md) -- scheduler
   thresholds, per-test overrides
+- [Benchmarking and negative tests](recipes/benchmarking-tests.md) --
+  performance gates, intentional degradation, Assert vs AssertPlan

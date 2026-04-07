@@ -106,6 +106,7 @@ const BUSYBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
 pub fn resolve_shared_libs(binary: &Path) -> Result<Vec<(String, PathBuf)>> {
     let output = std::process::Command::new("ldd")
         .arg(binary)
+        .env_remove("LD_LIBRARY_PATH")
         .output()
         .with_context(|| format!("ldd {}", binary.display()))?;
 
@@ -123,8 +124,21 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<Vec<(String, PathBuf)>> {
             continue;
         }
         if let Some(path) = parse_ldd_line(line) {
-            let guest = path.strip_prefix('/').unwrap_or(&path);
-            libs.push((guest.to_string(), PathBuf::from(&path)));
+            // Canonicalize the host path to resolve symlinks (e.g.,
+            // /lib64/libelf.so.1 → /usr/lib64/libelf.so.1 when /lib64
+            // is a symlink to usr/lib64). Include both the canonical
+            // and ldd-reported paths so the dynamic linker finds libs
+            // regardless of whether the guest has matching symlinks.
+            let host = PathBuf::from(&path);
+            let canonical = std::fs::canonicalize(&host).unwrap_or(host.clone());
+            let canon_str = canonical.to_str().unwrap_or(&path);
+            let canon_guest = canon_str.strip_prefix('/').unwrap_or(canon_str);
+            libs.push((canon_guest.to_string(), canonical.clone()));
+
+            let ldd_guest = path.strip_prefix('/').unwrap_or(&path);
+            if ldd_guest != canon_guest {
+                libs.push((ldd_guest.to_string(), canonical));
+            }
         }
     }
 
@@ -908,6 +922,25 @@ mod tests {
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("bin/busybox"), "base should contain busybox");
         assert!(s.contains("bin/sh"), "base should contain sh symlink");
+    }
+
+    #[test]
+    fn create_initramfs_base_includes_extra_shared_libs() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let sched = std::path::PathBuf::from("target/debug/stt-sched");
+        if !sched.exists() {
+            eprintln!("skipping: stt-sched not built");
+            return;
+        }
+        let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
+        let base = create_initramfs_base(&exe, &extras).unwrap();
+        let s = String::from_utf8_lossy(&base);
+        assert!(
+            s.contains("lib64/libelf"),
+            "initramfs with stt-sched extra should contain libelf; \
+             resolved libs: {:?}",
+            resolve_shared_libs(sched.as_path()).unwrap()
+        );
     }
 
     #[test]

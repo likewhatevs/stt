@@ -364,6 +364,7 @@ dependencies = [
  "anyhow",
  "clap",
  "console",
+ "libc",
  "rayon",
  "serde",
  "serde_json",

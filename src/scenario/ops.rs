@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::verify::{self, VerifyResult};
+use crate::assert::{self, AssertResult};
 use crate::vmm::shm_ring::{self, StimulusPayload};
 use crate::workload::{WorkType, WorkloadConfig, WorkloadHandle};
 
@@ -106,6 +106,18 @@ pub enum CpusetSpec {
 /// Bundles the three ops that always go together (AddCgroup + SetCpuset +
 /// Spawn) into a single value. The executor creates the cgroup, optionally
 /// sets its cpuset, spawns workers, and moves them into the cgroup.
+///
+/// ```
+/// # use stt::scenario::ops::{CgroupDef, CpusetSpec};
+/// # use stt::workload::WorkType;
+/// let def = CgroupDef::named("workers")
+///     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
+///     .workers(4)
+///     .work_type(WorkType::CpuSpin);
+///
+/// assert_eq!(def.name, "workers");
+/// assert_eq!(def.num_workers, 4);
+/// ```
 #[derive(Clone)]
 pub struct CgroupDef {
     pub name: Cow<'static, str>,
@@ -420,20 +432,20 @@ struct StepState<'a> {
 /// Execute a sequence of steps against the given context.
 ///
 /// Convenience wrapper around [`execute_steps_with`] that passes
-/// `None` for verify, falling back to `verify_not_starved`. Use
+/// `None` for checks, falling back to `assert_not_starved`. Use
 /// [`execute_steps_with`] when you need custom thresholds.
-pub fn execute_steps(ctx: &Ctx, steps: Vec<Step>) -> Result<VerifyResult> {
+pub fn execute_steps(ctx: &Ctx, steps: Vec<Step>) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, None)
 }
 
-/// Execute steps with an explicit [`Verify`](crate::verify::Verify) for
+/// Execute steps with an explicit [`Assert`](crate::assert::Assert) for
 /// worker checks. Use when the scenario needs custom gap, spread, or
-/// monitor thresholds. Pass `None` for default `verify_not_starved` behavior.
+/// monitor thresholds. Pass `None` for default `assert_not_starved` behavior.
 pub fn execute_steps_with(
     ctx: &Ctx,
     steps: Vec<Step>,
-    verify: Option<&crate::verify::Verify>,
-) -> Result<VerifyResult> {
+    checks: Option<&crate::assert::Assert>,
+) -> Result<AssertResult> {
     let mut state = StepState {
         cgroups: CgroupGroup::new(ctx.cgroups),
         handles: Vec::new(),
@@ -452,7 +464,7 @@ pub fn execute_steps_with(
     for (step_idx, step) in steps.iter().enumerate() {
         // Check scheduler liveness between steps (skip before first).
         if step_idx > 0 && !process_alive(ctx.sched_pid) {
-            let mut r = collect_result(&mut state, verify);
+            let mut r = collect_result(&mut state, checks);
             r.passed = false;
             r.details.push("scheduler died between steps".into());
             for line in read_kmsg().lines() {
@@ -514,7 +526,7 @@ pub fn execute_steps_with(
     // Final liveness check.
     let sched_dead = !process_alive(ctx.sched_pid);
 
-    let mut result = collect_result(&mut state, verify);
+    let mut result = collect_result(&mut state, checks);
 
     if !result.passed {
         for line in read_kmsg().lines() {
@@ -718,21 +730,21 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
     Some(cpus)
 }
 
-/// Collect all worker results and produce a VerifyResult.
+/// Collect all worker results and produce an AssertResult.
 ///
-/// When `verify` is provided, uses its worker plan. Otherwise falls
-/// back to `verify_not_starved`.
+/// When `checks` is provided, uses its worker plan. Otherwise falls
+/// back to `assert_not_starved`.
 fn collect_result(
     state: &mut StepState<'_>,
-    verify: Option<&crate::verify::Verify>,
-) -> VerifyResult {
-    let mut result = VerifyResult::pass();
+    checks: Option<&crate::assert::Assert>,
+) -> AssertResult {
+    let mut result = AssertResult::pass();
     let handles = std::mem::take(&mut state.handles);
     for (_name, h) in handles {
         let reports = h.stop_and_collect();
-        match verify {
-            Some(v) => result.merge(v.verify_cgroup(&reports, None)),
-            None => result.merge(verify::verify_not_starved(&reports)),
+        match checks {
+            Some(v) => result.merge(v.assert_cgroup(&reports, None)),
+            None => result.merge(assert::assert_not_starved(&reports)),
         }
     }
     result

@@ -1,13 +1,13 @@
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Setup, Step, execute_steps};
 use super::{CgroupGroup, Ctx, collect_all, spawn_diverse};
-use crate::verify::{self, VerifyResult};
+use crate::assert::{self, AssertResult};
 use crate::workload::*;
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
     fn per_cpu_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
         let all = ctx.topo.all_cpus();
         let n = (all.len() - 1).min(64);
@@ -29,7 +29,7 @@ pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
     fn reuse_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
         let all = ctx.topo.all_cpus();
         let n = (all.len() - 1).min(15);
@@ -95,16 +95,16 @@ pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-/// Per-CPU pinned workers + custom gap verification (max_gap_ms > 1500).
-/// Not expressible via Op/Step's standard verify_not_starved.
-pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<VerifyResult> {
+/// Per-CPU pinned workers + custom gap assertion (max_gap_ms > 1500).
+/// Not expressible via Op/Step's standard assert pipeline.
+pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     // Multiple CPUs sharing a DSQ under bursty wake patterns. Lockless
     // peek can miss tasks when store visibility ordering delays the
     // first_task pointer update. Without a fallback to the locked
     // consume path, CPUs go idle and never retry.
     let all = ctx.topo.all_cpus();
     if all.len() < 4 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=4 CPUs".into()],
             stats: Default::default(),
@@ -149,8 +149,8 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<VerifyResult> {
     }
     thread::sleep(ctx.duration);
 
-    let mut r = VerifyResult::pass();
-    r.merge(verify::verify_not_starved(&h_cgroup.stop_and_collect()));
+    let mut r = AssertResult::pass();
+    r.merge(assert::assert_not_starved(&h_cgroup.stop_and_collect()));
     for h in pinned_handles {
         let reports = h.stop_and_collect();
         for w in &reports {
@@ -164,17 +164,17 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<VerifyResult> {
                 ));
             }
         }
-        r.merge(verify::verify_not_starved(&reports));
+        r.merge(assert::assert_not_starved(&reports));
     }
     Ok(r)
 }
 
 /// Uses spawn_diverse helper for 5 different workload types across cgroups.
 /// Dynamic cgroup count and workload rotation logic is not Op/Step compatible.
-pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     // All workload types across 5 cgroups, no flags. Exercises base dispatch with every work pattern.
     if ctx.topo.all_cpus().len() < 6 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=6 CPUs for 5 cgroups".into()],
             stats: Default::default(),
@@ -193,11 +193,11 @@ pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
 }
 
 /// Uses spawn_diverse for workload variety + manual cpuset partitioning.
-pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     // All workload types with cpusets.
     let all = ctx.topo.all_cpus();
     if all.len() < 6 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=6 CPUs".into()],
             stats: Default::default(),
@@ -219,10 +219,10 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<VerifyResult> 
 }
 
 /// spawn_diverse + dynamic cgroup add/remove mid-run.
-pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     // Dynamic cgroup ops with diverse workloads.
     if ctx.topo.all_cpus().len() < 5 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=5 CPUs for dynamic cgroup add".into()],
             stats: Default::default(),
@@ -263,10 +263,10 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<VerifyResult>
 
 /// LLC-specific cpusets + tight flip loop. Uses Instant::now() deadline
 /// loop and LLC-aligned BTreeSets computed at runtime. Not Op/Step compatible.
-pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<AssertResult> {
     // Need at least 2 LLCs to flip cpusets across LLC boundaries.
     if ctx.topo.num_llcs() < 2 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=2 LLCs".into()],
             stats: Default::default(),
@@ -275,7 +275,7 @@ pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
     let llc0_full: BTreeSet<usize> = ctx.topo.llc_aligned_cpuset(0);
     let llc1_full: BTreeSet<usize> = ctx.topo.llc_aligned_cpuset(1);
     if llc0_full.is_empty() {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: LLC0 has no CPUs".into()],
             stats: Default::default(),
@@ -291,7 +291,7 @@ pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
         .collect();
     let llc1: BTreeSet<usize> = llc1_full.clone();
     if llc0.is_empty() {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: LLC0 too small after reserving for cg_0".into()],
             stats: Default::default(),
@@ -342,8 +342,8 @@ pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
         thread::sleep(Duration::from_millis(200));
     }
 
-    let mut r = VerifyResult::pass();
-    r.merge(verify::verify_not_starved(&h0.stop_and_collect()));
-    r.merge(verify::verify_not_starved(&h1.stop_and_collect()));
+    let mut r = AssertResult::pass();
+    r.merge(assert::assert_not_starved(&h0.stop_and_collect()));
+    r.merge(assert::assert_not_starved(&h1.stop_and_collect()));
     Ok(r)
 }

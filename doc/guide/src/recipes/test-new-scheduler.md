@@ -67,7 +67,7 @@ use stt::prelude::*;
 use stt::scenario::*;
 
 #[stt_test(sockets = 2, cores = 4, threads = 2, scheduler = MY_SCHED)]
-fn basic_proportional(ctx: &Ctx) -> Result<VerifyResult> {
+fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     let wl = dfl_wl(ctx);
     let (handles, _guard) = setup_cgroups(ctx, 2, &wl)?;
     std::thread::sleep(ctx.duration);

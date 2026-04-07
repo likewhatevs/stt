@@ -10,12 +10,12 @@
 //! Write a test that boots a VM, creates a cgroup, runs a workload, and
 //! checks the result:
 //!
-//! ```rust,ignore
+//! ```rust
 //! use stt::prelude::*;
 //! use std::collections::BTreeSet;
 //!
 //! #[stt_test(sockets = 1, cores = 2, threads = 1)]
-//! fn my_scheduler_test(ctx: &Ctx) -> Result<VerifyResult> {
+//! fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     // Create a cgroup and assign all CPUs.
 //!     let mut group = CgroupGroup::new(ctx.cgroups);
 //!     group.add_cgroup_no_cpuset("workers")?;
@@ -38,9 +38,9 @@
 //!     std::thread::sleep(ctx.duration);
 //!     let reports = handle.stop_and_collect();
 //!
-//!     // Verify: no worker was starved.
-//!     let plan = VerificationPlan::new().check_not_starved();
-//!     Ok(plan.verify_cgroup(&reports, None))
+//!     // Assert: no worker was starved.
+//!     let plan = AssertPlan::new().check_not_starved();
+//!     Ok(plan.assert_cgroup(&reports, None))
 //! }
 //! ```
 //!
@@ -57,7 +57,7 @@
 //! - [`cgroup`] -- cgroup v2 filesystem operations
 //! - [`scenario`] -- test case definitions, flag system, cgroup helpers
 //! - [`runner`] -- scenario execution engine with scheduler lifecycle
-//! - [`verify`] -- pass/fail evaluation (starvation, isolation, fairness)
+//! - [`assert`] -- pass/fail assertions (starvation, isolation, fairness)
 //! - [`workload`] -- worker process types and telemetry collection
 //! - [`monitor`] -- host-side guest memory observation via BTF
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
@@ -90,6 +90,7 @@ pub fn read_kmsg() -> String {
         Err(_) => String::new(),
     }
 }
+pub mod assert;
 pub mod monitor;
 pub mod probe;
 pub mod runner;
@@ -98,7 +99,9 @@ pub mod stats;
 pub mod test_support;
 pub mod timeline;
 pub mod topology;
-pub mod verify;
+/// Backward-compatible module alias.
+#[doc(hidden)]
+pub use assert as verify;
 pub mod vm;
 pub mod vmm;
 pub mod workload;
@@ -107,23 +110,26 @@ pub use stt_macros::stt_test;
 
 /// Re-exports for writing `#[stt_test]` functions.
 ///
-/// ```ignore
+/// ```rust
 /// use stt::prelude::*;
 ///
 /// #[stt_test(sockets = 1, cores = 2, threads = 1)]
-/// fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
-///     Ok(VerifyResult::pass())
+/// fn my_test(ctx: &Ctx) -> Result<AssertResult> {
+///     Ok(AssertResult::pass())
 /// }
 /// ```
 pub mod prelude {
     pub use anyhow::Result;
 
+    pub use crate::assert::{Assert, AssertPlan, AssertResult};
     pub use crate::cgroup::CgroupManager;
     pub use crate::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
     pub use crate::scenario::{CgroupGroup, Ctx};
     pub use crate::stt_test;
     pub use crate::test_support::{Scheduler, SchedulerSpec};
-    pub use crate::verify::{VerificationPlan, Verify, VerifyResult};
+    // Backward-compatible aliases
+    #[doc(hidden)]
+    pub use crate::assert::{VerificationPlan, Verify, VerifyResult};
     pub use crate::workload::{
         WorkProgram, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle,
     };

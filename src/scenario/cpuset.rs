@@ -1,12 +1,12 @@
 use super::Ctx;
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
-use crate::verify::VerifyResult;
+use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
             setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
@@ -32,7 +32,7 @@ pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
             setup: vec![
@@ -60,9 +60,9 @@ pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 4 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=4 CPUs".into()],
             stats: Default::default(),
@@ -130,9 +130,9 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 8 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=8 CPUs".into()],
             stats: Default::default(),
@@ -200,7 +200,7 @@ pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let mid = ctx.topo.usable_cpus().len() / 2;
 
     let steps = vec![Step {
@@ -223,9 +223,9 @@ pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<VerifyResult
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 4 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=4 CPUs".into()],
             stats: Default::default(),
@@ -286,7 +286,7 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<VerifyResult> 
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
             setup: vec![

@@ -23,7 +23,7 @@ dropped a task. Reports include the gap duration, CPU, and timing.
 **Cpuset isolation** -- workers must only run on CPUs in their assigned
 cpuset. Any execution on an unexpected CPU fails the test.
 
-**Throughput parity** -- `verify_throughput_parity()` checks that
+**Throughput parity** -- `assert_throughput_parity()` checks that
 workers produce similar throughput (work_units per CPU-second). Two
 thresholds:
 - `max_throughput_cv`: coefficient of variation across workers. High
@@ -33,22 +33,21 @@ thresholds:
   Catches cases where all workers are equally slow (CV passes but
   absolute throughput is too low).
 
-Neither threshold is set by default; enable via `Verify` setters or
+Neither threshold is set by default; enable via `Assert` setters or
 `#[stt_test]` attributes.
 
-**Benchmarking** -- `verify_benchmarks()` checks per-wakeup latency
+**Benchmarking** -- `assert_benchmarks()` checks per-wakeup latency
 and iteration throughput. Three thresholds:
 - `max_p99_wake_latency_ns`: p99 of all `wake_latencies_ns` samples
   across workers in a cgroup. Populated only for blocking work types
-  (FutexPingPong, CachePipe, Bursty, CacheYield, PipeIo).
+  (FutexPingPong, FutexFanOut, CachePipe, Bursty, CacheYield, PipeIo).
 - `max_wake_latency_cv`: coefficient of variation of wake latency
   samples. High CV means inconsistent scheduling latency.
 - `min_iteration_rate`: minimum outer-loop iterations per wall-clock
   second per worker.
 
-None are set by default. Set via `Verify` setters or
-`VerificationPlan` builder methods. The `#[stt_test]` macro does not
-yet expose these attributes.
+None are set by default. Set via `Assert` setters,
+`AssertPlan` builder methods, or `#[stt_test]` attributes.
 
 ## Monitor checks
 
@@ -68,13 +67,13 @@ memory (per-CPU runqueue structs via BTF offsets) and evaluates:
 Monitor thresholds use a sustained sample window (default: 5 samples).
 A violation must persist for N consecutive samples before failing.
 
-## Verify struct
+## Assert struct
 
-`Verify` is a composable configuration that carries both worker checks
+`Assert` is a composable configuration that carries both worker checks
 and monitor thresholds:
 
 ```rust,ignore
-pub struct Verify {
+pub struct Assert {
     // Worker checks
     pub not_starved: Option<bool>,
     pub isolation: Option<bool>,
@@ -89,6 +88,7 @@ pub struct Verify {
     pub max_p99_wake_latency_ns: Option<u64>,
     pub max_wake_latency_cv: Option<f64>,
     pub min_iteration_rate: Option<f64>,
+    pub max_migration_ratio: Option<f64>,
 
     // Monitor checks
     pub max_imbalance_ratio: Option<f64>,
@@ -106,19 +106,19 @@ Every field is `Option`. `None` means "inherit from parent layer."
 
 Verification uses a three-layer merge:
 
-1. `Verify::default_checks()` -- baseline: `not_starved` enabled,
+1. `Assert::default_checks()` -- baseline: `not_starved` enabled,
    monitor thresholds from `MonitorThresholds::DEFAULT`.
-2. `Scheduler.verify` -- scheduler-level overrides.
-3. Per-test `verify` -- test-specific overrides via `#[stt_test]`
+2. `Scheduler.assert` -- scheduler-level overrides.
+3. Per-test `assert` -- test-specific overrides via `#[stt_test]`
    attributes.
 
 All fields use last-`Some`-wins semantics. A `Some(false)` in a
 higher layer can disable a check that a lower layer enabled.
 
 ```rust,ignore
-let final_verify = Verify::default_checks()
-    .merge(&scheduler.verify)
-    .merge(&test_verify);
+let final_assert = Assert::default_checks()
+    .merge(&scheduler.assert)
+    .merge(&test_assert);
 ```
 
 ## Default thresholds
@@ -149,13 +149,13 @@ instrumented builds.
 All monitor thresholds use the `sustained_samples` window -- a
 violation must persist for N consecutive samples before failing.
 
-## VerificationPlan
+## AssertPlan
 
-`VerificationPlan` is the worker-side check configuration used in
+`AssertPlan` is the worker-side check configuration used in
 custom scenarios. It has concrete bool/threshold fields (not `Option`):
 
 ```rust,ignore
-pub struct VerificationPlan {
+pub struct AssertPlan {
     pub not_starved: bool,
     pub isolation: bool,
     pub max_gap_ms: Option<u64>,
@@ -165,21 +165,22 @@ pub struct VerificationPlan {
     pub max_p99_wake_latency_ns: Option<u64>,
     pub max_wake_latency_cv: Option<f64>,
     pub min_iteration_rate: Option<f64>,
+    pub max_migration_ratio: Option<f64>,
 }
 ```
 
-Use `VerificationPlan` when writing custom scenarios that call
-`plan.verify_cgroup(reports, cpuset)` directly. Use `Verify` for the
-merge chain (`#[stt_test]` attributes, `Scheduler.verify`,
+Use `AssertPlan` when writing custom scenarios that call
+`plan.assert_cgroup(reports, cpuset)` directly. Use `Assert` for the
+merge chain (`#[stt_test]` attributes, `Scheduler.assert`,
 `execute_steps_with`).
 
-`Verify::worker_plan()` extracts a `VerificationPlan` from a `Verify`,
+`Assert::worker_plan()` extracts an `AssertPlan` from an `Assert`,
 resolving `Option` fields to concrete values.
 
 ## Constants
 
-- `Verify::NONE` -- all checks disabled, all overrides `None`.
-- `Verify::default_checks()` -- `not_starved` enabled, monitor
+- `Assert::NONE` -- all checks disabled, all overrides `None`.
+- `Assert::default_checks()` -- `not_starved` enabled, monitor
   thresholds populated from `MonitorThresholds::DEFAULT`.
 
 For examples of overriding thresholds at the scheduler and per-test

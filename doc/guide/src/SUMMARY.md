@@ -10,6 +10,7 @@
   - [Gauntlet](running-tests/gauntlet.md)
   - [Baselines](running-tests/baselines.md)
   - [Auto-Repro](running-tests/auto-repro.md)
+  - [BPF Verifier](running-tests/verifier.md)
 - [Core Concepts](concepts.md)
   - [Scenarios](concepts/scenarios.md)
   - [Flags](concepts/flags.md)
@@ -30,6 +31,7 @@
   - [A/B Compare Branches](recipes/ab-compare.md)
   - [Write a Dynamic Scenario](recipes/dynamic-scenario.md)
   - [Customize Verification](recipes/custom-verification.md)
+  - [Benchmarking and Negative Tests](recipes/benchmarking-tests.md)
 
 # Architecture
 

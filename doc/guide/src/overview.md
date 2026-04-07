@@ -7,16 +7,22 @@ correctness. Also tests under the kernel's default EEVDF scheduler.
 
 ## Design
 
-Testing schedulers requires three things that are hard to get on real
-hardware: controlled CPU topologies, deterministic workloads, and
-observation without interference.
+Two principles drive stt's architecture:
 
-stt addresses all three. It boots Linux in a KVM VM with synthetic
-ACPI tables that present any topology (1 to 252 CPUs, arbitrary LLC
-structure). It spawns `fork()`ed worker processes with controlled
-workload patterns. It observes scheduler state by reading guest memory
-directly from the host -- no BPF instrumentation, no observer effects
-on scheduling decisions.
+**Fidelity without overhead** -- every test boots a real Linux kernel
+in a KVM VM with real cgroups and real BPF programs. No mocking, no
+containers, no shared state. The VMM is minimal: no disks, no network
+devices, no PCI. The device model is two serial ports (COM1 for kernel
+console, COM2 for application I/O) and a shared-memory ring buffer.
+
+**Direct access over tooling layers** -- the host-side monitor reads
+guest memory directly via BTF-resolved struct offsets (`rq.nr_running`,
+`rq.clock`) to observe scheduler state. No BPF instrumentation inside
+the guest, no observer effects on scheduling decisions. Verifier
+statistics come from the real kernel verifier inside the VM -- the
+scheduler binary loads each program with `BPF_LOG_STATS` and emits
+structured output; the host has no BPF dependency. Cycle collapse
+reduces repetitive loop unrolling instead of truncating.
 
 The same `stt` binary runs on both sides. On the host it manages the
 VM, runs the monitor, and evaluates results. Inside the VM it creates
@@ -43,6 +49,18 @@ cargo stt vm --sockets 2 --cores 4 --threads 2 \
 - **Stress** -- many cgroups, many workers, rapid topology changes.
 - **Stall detection** -- scheduler doesn't drop tasks.
 
+## BPF verifier analysis
+
+`cargo stt verifier` boots a scheduler in a VM and captures per-program
+verifier output from the real kernel verifier. The scheduler binary
+loads each BPF program inside the VM with `BPF_LOG_STATS` enabled --
+there is no host-side BPF loading. Per-program statistics include
+instruction counts, states explored, verification time, and stack
+depth. The default output applies **cycle collapse** to reduce
+repetitive loop unrolling. A/B diff mode boots two VMs and compares
+instruction counts between builds. See
+[BPF Verifier](running-tests/verifier.md) for details.
+
 ## Auto-repro probe pipeline
 
 When a scheduler crashes, stt can automatically rerun the failing
@@ -62,7 +80,7 @@ use stt::prelude::*;
 use std::collections::BTreeSet;
 
 #[stt_test(sockets = 1, cores = 2, threads = 1)]
-fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     let mut group = CgroupGroup::new(ctx.cgroups);
     group.add_cgroup_no_cpuset("workers")?;
     let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
@@ -82,13 +100,13 @@ fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
     std::thread::sleep(ctx.duration);
     let reports = handle.stop_and_collect();
 
-    let plan = VerificationPlan::new().check_not_starved();
-    Ok(plan.verify_cgroup(&reports, None))
+    let plan = AssertPlan::new().check_not_starved();
+    Ok(plan.assert_cgroup(&reports, None))
 }
 ```
 
 The prelude also exports ops types (`CgroupDef`, `CpusetSpec`,
-`Step`, `execute_steps`), `Verify` for composable verification
+`Step`, `execute_steps`), `Assert` for composable assertions
 config, and `WorkerReport` for telemetry access.
 
 ## Two binaries
@@ -101,7 +119,8 @@ stt ships two binaries:
 - **`cargo-stt`** -- cargo plugin. Adds test discovery, scheduler
   builds, and gauntlet orchestration on top of `stt`. Provides
   `cargo stt vm`, `cargo stt test`, `cargo stt gauntlet`,
-  `cargo stt list`, `cargo stt topo`, and `cargo stt probe`.
+  `cargo stt list`, `cargo stt topo`, `cargo stt probe`, and
+  `cargo stt verifier`.
 
 See [CLI Reference](cli-reference.md) for the complete subcommand
 listing.
@@ -113,4 +132,4 @@ listing.
 | `stt` | Core library and CLI binary |
 | `stt-macros` | `#[stt_test]` proc macro |
 | `stt-sched` | Minimal BPF scheduler for testing |
-| `cargo-stt` | Cargo plugin (`cargo stt vm`, `cargo stt test`, `cargo stt gauntlet`, `cargo stt list`, `cargo stt topo`, `cargo stt probe`) |
+| `cargo-stt` | Cargo plugin (`cargo stt vm`, `cargo stt test`, `cargo stt gauntlet`, `cargo stt list`, `cargo stt topo`, `cargo stt probe`, `cargo stt verifier`) |

@@ -9,14 +9,14 @@ inside a VM.
 use stt::prelude::*;
 
 #[stt_test(sockets = 2, cores = 4, threads = 2)]
-fn my_test(ctx: &Ctx) -> Result<VerifyResult> {
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     // ctx provides cgroup manager, topology, duration, etc.
-    Ok(VerifyResult::pass())
+    Ok(AssertResult::pass())
 }
 ```
 
 The function must have signature
-`fn(&stt::scenario::Ctx) -> anyhow::Result<stt::verify::VerifyResult>`.
+`fn(&stt::scenario::Ctx) -> anyhow::Result<stt::assert::AssertResult>`.
 
 ## What the macro generates
 
@@ -64,6 +64,10 @@ All attributes are optional with defaults.
 | `sustained_samples` | inherited | Sample window for sustained violations |
 | `max_fallback_rate` | inherited | Max fallback event rate |
 | `max_keep_last_rate` | inherited | Max keep-last event rate |
+| `max_p99_wake_latency_ns` | inherited | Max p99 wake latency in nanoseconds |
+| `max_wake_latency_cv` | inherited | Max wake latency coefficient of variation |
+| `min_iteration_rate` | inherited | Minimum iterations per wall-clock second per worker |
+| `max_migration_ratio` | inherited | Max migration ratio (migrations/iterations) per cgroup |
 
 `not_starved = true` enables three distinct checks: starvation (any
 worker with zero work units), fairness spread (max-min runnable% below
@@ -117,12 +121,14 @@ attributes to filter which presets each test runs on. See
 |---|---|---|
 | `auto_repro` | `true` | Auto-repro on crash |
 | `replicas` | 1 | Number of times to run |
-| `performance_mode` | `false` | Pin vCPUs to host cores, hugepages |
+| `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling; `cargo stt test` reserves host threads per LLC group via nextest |
+| `super_perf_mode` | `false` | Implies `performance_mode`; additionally validates LLC exclusivity at build time |
 | `duration_s` | 0 | Per-scenario duration override (0 = use default 2s) |
 | `workers_per_cgroup` | 0 | Workers per cgroup override (0 = use default 2) |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
-what `performance_mode` enables, prerequisites, and validation behavior.
+what `performance_mode` and `super_perf_mode` enable, prerequisites,
+and validation behavior.
 
 ## Example with custom scheduler
 
@@ -148,8 +154,8 @@ const MITOSIS: Scheduler = Scheduler::new("mitosis")
     not_starved = true,
     max_gap_ms = 5000,
 )]
-fn mitosis_basic(ctx: &Ctx) -> Result<VerifyResult> {
+fn mitosis_basic(ctx: &Ctx) -> Result<AssertResult> {
     // Test logic here
-    Ok(VerifyResult::pass())
+    Ok(AssertResult::pass())
 }
 ```

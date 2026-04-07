@@ -11,7 +11,7 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 /// Attribute macro that registers a function as an stt integration test.
 ///
 /// The annotated function must have signature `fn(&stt::scenario::Ctx) ->
-/// anyhow::Result<stt::verify::VerifyResult>`. The macro:
+/// anyhow::Result<stt::assert::AssertResult>`. The macro:
 ///
 /// 1. Renames the original function to `__stt_inner_{name}`.
 /// 2. Registers it in the `STT_TESTS` distributed slice via linkme.
@@ -24,6 +24,12 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `threads = N` (default: 1)
 ///   - `memory_mb = N` (default: 2048)
 ///   - `performance_mode = bool` (default: false) -- vCPU pinning, hugepages
+///   - `duration_s = N`, `workers_per_cgroup = N` -- workload overrides
+///   - `scheduler = PATH` -- scheduler constant reference
+///   - `max_gap_ms`, `max_spread_pct`, `max_imbalance_ratio` -- assertion thresholds
+///   - `max_p99_wake_latency_ns`, `max_wake_latency_cv`, `min_iteration_rate` -- benchmarking
+///   - `required_flags`, `excluded_flags` -- flag profile filtering
+///   - See SttTestEntry and Assert for the full field list.
 #[proc_macro_attribute]
 pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -52,6 +58,10 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut min_work_rate: Option<f64> = None;
     let mut max_fallback_rate: Option<f64> = None;
     let mut max_keep_last_rate: Option<f64> = None;
+    let mut max_p99_wake_latency_ns: Option<u64> = None;
+    let mut max_wake_latency_cv: Option<f64> = None;
+    let mut min_iteration_rate: Option<f64> = None;
+    let mut max_migration_ratio: Option<f64> = None;
     let mut extra_sched_args: Vec<String> = Vec::new();
     let mut required_flags: Vec<String> = Vec::new();
     let mut excluded_flags: Vec<String> = Vec::new();
@@ -61,6 +71,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut min_cpus: u32 = 1;
     let mut watchdog_timeout_jiffies: u64 = 0;
     let mut performance_mode: bool = false;
+    let mut super_perf_mode: bool = false;
     let mut duration_s: u64 = 0;
     let mut workers_per_cgroup: u32 = 0;
 
@@ -97,7 +108,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scheduler = Some(p);
                     }
                     "auto_repro" | "not_starved" | "isolation" | "performance_mode"
-                    | "requires_smt" => {
+                    | "super_perf_mode" | "requires_smt" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -117,6 +128,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "not_starved" => not_starved = Some(lit_bool.value()),
                             "isolation" => isolation = Some(lit_bool.value()),
                             "performance_mode" => performance_mode = lit_bool.value(),
+                            "super_perf_mode" => super_perf_mode = lit_bool.value(),
                             "requires_smt" => requires_smt = lit_bool.value(),
                             _ => unreachable!(),
                         }
@@ -134,7 +146,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "max_local_dsq_depth"
                     | "min_sockets"
                     | "min_llcs"
-                    | "min_cpus" => {
+                    | "min_cpus"
+                    | "max_p99_wake_latency_ns" => {
                         let lit_int = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Int(li),
@@ -223,6 +236,13 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .base10_parse::<u32>()
                                     .unwrap_or_else(|e| panic!("{e}"))
                             }
+                            "max_p99_wake_latency_ns" => {
+                                max_p99_wake_latency_ns = Some(
+                                    lit_int
+                                        .base10_parse::<u64>()
+                                        .unwrap_or_else(|e| panic!("{e}")),
+                                )
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -231,7 +251,10 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "max_keep_last_rate"
                     | "max_spread_pct"
                     | "max_throughput_cv"
-                    | "min_work_rate" => {
+                    | "min_work_rate"
+                    | "max_wake_latency_cv"
+                    | "min_iteration_rate"
+                    | "max_migration_ratio" => {
                         let lit_float = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Float(lf),
@@ -256,6 +279,9 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "max_spread_pct" => max_spread_pct = Some(v),
                             "max_throughput_cv" => max_throughput_cv = Some(v),
                             "min_work_rate" => min_work_rate = Some(v),
+                            "max_wake_latency_cv" => max_wake_latency_cv = Some(v),
+                            "min_iteration_rate" => min_iteration_rate = Some(v),
+                            "max_migration_ratio" => max_migration_ratio = Some(v),
                             _ => unreachable!(),
                         }
                     }
@@ -314,7 +340,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_jiffies, performance_mode, duration_s, workers_per_cgroup"),
+                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_jiffies, performance_mode, super_perf_mode, duration_s, workers_per_cgroup"),
                         )
                         .to_compile_error()
                         .into();
@@ -376,7 +402,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         ..sig.clone()
     };
 
-    // Build Verify field tokens.
+    // Build Assert field tokens.
     let not_starved_tokens = match not_starved {
         Some(v) => quote! { Some(#v) },
         None => quote! { None },
@@ -425,6 +451,27 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         Some(v) => quote! { Some(#v) },
         None => quote! { None },
     };
+    let p99_wake_tokens = match max_p99_wake_latency_ns {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    };
+    let wake_cv_tokens = match max_wake_latency_cv {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    };
+    let iter_rate_tokens = match min_iteration_rate {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    };
+    let mig_ratio_tokens = match max_migration_ratio {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    };
+
+    // super_perf_mode implies performance_mode.
+    if super_perf_mode {
+        performance_mode = true;
+    }
 
     let expanded = quote! {
         #(#attrs)*
@@ -442,16 +489,17 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             scheduler: #scheduler_tokens,
             auto_repro: #auto_repro,
             replicas: #replicas,
-            verify: ::stt::verify::Verify {
+            assert: ::stt::assert::Assert {
                 not_starved: #not_starved_tokens,
                 isolation: #isolation_tokens,
                 max_gap_ms: #gap_tokens,
                 max_spread_pct: #spread_tokens,
                 max_throughput_cv: #throughput_cv_tokens,
                 min_work_rate: #work_rate_tokens,
-                max_p99_wake_latency_ns: None,
-                max_wake_latency_cv: None,
-                min_iteration_rate: None,
+                max_p99_wake_latency_ns: #p99_wake_tokens,
+                max_wake_latency_cv: #wake_cv_tokens,
+                min_iteration_rate: #iter_rate_tokens,
+                max_migration_ratio: #mig_ratio_tokens,
                 max_imbalance_ratio: #imbalance_tokens,
                 max_local_dsq_depth: #dsq_tokens,
                 fail_on_stall: #stall_tokens,
@@ -469,6 +517,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             watchdog_timeout_jiffies: #watchdog_timeout_jiffies,
             bpf_map_write: None,
             performance_mode: #performance_mode,
+            super_perf_mode: #super_perf_mode,
             duration_s: #duration_s,
             workers_per_cgroup: #workers_per_cgroup,
         };

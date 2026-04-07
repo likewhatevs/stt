@@ -73,7 +73,8 @@ Workers collect two categories of timing data:
 **Per-wakeup latency** (`wake_latencies_ns`): timestamp-based samples
 recorded around blocking operations. Populated for work types with a
 blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
-(futex wait), CacheYield (yield), CachePipe (pipe read). Each sample
+(futex wait), FutexFanOut (futex wait, receivers only), CacheYield
+(yield), CachePipe (pipe read). Each sample
 is `Instant::elapsed()` across the blocking call, in nanoseconds.
 
 **schedstat deltas**: read from `/proc/self/schedstat` at work-loop

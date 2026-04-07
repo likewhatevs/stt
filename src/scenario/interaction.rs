@@ -1,11 +1,11 @@
 use super::Ctx;
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
-use crate::verify::VerifyResult;
+use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 use std::time::Duration;
 
-pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
             setup: vec![
@@ -30,7 +30,7 @@ pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0").workers(8),
@@ -52,7 +52,7 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<VerifyResult>
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     let heavy = WorkloadConfig {
         num_workers: ctx.workers_per_cgroup * 2,
         ..Default::default()
@@ -107,9 +107,9 @@ pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 5 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=5 CPUs for 4 cgroups".into()],
             stats: Default::default(),
@@ -133,7 +133,7 @@ pub fn custom_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
     let mid = ctx.topo.usable_cpus().len() / 2;
 
     let steps = vec![Step {
@@ -157,10 +157,10 @@ pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<VerifyResult
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
     let sets = ctx.topo.overlapping_cpusets(3, 0.5);
     if sets.iter().any(|s| s.is_empty()) {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: not enough CPUs".into()],
             stats: Default::default(),
@@ -192,7 +192,7 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Veri
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
     let half = ctx.workers_per_cgroup;
 
     let mut move_steps: Vec<Step> = (0..9)
@@ -229,7 +229,7 @@ pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let mut move_steps: Vec<Step> = (0..5)
         .map(|i| {
             let (from, to) = if i % 2 == 0 {
@@ -273,7 +273,7 @@ pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
             setup: vec![
@@ -302,7 +302,7 @@ pub fn custom_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0").workers(16),
@@ -318,7 +318,7 @@ pub fn custom_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0")

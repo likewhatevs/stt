@@ -12,13 +12,16 @@ pub struct LlcGroup {
     pub cpus: Vec<usize>,
 }
 
-/// Host CPU topology: LLC groups and online CPU set.
+/// Host CPU topology: LLC groups, NUMA nodes, and online CPU set.
 #[derive(Debug, Clone)]
 pub struct HostTopology {
     /// LLC groups indexed by their order of discovery.
     pub llc_groups: Vec<LlcGroup>,
     /// All online CPUs.
     pub online_cpus: Vec<usize>,
+    /// NUMA node ID for each online CPU, indexed by CPU ID.
+    /// CPUs not in the map default to node 0.
+    pub cpu_to_node: std::collections::HashMap<usize, usize>,
 }
 
 /// Pinning plan: maps each vCPU index to a host CPU, plus a dedicated
@@ -45,10 +48,32 @@ impl HostTopology {
                 cpus: llc.cpus().to_vec(),
             })
             .collect();
+        let cpu_to_node = discover_cpu_numa_nodes(&online_cpus);
         Ok(Self {
             llc_groups,
             online_cpus,
+            cpu_to_node,
         })
+    }
+
+    /// Maximum cores per LLC group on the host.
+    pub fn max_cores_per_llc(&self) -> usize {
+        self.llc_groups
+            .iter()
+            .map(|g| g.cpus.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// NUMA nodes used by the given set of host CPUs.
+    pub fn numa_nodes_for_cpus(&self, cpus: &[usize]) -> Vec<usize> {
+        let mut nodes: Vec<usize> = cpus
+            .iter()
+            .map(|c| self.cpu_to_node.get(c).copied().unwrap_or(0))
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
     }
 
     /// Total available host CPUs.
@@ -144,6 +169,75 @@ impl HostTopology {
             assignments,
             service_cpu,
         })
+    }
+}
+
+/// Discover the NUMA node for each CPU by reading
+/// `/sys/devices/system/cpu/cpuN/node*` symlinks.
+/// Returns a map from CPU ID to NUMA node ID. On single-node systems
+/// or when sysfs is unavailable, returns an empty map (callers default
+/// to node 0).
+fn discover_cpu_numa_nodes(online_cpus: &[usize]) -> std::collections::HashMap<usize, usize> {
+    let mut map = std::collections::HashMap::new();
+    for &cpu in online_cpus {
+        let cpu_dir = format!("/sys/devices/system/cpu/cpu{cpu}");
+        let Ok(entries) = std::fs::read_dir(&cpu_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(node_str) = name_str.strip_prefix("node")
+                && let Ok(node_id) = node_str.parse::<usize>()
+            {
+                map.insert(cpu, node_id);
+                break;
+            }
+        }
+    }
+    map
+}
+
+/// Bind a memory region to specific NUMA nodes using `mbind(MPOL_BIND)`.
+/// `nodes` is the set of NUMA node IDs. Falls back silently on error
+/// (single-node systems, missing capabilities).
+pub fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
+    if nodes.is_empty() || len == 0 {
+        return;
+    }
+    let max_node = nodes.iter().copied().max().unwrap_or(0);
+    // nodemask is a bitmask: bit N = node N. Size in unsigned longs.
+    let mask_bits = max_node + 2; // mbind maxnode is 1-indexed
+    let mask_longs = mask_bits.div_ceil(usize::BITS as usize);
+    let mut nodemask = vec![0usize; mask_longs];
+    for &node in nodes {
+        nodemask[node / (usize::BITS as usize)] |= 1 << (node % (usize::BITS as usize));
+    }
+
+    const MPOL_BIND: i32 = 2;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            addr as *mut libc::c_void,
+            len,
+            MPOL_BIND,
+            nodemask.as_ptr(),
+            mask_bits as libc::c_ulong,
+            0u32, // flags: 0 = apply to future allocations
+        )
+    };
+    if rc == 0 {
+        eprintln!(
+            "performance_mode: mbind {} MB to NUMA node(s) {:?}",
+            len >> 20,
+            nodes,
+        );
+    } else {
+        let err = std::io::Error::last_os_error();
+        eprintln!(
+            "performance_mode: WARNING: mbind to node(s) {:?} failed: {err}",
+            nodes,
+        );
     }
 }
 
@@ -321,12 +415,20 @@ mod tests {
     // -- synthetic topology mapping tests --
 
     /// Helper: build a synthetic HostTopology with the given LLC groups.
+    /// Assigns each LLC group to a NUMA node matching the group index.
     fn synthetic_topo(groups: Vec<Vec<usize>>) -> HostTopology {
         let all_cpus: Vec<usize> = groups.iter().flatten().copied().collect();
+        let mut cpu_to_node = std::collections::HashMap::new();
+        for (node, group) in groups.iter().enumerate() {
+            for &cpu in group {
+                cpu_to_node.insert(cpu, node);
+            }
+        }
         let llc_groups = groups.into_iter().map(|cpus| LlcGroup { cpus }).collect();
         HostTopology {
             llc_groups,
             online_cpus: all_cpus,
+            cpu_to_node,
         }
     }
 
@@ -587,5 +689,59 @@ mod tests {
         let vcpu_cpus: std::collections::HashSet<usize> =
             plan.assignments.iter().map(|a| a.1).collect();
         assert!(!vcpu_cpus.contains(&service));
+    }
+
+    // -- NUMA node discovery tests --
+
+    #[test]
+    fn sysfs_cpu_to_node_populated() {
+        let topo = HostTopology::from_sysfs().unwrap();
+        // On any Linux host, at least some CPUs should have NUMA info.
+        // On single-node systems the map may map everything to node 0.
+        if !topo.cpu_to_node.is_empty() {
+            for (&cpu, &node) in &topo.cpu_to_node {
+                assert!(
+                    topo.online_cpus.contains(&cpu),
+                    "NUMA mapping for CPU {cpu} but not in online set",
+                );
+                // NUMA node IDs are typically small (0-N).
+                assert!(node < 1024, "unexpected NUMA node ID {node} for CPU {cpu}");
+            }
+        }
+    }
+
+    #[test]
+    fn numa_nodes_for_cpus_synthetic() {
+        let topo = synthetic_topo(vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(topo.numa_nodes_for_cpus(&[0, 1]), vec![0]);
+        assert_eq!(topo.numa_nodes_for_cpus(&[2, 3]), vec![1]);
+        let mut nodes = topo.numa_nodes_for_cpus(&[0, 2]);
+        nodes.sort();
+        assert_eq!(nodes, vec![0, 1]);
+    }
+
+    #[test]
+    fn numa_nodes_for_cpus_empty() {
+        let topo = synthetic_topo(vec![vec![0, 1]]);
+        assert!(topo.numa_nodes_for_cpus(&[]).is_empty());
+    }
+
+    #[test]
+    fn max_cores_per_llc_synthetic() {
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5]]);
+        assert_eq!(topo.max_cores_per_llc(), 4);
+    }
+
+    #[test]
+    fn max_cores_per_llc_uniform() {
+        let topo = synthetic_topo(vec![vec![0, 1, 2], vec![3, 4, 5]]);
+        assert_eq!(topo.max_cores_per_llc(), 3);
+    }
+
+    #[test]
+    fn mbind_to_nodes_empty_is_noop() {
+        // Should not panic.
+        mbind_to_nodes(std::ptr::null_mut(), 0, &[]);
+        mbind_to_nodes(std::ptr::null_mut(), 4096, &[]);
     }
 }

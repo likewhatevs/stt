@@ -13,10 +13,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::assert::{AssertResult, ScenarioStats};
 use crate::monitor::MonitorSummary;
 use crate::scenario::Ctx;
 use crate::timeline::StimulusEvent;
-use crate::verify::{ScenarioStats, VerifyResult};
 use crate::vmm;
 
 /// True when RUST_BACKTRACE is set to "1" or "full".
@@ -149,7 +149,7 @@ fn maybe_dispatch_host_test() -> Option<i32> {
 
     let active_flags = extract_flags_arg(&args).unwrap_or_default();
     match run_stt_test_with_topo_and_flags(entry, &topo, &active_flags) {
-        Ok(()) => Some(0),
+        Ok(_) => Some(0),
         Err(e) => {
             eprintln!("stt_test: {e:#}");
             Some(1)
@@ -200,7 +200,7 @@ pub struct Scheduler {
     pub flags: &'static [&'static FlagDecl],
     pub sysctls: &'static [(&'static str, &'static str)],
     pub kargs: &'static [&'static str],
-    pub verify: crate::verify::Verify,
+    pub assert: crate::assert::Assert,
 }
 
 impl Scheduler {
@@ -210,7 +210,7 @@ impl Scheduler {
         flags: &[],
         sysctls: &[],
         kargs: &[],
-        verify: crate::verify::Verify::NONE,
+        assert: crate::assert::Assert::NONE,
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -221,7 +221,7 @@ impl Scheduler {
             flags: &[],
             sysctls: &[],
             kargs: &[],
-            verify: crate::verify::Verify::NONE,
+            assert: crate::assert::Assert::NONE,
         }
     }
 
@@ -249,9 +249,9 @@ impl Scheduler {
         self
     }
 
-    /// Set verification config. Returns self for const chaining.
-    pub const fn verify(mut self, verify: crate::verify::Verify) -> Self {
-        self.verify = verify;
+    /// Set assertion config. Returns self for const chaining.
+    pub const fn assert(mut self, assert: crate::assert::Assert) -> Self {
+        self.assert = assert;
         self
     }
 
@@ -331,7 +331,7 @@ pub struct BpfMapWrite {
 /// Registration entry for an `#[stt_test]`-annotated function.
 pub struct SttTestEntry {
     pub name: &'static str,
-    pub func: fn(&Ctx) -> Result<VerifyResult>,
+    pub func: fn(&Ctx) -> Result<AssertResult>,
     pub sockets: u32,
     pub cores: u32,
     pub threads: u32,
@@ -339,7 +339,7 @@ pub struct SttTestEntry {
     pub scheduler: &'static Scheduler,
     pub auto_repro: bool,
     pub replicas: u32,
-    pub verify: crate::verify::Verify,
+    pub assert: crate::assert::Assert,
     pub extra_sched_args: &'static [&'static str],
     /// Override for scx_watchdog_timeout in the guest kernel (jiffies).
     /// 0 = no override (use kernel default).
@@ -363,6 +363,9 @@ pub struct SttTestEntry {
     /// host has enough CPUs and LLCs to satisfy the request without
     /// oversubscription.
     pub performance_mode: bool,
+    /// LLC exclusivity mode. Implies performance_mode. Each virtual socket
+    /// reserves an entire physical LLC group.
+    pub super_perf_mode: bool,
     /// Override workload duration in seconds. 0 = use default (2s).
     pub duration_s: u64,
     /// Override workers per cgroup. 0 = use default (2).
@@ -403,6 +406,15 @@ pub struct SttTestInfo {
     /// Flag names supported by this test's scheduler.
     #[serde(default)]
     pub scheduler_flags: Vec<String>,
+    /// When true, the test pins vCPUs to host CPUs for stable timing.
+    #[serde(default)]
+    pub performance_mode: bool,
+    /// LLC exclusivity mode. Implies performance_mode.
+    #[serde(default)]
+    pub super_perf_mode: bool,
+    /// Total vCPUs requested (sockets * cores * threads).
+    #[serde(default)]
+    pub total_vcpus: u32,
 }
 
 fn default_one() -> u32 {
@@ -431,6 +443,9 @@ impl SttTestInfo {
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect(),
+            performance_mode: e.performance_mode || e.super_perf_mode,
+            super_perf_mode: e.super_perf_mode,
+            total_vcpus: e.sockets * e.cores * e.threads,
         }
     }
 }
@@ -481,12 +496,12 @@ pub fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
 ///
 /// Validates KVM access and auto-discovers a kernel image via
 /// `resolve_kernel()` when `STT_TEST_KERNEL` is not set.
-pub fn run_stt_test(entry: &SttTestEntry) -> Result<()> {
+pub fn run_stt_test(entry: &SttTestEntry) -> Result<AssertResult> {
     run_stt_test_inner(entry, None, &[])
 }
 
 /// Like `run_stt_test` but with an explicit topology override.
-pub fn run_stt_test_with_topo(entry: &SttTestEntry, topo: &TopoOverride) -> Result<()> {
+pub fn run_stt_test_with_topo(entry: &SttTestEntry, topo: &TopoOverride) -> Result<AssertResult> {
     run_stt_test_inner(entry, Some(topo), &[])
 }
 
@@ -496,7 +511,7 @@ pub fn run_stt_test_with_topo_and_flags(
     entry: &SttTestEntry,
     topo: &TopoOverride,
     active_flags: &[String],
-) -> Result<()> {
+) -> Result<AssertResult> {
     run_stt_test_inner(entry, Some(topo), active_flags)
 }
 
@@ -504,7 +519,7 @@ fn run_stt_test_inner(
     entry: &SttTestEntry,
     topo: Option<&TopoOverride>,
     active_flags: &[String],
-) -> Result<()> {
+) -> Result<AssertResult> {
     ensure_kvm()?;
     let kernel = resolve_kernel()?;
     let scheduler = resolve_scheduler(&entry.scheduler.binary)?;
@@ -545,12 +560,13 @@ fn run_stt_test_inner(
         .shm_size(STT_TEST_SHM_SIZE)
         .run_args(&guest_args)
         .timeout(Duration::from_secs(60))
-        .performance_mode(entry.performance_mode);
+        .performance_mode(entry.performance_mode || entry.super_perf_mode)
+        .super_perf_mode(entry.super_perf_mode);
 
-    // Merge order: default_checks -> scheduler.verify -> per-test verify.
-    let merged_verify = crate::verify::Verify::default_checks()
-        .merge(&entry.scheduler.verify)
-        .merge(&entry.verify);
+    // Merge order: default_checks -> scheduler.assert -> per-test assert.
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(&entry.scheduler.assert)
+        .merge(&entry.assert);
 
     if let Some(ref sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);
@@ -560,7 +576,7 @@ fn run_stt_test_inner(
         builder = builder.sched_disable_cmds(disable);
     }
     if entry.scheduler.binary.has_active_scheduling() {
-        builder = builder.monitor_thresholds(merged_verify.monitor_thresholds());
+        builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
     }
 
     // Merge scheduler args: extra_sched_args from the entry + args derived
@@ -631,7 +647,7 @@ fn run_stt_test_inner(
         entry,
         &result,
         scheduler.as_deref(),
-        &merged_verify,
+        &merged_assert,
         &stimulus_events,
         sockets,
         cores,
@@ -651,13 +667,13 @@ fn evaluate_vm_result(
     entry: &SttTestEntry,
     result: &vmm::VmResult,
     _scheduler: Option<&Path>,
-    merged_verify: &crate::verify::Verify,
+    merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
     sockets: u32,
     cores: u32,
     threads: u32,
     repro_fn: &dyn Fn(&str) -> Option<String>,
-) -> Result<()> {
+) -> Result<AssertResult> {
     // Build timeline from stimulus events + monitor samples.
     let timeline = result
         .monitor
@@ -712,7 +728,7 @@ fn evaluate_vm_result(
         }
     }
 
-    if let Ok(verify_result) = parse_verify_result(output) {
+    if let Ok(verify_result) = parse_assert_result(output) {
         // Write sidecar before checking pass/fail so both outcomes are captured.
         write_sidecar(entry, result, stimulus_events, &verify_result, "CpuSpin");
 
@@ -749,7 +765,7 @@ fn evaluate_vm_result(
         if entry.scheduler.binary.has_active_scheduling()
             && let Some(ref monitor) = result.monitor
         {
-            let thresholds = merged_verify.monitor_thresholds();
+            let thresholds = merged_assert.monitor_thresholds();
             let verdict = thresholds.evaluate(monitor);
             if !verdict.passed {
                 let details = verdict.details.join("\n  ");
@@ -769,10 +785,10 @@ fn evaluate_vm_result(
             }
         }
 
-        return Ok(());
+        return Ok(verify_result);
     }
 
-    // No parseable result — the payload never wrote a VerifyResult to COM2.
+    // No parseable result — the payload never wrote a AssertResult to COM2.
     // When a scheduler is running this typically means the scheduler died;
     // without a scheduler (EEVDF) it means the payload itself failed.
     // Attempt auto-repro if enabled and a scheduler was running.
@@ -1049,8 +1065,8 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
     // violations to warnings and relax the gap threshold.
     #[cfg(coverage)]
     {
-        crate::verify::set_warn_unfair(true);
-        crate::verify::set_coverage_gap_ms(5000);
+        crate::assert::set_warn_unfair(true);
+        crate::assert::set_coverage_gap_ms(5000);
     }
 
     let entry = match find_test(name) {
@@ -1171,19 +1187,19 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
     let result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {
-            let r = VerifyResult {
+            let r = AssertResult {
                 passed: false,
                 details: vec![format!("{e:#}")],
                 stats: Default::default(),
             };
-            print_verify_result(&r);
+            print_assert_result(&r);
             collect_and_print_probe_data(probe_stop, probe_handle);
             return Some(1);
         }
     };
 
     let exit_code = if result.passed { 0 } else { 1 };
-    print_verify_result(&result);
+    print_assert_result(&result);
     collect_and_print_probe_data(probe_stop, probe_handle);
     Some(exit_code)
 }
@@ -1473,12 +1489,12 @@ fn target_dir() -> PathBuf {
 // Result serialization
 // ---------------------------------------------------------------------------
 
-/// Delimiters for the VerifyResult JSON in guest output.
+/// Delimiters for the AssertResult JSON in guest output.
 const RESULT_START: &str = "===STT_TEST_RESULT_START===";
 const RESULT_END: &str = "===STT_TEST_RESULT_END===";
 
-/// Print VerifyResult as delimited JSON to stdout (captured by COM2).
-fn print_verify_result(r: &VerifyResult) {
+/// Print AssertResult as delimited JSON to stdout (captured by COM2).
+fn print_assert_result(r: &AssertResult) {
     println!("{RESULT_START}");
     if let Ok(json) = serde_json::to_string(r) {
         println!("{json}");
@@ -1486,11 +1502,11 @@ fn print_verify_result(r: &VerifyResult) {
     println!("{RESULT_END}");
 }
 
-/// Parse VerifyResult from guest output between delimiters.
-fn parse_verify_result(output: &str) -> Result<VerifyResult> {
+/// Parse AssertResult from guest output between delimiters.
+fn parse_assert_result(output: &str) -> Result<AssertResult> {
     let json = crate::probe::output::extract_section(output, RESULT_START, RESULT_END);
     anyhow::ensure!(!json.is_empty(), "missing result delimiters");
-    serde_json::from_str(&json).context("parse VerifyResult JSON")
+    serde_json::from_str(&json).context("parse AssertResult JSON")
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,7 +1795,7 @@ fn write_sidecar(
     entry: &SttTestEntry,
     vm_result: &vmm::VmResult,
     stimulus_events: &[StimulusEvent],
-    verify_result: &VerifyResult,
+    verify_result: &AssertResult,
     work_type: &str,
 ) {
     let dir = match std::env::var("STT_SIDECAR_DIR") {
@@ -1820,8 +1836,8 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // Register a test entry in the distributed slice for unit testing find_test.
-    fn __stt_inner_unit_test_dummy(_ctx: &Ctx) -> Result<VerifyResult> {
-        Ok(VerifyResult::pass())
+    fn __stt_inner_unit_test_dummy(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
     }
 
     #[distributed_slice(STT_TESTS)]
@@ -1835,7 +1851,7 @@ mod tests {
         scheduler: &Scheduler::EEVDF,
         auto_repro: true,
         replicas: 1,
-        verify: crate::verify::Verify::NONE,
+        assert: crate::assert::Assert::NONE,
         extra_sched_args: &[],
         required_flags: &[],
         excluded_flags: &[],
@@ -1846,6 +1862,7 @@ mod tests {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: None,
         performance_mode: false,
+        super_perf_mode: false,
         duration_s: 0,
         workers_per_cgroup: 0,
     };
@@ -1895,30 +1912,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_verify_result_valid() {
+    fn parse_assert_result_valid() {
         let json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("noise\n{RESULT_START}\n{json}\n{RESULT_END}\nmore");
-        let r = parse_verify_result(&output).unwrap();
+        let r = parse_assert_result(&output).unwrap();
         assert!(r.passed);
     }
 
     #[test]
-    fn parse_verify_result_missing_start() {
+    fn parse_assert_result_missing_start() {
         let output = format!("no start\n{RESULT_END}\n");
-        assert!(parse_verify_result(&output).is_err());
+        assert!(parse_assert_result(&output).is_err());
     }
 
     #[test]
-    fn parse_verify_result_missing_end() {
+    fn parse_assert_result_missing_end() {
         let output = format!("{RESULT_START}\n{{}}");
-        assert!(parse_verify_result(&output).is_err());
+        assert!(parse_assert_result(&output).is_err());
     }
 
     #[test]
-    fn parse_verify_result_failed() {
+    fn parse_assert_result_failed() {
         let json = r#"{"passed":false,"details":["stuck 3000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
-        let r = parse_verify_result(&output).unwrap();
+        let r = parse_assert_result(&output).unwrap();
         assert!(!r.passed);
         assert_eq!(r.details, vec!["stuck 3000ms"]);
     }
@@ -2002,25 +2019,25 @@ mod tests {
         assert!(extract_test_fn_arg(&args).is_none());
     }
 
-    // -- parse_verify_result additional tests --
+    // -- parse_assert_result additional tests --
 
     #[test]
-    fn parse_verify_result_malformed_json() {
+    fn parse_assert_result_malformed_json() {
         let output = format!("{RESULT_START}\nnot valid json\n{RESULT_END}");
-        assert!(parse_verify_result(&output).is_err());
+        assert!(parse_assert_result(&output).is_err());
     }
 
     #[test]
-    fn parse_verify_result_empty_json_between_delimiters() {
+    fn parse_assert_result_empty_json_between_delimiters() {
         let output = format!("{RESULT_START}\n\n{RESULT_END}");
-        assert!(parse_verify_result(&output).is_err());
+        assert!(parse_assert_result(&output).is_err());
     }
 
     #[test]
-    fn parse_verify_result_with_details() {
+    fn parse_assert_result_with_details() {
         let json = r#"{"passed":false,"details":["err1","err2"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
-        let r = parse_verify_result(&output).unwrap();
+        let r = parse_assert_result(&output).unwrap();
         assert!(!r.passed);
         assert_eq!(r.details.len(), 2);
         assert_eq!(r.details[0], "err1");
@@ -2499,8 +2516,8 @@ mod tests {
         assert!(s.flags.is_empty());
         assert!(s.sysctls.is_empty());
         assert!(s.kargs.is_empty());
-        assert!(s.verify.not_starved.is_none());
-        assert!(s.verify.max_imbalance_ratio.is_none());
+        assert!(s.assert.not_starved.is_none());
+        assert!(s.assert.max_imbalance_ratio.is_none());
     }
 
     static FLAG_A: FlagDecl = FlagDecl {
@@ -2653,12 +2670,12 @@ mod tests {
 
     #[test]
     fn scheduler_with_verify() {
-        let v = crate::verify::Verify::NONE
+        let v = crate::assert::Assert::NONE
             .check_not_starved()
             .max_imbalance_ratio(3.0);
-        let s = Scheduler::new("sched").verify(v);
-        assert_eq!(s.verify.not_starved, Some(true));
-        assert_eq!(s.verify.max_imbalance_ratio, Some(3.0));
+        let s = Scheduler::new("sched").assert(v);
+        assert_eq!(s.assert.not_starved, Some(true));
+        assert_eq!(s.assert.max_imbalance_ratio, Some(3.0));
     }
 
     #[test]
@@ -2668,8 +2685,8 @@ mod tests {
             topology: "2s4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             passed: true,
-            stats: crate::verify::ScenarioStats {
-                cgroups: vec![crate::verify::CgroupStats {
+            stats: crate::assert::ScenarioStats {
+                cgroups: vec![crate::assert::CgroupStats {
                     num_workers: 4,
                     num_cpus: 2,
                     avg_runnable_pct: 50.0,
@@ -2789,6 +2806,9 @@ mod tests {
             requires_smt: true,
             min_cpus: 8,
             scheduler_flags: vec!["borrow".into(), "rebal".into()],
+            performance_mode: true,
+            super_perf_mode: false,
+            total_vcpus: 16,
         };
         let json = serde_json::to_string(&info).unwrap();
         let loaded: SttTestInfo = serde_json::from_str(&json).unwrap();
@@ -2806,6 +2826,8 @@ mod tests {
         assert!(loaded.requires_smt);
         assert_eq!(loaded.min_cpus, 8);
         assert_eq!(loaded.scheduler_flags, vec!["borrow", "rebal"]);
+        assert!(loaded.performance_mode);
+        assert_eq!(loaded.total_vcpus, 16);
     }
 
     #[test]
@@ -3096,8 +3118,8 @@ mod tests {
         // SAFETY: test-only, single-threaded env mutation with save/restore.
         unsafe { std::env::remove_var(key) };
 
-        fn dummy(_ctx: &Ctx) -> Result<VerifyResult> {
-            Ok(VerifyResult::pass())
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
         }
         let entry = SttTestEntry {
             name: "__sidecar_noop__",
@@ -3109,7 +3131,7 @@ mod tests {
             scheduler: &Scheduler::EEVDF,
             auto_repro: false,
             replicas: 1,
-            verify: crate::verify::Verify::NONE,
+            assert: crate::assert::Assert::NONE,
             extra_sched_args: &[],
             required_flags: &[],
             excluded_flags: &[],
@@ -3120,6 +3142,7 @@ mod tests {
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
+            super_perf_mode: false,
             duration_s: 0,
             workers_per_cgroup: 0,
         };
@@ -3134,7 +3157,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
         };
-        let verify_result = VerifyResult::pass();
+        let verify_result = AssertResult::pass();
         // This should be a no-op because STT_SIDECAR_DIR is not set.
         write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
 
@@ -3153,8 +3176,8 @@ mod tests {
         // SAFETY: test-only, single-threaded env mutation with save/restore.
         unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
 
-        fn dummy(_ctx: &Ctx) -> Result<VerifyResult> {
-            Ok(VerifyResult::pass())
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
         }
         let entry = SttTestEntry {
             name: "__sidecar_write_test__",
@@ -3166,7 +3189,7 @@ mod tests {
             scheduler: &Scheduler::EEVDF,
             auto_repro: false,
             replicas: 1,
-            verify: crate::verify::Verify::NONE,
+            assert: crate::assert::Assert::NONE,
             extra_sched_args: &[],
             required_flags: &[],
             excluded_flags: &[],
@@ -3177,6 +3200,7 @@ mod tests {
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
+            super_perf_mode: false,
             duration_s: 0,
             workers_per_cgroup: 0,
         };
@@ -3191,7 +3215,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
         };
-        let verify_result = VerifyResult::pass();
+        let verify_result = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
 
         let path = tmp.join("__sidecar_write_test__.stt.json");
@@ -3235,8 +3259,8 @@ mod tests {
 
     // -- evaluate_vm_result error path tests --
 
-    fn dummy_test_fn(_ctx: &Ctx) -> Result<VerifyResult> {
-        Ok(VerifyResult::pass())
+    fn dummy_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
     }
 
     fn eevdf_entry(name: &'static str) -> SttTestEntry {
@@ -3250,7 +3274,7 @@ mod tests {
             scheduler: &Scheduler::EEVDF,
             auto_repro: false,
             replicas: 1,
-            verify: crate::verify::Verify::NONE,
+            assert: crate::assert::Assert::NONE,
             extra_sched_args: &[],
             required_flags: &[],
             excluded_flags: &[],
@@ -3261,6 +3285,7 @@ mod tests {
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
+            super_perf_mode: false,
             duration_s: 0,
             workers_per_cgroup: 0,
         }
@@ -3272,7 +3297,7 @@ mod tests {
         flags: &[],
         sysctls: &[],
         kargs: &[],
-        verify: crate::verify::Verify::NONE,
+        assert: crate::assert::Assert::NONE,
     };
 
     fn sched_entry(name: &'static str) -> SttTestEntry {
@@ -3286,7 +3311,7 @@ mod tests {
             scheduler: &SCHED_TEST,
             auto_repro: false,
             replicas: 1,
-            verify: crate::verify::Verify::NONE,
+            assert: crate::assert::Assert::NONE,
             extra_sched_args: &[],
             required_flags: &[],
             excluded_flags: &[],
@@ -3297,6 +3322,7 @@ mod tests {
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
+            super_perf_mode: false,
             duration_s: 0,
             workers_per_cgroup: 0,
         }
@@ -3331,8 +3357,8 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
-        let verify = crate::verify::Verify::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -3357,13 +3383,13 @@ mod tests {
     fn eval_sched_dies_no_com2_output() {
         let entry = sched_entry("__eval_sched_dies__");
         let result = make_vm_result("", "boot ok", 1, false);
-        let verify = crate::verify::Verify::NONE;
+        let assertions = crate::assert::Assert::NONE;
         let sched_path = std::path::Path::new("/fake/sched");
         let err = evaluate_vm_result(
             &entry,
             &result,
             Some(sched_path),
-            &verify,
+            &assertions,
             &[],
             1,
             2,
@@ -3391,13 +3417,13 @@ mod tests {
         );
         let entry = sched_entry("__eval_sched_log__");
         let result = make_vm_result(&sched_log, "", -1, false);
-        let verify = crate::verify::Verify::NONE;
+        let assertions = crate::assert::Assert::NONE;
         let sched_path = std::path::Path::new("/fake/sched");
         let err = evaluate_vm_result(
             &entry,
             &result,
             Some(sched_path),
-            &verify,
+            &assertions,
             &[],
             1,
             2,
@@ -3426,8 +3452,8 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
-        let verify = crate::verify::Verify::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -3446,7 +3472,7 @@ mod tests {
 
     #[test]
     fn eval_payload_exits_no_verify_result() {
-        // Payload wrote something to COM2 but not a valid VerifyResult.
+        // Payload wrote something to COM2 but not a valid AssertResult.
         let entry = eevdf_entry("__eval_no_verify__");
         let result = make_vm_result(
             "some output but no delimiters",
@@ -3454,8 +3480,8 @@ mod tests {
             0,
             false,
         );
-        let verify = crate::verify::Verify::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -3473,13 +3499,13 @@ mod tests {
         let output = "stt-0 [001] 0.5: sched_ext_dump: Debug dump line";
         let entry = sched_entry("__eval_dump__");
         let result = make_vm_result(output, "", -1, false);
-        let verify = crate::verify::Verify::NONE;
+        let assertions = crate::assert::Assert::NONE;
         let sched_path = std::path::Path::new("/fake/sched");
         let err = evaluate_vm_result(
             &entry,
             &result,
             Some(sched_path),
-            &verify,
+            &assertions,
             &[],
             1,
             2,
@@ -3504,10 +3530,11 @@ mod tests {
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_pass__");
         let result = make_vm_result(&output, "", 0, false);
-        let verify = crate::verify::Verify::NONE;
+        let assertions = crate::assert::Assert::NONE;
         assert!(
-            evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro,).is_ok(),
-            "passing VerifyResult should return Ok",
+            evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro,)
+                .is_ok(),
+            "passing AssertResult should return Ok",
         );
     }
 
@@ -3517,13 +3544,13 @@ mod tests {
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_fail_details__");
         let result = make_vm_result(&output, "", 0, false);
-        let verify = crate::verify::Verify::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("failed:"),
-            "failed VerifyResult should say 'failed:', got: {msg}",
+            "failed AssertResult should say 'failed:', got: {msg}",
         );
         assert!(
             msg.contains("stuck 3000ms"),
@@ -3541,13 +3568,13 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
-        let verify = crate::verify::Verify::NONE;
+        let assertions = crate::assert::Assert::NONE;
         let sched_path = std::path::Path::new("/fake/sched");
         let err = evaluate_vm_result(
             &entry,
             &result,
             Some(sched_path),
-            &verify,
+            &assertions,
             &[],
             1,
             2,
@@ -3619,8 +3646,8 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
-        let verify = crate::verify::Verify::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -3635,8 +3662,8 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("STT_INIT_STARTED\n", "boot log", 1, false);
-        let verify = crate::verify::Verify::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -3652,8 +3679,8 @@ mod tests {
         let entry = eevdf_entry("__eval_payload_start__");
         let output = "STT_INIT_STARTED\nSTT_PAYLOAD_STARTING\ngarbage";
         let result = make_vm_result(output, "", 1, false);
-        let verify = crate::verify::Verify::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &verify, &[], 1, 2, 1, &no_repro)
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(

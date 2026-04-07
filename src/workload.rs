@@ -37,6 +37,17 @@ pub enum AffinityMode {
 ///
 /// Different work types exercise different scheduler code paths:
 /// CPU-bound, yield-heavy, I/O, bursty, or inter-process communication.
+///
+/// ```
+/// # use stt::workload::WorkType;
+/// let wt = WorkType::from_name("CpuSpin").unwrap();
+/// assert!(matches!(wt, WorkType::CpuSpin));
+///
+/// let bursty = WorkType::Bursty { burst_ms: 10, sleep_ms: 5 };
+/// assert!(matches!(bursty, WorkType::Bursty { .. }));
+///
+/// assert!(WorkType::from_name("nonexistent").is_none());
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub enum WorkType {
     CpuSpin,
@@ -192,6 +203,16 @@ impl WorkType {
 /// Provides named presets for common workload patterns. Resolves to a
 /// concrete `WorkType` via [`resolve()`](Self::resolve). CLI uses preset
 /// names via [`from_name()`](Self::from_name).
+///
+/// ```
+/// # use stt::workload::WorkProgram;
+/// let prog = WorkProgram::from_name("cpu_spin").unwrap();
+/// let wt = prog.resolve();
+/// assert!(matches!(wt, stt::workload::WorkType::CpuSpin));
+///
+/// assert!(WorkProgram::from_name("nonexistent").is_none());
+/// assert!(!WorkProgram::ALL_NAMES.is_empty());
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub enum WorkProgram {
     /// A single work type, used directly.
@@ -383,7 +404,7 @@ pub struct WorkerReport {
     /// When the longest gap happened (ms from start).
     pub max_gap_at_ms: u64,
     /// Per-wakeup latency samples (ns). Populated for blocking work types
-    /// (FutexPingPong, CachePipe, Bursty, CacheYield, PipeIo).
+    /// (FutexPingPong, FutexFanOut, CachePipe, Bursty, CacheYield, PipeIo).
     #[serde(default)]
     pub wake_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
@@ -686,9 +707,11 @@ impl WorkloadHandle {
         let was_started = self.started;
         self.start();
 
-        // If we just started workers, give them time to begin before stopping
+        // If we just started workers, give them time to begin before stopping.
+        // 500ms accommodates parallel test runs where CPU contention delays
+        // fork/exec of worker processes.
         if !was_started {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
         let mut reports = Vec::new();

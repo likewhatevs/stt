@@ -9,7 +9,7 @@ without hand-written `Action::Custom` functions.
 use stt::prelude::*;
 use stt::scenario::ops::*;
 
-fn my_resize_scenario(ctx: &Ctx) -> Result<VerifyResult> {
+fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         // Phase 1: two disjoint cgroups, hold for half the duration
         Step {
@@ -50,7 +50,7 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<VerifyResult> {
 use stt::prelude::*;
 use stt::scenario::ops::*;
 
-fn my_traverse_scenario(ctx: &Ctx) -> Result<VerifyResult> {
+fn my_traverse_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let traverse = Traverse {
         seed: Some(42),
         cgroup_count: 2..=4,

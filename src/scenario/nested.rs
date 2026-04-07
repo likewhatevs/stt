@@ -1,13 +1,13 @@
 use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
 use super::{CgroupGroup, Ctx, collect_all, dfl_wl, setup_cgroups};
-use crate::verify::{self, VerifyResult};
+use crate::assert::{self, AssertResult};
 use crate::workload::*;
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0/sub_a"),
@@ -30,7 +30,7 @@ pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
             setup: vec![CgroupDef::named("cg_0/sub")].into(),
@@ -79,7 +79,7 @@ pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<VerifyResult> {
 
 /// Rapid nested cgroup create/destroy with dynamic names. Custom logic
 /// for dynamic naming.
-pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     let (handles, _guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
     let deadline = Instant::now() + ctx.duration;
     let mut i = 0;
@@ -101,10 +101,10 @@ pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<VerifyResult> {
 
 /// Nested cgroups with cpusets + subtree_control filesystem writes.
 /// Custom filesystem ops not representable via Op, stays custom.
-pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     let all = ctx.topo.all_cpus();
     if all.len() < 4 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=4 CPUs".into()],
             stats: Default::default(),
@@ -133,13 +133,13 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<VerifyResult> {
 
     thread::sleep(ctx.duration);
     let reports = h.stop_and_collect();
-    let mut r = VerifyResult::pass();
-    r.merge(verify::verify_not_starved(&reports));
-    r.merge(verify::verify_isolation(&reports, &sub_set));
+    let mut r = AssertResult::pass();
+    r.merge(assert::assert_not_starved(&reports));
+    r.merge(assert::assert_isolation(&reports, &sub_set));
     Ok(r)
 }
 
-pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0/sub_a").workers(8),
@@ -165,7 +165,7 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_nested_cgroup_noctrl(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0/sub_a/deep"),

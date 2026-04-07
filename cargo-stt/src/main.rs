@@ -37,6 +37,8 @@ enum Cmd {
     Topo,
     /// Probe kernel functions from a crash stack
     Probe(ProbeArgs),
+    /// Load scheduler BPF programs and report verifier statistics
+    Verifier(VerifierArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -188,6 +190,22 @@ struct ProbeArgs {
     trigger: Option<String>,
 }
 
+#[derive(Debug, Parser)]
+struct VerifierArgs {
+    /// Cargo package containing the scheduler
+    #[clap(long, short, default_value = "stt-sched")]
+    package: String,
+    /// Second package for A/B instruction count delta
+    #[clap(long)]
+    diff: Option<String>,
+    /// Full verifier log output
+    #[clap(long, short)]
+    verbose: bool,
+    /// Path to kernel image for the VM
+    #[clap(long)]
+    kernel: Option<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -197,6 +215,7 @@ fn main() -> Result<()> {
         Cmd::List(a) => cmd_list(a),
         Cmd::Topo => cmd_topo(),
         Cmd::Probe(a) => cmd_probe(a),
+        Cmd::Verifier(a) => cmd_verifier(a),
     }
 }
 
@@ -414,6 +433,112 @@ fn cmd_vm(args: VmArgs) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Generate a nextest tool config that assigns `threads-required` to
+/// performance_mode tests based on host LLC topology. This prevents
+/// nextest from scheduling more perf tests in parallel than the host
+/// can support without CPU contention.
+///
+/// The pinning plan maps each virtual socket to a physical LLC group,
+/// so threads-required = sum(llc_groups[i].cpus.len() for i in 0..sockets) + 1.
+/// The per-group sum handles asymmetric LLCs correctly. Uses cpus.len()
+/// (logical CPUs / hardware threads), not physical core count.
+///
+/// Returns the path to the generated temp file.
+/// Result of generating a perf tool config. Holds the path and, when
+/// backed by memfd, the open file descriptor that keeps the memfd alive.
+struct PerfToolConfig {
+    path: PathBuf,
+    /// Kept open so `/proc/self/fd/N` remains valid until nextest exits.
+    _memfd: Option<std::fs::File>,
+}
+
+fn generate_perf_tool_config(package: &str) -> Result<PerfToolConfig> {
+    let tests = discover_tests_with_binaries(package)?;
+    let perf_tests: Vec<&DiscoveredTest> = tests
+        .iter()
+        .filter(|t| t.info.performance_mode && t.info.total_vcpus > 0)
+        .collect();
+
+    let host_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let mut config = String::new();
+    config.push_str(&format!(
+        "[test-groups.\"@tool:stt:perf\"]\nmax-threads = {host_cpus}\n"
+    ));
+
+    // Read host topology for LLC-aware thread reservation.
+    let host_topo = stt::vmm::host_topology::HostTopology::from_sysfs().ok();
+
+    // Group perf tests by threads-required.
+    // Pinning maps each virtual socket to a physical LLC group.
+    // threads-required = sum of cpus.len() for the first N LLC groups + 1
+    // (service CPU). Falls back to vcpus + 1 if host topology is unavailable.
+    // Note: threads-required prevents total CPU overcommit but does not
+    // enforce per-LLC exclusion. Two tests using 1 socket each could be
+    // scheduled on the same LLC group by nextest. super_perf_mode's
+    // exclusivity is enforced at VM build time, not at scheduling time.
+    let mut by_threads: std::collections::BTreeMap<u32, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for t in &perf_tests {
+        let threads_required = if let Some(ref topo) = host_topo {
+            let llcs_used = t.info.sockets as usize;
+            let reserved: usize = topo
+                .llc_groups
+                .iter()
+                .take(llcs_used)
+                .map(|g| g.cpus.len())
+                .sum();
+            reserved as u32 + 1
+        } else {
+            t.info.total_vcpus + 1
+        };
+        by_threads
+            .entry(threads_required)
+            .or_default()
+            .push(&t.info.name);
+    }
+    for (threads_required, names) in &by_threads {
+        let filter: String = names
+            .iter()
+            .map(|n| format!("test(={n})"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        config.push_str(&format!(
+            "\n[[profile.default.overrides]]\nfilter = \"{filter}\"\n\
+             threads-required = {threads_required}\n\
+             test-group = \"@tool:stt:perf\"\n"
+        ));
+    }
+
+    write_perf_tool_config(&config)
+}
+
+/// Write tool config to memfd (in-memory, auto-cleaned on exit).
+/// Falls back to a temp file if memfd_create is unavailable.
+fn write_perf_tool_config(config: &str) -> Result<PerfToolConfig> {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+
+    let fd = unsafe { libc::memfd_create(c"stt-nextest".as_ptr(), 0) };
+    if fd >= 0 {
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(config.as_bytes())
+            .context("write memfd tool config")?;
+        let path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+        return Ok(PerfToolConfig {
+            path,
+            _memfd: Some(file),
+        });
+    }
+
+    // Fallback: temp file on disk.
+    let path = std::env::temp_dir().join(format!("stt-nextest-{}.toml", std::process::id()));
+    std::fs::write(&path, config)?;
+    Ok(PerfToolConfig { path, _memfd: None })
+}
+
 fn cmd_test(args: TestArgs) -> Result<()> {
     let sidecar_dir = std::env::temp_dir().join(format!("stt-sidecar-{}", std::process::id()));
     std::fs::create_dir_all(&sidecar_dir)?;
@@ -444,6 +569,20 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     if !args.nextest_args.is_empty() {
         cmd.args(&args.nextest_args);
     }
+
+    // Generate nextest tool config for performance_mode tests so they
+    // reserve LLC group CPUs (+1 for service) via threads-required.
+    // _tool_config must outlive cmd.status() so the memfd stays open.
+    let _tool_config = if has_nextest {
+        let tc = generate_perf_tool_config(&args.package).ok();
+        if let Some(ref tc) = tc {
+            cmd.arg("--tool-config-file");
+            cmd.arg(format!("stt:{}", tc.path.display()));
+        }
+        tc
+    } else {
+        None
+    };
 
     cmd.env("STT_SIDECAR_DIR", &sidecar_dir);
     if let Some(ref kernel) = args.kernel {
@@ -507,6 +646,12 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     }
 
     let _ = std::fs::remove_dir_all(&sidecar_dir);
+    // Clean up temp file fallback (memfd is auto-cleaned on drop).
+    if let Some(ref tc) = _tool_config
+        && tc._memfd.is_none()
+    {
+        let _ = std::fs::remove_file(&tc.path);
+    }
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -945,6 +1090,560 @@ fn find_stt_binary() -> Result<PathBuf> {
     anyhow::bail!("stt binary not found; run `cargo build -p stt` first")
 }
 
+// ---------------------------------------------------------------------------
+// Verifier subcommand
+// ---------------------------------------------------------------------------
+
+/// Parsed verifier stats from the kernel log line:
+/// `processed N insns (limit M) max_states_per_insn X total_states Y peak_states Z mark_read W`
+struct VerifierStats {
+    processed_insns: u64,
+    total_states: u64,
+    peak_states: u64,
+    time_usec: Option<u64>,
+    stack_depth: Option<String>,
+}
+
+/// Parse verifier stats from the log output.
+///
+/// The kernel always emits a "processed N insns ..." line. When
+/// BPF_LOG_STATS is set, it also emits "verification time" and
+/// "stack depth" lines.
+fn parse_verifier_stats(log: &str) -> VerifierStats {
+    let mut stats = VerifierStats {
+        processed_insns: 0,
+        total_states: 0,
+        peak_states: 0,
+        time_usec: None,
+        stack_depth: None,
+    };
+
+    let mut found_insns = false;
+    let mut found_time = false;
+    let mut found_stack = false;
+
+    for line in log.lines().rev() {
+        if !found_insns && line.starts_with("processed ") {
+            found_insns = true;
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if words.len() >= 2 {
+                stats.processed_insns = words[1].parse().unwrap_or(0);
+            }
+            for (i, &w) in words.iter().enumerate() {
+                if w == "total_states"
+                    && let Some(v) = words.get(i + 1)
+                {
+                    stats.total_states = v.parse().unwrap_or(0);
+                }
+                if w == "peak_states"
+                    && let Some(v) = words.get(i + 1)
+                {
+                    stats.peak_states = v.parse().unwrap_or(0);
+                }
+            }
+        }
+        if !found_time && line.contains("verification time") {
+            found_time = true;
+            for word in line.split_whitespace() {
+                if let Ok(n) = word.parse::<u64>() {
+                    stats.time_usec = Some(n);
+                    break;
+                }
+            }
+        }
+        if !found_stack && line.contains("stack depth") {
+            found_stack = true;
+            if let Some(pos) = line.find("stack depth") {
+                let after = &line[pos + "stack depth".len()..];
+                let depth_str = after.trim();
+                if !depth_str.is_empty() {
+                    stats.stack_depth = Some(depth_str.to_string());
+                }
+            }
+        }
+        if found_insns && found_time && found_stack {
+            break;
+        }
+    }
+
+    stats
+}
+
+/// Normalize a BPF verifier log line by stripping variable register-state
+/// annotations so that lines from different loop iterations compare equal.
+///
+/// Handles:
+/// - Instruction with `; frame` annotation: `3006: (07) r9 += 1  ; frame1: R9_w=2`
+/// - Instruction with `; R` + digit annotation: `9: (15) if r7 == 0x0 goto pc+1  ; R7=scalar(...)`
+/// - Branch with inline target state: `3026: (b5) if r6 <= 0x11dc0 goto pc+2 3029: frame1: R0=1`
+/// - Standalone register dump with frame: `3041: frame1: R0_w=scalar()`
+/// - Standalone register dump without frame: `3029: R0=1 R6=scalar()`
+///
+/// Preserves source comments (`; for (int j = 0; ...)`) and non-annotation
+/// semicolons (`; Return value`) -- these serve as cycle anchors.
+fn normalize_verifier_line(line: &str) -> &str {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.as_bytes()[0].is_ascii_digit() {
+        return trimmed;
+    }
+    // "3041: frame1: ..." or "3041: R0_w=scalar()" — standalone register dump.
+    // State-only lines; keep just the instruction index.
+    if let Some(colon) = trimmed.find(": ") {
+        let after = &trimmed[colon + 2..];
+        if after.starts_with("frame")
+            || (after.starts_with('R')
+                && after.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit()))
+        {
+            return &trimmed[..colon + 1];
+        }
+    }
+    // "; frame" annotation on instruction line
+    if let Some(pos) = trimmed.find("; frame") {
+        return trimmed[..pos].trim_end();
+    }
+    // "; R" followed by digit — register annotation without frame prefix
+    if let Some(pos) = trimmed.find("; R")
+        && trimmed
+            .as_bytes()
+            .get(pos + 3)
+            .is_some_and(|b| b.is_ascii_digit())
+    {
+        return trimmed[..pos].trim_end();
+    }
+    // Inline branch-target state: "goto pc+2 3029: frame1: ..."
+    if let Some(goto_pos) = trimmed.find("goto pc") {
+        let after_goto = &trimmed[goto_pos + 7..];
+        let end = after_goto
+            .find(|c: char| c != '+' && c != '-' && !c.is_ascii_digit())
+            .unwrap_or(after_goto.len());
+        let insn_end = goto_pos + 7 + end;
+        if insn_end < trimmed.len() {
+            return trimmed[..insn_end].trim_end();
+        }
+    }
+    trimmed
+}
+
+/// Detect a single repeating cycle in a slice of lines.
+///
+/// Returns `Some((start, period, count))` where the cycle begins at
+/// `start`, each iteration is `period` lines, and it repeats `count` times.
+fn detect_cycle(lines: &[&str]) -> Option<(usize, usize, usize)> {
+    const MIN_PERIOD: usize = 5;
+    const MIN_REPS: usize = 6;
+
+    if lines.len() < MIN_PERIOD * MIN_REPS {
+        return None;
+    }
+
+    let normalized: Vec<&str> = lines.iter().map(|l| normalize_verifier_line(l)).collect();
+
+    // Find most frequent non-trivial normalized line (the "anchor").
+    let mut sorted_norms: Vec<&str> = normalized
+        .iter()
+        .filter(|l| l.len() >= 10)
+        .copied()
+        .collect();
+    sorted_norms.sort_unstable();
+
+    let mut best_anchor: Option<(&str, usize)> = None;
+    let mut i = 0;
+    while i < sorted_norms.len() {
+        let mut j = i + 1;
+        while j < sorted_norms.len() && sorted_norms[j] == sorted_norms[i] {
+            j += 1;
+        }
+        let count = j - i;
+        if count >= MIN_REPS && best_anchor.is_none_or(|(_, best)| count > best) {
+            best_anchor = Some((sorted_norms[i], count));
+        }
+        i = j;
+    }
+
+    let (anchor, _) = best_anchor?;
+
+    let positions: Vec<usize> = normalized
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == anchor)
+        .map(|(i, _)| i)
+        .collect();
+
+    // Try strides 1..3 to handle anchors appearing K times per cycle.
+    for stride in 1..=3usize {
+        if positions.len() <= stride {
+            continue;
+        }
+
+        let mut gaps: Vec<usize> = positions
+            .windows(stride + 1)
+            .map(|w| w[stride] - w[0])
+            .filter(|g| *g >= MIN_PERIOD)
+            .collect();
+        gaps.sort_unstable();
+
+        let mut best_period = 0;
+        let mut best_gap_count = 0;
+        let mut gi = 0;
+        while gi < gaps.len() {
+            let mut gj = gi + 1;
+            while gj < gaps.len() && gaps[gj] == gaps[gi] {
+                gj += 1;
+            }
+            let count = gj - gi;
+            if count > best_gap_count {
+                best_gap_count = count;
+                best_period = gaps[gi];
+            }
+            gi = gj;
+        }
+        if best_period == 0 || best_gap_count < MIN_REPS - 1 {
+            continue;
+        }
+        let period = best_period;
+
+        for &pos in &positions {
+            if pos + 2 * period > lines.len() {
+                break;
+            }
+            if normalized[pos..pos + period] == normalized[pos + period..pos + 2 * period] {
+                let first_block = &normalized[pos..pos + period];
+                let mut count = 1;
+                while pos + (count + 1) * period <= lines.len() {
+                    if normalized[pos + count * period..pos + (count + 1) * period] != *first_block
+                    {
+                        break;
+                    }
+                    count += 1;
+                }
+                // Try earlier starts to find best alignment.
+                let mut best_start = pos;
+                let mut best_count = count;
+                for offset in 1..period {
+                    let Some(cand) = pos.checked_sub(offset) else {
+                        break;
+                    };
+                    if cand + 2 * period > lines.len() {
+                        continue;
+                    }
+                    if normalized[cand..cand + period]
+                        != normalized[cand + period..cand + 2 * period]
+                    {
+                        continue;
+                    }
+                    let mut c = 2;
+                    while cand + (c + 1) * period <= lines.len()
+                        && normalized[cand + c * period..cand + (c + 1) * period]
+                            == normalized[cand..cand + period]
+                    {
+                        c += 1;
+                    }
+                    if c > best_count {
+                        best_start = cand;
+                        best_count = c;
+                    }
+                }
+                if best_count >= MIN_REPS {
+                    return Some((best_start, period, best_count));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Collapse repeating cycles in a verifier log.
+///
+/// Runs cycle detection iteratively (up to 5 passes for nested loops).
+/// Each cycle is replaced with a header (`--- Nx of the following M lines ---`),
+/// the first iteration, an omission marker (`--- N identical iterations omitted ---`),
+/// the last iteration, and an end marker (`--- end repeat ---`).
+fn collapse_cycles(log: &str) -> String {
+    const MAX_PASSES: usize = 5;
+    let mut text = log.to_string();
+
+    for _ in 0..MAX_PASSES {
+        let lines: Vec<&str> = text.lines().collect();
+        let (start, period, count) = match detect_cycle(&lines) {
+            Some(c) => c,
+            None => break,
+        };
+
+        let mut out = String::new();
+        for line in &lines[..start] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "--- {}x of the following {} lines ---\n",
+            count, period
+        ));
+        for line in &lines[start..start + period] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "--- {} identical iterations omitted ---\n",
+            count - 2
+        ));
+        let last_start = start + (count - 1) * period;
+        for line in &lines[last_start..last_start + period] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("--- end repeat ---\n");
+        let suffix_start = start + count * period;
+        for line in &lines[suffix_start..] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        text = out;
+    }
+
+    text
+}
+
+/// Format a single program's brief output line (without ANSI color).
+fn format_brief_line(name: &str, insn_cnt: usize, vs: &VerifierStats) -> String {
+    let mut extra = String::new();
+    if vs.total_states > 0 {
+        extra.push_str(&format!("  states={}/{}", vs.peak_states, vs.total_states));
+    }
+    if let Some(t) = vs.time_usec {
+        extra.push_str(&format!("  time={t}us"));
+    }
+    if let Some(ref s) = vs.stack_depth {
+        extra.push_str(&format!("  stack={s}"));
+    }
+    format!(
+        "  {:<40} insns={:<6} processed={:<6}{}",
+        name, insn_cnt, vs.processed_insns, extra
+    )
+}
+
+/// Boot a scheduler in a VM and capture its verifier output from dmesg.
+///
+/// The scheduler loads BPF programs during startup; the kernel writes
+/// verifier stats to dmesg on COM1. Returns the captured output.
+/// Per-program verifier statistics parsed from VM output.
+struct ProgStats {
+    name: String,
+    /// Pre-verification program size (BPF insns).
+    insn_cnt: usize,
+    /// Verifier log (stats-only or full, depending on log level).
+    log: String,
+}
+
+/// Parse structured verifier output from a VM run.
+///
+/// The scheduler binary emits lines when invoked with `--dump-verifier`:
+///   STT_VERIFIER_PROG <name> insn_cnt=<N>
+///   STT_VERIFIER_LOG <name> <log line>
+///   STT_VERIFIER_DONE
+fn parse_vm_verifier_output(output: &str) -> Vec<ProgStats> {
+    let mut stats: Vec<ProgStats> = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_insn_cnt = 0usize;
+    let mut current_log = String::new();
+
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("STT_VERIFIER_PROG ") {
+            if let Some(name) = current_name.take() {
+                stats.push(ProgStats {
+                    name,
+                    insn_cnt: current_insn_cnt,
+                    log: std::mem::take(&mut current_log),
+                });
+            }
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            current_name = Some(parts[0].to_string());
+            current_insn_cnt = parts
+                .get(1)
+                .and_then(|s| s.strip_prefix("insn_cnt="))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            current_log.clear();
+        } else if let Some(rest) = line.strip_prefix("STT_VERIFIER_LOG ") {
+            if let Some((_, log_line)) = rest.split_once(' ') {
+                if !current_log.is_empty() {
+                    current_log.push('\n');
+                }
+                current_log.push_str(log_line);
+            }
+        } else if line.starts_with("STT_VERIFIER_DONE")
+            && let Some(name) = current_name.take()
+        {
+            stats.push(ProgStats {
+                name,
+                insn_cnt: current_insn_cnt,
+                log: std::mem::take(&mut current_log),
+            });
+        }
+    }
+    if let Some(name) = current_name {
+        stats.push(ProgStats {
+            name,
+            insn_cnt: current_insn_cnt,
+            log: current_log,
+        });
+    }
+    stats
+}
+
+/// A single row in the A/B diff output.
+struct DiffRow {
+    name: String,
+    a: u64,
+    b: u64,
+    delta: i64,
+}
+
+/// Build diff rows from A stats and B lookup map.
+fn build_diff_rows(
+    stats_a: &[ProgStats],
+    b_map: &std::collections::HashMap<String, u64>,
+) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    for ps in stats_a {
+        let a = parse_verifier_stats(&ps.log).processed_insns;
+        let b = b_map.get(&ps.name).copied().unwrap_or(0);
+        rows.push(DiffRow {
+            name: ps.name.clone(),
+            a,
+            b,
+            delta: a as i64 - b as i64,
+        });
+    }
+    rows
+}
+
+/// Build the B-side lookup map from collected stats.
+fn build_b_map(stats_b: &[ProgStats]) -> std::collections::HashMap<String, u64> {
+    stats_b
+        .iter()
+        .map(|ps| {
+            let vs = parse_verifier_stats(&ps.log);
+            (ps.name.clone(), vs.processed_insns)
+        })
+        .collect()
+}
+
+/// Build a scheduler, boot it in a VM with `--dump-verifier`, and
+/// parse the structured verifier output.
+fn collect_verifier_via_vm(
+    package: &str,
+    verbose: bool,
+    kernel: Option<&str>,
+) -> Result<Vec<ProgStats>> {
+    println!(
+        "{} building scheduler package '{package}'",
+        style("build").cyan().bold(),
+    );
+    let sched_bin = build_and_find_binary(package)
+        .with_context(|| format!("build scheduler package '{package}'"))?;
+
+    let kernel_path = if let Some(k) = kernel {
+        PathBuf::from(k)
+    } else {
+        stt::find_kernel()
+            .ok_or_else(|| anyhow::anyhow!("no kernel found; use --kernel to specify one"))?
+    };
+
+    let mut sched_args = vec!["--dump-verifier".to_string()];
+    if verbose {
+        sched_args.push("--dump-verifier-verbose".to_string());
+    }
+
+    let vm = stt::vmm::SttVm::builder()
+        .kernel(&kernel_path)
+        .scheduler_binary(&sched_bin)
+        .sched_args(&sched_args)
+        .topology(1, 1, 1)
+        .memory_mb(2048)
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("build verifier VM")?;
+
+    println!(
+        "{} booting VM with scheduler from '{package}'",
+        style("verifier").cyan().bold(),
+    );
+    let result = vm.run().context("run verifier VM")?;
+
+    if !result.success && !result.output.contains("STT_VERIFIER_DONE") {
+        anyhow::bail!(
+            "verifier VM exited with code {} (timed_out={})\n{}",
+            result.exit_code,
+            result.timed_out,
+            result.output,
+        );
+    }
+
+    Ok(parse_vm_verifier_output(&result.output))
+}
+
+fn cmd_verifier(args: VerifierArgs) -> Result<()> {
+    let verbose = args.verbose;
+
+    let stats_a = collect_verifier_via_vm(&args.package, verbose, args.kernel.as_deref())?;
+
+    println!("\n{}", style(&args.package).bold());
+    for ps in &stats_a {
+        let vs = parse_verifier_stats(&ps.log);
+        println!("{}", format_brief_line(&ps.name, ps.insn_cnt, &vs));
+    }
+
+    for ps in &stats_a {
+        if !ps.log.is_empty() {
+            println!(
+                "\n{}  {}",
+                style(&args.package).bold(),
+                style(&ps.name).cyan()
+            );
+            if verbose {
+                print!("{}", ps.log);
+            } else {
+                print!("{}", collapse_cycles(&ps.log));
+            }
+        }
+    }
+
+    // A/B comparison mode.
+    if let Some(ref diff_pkg) = args.diff {
+        let stats_b = collect_verifier_via_vm(diff_pkg, verbose, args.kernel.as_deref())?;
+
+        println!("\n{}", style(diff_pkg).bold());
+        for ps in &stats_b {
+            let vs = parse_verifier_stats(&ps.log);
+            println!("{}", format_brief_line(&ps.name, ps.insn_cnt, &vs));
+        }
+
+        let b_map = build_b_map(&stats_b);
+        let diff_rows = build_diff_rows(&stats_a, &b_map);
+
+        println!(
+            "\n{} A/B diff: {} vs {diff_pkg}",
+            style("delta").cyan().bold(),
+            args.package,
+        );
+        println!(
+            "  {:<40} {:>10} {:>10} {:>10}",
+            "program", "A", "B", "delta"
+        );
+        println!("  {}", "-".repeat(72));
+
+        for row in &diff_rows {
+            println!(
+                "  {:<40} {:>10} {:>10} {:>+10}",
+                row.name, row.a, row.b, row.delta
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,6 +1950,9 @@ stack backtrace:";
             requires_smt,
             min_cpus,
             scheduler_flags: vec![],
+            performance_mode: false,
+            super_perf_mode: false,
+            total_vcpus: 2,
         }
     }
 
@@ -1342,5 +2044,913 @@ stack backtrace:";
             }
             _ => panic!("expected Gauntlet"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // verifier subcommand
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_verifier_defaults() {
+        let cli = Cli::try_parse_from(["cargo-stt", "stt", "verifier"]).unwrap();
+        match cli.command {
+            Cmd::Verifier(args) => {
+                assert_eq!(args.package, "stt-sched");
+                assert!(args.diff.is_none());
+                assert!(!args.verbose);
+            }
+            _ => panic!("expected Verifier"),
+        }
+    }
+
+    #[test]
+    fn cli_verifier_with_flags() {
+        let cli = Cli::try_parse_from([
+            "cargo-stt",
+            "stt",
+            "verifier",
+            "-p",
+            "my_sched",
+            "--diff",
+            "other_sched",
+            "-v",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Verifier(args) => {
+                assert_eq!(args.package, "my_sched");
+                assert_eq!(args.diff.as_deref(), Some("other_sched"));
+                assert!(args.verbose);
+            }
+            _ => panic!("expected Verifier"),
+        }
+    }
+
+    #[test]
+    fn parse_verifier_stats_full_line() {
+        let log = "processed 1234 insns (limit 1000000) max_states_per_insn 5 total_states 200 peak_states 50 mark_read 10\nverification time 42 usec\nstack depth 32+0\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 1234);
+        assert_eq!(vs.total_states, 200);
+        assert_eq!(vs.peak_states, 50);
+        assert_eq!(vs.time_usec, Some(42));
+        assert_eq!(vs.stack_depth.as_deref(), Some("32+0"));
+    }
+
+    #[test]
+    fn parse_verifier_stats_insns_only() {
+        let log = "processed 500 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_states 3 mark_read 0\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 500);
+        assert_eq!(vs.total_states, 10);
+        assert_eq!(vs.peak_states, 3);
+        assert!(vs.time_usec.is_none());
+        assert!(vs.stack_depth.is_none());
+    }
+
+    #[test]
+    fn parse_verifier_stats_empty() {
+        let vs = super::parse_verifier_stats("");
+        assert_eq!(vs.processed_insns, 0);
+        assert_eq!(vs.total_states, 0);
+        assert_eq!(vs.peak_states, 0);
+        assert!(vs.time_usec.is_none());
+        assert!(vs.stack_depth.is_none());
+    }
+
+    #[test]
+    fn parse_verifier_stats_garbage_lines() {
+        let log = "some random output\nnot a stats line\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 0);
+        assert_eq!(vs.total_states, 0);
+        assert!(vs.time_usec.is_none());
+    }
+
+    #[test]
+    fn parse_verifier_stats_time_without_insns() {
+        // Time line present but no processed insns line.
+        let log = "verification time 100 usec\nstack depth 64\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 0);
+        assert_eq!(vs.time_usec, Some(100));
+        assert_eq!(vs.stack_depth.as_deref(), Some("64"));
+    }
+
+    #[test]
+    fn parse_verifier_stats_multi_subprogram_stack() {
+        let log = "processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0\nstack depth 32+16+8\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 42);
+        assert_eq!(vs.stack_depth.as_deref(), Some("32+16+8"));
+    }
+
+    #[test]
+    fn parse_verifier_stats_noise_between_lines() {
+        let log = "\
+libbpf: loading something
+processed 999 insns (limit 1000000) max_states_per_insn 3 total_states 77 peak_states 20 mark_read 5
+libbpf: prog 'dispatch': attached
+verification time 7 usec
+stack depth 48+0
+";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 999);
+        assert_eq!(vs.total_states, 77);
+        assert_eq!(vs.peak_states, 20);
+        assert_eq!(vs.time_usec, Some(7));
+        assert_eq!(vs.stack_depth.as_deref(), Some("48+0"));
+    }
+
+    #[test]
+    fn parse_verifier_stats_partial_insns_line() {
+        // Truncated: only "processed N" without the rest.
+        let log = "processed 123\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 123);
+        assert_eq!(vs.total_states, 0);
+        assert_eq!(vs.peak_states, 0);
+    }
+
+    #[test]
+    fn parse_verifier_stats_only_stack_depth() {
+        let log = "stack depth 128\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.stack_depth.as_deref(), Some("128"));
+        assert_eq!(vs.processed_insns, 0);
+    }
+
+    #[test]
+    fn parse_verifier_stats_zero_insns() {
+        let log = "processed 0 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 0);
+        assert_eq!(vs.total_states, 0);
+        assert_eq!(vs.peak_states, 0);
+    }
+
+    #[test]
+    fn parse_verifier_stats_large_values() {
+        let log = "processed 999999 insns (limit 1000000) max_states_per_insn 100 total_states 50000 peak_states 12345 mark_read 9999\nverification time 123456 usec\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 999999);
+        assert_eq!(vs.total_states, 50000);
+        assert_eq!(vs.peak_states, 12345);
+        assert_eq!(vs.time_usec, Some(123456));
+    }
+
+    #[test]
+    fn parse_verifier_stats_stack_depth_single() {
+        let log = "stack depth 64\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.stack_depth.as_deref(), Some("64"));
+    }
+
+    #[test]
+    fn parse_verifier_stats_stack_depth_many_subprograms() {
+        let log = "stack depth 32+16+8+0+0\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.stack_depth.as_deref(), Some("32+16+8+0+0"));
+    }
+
+    #[test]
+    fn parse_verifier_stats_multiple_processed_lines_takes_last() {
+        // Kernel only emits one, but test that rev() scan takes the first
+        // match from the end.
+        let log = "processed 100 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0\nprocessed 200 insns (limit 1000000) max_states_per_insn 2 total_states 10 peak_states 4 mark_read 0\n";
+        let vs = super::parse_verifier_stats(log);
+        // rev() scan hits the second line first.
+        assert_eq!(vs.processed_insns, 200);
+        assert_eq!(vs.total_states, 10);
+    }
+
+    #[test]
+    fn parse_verifier_stats_complexity_error_with_stats() {
+        // Verifier rejects a program but still emits the stats line.
+        let log = "\
+func#0 @0
+0: R1=ctx() R10=fp0
+1: (bf) r6 = r1                       ; R1=ctx() R6_w=ctx()
+back-edge from insn 42 to 10
+BPF program is too complex
+processed 131071 insns (limit 131072) max_states_per_insn 12 total_states 9999 peak_states 5000 mark_read 800
+verification time 250000 usec
+stack depth 96+32
+";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 131071);
+        assert_eq!(vs.total_states, 9999);
+        assert_eq!(vs.peak_states, 5000);
+        assert_eq!(vs.time_usec, Some(250000));
+        assert_eq!(vs.stack_depth.as_deref(), Some("96+32"));
+    }
+
+    #[test]
+    fn parse_verifier_stats_complexity_error_no_stats() {
+        // Verifier rejects before emitting stats (e.g. immediate type error).
+        let log = "\
+func#0 @0
+0: R1=ctx() R10=fp0
+R1 type=ctx expected=fp
+";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 0);
+        assert_eq!(vs.total_states, 0);
+        assert!(vs.time_usec.is_none());
+        assert!(vs.stack_depth.is_none());
+    }
+
+    #[test]
+    fn parse_verifier_stats_loop_warning_with_stats() {
+        // Loop detection warnings interspersed with normal output.
+        let log = "\
+infinite loop detected at insn 15
+back-edge from insn 30 to 15
+processed 500 insns (limit 1000000) max_states_per_insn 3 total_states 40 peak_states 15 mark_read 5
+verification time 100 usec
+";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 500);
+        assert_eq!(vs.total_states, 40);
+        assert_eq!(vs.peak_states, 15);
+        assert_eq!(vs.time_usec, Some(100));
+    }
+
+    // -- adversary edge cases: malformed/truncated stats lines --
+
+    #[test]
+    fn parse_verifier_stats_processed_no_number() {
+        // Just "processed" with nothing after it.
+        let log = "processed\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 0);
+    }
+
+    #[test]
+    fn parse_verifier_stats_keyword_at_end_no_value() {
+        // "total_states" is the last word with no value after it.
+        let log = "processed 100 insns (limit 1000000) max_states_per_insn 1 total_states\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 100);
+        assert_eq!(vs.total_states, 0);
+    }
+
+    #[test]
+    fn parse_verifier_stats_non_numeric_values() {
+        // Numeric processed count but non-numeric state values.
+        let log = "processed 100 insns (limit 1000000) max_states_per_insn 1 total_states abc peak_states xyz mark_read 0\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 100);
+        assert_eq!(vs.total_states, 0);
+        assert_eq!(vs.peak_states, 0);
+    }
+
+    #[test]
+    fn parse_verifier_stats_verification_time_no_number() {
+        // "unknown" is not a valid u64.
+        let log = "verification time unknown usec\n";
+        let vs = super::parse_verifier_stats(log);
+        assert!(vs.time_usec.is_none());
+    }
+
+    #[test]
+    fn parse_verifier_stats_stack_depth_empty() {
+        // "stack depth" followed by only whitespace.
+        let log = "stack depth   \n";
+        let vs = super::parse_verifier_stats(log);
+        assert!(vs.stack_depth.is_none());
+    }
+
+    #[test]
+    fn parse_verifier_stats_peak_states_at_end() {
+        // "peak_states" is the last keyword with no value.
+        let log = "processed 50 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_states\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 50);
+        assert_eq!(vs.total_states, 10);
+        assert_eq!(vs.peak_states, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_brief_line
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_brief_line_full_stats() {
+        let vs = super::VerifierStats {
+            processed_insns: 1234,
+            total_states: 200,
+            peak_states: 50,
+            time_usec: Some(42),
+            stack_depth: Some("32+0".into()),
+        };
+        let line = super::format_brief_line("dispatch", 100, &vs);
+        assert!(line.contains("insns=100"), "insns: {line}");
+        assert!(line.contains("processed=1234"), "processed: {line}");
+        assert!(line.contains("states=50/200"), "states: {line}");
+        assert!(line.contains("time=42us"), "time: {line}");
+        assert!(line.contains("stack=32+0"), "stack: {line}");
+    }
+
+    #[test]
+    fn format_brief_line_insns_only() {
+        let vs = super::VerifierStats {
+            processed_insns: 500,
+            total_states: 0,
+            peak_states: 0,
+            time_usec: None,
+            stack_depth: None,
+        };
+        let line = super::format_brief_line("init", 20, &vs);
+        assert!(line.contains("insns=20"), "insns: {line}");
+        assert!(line.contains("processed=500"), "processed: {line}");
+        assert!(!line.contains("states="), "no states: {line}");
+        assert!(!line.contains("time="), "no time: {line}");
+        assert!(!line.contains("stack="), "no stack: {line}");
+    }
+
+    #[test]
+    fn format_brief_line_zero_processed() {
+        let vs = super::VerifierStats {
+            processed_insns: 0,
+            total_states: 0,
+            peak_states: 0,
+            time_usec: None,
+            stack_depth: None,
+        };
+        let line = super::format_brief_line("broken", 0, &vs);
+        assert!(line.contains("insns=0"), "insns: {line}");
+        assert!(line.contains("processed=0"), "processed: {line}");
+    }
+
+    #[test]
+    fn format_brief_line_states_without_time() {
+        let vs = super::VerifierStats {
+            processed_insns: 100,
+            total_states: 10,
+            peak_states: 5,
+            time_usec: None,
+            stack_depth: None,
+        };
+        let line = super::format_brief_line("prog", 50, &vs);
+        assert!(line.contains("states=5/10"), "states: {line}");
+        assert!(!line.contains("time="), "no time: {line}");
+    }
+
+    #[test]
+    fn format_brief_line_long_name_alignment() {
+        let vs = super::VerifierStats {
+            processed_insns: 42,
+            total_states: 0,
+            peak_states: 0,
+            time_usec: None,
+            stack_depth: None,
+        };
+        let short = super::format_brief_line("x", 1, &vs);
+        let long = super::format_brief_line("a_very_long_program_name_here", 1, &vs);
+        // Both should contain the same data.
+        assert!(short.contains("processed=42"));
+        assert!(long.contains("processed=42"));
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_verifier_line
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_plain_instruction() {
+        assert_eq!(
+            super::normalize_verifier_line("100: (07) r1 += 8"),
+            "100: (07) r1 += 8"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_frame_annotation() {
+        assert_eq!(
+            super::normalize_verifier_line("3006: (07) r9 += 1  ; frame1: R9_w=2"),
+            "3006: (07) r9 += 1"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_register_annotation() {
+        assert_eq!(
+            super::normalize_verifier_line("42: (bf) r6 = r1 ; R1=ctx() R6_w=ctx()"),
+            "42: (bf) r6 = r1"
+        );
+    }
+
+    #[test]
+    fn normalize_standalone_register_dump() {
+        assert_eq!(
+            super::normalize_verifier_line("3041: frame1: R0_w=scalar()"),
+            "3041:"
+        );
+    }
+
+    #[test]
+    fn normalize_goto_inline_state() {
+        assert_eq!(
+            super::normalize_verifier_line(
+                "3026: (b5) if r6 <= 0x11dc0 goto pc+2 3029: frame1: R0=1 R6=scalar()"
+            ),
+            "3026: (b5) if r6 <= 0x11dc0 goto pc+2"
+        );
+    }
+
+    #[test]
+    fn normalize_goto_no_inline_state() {
+        assert_eq!(
+            super::normalize_verifier_line("50: (05) goto pc+10"),
+            "50: (05) goto pc+10"
+        );
+    }
+
+    #[test]
+    fn normalize_non_instruction_line() {
+        assert_eq!(super::normalize_verifier_line("func#0 @0"), "func#0 @0");
+    }
+
+    #[test]
+    fn normalize_empty() {
+        assert_eq!(super::normalize_verifier_line(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_cycle / collapse_cycles
+    // -----------------------------------------------------------------------
+
+    /// Build a log with a repeating block.
+    ///
+    /// Mimics real verifier output: the loop body revisits the same
+    /// BPF instruction numbers each iteration, with different register
+    /// state annotations that normalization strips.
+    fn repeating_log(prefix: usize, period: usize, reps: usize, suffix: usize) -> String {
+        let mut lines = Vec::new();
+        for i in 0..prefix {
+            lines.push(format!("{}: (07) r1 += {i}", 1000 + i));
+        }
+        // Each iteration visits the same instruction range (100..100+period)
+        // with varying register annotations.
+        for rep in 0..reps {
+            for j in 0..period {
+                let insn = 100 + j;
+                lines.push(format!(
+                    "{insn}: (bf) r{} = r{} ; frame1: R{}_w={}",
+                    j % 10,
+                    (j + 1) % 10,
+                    j % 10,
+                    rep * 100 + j
+                ));
+            }
+        }
+        for i in 0..suffix {
+            lines.push(format!("{}: (95) exit_{i}", 2000 + i));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn detect_cycle_basic() {
+        let log = repeating_log(0, 10, 8, 0);
+        let lines: Vec<&str> = log.lines().collect();
+        let result = super::detect_cycle(&lines);
+        assert!(result.is_some(), "should detect cycle");
+        let (start, period, count) = result.unwrap();
+        assert_eq!(period, 10);
+        assert!(count >= 6, "count={count}");
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn detect_cycle_with_prefix_suffix() {
+        let log = repeating_log(5, 10, 8, 5);
+        let lines: Vec<&str> = log.lines().collect();
+        let result = super::detect_cycle(&lines);
+        assert!(result.is_some(), "should detect cycle with prefix/suffix");
+        let (_start, period, count) = result.unwrap();
+        assert_eq!(period, 10);
+        assert!(count >= 6);
+    }
+
+    #[test]
+    fn detect_cycle_too_few_reps() {
+        // Only 3 reps, MIN_REPS is 6.
+        let log = repeating_log(0, 10, 3, 0);
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(super::detect_cycle(&lines).is_none());
+    }
+
+    #[test]
+    fn detect_cycle_too_few_lines() {
+        // Too few total lines for any cycle to meet MIN_PERIOD * MIN_REPS.
+        let lines: Vec<String> = (0..20)
+            .map(|i| format!("{}: (07) r1 += {i}", 100 + i % 3))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        assert!(super::detect_cycle(&refs).is_none());
+    }
+
+    #[test]
+    fn detect_cycle_no_cycle() {
+        let lines: Vec<String> = (0..100).map(|i| format!("{i}: unique_insn_{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        assert!(super::detect_cycle(&refs).is_none());
+    }
+
+    #[test]
+    fn detect_cycle_empty() {
+        let empty: Vec<&str> = vec![];
+        assert!(super::detect_cycle(&empty).is_none());
+    }
+
+    #[test]
+    fn normalize_goto_negative_offset() {
+        assert_eq!(
+            super::normalize_verifier_line("50: (05) goto pc-10 60: frame1: R0=1"),
+            "50: (05) goto pc-10"
+        );
+    }
+
+    #[test]
+    fn normalize_semicolon_source_comment() {
+        // Source comments are cycle anchors — must NOT be stripped.
+        let line = "100: (07) r1 += 8 ; for (int j = 0; j < n; j++)";
+        assert_eq!(super::normalize_verifier_line(line), line);
+    }
+
+    #[test]
+    fn normalize_semicolon_return_value_comment() {
+        // "; Return value" — R is followed by 'e', not a digit.
+        let line = "200: (b7) r0 = 0 ; Return value";
+        assert_eq!(super::normalize_verifier_line(line), line);
+    }
+
+    #[test]
+    fn normalize_standalone_bare_register_dump() {
+        // Pattern 7: "NNNN: R0=..." without frame prefix.
+        assert_eq!(
+            super::normalize_verifier_line("3029: R0=1 R6=scalar(id=1)"),
+            "3029:"
+        );
+    }
+
+    #[test]
+    fn normalize_standalone_r10_dump() {
+        assert_eq!(super::normalize_verifier_line("42: R10=fp0"), "42:");
+    }
+
+    #[test]
+    fn detect_cycle_exact_boundary() {
+        // Exactly MIN_PERIOD(5) * MIN_REPS(6) = 30 lines, all identical after normalization.
+        let log = repeating_log(0, 5, 6, 0);
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 30);
+        let result = super::detect_cycle(&lines);
+        assert!(result.is_some(), "boundary case should detect cycle");
+        let (_start, period, count) = result.unwrap();
+        assert_eq!(period, 5);
+        assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn collapse_cycles_empty_string() {
+        assert_eq!(super::collapse_cycles(""), "");
+    }
+
+    #[test]
+    fn parse_verifier_stats_windows_line_endings() {
+        let log = "processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0\r\nverification time 10 usec\r\nstack depth 16\r\n";
+        let vs = super::parse_verifier_stats(log);
+        assert_eq!(vs.processed_insns, 42);
+        assert_eq!(vs.time_usec, Some(10));
+        // Stack depth may contain trailing \r from the line.
+        assert!(vs.stack_depth.is_some());
+    }
+
+    #[test]
+    fn collapse_cycles_basic() {
+        let log = repeating_log(2, 10, 8, 2);
+        let collapsed = super::collapse_cycles(&log);
+        assert!(
+            collapsed.contains("identical iterations omitted"),
+            "should contain omission marker: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("8x of the following 10 lines"),
+            "should state count and period: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("end repeat"),
+            "should contain end marker: {collapsed}"
+        );
+        // Collapsed output should be shorter.
+        assert!(
+            collapsed.lines().count() < log.lines().count(),
+            "collapsed ({}) should be shorter than original ({})",
+            collapsed.lines().count(),
+            log.lines().count()
+        );
+    }
+
+    #[test]
+    fn collapse_cycles_no_cycle() {
+        let log = "line 1\nline 2\nline 3\n";
+        let collapsed = super::collapse_cycles(log);
+        assert_eq!(collapsed, log);
+    }
+
+    #[test]
+    fn collapse_cycles_preserves_stats() {
+        // Stats at the end should survive collapse.
+        let mut log = repeating_log(0, 10, 8, 0);
+        log.push_str("\nprocessed 1000 insns (limit 1000000) max_states_per_insn 5 total_states 100 peak_states 30 mark_read 10\n");
+        let collapsed = super::collapse_cycles(&log);
+        assert!(
+            collapsed.contains("processed 1000 insns"),
+            "stats must survive: {collapsed}"
+        );
+    }
+
+    #[test]
+    fn collapse_cycles_with_register_annotations() {
+        // Lines differ only in register state — normalization makes them equal.
+        // Same insn numbers each iteration (realistic verifier output).
+        let mut lines = Vec::new();
+        lines.push("0: (07) r1 += 1".to_string());
+        for rep in 0..8 {
+            for j in 0..6 {
+                let insn = 100 + j; // same insn each iteration
+                lines.push(format!(
+                    "{insn}: (bf) r{} = r{} ; frame1: R{}_w={}",
+                    j % 10,
+                    (j + 1) % 10,
+                    j % 10,
+                    rep * 100 + j
+                ));
+            }
+        }
+        lines.push("200: (95) exit".to_string());
+        let log = lines.join("\n");
+        let collapsed = super::collapse_cycles(&log);
+        assert!(
+            collapsed.contains("identical iterations omitted"),
+            "should collapse despite different register state: {collapsed}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_vm_verifier_output
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_vm_verifier_output_basic() {
+        let output = "\
+some boot noise
+STT_VERIFIER_PROG stt_init insn_cnt=42
+STT_VERIFIER_LOG stt_init processed 100 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0
+STT_VERIFIER_LOG stt_init verification time 10 usec
+STT_VERIFIER_PROG stt_dispatch insn_cnt=200
+STT_VERIFIER_LOG stt_dispatch processed 500 insns (limit 1000000) max_states_per_insn 3 total_states 50 peak_states 20 mark_read 5
+STT_VERIFIER_DONE
+more noise
+";
+        let stats = super::parse_vm_verifier_output(output);
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].name, "stt_init");
+        assert_eq!(stats[0].insn_cnt, 42);
+        assert!(stats[0].log.contains("processed 100 insns"));
+        assert_eq!(stats[1].name, "stt_dispatch");
+        assert_eq!(stats[1].insn_cnt, 200);
+        assert!(stats[1].log.contains("processed 500 insns"));
+    }
+
+    #[test]
+    fn parse_vm_verifier_output_empty() {
+        let stats = super::parse_vm_verifier_output("no markers here\n");
+        assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn parse_vm_verifier_output_no_done_marker() {
+        let output = "\
+STT_VERIFIER_PROG stt_init insn_cnt=10
+STT_VERIFIER_LOG stt_init processed 50 insns (limit 1000000) max_states_per_insn 1 total_states 3 peak_states 1 mark_read 0
+";
+        let stats = super::parse_vm_verifier_output(output);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].name, "stt_init");
+    }
+
+    #[test]
+    fn parse_vm_verifier_output_fail_program() {
+        let output = "\
+STT_VERIFIER_PROG broken_prog insn_cnt=0
+STT_VERIFIER_LOG broken_prog FAIL: verification failed
+STT_VERIFIER_DONE
+";
+        let stats = super::parse_vm_verifier_output(output);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].name, "broken_prog");
+        assert!(stats[0].log.contains("FAIL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_b_map / build_diff_rows
+    // -----------------------------------------------------------------------
+
+    fn prog(name: &str, insn_cnt: usize, log: &str) -> super::ProgStats {
+        super::ProgStats {
+            name: name.to_string(),
+            insn_cnt,
+            log: log.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_b_map_basic() {
+        let stats_b = vec![prog(
+            "dispatch",
+            100,
+            "processed 500 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0\n",
+        )];
+        let map = super::build_b_map(&stats_b);
+        assert_eq!(map.get("dispatch"), Some(&500));
+    }
+
+    #[test]
+    fn build_b_map_empty() {
+        let map = super::build_b_map(&[]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn build_diff_rows_matching_programs() {
+        let stats_a = vec![prog(
+            "dispatch",
+            100,
+            "processed 500 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0\n",
+        )];
+        let mut b_map = std::collections::HashMap::new();
+        b_map.insert("dispatch".to_string(), 300u64);
+
+        let rows = super::build_diff_rows(&stats_a, &b_map);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "dispatch");
+        assert_eq!(rows[0].a, 500);
+        assert_eq!(rows[0].b, 300);
+        assert_eq!(rows[0].delta, 200);
+    }
+
+    #[test]
+    fn build_diff_rows_program_missing_from_b() {
+        let stats_a = vec![prog(
+            "new_prog",
+            50,
+            "processed 100 insns (limit 1000000) max_states_per_insn 1 total_states 2 peak_states 1 mark_read 0\n",
+        )];
+        let b_map = std::collections::HashMap::new();
+
+        let rows = super::build_diff_rows(&stats_a, &b_map);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].a, 100);
+        assert_eq!(rows[0].b, 0);
+        assert_eq!(rows[0].delta, 100);
+    }
+
+    #[test]
+    fn build_diff_rows_negative_delta() {
+        let stats_a = vec![prog(
+            "dispatch",
+            100,
+            "processed 200 insns (limit 1000000) max_states_per_insn 1 total_states 3 peak_states 1 mark_read 0\n",
+        )];
+        let mut b_map = std::collections::HashMap::new();
+        b_map.insert("dispatch".to_string(), 500u64);
+
+        let rows = super::build_diff_rows(&stats_a, &b_map);
+        assert_eq!(rows[0].delta, -300);
+    }
+
+    #[test]
+    fn build_diff_rows_empty_a() {
+        let b_map = std::collections::HashMap::new();
+        let rows = super::build_diff_rows(&[], &b_map);
+        assert!(rows.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // verifier integration tests (require KVM, run with --ignored)
+    // -----------------------------------------------------------------------
+
+    /// Boot scheduler in VM, capture per-program verifier stats.
+    ///   cargo test -p cargo-stt -- --ignored verifier_subcommand_brief
+    #[test]
+    #[ignore]
+    fn verifier_subcommand_brief() {
+        let result = super::cmd_verifier(super::VerifierArgs {
+            package: "stt-sched".into(),
+            diff: None,
+            verbose: false,
+            kernel: None,
+        });
+        assert!(result.is_ok(), "verifier failed: {}", result.unwrap_err());
+    }
+
+    /// Boot scheduler in VM with verbose output (full dmesg).
+    ///   cargo test -p cargo-stt -- --ignored --nocapture verifier_subcommand_verbose
+    #[test]
+    #[ignore]
+    fn verifier_subcommand_verbose() {
+        let result = super::cmd_verifier(super::VerifierArgs {
+            package: "stt-sched".into(),
+            diff: None,
+            verbose: true,
+            kernel: None,
+        });
+        assert!(
+            result.is_ok(),
+            "verbose verifier failed: {}",
+            result.unwrap_err()
+        );
+    }
+
+    /// A/B diff mode: compare stt-sched against itself (delta = 0).
+    ///   cargo test -p cargo-stt -- --ignored --nocapture verifier_subcommand_diff
+    #[test]
+    #[ignore]
+    fn verifier_subcommand_diff() {
+        let result = super::cmd_verifier(super::VerifierArgs {
+            package: "stt-sched".into(),
+            diff: Some("stt-sched".into()),
+            verbose: false,
+            kernel: None,
+        });
+        assert!(
+            result.is_ok(),
+            "diff verifier failed: {}",
+            result.unwrap_err()
+        );
+    }
+
+    /// Demonstrate cycle collapse on synthetic verifier output.
+    ///
+    /// Generates a realistic verifier log with loop unrolling, then shows
+    /// the raw vs collapsed output. Run with `--nocapture` to see the
+    /// difference:
+    ///   cargo test -p cargo-stt -- --ignored --nocapture verifier_cycle_collapse_demo
+    #[test]
+    #[ignore]
+    fn verifier_cycle_collapse_demo() {
+        let mut lines = Vec::new();
+        lines.push("func#0 @0".to_string());
+        lines.push("0: R1=ctx() R10=fp0".to_string());
+        lines.push("1: (bf) r6 = r1".to_string());
+
+        // 10 iterations of an 8-instruction loop body.
+        for rep in 0..10 {
+            for j in 0..8 {
+                let insn = 100 + j;
+                lines.push(format!(
+                    "{insn}: (bf) r{} = r{} ; frame1: R{}_w=scalar(id={},umin={})",
+                    j % 10,
+                    (j + 1) % 10,
+                    j % 10,
+                    rep * 10 + j,
+                    rep * 100 + j
+                ));
+            }
+        }
+
+        lines.push("200: (95) exit".to_string());
+        lines.push("processed 500 insns (limit 1000000) max_states_per_insn 5 total_states 100 peak_states 30 mark_read 10".to_string());
+        lines.push("verification time 42 usec".to_string());
+        lines.push("stack depth 32+0".to_string());
+        let raw_log = lines.join("\n");
+
+        let collapsed = super::collapse_cycles(&raw_log);
+
+        let raw_lines = raw_log.lines().count();
+        let collapsed_lines = collapsed.lines().count();
+
+        println!("\n=== CYCLE COLLAPSE DEMO ===\n");
+        println!("Raw verifier log: {} lines", raw_lines);
+        println!("Collapsed output: {} lines", collapsed_lines);
+        println!(
+            "Compression: {:.0}% reduction\n",
+            (1.0 - collapsed_lines as f64 / raw_lines as f64) * 100.0
+        );
+        println!("--- COLLAPSED OUTPUT ---");
+        print!("{collapsed}");
+        println!("--- END ---\n");
+
+        assert!(
+            collapsed_lines < raw_lines,
+            "collapsed ({collapsed_lines}) should be shorter than raw ({raw_lines})"
+        );
+        assert!(collapsed.contains("identical iterations omitted"));
+        assert!(collapsed.contains("end repeat"));
+        assert!(collapsed.contains("processed 500 insns"));
     }
 }

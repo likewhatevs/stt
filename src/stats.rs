@@ -4,10 +4,40 @@
 //! statistical analysis, regression detection, and baseline save/compare
 //! workflows.
 
+use std::collections::BTreeMap;
+
 use polars::prelude::*;
 
 use crate::timeline::Timeline;
 use crate::vmm::shm_ring;
+
+/// Definition of an extensible metric for the generic comparison pipeline.
+///
+/// Each entry describes a metric that can be populated via `ext_metrics`
+/// on stats types. The pipeline uses `higher_is_worse` to determine
+/// regression direction, and `default_abs`/`default_rel` for dual-gate
+/// significance thresholds.
+pub struct MetricDef {
+    pub name: &'static str,
+    pub higher_is_worse: bool,
+    pub default_abs: f64,
+    pub default_rel: f64,
+}
+
+/// Registry of extensible metrics processed by the comparison pipeline.
+///
+/// Typed fields (spread, gap_ms, etc.) remain as primary metrics. Entries
+/// here are iterated by `aggregate_cgroup`, `compare_with_policies`, and
+/// `format_metric_deltas` for any metric populated in `ext_metrics`.
+///
+/// All entries must have `higher_is_worse: true` until
+/// `AssertResult::merge` supports per-metric merge direction.
+pub static EXTENSIBLE_METRICS: &[MetricDef] = &[MetricDef {
+    name: "migration_ratio",
+    higher_is_worse: true,
+    default_abs: 0.05,
+    default_rel: 0.20,
+}];
 
 /// Monitor data preserved from a gauntlet VM run for timeline analysis.
 pub struct GauntletMonitorData {
@@ -46,6 +76,8 @@ pub struct GauntletRow {
     pub spread: f64,
     pub gap_ms: u64,
     pub migrations: u64,
+    #[serde(default)]
+    pub migration_ratio: f64,
     // Monitor fields (host-side telemetry from guest memory reads).
     pub imbalance_ratio: f64,
     pub max_dsq_depth: u32,
@@ -72,6 +104,11 @@ pub struct GauntletRow {
     pub worst_fallback_delta: f64,
     pub worst_keep_last_delta: f64,
     pub degradation_count: u32,
+    /// Extensible metrics populated by scenarios and processed by the
+    /// generic comparison pipeline. Keyed by metric name (matching
+    /// `MetricDef::name` in `EXTENSIBLE_METRICS`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ext_metrics: BTreeMap<String, f64>,
 }
 
 /// Convert a SidecarResult to a GauntletRow for baseline comparison.
@@ -86,6 +123,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         spread: sc.stats.worst_spread,
         gap_ms: sc.stats.worst_gap_ms,
         migrations: sc.stats.total_migrations,
+        migration_ratio: sc.stats.worst_migration_ratio,
         imbalance_ratio: sc
             .monitor
             .as_ref()
@@ -125,6 +163,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         worst_fallback_delta: 0.0,
         worst_keep_last_delta: 0.0,
         degradation_count: 0,
+        ext_metrics: sc.stats.ext_metrics.clone(),
     }
 }
 
@@ -151,6 +190,7 @@ pub fn sidecar_to_row_labeled(sc: &crate::test_support::SidecarResult, label: &s
         spread: sc.stats.worst_spread,
         gap_ms: sc.stats.worst_gap_ms,
         migrations: sc.stats.total_migrations,
+        migration_ratio: sc.stats.worst_migration_ratio,
         imbalance_ratio: sc
             .monitor
             .as_ref()
@@ -190,6 +230,7 @@ pub fn sidecar_to_row_labeled(sc: &crate::test_support::SidecarResult, label: &s
         worst_fallback_delta: 0.0,
         worst_keep_last_delta: 0.0,
         degradation_count: 0,
+        ext_metrics: sc.stats.ext_metrics.clone(),
     }
 }
 
@@ -338,6 +379,7 @@ pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
             spread: stats.map(|s| s.worst_spread).unwrap_or(0.0),
             gap_ms: stats.map(|s| s.worst_gap_ms).unwrap_or(0),
             migrations: stats.map(|s| s.total_migrations).unwrap_or(0),
+            migration_ratio: stats.map(|s| s.worst_migration_ratio).unwrap_or(0.0),
             imbalance_ratio: summary.map(|m| m.max_imbalance_ratio).unwrap_or(0.0),
             max_dsq_depth: summary.map(|m| m.max_local_dsq_depth).unwrap_or(0),
             stall_count: if summary.map(|m| m.stall_detected).unwrap_or(false) {
@@ -365,6 +407,7 @@ pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
             worst_fallback_delta: worst_fb_delta,
             worst_keep_last_delta: worst_kl_delta,
             degradation_count: deg_count,
+            ext_metrics: stats.map(|s| s.ext_metrics.clone()).unwrap_or_default(),
         });
     }
     rows
@@ -381,6 +424,7 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let spread: Vec<f64> = rows.iter().map(|r| r.spread).collect();
     let gap_ms: Vec<f64> = rows.iter().map(|r| r.gap_ms as f64).collect();
     let migrations: Vec<f64> = rows.iter().map(|r| r.migrations as f64).collect();
+    let migration_ratio: Vec<f64> = rows.iter().map(|r| r.migration_ratio).collect();
     let imbalance: Vec<f64> = rows.iter().map(|r| r.imbalance_ratio).collect();
     let dsq_depth: Vec<f64> = rows.iter().map(|r| r.max_dsq_depth as f64).collect();
     let stalls: Vec<f64> = rows.iter().map(|r| r.stall_count as f64).collect();
@@ -412,6 +456,7 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "spread" => &spread,
         "gap_ms" => &gap_ms,
         "migrations" => &migrations,
+        "migration_ratio" => &migration_ratio,
         "imbalance" => &imbalance,
         "dsq_depth" => &dsq_depth,
         "stalls" => &stalls,
@@ -496,6 +541,7 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
         "spread",
         "gap_ms",
         "migrations",
+        "migration_ratio",
         "imbalance",
         "dsq_depth",
         "stalls",
@@ -1197,11 +1243,14 @@ struct CgroupDelta {
     total_iterations_delta: f64,
     run_delay_delta: f64,
     worst_run_delay_delta: f64,
+    migration_ratio_delta: f64,
     // Pass rate change.
     baseline_pass_rate: f64,
     current_pass_rate: f64,
     // Resolved thresholds used for this cgroup.
     resolved: ResolvedPolicy,
+    /// Deltas for extensible metrics (current - baseline).
+    ext_metric_deltas: BTreeMap<String, f64>,
 }
 
 /// Aggregate a group of rows for the same (scenario, flags, topology) into
@@ -1220,11 +1269,25 @@ struct CgroupAgg {
     total_iterations: f64,
     run_delay: f64,
     worst_run_delay: f64,
+    migration_ratio: f64,
+    /// Mean values for extensible metrics across rows.
+    ext_metrics: BTreeMap<String, f64>,
 }
 
 fn aggregate_cgroup(rows: &[&GauntletRow]) -> CgroupAgg {
     let n = rows.len() as f64;
     let pass_count = rows.iter().filter(|r| r.passed).count() as f64;
+
+    // Aggregate extensible metrics: mean across rows.
+    let mut ext_sums: BTreeMap<String, f64> = BTreeMap::new();
+    for r in rows {
+        for (k, v) in &r.ext_metrics {
+            *ext_sums.entry(k.clone()).or_insert(0.0) += v;
+        }
+    }
+    let ext_metrics: BTreeMap<String, f64> =
+        ext_sums.into_iter().map(|(k, sum)| (k, sum / n)).collect();
+
     CgroupAgg {
         pass_rate: pass_count / n,
         spread: rows.iter().map(|r| r.spread).sum::<f64>() / n,
@@ -1239,6 +1302,8 @@ fn aggregate_cgroup(rows: &[&GauntletRow]) -> CgroupAgg {
         total_iterations: rows.iter().map(|r| r.total_iterations as f64).sum::<f64>() / n,
         run_delay: rows.iter().map(|r| r.mean_run_delay_us).sum::<f64>() / n,
         worst_run_delay: rows.iter().map(|r| r.worst_run_delay_us).sum::<f64>() / n,
+        migration_ratio: rows.iter().map(|r| r.migration_ratio).sum::<f64>() / n,
+        ext_metrics,
     }
 }
 
@@ -1250,6 +1315,25 @@ fn aggregate_cgroup(rows: &[&GauntletRow]) -> CgroupAgg {
 /// increase as regression (higher spread/gap/imbalance = worse).
 ///
 /// `Copy` + const-constructible: can live in `const` or `static` items.
+///
+/// ```
+/// # use stt::stats::ComparisonPolicy;
+/// // EMPTY inherits all thresholds from DEFAULTS.
+/// let policy = ComparisonPolicy::EMPTY;
+/// assert!(policy.spread_abs.is_none());
+///
+/// // DEFAULTS has concrete values for every metric.
+/// let defaults = ComparisonPolicy::DEFAULTS;
+/// assert!(defaults.spread_abs.is_some());
+///
+/// // Override one threshold.
+/// let custom = ComparisonPolicy {
+///     spread_abs: Some(5.0),
+///     ..ComparisonPolicy::EMPTY
+/// };
+/// assert_eq!(custom.spread_abs, Some(5.0));
+/// assert!(custom.gap_ms_abs.is_none());
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ComparisonPolicy {
     pub spread_abs: Option<f64>,
@@ -1290,6 +1374,10 @@ pub struct ComparisonPolicy {
     pub worst_run_delay_abs: Option<f64>,
     #[serde(default)]
     pub worst_run_delay_rel: Option<f64>,
+    #[serde(default)]
+    pub migration_ratio_abs: Option<f64>,
+    #[serde(default)]
+    pub migration_ratio_rel: Option<f64>,
 }
 
 impl ComparisonPolicy {
@@ -1320,6 +1408,8 @@ impl ComparisonPolicy {
         run_delay_rel: None,
         worst_run_delay_abs: None,
         worst_run_delay_rel: None,
+        migration_ratio_abs: None,
+        migration_ratio_rel: None,
     };
 
     /// Reproduces the original hardcoded thresholds exactly.
@@ -1349,6 +1439,8 @@ impl ComparisonPolicy {
         run_delay_rel: Some(0.20),
         worst_run_delay_abs: Some(200.0), // 200us absolute (tail metric, wider tolerance)
         worst_run_delay_rel: Some(0.30),
+        migration_ratio_abs: Some(0.05), // 5% absolute migration ratio delta
+        migration_ratio_rel: Some(0.20),
     };
 
     /// Merge self over DEFAULTS, returning resolved thresholds for each metric.
@@ -1381,6 +1473,8 @@ impl ComparisonPolicy {
             run_delay_rel: r(self.run_delay_rel, d.run_delay_rel),
             worst_run_delay_abs: r(self.worst_run_delay_abs, d.worst_run_delay_abs),
             worst_run_delay_rel: r(self.worst_run_delay_rel, d.worst_run_delay_rel),
+            migration_ratio_abs: r(self.migration_ratio_abs, d.migration_ratio_abs),
+            migration_ratio_rel: r(self.migration_ratio_rel, d.migration_ratio_rel),
         }
     }
 }
@@ -1419,6 +1513,8 @@ struct ResolvedPolicy {
     run_delay_rel: f64,
     worst_run_delay_abs: f64,
     worst_run_delay_rel: f64,
+    migration_ratio_abs: f64,
+    migration_ratio_rel: f64,
 }
 
 /// Dual-gate significance test: exceeds both absolute and relative thresholds.
@@ -1477,7 +1573,7 @@ pub fn compare_with_policies(
     current: &[GauntletRow],
     policies: &[ScopedPolicy],
 ) -> String {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     type Key = (String, String, String, String);
 
@@ -1525,6 +1621,17 @@ pub fn compare_with_policies(
             let ti_d = b.total_iterations - a.total_iterations;
             let rd_d = b.run_delay - a.run_delay;
             let wrd_d = b.worst_run_delay - a.worst_run_delay;
+            let mr_d = b.migration_ratio - a.migration_ratio;
+
+            // Compute extensible metric deltas.
+            let mut ext_deltas = BTreeMap::new();
+            let mut all_ext_keys: BTreeSet<String> = a.ext_metrics.keys().cloned().collect();
+            all_ext_keys.extend(b.ext_metrics.keys().cloned());
+            for ek in &all_ext_keys {
+                let av = a.ext_metrics.get(ek).copied().unwrap_or(0.0);
+                let bv = b.ext_metrics.get(ek).copied().unwrap_or(0.0);
+                ext_deltas.insert(ek.clone(), bv - av);
+            }
 
             let any_regression = is_significant(spread_d, r.spread_abs, r.spread_rel, a.spread)
                 && spread_d > 0.0
@@ -1563,7 +1670,19 @@ pub fn compare_with_policies(
                     r.worst_run_delay_rel,
                     a.worst_run_delay,
                 ) && wrd_d > 0.0
-                || pass_d < -r.pass_rate_tol;
+                || is_significant(
+                    mr_d,
+                    r.migration_ratio_abs,
+                    r.migration_ratio_rel,
+                    a.migration_ratio,
+                ) && mr_d > 0.0
+                || pass_d < -r.pass_rate_tol
+                || EXTENSIBLE_METRICS.iter().any(|md| {
+                    let d = ext_deltas.get(md.name).copied().unwrap_or(0.0);
+                    let bv = a.ext_metrics.get(md.name).copied().unwrap_or(0.0);
+                    is_significant(d, md.default_abs, md.default_rel, bv)
+                        && ((md.higher_is_worse && d > 0.0) || (!md.higher_is_worse && d < 0.0))
+                });
 
             let any_improvement = is_significant(spread_d, r.spread_abs, r.spread_rel, a.spread)
                 && spread_d < 0.0
@@ -1602,7 +1721,19 @@ pub fn compare_with_policies(
                     r.worst_run_delay_rel,
                     a.worst_run_delay,
                 ) && wrd_d < 0.0
-                || pass_d > r.pass_rate_tol;
+                || is_significant(
+                    mr_d,
+                    r.migration_ratio_abs,
+                    r.migration_ratio_rel,
+                    a.migration_ratio,
+                ) && mr_d < 0.0
+                || pass_d > r.pass_rate_tol
+                || EXTENSIBLE_METRICS.iter().any(|md| {
+                    let d = ext_deltas.get(md.name).copied().unwrap_or(0.0);
+                    let bv = a.ext_metrics.get(md.name).copied().unwrap_or(0.0);
+                    is_significant(d, md.default_abs, md.default_rel, bv)
+                        && ((md.higher_is_worse && d < 0.0) || (!md.higher_is_worse && d > 0.0))
+                });
 
             let change = if any_regression {
                 CgroupChange::Regression
@@ -1630,9 +1761,11 @@ pub fn compare_with_policies(
                 total_iterations_delta: ti_d,
                 run_delay_delta: rd_d,
                 worst_run_delay_delta: wrd_d,
+                migration_ratio_delta: mr_d,
                 baseline_pass_rate: a.pass_rate,
                 current_pass_rate: b.pass_rate,
                 resolved: r,
+                ext_metric_deltas: ext_deltas,
             });
         } else {
             removed.push(key.clone());
@@ -1756,6 +1889,17 @@ fn format_metric_deltas(out: &mut String, d: &CgroupDelta) {
             d.worst_run_delay_delta
         ));
     }
+    if d.migration_ratio_delta.abs() > r.migration_ratio_abs {
+        parts.push(format!("migration_ratio: {:+.4}", d.migration_ratio_delta));
+    }
+    // Extensible metrics from the registry.
+    for md in EXTENSIBLE_METRICS {
+        if let Some(&delta) = d.ext_metric_deltas.get(md.name)
+            && delta.abs() > md.default_abs
+        {
+            parts.push(format!("{}: {:+.4}", md.name, delta));
+        }
+    }
     if (d.current_pass_rate - d.baseline_pass_rate).abs() > r.pass_rate_tol {
         parts.push(format!(
             "pass: {:.0}%->{:.0}%",
@@ -1771,8 +1915,8 @@ fn format_metric_deltas(out: &mut String, d: &CgroupDelta) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assert::ScenarioStats;
     use crate::runner::ScenarioResult;
-    use crate::verify::ScenarioStats;
 
     fn make_result(
         label: &str,
@@ -1905,7 +2049,7 @@ mod tests {
         let rows = extract_rows(&results);
         let df = build_dataframe(&rows).unwrap();
         assert_eq!(df.height(), 2);
-        assert_eq!(df.width(), 26);
+        assert_eq!(df.width(), 27);
     }
 
     #[test]
@@ -1991,6 +2135,7 @@ mod tests {
             spread,
             gap_ms: 50,
             migrations: 10,
+            migration_ratio: 0.0,
             imbalance_ratio: 1.0,
             max_dsq_depth: 2,
             stall_count: 0,
@@ -2008,6 +2153,7 @@ mod tests {
             worst_fallback_delta: 0.0,
             worst_keep_last_delta: 0.0,
             degradation_count: 0,
+            ext_metrics: BTreeMap::new(),
         }
     }
 
@@ -2269,9 +2415,11 @@ mod tests {
             total_iterations_delta: 0.0,
             run_delay_delta: 0.0,
             worst_run_delay_delta: 0.0,
+            migration_ratio_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
+            ext_metric_deltas: BTreeMap::new(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);
@@ -2298,9 +2446,11 @@ mod tests {
             total_iterations_delta: 0.0,
             run_delay_delta: 0.0,
             worst_run_delay_delta: 0.0,
+            migration_ratio_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
+            ext_metric_deltas: BTreeMap::new(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);
@@ -2701,7 +2851,7 @@ mod tests {
             topology: "default_topo".to_string(),
             scheduler: "test".to_string(),
             passed: true,
-            stats: crate::verify::ScenarioStats {
+            stats: crate::assert::ScenarioStats {
                 cgroups: vec![],
                 total_workers: 4,
                 total_cpus: 8,
@@ -2734,7 +2884,7 @@ mod tests {
             topology: "my_topo".to_string(),
             scheduler: "test".to_string(),
             passed: true,
-            stats: crate::verify::ScenarioStats::default(),
+            stats: crate::assert::ScenarioStats::default(),
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
@@ -2752,7 +2902,7 @@ mod tests {
             topology: "topo".to_string(),
             scheduler: "s".to_string(),
             passed: false,
-            stats: crate::verify::ScenarioStats::default(),
+            stats: crate::assert::ScenarioStats::default(),
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
@@ -2795,9 +2945,11 @@ mod tests {
             total_iterations_delta: 0.0,
             run_delay_delta: 0.0,
             worst_run_delay_delta: 0.0,
+            migration_ratio_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 0.5,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
+            ext_metric_deltas: BTreeMap::new(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);
@@ -3128,9 +3280,11 @@ mod tests {
             total_iterations_delta: 0.0,
             run_delay_delta: 0.0,
             worst_run_delay_delta: 500.0,
+            migration_ratio_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
+            ext_metric_deltas: BTreeMap::new(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);
@@ -3157,9 +3311,11 @@ mod tests {
             total_iterations_delta: 0.0,
             run_delay_delta: 0.0,
             worst_run_delay_delta: 0.0,
+            migration_ratio_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
+            ext_metric_deltas: BTreeMap::new(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);
@@ -3186,9 +3342,11 @@ mod tests {
             total_iterations_delta: -500.0,
             run_delay_delta: 0.0,
             worst_run_delay_delta: 0.0,
+            migration_ratio_delta: 0.0,
             baseline_pass_rate: 1.0,
             current_pass_rate: 1.0,
             resolved: ComparisonPolicy::DEFAULTS.resolved(),
+            ext_metric_deltas: BTreeMap::new(),
         };
         let mut out = String::new();
         format_metric_deltas(&mut out, &d);

@@ -14,6 +14,7 @@ pub enum WorkType {
     CachePressure { size_kb: usize, stride: usize },
     CacheYield { size_kb: usize, stride: usize },
     CachePipe { size_kb: usize, burst_iters: u64 },
+    FutexFanOut { fan_out: usize, spin_iters: u64 },
 }
 ```
 
@@ -56,6 +57,11 @@ wake_affine placement after voluntary preemption.
 a partner worker. Combines cache-hot working set with cross-CPU wake
 placement. Requires even `num_workers`.
 
+**`FutexFanOut`** -- 1:N fan-out wake pattern (schbench-style). One
+messenger per group does `spin_iters` of CPU work then wakes `fan_out`
+receivers via `FUTEX_WAKE`. Receivers measure wake-to-run latency.
+Requires `num_workers` divisible by `fan_out + 1`.
+
 ## Grouped work types
 
 `PipeIo`, `FutexPingPong`, and `CachePipe` require `num_workers`
@@ -75,6 +81,7 @@ futex wait/wake.
 - `CachePressure`: `size_kb=32`, `stride=64`
 - `CacheYield`: `size_kb=32`, `stride=64`
 - `CachePipe`: `size_kb=32`, `burst_iters=1024`
+- `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
 
 ## WorkProgram
 
@@ -102,6 +109,7 @@ pub enum WorkProgram {
 | `cache_yield` | `CacheYield { size_kb: 32, stride: 64 }` |
 | `cache_pipe` | `CachePipe { size_kb: 32, burst_iters: 1024 }` |
 | `futex` | `FutexPingPong { spin_iters: 1024 }` |
+| `fanout` | `FutexFanOut { fan_out: 4, spin_iters: 1024 }` |
 
 Use `WorkProgram::from_name()` to parse CLI preset names.
 `WorkProgram` is re-exported in the prelude.

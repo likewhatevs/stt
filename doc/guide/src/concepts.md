@@ -27,7 +27,7 @@ constraints (`steal` requires `llc`). Dependencies are declared
 statically and enforced at profile generation time -- invalid
 combinations are rejected automatically.
 
-Verification layers merge: `Verify::default_checks()` provides
+Assertion layers merge: `Assert::default_checks()` provides
 baselines, each `Scheduler` can override thresholds, and individual
 `#[stt_test]` attributes can override further. This eliminates
 per-test boilerplate while allowing scheduler-specific tuning.

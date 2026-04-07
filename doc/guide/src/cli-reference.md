@@ -34,6 +34,7 @@ builds, and gauntlet orchestration. Install it with
 | `cargo stt list` | List registered `#[stt_test]` entries |
 | `cargo stt topo` | Show host CPU topology |
 | `cargo stt probe` | Probe kernel functions from a crash stack |
+| `cargo stt verifier` | Boot scheduler in VM and report verifier stats |
 
 ### `cargo stt vm`
 
@@ -63,7 +64,10 @@ flag profile dimensions.
 ### `cargo stt test`
 
 Runs `#[stt_test]` integration tests via nextest with sidecar
-collection.
+collection. Tests with `performance_mode = true` are automatically
+scheduled with `threads-required` based on host LLC topology
+(sum of CPUs in used LLC groups + 1) via a generated nextest tool
+config, preventing CPU oversubscription on the host.
 
 Key options: `--filter`, `--kernel`, `--scheduler-bin`,
 `--save-baseline`, `--compare`, `--nextest-profile`,
@@ -75,6 +79,19 @@ Lists all registered `#[stt_test]` entries by building the test
 binary and querying it with `--stt-list`.
 
 Key options: `-p`/`--package`.
+
+### `cargo stt verifier`
+
+Boots a scheduler in a VM and reports per-program verifier statistics.
+Default output applies cycle collapse to reduce repetitive loop
+unrolling.
+
+Key options: `-p`/`--package` (default: `stt-sched`),
+`-v`/`--verbose` (full raw log), `--diff <package>` (A/B instruction
+count delta), `--kernel <path>` (kernel image for the VM).
+
+See [BPF Verifier](running-tests/verifier.md) for the wire protocol
+and cycle collapse algorithm.
 
 ### `cargo stt probe`
 

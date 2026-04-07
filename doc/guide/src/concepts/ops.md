@@ -109,28 +109,28 @@ How long to hold after a step completes:
 
 ## execute_steps_with
 
-`execute_steps_with(ctx, steps, verify)` is the same as
+`execute_steps_with(ctx, steps, assertions)` is the same as
 `execute_steps` but accepts an explicit
-[`Verify`](verification.md#verify-struct) for worker checks.
+[`Assert`](verification.md#assert-struct) for worker checks.
 `execute_steps` is a convenience wrapper that passes `None`.
 
 ```rust,ignore
 use stt::prelude::*;
 use stt::scenario::ops::execute_steps_with;
 
-fn my_scenario(ctx: &Ctx) -> Result<VerifyResult> {
-    let verify = Verify::NONE
+fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
+    let assertions = Assert::NONE
         .check_not_starved()
         .max_gap_ms(3000);
 
     let steps = vec![/* ... */];
-    execute_steps_with(ctx, steps, Some(&verify))
+    execute_steps_with(ctx, steps, Some(&assertions))
 }
 ```
 
-When `verify` is `Some`, the provided thresholds override the defaults
+When `assertions` is `Some`, the provided thresholds override the defaults
 for gap and spread checks. When `None`, `execute_steps_with` falls
-back to `verify_not_starved()` with the default thresholds.
+back to `assert_not_starved()` with the default thresholds.
 
 ## Layout
 

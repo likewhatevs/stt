@@ -1,254 +1,254 @@
 use anyhow::Result;
+use stt::assert::AssertResult;
 use stt::scenario::Ctx;
 use stt::stt_test;
 use stt::test_support::{Scheduler, SchedulerSpec};
-use stt::verify::VerifyResult;
 
 const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
 // -- basic --
 
 #[stt_test(sockets = 1, cores = 2, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::basic::custom_cgroup_pipe_io(ctx)
 }
 
 #[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
-fn cover_sched_mixed(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::basic::custom_sched_mixed(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_host_cgroup_contention(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::basic::custom_host_cgroup_contention(ctx)
 }
 
 // -- affinity --
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_affinity_change(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::affinity::custom_cgroup_affinity_change(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_multicpu_pin(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::affinity::custom_cgroup_multicpu_pin(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::affinity::custom_cgroup_cpuset_multicpu_pin(ctx)
 }
 
 // -- cpuset --
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_apply_midrun(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_clear_midrun(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_resize(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_resize(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
-fn cover_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_swap_disjoint(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_workload_imbalance(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
 }
 
 #[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15)]
-fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
 }
 
 // -- dynamic --
 
 #[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
-fn cover_cgroup_add_midrun(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::dynamic::custom_cgroup_add_midrun(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_remove_midrun(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::dynamic::custom_cgroup_remove_midrun(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_rapid_churn(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::dynamic::custom_cgroup_rapid_churn(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::dynamic::custom_cgroup_cpuset_add_remove(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::dynamic::custom_cgroup_add_during_imbalance(ctx)
 }
 
 // -- interaction --
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_imbalance_mixed_workload(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_add_load_imbalance(ctx)
 }
 
 #[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
-fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
-fn cover_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_4way_load_imbalance(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_cpuset_imbalance_combined(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_cpuset_overlap_imbalance_combined(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_noctrl_task_migration(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_noctrl_imbalance(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_noctrl_cpuset_change(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_noctrl_load_imbalance(ctx)
 }
 
 #[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
-fn cover_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::interaction::custom_cgroup_io_compute_imbalance(ctx)
 }
 
 // -- nested --
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_nested_cgroup_steady(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::nested::custom_nested_cgroup_steady(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_nested_cgroup_task_move(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::nested::custom_nested_cgroup_task_move(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::nested::custom_nested_cgroup_rapid_churn(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_nested_cgroup_cpuset(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::nested::custom_nested_cgroup_cpuset(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_nested_cgroup_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::nested::custom_nested_cgroup_imbalance(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_nested_cgroup_noctrl(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::nested::custom_nested_cgroup_noctrl(ctx)
 }
 
 // -- stress --
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_per_cpu(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::stress::custom_cgroup_per_cpu(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::stress::custom_cgroup_exhaust_reuse(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_dsq_contention(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::stress::custom_cgroup_dsq_contention(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
-fn cover_cgroup_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::stress::custom_cgroup_workload_variety(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
-fn cover_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::stress::custom_cgroup_cpuset_workload_variety(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
-fn cover_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::stress::custom_cgroup_dynamic_workload_variety(ctx)
 }
 
 #[stt_test(sockets = 2, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::stress::custom_cgroup_cpuset_crossllc_race(ctx)
 }
 
 // -- performance --
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cache_pressure_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::performance::custom_cache_pressure_imbalance(ctx)
 }
 
 #[stt_test(sockets = 2, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cache_yield_wake_affine(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::performance::custom_cache_yield_wake_affine(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::performance::custom_cache_pipe_io_compute_imbalance(ctx)
 }
 
 #[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_fanout_wake(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::performance::custom_fanout_wake(ctx)
 }
 
@@ -261,7 +261,7 @@ fn cover_fanout_wake(ctx: &Ctx) -> Result<VerifyResult> {
     max_imbalance_ratio = 10.0,
     fail_on_stall = false,
 )]
-fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::basic::custom_sched_mixed(ctx)
 }
 
@@ -269,7 +269,7 @@ fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<VerifyResult> {
 fn cover_watchdog_forced_stall() {
     use stt::test_support::{SttTestEntry, run_stt_test};
 
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
         stt::scenario::basic::custom_sched_mixed(_ctx)
     }
 
@@ -288,7 +288,7 @@ fn cover_watchdog_forced_stall() {
         scheduler: &STALL_SCHED,
         auto_repro: true,
         replicas: 1,
-        verify: stt::verify::Verify::NONE,
+        assert: stt::assert::Assert::NONE,
         extra_sched_args: &["--stall-after", "1"],
         required_flags: &[],
         excluded_flags: &[],
@@ -298,7 +298,8 @@ fn cover_watchdog_forced_stall() {
         min_cpus: 1,
         watchdog_timeout_jiffies: 2000,
         bpf_map_write: None,
-        performance_mode: false,
+        performance_mode: true,
+        super_perf_mode: false,
         duration_s: 0,
         workers_per_cgroup: 0,
     };
@@ -335,7 +336,7 @@ fn cover_watchdog_forced_stall() {
 fn neg_stall_detection_scx_exit() {
     use stt::test_support::{SttTestEntry, run_stt_test};
 
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
         stt::scenario::basic::custom_sched_mixed(_ctx)
     }
 
@@ -354,7 +355,7 @@ fn neg_stall_detection_scx_exit() {
         scheduler: &STALL_SCHED,
         auto_repro: false,
         replicas: 1,
-        verify: stt::verify::Verify::NONE,
+        assert: stt::assert::Assert::NONE,
         extra_sched_args: &["--stall-after", "1"],
         required_flags: &[],
         excluded_flags: &[],
@@ -365,6 +366,7 @@ fn neg_stall_detection_scx_exit() {
         watchdog_timeout_jiffies: 3000,
         bpf_map_write: None,
         performance_mode: false,
+        super_perf_mode: false,
         duration_s: 0,
         workers_per_cgroup: 0,
     };
@@ -386,13 +388,13 @@ fn neg_stall_detection_scx_exit() {
     );
 }
 
-// -- negative: scheduler death without VerifyResult --
+// -- negative: scheduler death without AssertResult --
 
 #[test]
 fn neg_sched_death_no_verify_result() {
     use stt::test_support::{SttTestEntry, run_stt_test};
 
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
         stt::scenario::basic::custom_sched_mixed(_ctx)
     }
 
@@ -411,7 +413,7 @@ fn neg_sched_death_no_verify_result() {
         scheduler: &DEATH_SCHED,
         auto_repro: true,
         replicas: 1,
-        verify: stt::verify::Verify::NONE,
+        assert: stt::assert::Assert::NONE,
         extra_sched_args: &["--stall-after", "1"],
         required_flags: &[],
         excluded_flags: &[],
@@ -422,13 +424,14 @@ fn neg_sched_death_no_verify_result() {
         watchdog_timeout_jiffies: 3000,
         bpf_map_write: None,
         performance_mode: false,
+        super_perf_mode: false,
         duration_s: 10,
         workers_per_cgroup: 0,
     };
 
     let result = run_stt_test(&__STT_ENTRY_SCHED_DEATH);
     // Scheduler stalls after 1s, kernel watchdog kills it.
-    // No VerifyResult is produced — the error path handles this.
+    // No AssertResult is produced — the error path handles this.
     assert!(result.is_err(), "stalled scheduler must cause failure");
     let err = format!("{:#}", result.unwrap_err());
     assert!(
@@ -460,8 +463,8 @@ fn neg_auto_repro_on_verify_failure() {
     // the verify-failure branch with auto_repro=true. attempt_auto_repro
     // extracts functions from the scheduler log; a normal exit has no
     // stack traces, so it returns None. No --stall-after: the scheduler
-    // must stay alive so the VerifyResult reaches COM2.
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+    // must stay alive so the AssertResult reaches COM2.
+    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
         let mut r = stt::scenario::basic::custom_sched_mixed(_ctx)?;
         r.passed = false;
         r.details.push("forced failure for auto-repro test".into());
@@ -483,7 +486,7 @@ fn neg_auto_repro_on_verify_failure() {
         scheduler: &REPRO_SCHED,
         auto_repro: true,
         replicas: 1,
-        verify: stt::verify::Verify::NONE,
+        assert: stt::assert::Assert::NONE,
         extra_sched_args: &[],
         required_flags: &[],
         excluded_flags: &[],
@@ -494,6 +497,7 @@ fn neg_auto_repro_on_verify_failure() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: None,
         performance_mode: false,
+        super_perf_mode: false,
         duration_s: 0,
         workers_per_cgroup: 0,
     };
@@ -534,7 +538,7 @@ fn neg_auto_repro_on_verify_failure() {
 fn neg_crash_after_auto_repro() {
     use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
 
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
         stt::scenario::basic::custom_sched_mixed(_ctx)
     }
 
@@ -561,7 +565,7 @@ fn neg_crash_after_auto_repro() {
         scheduler: &CRASH_SCHED,
         auto_repro: true,
         replicas: 1,
-        verify: stt::verify::Verify::NONE,
+        assert: stt::assert::Assert::NONE,
         extra_sched_args: &[],
         required_flags: &[],
         excluded_flags: &[],
@@ -572,6 +576,7 @@ fn neg_crash_after_auto_repro() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_CRASH),
         performance_mode: false,
+        super_perf_mode: false,
         duration_s: 0,
         workers_per_cgroup: 0,
     };
@@ -612,7 +617,7 @@ fn neg_crash_after_auto_repro() {
 fn demo_bpf_crash_auto_repro() {
     use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
 
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
         stt::scenario::basic::custom_sched_mixed(_ctx)
     }
 
@@ -639,7 +644,7 @@ fn demo_bpf_crash_auto_repro() {
         scheduler: &CRASH_SCHED,
         auto_repro: true,
         replicas: 1,
-        verify: stt::verify::Verify::NONE,
+        assert: stt::assert::Assert::NONE,
         extra_sched_args: &[],
         required_flags: &[],
         excluded_flags: &[],
@@ -650,6 +655,7 @@ fn demo_bpf_crash_auto_repro() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_CRASH),
         performance_mode: false,
+        super_perf_mode: false,
         duration_s: 0,
         workers_per_cgroup: 0,
     };
@@ -687,7 +693,7 @@ fn neg_host_crash_auto_repro() {
     use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
     use stt::workload::WorkType;
 
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
         let steps = vec![Step {
             setup: vec![
                 CgroupDef::named("demo_workers")
@@ -722,7 +728,7 @@ fn neg_host_crash_auto_repro() {
         scheduler: &CRASH_SCHED,
         auto_repro: true,
         replicas: 1,
-        verify: stt::verify::Verify::NONE,
+        assert: stt::assert::Assert::NONE,
         extra_sched_args: &[],
         required_flags: &[],
         excluded_flags: &[],
@@ -733,6 +739,7 @@ fn neg_host_crash_auto_repro() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_CRASH),
         performance_mode: false,
+        super_perf_mode: false,
         duration_s: 0,
         workers_per_cgroup: 0,
     };
@@ -764,7 +771,7 @@ fn demo_host_crash_auto_repro() {
     use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
     use stt::workload::WorkType;
 
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::verify::VerifyResult> {
+    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
         let steps = vec![Step {
             setup: vec![
                 CgroupDef::named("demo_workers")
@@ -799,7 +806,7 @@ fn demo_host_crash_auto_repro() {
         scheduler: &CRASH_SCHED,
         auto_repro: true,
         replicas: 1,
-        verify: stt::verify::Verify::NONE,
+        assert: stt::assert::Assert::NONE,
         extra_sched_args: &[],
         required_flags: &[],
         excluded_flags: &[],
@@ -810,6 +817,7 @@ fn demo_host_crash_auto_repro() {
         watchdog_timeout_jiffies: 0,
         bpf_map_write: Some(&BPF_CRASH),
         performance_mode: false,
+        super_perf_mode: false,
         duration_s: 0,
         workers_per_cgroup: 0,
     };
@@ -829,7 +837,7 @@ fn demo_host_crash_auto_repro() {
     max_imbalance_ratio = 20.0,
     sustained_samples = 15,
 )]
-fn cover_monitor_evaluation(ctx: &Ctx) -> Result<VerifyResult> {
+fn cover_monitor_evaluation(ctx: &Ctx) -> Result<AssertResult> {
     // Exercises the host-side monitor threshold evaluation path in
     // run_stt_test_inner (lines 550-571). The scenario passes, then
     // the host evaluates monitor samples against merged thresholds.

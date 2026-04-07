@@ -35,7 +35,7 @@ stt vm
   |                             +-- signal workers to start
   |                             +-- poll scheduler liveness
   |                             +-- stop workers, collect reports
-  |                             +-- verify results
+  |                             +-- evaluate results
   |                             +-- write result to serial
   |                           
   +-- read result from serial 

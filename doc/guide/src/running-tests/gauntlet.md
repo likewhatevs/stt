@@ -79,7 +79,7 @@ which presets they run on. For example:
     requires_smt = true,
     required_flags = ["llc"],
 )]
-fn cross_llc_test(ctx: &Ctx) -> Result<VerifyResult> { /* ... */ }
+fn cross_llc_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
 This test skips `tiny-1llc` (1 LLC), `odd-3llc` (no SMT), and all

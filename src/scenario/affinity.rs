@@ -1,11 +1,11 @@
 use super::Ctx;
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
-use crate::verify::VerifyResult;
+use crate::assert::AssertResult;
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     let mut steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
         ops: vec![],
@@ -30,7 +30,7 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let all = ctx.topo.all_cpus();
     let pin_cpus: BTreeSet<usize> = if all.len() >= 2 {
         all[..2].iter().copied().collect()
@@ -56,7 +56,7 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let usable = ctx.topo.usable_cpus();
     let mid = usable.len() / 2;
     let a: BTreeSet<usize> = usable[..mid].iter().copied().collect();

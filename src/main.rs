@@ -5,7 +5,7 @@ use clap::Parser;
 use console::style;
 
 use runner::{RunConfig, Runner};
-use stt::{probe, runner, scenario, topology, verify, workload};
+use stt::{assert, probe, runner, scenario, topology, workload};
 use topology::TestTopology;
 
 #[derive(Debug, Parser)]
@@ -262,7 +262,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     let active_flags = parse_flags(&args)?;
     let scheduler_bin = args.scheduler_bin.or(args.mitosis_bin);
     if args.warn_unfair {
-        verify::set_warn_unfair(true);
+        assert::set_warn_unfair(true);
     }
     let repro = args.repro || args.probe_stack.is_some() || args.auto_repro;
     if repro {
@@ -558,8 +558,7 @@ fn cmd_clean_kernel(args: KernelPathArg) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
-    use stt::{monitor, stats, test_support, verify};
+    use stt::{monitor, stats, test_support};
 
     fn sr(name: &str, passed: bool, dur: f64, details: Vec<&str>) -> runner::ScenarioResult {
         runner::ScenarioResult {
@@ -1032,7 +1031,7 @@ mod tests {
             topology: "2s4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             passed: true,
-            stats: verify::ScenarioStats {
+            stats: assert::ScenarioStats {
                 cgroups: vec![],
                 total_workers: 4,
                 total_cpus: 8,

@@ -12,15 +12,15 @@ Define a `Scheduler` with custom verification:
 const RELAXED: Scheduler = Scheduler::new("relaxed_sched")
     .binary(SchedulerSpec::Name("scx_relaxed"))
     .flags(&[&LLC_DECL, &BORROW_DECL])
-    .verify(
-        Verify::NONE
+    .assert(
+        Assert::NONE
             .max_imbalance_ratio(5.0)    // tolerate 5:1 imbalance
             .max_fallback_rate(500.0)     // higher fallback rate ok
             .fail_on_stall(false)         // don't fail on stall
     );
 ```
 
-These overrides sit between `Verify::default_checks()` and per-test
+These overrides sit between `Assert::default_checks()` and per-test
 overrides in the merge chain.
 
 ## Per-test overrides via #[stt_test]
@@ -36,9 +36,9 @@ overrides in the merge chain.
     max_imbalance_ratio = 10.0,
     sustained_samples = 10,
 )]
-fn high_imbalance_test(ctx: &Ctx) -> Result<VerifyResult> {
+fn high_imbalance_test(ctx: &Ctx) -> Result<AssertResult> {
     // ...
-    Ok(VerifyResult::pass())
+    Ok(AssertResult::pass())
 }
 ```
 
@@ -53,37 +53,37 @@ fn high_imbalance_test(ctx: &Ctx) -> Result<VerifyResult> {
    below `max_gap_ms` (default: 2000ms release, 3000ms debug).
 
 Each threshold can be overridden independently in `#[stt_test]`
-attributes or in `Scheduler.verify`.
+attributes or in `Scheduler.assert`.
 
 ## Merge order
 
 ```text
-Verify::default_checks()     <- baseline (not_starved, monitor defaults)
-    .merge(&scheduler.verify) <- scheduler overrides
-    .merge(&test.verify)      <- per-test attribute overrides
+Assert::default_checks()     <- baseline (not_starved, monitor defaults)
+    .merge(&scheduler.assert) <- scheduler overrides
+    .merge(&test.assert)      <- per-test attribute overrides
 ```
 
 All fields use last-`Some`-wins -- a higher layer's `Some` replaces
 the lower. A scheduler or test can disable a check by setting
 `Some(false)` even if a lower layer enabled it.
 
-## Using Verify directly in ops scenarios
+## Using Assert directly in ops scenarios
 
 ```rust,ignore
-fn my_scenario(ctx: &Ctx) -> Result<VerifyResult> {
-    let verify = Verify::NONE
+fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
+    let assertions = Assert::NONE
         .check_not_starved()
         .max_gap_ms(3000);
 
     let steps = vec![/* ... */];
-    execute_steps_with(ctx, steps, Some(&verify))
+    execute_steps_with(ctx, steps, Some(&assertions))
 }
 ```
 
-`execute_steps_with` applies the given `Verify` for worker checks.
+`execute_steps_with` applies the given `Assert` for worker checks.
 `execute_steps` (without `_with`) passes `None`, using the default
-gap and spread thresholds from `verify_not_starved()` instead of
-per-invocation `Verify` overrides.
+gap and spread thresholds from `assert_not_starved()` instead of
+per-invocation `Assert` overrides.
 
 See [Ops and Steps](../concepts/ops.md) for the full step execution
 model.

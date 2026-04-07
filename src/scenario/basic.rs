@@ -1,11 +1,11 @@
 use super::Ctx;
 use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
-use crate::verify::VerifyResult;
+use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 use std::time::Duration;
 
-pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
         ops: vec![Op::SpawnHost {
@@ -20,7 +20,7 @@ pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_sched_mixed(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     let configs = [
         (SchedPolicy::Normal, WorkType::CpuSpin),
         (SchedPolicy::Batch, WorkType::CpuSpin),
@@ -65,7 +65,7 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_pipe_io(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
     let mut ops = vec![
         Op::AddCgroup {
             name: "cg_0".into(),

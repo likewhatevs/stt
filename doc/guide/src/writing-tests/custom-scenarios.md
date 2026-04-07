@@ -14,7 +14,7 @@ cannot express.
 use stt::prelude::*;
 use stt::scenario::*;
 
-fn my_custom_scenario(ctx: &Ctx) -> Result<VerifyResult> {
+fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let wl = dfl_wl(ctx);
     let (handles, _guard) = setup_cgroups(ctx, 2, &wl)?;
 
@@ -32,7 +32,7 @@ each, starts them. Returns `(Vec<WorkloadHandle>, CgroupGroup)`. The
 `CgroupGroup` is an RAII guard that removes cgroups on drop.
 
 **`collect_all(handles)`** -- stops all workers, collects reports, runs
-`verify_not_starved()` on each. Merges results: if any worker group
+`assert_not_starved()` on each. Merges results: if any worker group
 fails, the overall result fails. Details from all groups are combined.
 
 **`dfl_wl(ctx)`** -- creates a `WorkloadConfig` with
@@ -65,6 +65,14 @@ pub struct Ctx<'a> {
 
 **`settle_ms`** -- time to wait after cgroup creation for the scheduler
 to stabilize.
+
+## Verification in custom scenarios
+
+Use `AssertPlan` when calling `plan.assert_cgroup(reports, cpuset)`
+directly. Use `Assert` with `execute_steps_with()` for ops-based
+scenarios. See
+[Assert vs AssertPlan](../recipes/benchmarking-tests.md#assert-vs-assertplan)
+and [Verification](../concepts/verification.md#assertplan).
 
 ## Registering a custom scenario
 

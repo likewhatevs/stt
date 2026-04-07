@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::assert::ScenarioStats;
 use crate::cgroup::CgroupManager;
 use crate::probe::btf::discover_bpf_symbols;
 use crate::probe::stack::{
@@ -14,7 +15,6 @@ use crate::probe::stack::{
 };
 use crate::scenario::{self, Ctx, FlagProfile, Scenario, flags};
 use crate::topology::TestTopology;
-use crate::verify::ScenarioStats;
 
 // Re-export public API used by main.rs
 pub use crate::probe::stack::extract_stack_functions_all_pub;
@@ -476,7 +476,7 @@ mod tests {
             details: vec![],
             stats: ScenarioStats {
                 cgroups: vec![
-                    crate::verify::CgroupStats {
+                    crate::assert::CgroupStats {
                         num_workers: 4,
                         num_cpus: 4,
                         avg_runnable_pct: 75.0,
@@ -488,7 +488,7 @@ mod tests {
                         total_migrations: 3,
                         ..Default::default()
                     },
-                    crate::verify::CgroupStats {
+                    crate::assert::CgroupStats {
                         num_workers: 4,
                         num_cpus: 4,
                         avg_runnable_pct: 72.0,
@@ -739,8 +739,8 @@ mod tests {
             passed: false,
             duration_s: 12.5,
             details: vec!["stuck 3000ms on cpu2".into(), "unfair cgroup".into()],
-            stats: crate::verify::ScenarioStats {
-                cgroups: vec![crate::verify::CgroupStats {
+            stats: crate::assert::ScenarioStats {
+                cgroups: vec![crate::assert::CgroupStats {
                     num_workers: 4,
                     num_cpus: 2,
                     avg_runnable_pct: 50.0,

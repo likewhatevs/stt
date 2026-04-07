@@ -39,9 +39,9 @@ use anyhow::Result;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
+use crate::assert::{self, AssertResult};
 use crate::cgroup::CgroupManager;
 use crate::topology::TestTopology;
-use crate::verify::{self, VerifyResult};
 use crate::workload::*;
 
 /// Check if a process is alive via kill(pid, 0).
@@ -224,7 +224,7 @@ pub enum Action {
     /// Run workers for the configured duration with no dynamic operations.
     Steady,
     /// Execute custom scenario logic with access to the full test context.
-    Custom(fn(&Ctx) -> Result<VerifyResult>),
+    Custom(fn(&Ctx) -> Result<AssertResult>),
 }
 
 /// Per-cgroup workload definition.
@@ -286,6 +286,19 @@ impl Default for CgroupWork {
 /// `required_flags` and `excluded_flags` use typed [`FlagDecl`](flags::FlagDecl)
 /// references. [`profiles()`](Scenario::profiles) generates all valid
 /// flag combinations that satisfy these constraints.
+///
+/// ```
+/// # use stt::scenario::all_scenarios;
+/// let scenarios = all_scenarios();
+/// assert!(!scenarios.is_empty());
+///
+/// let first = &scenarios[0];
+/// assert!(!first.name.is_empty());
+/// assert!(!first.category.is_empty());
+///
+/// let profiles = first.profiles();
+/// assert!(!profiles.is_empty());
+/// ```
 pub struct Scenario {
     /// Unique identifier (e.g. `"cgroup_steady"`).
     pub name: &'static str,
@@ -415,8 +428,8 @@ pub struct Ctx<'a> {
     pub work_type_override: Option<WorkType>,
 }
 
-/// Run a scenario. Returns verification result.
-pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
+/// Run a scenario. Returns assertion result.
+pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     tracing::info!(scenario = scenario.name, "running");
     if let Action::Custom(f) = &scenario.action {
         return f(ctx);
@@ -428,7 +441,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
     if let Some(ref cs) = cpusets
         && cs.iter().any(|s| s.is_empty())
     {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: not enough CPUs/LLCs".into()],
             stats: Default::default(),
@@ -525,12 +538,12 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
     }
     // host noise disabled
 
-    let mut result = VerifyResult::pass();
+    let mut result = AssertResult::pass();
     for (i, h) in handles.into_iter().enumerate() {
         let reports = h.stop_and_collect();
-        result.merge(verify::verify_not_starved(&reports));
+        result.merge(assert::assert_not_starved(&reports));
         if let Some(ref cs) = cpusets {
-            result.merge(verify::verify_isolation(&reports, &cs[i]));
+            result.merge(assert::assert_isolation(&reports, &cs[i]));
         }
     }
 
@@ -674,11 +687,11 @@ pub fn setup_cgroups<'a>(
 
 /// Stop all workers, collect reports, and run starvation checks.
 ///
-/// Returns a merged [`VerifyResult`] across all workers.
-pub fn collect_all(handles: Vec<WorkloadHandle>) -> VerifyResult {
-    let mut r = VerifyResult::pass();
+/// Returns a merged [`AssertResult`] across all workers.
+pub fn collect_all(handles: Vec<WorkloadHandle>) -> AssertResult {
+    let mut r = AssertResult::pass();
     for h in handles {
-        r.merge(verify::verify_not_starved(&h.stop_and_collect()));
+        r.merge(assert::assert_not_starved(&h.stop_and_collect()));
     }
     r
 }

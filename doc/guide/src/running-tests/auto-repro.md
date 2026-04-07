@@ -49,7 +49,7 @@ In `#[stt_test]`:
 
 ```rust,ignore
 #[stt_test(auto_repro = true)]
-fn my_test(ctx: &Ctx) -> Result<VerifyResult> { ... }
+fn my_test(ctx: &Ctx) -> Result<AssertResult> { ... }
 ```
 
 `auto_repro` defaults to `true` in `#[stt_test]` but `false` on the
@@ -124,7 +124,7 @@ The `demo_host_crash_auto_repro` test:
 use stt::prelude::*;
 use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
 
-fn scenario(ctx: &Ctx) -> Result<VerifyResult> {
+fn scenario(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("demo_workers")

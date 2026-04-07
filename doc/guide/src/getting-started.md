@@ -41,7 +41,7 @@ use stt::prelude::*;
 use std::collections::BTreeSet;
 
 #[stt_test(sockets = 1, cores = 2, threads = 1)]
-fn my_scheduler_test(ctx: &Ctx) -> Result<VerifyResult> {
+fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
     // Create a cgroup and assign all CPUs.
     let mut group = CgroupGroup::new(ctx.cgroups);
     group.add_cgroup_no_cpuset("workers")?;
@@ -64,9 +64,9 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<VerifyResult> {
     std::thread::sleep(ctx.duration);
     let reports = handle.stop_and_collect();
 
-    // Verify: no worker was starved.
-    let plan = VerificationPlan::new().check_not_starved();
-    Ok(plan.verify_cgroup(&reports, None))
+    // Assert: no worker was starved.
+    let plan = AssertPlan::new().check_not_starved();
+    Ok(plan.assert_cgroup(&reports, None))
 }
 ```
 

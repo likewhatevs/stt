@@ -1,15 +1,15 @@
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
 use super::{Ctx, collect_all, dfl_wl, setup_cgroups};
-use crate::verify::VerifyResult;
+use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
     let max_new = ctx.topo.total_cpus().saturating_sub(3).min(2);
     if max_new == 0 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=4 CPUs".into()],
             stats: Default::default(),
@@ -38,10 +38,10 @@ pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
     let n = 4.min(ctx.topo.total_cpus().saturating_sub(1));
     if n < 2 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=3 CPUs".into()],
             stats: Default::default(),
@@ -80,7 +80,7 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<VerifyResult> {
 }
 
 /// Rapid create/destroy cycling. Custom logic for dynamic naming.
-pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     let (handles, _guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
     let deadline = Instant::now() + ctx.duration;
     let mut i = 0;
@@ -94,9 +94,9 @@ pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<VerifyResult> {
     Ok(collect_all(handles))
 }
 
-pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 4 {
-        return Ok(VerifyResult {
+        return Ok(AssertResult {
             passed: true,
             details: vec!["skipped: need >=4 CPUs".into()],
             stats: Default::default(),
@@ -138,7 +138,7 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<VerifyResult> {
     execute_steps(ctx, steps)
 }
 
-pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
             setup: vec![

@@ -12,7 +12,7 @@ pub struct Scheduler {
     pub flags: &'static [&'static FlagDecl],
     pub sysctls: &'static [(&'static str, &'static str)],
     pub kargs: &'static [&'static str],
-    pub verify: Verify,
+    pub assert: Assert,
 }
 ```
 
@@ -58,7 +58,7 @@ use stt::scenario::flags::*;
 const MY_SCHEDULER: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
     .flags(&[&LLC_DECL, &BORROW_DECL, &STEAL_DECL, &REBAL_DECL])
-    .verify(Verify::NONE.max_imbalance_ratio(2.0));
+    .assert(Assert::NONE.max_imbalance_ratio(2.0));
 ```
 
 ## Flag scoping
@@ -70,8 +70,8 @@ doesn't implement.
 
 ## Verification overrides
 
-`Scheduler.verify` provides scheduler-level verification defaults.
-These sit between `Verify::default_checks()` and per-test overrides in
+`Scheduler.assert` provides scheduler-level verification defaults.
+These sit between `Assert::default_checks()` and per-test overrides in
 the merge chain.
 
 A scheduler that tolerates higher imbalance:
@@ -79,7 +79,7 @@ A scheduler that tolerates higher imbalance:
 ```rust,ignore
 const RELAXED: Scheduler = Scheduler::new("relaxed")
     .binary(SchedulerSpec::Name("scx_relaxed"))
-    .verify(Verify::NONE.max_imbalance_ratio(5.0));
+    .assert(Assert::NONE.max_imbalance_ratio(5.0));
 ```
 
 ## Kernel-built scheduler example
