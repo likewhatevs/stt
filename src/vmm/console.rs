@@ -7,8 +7,10 @@
 pub(crate) const COM1_BASE: u16 = 0x3F8;
 pub(crate) const COM2_BASE: u16 = 0x2F8;
 
-/// ISA IRQ lines for the two COM ports.
+/// ISA IRQ lines for the two COM ports (x86_64 port I/O only).
+#[cfg(target_arch = "x86_64")]
 pub(crate) const COM1_IRQ: u32 = 4;
+#[cfg(target_arch = "x86_64")]
 pub(crate) const COM2_IRQ: u32 = 3;
 
 const NUM_REGS: u16 = 8;
@@ -74,6 +76,18 @@ impl Serial {
             *first = self.inner.read(offset);
         }
         true
+    }
+
+    /// Write a byte to a register at the given offset.
+    /// Used by MMIO dispatch where the offset is computed externally.
+    pub(crate) fn inner_write(&mut self, offset: u8, byte: u8) {
+        let _ = self.inner.write(offset, byte);
+    }
+
+    /// Read a byte from a register at the given offset.
+    /// Used by MMIO dispatch where the offset is computed externally.
+    pub(crate) fn inner_read(&mut self, offset: u8) -> u8 {
+        self.inner.read(offset)
     }
 
     /// Queue input bytes (for host->guest communication).

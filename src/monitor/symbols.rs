@@ -9,13 +9,26 @@ use anyhow::{Context, Result};
 use object::{Object, ObjectSymbol};
 use std::path::Path;
 
-/// x86-64 kernel text mapping base (non-KASLR).
-/// Used to convert kernel data/bss symbol VAs to physical addresses
+/// Kernel text mapping base (non-KASLR).
+/// Used to convert kernel data/bss symbol VAs to guest-memory offsets
 /// for the bootstrap read of `page_offset_base`.
-const START_KERNEL_MAP: u64 = 0xffff_ffff_8000_0000;
+///
+/// x86-64: `__START_KERNEL_map` = 0xffff_ffff_8000_0000.
+/// aarch64 48-bit VA: `KIMAGE_VADDR` = _PAGE_END(48) + SZ_2G
+///   = 0xffff_8000_8000_0000.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const START_KERNEL_MAP: u64 = 0xffff_ffff_8000_0000;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const START_KERNEL_MAP: u64 = 0xffff_8000_8000_0000;
 
-/// Default PAGE_OFFSET for x86-64 4-level paging (non-KASLR).
+/// Default PAGE_OFFSET (non-KASLR).
+///
+/// x86-64 4-level paging: 0xffff_8880_0000_0000.
+/// aarch64 48-bit VA: -(1 << 48) = 0xffff_0000_0000_0000.
+#[cfg(target_arch = "x86_64")]
 const DEFAULT_PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
+#[cfg(target_arch = "aarch64")]
+const DEFAULT_PAGE_OFFSET: u64 = 0xffff_0000_0000_0000;
 
 /// Kernel symbol addresses extracted from vmlinux ELF.
 #[derive(Debug, Clone)]

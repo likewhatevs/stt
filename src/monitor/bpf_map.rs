@@ -55,6 +55,28 @@ pub struct BpfMapInfo {
 ///
 /// `value_kva` is `Some` only for `BPF_MAP_TYPE_ARRAY` maps where
 /// the value data is inline at the `bpf_array.value` flex array offset.
+/// Translate a kernel virtual address to a GuestMem offset, trying
+/// direct mapping first, then page table walk.
+///
+/// BPF map structs are SLAB-allocated (linear map) or vmalloc'd
+/// (modules, BPF programs). The page table walk handles both vmalloc
+/// and module addresses.
+fn translate_any_kva(
+    mem: &GuestMem,
+    cr3_pa: u64,
+    page_offset: u64,
+    kva: u64,
+    l5: bool,
+) -> Option<u64> {
+    // Linear map: PAGE_OFFSET..PAGE_END — SLAB allocations
+    let direct_pa = kva_to_pa(kva, page_offset);
+    if direct_pa < mem.size() {
+        return Some(direct_pa);
+    }
+    // Vmalloc / module addresses: page table walk
+    mem.translate_kva(cr3_pa, kva, l5)
+}
+
 pub(crate) fn find_all_bpf_maps(
     mem: &GuestMem,
     cr3_pa: u64,
@@ -69,7 +91,6 @@ pub(crate) fn find_all_bpf_maps(
     if xa_head == 0 {
         return Vec::new();
     }
-
     // idr_next is the next ID the kernel will allocate. All live entries
     // have IDs in 0..idr_next, so scanning beyond it only hits empty or
     // wrapped slots.
@@ -92,7 +113,7 @@ pub(crate) fn find_all_bpf_maps(
             continue;
         }
 
-        let Some(map_pa) = mem.translate_kva(cr3_pa, entry, l5) else {
+        let Some(map_pa) = translate_any_kva(mem, cr3_pa, page_offset, entry, l5) else {
             continue;
         };
 
@@ -854,11 +875,31 @@ fn xa_node_shift(mem: &GuestMem, page_offset: u64, node_kva: u64, shift_off: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::symbols::START_KERNEL_MAP;
+
+    // On aarch64, page table entries contain GPAs starting at DRAM_START.
+    // The walker subtracts DRAM_START to produce GuestMem offsets. Test
+    // page table entries must include this base so the subtraction yields
+    // the correct buffer offset.
+    #[cfg(target_arch = "x86_64")]
+    const PTE_BASE: u64 = 0;
+    #[cfg(target_arch = "aarch64")]
+    const PTE_BASE: u64 = crate::vmm::kvm::DRAM_START;
+
+    // Huge page (block) descriptor flags differ by architecture.
+    // x86: PS(0x80) | present | rw | accessed | dirty = 0xE3.
+    // aarch64: block descriptor bits [1:0] = 0b01 = 0x01.
+    #[cfg(target_arch = "x86_64")]
+    const BLOCK_FLAGS: u64 = 0xE3;
+    #[cfg(target_arch = "aarch64")]
+    #[allow(dead_code)] // used when aarch64 huge page tests are added
+    const BLOCK_FLAGS: u64 = 0x01;
 
     // -- translate_kva tests --
 
     /// Build a minimal 4-level page table in a buffer, mapping a single
     /// 4KB page. Returns (buffer, cr3_pa, mapped_kva, mapped_pa).
+    #[cfg(target_arch = "x86_64")]
     fn setup_page_table() -> (Vec<u8>, u64, u64, u64) {
         // Use a KVA and compute indices dynamically.
         let kva: u64 = 0xFFFF_8880_0000_5000;
@@ -883,14 +924,10 @@ mod tests {
             buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
         };
 
-        // PGD[pgd_idx] -> PUD
-        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
-        // PUD[pud_idx] -> PMD
-        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
-        // PMD[pmd_idx] -> PTE
-        write_entry(&mut buf, pmd_pa, pmd_idx, pte_pa | 0x63);
-        // PTE[pte_idx] -> data page
-        write_entry(&mut buf, pte_pa, pte_idx, data_pa | 0x63);
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pte_pa, pte_idx, (data_pa + PTE_BASE) | 0x63);
 
         // Write known data at the target page.
         buf[data_pa as usize..data_pa as usize + 8]
@@ -900,6 +937,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_basic() {
         let (buf, cr3_pa, kva, data_pa) = setup_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -910,6 +948,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_with_offset() {
         let (buf, cr3_pa, kva, data_pa) = setup_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -919,6 +958,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_unmapped() {
         let (buf, cr3_pa, _, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -928,6 +968,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_unmapped_pte() {
         let (buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -940,6 +981,7 @@ mod tests {
     // -- translate_kva: 2MB huge page --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_2mb_huge_page() {
         // Map KVA via a 2MB page (PS bit set in PMD entry).
         let kva: u64 = 0xFFFF_8880_0020_0000; // 2MB-aligned
@@ -961,11 +1003,16 @@ mod tests {
         };
 
         // PGD -> PUD
-        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
         // PUD -> PMD
-        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
         // PMD entry with PS bit set (bit 7) = 2MB huge page
-        write_entry(&mut buf, pmd_pa, pmd_idx, huge_page_pa | 0xE3); // present+rw+PS
+        write_entry(
+            &mut buf,
+            pmd_pa,
+            pmd_idx,
+            (huge_page_pa + PTE_BASE) | BLOCK_FLAGS,
+        ); // present+rw+PS
 
         // Write marker data at the huge page base.
         buf[huge_page_pa as usize..huge_page_pa as usize + 8]
@@ -984,6 +1031,7 @@ mod tests {
     // -- translate_kva: 1GB huge page --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_1gb_huge_page() {
         // Map KVA via a 1GB page (PS bit set in PUD entry).
         let kva: u64 = 0xFFFF_8880_4000_0000; // 1GB-aligned
@@ -1005,9 +1053,14 @@ mod tests {
         };
 
         // PGD -> PUD
-        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
         // PUD entry with PS bit set = 1GB huge page
-        write_entry(&mut buf, pud_pa, pud_idx, huge_page_pa | 0xE3);
+        write_entry(
+            &mut buf,
+            pud_pa,
+            pud_idx,
+            (huge_page_pa + PTE_BASE) | BLOCK_FLAGS,
+        );
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let pa = mem.translate_kva(pgd_pa, kva, false);
@@ -1055,7 +1108,7 @@ mod tests {
         };
 
         // PGD present -> PUD
-        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
         // PUD entry without present bit.
         write_entry(&mut buf, pud_pa, pud_idx, 0x3000); // no PRESENT
 
@@ -1081,8 +1134,8 @@ mod tests {
             buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
         };
 
-        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
-        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
         // PMD entry without present bit.
         write_entry(&mut buf, pmd_pa, pmd_idx, 0x4000); // no PRESENT
 
@@ -1110,9 +1163,9 @@ mod tests {
             buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
         };
 
-        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
-        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
-        write_entry(&mut buf, pmd_pa, pmd_idx, pte_pa | 0x63);
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x63);
         // PTE entry without present bit.
         write_entry(&mut buf, pte_pa, pte_idx, 0x5000); // no PRESENT
 
@@ -1123,6 +1176,7 @@ mod tests {
     // -- write_bpf_map_value tests --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_u32_roundtrip() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -1318,6 +1372,7 @@ mod tests {
     /// - IDR at idr_pa (BSS region, translated via text_kva_to_pa)
     /// - bpf_map at map_pa (vmalloc'd, translated via page table walk)
     /// - Page table mapping map_kva -> map_pa
+    #[cfg(target_arch = "x86_64")]
     fn setup_find_bpf_map(
         map_name: &str,
         map_type: u32,
@@ -1377,10 +1432,10 @@ mod tests {
         };
 
         // Page table: PGD -> PUD -> PMD -> PTE -> map_pa.
-        write_u64(&mut buf, pgd_pa + pgd_idx * 8, pud_pa | 0x63);
-        write_u64(&mut buf, pud_pa + pud_idx * 8, pmd_pa | 0x63);
-        write_u64(&mut buf, pmd_pa + pmd_idx * 8, pte_pa | 0x63);
-        write_u64(&mut buf, pte_pa + pte_idx * 8, map_pa | 0x63);
+        write_u64(&mut buf, pgd_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte_idx * 8, (map_pa + PTE_BASE) | 0x63);
 
         // IDR: xa_head is a single-entry xarray pointing directly to map_kva.
         // Single entry = bit 1 clear on map_kva (it has bit 1 clear: 0x...0000).
@@ -1400,13 +1455,14 @@ mod tests {
         // IDR KVA: idr is in BSS, so text_kva_to_pa(idr_kva) = idr_pa.
         // text_kva_to_pa(kva) = kva - START_KERNEL_MAP.
         // So idr_kva = idr_pa + START_KERNEL_MAP.
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
         (buf, pgd_pa, idr_kva, offsets)
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_bpf_map_discovers_matching_map() {
         let (buf, cr3_pa, idr_kva, offsets) =
             setup_find_bpf_map("mitosis.bss", BPF_MAP_TYPE_ARRAY, 64);
@@ -1433,6 +1489,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_bpf_map_no_match_wrong_suffix() {
         let (buf, cr3_pa, idr_kva, offsets) =
             setup_find_bpf_map("mitosis.bss", BPF_MAP_TYPE_ARRAY, 64);
@@ -1451,6 +1508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_bpf_map_skips_non_array_type() {
         // map_type = 1 (BPF_MAP_TYPE_HASH), not BPF_MAP_TYPE_ARRAY.
         let (buf, cr3_pa, idr_kva, offsets) = setup_find_bpf_map("test.bss", 1, 64);
@@ -1490,7 +1548,7 @@ mod tests {
         let size = 0x2000;
         let buf = vec![0u8; size]; // All zeros, so xa_head = 0.
 
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -1510,6 +1568,7 @@ mod tests {
 
     /// Build a 5-level page table mapping a single 4KB page.
     /// Returns (buffer, cr3_pa, mapped_kva, mapped_pa).
+    #[cfg(target_arch = "x86_64")]
     fn setup_5level_page_table() -> (Vec<u8>, u64, u64, u64) {
         // Use a KVA with a non-zero PML5 index (bits 56:48).
         let kva: u64 = 0xFF11_8880_0000_5000;
@@ -1535,15 +1594,15 @@ mod tests {
         };
 
         // PML5[pml5_idx] -> P4D
-        write_entry(&mut buf, pml5_pa, pml5_idx, p4d_pa | 0x63);
+        write_entry(&mut buf, pml5_pa, pml5_idx, (p4d_pa + PTE_BASE) | 0x63);
         // P4D/PGD[pgd_idx] -> PUD
-        write_entry(&mut buf, p4d_pa, pgd_idx, pud_pa | 0x63);
+        write_entry(&mut buf, p4d_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
         // PUD[pud_idx] -> PMD
-        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
         // PMD[pmd_idx] -> PTE
-        write_entry(&mut buf, pmd_pa, pmd_idx, pte_pa | 0x63);
+        write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x63);
         // PTE[pte_idx] -> data page
-        write_entry(&mut buf, pte_pa, pte_idx, data_pa | 0x63);
+        write_entry(&mut buf, pte_pa, pte_idx, (data_pa + PTE_BASE) | 0x63);
 
         // Write marker at data page.
         buf[data_pa as usize..data_pa as usize + 8]
@@ -1553,6 +1612,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_basic() {
         let (buf, cr3_pa, kva, data_pa) = setup_5level_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -1562,6 +1622,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_with_offset() {
         let (buf, cr3_pa, kva, data_pa) = setup_5level_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -1570,6 +1631,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_unmapped_pml5() {
         let (buf, cr3_pa, _, _) = setup_5level_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -1579,6 +1641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_vs_4level_same_buffer() {
         // With l5=false on the same buffer, the walk starts at PGD (which
         // is our PML5). The PGD index from a 4-level perspective differs,
@@ -1596,6 +1659,7 @@ mod tests {
     // -- write_bpf_map_value byte-by-byte across pages --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_bytes_roundtrip() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -1621,6 +1685,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_fails_on_unmapped_kva() {
         let (mut buf, cr3_pa, _, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -1763,6 +1828,7 @@ mod tests {
 
     /// Build a buffer with multiple maps in the IDR (via xa_node).
     /// First map has wrong name, second map matches.
+    #[cfg(target_arch = "x86_64")]
     fn setup_find_bpf_map_multi() -> (Vec<u8>, u64, u64, BpfMapOffsets) {
         let offsets = BpfMapOffsets {
             map_name: 32,
@@ -1825,11 +1891,11 @@ mod tests {
         };
 
         // Page table.
-        write_u64(&mut buf, pgd_pa + pgd_idx * 8, pud_pa | 0x63);
-        write_u64(&mut buf, pud_pa + pud_idx * 8, pmd_pa | 0x63);
-        write_u64(&mut buf, pmd_pa + pmd_idx * 8, pte_pa | 0x63);
-        write_u64(&mut buf, pte_pa + pte1_idx * 8, map1_pa | 0x63);
-        write_u64(&mut buf, pte_pa + pte2_idx * 8, map2_pa | 0x63);
+        write_u64(&mut buf, pgd_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte1_idx * 8, (map1_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte2_idx * 8, (map2_pa + PTE_BASE) | 0x63);
 
         // xa_node at xa_node_pa: shift=0 (leaf), with two entries.
         buf[xa_node_pa as usize] = 0; // shift=0
@@ -1877,13 +1943,14 @@ mod tests {
         let name2_pa = map2_pa + offsets.map_name as u64;
         buf[name2_pa as usize..name2_pa as usize + name2.len()].copy_from_slice(name2);
 
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
         (buf, pgd_pa, idr_kva, offsets)
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_bpf_map_skips_wrong_name_finds_second() {
         let (buf, cr3_pa, idr_kva, offsets) = setup_find_bpf_map_multi();
         let page_offset: u64 = 0xFFFF_8880_0000_0000;
@@ -1899,6 +1966,7 @@ mod tests {
     // -- find_bpf_map with full-length name (no null terminator) --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_bpf_map_full_length_name() {
         // Map name fills all BPF_OBJ_NAME_LEN bytes with no null.
         let full_name = "0123456789a.bss"; // 15 bytes, fits in 16 with null.
@@ -1919,6 +1987,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_bpf_map_max_length_name_no_null() {
         // Exactly 16 bytes, no null terminator.
         let max_name = "0123456789a.bss!"; // 16 bytes
@@ -1950,6 +2019,7 @@ mod tests {
     // -- write_bpf_map_value with nonzero offset --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_nonzero_offset() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
         // Record the original bytes at data_pa before writing.
@@ -1981,6 +2051,7 @@ mod tests {
     // -- write_bpf_map_value with empty data --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_empty_data() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -2003,6 +2074,7 @@ mod tests {
     // -- write_bpf_map_value_u32 with 5-level paging --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_u32_5level() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_5level_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -2032,6 +2104,7 @@ mod tests {
     // -- 5-level: not-present at P4D level --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_p4d_not_present() {
         // PML5 entry is present but the P4D (delegated to walk_4level as
         // PGD) has no entry for the requested PGD index.
@@ -2046,7 +2119,7 @@ mod tests {
         let mut buf = vec![0u8; size];
 
         let off = (pml5_pa + pml5_idx * 8) as usize;
-        buf[off..off + 8].copy_from_slice(&(p4d_pa | 0x63).to_ne_bytes());
+        buf[off..off + 8].copy_from_slice(&((p4d_pa + PTE_BASE) | 0x63).to_ne_bytes());
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         assert_eq!(mem.translate_kva(pml5_pa, kva, true), None);
@@ -2055,6 +2128,7 @@ mod tests {
     // -- 5-level: 2MB huge page --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_2mb_huge_page() {
         let kva: u64 = 0xFF11_8880_0020_0000; // 2MB-aligned
         let pml5_idx = (kva >> 48) & 0x1FF;
@@ -2076,10 +2150,15 @@ mod tests {
             buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
         };
 
-        write_entry(&mut buf, pml5_pa, pml5_idx, p4d_pa | 0x63);
-        write_entry(&mut buf, p4d_pa, pgd_idx, pud_pa | 0x63);
-        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
-        write_entry(&mut buf, pmd_pa, pmd_idx, huge_page_pa | 0xE3); // PS bit
+        write_entry(&mut buf, pml5_pa, pml5_idx, (p4d_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, p4d_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
+        write_entry(
+            &mut buf,
+            pmd_pa,
+            pmd_idx,
+            (huge_page_pa + PTE_BASE) | BLOCK_FLAGS,
+        ); // PS bit
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let pa = mem.translate_kva(pml5_pa, kva, true);
@@ -2092,6 +2171,7 @@ mod tests {
     // -- 5-level: 1GB huge page --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_1gb_huge_page() {
         let kva: u64 = 0xFF11_8880_4000_0000; // 1GB-aligned
         let pml5_idx = (kva >> 48) & 0x1FF;
@@ -2111,9 +2191,14 @@ mod tests {
             buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
         };
 
-        write_entry(&mut buf, pml5_pa, pml5_idx, p4d_pa | 0x63);
-        write_entry(&mut buf, p4d_pa, pgd_idx, pud_pa | 0x63);
-        write_entry(&mut buf, pud_pa, pud_idx, huge_page_pa | 0xE3); // PS bit
+        write_entry(&mut buf, pml5_pa, pml5_idx, (p4d_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, p4d_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
+        write_entry(
+            &mut buf,
+            pud_pa,
+            pud_idx,
+            (huge_page_pa + PTE_BASE) | BLOCK_FLAGS,
+        ); // PS bit
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let pa = mem.translate_kva(pml5_pa, kva, true);
@@ -2162,7 +2247,7 @@ mod tests {
         buf[off_next..off_next + 4].copy_from_slice(&1u32.to_ne_bytes());
 
         // PGD exists but is all zeros — no entries.
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -2181,6 +2266,7 @@ mod tests {
     // -- find_bpf_map with 5-level paging --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_bpf_map_5level() {
         // Verify find_bpf_map works when l5=true by constructing a
         // 5-level page table mapping the bpf_map.
@@ -2228,11 +2314,11 @@ mod tests {
         };
 
         // 5-level page table.
-        write_u64(&mut buf, pml5_pa + pml5_idx * 8, p4d_pa | 0x63);
-        write_u64(&mut buf, p4d_pa + pgd_idx * 8, pud_pa | 0x63);
-        write_u64(&mut buf, pud_pa + pud_idx * 8, pmd_pa | 0x63);
-        write_u64(&mut buf, pmd_pa + pmd_idx * 8, pte_pa | 0x63);
-        write_u64(&mut buf, pte_pa + pte_idx * 8, map_pa | 0x63);
+        write_u64(&mut buf, pml5_pa + pml5_idx * 8, (p4d_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, p4d_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte_idx * 8, (map_pa + PTE_BASE) | 0x63);
 
         // IDR: single-entry xarray.
         write_u64(&mut buf, idr_pa + offsets.idr_xa_head as u64, map_kva);
@@ -2250,7 +2336,7 @@ mod tests {
         let name_pa = (map_pa + offsets.map_name as u64) as usize;
         buf[name_pa..name_pa + name.len()].copy_from_slice(name);
 
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -2275,6 +2361,7 @@ mod tests {
 
     /// Build a page table mapping two consecutive 4KB virtual pages to
     /// two physical pages. Returns (buffer, cr3_pa, base_kva, page1_pa, page2_pa).
+    #[cfg(target_arch = "x86_64")]
     fn setup_two_page_table() -> (Vec<u8>, u64, u64, u64, u64) {
         let kva: u64 = 0xFFFF_8880_0000_5000;
         let kva2: u64 = kva + 0x1000;
@@ -2299,16 +2386,17 @@ mod tests {
             buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
         };
 
-        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
-        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
-        write_entry(&mut buf, pmd_pa, pmd_idx, pte_pa | 0x63);
-        write_entry(&mut buf, pte_pa, pte1_idx, page1_pa | 0x63);
-        write_entry(&mut buf, pte_pa, pte2_idx, page2_pa | 0x63);
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pte_pa, pte1_idx, (page1_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pte_pa, pte2_idx, (page2_pa + PTE_BASE) | 0x63);
 
         (buf, pgd_pa, kva, page1_pa, page2_pa)
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_across_page_boundary() {
         let (mut buf, cr3_pa, kva, page1_pa, page2_pa) = setup_two_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -2343,6 +2431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_single_byte_on_second_page() {
         let (mut buf, cr3_pa, kva, _, page2_pa) = setup_two_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -2373,6 +2462,7 @@ mod tests {
     // -- find_bpf_map: first entry untranslatable, second succeeds --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_bpf_map_skips_untranslatable_finds_translatable() {
         let offsets = BpfMapOffsets {
             map_name: 32,
@@ -2433,11 +2523,11 @@ mod tests {
         };
 
         // Page table — only map2_kva is mapped.
-        write_u64(&mut buf, pgd_pa + pgd_idx * 8, pud_pa | 0x63);
-        write_u64(&mut buf, pud_pa + pud_idx * 8, pmd_pa | 0x63);
-        write_u64(&mut buf, pmd_pa + pmd_idx * 8, pte_pa | 0x63);
+        write_u64(&mut buf, pgd_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
         // Only PTE for map2_kva. map1_kva's PTE slot is zero (not present).
-        write_u64(&mut buf, pte_pa + pte2_idx * 8, map2_pa | 0x63);
+        write_u64(&mut buf, pte_pa + pte2_idx * 8, (map2_pa + PTE_BASE) | 0x63);
 
         // xa_node: slot 0 -> map1_kva (untranslatable), slot 1 -> map2_kva.
         buf[xa_node_pa as usize] = 0; // shift=0
@@ -2472,7 +2562,7 @@ mod tests {
         let name_pa = (map2_pa + offsets.map_name as u64) as usize;
         buf[name_pa..name_pa + name.len()].copy_from_slice(name);
 
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -2487,6 +2577,7 @@ mod tests {
     // -- read_bpf_map_value tests --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_bpf_map_value_u32_roundtrip() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
         // Write a known u32 at data_pa + 4.
@@ -2510,6 +2601,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_bpf_map_value_bytes() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
         buf[data_pa as usize..data_pa as usize + 4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
@@ -2531,6 +2623,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_bpf_map_value_empty() {
         let (buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -2551,6 +2644,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_bpf_map_value_unmapped_returns_none() {
         let (buf, cr3_pa, _, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -2571,6 +2665,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_then_read_bpf_map_value_roundtrip() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -2612,6 +2707,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_bpf_map_value_across_page_boundary() {
         let (mut buf, cr3_pa, kva, page1_pa, page2_pa) = setup_two_page_table();
         // Write known bytes at the page boundary.
@@ -2638,6 +2734,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_bpf_map_value_u32_5level() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_5level_page_table();
         buf[data_pa as usize..data_pa as usize + 4].copy_from_slice(&0xDEAD_BEEFu32.to_ne_bytes());
@@ -2663,6 +2760,7 @@ mod tests {
     // -- find_all_bpf_maps tests (fix #3) --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_all_bpf_maps_returns_both_types() {
         // Reuse multi-map helper but change map1 to HASH type.
         let mut setup = setup_find_bpf_map_multi();
@@ -2689,6 +2787,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_all_bpf_maps_single_entry() {
         let (buf, cr3_pa, idr_kva, offsets) =
             setup_find_bpf_map("test.bss", BPF_MAP_TYPE_ARRAY, 64);
@@ -2724,7 +2823,7 @@ mod tests {
             btf_data_size: 0,
         };
         let buf = vec![0u8; 0x2000];
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = 0x1000 + start_kernel_map;
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
 
@@ -2742,6 +2841,7 @@ mod tests {
     // -- value_kva Option tests (fix #4) --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_value_returns_none_for_non_array_map() {
         let (buf, cr3_pa, _, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -2762,6 +2862,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_value_returns_false_for_non_array_map() {
         let (mut buf, cr3_pa, _, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -2791,6 +2892,7 @@ mod tests {
     // -- map_flags test (fix #5) --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_all_bpf_maps_reads_map_flags() {
         let (mut buf, cr3_pa, idr_kva, offsets) =
             setup_find_bpf_map("flagged.bss", BPF_MAP_TYPE_ARRAY, 64);
@@ -2835,6 +2937,7 @@ mod tests {
     // -- xa_load continue past failed entry test (fix #12) --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_all_bpf_maps_continues_past_untranslatable_entry() {
         // IDR with two entries via xa_node. First entry has an
         // untranslatable KVA (no page table mapping). Second entry
@@ -2889,10 +2992,10 @@ mod tests {
         };
 
         // Page table for map_kva only.
-        write_u64(&mut buf, pgd_pa + pgd_idx * 8, pud_pa | 0x63);
-        write_u64(&mut buf, pud_pa + pud_idx * 8, pmd_pa | 0x63);
-        write_u64(&mut buf, pmd_pa + pmd_idx * 8, pte_pa | 0x63);
-        write_u64(&mut buf, pte_pa + pte_idx * 8, map_pa | 0x63);
+        write_u64(&mut buf, pgd_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte_idx * 8, (map_pa + PTE_BASE) | 0x63);
 
         // xa_node with two entries: slot 0 = bad_kva, slot 1 = map_kva.
         buf[xa_node_pa as usize] = 0; // shift=0
@@ -2923,7 +3026,7 @@ mod tests {
         let name_pa = (map_pa + offsets.map_name as u64) as usize;
         buf[name_pa..name_pa + name.len()].copy_from_slice(name);
 
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -2941,6 +3044,7 @@ mod tests {
     // -- bounds check tests (fix #12) --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_value_rejects_out_of_bounds() {
         let (buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -2967,6 +3071,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_value_rejects_out_of_bounds() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -3062,6 +3167,7 @@ mod tests {
     // -- read_field / write_field tests --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_write_field_typed_roundtrip() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -3097,6 +3203,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn read_write_field_all_types() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -3294,6 +3401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn write_field_type_mismatch_returns_false() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
         let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
@@ -3410,6 +3518,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_all_bpf_maps_populates_btf_fields() {
         let (mut buf, cr3_pa, idr_kva, mut offsets) =
             setup_find_bpf_map("test.bss", BPF_MAP_TYPE_ARRAY, 64);
@@ -3457,6 +3566,7 @@ mod tests {
     // -- idr_next scan bound --
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn find_all_bpf_maps_respects_idr_next_bound() {
         // Build IDR with 3 slots in xa_node, but set idr_next=2.
         // Only indices 0 and 1 should be scanned.
@@ -3512,12 +3622,12 @@ mod tests {
         };
 
         // Page table for all three map KVAs.
-        write_u64(&mut buf, pgd_pa + pgd_idx * 8, pud_pa | 0x63);
-        write_u64(&mut buf, pud_pa + pud_idx * 8, pmd_pa | 0x63);
-        write_u64(&mut buf, pmd_pa + pmd_idx * 8, pte_pa | 0x63);
-        write_u64(&mut buf, pte_pa + pte1_idx * 8, map_pa | 0x63);
-        write_u64(&mut buf, pte_pa + pte2_idx * 8, map2_pa | 0x63);
-        write_u64(&mut buf, pte_pa + pte3_idx * 8, map3_pa | 0x63);
+        write_u64(&mut buf, pgd_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte1_idx * 8, (map_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte2_idx * 8, (map2_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte3_idx * 8, (map3_pa + PTE_BASE) | 0x63);
 
         // xa_node with 3 entries.
         buf[xa_node_pa as usize] = 0; // shift=0
@@ -3574,7 +3684,7 @@ mod tests {
         let name_pa = (map3_pa + offsets.map_name as u64) as usize;
         buf[name_pa..name_pa + name.len()].copy_from_slice(name);
 
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
@@ -3585,5 +3695,140 @@ mod tests {
         assert!(maps.iter().any(|m| m.name == "first.bss"));
         assert!(maps.iter().any(|m| m.name == "second.bss"));
         assert!(!maps.iter().any(|m| m.name == "third.bss"));
+    }
+
+    // -- translate_kva in kernel image / vmalloc region --
+
+    /// Build a page table mapping KVA 0xFFFF_8000_8400_5000 (KIMAGE_VADDR
+    /// region on aarch64, vmalloc range where BPF maps live).
+    ///
+    /// x86_64: 4-level walk, 4KB pages, PGD index 256.
+    /// aarch64 (64KB granule): 3-level walk, PGD index 32.
+    #[cfg(target_arch = "x86_64")]
+    fn setup_page_table_vmalloc() -> (Vec<u8>, u64, u64, u64) {
+        let kva: u64 = 0xFFFF_8000_8400_5000;
+        let pgd_idx = (kva >> 39) & 0x1FF;
+        let pud_idx = (kva >> 30) & 0x1FF;
+        let pmd_idx = (kva >> 21) & 0x1FF;
+        let pte_idx = (kva >> 12) & 0x1FF;
+
+        let pgd_pa: u64 = 0x10000;
+        let pud_pa: u64 = pgd_pa + 0x1000;
+        let pmd_pa: u64 = pud_pa + 0x1000;
+        let pte_pa: u64 = pmd_pa + 0x1000;
+        let data_pa: u64 = pte_pa + 0x1000;
+
+        let size = (data_pa + 0x1000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x63);
+        write_entry(&mut buf, pte_pa, pte_idx, (data_pa + PTE_BASE) | 0x63);
+
+        // Write known data at the target page.
+        buf[data_pa as usize..data_pa as usize + 8]
+            .copy_from_slice(&0x1234_5678_ABCD_EF00u64.to_ne_bytes());
+
+        (buf, pgd_pa, kva, data_pa)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn translate_kva_l0_index_256() {
+        let (buf, cr3_pa, kva, data_pa) = setup_page_table_l0_256();
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let pa = mem.translate_kva(cr3_pa, kva, false);
+        assert_eq!(
+            pa,
+            Some(data_pa),
+            "L0[256] walk should resolve to data page"
+        );
+        assert_eq!(mem.read_u64(pa.unwrap(), 0), 0x1234_5678_ABCD_EF00);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn translate_kva_l0_index_256_with_offset() {
+        let (buf, cr3_pa, kva, data_pa) = setup_page_table_l0_256();
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
+        assert_eq!(pa, Some(data_pa + 0x100));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn translate_kva_l0_index_256_unmapped_neighbor() {
+        let (buf, cr3_pa, kva, _) = setup_page_table_l0_256();
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let kva_257 = kva + (1u64 << 39);
+        assert_eq!(mem.translate_kva(cr3_pa, kva_257, false), None);
+    }
+
+    // -- aarch64 64KB granule vmalloc region tests --
+
+    /// Build a 3-level page table for 64KB granule mapping KVA
+    /// 0xFFFF_8000_8400_0000 (KIMAGE_VADDR region, PGD index 32).
+    #[cfg(target_arch = "aarch64")]
+    fn setup_page_table_vmalloc_64k() -> (Vec<u8>, u64, u64, u64) {
+        let kva: u64 = 0xFFFF_8000_8400_0000;
+        let pgd_idx = (kva >> 42) & 0x3F; // 32
+        let pmd_idx = (kva >> 29) & 0x1FFF; // 4
+        let pte_idx = (kva >> 16) & 0x1FFF; // 0
+
+        let pgd_pa: u64 = 0x10000;
+        let pmd_pa: u64 = 0x20000;
+        let pte_pa: u64 = 0x30000;
+        let data_pa: u64 = 0x40000;
+
+        let size = (data_pa + 0x10000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        write_entry(&mut buf, pgd_pa, pgd_idx, (pmd_pa + PTE_BASE) | 0x03);
+        write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x03);
+        write_entry(&mut buf, pte_pa, pte_idx, (data_pa + PTE_BASE) | 0x03);
+
+        buf[data_pa as usize..data_pa as usize + 8]
+            .copy_from_slice(&0x1234_5678_ABCD_EF00u64.to_ne_bytes());
+
+        (buf, pgd_pa, kva, data_pa)
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn translate_kva_vmalloc_64k() {
+        let (buf, cr3_pa, kva, data_pa) = setup_page_table_vmalloc_64k();
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let pa = mem.translate_kva(cr3_pa, kva, false);
+        assert_eq!(pa, Some(data_pa), "64KB vmalloc walk should resolve");
+        assert_eq!(mem.read_u64(pa.unwrap(), 0), 0x1234_5678_ABCD_EF00);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn translate_kva_vmalloc_64k_with_offset() {
+        let (buf, cr3_pa, kva, data_pa) = setup_page_table_vmalloc_64k();
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
+        assert_eq!(pa, Some(data_pa + 0x100));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn translate_kva_vmalloc_64k_unmapped_neighbor() {
+        let (buf, cr3_pa, kva, _) = setup_page_table_vmalloc_64k();
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let unmapped = kva + (1u64 << 42);
+        assert_eq!(mem.translate_kva(cr3_pa, unmapped, false), None);
     }
 }

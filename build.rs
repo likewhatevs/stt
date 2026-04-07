@@ -85,6 +85,7 @@ fn main() {
                     "clone",
                     "--depth=1",
                     "--single-branch",
+                    "--branch=1_36_1",
                     "https://github.com/mirror/busybox.git",
                     busybox_src.to_str().unwrap(),
                 ])

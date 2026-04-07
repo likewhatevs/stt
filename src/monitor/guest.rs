@@ -239,6 +239,7 @@ impl<'a> GuestKernel<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::symbols::START_KERNEL_MAP;
 
     // Since GuestKernel::new() requires a real vmlinux, we test the
     // methods by constructing GuestKernel manually (bypassing ::new).
@@ -246,7 +247,7 @@ mod tests {
 
     #[test]
     fn text_kva_to_pa_and_read() {
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let sym_kva = start_kernel_map + 0x1000;
         let pa = text_kva_to_pa(sym_kva);
         assert_eq!(pa, 0x1000);
@@ -294,7 +295,7 @@ mod tests {
 
     #[test]
     fn read_symbol_u32_from_guest() {
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let sym_kva = start_kernel_map + 0x100;
         // PA = 0x100
         let mut buf = vec![0u8; 0x200];
@@ -316,7 +317,7 @@ mod tests {
 
     #[test]
     fn read_symbol_u64_from_guest() {
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let sym_kva = start_kernel_map + 0x100;
         let mut buf = vec![0u8; 0x200];
         buf[0x100..0x108].copy_from_slice(&0x1234_5678_ABCD_EF00u64.to_ne_bytes());
@@ -340,7 +341,7 @@ mod tests {
 
     #[test]
     fn read_symbol_bytes_from_guest() {
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let sym_kva = start_kernel_map + 0x100;
         let mut buf = vec![0u8; 0x200];
         buf[0x100..0x105].copy_from_slice(&[1, 2, 3, 4, 5]);
@@ -381,7 +382,7 @@ mod tests {
 
     #[test]
     fn write_symbol_u64_to_guest() {
-        let start_kernel_map: u64 = 0xffff_ffff_8000_0000;
+        let start_kernel_map: u64 = START_KERNEL_MAP;
         let sym_kva = start_kernel_map + 0x100;
         let mut buf = vec![0u8; 0x200];
 

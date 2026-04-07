@@ -22,11 +22,12 @@ pub use x86_64::mptable;
 pub use aarch64::boot;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::kvm;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::topology as arch_topology;
 
 pub use topology::Topology;
 
 use anyhow::{Context, Result};
-#[cfg(target_arch = "x86_64")]
 use kvm_ioctls::VcpuExit;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -36,9 +37,54 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use vm_memory::{Bytes, GuestAddress, GuestMemory};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use crate::monitor;
+
+// ---------------------------------------------------------------------------
+// Shared hugepage memory allocation
+// ---------------------------------------------------------------------------
+
+/// Allocate guest memory backed by 2MB hugepages at the given base address.
+///
+/// Uses MmapRegionBuilder with MAP_HUGETLB to request hugepage-backed
+/// anonymous memory. Falls back to regular pages if hugepages fail.
+pub(crate) fn allocate_hugepage_memory(size: usize, base: GuestAddress) -> Result<GuestMemoryMmap> {
+    use vm_memory::mmap::{GuestRegionMmap, MmapRegionBuilder};
+
+    let flags = libc::MAP_ANONYMOUS
+        | libc::MAP_PRIVATE
+        | libc::MAP_NORESERVE
+        | libc::MAP_HUGETLB
+        | libc::MAP_HUGE_2MB;
+
+    let region = MmapRegionBuilder::new(size)
+        .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+        .with_mmap_flags(flags)
+        .with_hugetlbfs(true)
+        .build();
+
+    match region {
+        Ok(r) => {
+            eprintln!(
+                "performance_mode: allocated {} MB with 2MB hugepages",
+                size >> 20
+            );
+            let guest_region = GuestRegionMmap::new(r, base)
+                .ok_or_else(|| anyhow::anyhow!("hugepage region overflow"))?;
+            GuestMemoryMmap::from_regions(vec![guest_region])
+                .context("create guest memory from hugepage region")
+        }
+        Err(e) => {
+            eprintln!(
+                "performance_mode: WARNING: hugepage allocation failed ({e}), \
+                 falling back to regular pages",
+            );
+            GuestMemoryMmap::<()>::from_ranges(&[(base, size)])
+                .context("allocate guest memory (hugepage fallback)")
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PiMutex — priority-inheritance mutex via pthread_mutex + PTHREAD_PRIO_INHERIT
@@ -519,9 +565,28 @@ pub struct VmResult {
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Base guest physical address of DRAM.
+/// x86_64: memory starts at PA 0.
+/// aarch64: device MMIO below DRAM_START, RAM above.
+#[cfg(target_arch = "x86_64")]
+const DRAM_BASE: u64 = 0;
+
+#[cfg(target_arch = "aarch64")]
+const DRAM_BASE: u64 = kvm::DRAM_START;
+
 /// Address where initramfs is loaded in guest memory.
 #[cfg(target_arch = "x86_64")]
 const INITRD_ADDR: u64 = 0x800_0000; // 128 MB
+
+/// Compute initramfs load address at the high end of DRAM, just below
+/// the FDT. Matches Firecracker/Cloud Hypervisor placement pattern —
+/// avoids conflicts with early kernel allocations near the kernel image.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_initrd_addr(memory_mb: u32, shm_size: u64, initrd_max_size: u64) -> u64 {
+    let fdt_addr = aarch64::fdt::fdt_address(memory_mb, shm_size);
+    // Place initrd just below FDT, page-aligned.
+    (fdt_addr - initrd_max_size) & !0xFFF
+}
 
 // ---------------------------------------------------------------------------
 // VcpuThread — Cloud Hypervisor pattern with Firecracker's immediate_exit
@@ -628,15 +693,23 @@ impl SttVm {
     }
 
     /// Boot the VM, run until halt/shutdown/timeout, return captured output.
-    #[cfg(target_arch = "x86_64")]
     pub fn run(&self) -> Result<VmResult> {
         let start = Instant::now();
 
-        // Spawn initramfs resolution in parallel with KVM creation.
         let initramfs_handle = self.spawn_initramfs_resolve();
         let (vm, kernel_result) = self.create_vm_and_load_kernel()?;
-        self.setup_memory(&vm, &kernel_result, initramfs_handle)?;
-        self.setup_vcpus(&vm, kernel_result.entry)?;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.setup_memory(&vm, &kernel_result, initramfs_handle)?;
+            self.setup_vcpus(&vm, kernel_result.entry)?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.setup_memory_aarch64(&vm, &kernel_result, initramfs_handle)?;
+            self.setup_vcpus_aarch64(&vm, kernel_result.entry)?;
+        }
+
         tracing::debug!(elapsed_us = start.elapsed().as_micros(), "total_setup");
 
         let (
@@ -665,9 +738,7 @@ impl SttVm {
         )
     }
 
-    /// Create the KVM VM and load the kernel. Returns the VM and kernel
-    /// load result. Spawns the initramfs-resolve thread to run in parallel.
-    #[cfg(target_arch = "x86_64")]
+    /// Create the KVM VM and load the kernel.
     fn create_vm_and_load_kernel(&self) -> Result<(kvm::SttKvm, boot::KernelLoadResult)> {
         let t0 = Instant::now();
         let use_hugepages = self.performance_mode
@@ -713,6 +784,7 @@ impl SttVm {
         &self,
         vm: &kvm::SttKvm,
         handle: JoinHandle<Result<BaseRef>>,
+        load_addr: u64,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
         let base = handle
@@ -740,7 +812,7 @@ impl SttVm {
 
         let t0 = Instant::now();
         let (addr, size) =
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[base_bytes, &suffix], INITRD_ADDR)?;
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[base_bytes, &suffix], load_addr)?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_initramfs");
         Ok((Some(addr), Some(size)))
     }
@@ -754,7 +826,7 @@ impl SttVm {
         initramfs_handle: Option<JoinHandle<Result<BaseRef>>>,
     ) -> Result<()> {
         let (initrd_addr, initrd_size) = match initramfs_handle {
-            Some(handle) => self.join_and_load_initramfs(vm, handle)?,
+            Some(handle) => self.join_and_load_initramfs(vm, handle, INITRD_ADDR)?,
             None => (None, None),
         };
 
@@ -866,7 +938,6 @@ impl SttVm {
 
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
-    #[cfg(target_arch = "x86_64")]
     #[allow(clippy::type_complexity)]
     fn run_vm(
         &self,
@@ -886,9 +957,8 @@ impl SttVm {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
-        // Register serial EventFds with KVM's irqfd so vm-superio trigger()
-        // calls inject the corresponding IRQ into the guest. Without this the
-        // 8250 driver never receives THRE interrupts and write() hangs.
+        // Register serial EventFds with KVM's irqfd for interrupt-driven TX.
+        #[cfg(target_arch = "x86_64")]
         if !vm.split_irqchip {
             vm.vm_fd
                 .register_irqfd(com1.lock().irq_evt(), console::COM1_IRQ)
@@ -896,6 +966,15 @@ impl SttVm {
             vm.vm_fd
                 .register_irqfd(com2.lock().irq_evt(), console::COM2_IRQ)
                 .context("register COM2 irqfd")?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            vm.vm_fd
+                .register_irqfd(com1.lock().irq_evt(), kvm::SERIAL_IRQ)
+                .context("register serial irqfd")?;
+            vm.vm_fd
+                .register_irqfd(com2.lock().irq_evt(), kvm::SERIAL2_IRQ)
+                .context("register serial2 irqfd")?;
         }
 
         let kill = Arc::new(AtomicBool::new(false));
@@ -1018,8 +1097,12 @@ impl SttVm {
 
         // BSP run loop.
         eprintln!("BSP: entering run loop");
+        #[cfg(target_arch = "x86_64")]
         let (exit_code, timed_out) =
             self.run_bsp(&mut bsp, &com1, &com2, &kill, has_immediate_exit, start);
+        #[cfg(target_arch = "aarch64")]
+        let (exit_code, timed_out) =
+            self.run_bsp_aarch64(&mut bsp, &com1, &com2, &kill, has_immediate_exit, start);
         bsp_done.store(true, Ordering::Release);
         eprintln!("BSP: exited run loop, code={exit_code} timed_out={timed_out}");
 
@@ -1043,7 +1126,6 @@ impl SttVm {
 
     /// Spawn AP vCPU threads. Each thread optionally pins itself to a
     /// host CPU from `pin_targets` (indexed by AP order, 0-based).
-    #[cfg(target_arch = "x86_64")]
     fn spawn_ap_threads(
         &self,
         vcpus: Vec<kvm_ioctls::VcpuFd>,
@@ -1079,7 +1161,10 @@ impl SttVm {
                     if rt {
                         set_rt_priority(1, &format!("vCPU {}", i + 1));
                     }
+                    #[cfg(target_arch = "x86_64")]
                     vcpu_run_loop(&mut vcpu, &com1_clone, &com2_clone, &kill_clone);
+                    #[cfg(target_arch = "aarch64")]
+                    vcpu_run_loop_aarch64(&mut vcpu, &com1_clone, &com2_clone, &kill_clone);
                     exited_clone.store(true, Ordering::Release);
                     vcpu
                 })
@@ -1095,7 +1180,6 @@ impl SttVm {
     }
 
     /// Start the monitor thread if vmlinux is available.
-    #[cfg(target_arch = "x86_64")]
     fn start_monitor(
         &self,
         vm: &kvm::SttKvm,
@@ -1113,7 +1197,10 @@ impl SttVm {
             return Ok(None);
         };
 
-        let host_base = vm.guest_mem.get_host_address(GuestAddress(0)).unwrap();
+        let host_base = vm
+            .guest_mem
+            .get_host_address(GuestAddress(DRAM_BASE))
+            .unwrap();
         let mem_size = (self.memory_mb as u64) << 20;
         let mem = monitor::reader::GuestMem::new(host_base, mem_size);
         let num_cpus = self.topology.total_cpus();
@@ -1211,7 +1298,6 @@ impl SttVm {
     /// 1. Poll `find_map` until the scheduler's BPF maps are discoverable
     /// 2. Poll the SHM ring for MSG_TYPE_SCENARIO_START
     /// 3. Write the crash value
-    #[cfg(target_arch = "x86_64")]
     fn start_bpf_map_write(
         &self,
         vm: &kvm::SttKvm,
@@ -1225,7 +1311,10 @@ impl SttVm {
             return Ok(None);
         };
 
-        let host_base = vm.guest_mem.get_host_address(GuestAddress(0)).unwrap();
+        let host_base = vm
+            .guest_mem
+            .get_host_address(GuestAddress(DRAM_BASE))
+            .unwrap();
         let mem_size = (self.memory_mb as u64) << 20;
         let mem = monitor::reader::GuestMem::new(host_base, mem_size);
         let kill_clone = kill.clone();
@@ -1430,7 +1519,6 @@ impl SttVm {
     }
 
     /// Shutdown threads and collect output.
-    #[cfg(target_arch = "x86_64")]
     #[allow(clippy::too_many_arguments)]
     fn collect_results(
         &self,
@@ -1479,7 +1567,7 @@ impl SttVm {
 
         let (shm_data, stimulus_events) = if self.shm_size > 0 {
             let mem_size = (self.memory_mb as u64) << 20;
-            let shm_base = mem_size - self.shm_size;
+            let shm_base = DRAM_BASE + mem_size - self.shm_size;
             let shm_size = self.shm_size as usize;
             let mut shm_buf = vec![0u8; shm_size];
             vm.guest_mem
@@ -1524,12 +1612,338 @@ impl SttVm {
 }
 
 // ---------------------------------------------------------------------------
+// aarch64 run path — MMIO-based serial, FDT instead of ACPI
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+impl SttVm {
+    fn setup_memory_aarch64(
+        &self,
+        vm: &kvm::SttKvm,
+        _kernel_result: &boot::KernelLoadResult,
+        initramfs_handle: Option<JoinHandle<Result<BaseRef>>>,
+    ) -> Result<()> {
+        // Build initramfs data, then place it at the high end of DRAM
+        // (just below FDT) to avoid conflicts with early kernel allocations.
+        let (initrd_addr, initrd_size) = match initramfs_handle {
+            Some(handle) => {
+                let base = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
+                let base_bytes: &[u8] = base.as_ref();
+                let enable_refs: Vec<&str> =
+                    self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
+                let disable_refs: Vec<&str> =
+                    self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
+                let suffix = initramfs::build_suffix_full(
+                    base_bytes.len(),
+                    &self.run_args,
+                    &self.sched_args,
+                    &enable_refs,
+                    &disable_refs,
+                )?;
+                // Gzip-compress the cpio data. The kernel's initramfs
+                // handler tries decompression first, so this avoids the
+                // "invalid magic" fallback path and its free_initrd_mem
+                // edge cases on some kernel builds.
+                let compressed = {
+                    use flate2::write::GzEncoder;
+                    use std::io::Write;
+                    let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    enc.write_all(base_bytes).context("gzip initramfs base")?;
+                    enc.write_all(&suffix).context("gzip initramfs suffix")?;
+                    enc.finish().context("finish gzip initramfs")?
+                };
+                let total_size = compressed.len() as u64;
+                let load_addr = aarch64_initrd_addr(self.memory_mb, self.shm_size, total_size);
+                initramfs::load_initramfs_parts(&vm.guest_mem, &[&compressed], load_addr)?;
+                (Some(load_addr), Some(total_size as u32))
+            }
+            None => (None, None),
+        };
+
+        let mut cmdline = concat!(
+            "console=ttyS0 earlycon=uart,mmio,0x09000000 ",
+            "nomodules mitigations=off ",
+            "random.trust_cpu=on swiotlb=noforce ",
+            "pci=off reboot=k panic=-1 nokaslr lockdown=none ",
+            "sysctl.kernel.unprivileged_bpf_disabled=0 ",
+            "kfence.sample_interval=0",
+        )
+        .to_string();
+        if self.init_binary.is_some() {
+            cmdline.push_str(" rdinit=/init");
+        }
+        if self.shm_size > 0 {
+            let mem_size = (self.memory_mb as u64) << 20;
+            let shm_base = kvm::DRAM_START + mem_size - self.shm_size;
+            cmdline.push_str(&format!(
+                " STT_SHM_BASE={:#x} STT_SHM_SIZE={:#x}",
+                shm_base, self.shm_size
+            ));
+        }
+        if !self.cmdline_extra.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(&self.cmdline_extra);
+        }
+
+        let t0 = Instant::now();
+        // Validate length only — aarch64 kernel reads cmdline from FDT
+        // /chosen/bootargs, not from a fixed memory address.
+        boot::validate_cmdline(&cmdline)?;
+
+        // Generate and load the FDT.
+        let fdt_addr = aarch64::fdt::fdt_address(self.memory_mb, self.shm_size);
+        let mpidrs =
+            aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
+        let dtb = aarch64::fdt::create_fdt(
+            &mpidrs,
+            self.memory_mb,
+            &cmdline,
+            initrd_addr,
+            initrd_size,
+            self.shm_size,
+        )
+        .context("create FDT")?;
+        vm.guest_mem
+            .write_slice(&dtb, GuestAddress(fdt_addr))
+            .context("write FDT to guest memory")?;
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            fdt_addr,
+            fdt_len = dtb.len(),
+            "cmdline_fdt",
+        );
+
+        // Initialize SHM ring buffer.
+        let t0 = Instant::now();
+        if self.shm_size > 0 {
+            let mem_size = (self.memory_mb as u64) << 20;
+            let shm_base = kvm::DRAM_START + mem_size - self.shm_size;
+            let shm_size = self.shm_size as usize;
+            let header = shm_ring::ShmRingHeader {
+                magic: shm_ring::SHM_RING_MAGIC,
+                version: shm_ring::SHM_RING_VERSION,
+                capacity: (shm_size - shm_ring::HEADER_SIZE) as u32,
+                _pad: 0,
+                write_ptr: 0,
+                read_ptr: 0,
+                drops: 0,
+            };
+            vm.guest_mem
+                .write_slice(
+                    zerocopy::IntoBytes::as_bytes(&header),
+                    GuestAddress(shm_base),
+                )
+                .context("write SHM header")?;
+        }
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "shm_ring_init");
+
+        Ok(())
+    }
+
+    fn setup_vcpus_aarch64(&self, vm: &kvm::SttKvm, kernel_entry: u64) -> Result<()> {
+        let t0 = Instant::now();
+        let fdt_addr = aarch64::fdt::fdt_address(self.memory_mb, self.shm_size);
+        boot::setup_regs(&vm.vcpus[0], kernel_entry, fdt_addr)?;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "bsp_setup");
+        // APs start powered off via PSCI — no register setup needed.
+        Ok(())
+    }
+
+    fn run_bsp_aarch64(
+        &self,
+        bsp: &mut kvm_ioctls::VcpuFd,
+        com1: &Arc<PiMutex<console::Serial>>,
+        com2: &Arc<PiMutex<console::Serial>>,
+        kill: &Arc<AtomicBool>,
+        has_immediate_exit: bool,
+        start: Instant,
+    ) -> (i32, bool) {
+        let timeout = self.timeout;
+        let mut exit_code: i32 = -1;
+
+        loop {
+            if start.elapsed() > timeout {
+                return (exit_code, true);
+            }
+            if kill.load(Ordering::Acquire) {
+                break;
+            }
+
+            match bsp.run() {
+                Ok(VcpuExit::MmioWrite(addr, data)) => {
+                    if dispatch_mmio_write(com1, com2, addr, data) {
+                        exit_code = 0;
+                        break;
+                    }
+                }
+                Ok(VcpuExit::MmioRead(addr, data)) => {
+                    dispatch_mmio_read(com1, com2, addr, data);
+                }
+                Ok(VcpuExit::Hlt) => {
+                    exit_code = 0;
+                    break;
+                }
+                Ok(VcpuExit::Shutdown) => {
+                    exit_code = 0;
+                    break;
+                }
+                Ok(VcpuExit::SystemEvent(event_type, _)) => {
+                    if event_type == KVM_SYSTEM_EVENT_SHUTDOWN
+                        || event_type == KVM_SYSTEM_EVENT_RESET
+                    {
+                        exit_code = 0;
+                        break;
+                    }
+                }
+                Ok(VcpuExit::FailEntry(reason, _cpu)) => {
+                    tracing::error!(reason, "BSP VM entry failed");
+                    break;
+                }
+                Ok(VcpuExit::InternalError) => {
+                    tracing::error!("BSP internal error");
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    if e.errno() == libc::EAGAIN || e.errno() == libc::EINTR {
+                        if has_immediate_exit {
+                            bsp.set_kvm_immediate_exit(0);
+                        }
+                        continue;
+                    }
+                    tracing::error!(%e, "BSP run failed");
+                    break;
+                }
+            }
+        }
+
+        (exit_code, false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// aarch64 MMIO dispatch — serial over MMIO
+// ---------------------------------------------------------------------------
+
+/// Dispatch an MMIO write to serial devices.
+/// Returns `true` if the caller should exit (shutdown detected).
+#[cfg(target_arch = "aarch64")]
+fn dispatch_mmio_write(
+    com1: &PiMutex<console::Serial>,
+    com2: &PiMutex<console::Serial>,
+    addr: u64,
+    data: &[u8],
+) -> bool {
+    if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL_MMIO_BASE) {
+        if let Some(&byte) = data.first() {
+            com1.lock().inner_write(offset, byte);
+        }
+    } else if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL2_MMIO_BASE)
+        && let Some(&byte) = data.first()
+    {
+        com2.lock().inner_write(offset, byte);
+    }
+    false
+}
+
+/// Dispatch an MMIO read from serial devices.
+#[cfg(target_arch = "aarch64")]
+fn dispatch_mmio_read(
+    com1: &PiMutex<console::Serial>,
+    com2: &PiMutex<console::Serial>,
+    addr: u64,
+    data: &mut [u8],
+) {
+    if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL_MMIO_BASE) {
+        if let Some(first) = data.first_mut() {
+            *first = com1.lock().inner_read(offset);
+        }
+    } else if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL2_MMIO_BASE) {
+        if let Some(first) = data.first_mut() {
+            *first = com2.lock().inner_read(offset);
+        }
+    } else {
+        // Unknown MMIO: return 0xFF for reads (missing device).
+        for b in data.iter_mut() {
+            *b = 0xff;
+        }
+    }
+}
+
+/// Compute register offset for an MMIO address within a serial region.
+#[cfg(target_arch = "aarch64")]
+fn mmio_serial_offset(addr: u64, base: u64) -> Option<u8> {
+    let size = kvm::SERIAL_MMIO_SIZE;
+    if addr >= base && addr < base + size {
+        Some((addr - base) as u8)
+    } else {
+        None
+    }
+}
+
+/// Per-vCPU KVM_RUN loop for AP threads (aarch64).
+#[cfg(target_arch = "aarch64")]
+fn vcpu_run_loop_aarch64(
+    vcpu: &mut kvm_ioctls::VcpuFd,
+    com1: &Arc<PiMutex<console::Serial>>,
+    com2: &Arc<PiMutex<console::Serial>>,
+    kill: &Arc<AtomicBool>,
+) {
+    loop {
+        if kill.load(Ordering::Acquire) {
+            break;
+        }
+
+        match vcpu.run() {
+            Ok(VcpuExit::MmioWrite(addr, data)) => {
+                if dispatch_mmio_write(com1, com2, addr, data) {
+                    kill.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            Ok(VcpuExit::MmioRead(addr, data)) => {
+                dispatch_mmio_read(com1, com2, addr, data);
+            }
+            Ok(VcpuExit::Hlt) => {
+                if kill.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            Ok(VcpuExit::Shutdown) => break,
+            Ok(VcpuExit::SystemEvent(event_type, _)) => {
+                if event_type == KVM_SYSTEM_EVENT_SHUTDOWN || event_type == KVM_SYSTEM_EVENT_RESET {
+                    break;
+                }
+            }
+            Ok(VcpuExit::FailEntry(_, _)) | Ok(VcpuExit::InternalError) => break,
+            Ok(_) => {}
+            Err(e) => {
+                if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN {
+                    vcpu.set_kvm_immediate_exit(0);
+                    if kill.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                if kill.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        }
+
+        if kill.load(Ordering::Acquire) {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // I/O dispatch — shared between BSP and AP run loops
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "x86_64")]
 const KVM_SYSTEM_EVENT_SHUTDOWN: u32 = 1;
-#[cfg(target_arch = "x86_64")]
 const KVM_SYSTEM_EVENT_RESET: u32 = 2;
 
 /// I8042 ports and commands — minimal emulation for x86 guest reboot.
@@ -1712,7 +2126,38 @@ fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
     if candidate.exists() {
         return Some(candidate);
     }
-    // TODO: aarch64 kernel image path heuristics
+    // kernel_path is typically <root>/arch/arm64/boot/Image
+    if let Ok(root) = dir.join("../../..").canonicalize() {
+        let candidate = root.join("vmlinux");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    // Distro kernel: extract version from vmlinuz-<version> and check
+    // /boot/vmlinux-<version> or /lib/modules/<version>/build/vmlinux.
+    if let Some(name) = kernel_path.file_name().and_then(|n| n.to_str()) {
+        let version = name.strip_prefix("vmlinuz-").unwrap_or(name);
+        let boot = PathBuf::from(format!("/boot/vmlinux-{version}"));
+        if boot.exists() {
+            return Some(boot);
+        }
+        let modules = PathBuf::from(format!("/lib/modules/{version}/build/vmlinux"));
+        if modules.exists() {
+            return Some(modules);
+        }
+    }
+    // kernel_path may be /lib/modules/<version>/vmlinuz — extract version
+    // from the parent directory name.
+    if let Some(parent_name) = dir.file_name().and_then(|n| n.to_str()) {
+        let build = dir.join("build/vmlinux");
+        if build.exists() {
+            return Some(build);
+        }
+        let boot = PathBuf::from(format!("/boot/vmlinux-{parent_name}"));
+        if boot.exists() {
+            return Some(boot);
+        }
+    }
     None
 }
 
@@ -1800,10 +2245,9 @@ impl SttVmBuilder {
         {
             self.kernel = Some(dir.join("arch/x86/boot/bzImage"));
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
         {
-            let _ = dir;
-            todo!("aarch64: resolve kernel image path");
+            self.kernel = Some(dir.join("arch/arm64/boot/Image"));
         }
         self
     }
@@ -2952,5 +3396,84 @@ mod tests {
         // This test always passes; it exercises the warning path.
         set_rt_priority(1, "test-thread");
         // If we get here, set_rt_priority didn't panic.
+    }
+
+    // -- aarch64 boot tests --
+
+    /// Find an aarch64 kernel suitable for boot tests.
+    /// Accepts both raw Image and gzip-compressed vmlinuz — load_kernel
+    /// decompresses transparently.
+    #[cfg(target_arch = "aarch64")]
+    fn find_aarch64_image() -> Option<std::path::PathBuf> {
+        crate::find_kernel()
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn boot_kernel_produces_output_aarch64() {
+        let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(kernel) = find_aarch64_image() else {
+            eprintln!("skipping: no aarch64 Image found (only compressed vmlinuz available)");
+            return;
+        };
+
+        let vm = SttVm::builder()
+            .kernel(&kernel)
+            .topology(1, 1, 1)
+            .memory_mb(256)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let result = vm.run().unwrap();
+        assert!(
+            result.stderr.contains("Linux") || result.stderr.contains("Booting"),
+            "kernel console should contain boot messages, got: {}",
+            &result.stderr[..result.stderr.len().min(200)],
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn boot_kernel_smp_topology_aarch64() {
+        let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(kernel) = find_aarch64_image() else {
+            eprintln!("skipping: no aarch64 Image found");
+            return;
+        };
+
+        let vm = SttVm::builder()
+            .kernel(&kernel)
+            .topology(2, 2, 1) // 4 CPUs
+            .memory_mb(256)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let result = vm.run().unwrap();
+        assert!(!result.stderr.is_empty(), "no console output from SMP boot");
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_kvm_has_immediate_exit() {
+        let topo = Topology {
+            sockets: 1,
+            cores_per_socket: 1,
+            threads_per_core: 1,
+        };
+        let vm = kvm::SttKvm::new(topo, 64).unwrap();
+        assert!(
+            vm.has_immediate_exit,
+            "KVM_CAP_IMMEDIATE_EXIT should be available on modern kernels"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn builder_kernel_dir_resolves_image() {
+        let b = SttVmBuilder::default().kernel_dir("/some/linux");
+        assert_eq!(
+            b.kernel.as_deref(),
+            Some(std::path::Path::new("/some/linux/arch/arm64/boot/Image"))
+        );
     }
 }

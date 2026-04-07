@@ -110,11 +110,16 @@ impl GuestMem {
     }
 
     /// Translate a kernel virtual address to guest physical address via
-    /// page table walk. Supports both 4-level (PGD -> PUD -> PMD -> PTE)
-    /// and 5-level (PML5 -> P4D -> PUD -> PMD -> PTE) paging.
+    /// page table walk.
+    ///
+    /// x86-64: supports 4-level (PGD -> PUD -> PMD -> PTE) and 5-level
+    /// (PML5 -> P4D -> PUD -> PMD -> PTE) paging.
+    ///
+    /// aarch64: 4-level walk with AArch64 translation table descriptors
+    /// (4KB granule, 48-bit VA). `l5` is ignored.
     ///
     /// `cr3_pa` is the physical address of the top-level page table.
-    /// `l5` selects 5-level paging (LA57); use `resolve_pgtable_l5`
+    /// `l5` selects 5-level paging (x86 LA57); use `resolve_pgtable_l5`
     /// to detect the guest's mode at runtime.
     /// Returns `None` if any level is not present or the address is
     /// out of guest memory bounds.
@@ -126,7 +131,15 @@ impl GuestMem {
         }
     }
 
-    /// 4-level page table walk: CR3 -> PGD -> PUD -> PMD -> PTE.
+    /// 4-level page table walk.
+    ///
+    /// x86-64: CR3 -> PGD -> PUD -> PMD -> PTE. Uses PS bit (bit 7) for
+    /// huge pages, OA in bits [51:12].
+    ///
+    /// aarch64: TTBR -> L0/PGD -> L1/PUD -> L2/PMD -> L3/PTE. Uses
+    /// descriptor type bits [1:0] (0b11 = table/page, 0b01 = block),
+    /// OA in bits [47:12].
+    #[cfg(target_arch = "x86_64")]
     fn walk_4level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
         const PRESENT: u64 = 1;
         const PS: u64 = 1 << 7;
@@ -177,7 +190,82 @@ impl GuestMem {
         Some((ptee & ADDR_MASK) | page_off)
     }
 
+    /// aarch64 page table walk (64KB granule, 3-level, 48-bit VA).
+    ///
+    /// With 64KB pages and 48-bit VA, the kernel uses 3 levels:
+    ///   PGD: bits [47:42] = 6 bits, 64 entries
+    ///   PMD: bits [41:29] = 13 bits, 8192 entries
+    ///   PTE: bits [28:16] = 13 bits, 8192 entries
+    ///   page offset: bits [15:0] = 16 bits
+    ///
+    /// Descriptor format (ARMv8 D5.3):
+    /// - bits [1:0] = 0b00: invalid
+    /// - bits [1:0] = 0b01: block descriptor (PGD/PMD levels)
+    /// - bits [1:0] = 0b11: table descriptor (PGD/PMD) or page (PTE)
+    /// - bits [47:16]: output address for 64KB granule
+    ///
+    /// Page table entries contain guest physical addresses (GPAs). Since
+    /// GuestMem is mapped at DRAM_START, all GPAs are adjusted by
+    /// subtracting DRAM_START to produce offsets into the memory region.
+    #[cfg(target_arch = "aarch64")]
+    fn walk_4level(&self, ttbr_pa: u64, kva: u64) -> Option<u64> {
+        use crate::vmm::kvm::DRAM_START;
+
+        const VALID: u64 = 1;
+        const TABLE: u64 = 0b11;
+        const BLOCK: u64 = 0b01;
+        const DESC_MASK: u64 = 0b11;
+        // OA mask for 64KB granule: bits [47:16]
+        const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_0000;
+
+        let to_offset = |gpa: u64| -> u64 { gpa.wrapping_sub(DRAM_START) };
+
+        // 3-level walk for 64KB granule, 48-bit VA.
+        let pgd_idx = (kva >> 42) & 0x3F; // bits [47:42], 6 bits
+        let pmd_idx = (kva >> 29) & 0x1FFF; // bits [41:29], 13 bits
+        let pte_idx = (kva >> 16) & 0x1FFF; // bits [28:16], 13 bits
+        let page_off = kva & 0xFFFF; // bits [15:0], 16 bits
+
+        // PGD — ttbr_pa is already a GuestMem offset.
+        let pgd_off = (ttbr_pa & ADDR_MASK) + pgd_idx * 8;
+        let pgde = self.read_u64(pgd_off, 0);
+        if pgde & VALID == 0 {
+            return None;
+        }
+        // PGD block: 4TB region (unlikely but spec-allowed)
+        if pgde & DESC_MASK == BLOCK {
+            let base = pgde & 0x0000_FC00_0000_0000;
+            return Some(to_offset(base) | (kva & 0x3FF_FFFF_FFFF));
+        }
+
+        // PMD
+        let pmd_off = to_offset(pgde & ADDR_MASK) + pmd_idx * 8;
+        let pmde = self.read_u64(pmd_off, 0);
+        if pmde & VALID == 0 {
+            return None;
+        }
+        // PMD block: 512MB region
+        if pmde & DESC_MASK == BLOCK {
+            let base = pmde & 0x0000_FFFF_E000_0000;
+            return Some(to_offset(base) | (kva & 0x1FFF_FFFF));
+        }
+
+        // PTE — page descriptor (bits [1:0] = 0b11)
+        let pte_off = to_offset(pmde & ADDR_MASK) + pte_idx * 8;
+        let ptee = self.read_u64(pte_off, 0);
+        if ptee & VALID == 0 {
+            return None;
+        }
+        if ptee & DESC_MASK != TABLE {
+            return None;
+        }
+
+        Some(to_offset(ptee & ADDR_MASK) | page_off)
+    }
+
     /// 5-level page table walk: CR3 -> PML5 -> P4D -> PUD -> PMD -> PTE.
+    /// x86-64 only; aarch64 does not use 5-level paging.
+    #[cfg(target_arch = "x86_64")]
     fn walk_5level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
         const PRESENT: u64 = 1;
         const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -194,6 +282,12 @@ impl GuestMem {
         // P4D is the next level; continue with 4-level walk from there.
         let p4d_pa = pml5e & ADDR_MASK;
         self.walk_4level(p4d_pa, kva)
+    }
+
+    /// aarch64 stub: 5-level paging is not used.
+    #[cfg(target_arch = "aarch64")]
+    fn walk_5level(&self, _cr3_pa: u64, _kva: u64) -> Option<u64> {
+        None
     }
 
     /// Guest memory size in bytes.

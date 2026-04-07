@@ -181,7 +181,7 @@ impl SttKvm {
         // Allocate guest memory
         let mem_size = (memory_mb as u64) << 20;
         let guest_mem = if use_hugepages {
-            Self::allocate_hugepage_memory(mem_size as usize)?
+            crate::vmm::allocate_hugepage_memory(mem_size as usize, GuestAddress(0))?
         } else {
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mem_size as usize)])
                 .context("allocate guest memory")?
@@ -234,47 +234,6 @@ impl SttKvm {
             has_immediate_exit,
             split_irqchip,
         })
-    }
-
-    /// Allocate guest memory backed by 2MB hugepages.
-    ///
-    /// Uses MmapRegionBuilder with MAP_HUGETLB to request hugepage-backed
-    /// anonymous memory. Falls back to regular pages if hugepages fail.
-    fn allocate_hugepage_memory(size: usize) -> Result<GuestMemoryMmap> {
-        use vm_memory::mmap::{GuestRegionMmap, MmapRegionBuilder};
-
-        let flags = libc::MAP_ANONYMOUS
-            | libc::MAP_PRIVATE
-            | libc::MAP_NORESERVE
-            | libc::MAP_HUGETLB
-            | libc::MAP_HUGE_2MB;
-
-        let region = MmapRegionBuilder::new(size)
-            .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
-            .with_mmap_flags(flags)
-            .with_hugetlbfs(true)
-            .build();
-
-        match region {
-            Ok(r) => {
-                eprintln!(
-                    "performance_mode: allocated {} MB with 2MB hugepages",
-                    size >> 20
-                );
-                let guest_region = GuestRegionMmap::new(r, GuestAddress(0))
-                    .ok_or_else(|| anyhow::anyhow!("hugepage region overflow"))?;
-                GuestMemoryMmap::from_regions(vec![guest_region])
-                    .context("create guest memory from hugepage region")
-            }
-            Err(e) => {
-                eprintln!(
-                    "performance_mode: WARNING: hugepage allocation failed ({e}), \
-                     falling back to regular pages",
-                );
-                GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), size)])
-                    .context("allocate guest memory (hugepage fallback)")
-            }
-        }
     }
 }
 

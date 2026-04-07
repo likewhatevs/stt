@@ -71,7 +71,7 @@ fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
     DEFAULT_HZ
 }
 
-/// Locate the vmlinux ELF from a kernel image (bzImage) path.
+/// Locate the vmlinux ELF from a kernel image path.
 /// Mirrors the logic in `vmm::find_vmlinux`.
 fn find_vmlinux_from_kernel(kernel_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let dir = kernel_path.parent()?;
@@ -79,7 +79,7 @@ fn find_vmlinux_from_kernel(kernel_path: &std::path::Path) -> Option<std::path::
     if candidate.exists() {
         return Some(candidate);
     }
-    // <root>/arch/x86/boot/bzImage -> <root>/vmlinux
+    // <root>/arch/{x86/boot,arm64/boot}/Image -> <root>/vmlinux
     if let Ok(root) = dir.join("../../..").canonicalize() {
         let candidate = root.join("vmlinux");
         if candidate.exists() {
