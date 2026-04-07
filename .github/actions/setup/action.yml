@@ -43,12 +43,18 @@ runs:
           autoconf \
           automake \
           libtool \
-          gettext
+          gettext \
+          libelf-dev \
+          libcap-dev \
+          binutils-dev \
+          zlib1g-dev
         sudo apt-get install -y linux-headers-$(uname -r) || true
         sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
         sudo update-alternatives --set clang /usr/bin/clang-20
         sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-20 200
         sudo update-alternatives --set llvm-strip /usr/bin/llvm-strip-20
+        sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-20 200
+        sudo update-alternatives --set llvm-config /usr/bin/llvm-config-20
 
     - name: Build and install bpftool
       shell: bash
