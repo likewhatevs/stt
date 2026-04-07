@@ -1331,8 +1331,8 @@ fn validate_kernel_tree(path: &std::path::Path) -> Result<()> {
     if !path.join("Makefile").exists() {
         anyhow::bail!("{}: not a kernel tree (no Makefile)", path.display());
     }
-    if !path.join("arch/x86").exists() {
-        anyhow::bail!("{}: not a kernel tree (no arch/x86/)", path.display());
+    if !path.join("kernel").exists() {
+        anyhow::bail!("{}: not a kernel tree (no kernel/)", path.display());
     }
     Ok(())
 }
@@ -2828,14 +2828,14 @@ mod tests {
         let _ = std::fs::write(dir.join("Makefile"), "");
         let r = validate_kernel_tree(&dir);
         assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("no arch/x86"));
+        assert!(r.unwrap_err().to_string().contains("no kernel/"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn validate_kernel_tree_valid() {
         let dir = std::env::temp_dir().join("stt-test-valid-tree");
-        let _ = std::fs::create_dir_all(dir.join("arch/x86"));
+        let _ = std::fs::create_dir_all(dir.join("kernel"));
         let _ = std::fs::write(dir.join("Makefile"), "");
         let r = validate_kernel_tree(&dir);
         assert!(r.is_ok());
