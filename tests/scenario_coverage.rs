@@ -230,6 +230,28 @@ fn cover_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::stress::custom_cgroup_cpuset_crossllc_race(ctx)
 }
 
+// -- performance --
+
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_cache_pressure_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+    stt::scenario::performance::custom_cache_pressure_imbalance(ctx)
+}
+
+#[stt_test(sockets = 2, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_cache_yield_wake_affine(ctx: &Ctx) -> Result<VerifyResult> {
+    stt::scenario::performance::custom_cache_yield_wake_affine(ctx)
+}
+
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<VerifyResult> {
+    stt::scenario::performance::custom_cache_pipe_io_compute_imbalance(ctx)
+}
+
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_fanout_wake(ctx: &Ctx) -> Result<VerifyResult> {
+    stt::scenario::performance::custom_fanout_wake(ctx)
+}
+
 // -- watchdog timeout overwrite --
 
 #[stt_test(

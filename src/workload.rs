@@ -80,6 +80,14 @@ pub enum WorkType {
         size_kb: usize,
         burst_iters: u64,
     },
+    /// 1:N fan-out wake pattern (schbench-style). One messenger per group
+    /// does CPU work then wakes N receivers via FUTEX_WAKE. Receivers
+    /// measure wake-to-run latency. Requires num_workers divisible by
+    /// (fan_out + 1).
+    FutexFanOut {
+        fan_out: usize,
+        spin_iters: u64,
+    },
 }
 
 impl WorkType {
@@ -94,6 +102,7 @@ impl WorkType {
         "CachePressure",
         "CacheYield",
         "CachePipe",
+        "FutexFanOut",
     ];
 
     #[allow(dead_code)]
@@ -109,6 +118,7 @@ impl WorkType {
             WorkType::CachePressure { .. } => "CachePressure",
             WorkType::CacheYield { .. } => "CacheYield",
             WorkType::CachePipe { .. } => "CachePipe",
+            WorkType::FutexFanOut { .. } => "FutexFanOut",
         }
     }
 
@@ -136,21 +146,34 @@ impl WorkType {
                 size_kb: 32,
                 burst_iters: 1024,
             }),
+            "FutexFanOut" => Some(WorkType::FutexFanOut {
+                fan_out: 4,
+                spin_iters: 1024,
+            }),
             _ => None,
         }
     }
 
-    /// Whether this work type requires an even number of workers (paired communication).
-    pub fn requires_even_workers(&self) -> bool {
-        matches!(
-            self,
-            WorkType::PipeIo { .. } | WorkType::FutexPingPong { .. } | WorkType::CachePipe { .. }
-        )
+    /// Worker group size for this work type, or None if ungrouped.
+    ///
+    /// `num_workers` must be divisible by this value. Paired types return 2,
+    /// fan-out returns fan_out + 1 (1 messenger + N receivers).
+    pub fn worker_group_size(&self) -> Option<usize> {
+        match self {
+            WorkType::PipeIo { .. }
+            | WorkType::FutexPingPong { .. }
+            | WorkType::CachePipe { .. } => Some(2),
+            WorkType::FutexFanOut { fan_out, .. } => Some(fan_out + 1),
+            _ => None,
+        }
     }
 
     /// Whether this work type needs a pre-fork shared memory region (MAP_SHARED mmap).
     pub fn needs_shared_mem(&self) -> bool {
-        matches!(self, WorkType::FutexPingPong { .. })
+        matches!(
+            self,
+            WorkType::FutexPingPong { .. } | WorkType::FutexFanOut { .. }
+        )
     }
 
     /// Whether this work type allocates a per-worker cache buffer post-fork.
@@ -187,6 +210,7 @@ impl WorkProgram {
         "cache_yield",
         "cache_pipe",
         "futex",
+        "fanout",
     ];
 
     /// CPU-only spin loop.
@@ -251,6 +275,14 @@ impl WorkProgram {
         WorkProgram::Single(WorkType::FutexPingPong { spin_iters: 1024 })
     }
 
+    /// 1:N fan-out wake (schbench-style).
+    pub const fn fanout() -> Self {
+        WorkProgram::Single(WorkType::FutexFanOut {
+            fan_out: 4,
+            spin_iters: 1024,
+        })
+    }
+
     /// Resolve a preset name to a WorkProgram.
     pub fn from_name(s: &str) -> Option<WorkProgram> {
         match s {
@@ -264,6 +296,7 @@ impl WorkProgram {
             "cache_yield" => Some(Self::cache_yield()),
             "cache_pipe" => Some(Self::cache_pipe()),
             "futex" => Some(Self::futex()),
+            "fanout" => Some(Self::fanout()),
             _ => None,
         }
     }
@@ -273,11 +306,6 @@ impl WorkProgram {
         match self {
             WorkProgram::Single(wt) => *wt,
         }
-    }
-
-    /// Whether the resolved WorkType requires even workers.
-    pub fn requires_even_workers(&self) -> bool {
-        self.resolve().requires_even_workers()
     }
 }
 
@@ -400,7 +428,7 @@ pub fn set_repro_mode(v: bool) {
 pub struct WorkloadHandle {
     children: Vec<(u32, std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
     started: bool,
-    /// Shared mmap regions for FutexPingPong (one per worker pair). Unmapped on drop.
+    /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
 }
 
@@ -418,10 +446,13 @@ impl WorkloadHandle {
             WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
         );
         let needs_futex = config.work_type.needs_shared_mem();
-        if config.work_type.requires_even_workers() && !config.num_workers.is_multiple_of(2) {
+        if let Some(group_size) = config.work_type.worker_group_size()
+            && (config.num_workers == 0 || !config.num_workers.is_multiple_of(group_size))
+        {
             anyhow::bail!(
-                "{} requires even num_workers, got {}",
+                "{} requires num_workers divisible by {}, got {}",
                 config.work_type.name(),
+                group_size,
                 config.num_workers
             );
         }
@@ -443,12 +474,13 @@ impl WorkloadHandle {
             }
         }
 
-        // For FutexPingPong, allocate one shared futex word per worker pair
-        // via MAP_SHARED|MAP_ANONYMOUS so both sides of the fork see the same
-        // physical page.
+        // For FutexPingPong/FutexFanOut, allocate one shared futex word per
+        // worker group via MAP_SHARED|MAP_ANONYMOUS so all members of the
+        // fork see the same physical page.
         let mut futex_ptrs: Vec<*mut u32> = Vec::new();
+        let futex_group_size = config.work_type.worker_group_size().unwrap_or(2);
         if needs_futex {
-            for _ in 0..config.num_workers / 2 {
+            for _ in 0..config.num_workers / futex_group_size {
                 let ptr = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
@@ -487,11 +519,11 @@ impl WorkloadHandle {
                 None
             };
 
-            // Futex pointer for this worker (FutexPingPong only).
+            // Futex pointer for this worker (FutexPingPong/FutexFanOut).
             let worker_futex: Option<(*mut u32, bool)> = if needs_futex {
-                let pair_idx = i / 2;
-                let is_first = i % 2 == 0;
-                Some((futex_ptrs[pair_idx], is_first))
+                let group_idx = i / futex_group_size;
+                let is_first = i % futex_group_size == 0;
+                Some((futex_ptrs[group_idx], is_first))
             } else {
                 None
             };
@@ -1039,6 +1071,76 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::FutexFanOut {
+                fan_out,
+                spin_iters,
+            } => {
+                let (futex_ptr, is_messenger) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                // CPU burst
+                for _ in 0..spin_iters {
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
+                    std::hint::spin_loop();
+                }
+                if is_messenger {
+                    // Increment generation counter and wake all receivers.
+                    let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
+                    unsafe {
+                        std::ptr::write_volatile(futex_ptr, next);
+                        libc::syscall(
+                            libc::SYS_futex,
+                            futex_ptr,
+                            libc::FUTEX_WAKE,
+                            fan_out as i32,
+                            std::ptr::null::<libc::timespec>(),
+                            std::ptr::null::<u32>(),
+                            0u32,
+                        );
+                    }
+                    // Short spin to let receivers run before next wake cycle.
+                    for _ in 0..256 {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    // Receiver: wait for the generation counter to advance.
+                    let expected = unsafe { std::ptr::read_volatile(futex_ptr) };
+                    let before_block = Instant::now();
+                    let ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 100_000_000, // 100ms
+                    };
+                    loop {
+                        if STOP.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
+                        if cur != expected {
+                            reservoir_push(
+                                &mut wake_latencies_ns,
+                                &mut wake_sample_count,
+                                before_block.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                            break;
+                        }
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_futex,
+                                futex_ptr,
+                                libc::FUTEX_WAIT,
+                                expected,
+                                &ts as *const libc::timespec,
+                                std::ptr::null::<u32>(),
+                                0u32,
+                            );
+                        }
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
         }
 
         if work_units.is_multiple_of(1024) {
@@ -1231,7 +1333,7 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        assert_eq!(WorkType::ALL_NAMES.len(), 10);
+        assert_eq!(WorkType::ALL_NAMES.len(), 11);
     }
 
     #[test]
@@ -1507,7 +1609,10 @@ mod tests {
         let result = WorkloadHandle::spawn(&config);
         assert!(result.is_err(), "PipeIo with odd workers should fail");
         let msg = format!("{:#}", result.err().unwrap());
-        assert!(msg.contains("even"), "expected even-workers error: {msg}");
+        assert!(
+            msg.contains("divisible by 2"),
+            "expected divisibility error: {msg}"
+        );
     }
 
     #[test]
@@ -2234,5 +2339,227 @@ mod tests {
         // Verifies the function parses without panicking.
         let (cpu_time, run_delay, timeslices) = read_schedstat();
         let _ = (cpu_time, run_delay, timeslices);
+    }
+
+    // -- FutexFanOut tests --
+
+    #[test]
+    fn spawn_futex_fanout_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 5, // 1 messenger + 4 receivers
+            affinity: AffinityMode::None,
+            work_type: WorkType::FutexFanOut {
+                fan_out: 4,
+                spin_iters: 1024,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 5);
+        for r in &reports {
+            assert!(r.work_units > 0, "FutexFanOut worker {} did no work", r.tid);
+        }
+    }
+
+    #[test]
+    fn spawn_futex_fanout_receivers_record_wake_latency() {
+        let config = WorkloadConfig {
+            num_workers: 5,
+            affinity: AffinityMode::None,
+            work_type: WorkType::FutexFanOut {
+                fan_out: 4,
+                spin_iters: 512,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let reports = h.stop_and_collect();
+        // At least one receiver should have wake latency samples.
+        let has_latencies = reports.iter().any(|r| !r.wake_latencies_ns.is_empty());
+        assert!(has_latencies, "receivers should record wake latencies");
+    }
+
+    #[test]
+    fn spawn_futex_fanout_bad_worker_count_fails() {
+        let config = WorkloadConfig {
+            num_workers: 3, // not divisible by 5
+            affinity: AffinityMode::None,
+            work_type: WorkType::FutexFanOut {
+                fan_out: 4,
+                spin_iters: 1024,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let result = WorkloadHandle::spawn(&config);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("divisible by 5"),
+            "expected divisibility error: {msg}"
+        );
+    }
+
+    #[test]
+    fn spawn_futex_fanout_two_groups() {
+        let config = WorkloadConfig {
+            num_workers: 10, // 2 groups of (1+4)
+            affinity: AffinityMode::None,
+            work_type: WorkType::FutexFanOut {
+                fan_out: 4,
+                spin_iters: 512,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        assert_eq!(h.tids().len(), 10);
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 10);
+        for r in &reports {
+            assert!(r.work_units > 0, "worker {} did no work", r.tid);
+        }
+    }
+
+    #[test]
+    fn spawn_futex_fanout_fan_out_one() {
+        // Minimal fan-out: 1 messenger + 1 receiver per group (like ping-pong).
+        let config = WorkloadConfig {
+            num_workers: 2,
+            affinity: AffinityMode::None,
+            work_type: WorkType::FutexFanOut {
+                fan_out: 1,
+                spin_iters: 1024,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.work_units > 0, "worker {} did no work", r.tid);
+        }
+    }
+
+    #[test]
+    fn work_type_futex_fanout_name() {
+        let wt = WorkType::FutexFanOut {
+            fan_out: 4,
+            spin_iters: 1024,
+        };
+        assert_eq!(wt.name(), "FutexFanOut");
+    }
+
+    #[test]
+    fn work_type_futex_fanout_from_name() {
+        let wt = WorkType::from_name("FutexFanOut").unwrap();
+        match wt {
+            WorkType::FutexFanOut {
+                fan_out,
+                spin_iters,
+            } => {
+                assert_eq!(fan_out, 4);
+                assert_eq!(spin_iters, 1024);
+            }
+            _ => panic!("expected FutexFanOut"),
+        }
+    }
+
+    #[test]
+    fn work_type_futex_fanout_group_size() {
+        let wt = WorkType::FutexFanOut {
+            fan_out: 4,
+            spin_iters: 1024,
+        };
+        assert_eq!(wt.worker_group_size(), Some(5));
+    }
+
+    #[test]
+    fn work_type_futex_fanout_needs_shared_mem() {
+        let wt = WorkType::FutexFanOut {
+            fan_out: 4,
+            spin_iters: 1024,
+        };
+        assert!(wt.needs_shared_mem());
+    }
+
+    #[test]
+    fn work_program_fanout_resolves() {
+        let wp = WorkProgram::fanout();
+        match wp.resolve() {
+            WorkType::FutexFanOut {
+                fan_out,
+                spin_iters,
+            } => {
+                assert_eq!(fan_out, 4);
+                assert_eq!(spin_iters, 1024);
+            }
+            _ => panic!("expected FutexFanOut"),
+        }
+    }
+
+    #[test]
+    fn work_program_fanout_from_name() {
+        let wp = WorkProgram::from_name("fanout").unwrap();
+        assert!(matches!(wp.resolve(), WorkType::FutexFanOut { .. }));
+    }
+
+    #[test]
+    fn worker_group_size_paired_types() {
+        assert_eq!(
+            WorkType::PipeIo { burst_iters: 1024 }.worker_group_size(),
+            Some(2)
+        );
+        assert_eq!(
+            WorkType::FutexPingPong { spin_iters: 1024 }.worker_group_size(),
+            Some(2)
+        );
+        assert_eq!(
+            WorkType::CachePipe {
+                size_kb: 32,
+                burst_iters: 1024
+            }
+            .worker_group_size(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn worker_group_size_ungrouped_types() {
+        assert_eq!(WorkType::CpuSpin.worker_group_size(), None);
+        assert_eq!(WorkType::YieldHeavy.worker_group_size(), None);
+        assert_eq!(WorkType::Mixed.worker_group_size(), None);
+        assert_eq!(WorkType::IoSync.worker_group_size(), None);
+        assert_eq!(
+            WorkType::Bursty {
+                burst_ms: 50,
+                sleep_ms: 100
+            }
+            .worker_group_size(),
+            None
+        );
+        assert_eq!(
+            WorkType::CachePressure {
+                size_kb: 32,
+                stride: 64
+            }
+            .worker_group_size(),
+            None
+        );
+        assert_eq!(
+            WorkType::CacheYield {
+                size_kb: 32,
+                stride: 64
+            }
+            .worker_group_size(),
+            None
+        );
     }
 }

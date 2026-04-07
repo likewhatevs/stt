@@ -51,6 +51,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
     use super::dynamic::*;
     use super::interaction::*;
     use super::nested::*;
+    use super::performance::*;
     use super::stress::*;
 
     let dfl = || vec![CgroupWork::default()];
@@ -820,6 +821,54 @@ pub fn all_scenarios() -> Vec<Scenario> {
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_crossllc_race),
+        },
+        // Performance: cache pressure vs compute imbalance
+        Scenario {
+            name: "cache_pressure_imbalance",
+            category: "performance",
+            description: "CachePressure vs CpuSpin cgroups",
+            required_flags: F_BORROW,
+            excluded_flags: &[],
+            num_cgroups: 0,
+            cpuset_mode: CpusetMode::None,
+            cgroup_works: vec![],
+            action: Action::Custom(custom_cache_pressure_imbalance),
+        },
+        // Performance: cache yield wake-affine placement
+        Scenario {
+            name: "cache_yield_wake_affine",
+            category: "performance",
+            description: "CacheYield workers testing wake-affine placement",
+            required_flags: F_LLC,
+            excluded_flags: &[],
+            num_cgroups: 0,
+            cpuset_mode: CpusetMode::None,
+            cgroup_works: vec![],
+            action: Action::Custom(custom_cache_yield_wake_affine),
+        },
+        // Performance: cache pipe + compute imbalance
+        Scenario {
+            name: "cache_pipe_io_compute_imbalance",
+            category: "performance",
+            description: "CachePipe vs CpuSpin cgroups",
+            required_flags: F_BORROW,
+            excluded_flags: &[],
+            num_cgroups: 0,
+            cpuset_mode: CpusetMode::None,
+            cgroup_works: vec![],
+            action: Action::Custom(custom_cache_pipe_io_compute_imbalance),
+        },
+        // Performance: 1:N fan-out wake pattern
+        Scenario {
+            name: "fanout_wake",
+            category: "performance",
+            description: "1:N futex fan-out wake vs compute workers",
+            required_flags: F_BORROW,
+            excluded_flags: &[],
+            num_cgroups: 0,
+            cpuset_mode: CpusetMode::None,
+            cgroup_works: vec![],
+            action: Action::Custom(custom_fanout_wake),
         },
     ]
 }

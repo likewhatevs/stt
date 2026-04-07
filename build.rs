@@ -76,7 +76,7 @@ fn main() {
     if !busybox_out.exists() {
         let busybox_src = out_dir.join("busybox-src");
         // Clean up partial clones from interrupted builds
-        if busybox_src.exists() && !busybox_src.join(".git/HEAD").exists() {
+        if busybox_src.exists() && !busybox_src.join("Makefile").exists() {
             std::fs::remove_dir_all(&busybox_src).ok();
         }
         if !busybox_src.exists() {

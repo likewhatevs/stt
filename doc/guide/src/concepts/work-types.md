@@ -56,12 +56,15 @@ wake_affine placement after voluntary preemption.
 a partner worker. Combines cache-hot working set with cross-CPU wake
 placement. Requires even `num_workers`.
 
-## Paired work types
+## Grouped work types
 
-`PipeIo`, `FutexPingPong`, and `CachePipe` require even `num_workers`.
-`WorkType::requires_even_workers()` returns `true` for these variants.
-`PipeIo` and `CachePipe` use pipes; `FutexPingPong` uses shared mmap
-pages with futex wait/wake.
+`PipeIo`, `FutexPingPong`, and `CachePipe` require `num_workers`
+divisible by 2 (paired). `FutexFanOut` requires `num_workers` divisible
+by `fan_out + 1` (1 messenger + N receivers per group).
+`WorkType::worker_group_size()` returns the group size for these
+variants, or `None` for ungrouped types. `PipeIo` and `CachePipe` use
+pipes; `FutexPingPong` and `FutexFanOut` use shared mmap pages with
+futex wait/wake.
 
 ## Default values
 

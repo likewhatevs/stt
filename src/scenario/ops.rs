@@ -572,8 +572,10 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
         let effective_work_type = if def.swappable
             && let Some(override_wt) = ctx.work_type_override
         {
-            // Skip paired-worker overrides when num_workers is odd.
-            if override_wt.requires_even_workers() && n % 2 != 0 {
+            // Skip grouped-worker overrides when num_workers is not divisible.
+            if let Some(gs) = override_wt.worker_group_size()
+                && n % gs != 0
+            {
                 def.work_type
             } else {
                 override_wt

@@ -25,6 +25,7 @@ pub mod dynamic;
 pub mod interaction;
 pub mod nested;
 pub mod ops;
+pub mod performance;
 pub mod stress;
 
 pub use catalog::all_scenarios;
@@ -469,8 +470,10 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<VerifyResult> {
         let effective_work_type = if let Some(override_wt) = ctx.work_type_override
             && matches!(cw.work_type, WorkType::CpuSpin)
         {
-            // Skip paired-worker overrides when num_workers is odd.
-            if override_wt.requires_even_workers() && n % 2 != 0 {
+            // Skip grouped-worker overrides when num_workers is not divisible.
+            if let Some(gs) = override_wt.worker_group_size()
+                && n % gs != 0
+            {
                 cw.work_type
             } else {
                 override_wt
@@ -1021,6 +1024,7 @@ mod tests {
             "advanced",
             "nested",
             "interaction",
+            "performance",
         ];
         for s in &all_scenarios() {
             assert!(
