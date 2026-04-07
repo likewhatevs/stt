@@ -123,15 +123,8 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<Vec<(String, PathBuf)>> {
             continue;
         }
         if let Some(path) = parse_ldd_line(line) {
-            // Place all libraries under lib/ in the guest. ldd may
-            // report paths in /lib64/, build directories, or other
-            // host-specific locations that don't exist in the initramfs.
-            let filename = Path::new(&path)
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.clone());
-            let guest = format!("lib/{filename}");
-            libs.push((guest, PathBuf::from(&path)));
+            let guest = path.strip_prefix('/').unwrap_or(&path);
+            libs.push((guest.to_string(), PathBuf::from(&path)));
         }
     }
 

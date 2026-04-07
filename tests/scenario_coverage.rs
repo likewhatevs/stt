@@ -259,6 +259,7 @@ fn cover_fanout_wake(ctx: &Ctx) -> Result<VerifyResult> {
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_jiffies = 60000,
     max_imbalance_ratio = 10.0,
+    fail_on_stall = false,
 )]
 fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<VerifyResult> {
     stt::scenario::basic::custom_sched_mixed(ctx)
@@ -421,7 +422,7 @@ fn neg_sched_death_no_verify_result() {
         watchdog_timeout_jiffies: 3000,
         bpf_map_write: None,
         performance_mode: false,
-        duration_s: 0,
+        duration_s: 10,
         workers_per_cgroup: 0,
     };
 

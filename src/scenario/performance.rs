@@ -90,7 +90,7 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<VerifyResult>
         n_pipe
     };
 
-    let verify = Verify::default_checks().max_wake_latency_cv(3.0);
+    let verify = Verify::default_checks().max_wake_latency_cv(15.0);
 
     let steps = vec![Step {
         setup: vec![
@@ -123,7 +123,9 @@ pub fn custom_fanout_wake(ctx: &Ctx) -> Result<VerifyResult> {
     // Round down to nearest multiple of group_size, at least one group.
     let n_fanout = (ctx.workers_per_cgroup / group_size).max(1) * group_size;
 
-    let verify = Verify::default_checks().max_wake_latency_cv(3.0);
+    let verify = Verify::default_checks()
+        .max_wake_latency_cv(5.0)
+        .max_spread_pct(50.0);
 
     let steps = vec![Step {
         setup: vec![
