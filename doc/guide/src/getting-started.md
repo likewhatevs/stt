@@ -62,6 +62,23 @@ Run with `cargo test` (requires `/dev/kvm`).
 cargo install --path cargo-stt
 ```
 
+## Build a kernel
+
+stt embeds a kernel config fragment tuned for scheduler testing
+(sched_ext, BPF, kprobes, minimal boot). To build a kernel from a
+Linux source tree:
+
+```sh
+stt build-kernel ~/linux
+```
+
+This runs `make defconfig`, merges the stt config fragment, and
+builds with `make -j$(nproc)`. To clean:
+
+```sh
+stt clean-kernel ~/linux
+```
+
 ## Run a scenario
 
 ```sh

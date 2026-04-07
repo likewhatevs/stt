@@ -37,6 +37,10 @@ enum Command {
     Cleanup(CleanupArgs),
     /// Run integration tests via nextest with sidecar collection
     Test(TestArgs),
+    /// Build a kernel with stt's config fragment
+    BuildKernel(BuildKernelArgs),
+    /// Clean a kernel source tree (make mrproper)
+    CleanKernel(CleanKernelArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -192,6 +196,20 @@ struct TestArgs {
     /// Extra arguments passed through to nextest (or cargo test)
     #[clap(last = true)]
     nextest_args: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct BuildKernelArgs {
+    /// Path to linux source tree (default: current directory)
+    #[clap(default_value = ".")]
+    path: String,
+}
+
+#[derive(Debug, Parser)]
+struct CleanKernelArgs {
+    /// Path to linux source tree (default: current directory)
+    #[clap(default_value = ".")]
+    path: String,
 }
 
 /// Split run_args into scenario names and extra CLI options.
@@ -367,6 +385,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Test(a) => cmd_test(a),
+        Command::BuildKernel(a) => cmd_build_kernel(a),
+        Command::CleanKernel(a) => cmd_clean_kernel(a),
     }
 }
 
@@ -1287,6 +1307,87 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     if code != 0 {
         anyhow::bail!("test runner exited with code {code}");
     }
+    Ok(())
+}
+
+/// Embedded kernel config fragment for stt kernel builds.
+const KERNEL_CONFIG: &str = include_str!("../kernel.config");
+
+/// Validate that a path looks like a kernel source tree.
+fn validate_kernel_tree(path: &std::path::Path) -> Result<()> {
+    if !path.join("Makefile").exists() {
+        anyhow::bail!("{}: not a kernel tree (no Makefile)", path.display());
+    }
+    if !path.join("arch/x86").exists() {
+        anyhow::bail!("{}: not a kernel tree (no arch/x86/)", path.display());
+    }
+    Ok(())
+}
+
+fn run_step(label: &str, cmd: &str, args: &[&str]) -> Result<()> {
+    println!("{} {label}", style(">>>").cyan().bold());
+    let status = std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("{label} failed (exit {})", status.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
+fn cmd_build_kernel(args: BuildKernelArgs) -> Result<()> {
+    let path = std::path::Path::new(&args.path)
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("{}: {e}", args.path))?;
+    validate_kernel_tree(&path)?;
+
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8"))?;
+
+    let dot_config = path.join(".config");
+    let jobs = format!("-j{}", num_cpus());
+
+    run_step("defconfig", "make", &["-C", path_str, "defconfig"])?;
+
+    // Append stt config fragment to .config. Using cat-append + olddefconfig
+    // instead of merge_config.sh because merge_config.sh runs its own
+    // olddefconfig internally which can drop options whose dependencies
+    // weren't yet resolved in the base config.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&dot_config)
+            .map_err(|e| anyhow::anyhow!("append to .config: {e}"))?;
+        f.write_all(b"\n")
+            .and_then(|_| f.write_all(KERNEL_CONFIG.as_bytes()))
+            .map_err(|e| anyhow::anyhow!("write config fragment: {e}"))?;
+    }
+    println!(">>> {}", console::style("append stt config").cyan());
+
+    run_step("olddefconfig", "make", &["-C", path_str, "olddefconfig"])?;
+    run_step(&format!("build ({jobs})"), "make", &["-C", path_str, &jobs])?;
+    println!("{} kernel built", style("done").green().bold());
+    Ok(())
+}
+
+fn cmd_clean_kernel(args: CleanKernelArgs) -> Result<()> {
+    let path = std::path::Path::new(&args.path)
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("{}: {e}", args.path))?;
+    validate_kernel_tree(&path)?;
+
+    println!("{} make mrproper", style(">>>").cyan().bold());
+    let status = std::process::Command::new("make")
+        .args(["-C", path.to_str().unwrap(), "mrproper"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("mrproper: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("mrproper failed (exit {})", status.code().unwrap_or(-1));
+    }
+    println!("{} clean", style("done").green().bold());
     Ok(())
 }
 
@@ -2643,5 +2744,88 @@ mod tests {
         assert!(summary.contains("0/2 passed"));
         assert!(summary.contains("j1"));
         assert!(summary.contains("j2"));
+    }
+
+    // -- kernel config tests --
+
+    #[test]
+    fn kernel_config_contains_sched_ext() {
+        assert!(KERNEL_CONFIG.contains("CONFIG_SCHED_CLASS_EXT=y"));
+    }
+
+    #[test]
+    fn kernel_config_contains_bpf() {
+        assert!(KERNEL_CONFIG.contains("CONFIG_BPF_SYSCALL=y"));
+        assert!(KERNEL_CONFIG.contains("CONFIG_BPF_JIT=y"));
+    }
+
+    #[test]
+    fn kernel_config_contains_btf() {
+        assert!(KERNEL_CONFIG.contains("CONFIG_DEBUG_INFO_BTF=y"));
+    }
+
+    #[test]
+    fn kernel_config_contains_kprobes() {
+        assert!(KERNEL_CONFIG.contains("CONFIG_KPROBES=y"));
+        assert!(KERNEL_CONFIG.contains("CONFIG_KPROBE_EVENTS=y"));
+    }
+
+    #[test]
+    fn kernel_config_contains_cgroups() {
+        assert!(KERNEL_CONFIG.contains("CONFIG_CGROUPS=y"));
+        assert!(KERNEL_CONFIG.contains("CONFIG_CPUSETS=y"));
+    }
+
+    #[test]
+    fn kernel_config_contains_serial() {
+        assert!(KERNEL_CONFIG.contains("CONFIG_SERIAL_8250=y"));
+        assert!(KERNEL_CONFIG.contains("CONFIG_SERIAL_8250_CONSOLE=y"));
+    }
+
+    #[test]
+    fn kernel_config_contains_numa() {
+        assert!(KERNEL_CONFIG.contains("CONFIG_SMP=y"));
+        assert!(KERNEL_CONFIG.contains("CONFIG_NUMA=y"));
+    }
+
+    #[test]
+    fn kernel_config_disables_lockdep() {
+        assert!(KERNEL_CONFIG.contains("# CONFIG_PROVE_LOCKING is not set"));
+    }
+
+    #[test]
+    fn kernel_config_disables_psi() {
+        assert!(KERNEL_CONFIG.contains("# CONFIG_PSI is not set"));
+    }
+
+    #[test]
+    fn validate_kernel_tree_missing_makefile() {
+        let dir = std::env::temp_dir().join("stt-test-no-makefile");
+        let _ = std::fs::create_dir_all(&dir);
+        let r = validate_kernel_tree(&dir);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("no Makefile"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_kernel_tree_missing_arch() {
+        let dir = std::env::temp_dir().join("stt-test-no-arch");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("Makefile"), "");
+        let r = validate_kernel_tree(&dir);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("no arch/x86"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_kernel_tree_valid() {
+        let dir = std::env::temp_dir().join("stt-test-valid-tree");
+        let _ = std::fs::create_dir_all(dir.join("arch/x86"));
+        let _ = std::fs::write(dir.join("Makefile"), "");
+        let r = validate_kernel_tree(&dir);
+        assert!(r.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
