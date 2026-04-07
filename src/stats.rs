@@ -2405,4 +2405,127 @@ mod tests {
             "pass: 100%->50%, got:\n{out}"
         );
     }
+
+    // -- sidecar_to_row tests --
+
+    #[test]
+    fn sidecar_to_row_basic() {
+        use crate::monitor;
+        use crate::test_support;
+        let sc = test_support::SidecarResult {
+            test_name: "my_test".to_string(),
+            topology: "2s4c2t".to_string(),
+            scheduler: "scx_mitosis".to_string(),
+            passed: true,
+            stats: ScenarioStats {
+                cgroups: vec![],
+                total_workers: 4,
+                total_cpus: 8,
+                total_migrations: 12,
+                worst_spread: 15.0,
+                worst_gap_ms: 200,
+                worst_gap_cpu: 3,
+            },
+            monitor: Some(monitor::MonitorSummary {
+                total_samples: 10,
+                max_imbalance_ratio: 2.5,
+                max_local_dsq_depth: 4,
+                stall_detected: true,
+                event_deltas: Some(monitor::ScxEventDeltas {
+                    total_fallback: 7,
+                    fallback_rate: 0.5,
+                    max_fallback_burst: 2,
+                    total_dispatch_offline: 0,
+                    total_dispatch_keep_last: 3,
+                    keep_last_rate: 0.2,
+                    total_enq_skip_exiting: 0,
+                    total_enq_skip_migration_disabled: 0,
+                }),
+            }),
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(row.scenario, "my_test");
+        assert_eq!(row.topology, "2s4c2t");
+        assert!(row.passed);
+        assert_eq!(row.spread, 15.0);
+        assert_eq!(row.gap_ms, 200);
+        assert_eq!(row.migrations, 12);
+        assert_eq!(row.imbalance_ratio, 2.5);
+        assert_eq!(row.max_dsq_depth, 4);
+        assert_eq!(row.stall_count, 1);
+        assert_eq!(row.fallback_count, 7);
+        assert_eq!(row.keep_last_count, 3);
+        assert!(row.flags.is_empty());
+        assert_eq!(row.replica, 1);
+    }
+
+    #[test]
+    fn sidecar_to_row_no_monitor() {
+        use crate::test_support;
+        let sc = test_support::SidecarResult {
+            test_name: "eevdf_test".to_string(),
+            topology: "1s2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(row.scenario, "eevdf_test");
+        assert!(!row.passed);
+        assert_eq!(row.imbalance_ratio, 0.0);
+        assert_eq!(row.max_dsq_depth, 0);
+        assert_eq!(row.stall_count, 0);
+        assert_eq!(row.fallback_count, 0);
+        assert_eq!(row.keep_last_count, 0);
+    }
+
+    #[test]
+    fn sidecar_to_row_no_stall() {
+        use crate::monitor;
+        use crate::test_support;
+        let sc = test_support::SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1s1c1t".to_string(),
+            scheduler: "test".to_string(),
+            passed: true,
+            stats: Default::default(),
+            monitor: Some(monitor::MonitorSummary {
+                total_samples: 5,
+                max_imbalance_ratio: 1.0,
+                max_local_dsq_depth: 0,
+                stall_detected: false,
+                event_deltas: None,
+            }),
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(row.stall_count, 0);
+        assert_eq!(row.fallback_count, 0);
+        assert_eq!(row.keep_last_count, 0);
+    }
+
+    #[test]
+    fn sidecar_to_row_labeled_basic() {
+        use crate::test_support;
+        let sc = test_support::SidecarResult {
+            test_name: "fallback".to_string(),
+            topology: "1s2c1t".to_string(),
+            scheduler: "test".to_string(),
+            passed: true,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+        };
+        let row = sidecar_to_row_labeled(&sc, "tiny-1llc/proportional/borrow");
+        assert_eq!(row.topology, "tiny-1llc");
+        assert_eq!(row.scenario, "proportional");
+        assert_eq!(row.flags, "borrow");
+    }
 }

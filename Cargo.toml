@@ -43,7 +43,6 @@ cpio = "0.4.1"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
-rayon = "1.11.0"
 object = { version = "0.39.0", features = ["read"] }
 linkme = "0.3"
 stt-macros = { path = "stt-macros" }

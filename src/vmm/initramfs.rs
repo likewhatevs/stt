@@ -28,6 +28,9 @@ echo "STT_INIT_STARTED" > /dev/ttyS1
 busybox mkdir -p /sys/fs/cgroup
 busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
 busybox mount -t tmpfs tmpfs /tmp
+if [ -f /sched_enable ]; then
+    . /sched_enable
+fi
 if [ -x /scheduler ]; then
     SCHED_ARGS=$(busybox cat /sched_args 2>/dev/null)
     /scheduler $SCHED_ARGS >/tmp/sched.log 2>&1 &
@@ -87,6 +90,9 @@ if [ -n "$SCHED_PID" ]; then
     echo "===SCHED_OUTPUT_START===" > /dev/ttyS1
     busybox cat /tmp/sched.log > /dev/ttyS1 2>/dev/null
     echo "===SCHED_OUTPUT_END===" > /dev/ttyS1
+fi
+if [ -f /sched_disable ]; then
+    . /sched_disable
 fi
 echo "STT_EXIT=$RC" > /dev/ttyS1
 # Let serial buffers drain before reboot.
@@ -284,6 +290,18 @@ pub fn create_initramfs_base(payload: &Path, extra_binaries: &[(&str, &Path)]) -
 /// entries, trailer, and 512-byte padding. `base_len` is needed to compute
 /// the padding. The returned Vec is typically ~200 bytes.
 pub fn build_suffix(base_len: usize, args: &[String], sched_args: &[String]) -> Result<Vec<u8>> {
+    build_suffix_full(base_len, args, sched_args, &[], &[])
+}
+
+/// Extended suffix builder that also writes /sched_enable and /sched_disable
+/// shell scripts for kernel-built schedulers.
+pub fn build_suffix_full(
+    base_len: usize,
+    args: &[String],
+    sched_args: &[String],
+    sched_enable: &[&str],
+    sched_disable: &[&str],
+) -> Result<Vec<u8>> {
     let mut suffix = Vec::new();
 
     // Args file
@@ -299,6 +317,16 @@ pub fn build_suffix(base_len: usize, args: &[String], sched_args: &[String]) -> 
             sched_args_data.as_bytes(),
             0o100644,
         )?;
+    }
+
+    // Kernel-built scheduler enable/disable scripts
+    if !sched_enable.is_empty() {
+        let data = sched_enable.join("\n");
+        write_entry(&mut suffix, "sched_enable", data.as_bytes(), 0o100755)?;
+    }
+    if !sched_disable.is_empty() {
+        let data = sched_disable.join("\n");
+        write_entry(&mut suffix, "sched_disable", data.as_bytes(), 0o100755)?;
     }
 
     // Trailer

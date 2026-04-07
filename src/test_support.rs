@@ -147,7 +147,8 @@ fn maybe_dispatch_host_test() -> Option<i32> {
         memory_mb,
     };
 
-    match run_stt_test_with_topo(entry, &topo) {
+    let active_flags = extract_flags_arg(&args).unwrap_or_default();
+    match run_stt_test_with_topo_and_flags(entry, &topo, &active_flags) {
         Ok(()) => Some(0),
         Err(e) => {
             eprintln!("stt_test: {e:#}");
@@ -170,6 +171,20 @@ pub enum SchedulerSpec {
     Name(&'static str),
     /// Explicit path to a scheduler binary.
     Path(&'static str),
+    /// Kernel-built scheduler (e.g. BPF-less sched_ext or debugfs-tuned).
+    /// Activated/deactivated via shell commands rather than a binary.
+    KernelBuiltin {
+        enable: &'static [&'static str],
+        disable: &'static [&'static str],
+    },
+}
+
+impl SchedulerSpec {
+    /// Whether this spec represents an active scheduling policy
+    /// (anything other than the kernel default EEVDF).
+    pub const fn has_active_scheduling(&self) -> bool {
+        !matches!(self, SchedulerSpec::None)
+    }
 }
 
 pub use crate::scenario::flags::FlagDecl;
@@ -331,6 +346,18 @@ pub struct SttTestEntry {
     pub watchdog_timeout_jiffies: u64,
     /// Host-side BPF map write to perform during VM execution.
     pub bpf_map_write: Option<&'static BpfMapWrite>,
+    /// Flags that must be present in every flag profile for this test.
+    pub required_flags: &'static [&'static str],
+    /// Flags that must not be present in any flag profile for this test.
+    pub excluded_flags: &'static [&'static str],
+    /// Minimum number of sockets for gauntlet topology filtering.
+    pub min_sockets: u32,
+    /// Minimum number of LLCs for gauntlet topology filtering.
+    pub min_llcs: u32,
+    /// Whether the test requires SMT (threads > 1) topologies.
+    pub requires_smt: bool,
+    /// Minimum total CPU count for gauntlet topology filtering.
+    pub min_cpus: u32,
     /// Pin vCPU threads to host cores matching the virtual topology's LLC
     /// structure, use 2MB hugepages for guest memory, and validate that the
     /// host has enough CPUs and LLCs to satisfy the request without
@@ -361,6 +388,25 @@ pub struct SttTestInfo {
     pub memory_mb: u32,
     pub scheduler: String,
     pub replicas: u32,
+    #[serde(default)]
+    pub required_flags: Vec<String>,
+    #[serde(default)]
+    pub excluded_flags: Vec<String>,
+    #[serde(default = "default_one")]
+    pub min_sockets: u32,
+    #[serde(default = "default_one")]
+    pub min_llcs: u32,
+    #[serde(default)]
+    pub requires_smt: bool,
+    #[serde(default = "default_one")]
+    pub min_cpus: u32,
+    /// Flag names supported by this test's scheduler.
+    #[serde(default)]
+    pub scheduler_flags: Vec<String>,
+}
+
+fn default_one() -> u32 {
+    1
 }
 
 impl SttTestInfo {
@@ -373,6 +419,18 @@ impl SttTestInfo {
             memory_mb: e.memory_mb,
             scheduler: e.scheduler.name.to_string(),
             replicas: e.replicas,
+            required_flags: e.required_flags.iter().map(|s| s.to_string()).collect(),
+            excluded_flags: e.excluded_flags.iter().map(|s| s.to_string()).collect(),
+            min_sockets: e.min_sockets,
+            min_llcs: e.min_llcs,
+            requires_smt: e.requires_smt,
+            min_cpus: e.min_cpus,
+            scheduler_flags: e
+                .scheduler
+                .supported_flag_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -424,15 +482,29 @@ pub fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
 /// Validates KVM access and auto-discovers a kernel image via
 /// `resolve_kernel()` when `STT_TEST_KERNEL` is not set.
 pub fn run_stt_test(entry: &SttTestEntry) -> Result<()> {
-    run_stt_test_inner(entry, None)
+    run_stt_test_inner(entry, None, &[])
 }
 
 /// Like `run_stt_test` but with an explicit topology override.
 pub fn run_stt_test_with_topo(entry: &SttTestEntry, topo: &TopoOverride) -> Result<()> {
-    run_stt_test_inner(entry, Some(topo))
+    run_stt_test_inner(entry, Some(topo), &[])
 }
 
-fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Result<()> {
+/// Like `run_stt_test_with_topo` but with active flags that map to
+/// scheduler CLI args via `Scheduler::flag_args()`.
+pub fn run_stt_test_with_topo_and_flags(
+    entry: &SttTestEntry,
+    topo: &TopoOverride,
+    active_flags: &[String],
+) -> Result<()> {
+    run_stt_test_inner(entry, Some(topo), active_flags)
+}
+
+fn run_stt_test_inner(
+    entry: &SttTestEntry,
+    topo: Option<&TopoOverride>,
+    active_flags: &[String],
+) -> Result<()> {
     ensure_kvm()?;
     let kernel = resolve_kernel()?;
     let scheduler = resolve_scheduler(&entry.scheduler.binary)?;
@@ -482,16 +554,29 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
 
     if let Some(ref sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);
+    }
+    if let SchedulerSpec::KernelBuiltin { enable, disable } = &entry.scheduler.binary {
+        builder = builder.sched_enable_cmds(enable);
+        builder = builder.sched_disable_cmds(disable);
+    }
+    if entry.scheduler.binary.has_active_scheduling() {
         builder = builder.monitor_thresholds(merged_verify.monitor_thresholds());
     }
 
-    if !entry.extra_sched_args.is_empty() {
-        let args: Vec<String> = entry
-            .extra_sched_args
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        builder = builder.sched_args(&args);
+    // Merge scheduler args: extra_sched_args from the entry + args derived
+    // from active flags via Scheduler::flag_args().
+    let mut sched_args: Vec<String> = entry
+        .extra_sched_args
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for flag_name in active_flags {
+        if let Some(args) = entry.scheduler.flag_args(flag_name) {
+            sched_args.extend(args.iter().map(|s| s.to_string()));
+        }
+    }
+    if !sched_args.is_empty() {
+        builder = builder.sched_args(&sched_args);
     }
 
     if entry.watchdog_timeout_jiffies > 0 {
@@ -565,7 +650,7 @@ fn run_stt_test_inner(entry: &SttTestEntry, topo: Option<&TopoOverride>) -> Resu
 fn evaluate_vm_result(
     entry: &SttTestEntry,
     result: &vmm::VmResult,
-    scheduler: Option<&Path>,
+    _scheduler: Option<&Path>,
     merged_verify: &crate::verify::Verify,
     stimulus_events: &[StimulusEvent],
     sockets: u32,
@@ -633,7 +718,7 @@ fn evaluate_vm_result(
 
         if !verify_result.passed {
             let details = verify_result.details.join("\n  ");
-            let repro = if scheduler.is_some() {
+            let repro = if entry.scheduler.binary.has_active_scheduling() {
                 repro_fn(output)
             } else {
                 None
@@ -661,7 +746,7 @@ fn evaluate_vm_result(
         // Evaluate monitor data against thresholds when a scheduler is running.
         // Without a scheduler (EEVDF), monitor reads rq data that may be
         // uninitialized or irrelevant — skip evaluation in that case.
-        if scheduler.is_some()
+        if entry.scheduler.binary.has_active_scheduling()
             && let Some(ref monitor) = result.monitor
         {
             let thresholds = merged_verify.monitor_thresholds();
@@ -691,7 +776,7 @@ fn evaluate_vm_result(
     // When a scheduler is running this typically means the scheduler died;
     // without a scheduler (EEVDF) it means the payload itself failed.
     // Attempt auto-repro if enabled and a scheduler was running.
-    let repro_section = if scheduler.is_some()
+    let repro_section = if entry.scheduler.binary.has_active_scheduling()
         && (output.contains("SCHEDULER_DIED") || output.contains("scheduler died"))
     {
         repro_fn(output)
@@ -719,7 +804,7 @@ fn evaluate_vm_result(
         );
     }
 
-    let reason = if scheduler.is_some() {
+    let reason = if entry.scheduler.binary.has_active_scheduling() {
         "scheduler died (no test result in COM2)"
     } else {
         "payload produced no output (no test result in COM2)"
@@ -1530,6 +1615,7 @@ fn scheduler_label(spec: &SchedulerSpec) -> String {
         SchedulerSpec::None => String::new(),
         SchedulerSpec::Name(n) => format!(" [sched={n}]"),
         SchedulerSpec::Path(p) => format!(" [sched={p}]"),
+        SchedulerSpec::KernelBuiltin { .. } => " [sched=kernel]".to_string(),
     }
 }
 
@@ -1545,7 +1631,7 @@ fn scheduler_label(spec: &SchedulerSpec) -> String {
 /// For `Path`, validates the file exists.
 pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
     match spec {
-        SchedulerSpec::None => Ok(None),
+        SchedulerSpec::None | SchedulerSpec::KernelBuiltin { .. } => Ok(None),
         SchedulerSpec::Path(p) => {
             let path = PathBuf::from(p);
             anyhow::ensure!(path.exists(), "scheduler not found: {p}");
@@ -1654,6 +1740,18 @@ fn extract_topo_arg(args: &[String]) -> Option<String> {
     None
 }
 
+/// Extract `--stt-flags=borrow,rebal` from the argument list.
+fn extract_flags_arg(args: &[String]) -> Option<Vec<String>> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--stt-flags=")
+            && !val.is_empty()
+        {
+            return Some(val.split(',').map(|s| s.to_string()).collect());
+        }
+    }
+    None
+}
+
 /// Extract `--stt-work-type=NAME` from the argument list.
 fn extract_work_type_arg(args: &[String]) -> Option<String> {
     for a in args {
@@ -1684,6 +1782,7 @@ fn write_sidecar(
         SchedulerSpec::None => "eevdf",
         SchedulerSpec::Name(n) => n,
         SchedulerSpec::Path(p) => p,
+        SchedulerSpec::KernelBuiltin { .. } => "kernel",
     };
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
@@ -1729,6 +1828,12 @@ mod tests {
         replicas: 1,
         verify: crate::verify::Verify::NONE,
         extra_sched_args: &[],
+        required_flags: &[],
+        excluded_flags: &[],
+        min_sockets: 1,
+        min_llcs: 1,
+        requires_smt: false,
+        min_cpus: 1,
         watchdog_timeout_jiffies: 0,
         bpf_map_write: None,
         performance_mode: false,
@@ -2393,41 +2498,49 @@ mod tests {
         name: "flag_a",
         args: &["--flag-a"],
         requires: &[],
+        shell_cmds: &[],
     };
     static BORROW: FlagDecl = FlagDecl {
         name: "borrow",
         args: &["--borrow"],
         requires: &[],
+        shell_cmds: &[],
     };
     static REBAL: FlagDecl = FlagDecl {
         name: "rebal",
         args: &["--rebal"],
         requires: &[],
+        shell_cmds: &[],
     };
     static TEST_LLC: FlagDecl = FlagDecl {
         name: "llc",
         args: &["--llc"],
         requires: &[],
+        shell_cmds: &[],
     };
     static TEST_STEAL: FlagDecl = FlagDecl {
         name: "steal",
         args: &["--steal"],
         requires: &[&TEST_LLC],
+        shell_cmds: &[],
     };
     static BORROW_LONG: FlagDecl = FlagDecl {
         name: "borrow",
         args: &["--enable-borrow"],
         requires: &[],
+        shell_cmds: &[],
     };
     static TEST_A: FlagDecl = FlagDecl {
         name: "a",
         args: &["-a"],
         requires: &[],
+        shell_cmds: &[],
     };
     static TEST_B: FlagDecl = FlagDecl {
         name: "b",
         args: &["-b"],
         requires: &[],
+        shell_cmds: &[],
     };
 
     // Static flag slices for tests (Scheduler.flags needs &'static).
@@ -2658,6 +2771,13 @@ mod tests {
             memory_mb: 4096,
             scheduler: "scx_mitosis".to_string(),
             replicas: 3,
+            required_flags: vec!["borrow".into()],
+            excluded_flags: vec!["steal".into()],
+            min_sockets: 2,
+            min_llcs: 4,
+            requires_smt: true,
+            min_cpus: 8,
+            scheduler_flags: vec!["borrow".into(), "rebal".into()],
         };
         let json = serde_json::to_string(&info).unwrap();
         let loaded: SttTestInfo = serde_json::from_str(&json).unwrap();
@@ -2668,6 +2788,13 @@ mod tests {
         assert_eq!(loaded.memory_mb, 4096);
         assert_eq!(loaded.scheduler, "scx_mitosis");
         assert_eq!(loaded.replicas, 3);
+        assert_eq!(loaded.required_flags, vec!["borrow"]);
+        assert_eq!(loaded.excluded_flags, vec!["steal"]);
+        assert_eq!(loaded.min_sockets, 2);
+        assert_eq!(loaded.min_llcs, 4);
+        assert!(loaded.requires_smt);
+        assert_eq!(loaded.min_cpus, 8);
+        assert_eq!(loaded.scheduler_flags, vec!["borrow", "rebal"]);
     }
 
     #[test]
@@ -2973,6 +3100,12 @@ mod tests {
             replicas: 1,
             verify: crate::verify::Verify::NONE,
             extra_sched_args: &[],
+            required_flags: &[],
+            excluded_flags: &[],
+            min_sockets: 1,
+            min_llcs: 1,
+            requires_smt: false,
+            min_cpus: 1,
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
@@ -3024,6 +3157,12 @@ mod tests {
             replicas: 1,
             verify: crate::verify::Verify::NONE,
             extra_sched_args: &[],
+            required_flags: &[],
+            excluded_flags: &[],
+            min_sockets: 1,
+            min_llcs: 1,
+            requires_smt: false,
+            min_cpus: 1,
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
@@ -3102,6 +3241,12 @@ mod tests {
             replicas: 1,
             verify: crate::verify::Verify::NONE,
             extra_sched_args: &[],
+            required_flags: &[],
+            excluded_flags: &[],
+            min_sockets: 1,
+            min_llcs: 1,
+            requires_smt: false,
+            min_cpus: 1,
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,
@@ -3132,6 +3277,12 @@ mod tests {
             replicas: 1,
             verify: crate::verify::Verify::NONE,
             extra_sched_args: &[],
+            required_flags: &[],
+            excluded_flags: &[],
+            min_sockets: 1,
+            min_llcs: 1,
+            requires_smt: false,
+            min_cpus: 1,
             watchdog_timeout_jiffies: 0,
             bpf_map_write: None,
             performance_mode: false,

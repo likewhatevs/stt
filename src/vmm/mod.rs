@@ -591,6 +591,10 @@ pub struct SttVm {
     /// Pinning plan computed during build() when performance_mode is enabled.
     /// Stored so topology is read once and the plan is reused at VM start.
     pinning_plan: Option<host_topology::PinningPlan>,
+    /// Shell commands to run in the guest to enable a kernel-built scheduler.
+    sched_enable_cmds: Vec<String>,
+    /// Shell commands to run in the guest to disable a kernel-built scheduler.
+    sched_disable_cmds: Vec<String>,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -698,7 +702,15 @@ impl SttVm {
         let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.run_args, &self.sched_args)?;
+        let enable_refs: Vec<&str> = self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
+        let disable_refs: Vec<&str> = self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
+        let suffix = initramfs::build_suffix_full(
+            base_bytes.len(),
+            &self.run_args,
+            &self.sched_args,
+            &enable_refs,
+            &disable_refs,
+        )?;
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
             base_bytes = base_bytes.len(),
@@ -1676,6 +1688,8 @@ pub struct SttVmBuilder {
     watchdog_timeout_jiffies: Option<u64>,
     bpf_map_write: Option<BpfMapWriteParams>,
     performance_mode: bool,
+    sched_enable_cmds: Vec<String>,
+    sched_disable_cmds: Vec<String>,
 }
 
 impl Default for SttVmBuilder {
@@ -1699,6 +1713,8 @@ impl Default for SttVmBuilder {
             watchdog_timeout_jiffies: None,
             bpf_map_write: None,
             performance_mode: false,
+            sched_enable_cmds: Vec::new(),
+            sched_disable_cmds: Vec::new(),
         }
     }
 }
@@ -1800,6 +1816,16 @@ impl SttVmBuilder {
         self
     }
 
+    pub fn sched_enable_cmds(mut self, cmds: &[&str]) -> Self {
+        self.sched_enable_cmds = cmds.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn sched_disable_cmds(mut self, cmds: &[&str]) -> Self {
+        self.sched_disable_cmds = cmds.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
     pub fn build(self) -> Result<SttVm> {
         let pinning_plan = if self.performance_mode {
             Some(self.validate_performance_mode()?)
@@ -1842,6 +1868,8 @@ impl SttVmBuilder {
             bpf_map_write: self.bpf_map_write,
             performance_mode: self.performance_mode,
             pinning_plan,
+            sched_enable_cmds: self.sched_enable_cmds,
+            sched_disable_cmds: self.sched_disable_cmds,
         })
     }
 

@@ -79,4 +79,56 @@ fn entry_default_fields() {
     assert_eq!(entry.cores, 2);
     assert_eq!(entry.threads, 1);
     assert_eq!(entry.memory_mb, 2048);
+    assert!(entry.required_flags.is_empty());
+    assert!(entry.excluded_flags.is_empty());
+    assert_eq!(entry.min_sockets, 1);
+    assert_eq!(entry.min_llcs, 1);
+    assert!(!entry.requires_smt);
+    assert_eq!(entry.min_cpus, 1);
+}
+
+/// Test with required_flags and excluded_flags attributes.
+#[stt_test(
+    sockets = 1,
+    cores = 2,
+    threads = 1,
+    required_flags = ["borrow", "rebal"],
+    excluded_flags = ["steal"]
+)]
+fn flags_attrs_compile(ctx: &Ctx) -> Result<VerifyResult> {
+    let _ = ctx;
+    Ok(VerifyResult::pass())
+}
+
+/// Verify required_flags and excluded_flags propagate to the entry.
+#[test]
+fn entry_flags_match_attrs() {
+    let entry = stt::test_support::find_test("flags_attrs_compile").unwrap();
+    assert_eq!(entry.required_flags, &["borrow", "rebal"]);
+    assert_eq!(entry.excluded_flags, &["steal"]);
+}
+
+/// Test with topology constraint attributes.
+#[stt_test(
+    sockets = 2,
+    cores = 4,
+    threads = 2,
+    min_sockets = 2,
+    min_llcs = 4,
+    requires_smt = true,
+    min_cpus = 8
+)]
+fn topo_constraints_compile(ctx: &Ctx) -> Result<VerifyResult> {
+    let _ = ctx;
+    Ok(VerifyResult::pass())
+}
+
+/// Verify topology constraints propagate to the entry.
+#[test]
+fn entry_topo_constraints_match_attrs() {
+    let entry = stt::test_support::find_test("topo_constraints_compile").unwrap();
+    assert_eq!(entry.min_sockets, 2);
+    assert_eq!(entry.min_llcs, 4);
+    assert!(entry.requires_smt);
+    assert_eq!(entry.min_cpus, 8);
 }

@@ -51,6 +51,12 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut max_fallback_rate: Option<f64> = None;
     let mut max_keep_last_rate: Option<f64> = None;
     let mut extra_sched_args: Vec<String> = Vec::new();
+    let mut required_flags: Vec<String> = Vec::new();
+    let mut excluded_flags: Vec<String> = Vec::new();
+    let mut min_sockets: u32 = 1;
+    let mut min_llcs: u32 = 1;
+    let mut requires_smt: bool = false;
+    let mut min_cpus: u32 = 1;
     let mut watchdog_timeout_jiffies: u64 = 0;
     let mut performance_mode: bool = false;
     let mut duration_s: u64 = 0;
@@ -88,7 +94,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         scheduler = Some(p);
                     }
-                    "auto_repro" | "not_starved" | "isolation" | "performance_mode" => {
+                    "auto_repro" | "not_starved" | "isolation" | "performance_mode"
+                    | "requires_smt" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -108,6 +115,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "not_starved" => not_starved = Some(lit_bool.value()),
                             "isolation" => isolation = Some(lit_bool.value()),
                             "performance_mode" => performance_mode = lit_bool.value(),
+                            "requires_smt" => requires_smt = lit_bool.value(),
                             _ => unreachable!(),
                         }
                     }
@@ -121,7 +129,10 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "watchdog_timeout_jiffies"
                     | "duration_s"
                     | "workers_per_cell"
-                    | "max_local_dsq_depth" => {
+                    | "max_local_dsq_depth"
+                    | "min_sockets"
+                    | "min_llcs"
+                    | "min_cpus" => {
                         let lit_int = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Int(li),
@@ -195,6 +206,21 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         .unwrap_or_else(|e| panic!("{e}")),
                                 )
                             }
+                            "min_sockets" => {
+                                min_sockets = lit_int
+                                    .base10_parse::<u32>()
+                                    .unwrap_or_else(|e| panic!("{e}"))
+                            }
+                            "min_llcs" => {
+                                min_llcs = lit_int
+                                    .base10_parse::<u32>()
+                                    .unwrap_or_else(|e| panic!("{e}"))
+                            }
+                            "min_cpus" => {
+                                min_cpus = lit_int
+                                    .base10_parse::<u32>()
+                                    .unwrap_or_else(|e| panic!("{e}"))
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -244,28 +270,34 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         fail_on_stall = Some(lit_bool.value());
                     }
-                    "extra_sched_args" => {
+                    "extra_sched_args" | "required_flags" | "excluded_flags" => {
                         let arr = match value {
                             syn::Expr::Array(ea) => ea,
                             _ => {
                                 return syn::Error::new_spanned(
                                     value,
-                                    "expected array of string literals for extra_sched_args",
+                                    format!("expected array of string literals for {ident}"),
                                 )
                                 .to_compile_error()
                                 .into();
                             }
+                        };
+                        let target = match ident.as_str() {
+                            "extra_sched_args" => &mut extra_sched_args,
+                            "required_flags" => &mut required_flags,
+                            "excluded_flags" => &mut excluded_flags,
+                            _ => unreachable!(),
                         };
                         for elem in &arr.elems {
                             match elem {
                                 syn::Expr::Lit(syn::ExprLit {
                                     lit: syn::Lit::Str(ls),
                                     ..
-                                }) => extra_sched_args.push(ls.value()),
+                                }) => target.push(ls.value()),
                                 _ => {
                                     return syn::Error::new_spanned(
                                         elem,
-                                        "expected string literal in extra_sched_args",
+                                        format!("expected string literal in {ident}"),
                                     )
                                     .to_compile_error()
                                     .into();
@@ -276,7 +308,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, watchdog_timeout_jiffies, performance_mode, duration_s, workers_per_cell"),
+                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_jiffies, performance_mode, duration_s, workers_per_cell"),
                         )
                         .to_compile_error()
                         .into();
@@ -409,6 +441,12 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 max_keep_last_rate: #keep_last_rate_tokens,
             },
             extra_sched_args: &[#(#extra_sched_args),*],
+            required_flags: &[#(#required_flags),*],
+            excluded_flags: &[#(#excluded_flags),*],
+            min_sockets: #min_sockets,
+            min_llcs: #min_llcs,
+            requires_smt: #requires_smt,
+            min_cpus: #min_cpus,
             watchdog_timeout_jiffies: #watchdog_timeout_jiffies,
             bpf_map_write: None,
             performance_mode: #performance_mode,

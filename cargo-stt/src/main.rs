@@ -151,6 +151,13 @@ struct GauntletArgs {
     /// Filter tests by name (substring match)
     #[clap(long)]
     filter: Option<String>,
+    /// Flags to enable (comma-separated). Constrains which flag profiles
+    /// are generated — only profiles containing exactly these flags are run.
+    #[clap(long, value_delimiter = ',')]
+    flags: Vec<String>,
+    /// Work types for cross dimension (comma-separated, e.g. CpuSpin,Bursty).
+    #[clap(long, value_delimiter = ',')]
+    work_types: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -502,12 +509,14 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// A gauntlet job: test name, binary path, topology string.
+/// A gauntlet job: test name, binary path, topology, flags.
 struct GauntletJob {
     label: String,
     test_name: String,
     binary: PathBuf,
     topo_str: String,
+    /// Active flags for this job (empty = default profile).
+    flags: Vec<String>,
 }
 
 /// Result from a single gauntlet VM run.
@@ -516,6 +525,80 @@ struct GauntletResult {
     passed: bool,
     duration_s: f64,
     detail: String,
+}
+
+/// Check whether a topology preset satisfies a test's constraints.
+fn preset_matches_constraints(preset: &stt::vm::TopoPreset, info: &SttTestInfo) -> bool {
+    let t = &preset.topology;
+    if t.sockets < info.min_sockets {
+        return false;
+    }
+    if t.num_llcs() < info.min_llcs {
+        return false;
+    }
+    if info.requires_smt && t.threads_per_core < 2 {
+        return false;
+    }
+    if t.total_cpus() < info.min_cpus {
+        return false;
+    }
+    true
+}
+
+/// Compute flag profiles for a test. When `--flags` override is set,
+/// produce a single profile with exactly those flags. Otherwise
+/// enumerate valid profiles from the scheduler's flag declarations
+/// constrained by the test's required/excluded flags.
+fn compute_profiles(info: &SttTestInfo, cli_flags: &[String]) -> Vec<Vec<String>> {
+    if !cli_flags.is_empty() {
+        return vec![cli_flags.to_vec()];
+    }
+    // No scheduler flags => single default (empty) profile.
+    if info.scheduler_flags.is_empty() {
+        return vec![vec![]];
+    }
+    let required: Vec<&str> = info.required_flags.iter().map(|s| s.as_str()).collect();
+    let excluded: Vec<&str> = info.excluded_flags.iter().map(|s| s.as_str()).collect();
+    let optional: Vec<&str> = info
+        .scheduler_flags
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|f| !required.contains(f) && !excluded.contains(f))
+        .collect();
+    // Enumerate power set of optional flags, keeping only profiles
+    // where all dependency constraints are satisfied.
+    let mut out = Vec::new();
+    for mask in 0..(1u32 << optional.len()) {
+        let mut fl: Vec<String> = required.iter().map(|s| s.to_string()).collect();
+        for (i, &f) in optional.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                fl.push(f.to_string());
+            }
+        }
+        // Dependency check: each flag's requires must also be present.
+        // Use flag_requires from the FlagDecl system.
+        let valid = fl.iter().all(|f| {
+            stt::scenario::flags::decl_by_name(f)
+                .map(|d| d.requires.iter().all(|r| fl.iter().any(|ff| ff == r.name)))
+                .unwrap_or(true)
+        });
+        if valid {
+            out.push(fl);
+        }
+    }
+    if out.is_empty() {
+        out.push(vec![]);
+    }
+    out
+}
+
+/// Format a flag profile name: "default" when empty, flags joined by "+".
+fn profile_name(flags: &[String]) -> String {
+    if flags.is_empty() {
+        "default".into()
+    } else {
+        flags.join("+")
+    }
 }
 
 fn cmd_gauntlet(args: GauntletArgs) -> Result<()> {
@@ -549,31 +632,38 @@ fn cmd_gauntlet(args: GauntletArgs) -> Result<()> {
             .unwrap_or(1)
     });
 
-    // Build job matrix: test x topology preset.
+    // Build job matrix: test x matching_topology x flag_profile.
     let mut jobs = Vec::new();
     for test in &discovered {
+        let profiles = compute_profiles(&test.info, &args.flags);
         for preset in &presets {
+            if !preset_matches_constraints(preset, &test.info) {
+                continue;
+            }
             let t = &preset.topology;
             let topo_str = format!(
                 "{}s{}c{}t",
                 t.sockets, t.cores_per_socket, t.threads_per_core
             );
-            let label = format!("{}/{}", preset.name, test.info.name);
-            jobs.push(GauntletJob {
-                label,
-                test_name: test.info.name.clone(),
-                binary: test.binary.clone(),
-                topo_str,
-            });
+            for profile in &profiles {
+                let pname = profile_name(profile);
+                let label = format!("{}/{}/{}", preset.name, test.info.name, pname);
+                jobs.push(GauntletJob {
+                    label,
+                    test_name: test.info.name.clone(),
+                    binary: test.binary.clone(),
+                    topo_str: topo_str.clone(),
+                    flags: profile.clone(),
+                });
+            }
         }
     }
 
     let total = jobs.len();
     println!(
-        "{} gauntlet: {} tests x {} topologies = {} VMs, {} parallel",
+        "{} gauntlet: {} tests x topologies x profiles = {} VMs, {} parallel",
         style("launching").cyan().bold(),
         discovered.len(),
-        presets.len(),
         total,
         max_par,
     );
@@ -679,8 +769,12 @@ fn run_gauntlet_jobs(
                 let _ = std::fs::create_dir_all(&job_sidecar);
 
                 let topo_arg = format!("--stt-topo={}", job.topo_str);
-                let output = Command::new(&job.binary)
-                    .args(["--stt-test-fn", &job.test_name, &topo_arg])
+                let mut cmd = Command::new(&job.binary);
+                cmd.args(["--stt-test-fn", &job.test_name, &topo_arg]);
+                if !job.flags.is_empty() {
+                    cmd.arg(format!("--stt-flags={}", job.flags.join(",")));
+                }
+                let output = cmd
                     .env("STT_SIDECAR_DIR", &job_sidecar)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -767,8 +861,20 @@ fn cmd_list(args: ListArgs) -> Result<()> {
         tests.len()
     );
     for t in &tests {
+        let mut extras = Vec::new();
+        if !t.info.required_flags.is_empty() {
+            extras.push(format!("req={}", t.info.required_flags.join("+")));
+        }
+        if !t.info.excluded_flags.is_empty() {
+            extras.push(format!("excl={}", t.info.excluded_flags.join("+")));
+        }
+        let extra_str = if extras.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", extras.join(" "))
+        };
         println!(
-            "  {:<35} {}s{}c{}t {}MB  sched={} replicas={}",
+            "  {:<35} {}s{}c{}t {}MB  sched={} replicas={}{}",
             t.info.name,
             t.info.sockets,
             t.info.cores,
@@ -776,6 +882,7 @@ fn cmd_list(args: ListArgs) -> Result<()> {
             t.info.memory_mb,
             t.info.scheduler,
             t.info.replicas,
+            extra_str,
         );
     }
     Ok(())
@@ -1093,5 +1200,145 @@ stack backtrace:";
         let result =
             Cli::try_parse_from(["cargo-stt", "stt", "vm", "--all-flags", "--flags", "borrow"]);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // profile_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn profile_name_empty() {
+        assert_eq!(profile_name(&[]), "default");
+    }
+
+    #[test]
+    fn profile_name_single() {
+        assert_eq!(profile_name(&["borrow".into()]), "borrow");
+    }
+
+    #[test]
+    fn profile_name_multiple() {
+        assert_eq!(
+            profile_name(&["borrow".into(), "rebal".into()]),
+            "borrow+rebal"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // preset_matches_constraints
+    // -----------------------------------------------------------------------
+
+    fn test_info(
+        min_sockets: u32,
+        min_llcs: u32,
+        requires_smt: bool,
+        min_cpus: u32,
+    ) -> SttTestInfo {
+        SttTestInfo {
+            name: "test".into(),
+            sockets: 1,
+            cores: 2,
+            threads: 1,
+            memory_mb: 2048,
+            scheduler: "eevdf".into(),
+            replicas: 1,
+            required_flags: vec![],
+            excluded_flags: vec![],
+            min_sockets,
+            min_llcs,
+            requires_smt,
+            min_cpus,
+            scheduler_flags: vec![],
+        }
+    }
+
+    #[test]
+    fn preset_matches_defaults() {
+        let preset = &stt::vm::gauntlet_presets()[0];
+        let info = test_info(1, 1, false, 1);
+        assert!(preset_matches_constraints(preset, &info));
+    }
+
+    #[test]
+    fn preset_rejects_insufficient_sockets() {
+        let preset = &stt::vm::gauntlet_presets()[0]; // tiny presets are 1 socket
+        let info = test_info(4, 1, false, 1);
+        assert!(!preset_matches_constraints(preset, &info));
+    }
+
+    #[test]
+    fn preset_rejects_insufficient_cpus() {
+        let preset = &stt::vm::gauntlet_presets()[0]; // tiny presets have few CPUs
+        let info = test_info(1, 1, false, 999);
+        assert!(!preset_matches_constraints(preset, &info));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_profiles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_profiles_no_scheduler_flags() {
+        let info = test_info(1, 1, false, 1);
+        let profiles = compute_profiles(&info, &[]);
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].is_empty());
+    }
+
+    #[test]
+    fn compute_profiles_cli_override() {
+        let info = test_info(1, 1, false, 1);
+        let flags = vec!["borrow".to_string(), "rebal".to_string()];
+        let profiles = compute_profiles(&info, &flags);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0], flags);
+    }
+
+    // -----------------------------------------------------------------------
+    // gauntlet CLI parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_gauntlet_with_flags() {
+        let cli = Cli::try_parse_from(["cargo-stt", "stt", "gauntlet", "--flags", "borrow,rebal"])
+            .unwrap();
+        match cli.command {
+            Cmd::Gauntlet(args) => {
+                assert_eq!(args.flags, vec!["borrow", "rebal"]);
+            }
+            _ => panic!("expected Gauntlet"),
+        }
+    }
+
+    #[test]
+    fn cli_gauntlet_with_work_types() {
+        let cli = Cli::try_parse_from([
+            "cargo-stt",
+            "stt",
+            "gauntlet",
+            "--work-types",
+            "CpuSpin,Bursty",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Gauntlet(args) => {
+                assert_eq!(args.work_types, vec!["CpuSpin", "Bursty"]);
+            }
+            _ => panic!("expected Gauntlet"),
+        }
+    }
+
+    #[test]
+    fn cli_gauntlet_defaults() {
+        let cli = Cli::try_parse_from(["cargo-stt", "stt", "gauntlet"]).unwrap();
+        match cli.command {
+            Cmd::Gauntlet(args) => {
+                assert!(args.flags.is_empty());
+                assert!(args.work_types.is_empty());
+                assert!(args.filter.is_none());
+                assert_eq!(args.package, "stt");
+            }
+            _ => panic!("expected Gauntlet"),
+        }
     }
 }

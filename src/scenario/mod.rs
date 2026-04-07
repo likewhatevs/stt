@@ -69,37 +69,46 @@ pub mod flags {
         #[allow(dead_code)]
         pub args: &'static [&'static str],
         pub requires: &'static [&'static FlagDecl],
+        /// Shell commands to run in the guest to enable this flag
+        /// (e.g. debugfs writes for kernel-built scheduler tunables).
+        pub shell_cmds: &'static [&'static str],
     }
 
     pub static LLC_DECL: FlagDecl = FlagDecl {
         name: "llc",
         args: &[],
         requires: &[],
+        shell_cmds: &[],
     };
     pub static BORROW_DECL: FlagDecl = FlagDecl {
         name: "borrow",
         args: &[],
         requires: &[],
+        shell_cmds: &[],
     };
     pub static STEAL_DECL: FlagDecl = FlagDecl {
         name: "steal",
         args: &[],
         requires: &[&LLC_DECL],
+        shell_cmds: &[],
     };
     pub static REBAL_DECL: FlagDecl = FlagDecl {
         name: "rebal",
         args: &[],
         requires: &[],
+        shell_cmds: &[],
     };
     pub static REJECT_PIN_DECL: FlagDecl = FlagDecl {
         name: "reject-pin",
         args: &[],
         requires: &[],
+        shell_cmds: &[],
     };
     pub static NO_CTRL_DECL: FlagDecl = FlagDecl {
         name: "no-ctrl",
         args: &[],
         requires: &[],
+        shell_cmds: &[],
     };
 
     /// All flag declarations in canonical order.
