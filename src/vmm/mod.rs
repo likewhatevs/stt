@@ -219,16 +219,33 @@ impl BaseKey {
         let mut hasher = std::hash::DefaultHasher::new();
 
         hash_file_sample(payload)?.hash(&mut hasher);
+        Self::hash_shared_libs(payload, &mut hasher);
 
         match scheduler {
             Some(s) => {
                 1u8.hash(&mut hasher);
                 hash_file_sample(s)?.hash(&mut hasher);
+                Self::hash_shared_libs(s, &mut hasher);
             }
             None => 0u8.hash(&mut hasher),
         }
 
         Ok(BaseKey(hasher.finish()))
+    }
+
+    /// Hash shared library paths and content samples for a binary so
+    /// the cache key changes when any shared lib is updated on the host.
+    fn hash_shared_libs(binary: &Path, hasher: &mut std::hash::DefaultHasher) {
+        if let Ok(libs) = initramfs::resolve_shared_libs(binary) {
+            let mut entries: Vec<_> = libs.iter().map(|(_, p)| p.clone()).collect();
+            entries.sort();
+            for p in &entries {
+                p.to_str().unwrap_or("").hash(hasher);
+                if let Ok(sample) = hash_file_sample(p) {
+                    sample.hash(hasher);
+                }
+            }
+        }
     }
 }
 
