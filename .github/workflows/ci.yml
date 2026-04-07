@@ -31,6 +31,7 @@ jobs:
         with:
           tools: cargo-nextest
           enable-kvm: 'true'
+      - run: cargo build --workspace
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
@@ -49,6 +50,7 @@ jobs:
           rust-components: llvm-tools-preview
           tools: cargo-llvm-cov,cargo-nextest
           enable-kvm: 'true'
+      - run: cargo build --workspace
       - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
