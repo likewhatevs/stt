@@ -178,8 +178,10 @@ fn maybe_dispatch_host_test() -> Option<i32> {
 /// SHM ring message type for profraw data.
 pub const MSG_TYPE_PROFRAW: u32 = 0x50524157; // "PRAW"
 
-/// SHM size for stt_test VMs: 4 MB (profraw can be 1-2 MB).
-const STT_TEST_SHM_SIZE: u64 = 4 * 1024 * 1024;
+/// SHM size for stt_test VMs: 16 MB.
+/// Sized for profraw (1-2 MB), stimulus events, exit code, and test
+/// results with mid-flight drain headroom.
+const STT_TEST_SHM_SIZE: u64 = 16 * 1024 * 1024;
 
 /// How to specify the scheduler binary for an `#[stt_test]`.
 pub enum SchedulerSpec {
@@ -723,7 +725,8 @@ fn run_stt_test_inner(
     };
 
     // Enforce memory floor based on initramfs size estimate.
-    let initrd_floor = vmm::estimate_min_memory_mb(&stt_bin, scheduler.as_deref());
+    let initrd_floor =
+        vmm::estimate_min_memory_mb(&stt_bin, scheduler.as_deref(), STT_TEST_SHM_SIZE);
     let memory_mb = memory_mb.max(initrd_floor);
 
     let mut builder = vmm::SttVm::builder()
@@ -889,7 +892,9 @@ fn evaluate_vm_result(
         duration_s: Some(result.duration.as_secs_f64()),
     };
 
-    if let Ok(verify_result) = parse_assert_result(output) {
+    if let Ok(verify_result) =
+        parse_assert_result_shm(result.shm_data.as_ref()).or_else(|_| parse_assert_result(output))
+    {
         // Write sidecar before checking pass/fail so both outcomes are captured.
         write_sidecar(entry, result, stimulus_events, &verify_result, "CpuSpin");
 
@@ -979,7 +984,7 @@ fn evaluate_vm_result(
         return Ok(verify_result);
     }
 
-    // No parseable result — the payload never wrote a AssertResult to COM2.
+    // No parseable result — no AssertResult found in SHM or COM2.
     // When a scheduler is running this typically means the scheduler died;
     // without a scheduler (EEVDF) it means the payload itself failed.
     // Attempt auto-repro if enabled and a scheduler was running.
@@ -1014,7 +1019,7 @@ fn evaluate_vm_result(
         .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
         .unwrap_or_default();
 
-    // Build monitor section for error paths where COM2 had no parseable result.
+    // Build monitor section for error paths where neither SHM nor COM2 had a parseable result.
     let monitor_section = if entry.scheduler.binary.has_active_scheduling()
         && let Some(ref monitor) = result.monitor
     {
@@ -1041,7 +1046,7 @@ fn evaluate_vm_result(
 
     if result.timed_out {
         let msg = format!(
-            "stt_test '{}'{} timed out (no result in COM2){}{}{}{}{}{}",
+            "stt_test '{}'{} timed out (no result in SHM or COM2){}{}{}{}{}{}",
             entry.name,
             sched_label,
             console_section,
@@ -1055,9 +1060,9 @@ fn evaluate_vm_result(
     }
 
     let reason = if entry.scheduler.binary.has_active_scheduling() {
-        "scheduler died (no test result in COM2)"
+        "scheduler died (no test result in SHM or COM2)"
     } else {
-        "payload produced no output (no test result in COM2)"
+        "payload produced no output (no test result in SHM or COM2)"
     };
     let msg = format!(
         "stt_test '{}'{} {}{}{}{}{}{}{}",
@@ -1310,7 +1315,7 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
 }
 
 /// Guest-side dispatch: check for `--stt-test-fn=NAME` in args, run the
-/// registered function, write the result to stdout (captured by COM2),
+/// registered function, write the result to SHM and stdout (COM2),
 /// and exit. Profraw flush is handled by `try_flush_profraw()` in the
 /// ctor before `std::process::exit()`.
 ///
@@ -1663,24 +1668,7 @@ fn pie_load_bias(data: &[u8]) -> usize {
 /// Parse STT_SHM_BASE and STT_SHM_SIZE from /proc/cmdline.
 fn parse_shm_params() -> Option<(u64, u64)> {
     let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
-    parse_shm_params_from_str(&cmdline)
-}
-
-/// Parse STT_SHM_BASE and STT_SHM_SIZE from a kernel command line string.
-fn parse_shm_params_from_str(cmdline: &str) -> Option<(u64, u64)> {
-    let base = cmdline
-        .split_whitespace()
-        .find(|s| s.starts_with("STT_SHM_BASE="))?
-        .strip_prefix("STT_SHM_BASE=")?;
-    let size = cmdline
-        .split_whitespace()
-        .find(|s| s.starts_with("STT_SHM_SIZE="))?
-        .strip_prefix("STT_SHM_SIZE=")?;
-    let base =
-        u64::from_str_radix(base.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
-    let size =
-        u64::from_str_radix(size.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
-    Some((base, size))
+    vmm::shm_ring::parse_shm_params_from_str(&cmdline)
 }
 
 /// Write a TLV message to the SHM ring buffer via /dev/mem mmap.
@@ -1759,16 +1747,29 @@ fn target_dir() -> PathBuf {
 const RESULT_START: &str = "===STT_TEST_RESULT_START===";
 const RESULT_END: &str = "===STT_TEST_RESULT_END===";
 
-/// Print AssertResult as delimited JSON to stdout (captured by COM2).
+/// Write AssertResult to SHM (primary) and stdout/COM2 (fallback).
 fn print_assert_result(r: &AssertResult) {
-    println!("{RESULT_START}");
     if let Ok(json) = serde_json::to_string(r) {
+        vmm::shm_ring::write_msg(vmm::shm_ring::MSG_TYPE_TEST_RESULT, json.as_bytes());
+        println!("{RESULT_START}");
         println!("{json}");
+        println!("{RESULT_END}");
     }
-    println!("{RESULT_END}");
 }
 
-/// Parse AssertResult from guest output between delimiters.
+/// Extract AssertResult from SHM drain entries.
+fn parse_assert_result_shm(shm: Option<&vmm::shm_ring::ShmDrainResult>) -> Result<AssertResult> {
+    let shm = shm.ok_or_else(|| anyhow::anyhow!("no SHM data"))?;
+    let entry = shm
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.msg_type == vmm::shm_ring::MSG_TYPE_TEST_RESULT && e.crc_ok)
+        .ok_or_else(|| anyhow::anyhow!("no test result in SHM"))?;
+    serde_json::from_slice(&entry.payload).context("parse AssertResult from SHM")
+}
+
+/// Parse AssertResult from guest COM2 output between delimiters.
 fn parse_assert_result(output: &str) -> Result<AssertResult> {
     let json = crate::probe::output::extract_section(output, RESULT_START, RESULT_END);
     anyhow::ensure!(!json.is_empty(), "missing result delimiters");
@@ -2097,6 +2098,7 @@ fn write_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmm::shm_ring::parse_shm_params_from_str;
 
     /// Serializes tests that mutate env vars.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3568,8 +3570,8 @@ mod tests {
             "should say timed out, got: {msg}",
         );
         assert!(
-            msg.contains("no result in COM2"),
-            "should mention COM2, got: {msg}",
+            msg.contains("no result in SHM or COM2"),
+            "should mention SHM or COM2, got: {msg}",
         );
         assert!(
             msg.contains("booting"),

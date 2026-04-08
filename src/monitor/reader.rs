@@ -441,7 +441,8 @@ pub(crate) fn monitor_loop(
     watchdog_override: Option<&WatchdogOverride>,
     vcpu_timing: Option<&VcpuTiming>,
     preemption_threshold_ns: u64,
-) -> Vec<MonitorSample> {
+    shm_base_pa: Option<u64>,
+) -> (Vec<MonitorSample>, crate::vmm::shm_ring::ShmDrainResult) {
     let preemption_threshold_ns = if preemption_threshold_ns > 0 {
         preemption_threshold_ns
     } else {
@@ -454,6 +455,8 @@ pub(crate) fn monitor_loop(
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(rq_pas.len());
     let mut prev_vcpu_times: Option<Vec<u64>> = None;
+    let mut shm_entries: Vec<crate::vmm::shm_ring::ShmEntry> = Vec::new();
+    let mut shm_drops: u64 = 0;
 
     loop {
         if kill.load(Ordering::Acquire) {
@@ -561,9 +564,23 @@ pub(crate) fn monitor_loop(
             elapsed_ms: start.elapsed().as_millis() as u64,
             cpus: cpus.clone(),
         });
+
+        // Mid-flight SHM drain: advance read_ptr so the guest can
+        // reclaim ring space. Accumulate drained entries for the
+        // caller to merge with the post-mortem drain.
+        if let Some(shm_pa) = shm_base_pa {
+            let drain = crate::vmm::shm_ring::shm_drain_live(mem, shm_pa);
+            shm_drops = shm_drops.max(drain.drops);
+            shm_entries.extend(drain.entries);
+        }
+
         std::thread::sleep(interval);
     }
-    samples
+    let shm_result = crate::vmm::shm_ring::ShmDrainResult {
+        entries: shm_entries,
+        drops: shm_drops,
+    };
+    (samples, shm_result)
 }
 
 #[cfg(test)]
@@ -681,7 +698,7 @@ mod tests {
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let kill = AtomicBool::new(true);
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -693,6 +710,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         assert!(samples.is_empty());
     }
@@ -712,7 +730,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -724,6 +742,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -803,7 +822,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -815,6 +834,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -846,7 +866,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -858,6 +878,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -1038,7 +1059,7 @@ mod tests {
         };
 
         let ev_pas = vec![ev_pa];
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[rq_pa],
             &offsets,
@@ -1050,6 +1071,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -1077,7 +1099,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1089,6 +1111,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -1131,7 +1154,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1143,6 +1166,7 @@ mod tests {
             Some(&wd),
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -1190,7 +1214,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -1202,6 +1226,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -1252,7 +1277,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1264,6 +1289,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -1315,7 +1341,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1327,6 +1353,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -1387,7 +1414,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1399,6 +1426,7 @@ mod tests {
             None,
             Some(&vcpu_timing),
             0,
+            None,
         );
         handle.join().unwrap();
         sleeper_kill.store(true, Ordering::Release);
@@ -1461,7 +1489,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1473,6 +1501,7 @@ mod tests {
             None,
             Some(&vcpu_timing),
             0,
+            None,
         );
         handle.join().unwrap();
         spinner_kill.store(true, Ordering::Release);
@@ -1533,7 +1562,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -1545,6 +1574,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 
@@ -1615,7 +1645,7 @@ mod tests {
             })
         };
 
-        let samples = monitor_loop(
+        let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1627,6 +1657,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         handle.join().unwrap();
 

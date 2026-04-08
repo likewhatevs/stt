@@ -516,18 +516,23 @@ fn shm_write_and_release(fd: std::os::unix::io::RawFd, data: &[u8], seg_name: &s
 /// free_initrd_mem() releases the compressed copy. The uncompressed
 /// content dominates: `2 * cpio_size` bounds the peak, plus 128 MB
 /// for kernel image, page tables, slab, and process execution.
-pub fn initramfs_min_memory_mb(initramfs_bytes: u64) -> u32 {
+/// `shm_bytes` is the SHM region carved from the top of guest memory
+/// (E820 gap) — it reduces usable RAM.
+pub fn initramfs_min_memory_mb(initramfs_bytes: u64, shm_bytes: u64) -> u32 {
     let initramfs_mb = ((initramfs_bytes + (1 << 20) - 1) >> 20) as u32;
-    2 * initramfs_mb + 128
+    let shm_mb = ((shm_bytes + (1 << 20) - 1) >> 20) as u32;
+    2 * initramfs_mb + 128 + shm_mb
 }
 
 /// Estimate minimum guest memory from binary file sizes.
 ///
 /// The uncompressed cpio is approximately the sum of the payload,
 /// scheduler, and shared library sizes plus cpio metadata (~5%).
+/// `shm_bytes` accounts for the SHM region carved from guest memory.
 pub fn estimate_min_memory_mb(
     payload: &std::path::Path,
     scheduler: Option<&std::path::Path>,
+    shm_bytes: u64,
 ) -> u32 {
     // Debug binaries are stripped before packing into the initramfs.
     // Estimate stripped size as 1/3 of debug size (conservative; actual
@@ -547,7 +552,7 @@ pub fn estimate_min_memory_mb(
         .sum();
     // 5% overhead for cpio headers and alignment.
     let uncompressed = ((payload_size + sched_size + lib_size) as f64 * 1.05) as u64;
-    initramfs_min_memory_mb(uncompressed)
+    initramfs_min_memory_mb(uncompressed, shm_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -958,7 +963,7 @@ impl SttVm {
         );
 
         // Enforce minimum memory for initramfs extraction.
-        let min_mb = initramfs_min_memory_mb(uncompressed_size as u64);
+        let min_mb = initramfs_min_memory_mb(uncompressed_size as u64, self.shm_size);
         if self.memory_mb < min_mb {
             anyhow::bail!(
                 "VM memory {}MB insufficient for initramfs \
@@ -1207,7 +1212,7 @@ impl SttVm {
         i32,
         bool,
         Vec<VcpuThread>,
-        Option<JoinHandle<Vec<monitor::MonitorSample>>>,
+        Option<JoinHandle<(Vec<monitor::MonitorSample>, shm_ring::ShmDrainResult)>>,
         Option<JoinHandle<()>>,
         Arc<PiMutex<console::Serial>>,
         Arc<PiMutex<console::Serial>>,
@@ -1440,13 +1445,14 @@ impl SttVm {
     }
 
     /// Start the monitor thread if vmlinux is available.
+    #[allow(clippy::type_complexity)]
     fn start_monitor(
         &self,
         vm: &kvm::SttKvm,
         kill: &Arc<AtomicBool>,
         start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
-    ) -> Result<Option<JoinHandle<Vec<monitor::MonitorSample>>>> {
+    ) -> Result<Option<JoinHandle<(Vec<monitor::MonitorSample>, shm_ring::ShmDrainResult)>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
         };
@@ -1481,6 +1487,11 @@ impl SttVm {
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
         let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
+        let shm_base_pa = if self.shm_size > 0 {
+            Some(DRAM_BASE + mem_size - self.shm_size)
+        } else {
+            None
+        };
 
         let handle = std::thread::Builder::new()
             .name("vmm-monitor".into())
@@ -1546,6 +1557,7 @@ impl SttVm {
                     watchdog_override.as_ref(),
                     Some(&vcpu_timing),
                     preemption_threshold_ns,
+                    shm_base_pa,
                 )
             })
             .context("spawn monitor thread")?;
@@ -1760,7 +1772,7 @@ impl SttVm {
         mut exit_code: i32,
         timed_out: bool,
         ap_threads: Vec<VcpuThread>,
-        monitor_handle: Option<JoinHandle<Vec<monitor::MonitorSample>>>,
+        monitor_handle: Option<JoinHandle<(Vec<monitor::MonitorSample>, shm_ring::ShmDrainResult)>>,
         bpf_write_handle: Option<JoinHandle<()>>,
         com1: Arc<PiMutex<console::Serial>>,
         com2: Arc<PiMutex<console::Serial>>,
@@ -1785,20 +1797,28 @@ impl SttVm {
             let _ = vt.handle.join();
         }
 
-        let monitor_report = monitor_handle.and_then(|h| h.join().ok()).map(|samples| {
-            let summary = monitor::MonitorSummary::from_samples(&samples);
-            let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
-            monitor::MonitorReport {
-                samples,
-                summary,
-                preemption_threshold_ns,
+        let (monitor_report, mid_flight_drain) = match monitor_handle.and_then(|h| h.join().ok()) {
+            Some((samples, drain)) => {
+                let summary = monitor::MonitorSummary::from_samples(&samples);
+                let preemption_threshold_ns =
+                    monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
+                let report = monitor::MonitorReport {
+                    samples,
+                    summary,
+                    preemption_threshold_ns,
+                };
+                (Some(report), drain)
             }
-        });
+            None => (None, shm_ring::ShmDrainResult::default()),
+        };
 
         if let Some(h) = bpf_write_handle {
             let _ = h.join();
         }
 
+        // Merge mid-flight drain (from monitor thread) with post-mortem
+        // drain (snapshot after VM exit). Mid-flight entries come first
+        // since they were drained during execution.
         let (shm_data, stimulus_events) = if self.shm_size > 0 {
             let mem_size = (self.memory_mb as u64) << 20;
             let shm_base = DRAM_BASE + mem_size - self.shm_size;
@@ -1807,14 +1827,24 @@ impl SttVm {
             vm.guest_mem
                 .read_slice(&mut shm_buf, GuestAddress(shm_base))
                 .context("read SHM region")?;
-            let drain = shm_ring::shm_drain(&shm_buf, 0);
-            let events: Vec<shm_ring::StimulusEvent> = drain
-                .entries
+            let post_mortem = shm_ring::shm_drain(&shm_buf, 0);
+
+            let mut all_entries = mid_flight_drain.entries;
+            all_entries.extend(post_mortem.entries);
+            let drops = mid_flight_drain.drops.max(post_mortem.drops);
+
+            let events: Vec<shm_ring::StimulusEvent> = all_entries
                 .iter()
                 .filter(|e| e.msg_type == shm_ring::MSG_TYPE_STIMULUS && e.crc_ok)
                 .filter_map(|e| shm_ring::StimulusEvent::from_payload(&e.payload))
                 .collect();
-            (Some(drain), events)
+            (
+                Some(shm_ring::ShmDrainResult {
+                    entries: all_entries,
+                    drops,
+                }),
+                events,
+            )
         } else {
             (None, Vec::new())
         };
@@ -1822,7 +1852,17 @@ impl SttVm {
         let app_output = com2.lock().output();
         let console_output = com1.lock().output();
 
-        if let Some(line) = app_output
+        // Extract exit code: SHM (primary), COM2 sentinel (fallback).
+        let shm_exit = shm_data.as_ref().and_then(|d| {
+            d.entries
+                .iter()
+                .rev()
+                .find(|e| e.msg_type == shm_ring::MSG_TYPE_EXIT && e.crc_ok && e.payload.len() == 4)
+                .map(|e| i32::from_ne_bytes(e.payload[..4].try_into().unwrap()))
+        });
+        if let Some(code) = shm_exit {
+            exit_code = code;
+        } else if let Some(line) = app_output
             .lines()
             .rev()
             .find(|l| l.starts_with("STT_EXIT="))

@@ -1,7 +1,7 @@
 /// Shared-memory ring buffer for guest-to-host data transfer.
 ///
 /// The guest writes TLV-framed messages into a fixed region at the top of
-/// guest physical memory. The host drains the ring after the VM exits.
+/// guest physical memory. The host drains both mid-flight and after VM exit.
 /// Single producer (guest), single consumer (host), no locking required.
 ///
 /// Memory layout:
@@ -69,6 +69,12 @@ pub const MSG_TYPE_SCENARIO_START: u32 = 0x5343_5354; // "SCST"
 /// Message type for scenario end marker.
 pub const MSG_TYPE_SCENARIO_END: u32 = 0x5343_454E; // "SCEN"
 
+/// Message type for guest exit code (payload: 4-byte i32).
+pub const MSG_TYPE_EXIT: u32 = 0x4558_4954; // "EXIT"
+
+/// Message type for test result (payload: JSON-encoded AssertResult).
+pub const MSG_TYPE_TEST_RESULT: u32 = 0x5445_5354; // "TEST"
+
 /// Current header version.
 pub const SHM_RING_VERSION: u32 = 1;
 
@@ -108,7 +114,7 @@ pub fn wait_for(slot: u8, timeout: std::time::Duration) -> anyhow::Result<()> {
         (slot as usize) < SIGNAL_SLOT_COUNT,
         "signal slot {slot} out of range"
     );
-    let ptr = shm_ptr()?;
+    let (ptr, _) = shm_ptr()?;
     let offset = SIGNAL_SLOT_BASE + slot as usize;
     let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
     let deadline = std::time::Instant::now() + timeout;
@@ -128,7 +134,7 @@ pub fn signal(slot: u8) {
         (slot as usize) < SIGNAL_SLOT_COUNT,
         "signal slot {slot} out of range"
     );
-    let Ok(ptr) = shm_ptr() else { return };
+    let Ok((ptr, _)) = shm_ptr() else { return };
     let offset = SIGNAL_SLOT_BASE + slot as usize;
     let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
     atom.store(1, std::sync::atomic::Ordering::Release);
@@ -145,27 +151,38 @@ pub fn signal_guest(mem: &crate::monitor::reader::GuestMem, shm_base: u64, slot:
     mem.write_u8(shm_base, SIGNAL_SLOT_BASE + slot as usize, 1);
 }
 
-/// Set the cached SHM base pointer. Called from `start_shm_poll` in
-/// the guest init after parsing /proc/cmdline.
-pub fn init_shm_ptr(base: *mut u8) {
-    let _ = SHM_PTR.set(ShmPtr(base));
+/// Set the cached SHM base pointer and region size. Called from
+/// `start_shm_poll` in the guest init after parsing /proc/cmdline.
+pub fn init_shm_ptr(base: *mut u8, size: usize) {
+    let _ = SHM_PTR.set(ShmPtr { ptr: base, size });
 }
 
-/// Wrapper for a raw pointer that is Send+Sync.
+/// Guest-side: write a TLV message to the SHM ring using the cached
+/// mmap pointer. No-op if SHM is not initialized.
+pub fn write_msg(msg_type: u32, payload: &[u8]) {
+    let Ok((ptr, size)) = shm_ptr() else { return };
+    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+    shm_write(buf, 0, msg_type, payload);
+}
+
+/// Wrapper for a raw pointer + size that is Send+Sync.
 /// SAFETY: The SHM pointer is set once during single-threaded init and
 /// points into a /dev/mem mmap that outlives all guest threads.
-struct ShmPtr(*mut u8);
+struct ShmPtr {
+    ptr: *mut u8,
+    size: usize,
+}
 unsafe impl Send for ShmPtr {}
 unsafe impl Sync for ShmPtr {}
 
 /// Cached SHM mmap pointer for guest-side signal operations.
 static SHM_PTR: std::sync::OnceLock<ShmPtr> = std::sync::OnceLock::new();
 
-/// Get the cached SHM mmap pointer, initializing from /proc/cmdline
-/// if not already set.
-fn shm_ptr() -> anyhow::Result<*mut u8> {
+/// Get the cached SHM mmap pointer and size, initializing from
+/// /proc/cmdline if not already set.
+fn shm_ptr() -> anyhow::Result<(*mut u8, usize)> {
     if let Some(p) = SHM_PTR.get() {
-        return Ok(p.0);
+        return Ok((p.ptr, p.size));
     }
     // Lazy init from /proc/cmdline.
     let cmdline = std::fs::read_to_string("/proc/cmdline")
@@ -186,8 +203,9 @@ fn shm_ptr() -> anyhow::Result<*mut u8> {
     )
     .ok_or_else(|| anyhow::anyhow!("/dev/mem mmap failed: {}", std::io::Error::last_os_error()))?;
 
-    let _ = SHM_PTR.set(ShmPtr(m.ptr));
-    Ok(m.ptr)
+    let size = shm_size as usize;
+    let _ = SHM_PTR.set(ShmPtr { ptr: m.ptr, size });
+    Ok((m.ptr, size))
 }
 
 /// Parse STT_SHM_BASE and STT_SHM_SIZE from a kernel command line string.
@@ -206,15 +224,6 @@ pub(crate) fn parse_shm_params_from_str(cmdline: &str) -> Option<(u64, u64)> {
         u64::from_str_radix(size.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
     Some((base, size))
 }
-
-/// Default SHM region size (64 KB).
-#[allow(dead_code)]
-pub const SHM_DEFAULT_SIZE: u64 = 64 * 1024;
-
-/// Minimum SHM region size. Must hold header + at least one message.
-#[allow(dead_code)]
-pub const SHM_MIN_SIZE: u64 =
-    std::mem::size_of::<ShmRingHeader>() as u64 + std::mem::size_of::<ShmMessage>() as u64 + 1;
 
 /// Ring buffer header at the start of the SHM region.
 ///
@@ -454,6 +463,103 @@ pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
     ShmDrainResult {
         entries,
         drops: header.drops,
+    }
+}
+
+/// Drain messages from the SHM ring while the guest VM is running.
+///
+/// Unlike `shm_drain` (which operates on a post-mortem snapshot),
+/// this reads from live guest memory via volatile pointers and writes
+/// `read_ptr` back so the guest can reclaim ring space.
+///
+/// `mem` provides volatile access to guest physical memory.
+/// `shm_base_pa` is the guest physical address of the SHM region.
+///
+/// Returns drained entries. Call periodically (~10ms) from the monitor
+/// thread to prevent ring overflow during long scenarios.
+pub fn shm_drain_live(mem: &crate::monitor::reader::GuestMem, shm_base_pa: u64) -> ShmDrainResult {
+    let magic = mem.read_u32(shm_base_pa, 0);
+    if magic != SHM_RING_MAGIC {
+        return ShmDrainResult::default();
+    }
+
+    let capacity = mem.read_u32(shm_base_pa, 8) as usize;
+    let write_ptr = mem.read_u64(shm_base_pa, 16);
+    let read_ptr = mem.read_u64(shm_base_pa, 24);
+    let drops = mem.read_u64(shm_base_pa, 32);
+
+    let data_start_pa = shm_base_pa + HEADER_SIZE as u64;
+    let mut read_pos = read_ptr;
+    let mut entries = Vec::new();
+
+    while read_pos + MSG_HEADER_SIZE as u64 <= write_ptr {
+        // Read message header via volatile.
+        let mut hdr_buf = [0u8; MSG_HEADER_SIZE];
+        read_ring_volatile(mem, data_start_pa, capacity, read_pos, &mut hdr_buf);
+        let msg = ShmMessage {
+            msg_type: u32::from_ne_bytes(hdr_buf[0..4].try_into().unwrap()),
+            length: u32::from_ne_bytes(hdr_buf[4..8].try_into().unwrap()),
+            crc32: u32::from_ne_bytes(hdr_buf[8..12].try_into().unwrap()),
+            _pad: u32::from_ne_bytes(hdr_buf[12..16].try_into().unwrap()),
+        };
+
+        let total_msg_size = MSG_HEADER_SIZE as u64 + msg.length as u64;
+        if read_pos + total_msg_size > write_ptr {
+            break;
+        }
+
+        let mut payload = vec![0u8; msg.length as usize];
+        if !payload.is_empty() {
+            read_ring_volatile(
+                mem,
+                data_start_pa,
+                capacity,
+                read_pos + MSG_HEADER_SIZE as u64,
+                &mut payload,
+            );
+        }
+
+        let computed_crc = crc32fast::hash(&payload);
+        entries.push(ShmEntry {
+            msg_type: msg.msg_type,
+            payload,
+            crc_ok: computed_crc == msg.crc32,
+        });
+
+        read_pos += total_msg_size;
+    }
+
+    // Advance read_ptr so the guest can reuse the drained space.
+    if read_pos != read_ptr {
+        mem.write_u64(shm_base_pa, 24, read_pos);
+    }
+
+    ShmDrainResult { entries, drops }
+}
+
+/// Read `out.len()` bytes from the ring data area via volatile reads,
+/// handling wraparound. Uses byte-by-byte volatile reads since the
+/// data area is in guest memory that the guest may be writing to.
+fn read_ring_volatile(
+    mem: &crate::monitor::reader::GuestMem,
+    data_start_pa: u64,
+    capacity: usize,
+    ptr: u64,
+    out: &mut [u8],
+) {
+    let mut remaining = out.len();
+    let mut src_pos = (ptr % capacity as u64) as usize;
+    let mut dst_pos = 0;
+    while remaining > 0 {
+        let chunk = remaining.min(capacity - src_pos);
+        for i in 0..chunk {
+            let pa = data_start_pa + (src_pos + i) as u64;
+            let byte = unsafe { std::ptr::read_volatile(mem.base_ptr().add(pa as usize)) };
+            out[dst_pos + i] = byte;
+        }
+        dst_pos += chunk;
+        src_pos = 0; // wrap
+        remaining -= chunk;
     }
 }
 
@@ -944,16 +1050,6 @@ mod tests {
     fn stall_req_offset_in_pad() {
         assert_eq!(STALL_REQ_OFFSET, 13);
         assert_eq!(STALL_REQ_ACTIVATE, b'S');
-    }
-
-    #[test]
-    fn shm_min_size_holds_one_message() {
-        assert!(SHM_MIN_SIZE > HEADER_SIZE as u64 + MSG_HEADER_SIZE as u64);
-    }
-
-    #[test]
-    fn shm_default_size_value() {
-        assert_eq!(SHM_DEFAULT_SIZE, 64 * 1024);
     }
 
     #[test]

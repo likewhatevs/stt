@@ -17,7 +17,7 @@ use nix::sys::reboot::{RebootMode, reboot};
 use nix::sys::stat::Mode;
 use nix::unistd::mkdir;
 
-/// COM2 device path for sentinel/result output.
+/// COM2 device path for sentinel and diagnostic output.
 const COM2: &str = "/dev/ttyS1";
 /// COM1 device path for kernel console / trace output.
 const COM1: &str = "/dev/ttyS0";
@@ -120,6 +120,11 @@ pub(crate) fn stt_guest_init() -> ! {
         libc::tcdrain(1);
     }
 
+    // Write exit code to SHM (primary) and COM2 (fallback).
+    crate::vmm::shm_ring::write_msg(
+        crate::vmm::shm_ring::MSG_TYPE_EXIT,
+        &(code as i32).to_ne_bytes(),
+    );
     write_com2(&format!("STT_EXIT={code}"));
 
     // Drain COM2 UART after writing the exit sentinel.
@@ -395,7 +400,7 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool) {
 
     // Initialize the signal slot pointer so shm_ring::wait_for and
     // shm_ring::signal can use this mmap.
-    crate::vmm::shm_ring::init_shm_ptr(shm_ptr);
+    crate::vmm::shm_ring::init_shm_ptr(shm_ptr, shm_size as usize);
 
     let dump_offset = crate::vmm::shm_ring::DUMP_REQ_OFFSET;
     let stall_offset = crate::vmm::shm_ring::STALL_REQ_OFFSET;
