@@ -56,6 +56,9 @@ pub(crate) struct KernelSymbols {
     /// 0 = 4-level paging, 1 = 5-level paging (LA57 active).
     /// None if the symbol is absent (CONFIG_PGTABLE_LEVELS < 5).
     pub pgtable_l5_enabled: Option<u64>,
+    /// Kernel virtual address of `prog_idr` (BPF program IDR).
+    /// None if the symbol is absent.
+    pub prog_idr: Option<u64>,
 }
 
 impl KernelSymbols {
@@ -96,6 +99,8 @@ impl KernelSymbols {
             .symbol_by_name("__pgtable_l5_enabled")
             .map(|s| s.address());
 
+        let prog_idr = elf.symbol_by_name("prog_idr").map(|s| s.address());
+
         Ok(Self {
             runqueues,
             per_cpu_offset,
@@ -104,6 +109,7 @@ impl KernelSymbols {
             scx_watchdog_timeout,
             init_top_pgt,
             pgtable_l5_enabled,
+            prog_idr,
         })
     }
 }
@@ -341,6 +347,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: None,
+            prog_idr: None,
         };
 
         let mut buf = [0u8; 0x2000];
@@ -364,6 +371,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: None,
+            prog_idr: None,
         };
 
         let buf = [0u8; 64];
@@ -395,6 +403,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: None,
+            prog_idr: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), expected_page_offset);
@@ -415,6 +424,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: None,
+            prog_idr: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -437,6 +447,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: None,
+            prog_idr: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -462,6 +473,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: None,
+            prog_idr: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -490,6 +502,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: None,
+            prog_idr: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), randomized_page_offset);
@@ -514,6 +527,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
+            prog_idr: None,
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols));
@@ -538,6 +552,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
+            prog_idr: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));
@@ -558,6 +573,7 @@ mod tests {
 
             init_top_pgt: None,
             pgtable_l5_enabled: None,
+            prog_idr: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));

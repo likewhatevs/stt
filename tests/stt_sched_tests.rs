@@ -260,6 +260,18 @@ static __STT_ENTRY_SCX: stt::test_support::SttTestEntry = stt::test_support::Stt
     ..stt::test_support::SttTestEntry::DEFAULT
 };
 
+/// Minimal scheduler test that exercises host-side BPF program enumeration.
+/// The framework asserts verifier_stats is non-empty for scheduler tests.
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 2, threads = 1, duration_s = 3)]
+fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0),
+    }];
+    execute_steps(ctx, steps)
+}
+
 fn scenario_mid_degrade(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
     use stt::scenario::ops::execute_steps_with;
     let checks = stt::assert::Assert::default_checks().max_gap_ms(50);

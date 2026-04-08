@@ -57,6 +57,10 @@ pub(crate) fn stt_guest_init() -> ! {
     // Phase 1: Mounts.
     mount_filesystems();
 
+    // Enable per-program BPF runtime stats (cnt, nsecs). The kernel
+    // only populates bpf_prog_stats when bpf_stats_enabled_key is set.
+    let _ = fs::write("/proc/sys/kernel/bpf_stats_enabled", "1");
+
     // Phase 2: Sentinel + stdio redirect.
     write_com2("STT_INIT_STARTED");
     redirect_stdio_to_com2();
@@ -75,6 +79,10 @@ pub(crate) fn stt_guest_init() -> ! {
     // Phase 4: SHM polling + trace pipe (background threads).
     let trace_stop = start_trace_pipe();
     let shm_stop = start_shm_poll();
+
+    // Signal the host that the scheduler is loaded and BPF programs
+    // are ready for enumeration.
+    crate::vmm::shm_ring::signal(1);
 
     // Phase 5: Dispatch.
     // Read test args from /args in the initramfs. As PID 1, the kernel

@@ -40,6 +40,8 @@ pub struct SidecarResult {
     pub stimulus_events: Vec<StimulusEvent>,
     #[serde(default = "crate::stats::default_work_type")]
     pub work_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verifier_stats: Vec<crate::monitor::bpf_prog::ProgVerifierInfo>,
 }
 
 /// Scan a directory for stt sidecar JSON files. Recurses one level
@@ -681,7 +683,119 @@ pub fn collect_and_print_sidecar_stats() {
         if !rows.is_empty() {
             eprintln!("{}", crate::stats::analyze_rows(&rows));
         }
+        let vstats = format_verifier_stats(&sidecars);
+        if !vstats.is_empty() {
+            eprintln!("{vstats}");
+        }
+        let cprofile = format_callback_profile(&sidecars);
+        if !cprofile.is_empty() {
+            eprintln!("{cprofile}");
+        }
     }
+}
+
+/// BPF verifier complexity limit (BPF_COMPLEXITY_LIMIT_INSNS).
+const VERIFIER_INSN_LIMIT: u32 = 1_000_000;
+
+/// Percentage of the verifier limit that triggers a warning.
+const VERIFIER_WARN_PCT: f64 = 75.0;
+
+/// Aggregate BPF verifier stats across sidecars into a summary table.
+///
+/// verified_insns is deterministic for a given binary, so per-program
+/// values are deduplicated (max across observations). Flags programs
+/// using >=75% of the 1M verifier complexity limit.
+fn format_verifier_stats(sidecars: &[SidecarResult]) -> String {
+    use std::collections::BTreeMap;
+
+    let mut by_name: BTreeMap<&str, u32> = BTreeMap::new();
+    for sc in sidecars {
+        for info in &sc.verifier_stats {
+            let entry = by_name.entry(&info.name).or_insert(0);
+            *entry = (*entry).max(info.verified_insns);
+        }
+    }
+
+    if by_name.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n=== BPF VERIFIER STATS ===\n\n");
+    out.push_str(&format!(
+        "  {:<24} {:>12} {:>8}\n",
+        "program", "verified", "limit%"
+    ));
+    out.push_str(&format!("  {:-<24} {:-<12} {:-<8}\n", "", "", ""));
+
+    let mut warnings = Vec::new();
+    let mut total: u64 = 0;
+
+    for (&name, &verified_insns) in &by_name {
+        let pct = (verified_insns as f64 / VERIFIER_INSN_LIMIT as f64) * 100.0;
+        let flag = if pct >= VERIFIER_WARN_PCT { " !" } else { "" };
+        out.push_str(&format!(
+            "  {:<24} {:>12} {:>7.1}%{flag}\n",
+            name, verified_insns, pct,
+        ));
+        if pct >= VERIFIER_WARN_PCT {
+            warnings.push(format!(
+                "  {name}: {pct:.1}% of 1M limit ({verified_insns} verified insns)",
+            ));
+        }
+        total += verified_insns as u64;
+    }
+
+    out.push_str(&format!("\n  total verified insns: {total}\n"));
+
+    if !warnings.is_empty() {
+        out.push_str("\nWARNING: programs near verifier complexity limit:\n");
+        for w in &warnings {
+            out.push_str(w);
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+/// Per-test BPF callback profile from monitor prog_stats_deltas.
+///
+/// Shows per-program invocation count, total CPU time, and average
+/// nanoseconds per call. Each test's profile is printed independently.
+fn format_callback_profile(sidecars: &[SidecarResult]) -> String {
+    let mut out = String::new();
+
+    for sc in sidecars {
+        let deltas = match sc
+            .monitor
+            .as_ref()
+            .and_then(|m| m.prog_stats_deltas.as_ref())
+        {
+            Some(d) if !d.is_empty() => d,
+            _ => continue,
+        };
+
+        if out.is_empty() {
+            out.push_str("\n=== BPF CALLBACK PROFILE ===\n");
+        }
+        out.push_str(&format!("\n  {} ({}):\n", sc.test_name, sc.topology));
+        out.push_str(&format!(
+            "    {:<24} {:>12} {:>14} {:>12}\n",
+            "program", "cnt", "total_ns", "avg_ns"
+        ));
+        out.push_str(&format!(
+            "    {:-<24} {:-<12} {:-<14} {:-<12}\n",
+            "", "", "", ""
+        ));
+        for d in deltas {
+            out.push_str(&format!(
+                "    {:<24} {:>12} {:>14} {:>12.0}\n",
+                d.name, d.cnt, d.nsecs, d.nsecs_per_call,
+            ));
+        }
+    }
+
+    out
 }
 
 fn run_stt_test_inner(
@@ -783,6 +897,23 @@ fn run_stt_test_inner(
     let vm = builder.build().context("build stt_test VM")?;
 
     let result = vm.run().context("run stt_test VM")?;
+
+    // Log verifier stats count for visibility.
+    if !result.verifier_stats.is_empty() {
+        eprintln!(
+            "stt_test: verifier_stats: {} struct_ops programs",
+            result.verifier_stats.len(),
+        );
+    }
+
+    // When running with a struct_ops scheduler, verify that host-side
+    // BPF program enumeration found programs with non-zero verified_insns.
+    if entry.scheduler.binary.has_active_scheduling()
+        && result.success
+        && result.verifier_stats.is_empty()
+    {
+        eprintln!("stt_test: WARNING: scheduler loaded but verifier_stats is empty");
+    }
 
     // Extract profraw from SHM ring buffer and collect stimulus events.
     let mut stimulus_events = Vec::new();
@@ -2085,6 +2216,7 @@ fn write_sidecar(
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
+        verifier_stats: vm_result.verifier_stats.clone(),
     };
     let path = dir.join(format!("{}.stt.json", entry.name));
     if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
@@ -2955,6 +3087,7 @@ mod tests {
                 ..Default::default()
             },
             monitor: Some(MonitorSummary {
+                prog_stats_deltas: None,
                 total_samples: 10,
                 max_imbalance_ratio: 1.5,
                 max_local_dsq_depth: 3,
@@ -2978,6 +3111,7 @@ mod tests {
                 total_iterations: None,
             }],
             work_type: "CpuSpin".to_string(),
+            verifier_stats: vec![],
         };
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -3012,6 +3146,7 @@ mod tests {
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            verifier_stats: vec![],
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -3221,6 +3356,7 @@ mod tests {
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            verifier_stats: vec![],
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(tmp.join("test_x.stt.json"), &json).unwrap();
@@ -3246,6 +3382,7 @@ mod tests {
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            verifier_stats: vec![],
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(sub.join("nested_test.stt.json"), &json).unwrap();
@@ -3288,6 +3425,7 @@ mod tests {
             monitor: None,
             stimulus_events: vec![],
             work_type: "Bursty".to_string(),
+            verifier_stats: vec![],
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -3321,6 +3459,7 @@ mod tests {
             monitor: None,
             shm_data: None,
             stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
         };
         let verify_result = AssertResult::pass();
         // This should be a no-op because STT_SIDECAR_DIR is not set.
@@ -3360,6 +3499,7 @@ mod tests {
             monitor: None,
             shm_data: None,
             stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
         };
         let verify_result = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
@@ -3457,6 +3597,7 @@ mod tests {
             monitor: None,
             shm_data: None,
             stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
         }
     }
 
@@ -3822,5 +3963,122 @@ mod tests {
             msg.contains("payload started but produced no test result"),
             "both sentinels should indicate payload ran but failed, got: {msg}",
         );
+    }
+
+    // -- format_verifier_stats tests --
+
+    fn make_sidecar_with_vstats(
+        vstats: Vec<crate::monitor::bpf_prog::ProgVerifierInfo>,
+    ) -> SidecarResult {
+        SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1s1c1t".to_string(),
+            scheduler: "test".to_string(),
+            passed: true,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            verifier_stats: vstats,
+        }
+    }
+
+    #[test]
+    fn format_verifier_stats_empty() {
+        assert!(format_verifier_stats(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_verifier_stats_no_data() {
+        let sc = make_sidecar_with_vstats(vec![]);
+        assert!(format_verifier_stats(&[sc]).is_empty());
+    }
+
+    #[test]
+    fn format_verifier_stats_table() {
+        let sc = make_sidecar_with_vstats(vec![
+            crate::monitor::bpf_prog::ProgVerifierInfo {
+                name: "dispatch".to_string(),
+                verified_insns: 50000,
+            },
+            crate::monitor::bpf_prog::ProgVerifierInfo {
+                name: "enqueue".to_string(),
+                verified_insns: 30000,
+            },
+        ]);
+        let result = format_verifier_stats(&[sc]);
+        assert!(result.contains("BPF VERIFIER STATS"));
+        assert!(result.contains("dispatch"));
+        assert!(result.contains("enqueue"));
+        assert!(result.contains("50000"));
+        assert!(result.contains("30000"));
+        assert!(result.contains("total verified insns: 80000"));
+        assert!(!result.contains("WARNING"));
+    }
+
+    #[test]
+    fn format_verifier_stats_warning() {
+        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierInfo {
+            name: "heavy".to_string(),
+            verified_insns: 800000,
+        }]);
+        let result = format_verifier_stats(&[sc]);
+        assert!(result.contains("WARNING"));
+        assert!(result.contains("heavy"));
+        assert!(result.contains("80.0%"));
+    }
+
+    #[test]
+    fn sidecar_verifier_stats_serde_roundtrip() {
+        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierInfo {
+            name: "init".to_string(),
+            verified_insns: 5000,
+        }]);
+        let json = serde_json::to_string(&sc).unwrap();
+        assert!(json.contains("verifier_stats"));
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.verifier_stats.len(), 1);
+        assert_eq!(loaded.verifier_stats[0].name, "init");
+        assert_eq!(loaded.verifier_stats[0].verified_insns, 5000);
+    }
+
+    #[test]
+    fn sidecar_verifier_stats_absent_deserializes_empty() {
+        let json = r#"{
+            "test_name": "t",
+            "topology": "1s1c1t",
+            "scheduler": "eevdf",
+            "passed": true,
+            "stats": {"cgroups":[],"total_workers":0,"total_cpus":0,
+                      "total_migrations":0,"worst_spread":0.0,
+                      "worst_gap_ms":0,"worst_gap_cpu":0,
+                      "total_iterations":0},
+            "stimulus_events": [],
+            "work_type": "CpuSpin"
+        }"#;
+        let loaded: SidecarResult = serde_json::from_str(json).unwrap();
+        assert!(loaded.verifier_stats.is_empty());
+    }
+
+    #[test]
+    fn sidecar_verifier_stats_empty_omitted() {
+        let sc = make_sidecar_with_vstats(vec![]);
+        let json = serde_json::to_string(&sc).unwrap();
+        assert!(!json.contains("verifier_stats"));
+    }
+
+    #[test]
+    fn format_verifier_stats_deduplicates() {
+        let sc1 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierInfo {
+            name: "dispatch".to_string(),
+            verified_insns: 50000,
+        }]);
+        let sc2 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierInfo {
+            name: "dispatch".to_string(),
+            verified_insns: 50000,
+        }]);
+        let result = format_verifier_stats(&[sc1, sc2]);
+        // Deduplicated: total should be 50000, not 100000.
+        assert!(result.contains("total verified insns: 50000"));
     }
 }

@@ -1750,9 +1750,11 @@ mod tests {
                     total_enq_skip_exiting: 0,
                     total_enq_skip_migration_disabled: 0,
                 }),
+                prog_stats_deltas: None,
             }),
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            verifier_stats: vec![],
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "my_test");
@@ -1782,6 +1784,7 @@ mod tests {
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            verifier_stats: vec![],
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "eevdf_test");
@@ -1804,6 +1807,7 @@ mod tests {
             passed: true,
             stats: Default::default(),
             monitor: Some(monitor::MonitorSummary {
+                prog_stats_deltas: None,
                 total_samples: 5,
                 max_imbalance_ratio: 1.0,
                 max_local_dsq_depth: 0,
@@ -1812,6 +1816,7 @@ mod tests {
             }),
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            verifier_stats: vec![],
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.stall_count, 0);

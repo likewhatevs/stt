@@ -5,16 +5,20 @@
 //! kernel or the scheduler under test.
 //!
 //! The [`bpf_map`] module provides host-side discovery and read/write
-//! access to BPF maps in guest memory. Maps are located by walking the
-//! kernel's `map_idr` xarray; values are accessed through page table
-//! translation. No guest cooperation is needed.
+//! access to BPF maps in guest memory. The [`bpf_prog`] module provides
+//! host-side enumeration of BPF programs and their verifier/runtime stats.
+//! Both locate kernel objects by walking IDR xarrays (shared infrastructure
+//! in the [`idr`] module) through page table translation. No guest
+//! cooperation is needed.
 //!
 //! See the [Monitor](https://sched-ext.github.io/scx/stt/architecture/monitor.html)
 //! chapter of the guide.
 
 pub mod bpf_map;
+pub mod bpf_prog;
 pub mod btf_offsets;
 pub mod guest;
+pub mod idr;
 pub mod reader;
 pub mod symbols;
 
@@ -218,15 +222,28 @@ pub struct MonitorReport {
 }
 
 /// Point-in-time snapshot of all CPUs.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MonitorSample {
     /// Milliseconds since VM start.
     pub elapsed_ms: u64,
     /// Per-CPU state at this instant.
     pub cpus: Vec<CpuSnapshot>,
+    /// Per-program BPF runtime stats (summed across CPUs).
+    /// None when no struct_ops programs are loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prog_stats: Option<Vec<bpf_prog::ProgRuntimeStats>>,
 }
 
 impl MonitorSample {
+    /// Create a sample with no prog_stats.
+    pub fn new(elapsed_ms: u64, cpus: Vec<CpuSnapshot>) -> Self {
+        Self {
+            elapsed_ms,
+            cpus,
+            prog_stats: None,
+        }
+    }
+
     /// Compute the imbalance ratio for this sample: max(nr_running) / max(1, min(nr_running)).
     /// Returns 1.0 for empty samples, 0.0 when all CPUs have nr_running=0.
     pub fn imbalance_ratio(&self) -> f64 {
@@ -312,6 +329,23 @@ pub struct MonitorSummary {
     /// None when event counters are not available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_deltas: Option<ScxEventDeltas>,
+    /// Per-program BPF callback profile over the monitoring window.
+    /// None when no struct_ops programs are loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prog_stats_deltas: Option<Vec<ProgStatsDelta>>,
+}
+
+/// Per-program BPF callback profile computed from first/last monitor samples.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProgStatsDelta {
+    /// Program name.
+    pub name: String,
+    /// Total invocations over the monitoring window.
+    pub cnt: u64,
+    /// Total CPU time in nanoseconds over the monitoring window.
+    pub nsecs: u64,
+    /// Average nanoseconds per call (nsecs / cnt). 0 when cnt is 0.
+    pub nsecs_per_call: f64,
 }
 
 /// Aggregate event counter statistics computed from first/last samples.
@@ -397,6 +431,7 @@ impl MonitorSummary {
         }
 
         let event_deltas = Self::compute_event_deltas(samples);
+        let prog_stats_deltas = Self::compute_prog_stats_deltas(samples);
 
         Self {
             total_samples: samples.len(),
@@ -404,6 +439,7 @@ impl MonitorSummary {
             max_local_dsq_depth,
             stall_detected,
             event_deltas,
+            prog_stats_deltas,
         }
     }
 
@@ -462,6 +498,42 @@ impl MonitorSummary {
             total_enq_skip_exiting: delta(|e| e.enq_skip_exiting),
             total_enq_skip_migration_disabled: delta(|e| e.enq_skip_migration_disabled),
         })
+    }
+
+    /// Compute per-program callback profile from first/last samples
+    /// that contain prog_stats.
+    fn compute_prog_stats_deltas(samples: &[MonitorSample]) -> Option<Vec<ProgStatsDelta>> {
+        let first = samples.iter().find(|s| s.prog_stats.is_some())?;
+        let last = samples.iter().rev().find(|s| s.prog_stats.is_some())?;
+
+        let first_progs = first.prog_stats.as_ref()?;
+        let last_progs = last.prog_stats.as_ref()?;
+
+        let deltas: Vec<ProgStatsDelta> = last_progs
+            .iter()
+            .map(|lp| {
+                let fp = first_progs.iter().find(|p| p.name == lp.name);
+                let cnt = lp.cnt.saturating_sub(fp.map_or(0, |p| p.cnt));
+                let nsecs = lp.nsecs.saturating_sub(fp.map_or(0, |p| p.nsecs));
+                let nsecs_per_call = if cnt > 0 {
+                    nsecs as f64 / cnt as f64
+                } else {
+                    0.0
+                };
+                ProgStatsDelta {
+                    name: lp.name.clone(),
+                    cnt,
+                    nsecs,
+                    nsecs_per_call,
+                }
+            })
+            .collect();
+
+        if deltas.is_empty() {
+            None
+        } else {
+            Some(deltas)
+        }
     }
 }
 
@@ -992,6 +1064,7 @@ mod tests {
     #[test]
     fn single_sample_imbalanced_cpus() {
         let sample = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -1018,6 +1091,7 @@ mod tests {
     #[test]
     fn stall_detected_when_clock_stuck() {
         let s1 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -1033,6 +1107,7 @@ mod tests {
             ],
         };
         let s2 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -1054,6 +1129,7 @@ mod tests {
     #[test]
     fn balanced_cpus_ratio_one() {
         let sample = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 50,
             cpus: vec![
                 CpuSnapshot {
@@ -1076,6 +1152,7 @@ mod tests {
     #[test]
     fn single_cpu_no_division_by_zero() {
         let sample = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 10,
             cpus: vec![CpuSnapshot {
                 nr_running: 5,
@@ -1095,6 +1172,7 @@ mod tests {
     #[test]
     fn all_zero_snapshots() {
         let sample = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![CpuSnapshot::default(), CpuSnapshot::default()],
         };
@@ -1111,6 +1189,7 @@ mod tests {
     #[test]
     fn empty_cpus_in_sample() {
         let sample = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 10,
             cpus: vec![],
         };
@@ -1125,6 +1204,7 @@ mod tests {
         // All CPUs have nr_running=0. The code uses min_nr.max(1) as
         // divisor, so ratio = 0/1 = 0.0, which is < initial 1.0.
         let sample = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 10,
             cpus: vec![
                 CpuSnapshot {
@@ -1149,6 +1229,7 @@ mod tests {
     fn min_nr_zero_max_nr_nonzero() {
         // min_nr=0, max_nr=5: ratio = 5/max(0,1) = 5.0
         let sample = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 10,
             cpus: vec![
                 CpuSnapshot {
@@ -1170,6 +1251,7 @@ mod tests {
     #[test]
     fn advancing_clocks_no_stall() {
         let s1 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -1185,6 +1267,7 @@ mod tests {
             ],
         };
         let s2 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -1200,6 +1283,7 @@ mod tests {
             ],
         };
         let s3 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 300,
             cpus: vec![
                 CpuSnapshot {
@@ -1224,6 +1308,7 @@ mod tests {
         // First sample has 2 CPUs, second has 3. Stall detection uses
         // min(prev.len, curr.len) = 2, so only CPUs 0-1 are compared.
         let s1 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -1239,6 +1324,7 @@ mod tests {
             ],
         };
         let s2 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -1269,6 +1355,7 @@ mod tests {
 
     fn balanced_sample(elapsed_ms: u64, clock_base: u64) -> MonitorSample {
         MonitorSample {
+            prog_stats: None,
             elapsed_ms,
             cpus: vec![
                 CpuSnapshot {
@@ -1336,6 +1423,7 @@ mod tests {
         let mut samples = Vec::new();
         for i in 0..4 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1378,6 +1466,7 @@ mod tests {
         let mut samples = Vec::new();
         for i in 0..5u64 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1415,6 +1504,7 @@ mod tests {
         let mut samples = Vec::new();
         for i in 0..3u64 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1455,6 +1545,7 @@ mod tests {
         let mut samples = Vec::new();
         for i in 0..2u64 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1494,6 +1585,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1509,6 +1601,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -1544,6 +1637,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![CpuSnapshot {
                     nr_running: 1,
@@ -1552,6 +1646,7 @@ mod tests {
                 }],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -1584,6 +1679,7 @@ mod tests {
         let mut samples = Vec::new();
         for i in 0..3u64 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1602,6 +1698,7 @@ mod tests {
         samples.push(balanced_sample(300, 2500));
         for i in 4..7u64 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1645,6 +1742,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1660,6 +1758,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -1675,6 +1774,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 300,
                 cpus: vec![
                     CpuSnapshot {
@@ -1707,10 +1807,12 @@ mod tests {
         let t = MonitorThresholds::default();
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![],
             },
@@ -1733,6 +1835,7 @@ mod tests {
         let garbage_clock = 10314579376562252011u64;
         let samples: Vec<_> = (0..10)
             .map(|i| MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1773,6 +1876,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -1788,6 +1892,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -1821,6 +1926,7 @@ mod tests {
     fn thresholds_dsq_over_plausibility_ceiling_passes() {
         let t = MonitorThresholds::default();
         let samples = vec![MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -1861,6 +1967,7 @@ mod tests {
             ..Default::default()
         };
         let samples = vec![MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![CpuSnapshot {
                 nr_running: 1,
@@ -1889,6 +1996,7 @@ mod tests {
         keep_last: i64,
     ) -> MonitorSample {
         MonitorSample {
+            prog_stats: None,
             elapsed_ms,
             cpus: vec![
                 CpuSnapshot {
@@ -2140,6 +2248,7 @@ mod tests {
     #[test]
     fn event_deltas_all_counters_computed() {
         let make = |elapsed_ms, fb, kl, dsq_off, exit, migdis| MonitorSample {
+            prog_stats: None,
             elapsed_ms,
             cpus: vec![CpuSnapshot {
                 nr_running: 1,
@@ -2184,6 +2293,7 @@ mod tests {
     fn data_looks_valid_all_same_clocks() {
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2197,6 +2307,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -2216,6 +2327,7 @@ mod tests {
     #[test]
     fn data_looks_valid_dsq_over_ceiling() {
         let samples = vec![MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![CpuSnapshot {
                 local_dsq_depth: 50000,
@@ -2231,6 +2343,7 @@ mod tests {
     #[test]
     fn imbalance_ratio_empty_cpus() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![],
         };
@@ -2240,6 +2353,7 @@ mod tests {
     #[test]
     fn imbalance_ratio_single_cpu() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![CpuSnapshot {
                 nr_running: 5,
@@ -2252,6 +2366,7 @@ mod tests {
     #[test]
     fn imbalance_ratio_balanced() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![
                 CpuSnapshot {
@@ -2270,6 +2385,7 @@ mod tests {
     #[test]
     fn imbalance_ratio_imbalanced() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![
                 CpuSnapshot {
@@ -2288,6 +2404,7 @@ mod tests {
     #[test]
     fn imbalance_ratio_zero_min() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![
                 CpuSnapshot {
@@ -2309,6 +2426,7 @@ mod tests {
     #[test]
     fn sum_event_field_none_when_no_counters() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![CpuSnapshot::default(), CpuSnapshot::default()],
         };
@@ -2318,6 +2436,7 @@ mod tests {
     #[test]
     fn sum_event_field_sums_across_cpus() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![
                 CpuSnapshot {
@@ -2342,6 +2461,7 @@ mod tests {
     #[test]
     fn sum_event_field_mixed_some_none() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 0,
             cpus: vec![
                 CpuSnapshot {
@@ -2362,6 +2482,7 @@ mod tests {
     #[test]
     fn sample_looks_valid_normal() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![CpuSnapshot {
                 local_dsq_depth: 5,
@@ -2374,6 +2495,7 @@ mod tests {
     #[test]
     fn sample_looks_valid_at_ceiling() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![CpuSnapshot {
                 local_dsq_depth: DSQ_PLAUSIBILITY_CEILING,
@@ -2386,6 +2508,7 @@ mod tests {
     #[test]
     fn sample_looks_valid_over_ceiling() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![CpuSnapshot {
                 local_dsq_depth: DSQ_PLAUSIBILITY_CEILING + 1,
@@ -2398,6 +2521,7 @@ mod tests {
     #[test]
     fn sample_looks_valid_empty_cpus() {
         let s = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![],
         };
@@ -2410,6 +2534,7 @@ mod tests {
     fn from_samples_fields_sane_values() {
         let samples: Vec<_> = (0..5u64)
             .map(|i| MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2524,6 +2649,7 @@ mod tests {
         };
         let samples: Vec<_> = (0..3u64)
             .map(|i| MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2589,6 +2715,7 @@ mod tests {
         };
         let samples: Vec<_> = (0..3u64)
             .map(|i| MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2647,6 +2774,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2662,6 +2790,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -2715,6 +2844,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2730,6 +2860,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -2785,6 +2916,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2800,6 +2932,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -2846,6 +2979,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2861,6 +2995,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -2907,6 +3042,7 @@ mod tests {
         // 3 samples: 2 consecutive stall pairs for cpu0, then clock advances.
         for i in 0..3u64 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2924,6 +3060,7 @@ mod tests {
         }
         // Break the streak: clock advances in 4th sample.
         samples.push(MonitorSample {
+            prog_stats: None,
             elapsed_ms: 300,
             cpus: vec![
                 CpuSnapshot {
@@ -2961,6 +3098,7 @@ mod tests {
         // 4 samples = 3 consecutive stall pairs for cpu0. cpu1 advances.
         let samples: Vec<_> = (0..4u64)
             .map(|i| MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -2992,6 +3130,7 @@ mod tests {
         // from_samples should not flag stall when both samples have
         // nr_running==0 on the stuck CPU.
         let s1 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -3007,6 +3146,7 @@ mod tests {
             ],
         };
         let s2 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -3036,6 +3176,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -3051,6 +3192,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -3067,6 +3209,7 @@ mod tests {
             },
             // Clock recovers.
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 300,
                 cpus: vec![
                     CpuSnapshot {
@@ -3186,6 +3329,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -3203,6 +3347,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -3249,6 +3394,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -3266,6 +3412,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -3308,6 +3455,7 @@ mod tests {
         };
         let samples = vec![
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 100,
                 cpus: vec![
                     CpuSnapshot {
@@ -3323,6 +3471,7 @@ mod tests {
                 ],
             },
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 200,
                 cpus: vec![
                     CpuSnapshot {
@@ -3360,6 +3509,7 @@ mod tests {
     fn from_samples_suppresses_stall_when_vcpu_preempted() {
         // from_samples should also respect vcpu_cpu_time_ns gating.
         let s1 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -3377,6 +3527,7 @@ mod tests {
             ],
         };
         let s2 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {

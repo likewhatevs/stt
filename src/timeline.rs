@@ -578,6 +578,7 @@ mod tests {
 
     fn sample(elapsed_ms: u64, cpus: Vec<(u32, u32, u64)>) -> MonitorSample {
         MonitorSample {
+            prog_stats: None,
             elapsed_ms,
             cpus: cpus
                 .into_iter()
@@ -853,6 +854,7 @@ mod tests {
         use crate::monitor::ScxEventCounters;
 
         let s1 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 600,
             cpus: vec![CpuSnapshot {
                 nr_running: 2,
@@ -869,6 +871,7 @@ mod tests {
             }],
         };
         let s2 = MonitorSample {
+            prog_stats: None,
             elapsed_ms: 1600,
             cpus: vec![CpuSnapshot {
                 nr_running: 2,
@@ -948,6 +951,7 @@ mod tests {
         // Phase 0: zero fallback rate (counter stays constant).
         for i in 5..15 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![CpuSnapshot {
                     nr_running: 2,
@@ -969,6 +973,7 @@ mod tests {
         // Rate = 500/1.0 = 500/s, well above threshold 10.0.
         for i in 15..25 {
             samples.push(MonitorSample {
+                prog_stats: None,
                 elapsed_ms: i * 100,
                 cpus: vec![CpuSnapshot {
                     nr_running: 2,
@@ -1084,6 +1089,7 @@ mod tests {
         let samples = vec![
             // Garbage sample (DSQ above ceiling).
             MonitorSample {
+                prog_stats: None,
                 elapsed_ms: 600,
                 cpus: vec![CpuSnapshot {
                     nr_running: 1,
@@ -1106,6 +1112,7 @@ mod tests {
     fn all_garbage_samples_yield_no_metrics() {
         let events = vec![stimulus(0, "ScenarioStart")];
         let samples = vec![MonitorSample {
+            prog_stats: None,
             elapsed_ms: 600,
             cpus: vec![CpuSnapshot {
                 nr_running: 1,

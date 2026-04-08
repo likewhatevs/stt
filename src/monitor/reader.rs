@@ -419,6 +419,14 @@ pub(crate) struct WatchdogOverride {
     pub jiffies: u64,
 }
 
+/// Pre-resolved BPF program stats context for the monitor loop.
+pub(crate) struct ProgStatsCtx {
+    pub cached: Vec<super::bpf_prog::CachedProgInfo>,
+    pub per_cpu_offsets: Vec<u64>,
+    pub page_offset: u64,
+    pub offsets: super::btf_offsets::BpfProgOffsets,
+}
+
 /// Run the monitor loop, sampling all CPUs at the given interval.
 /// Returns collected samples when `kill` is set.
 ///
@@ -442,6 +450,7 @@ pub(crate) fn monitor_loop(
     vcpu_timing: Option<&VcpuTiming>,
     preemption_threshold_ns: u64,
     shm_base_pa: Option<u64>,
+    prog_stats_ctx: Option<&ProgStatsCtx>,
 ) -> (Vec<MonitorSample>, crate::vmm::shm_ring::ShmDrainResult) {
     let preemption_threshold_ns = if preemption_threshold_ns > 0 {
         preemption_threshold_ns
@@ -560,9 +569,20 @@ pub(crate) fn monitor_loop(
 
         prev_vcpu_times = curr_vcpu_times;
 
+        let prog_stats = prog_stats_ctx.map(|ctx| {
+            super::bpf_prog::read_prog_runtime_stats(
+                mem,
+                &ctx.cached,
+                &ctx.per_cpu_offsets,
+                ctx.page_offset,
+                &ctx.offsets,
+            )
+        });
+
         samples.push(MonitorSample {
             elapsed_ms: start.elapsed().as_millis() as u64,
             cpus: cpus.clone(),
+            prog_stats,
         });
 
         // Mid-flight SHM drain: advance read_ptr so the guest can
@@ -711,6 +731,7 @@ mod tests {
             None,
             0,
             None,
+            None,
         );
         assert!(samples.is_empty());
     }
@@ -742,6 +763,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
         );
         handle.join().unwrap();
@@ -835,6 +857,7 @@ mod tests {
             None,
             0,
             None,
+            None,
         );
         handle.join().unwrap();
 
@@ -878,6 +901,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
         );
         handle.join().unwrap();
@@ -1072,6 +1096,7 @@ mod tests {
             None,
             0,
             None,
+            None,
         );
         handle.join().unwrap();
 
@@ -1111,6 +1136,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
         );
         handle.join().unwrap();
@@ -1166,6 +1192,7 @@ mod tests {
             Some(&wd),
             None,
             0,
+            None,
             None,
         );
         handle.join().unwrap();
@@ -1226,6 +1253,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
         );
         handle.join().unwrap();
@@ -1290,6 +1318,7 @@ mod tests {
             None,
             0,
             None,
+            None,
         );
         handle.join().unwrap();
 
@@ -1353,6 +1382,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
         );
         handle.join().unwrap();
@@ -1426,6 +1456,7 @@ mod tests {
             None,
             Some(&vcpu_timing),
             0,
+            None,
             None,
         );
         handle.join().unwrap();
@@ -1502,6 +1533,7 @@ mod tests {
             Some(&vcpu_timing),
             0,
             None,
+            None,
         );
         handle.join().unwrap();
         spinner_kill.store(true, Ordering::Release);
@@ -1574,6 +1606,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
         );
         handle.join().unwrap();
@@ -1657,6 +1690,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
         );
         handle.join().unwrap();

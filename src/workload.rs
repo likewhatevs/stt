@@ -1612,11 +1612,13 @@ mod tests {
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
         };
-        let h = WorkloadHandle::spawn(&config).unwrap();
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
         let tids = h.tids();
         assert_eq!(tids.len(), 4);
         let unique: std::collections::HashSet<u32> = tids.iter().copied().collect();
         assert_eq!(unique.len(), 4, "all worker PIDs should be distinct");
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
         let reports = h.stop_and_collect();
         assert_eq!(reports.len(), 4);
     }

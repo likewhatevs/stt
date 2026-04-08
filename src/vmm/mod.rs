@@ -687,6 +687,8 @@ pub struct VmResult {
     pub shm_data: Option<shm_ring::ShmDrainResult>,
     /// Stimulus events extracted from SHM ring entries.
     pub stimulus_events: Vec<shm_ring::StimulusEvent>,
+    /// BPF verifier stats collected from host-side memory reads.
+    pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,6 +1495,8 @@ impl SttVm {
             None
         };
 
+        let vmlinux_clone = vmlinux.clone();
+
         let handle = std::thread::Builder::new()
             .name("vmm-monitor".into())
             .spawn(move || {
@@ -1545,6 +1549,48 @@ impl SttVm {
                     pthreads: vcpu_pthreads,
                 };
 
+                // Wait for the guest to signal slot 1 (scheduler loaded)
+                // before discovering struct_ops programs. Without this,
+                // discovery races with scheduler BPF program registration.
+                if let Some(base) = shm_base_pa {
+                    let slot_pa = base + shm_ring::SIGNAL_SLOT_BASE as u64 + 1;
+                    let deadline = start + Duration::from_secs(30);
+                    while std::time::Instant::now() < deadline {
+                        if kill_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        if mem.read_u8(slot_pa, 0) != 0 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+
+                // Discover struct_ops programs for per-cycle stats.
+                let prog_stats_ctx =
+                    monitor::btf_offsets::BpfProgOffsets::from_vmlinux(&vmlinux_clone)
+                        .ok()
+                        .and_then(|prog_offsets| {
+                            let prog_idr_kva = symbols.prog_idr?;
+                            let cached = monitor::bpf_prog::discover_struct_ops_stats(
+                                &mem,
+                                monitor::symbols::text_kva_to_pa(symbols.init_top_pgt.unwrap_or(0)),
+                                page_offset,
+                                prog_idr_kva,
+                                &prog_offsets,
+                                monitor::symbols::resolve_pgtable_l5(&mem, &symbols),
+                            );
+                            if cached.is_empty() {
+                                return None;
+                            }
+                            Some(monitor::reader::ProgStatsCtx {
+                                cached,
+                                per_cpu_offsets: offsets_arr.clone(),
+                                page_offset,
+                                offsets: prog_offsets,
+                            })
+                        });
+
                 monitor::reader::monitor_loop(
                     &mem,
                     &rq_pas,
@@ -1558,6 +1604,7 @@ impl SttVm {
                     Some(&vcpu_timing),
                     preemption_threshold_ns,
                     shm_base_pa,
+                    prog_stats_ctx.as_ref(),
                 )
             })
             .context("spawn monitor thread")?;
@@ -1871,6 +1918,9 @@ impl SttVm {
             exit_code = code;
         }
 
+        // Collect BPF verifier stats from host-side memory reads.
+        let verifier_stats = self.collect_verifier_stats(&vm);
+
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
             exit_code,
@@ -1881,7 +1931,35 @@ impl SttVm {
             monitor: monitor_report,
             shm_data,
             stimulus_events,
+            verifier_stats,
         })
+    }
+
+    /// Read BPF verifier stats from guest memory after VM exit.
+    ///
+    /// Enumerates struct_ops programs in the kernel's `prog_idr` and
+    /// reads `bpf_prog_aux->verified_insns` for each.
+    fn collect_verifier_stats(&self, vm: &kvm::SttKvm) -> Vec<monitor::bpf_prog::ProgVerifierInfo> {
+        let vmlinux = match find_vmlinux(&self.kernel) {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+        let host_base = match vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE)) {
+            Ok(ptr) => ptr,
+            Err(_) => return Vec::new(),
+        };
+        let mem_size = (self.memory_mb as u64) << 20;
+        let mem = monitor::reader::GuestMem::new(host_base, mem_size);
+        let kernel = match monitor::guest::GuestKernel::new(&mem, &vmlinux) {
+            Ok(k) => k,
+            Err(_) => return Vec::new(),
+        };
+        let accessor =
+            match monitor::bpf_prog::BpfProgAccessor::from_guest_kernel(&kernel, &vmlinux) {
+                Ok(a) => a,
+                Err(_) => return Vec::new(),
+            };
+        accessor.struct_ops_progs()
     }
 }
 
@@ -2954,6 +3032,7 @@ mod tests {
             monitor: None,
             shm_data: None,
             stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -2975,6 +3054,7 @@ mod tests {
             monitor: None,
             shm_data: None,
             stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
@@ -3320,6 +3400,7 @@ mod tests {
             monitor: None,
             shm_data: None,
             stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -3331,6 +3412,7 @@ mod tests {
     fn vm_result_with_monitor_carries_summary() {
         use crate::monitor;
         let summary = monitor::MonitorSummary {
+            prog_stats_deltas: None,
             total_samples: 5,
             max_imbalance_ratio: 3.5,
             max_local_dsq_depth: 10,
@@ -3352,6 +3434,7 @@ mod tests {
             monitor: Some(report),
             shm_data: None,
             stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);

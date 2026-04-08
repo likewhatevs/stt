@@ -372,6 +372,88 @@ impl BpfMapOffsets {
     }
 }
 
+/// Byte offsets within kernel BPF program structures needed for
+/// host-side BPF program enumeration and verifier stats collection.
+#[derive(Debug, Clone)]
+pub struct BpfProgOffsets {
+    /// Offset of `type` (enum bpf_prog_type, u32) within `struct bpf_prog`.
+    pub prog_type: usize,
+    /// Offset of `aux` pointer within `struct bpf_prog`.
+    pub prog_aux: usize,
+    /// Offset of `verified_insns` (u32) within `struct bpf_prog_aux`.
+    pub aux_verified_insns: usize,
+    /// Offset of `name` (char\[BPF_OBJ_NAME_LEN\]) within `struct bpf_prog_aux`.
+    pub aux_name: usize,
+    /// IDR offsets reused from BpfMapOffsets for walking prog_idr.
+    pub xa_node_slots: usize,
+    /// Offset of `shift` (u8) within `struct xa_node`.
+    pub xa_node_shift: usize,
+    /// Offset of `xa_head` within `struct idr` (idr.idr_rt.xa_head).
+    pub idr_xa_head: usize,
+    /// Offset of `idr_next` (unsigned int) within `struct idr`.
+    pub idr_next: usize,
+    /// Offset of `stats` (__percpu pointer) within `struct bpf_prog`.
+    pub prog_stats: usize,
+    /// Offset of `cnt` (u64_stats_t) within `struct bpf_prog_stats`.
+    pub stats_cnt: usize,
+    /// Offset of `nsecs` (u64_stats_t) within `struct bpf_prog_stats`.
+    pub stats_nsecs: usize,
+}
+
+impl BpfProgOffsets {
+    /// Resolve BPF program struct offsets from a pre-loaded BTF object.
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (bpf_prog, _) = find_struct(btf, "bpf_prog")?;
+        let prog_type = member_byte_offset(btf, &bpf_prog, "type")?;
+        let prog_aux = member_byte_offset(btf, &bpf_prog, "aux")?;
+
+        let (bpf_prog_aux, _) = find_struct(btf, "bpf_prog_aux")?;
+        let aux_verified_insns = member_byte_offset(btf, &bpf_prog_aux, "verified_insns")?;
+        let aux_name = member_byte_offset(btf, &bpf_prog_aux, "name")?;
+
+        let (xa_node, _) = find_struct(btf, "xa_node")?;
+        let xa_node_slots = member_byte_offset(btf, &xa_node, "slots")?;
+        let xa_node_shift = member_byte_offset(btf, &xa_node, "shift")?;
+
+        let (idr_struct, _) = find_struct(btf, "idr")?;
+        let (idr_rt_off, idr_rt_member) =
+            member_byte_offset_with_member(btf, &idr_struct, "idr_rt")?;
+        let xa_struct = resolve_member_struct(btf, &idr_rt_member)
+            .context("btf: resolve type of idr.idr_rt")?;
+        let xa_head_off = member_byte_offset(btf, &xa_struct, "xa_head")?;
+        let idr_xa_head = idr_rt_off + xa_head_off;
+
+        let idr_next = member_byte_offset(btf, &idr_struct, "idr_next")?;
+
+        let prog_stats = member_byte_offset(btf, &bpf_prog, "stats")?;
+
+        let (bpf_prog_stats, _) = find_struct(btf, "bpf_prog_stats")?;
+        let stats_cnt = member_byte_offset(btf, &bpf_prog_stats, "cnt")?;
+        let stats_nsecs = member_byte_offset(btf, &bpf_prog_stats, "nsecs")?;
+
+        Ok(Self {
+            prog_type,
+            prog_aux,
+            aux_verified_insns,
+            aux_name,
+            xa_node_slots,
+            xa_node_shift,
+            idr_xa_head,
+            idr_next,
+            prog_stats,
+            stats_cnt,
+            stats_nsecs,
+        })
+    }
+
+    /// Parse BTF from a vmlinux ELF and resolve BPF program field offsets.
+    pub fn from_vmlinux(path: &Path) -> Result<Self> {
+        let btf =
+            load_btf_from_path(path).with_context(|| format!("btf: open {}", path.display()))?;
+        Self::from_btf(&btf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +515,18 @@ mod tests {
         assert!(offsets.map_btf > 0);
         assert!(offsets.map_btf_value_type_id > 0);
         assert!(offsets.btf_data_size > offsets.btf_data);
+    }
+
+    #[test]
+    fn parse_bpf_prog_offsets_from_vmlinux() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        let offsets = BpfProgOffsets::from_vmlinux(&path).unwrap();
+        assert!(offsets.prog_aux > 0);
+        assert!(offsets.aux_verified_insns > 0);
+        assert!(offsets.aux_name > 0);
     }
 
     #[test]

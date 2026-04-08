@@ -12,17 +12,15 @@
 //! - .bss value region is vmalloc'd: use `translate_kva`.
 
 use super::btf_offsets::BpfMapOffsets;
+use super::idr::{translate_any_kva, xa_load};
 use super::reader::GuestMem;
-use super::symbols::{kva_to_pa, text_kva_to_pa};
+use super::symbols::text_kva_to_pa;
 
 /// BPF_MAP_TYPE_ARRAY from include/uapi/linux/bpf.h.
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
 
 /// BPF_OBJ_NAME_LEN from include/linux/bpf.h.
 const BPF_OBJ_NAME_LEN: usize = 16;
-
-/// XA_CHUNK_SHIFT = 6, XA_CHUNK_SIZE = 64.
-const XA_CHUNK_SIZE: u64 = 64;
 
 /// Discovered BPF map metadata and value location.
 #[derive(Debug, Clone)]
@@ -55,28 +53,6 @@ pub struct BpfMapInfo {
 ///
 /// `value_kva` is `Some` only for `BPF_MAP_TYPE_ARRAY` maps where
 /// the value data is inline at the `bpf_array.value` flex array offset.
-/// Translate a kernel virtual address to a GuestMem offset, trying
-/// direct mapping first, then page table walk.
-///
-/// BPF map structs are SLAB-allocated (linear map) or vmalloc'd
-/// (modules, BPF programs). The page table walk handles both vmalloc
-/// and module addresses.
-fn translate_any_kva(
-    mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    kva: u64,
-    l5: bool,
-) -> Option<u64> {
-    // Linear map: PAGE_OFFSET..PAGE_END — SLAB allocations
-    let direct_pa = kva_to_pa(kva, page_offset);
-    if direct_pa < mem.size() {
-        return Some(direct_pa);
-    }
-    // Vmalloc / module addresses: page table walk
-    mem.translate_kva(cr3_pa, kva, l5)
-}
-
 pub(crate) fn find_all_bpf_maps(
     mem: &GuestMem,
     cr3_pa: u64,
@@ -812,69 +788,10 @@ impl<'a> BpfMapAccessorOwned<'a> {
     }
 }
 
-/// Load an entry from an xarray by index.
-///
-/// xa_node structs are SLAB-allocated and live in the direct mapping,
-/// so their KVAs are translated via `kva_to_pa(kva, page_offset)`.
-/// `slots_off` and `shift_off` are BTF-resolved byte offsets of
-/// `slots` and `shift` within `struct xa_node`.
-///
-/// Returns `Some(0)` for empty slots or `Some(ptr)` for populated
-/// entries. Out-of-bounds reads return 0 (empty slot).
-fn xa_load(
-    mem: &GuestMem,
-    page_offset: u64,
-    xa_head: u64,
-    index: u64,
-    slots_off: usize,
-    shift_off: usize,
-) -> Option<u64> {
-    if xa_head == 0 {
-        return Some(0);
-    }
-
-    // Check if xa_head is an internal node (bit 1 set) or a direct entry.
-    if xa_head & 2 == 0 {
-        // Single-entry xarray: only index 0 is valid.
-        return if index == 0 { Some(xa_head) } else { Some(0) };
-    }
-
-    // xa_head is a node pointer. Clear the internal marker bits.
-    let mut node_kva = xa_head & !3u64;
-    let mut shift = xa_node_shift(mem, page_offset, node_kva, shift_off);
-
-    loop {
-        let slot_idx = (index >> shift) & (XA_CHUNK_SIZE - 1);
-        let slot_pa = kva_to_pa(node_kva + slots_off as u64 + slot_idx * 8, page_offset);
-        let entry = mem.read_u64(slot_pa, 0);
-
-        if entry == 0 {
-            return Some(0);
-        }
-
-        if entry & 2 == 0 {
-            // Leaf entry — a pointer to a bpf_map (or other object).
-            return Some(entry);
-        }
-
-        // Internal node — descend.
-        node_kva = entry & !3u64;
-        if shift < 6 {
-            return Some(0);
-        }
-        shift -= 6; // XA_CHUNK_SHIFT
-    }
-}
-
-/// Read the `shift` field from an xa_node (SLAB-allocated, direct mapping).
-fn xa_node_shift(mem: &GuestMem, page_offset: u64, node_kva: u64, shift_off: usize) -> u64 {
-    let pa = kva_to_pa(node_kva, page_offset);
-    mem.read_u8(pa, shift_off) as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::idr::{XA_CHUNK_SIZE, xa_node_shift};
     use crate::monitor::symbols::START_KERNEL_MAP;
 
     // On aarch64, page table entries contain GPAs starting at DRAM_START.
