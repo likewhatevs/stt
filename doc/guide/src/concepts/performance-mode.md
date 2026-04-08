@@ -43,9 +43,18 @@ groups as virtual sockets.
 (check `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages`).
 Without them, guest memory uses regular pages. A warning is printed.
 
-**CAP_SYS_NICE** (optional) -- required for `SCHED_FIFO`. Without it,
-RT scheduling is skipped with a warning. The VM still runs with pinning
-and hugepages.
+**CAP_SYS_NICE or rtprio limit** (optional) -- `SCHED_FIFO` requires
+either `CAP_SYS_NICE` (root) or an `RLIMIT_RTPRIO` >= the requested
+priority. Set an rtprio limit for non-root use:
+
+```
+# /etc/security/limits.conf
+username  -  rtprio  99
+```
+
+Log out and back in for the limit to take effect. Without either
+capability, RT scheduling is skipped with a warning and vCPU threads
+run at normal priority (results may be noisy).
 
 ## Validation
 

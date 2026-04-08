@@ -186,13 +186,20 @@ pub fn detect_cycle(lines: &[&str]) -> Option<(usize, usize, usize)> {
         return None;
     }
 
-    let normalized: Vec<&str> = lines
+    // Two normalization levels:
+    // - anchor_norms: keeps addresses, strips register annotations. Used for
+    //   anchor frequency counting — prevents within-period duplicates at
+    //   different addresses from inflating frequency.
+    // - block_norms: also strips addresses. Used for block equality comparison
+    //   so unrolled loops (same instructions at different addresses) can match.
+    let anchor_norms: Vec<&str> = lines.iter().map(|l| normalize_verifier_line(l)).collect();
+    let block_norms: Vec<&str> = lines
         .iter()
         .map(|l| normalize_for_cycle_detection(l))
         .collect();
 
-    // Find most frequent non-trivial normalized line (the "anchor").
-    let mut sorted_norms: Vec<&str> = normalized
+    // Find most frequent non-trivial anchor-normalized line.
+    let mut sorted_norms: Vec<&str> = anchor_norms
         .iter()
         .filter(|l| l.len() >= 10)
         .copied()
@@ -213,9 +220,43 @@ pub fn detect_cycle(lines: &[&str]) -> Option<(usize, usize, usize)> {
         i = j;
     }
 
-    let (anchor, _) = best_anchor?;
+    // If address-preserving anchor search found nothing (unrolled loops
+    // where every address is unique), fall back to address-stripped norms.
+    let (anchor, use_block_norms_for_positions) = match best_anchor {
+        Some((a, _)) => (a, false),
+        None => {
+            let mut sorted_block: Vec<&str> = block_norms
+                .iter()
+                .filter(|l| l.len() >= 10)
+                .copied()
+                .collect();
+            sorted_block.sort_unstable();
+            let mut ba: Option<(&str, usize)> = None;
+            let mut bi = 0;
+            while bi < sorted_block.len() {
+                let mut bj = bi + 1;
+                while bj < sorted_block.len() && sorted_block[bj] == sorted_block[bi] {
+                    bj += 1;
+                }
+                let c = bj - bi;
+                if c >= MIN_REPS && ba.is_none_or(|(_, best)| c > best) {
+                    ba = Some((sorted_block[bi], c));
+                }
+                bi = bj;
+            }
+            match ba {
+                Some((a, _)) => (a, true),
+                None => return None,
+            }
+        }
+    };
 
-    let positions: Vec<usize> = normalized
+    let norms_for_pos = if use_block_norms_for_positions {
+        &block_norms
+    } else {
+        &anchor_norms
+    };
+    let positions: Vec<usize> = norms_for_pos
         .iter()
         .enumerate()
         .filter(|(_, l)| **l == anchor)
@@ -259,11 +300,11 @@ pub fn detect_cycle(lines: &[&str]) -> Option<(usize, usize, usize)> {
             if pos + 2 * period > lines.len() {
                 break;
             }
-            if normalized[pos..pos + period] == normalized[pos + period..pos + 2 * period] {
-                let first_block = &normalized[pos..pos + period];
+            if block_norms[pos..pos + period] == block_norms[pos + period..pos + 2 * period] {
+                let first_block = &block_norms[pos..pos + period];
                 let mut count = 1;
                 while pos + (count + 1) * period <= lines.len() {
-                    if normalized[pos + count * period..pos + (count + 1) * period] != *first_block
+                    if block_norms[pos + count * period..pos + (count + 1) * period] != *first_block
                     {
                         break;
                     }
@@ -279,15 +320,15 @@ pub fn detect_cycle(lines: &[&str]) -> Option<(usize, usize, usize)> {
                     if cand + 2 * period > lines.len() {
                         continue;
                     }
-                    if normalized[cand..cand + period]
-                        != normalized[cand + period..cand + 2 * period]
+                    if block_norms[cand..cand + period]
+                        != block_norms[cand + period..cand + 2 * period]
                     {
                         continue;
                     }
                     let mut c = 2;
                     while cand + (c + 1) * period <= lines.len()
-                        && normalized[cand + c * period..cand + (c + 1) * period]
-                            == normalized[cand..cand + period]
+                        && block_norms[cand + c * period..cand + (c + 1) * period]
+                            == block_norms[cand..cand + period]
                     {
                         c += 1;
                     }
@@ -309,9 +350,12 @@ pub fn detect_cycle(lines: &[&str]) -> Option<(usize, usize, usize)> {
 /// Collapse repeating cycles in a verifier log.
 ///
 /// Runs cycle detection iteratively (up to 5 passes for nested loops).
-/// Each cycle is replaced with a header (`--- Nx of the following M lines ---`),
-/// the first iteration, an omission marker (`--- N identical iterations omitted ---`),
-/// the last iteration, and an end marker (`--- end repeat ---`).
+/// Each cycle is replaced with:
+/// - `--- Nx of the following M lines ---` (count header, no closing marker)
+/// - first iteration (with original register annotations)
+/// - `--- K identical iterations omitted ---` (omission marker)
+/// - last iteration (with original register annotations)
+/// - `--- end repeat ---` (closes the omission)
 pub fn collapse_cycles(log: &str) -> String {
     const MAX_PASSES: usize = 5;
     let mut text = log.to_string();
@@ -1286,5 +1330,65 @@ STT_VERIFIER_DONE
         let b_map = HashMap::new();
         let rows = build_diff_rows(&[], &b_map);
         assert!(rows.is_empty());
+    }
+
+    /// Simulates the verifier trace produced by #pragma unroll loops.
+    /// Each copy is at a different base address but has the same
+    /// instruction sequence. After normalize_for_cycle_detection strips
+    /// addresses and register annotations, all copies look identical.
+    fn unrolled_verifier_log(copies: usize, body_len: usize) -> String {
+        let ops = [
+            "(85) call bpf_ktime_get_ns#5",
+            "(bf) r2 = r0",
+            "(77) r0 >>= 16",
+            "(af) r1 ^= r0",
+            "(77) r2 >>= 32",
+            "(0f) r1 += r2",
+            "(24) w1 *= 7",
+            "(04) w1 += 1",
+        ];
+        let mut lines = Vec::new();
+        lines.push("func#0 @0".to_string());
+        lines.push("0: R1=ctx() R10=fp0".to_string());
+        let mut addr = 10;
+        for copy in 0..copies {
+            for (j, op) in ops.iter().enumerate().take(body_len) {
+                lines.push(format!(
+                    "{}: {op} ; R0_w=scalar(id={})",
+                    addr,
+                    copy * 100 + j
+                ));
+                addr += 1;
+            }
+        }
+        lines.push(format!("{addr}: (05) goto pc-1"));
+        lines.push(
+            "processed 1000 insns (limit 1000000) max_states_per_insn 3 \
+             total_states 50 peak_states 20 mark_read 5"
+                .to_string(),
+        );
+        lines.join("\n")
+    }
+
+    #[test]
+    fn detect_cycle_unrolled_loop() {
+        let log = unrolled_verifier_log(8, 6);
+        let lines: Vec<&str> = log.lines().collect();
+        let result = detect_cycle(&lines);
+        assert!(result.is_some(), "should detect cycle in unrolled loop");
+        let (_start, period, count) = result.unwrap();
+        assert_eq!(period, 6);
+        assert!(count >= 6, "count={count}");
+    }
+
+    #[test]
+    fn collapse_cycles_unrolled_loop() {
+        let log = unrolled_verifier_log(8, 6);
+        let collapsed = collapse_cycles(&log);
+        assert!(
+            collapsed.contains("identical iterations omitted"),
+            "should collapse unrolled loop"
+        );
+        assert!(collapsed.lines().count() < log.lines().count());
     }
 }

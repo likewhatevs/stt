@@ -136,8 +136,10 @@ fn main() {
         .with_ignored_flag(true),
     );
 
-    trials.push(
-        libtest_mimic::Trial::test("demo_verifier_cycle_collapse", || {
+    // Non-ignored: programmatic check that cycle collapse works.
+    trials.push(libtest_mimic::Trial::test(
+        "verifier_cycle_collapse",
+        || {
             let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
             let sched_args = vec!["--verify-loop".to_string()];
             let result =
@@ -154,9 +156,8 @@ fn main() {
                 return Err("cycle collapse should compress verifier loop traces".into());
             }
             Ok(())
-        })
-        .with_ignored_flag(true),
-    );
+        },
+    ));
 
     let conclusion = libtest_mimic::run(&args, trials);
     if let Ok(dir) = std::env::var("STT_SIDECAR_DIR") {
@@ -204,6 +205,19 @@ static __STT_ENTRY_FAIL_VERIFY: SttTestEntry = SttTestEntry {
     func: scenario_fail_verify,
     scheduler: &FAIL_SCHED,
     extra_sched_args: &["--fail-verify"],
+    expect_err: true,
+    duration_s: 5,
+    workers_per_cgroup: 2,
+    ..SttTestEntry::DEFAULT
+};
+
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_VERIFY_REJECT: SttTestEntry = SttTestEntry {
+    name: "demo_verifier_cycle_collapse",
+    func: scenario_fail_verify,
+    scheduler: &FAIL_SCHED,
+    extra_sched_args: &["--verify-loop"],
     duration_s: 5,
     workers_per_cgroup: 2,
     ..SttTestEntry::DEFAULT

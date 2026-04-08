@@ -129,7 +129,7 @@ then detects repeating blocks:
 2. **Detect** -- find the most frequent normalized line (the "anchor"),
    compute gaps between anchor occurrences to determine the cycle
    period, then verify consecutive blocks match after normalization.
-   Minimum period: 5 lines. Minimum repetitions: 6.
+   Minimum period: 5 lines. Minimum repetitions: 3.
 
 3. **Collapse** -- replace the cycle with the first iteration, an
    omission count, and the last iteration. Run iteratively (up to 5

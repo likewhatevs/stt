@@ -111,6 +111,11 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     if fail_verify && let Some(rodata) = skel.maps.rodata_data.as_mut() {
         rodata.fail_verify = 1;
     }
+    if has_flag("--verify-loop")
+        && let Some(rodata) = skel.maps.rodata_data.as_mut()
+    {
+        rodata.verify_loop = 1;
+    }
     if scattershot && let Some(rodata) = skel.maps.rodata_data.as_mut() {
         rodata.scattershot = 1;
     }

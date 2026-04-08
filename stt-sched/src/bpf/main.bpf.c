@@ -43,13 +43,13 @@ const volatile int scattershot = 0;
  * spin of --degrade. Mutually exclusive with scattershot (see above). */
 const volatile int slow = 0;
 
-/* When non-zero, stt_dispatch contains an infinite loop that the
- * BPF verifier rejects. The verifier traces the back-edge at the
- * same instruction addresses each iteration, producing repetitive
- * output that collapse_cycles() compresses. libbpf prints the
- * verifier log to stderr on load failure.
- * const volatile (.rodata) so the verifier prunes the path when
- * verify_loop=0. Set via rodata before load. */
+/* When non-zero, stt_dispatch contains a #pragma unroll loop
+ * followed by while(1). The compiler unrolls the loop into
+ * sequential copies of the same instruction block. The trailing
+ * while(1) forces verifier rejection so libbpf prints the full
+ * trace to stderr. collapse_cycles() compresses the repetitive
+ * unrolled output. const volatile (.rodata) so the verifier
+ * prunes the path when verify_loop=0. */
 const volatile int verify_loop = 0;
 
 /* Runtime-mutable degrade flag. Set from userspace via .bss map write,
@@ -99,9 +99,25 @@ void BPF_STRUCT_OPS(stt_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 	}
 	if (verify_loop) {
+		/* Unrolled loop produces 8 copies of the same instruction
+		 * block at sequential addresses. The verifier traces all
+		 * copies linearly (no back-edges to prune). After
+		 * normalize_for_cycle_detection strips instruction addresses,
+		 * all copies look identical, so detect_cycle finds the
+		 * pattern. The trailing while(1) forces a verifier rejection
+		 * so libbpf prints the full trace to stderr. */
 		volatile u32 acc = 0;
+		#pragma unroll
+		for (int i = 0; i < 8; i++) {
+			u64 t = bpf_ktime_get_ns();
+			acc += (u32)t;
+			acc ^= (u32)(t >> 16);
+			acc += (u32)(t >> 32);
+			acc *= 7;
+			acc += 1;
+		}
 		while (1)
-			acc += bpf_ktime_get_ns();
+			acc += 1;
 	}
 	if (fail_verify) {
 		/* Null pointer dereference — verifier rejects this. */
