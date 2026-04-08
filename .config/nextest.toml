@@ -89,24 +89,21 @@ filter = "test(gauntlet/)"
 slow-timeout = { period = "120s", terminate-after = 2 }
 retries = 2
 
-# Performance-mode tests pin vCPUs to host CPUs via compute_pinning().
-# Concurrent tests rotate across LLC groups (via NEXTEST_TEST_GROUP_SLOT
-# or flock). max-threads limits total concurrent pinned VMs; each test
-# reserves 3 slots (2 vCPUs + 1 service CPU for 1s2c1t topology).
-# 4 concurrent tests = 12 slots; safe on hosts with 4+ LLC groups.
-# Dynamic config can be generated based on actual LLC count.
+# Performance-mode tests: each perf test acquires LLC locks at
+# runtime via flock, so nextest parallelism is a soft limit.
+# ── perf-vm ──────────────────────────────────────────────────────────
 [test-groups.perf-vm]
-max-threads = 12
+max-threads = 8
 
 [[profile.default.overrides]]
 filter = "test(perf_on) | test(sched_perf_)"
 test-group = "perf-vm"
-threads-required = 3
+threads-required = 1
 
 [[profile.ci.overrides]]
 filter = "test(perf_on) | test(sched_perf_)"
 test-group = "perf-vm"
-threads-required = 3
+threads-required = 1
 
 # Quick profile: exclude boot and bench tests.
 [[profile.quick.overrides]]

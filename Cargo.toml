@@ -45,6 +45,7 @@ vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 object = { version = "0.39.0", features = ["read"] }
+libtest-mimic = "0.8"
 linkme = "0.3"
 stt-macros = { path = "stt-macros" }
 visibility = "0.1"
@@ -54,9 +55,6 @@ integration = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
-
-[dev-dependencies]
-libtest-mimic = "0.8"
 
 [build-dependencies]
 libbpf-cargo = "0.26"

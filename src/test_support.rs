@@ -489,6 +489,22 @@ pub fn host_preset_compatible(
         && (vcpus_per_socket as usize) <= host.max_cores_per_llc()
 }
 
+/// Default seconds to wait for LLC/CPU resource locks before skipping.
+/// 55s leaves 5s margin before nextest's 60s default slow-timeout.
+const RESOURCE_WAIT_DEADLINE_SECS: u64 = 55;
+
+/// Deadline for resource acquisition polling. Uses
+/// `STT_RESOURCE_WAIT_SECS` env var if set, otherwise
+/// `RESOURCE_WAIT_DEADLINE_SECS` (55s).
+pub(crate) fn resource_deadline() -> std::time::Duration {
+    if let Ok(val) = std::env::var("STT_RESOURCE_WAIT_SECS")
+        && let Ok(secs) = val.parse::<u64>()
+    {
+        return std::time::Duration::from_secs(secs);
+    }
+    std::time::Duration::from_secs(RESOURCE_WAIT_DEADLINE_SECS)
+}
+
 /// Host-side entry point: build a VM, boot it with `--stt-test-fn=NAME`,
 /// extract profraw from SHM, and return the test result.
 ///
@@ -511,6 +527,137 @@ pub fn run_stt_test_with_topo_and_flags(
     active_flags: &[String],
 ) -> Result<AssertResult> {
     run_stt_test_inner(entry, Some(topo), active_flags)
+}
+
+/// Run a test result through expect_err logic and return a
+/// `Completion` or `Failed`.
+fn result_to_completion(
+    result: Result<AssertResult>,
+    expect_err: bool,
+) -> std::result::Result<libtest_mimic::Completion, libtest_mimic::Failed> {
+    match result {
+        Ok(_) if expect_err => Err("expected error but test passed".into()),
+        Ok(_) => Ok(libtest_mimic::Completion::Completed),
+        Err(e)
+            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+                .is_some() =>
+        {
+            let reason = e
+                .downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+                .unwrap()
+                .reason
+                .clone();
+            Ok(libtest_mimic::Completion::ignored_with(reason))
+        }
+        Err(_) if expect_err => Ok(libtest_mimic::Completion::Completed),
+        Err(e) => Err(format!("{e:#}").into()),
+    }
+}
+
+/// Build `libtest_mimic::Trial` entries for all registered `#[stt_test]`
+/// entries. Includes base trials and gauntlet variants.
+///
+/// Uses `Trial::ignorable_test()` so performance_mode tests that cannot
+/// acquire resources within the deadline appear as "ignored" instead of
+/// failing.
+pub fn build_stt_trials() -> Vec<libtest_mimic::Trial> {
+    let presets = crate::vm::gauntlet_presets();
+    let host_llcs = host_llc_count();
+    let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
+    let mut trials = Vec::new();
+
+    for entry in STT_TESTS.iter() {
+        let profiles = entry
+            .scheduler
+            .generate_profiles(entry.required_flags, entry.excluded_flags);
+
+        // Skip base trial entirely when the host cannot possibly
+        // satisfy the entry's topology. performance_mode tests need
+        // one LLC per virtual socket plus a service CPU.
+        let base_runnable = if entry.performance_mode {
+            host_topo.as_ref().is_some_and(|h| {
+                (entry.sockets as usize) < h.llc_groups.len()
+                    && ((entry.sockets * entry.cores * entry.threads) as usize) < h.total_cpus()
+                    && (entry.cores * entry.threads) as usize <= h.max_cores_per_llc()
+            })
+        } else {
+            true
+        };
+
+        if !base_runnable {
+            continue;
+        }
+
+        // Base trial: runs with the entry's own topology.
+        // Resource contention (performance_mode) is handled by
+        // result_to_completion via ResourceContention downcast.
+        let expect_err = entry.expect_err;
+        trials.push(
+            libtest_mimic::Trial::ignorable_test(entry.name.to_string(), move || {
+                let result = run_stt_test_inner(entry, None, &[]);
+                result_to_completion(result, expect_err)
+            })
+            .with_ignored_flag(entry.name.starts_with("demo_")),
+        );
+
+        // Gauntlet variants: topology x flags, always ignored by default.
+        for preset in &presets {
+            if !preset_matches(preset, entry, host_llcs) {
+                continue;
+            }
+            if let Some(ref host) = host_topo
+                && !host_preset_compatible(preset, host)
+            {
+                continue;
+            }
+            let t = &preset.topology;
+            let topo_str = format!(
+                "{}s{}c{}t",
+                t.sockets, t.cores_per_socket, t.threads_per_core,
+            );
+            let cpus = t.total_cpus();
+            let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
+            let preset_name = preset.name;
+
+            for profile in &profiles {
+                let pname = profile.name();
+                let name = format!("gauntlet/{}/{}/{}", entry.name, preset_name, pname);
+                let topo_str = topo_str.clone();
+                let flags: Vec<String> = profile.flags.iter().map(|s| s.to_string()).collect();
+
+                let expect_err = entry.expect_err;
+                trials.push(
+                    libtest_mimic::Trial::ignorable_test(name, move || {
+                        let (sockets, cores, threads) =
+                            parse_topo_string(&topo_str).expect("invalid topo string");
+                        let topo = TopoOverride {
+                            sockets,
+                            cores,
+                            threads,
+                            memory_mb,
+                        };
+                        let result = run_stt_test_inner(entry, Some(&topo), &flags);
+                        result_to_completion(result, expect_err)
+                    })
+                    .with_ignored_flag(true),
+                );
+            }
+        }
+    }
+
+    trials
+}
+
+/// Run sidecar collection and stats summary. Called from harness
+/// main() after `libtest_mimic::run()`.
+pub fn collect_and_print_sidecar_stats() {
+    if let Ok(dir) = std::env::var("STT_SIDECAR_DIR") {
+        let sidecars = collect_sidecars(std::path::Path::new(&dir));
+        let rows: Vec<_> = sidecars.iter().map(crate::stats::sidecar_to_row).collect();
+        if !rows.is_empty() {
+            eprintln!("{}", crate::stats::analyze_rows(&rows));
+        }
+    }
 }
 
 fn run_stt_test_inner(

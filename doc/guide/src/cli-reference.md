@@ -12,7 +12,6 @@ Build with `cargo build -p stt` or install with
 | `stt kernel build PATH` | Build a kernel with stt's config fragment |
 | `stt kernel clean PATH` | Clean a kernel source tree (`make mrproper`) |
 | `stt kernel kconfig` | Print stt's kernel config fragment to stdout |
-
 `stt run` exists but is hidden internal plumbing -- it is the
 guest-side dispatch that runs inside the VM. Do not call it directly.
 

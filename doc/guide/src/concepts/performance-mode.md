@@ -132,6 +132,15 @@ using `execute_steps_with` can pass custom `Assert` checks that are
 evaluated inside the guest against worker telemetry. These thresholds
 are only meaningful under performance mode's controlled environment.
 
+## Nextest parallelism
+
+Performance-mode tests each consume one LLC group on the host.
+The `perf-vm` test group in `.config/nextest.toml` sets a static
+`max-threads` limit. The flock-based LLC slot reservation
+(`acquire_slot_with_locks`) handles runtime contention: if all LLC
+slots are busy, the test is skipped with a `ResourceContention`
+error rather than silently degrading to a shared LLC.
+
 ## super_perf_mode
 
 `super_perf_mode` implies `performance_mode` and additionally

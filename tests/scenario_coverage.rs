@@ -6,91 +6,9 @@ use stt::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
 fn main() {
     let args = libtest_mimic::Arguments::from_args();
-    let presets = stt::vm::gauntlet_presets();
-    let host_llcs = stt::test_support::host_llc_count();
-    let host_topo = stt::vmm::host_topology::HostTopology::from_sysfs().ok();
-    let mut trials = Vec::new();
-
-    for entry in stt::test_support::STT_TESTS.iter() {
-        let profiles = entry
-            .scheduler
-            .generate_profiles(entry.required_flags, entry.excluded_flags);
-
-        // Base trial: runs with the entry's own topology, not ignored
-        // unless it's a demo_ test.
-        let expect_err = entry.expect_err;
-        trials.push(
-            libtest_mimic::Trial::test(entry.name.to_string(), move || {
-                match stt::test_support::run_stt_test(entry) {
-                    Ok(_) if expect_err => Err("expected error but test passed".into()),
-                    Ok(_) => Ok(()),
-                    Err(_) if expect_err => Ok(()),
-                    Err(e) => Err(format!("{e:#}").into()),
-                }
-            })
-            .with_ignored_flag(entry.name.starts_with("demo_")),
-        );
-
-        // Gauntlet variants: topology x flags, always ignored by default.
-        for preset in &presets {
-            if !stt::test_support::preset_matches(preset, entry, host_llcs) {
-                continue;
-            }
-            if let Some(ref host) = host_topo
-                && !stt::test_support::host_preset_compatible(preset, host)
-            {
-                continue;
-            }
-            let t = &preset.topology;
-            let topo_str = format!(
-                "{}s{}c{}t",
-                t.sockets, t.cores_per_socket, t.threads_per_core,
-            );
-            let cpus = t.total_cpus();
-            let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
-            let preset_name = preset.name;
-
-            for profile in &profiles {
-                let pname = profile.name();
-                let name = format!("gauntlet/{}/{}/{}", entry.name, preset_name, pname);
-                let topo_str = topo_str.clone();
-                let flags: Vec<String> = profile.flags.iter().map(|s| s.to_string()).collect();
-
-                let expect_err = entry.expect_err;
-                trials.push(
-                    libtest_mimic::Trial::test(name, move || {
-                        let (sockets, cores, threads) =
-                            stt::test_support::parse_topo_string(&topo_str)
-                                .expect("invalid topo string");
-                        let topo = stt::test_support::TopoOverride {
-                            sockets,
-                            cores,
-                            threads,
-                            memory_mb,
-                        };
-                        match stt::test_support::run_stt_test_with_topo_and_flags(
-                            entry, &topo, &flags,
-                        ) {
-                            Ok(_) if expect_err => Err("expected error but test passed".into()),
-                            Ok(_) => Ok(()),
-                            Err(_) if expect_err => Ok(()),
-                            Err(e) => Err(format!("{e:#}").into()),
-                        }
-                    })
-                    .with_ignored_flag(true),
-                );
-            }
-        }
-    }
-
+    let trials = stt::test_support::build_stt_trials();
     let conclusion = libtest_mimic::run(&args, trials);
-    if let Ok(dir) = std::env::var("STT_SIDECAR_DIR") {
-        let sidecars = stt::test_support::collect_sidecars(std::path::Path::new(&dir));
-        let rows: Vec<_> = sidecars.iter().map(stt::stats::sidecar_to_row).collect();
-        if !rows.is_empty() {
-            eprintln!("{}", stt::stats::analyze_rows(&rows));
-        }
-    }
+    stt::test_support::collect_and_print_sidecar_stats();
     conclusion.exit();
 }
 

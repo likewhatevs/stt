@@ -5,6 +5,22 @@
 
 use anyhow::{Context, Result};
 
+/// Resource contention error — LLC slots or CPUs unavailable.
+/// Downcast via `anyhow::Error::downcast_ref::<ResourceContention>()`
+/// to distinguish from fatal errors.
+#[derive(Debug)]
+pub struct ResourceContention {
+    pub reason: String,
+}
+
+impl std::fmt::Display for ResourceContention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for ResourceContention {}
+
 /// A physical LLC group on the host, identified by its cache ID.
 #[derive(Debug, Clone)]
 pub struct LlcGroup {
@@ -33,10 +49,10 @@ pub struct PinningPlan {
     /// Dedicated host CPU for monitor/watchdog threads. Set when
     /// `reserve_service_cpu` is true in `compute_pinning`.
     pub service_cpu: Option<usize>,
-    /// Held flock fd for LLC slot reservation. Dropped when the plan
-    /// (and the SttVm holding it) is dropped, releasing the slot.
+    /// Held flock fds for resource reservation. Dropped when the plan
+    /// (and the SttVm holding it) is dropped, releasing all locks.
     #[allow(dead_code)]
-    pub(crate) llc_lock: Option<std::os::fd::OwnedFd>,
+    pub(crate) locks: Vec<std::os::fd::OwnedFd>,
 }
 
 impl HostTopology {
@@ -176,64 +192,210 @@ impl HostTopology {
         Ok(PinningPlan {
             assignments,
             service_cpu,
-            llc_lock: None,
+            locks: Vec::new(),
         })
     }
 }
 
-/// Reserve an LLC slot via flock. Returns (llc_offset, lock_fd).
-///
-/// Tries `flock(LOCK_EX | LOCK_NB)` on `/tmp/stt-llc-{N}.lock` for
-/// each slot. The first successfully locked file determines the LLC
-/// offset. The fd is returned as `OwnedFd` so the lock is held until
-/// the VM (and its `PinningPlan`) is dropped.
-///
-/// `sockets_needed` is the number of LLC groups consumed per slot.
-/// `max_slots = num_llcs / sockets_needed`.
-///
-/// Falls back to slot 0 with a warning when all slots are taken.
-pub fn acquire_llc_lock(
-    num_llcs: usize,
-    sockets_needed: usize,
-) -> (usize, Option<std::os::fd::OwnedFd>) {
+/// Lock mode for LLC reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlcLockMode {
+    /// Exclusive access to the entire LLC (performance_mode tests).
+    /// Blocks while any shared or exclusive holder exists.
+    Exclusive,
+    /// Shared access to the LLC (non-perf pinned tests).
+    /// Multiple shared holders coexist; blocked by exclusive.
+    Shared,
+}
+
+/// Resource lock acquisition outcome.
+#[derive(Debug)]
+pub enum LockOutcome {
+    /// Locks acquired; PinningPlan.locks holds the fds.
+    Acquired {
+        llc_offset: usize,
+        locks: Vec<std::os::fd::OwnedFd>,
+    },
+    /// Resources busy and deadline reached.
+    Unavailable(String),
+}
+
+/// Open a lock file and attempt flock with LOCK_NB.
+/// Returns the OwnedFd on success, None on EWOULDBLOCK, or
+/// propagates other errors.
+fn try_flock(path: &str, mode: i32) -> Result<Option<std::os::fd::OwnedFd>> {
     use std::os::fd::FromRawFd;
-
-    let max_slots = num_llcs.checked_div(sockets_needed).unwrap_or(num_llcs);
-    if max_slots <= 1 {
-        return (0, None);
+    let cpath = std::ffi::CString::new(path).unwrap();
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR,
+            0o666 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!("open {path}: {err}");
     }
-
-    for slot in 0..max_slots {
-        let path = std::ffi::CString::new(format!("/tmp/stt-llc-{slot}.lock")).unwrap();
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR,
-                0o666 as libc::mode_t,
-            )
-        };
-        if fd < 0 {
-            continue;
-        }
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            let offset = slot * sockets_needed;
-            eprintln!(
-                "performance_mode: reserved LLC slot {} (offset {}, max {})",
-                slot, offset, max_slots,
-            );
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-            return (offset, Some(owned));
-        }
-        // EWOULDBLOCK: slot taken, close and try next.
+    let rc = unsafe { libc::flock(fd, mode | libc::LOCK_NB) };
+    if rc == 0 {
+        Ok(Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    } else {
         unsafe { libc::close(fd) };
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(None)
+        } else {
+            anyhow::bail!("flock {path}: {err}");
+        }
+    }
+}
+
+/// Acquire resource locks for a pinning plan.
+///
+/// **LLC locks** (`/tmp/stt-llc-{N}.lock`):
+/// - `Exclusive`: `flock(LOCK_EX | LOCK_NB)` — sole access to the LLC.
+/// - `Shared`: `flock(LOCK_SH | LOCK_NB)` — multiple holders coexist.
+///
+/// **CPU locks** (`/tmp/stt-cpu-{C}.lock`):
+/// - Always `flock(LOCK_EX | LOCK_NB)` — exclusive per CPU.
+/// - Skipped for `Exclusive` LLC mode (the LLC lock already provides
+///   exclusivity over all CPUs in the group).
+///
+/// Polls with 500ms sleep until locks are acquired or `deadline`
+/// is reached. Returns `LockOutcome::Unavailable` when the deadline
+/// expires without acquiring all locks.
+pub fn acquire_resource_locks(
+    plan: &PinningPlan,
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    deadline: std::time::Duration,
+) -> Result<LockOutcome> {
+    let start = std::time::Instant::now();
+
+    loop {
+        match try_acquire_all(plan, llc_indices, llc_mode) {
+            Ok(locks) => {
+                return Ok(LockOutcome::Acquired {
+                    llc_offset: llc_indices.first().copied().unwrap_or(0),
+                    locks,
+                });
+            }
+            Err(reason) => {
+                if start.elapsed() >= deadline {
+                    return Ok(LockOutcome::Unavailable(reason));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+/// Try to acquire all resource locks atomically (all-or-nothing).
+/// Returns the held fds on success, or an error string describing
+/// which resource was busy.
+fn try_acquire_all(
+    plan: &PinningPlan,
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
+    let flock_mode = match llc_mode {
+        LlcLockMode::Exclusive => libc::LOCK_EX,
+        LlcLockMode::Shared => libc::LOCK_SH,
+    };
+    let mut locks = Vec::new();
+
+    // Lock LLC files.
+    for &llc_idx in llc_indices {
+        let path = format!("/tmp/stt-llc-{llc_idx}.lock");
+        match try_flock(&path, flock_mode) {
+            Ok(Some(fd)) => locks.push(fd),
+            Ok(None) => return Err(format!("LLC {llc_idx} busy")),
+            Err(e) => return Err(format!("LLC {llc_idx}: {e}")),
+        }
     }
 
-    eprintln!(
-        "performance_mode: WARNING: all {} LLC slots busy, falling back to slot 0",
-        max_slots,
-    );
-    (0, None)
+    // Per-CPU locks: skip for exclusive LLC mode (the LLC lock covers
+    // all CPUs in the group).
+    if llc_mode != LlcLockMode::Exclusive {
+        for &(_vcpu, host_cpu) in &plan.assignments {
+            let path = format!("/tmp/stt-cpu-{host_cpu}.lock");
+            match try_flock(&path, libc::LOCK_EX) {
+                Ok(Some(fd)) => locks.push(fd),
+                Ok(None) => return Err(format!("CPU {host_cpu} busy")),
+                Err(e) => return Err(format!("CPU {host_cpu}: {e}")),
+            }
+        }
+        if let Some(cpu) = plan.service_cpu {
+            let path = format!("/tmp/stt-cpu-{cpu}.lock");
+            match try_flock(&path, libc::LOCK_EX) {
+                Ok(Some(fd)) => locks.push(fd),
+                Ok(None) => return Err(format!("service CPU {cpu} busy")),
+                Err(e) => return Err(format!("service CPU {cpu}: {e}")),
+            }
+        }
+    }
+
+    Ok(locks)
+}
+
+/// Acquire exclusive CPU locks for a non-perf VM.
+///
+/// Tries to flock `count` consecutive CPU files starting from offset 0,
+/// stepping by `count` if any CPU in the window is busy. Returns the held
+/// fds on success, or `ResourceContention` when the deadline expires.
+///
+/// `total_host_cpus` bounds the search space.
+pub fn acquire_cpu_locks(
+    count: usize,
+    total_host_cpus: usize,
+    deadline: std::time::Duration,
+) -> Result<Vec<std::os::fd::OwnedFd>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let start = std::time::Instant::now();
+
+    loop {
+        let mut offset = 0;
+        while offset + count <= total_host_cpus {
+            match try_acquire_cpu_window(offset, count) {
+                Ok(locks) => return Ok(locks),
+                Err(_) => {
+                    offset += count;
+                }
+            }
+        }
+
+        if start.elapsed() >= deadline {
+            return Err(anyhow::Error::new(ResourceContention {
+                reason: format!(
+                    "no {count} consecutive CPUs available — waited {}s",
+                    deadline.as_secs(),
+                ),
+            }));
+        }
+        let jitter = (std::process::id() as u64).wrapping_mul(7) % 100;
+        std::thread::sleep(std::time::Duration::from_millis(400 + jitter));
+    }
+}
+
+/// Try to flock CPUs [offset..offset+count) exclusively.
+/// Returns all fds on success, or an error string on any busy CPU.
+fn try_acquire_cpu_window(
+    offset: usize,
+    count: usize,
+) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
+    let mut locks = Vec::with_capacity(count);
+    for cpu in offset..offset + count {
+        let path = format!("/tmp/stt-cpu-{cpu}.lock");
+        match try_flock(&path, libc::LOCK_EX) {
+            Ok(Some(fd)) => locks.push(fd),
+            Ok(None) => return Err(format!("CPU {cpu} busy")),
+            Err(e) => return Err(format!("CPU {cpu}: {e}")),
+        }
+    }
+    Ok(locks)
 }
 
 /// Discover the NUMA node for each CPU by reading

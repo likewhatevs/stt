@@ -750,6 +750,10 @@ pub struct SttVm {
     pinning_plan: Option<host_topology::PinningPlan>,
     /// NUMA nodes to mbind guest memory to (derived from pinning plan).
     mbind_nodes: Vec<usize>,
+    /// CPU flock fds for non-perf VMs. Held for the VM's lifetime to
+    /// prevent other VMs from double-booking the same CPUs.
+    #[allow(dead_code)]
+    cpu_locks: Vec<std::os::fd::OwnedFd>,
     /// Shell commands to run in the guest to enable a kernel-built scheduler.
     sched_enable_cmds: Vec<String>,
     /// Shell commands to run in the guest to disable a kernel-built scheduler.
@@ -2549,14 +2553,21 @@ impl SttVmBuilder {
         self
     }
 
-    pub fn build(self) -> Result<SttVm> {
-        let (pinning_plan, mbind_nodes) = if self.performance_mode {
+    pub fn build(mut self) -> Result<SttVm> {
+        let (pinning_plan, mbind_nodes, cpu_locks) = if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
             let pinned_cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
             let nodes = host_topo.numa_nodes_for_cpus(&pinned_cpus);
-            (Some(plan), nodes)
+            // Perf VMs already hold CPU locks via PinningPlan.locks.
+            (Some(plan), nodes, Vec::new())
         } else {
-            (None, Vec::new())
+            let total_cpus = self.topology.total_cpus() as usize;
+            let host_cpus = host_topology::HostTopology::from_sysfs()
+                .map(|h| h.total_cpus())
+                .unwrap_or(total_cpus);
+            let deadline = crate::test_support::resource_deadline();
+            let locks = host_topology::acquire_cpu_locks(total_cpus, host_cpus, deadline)?;
+            (None, Vec::new(), locks)
         };
 
         let kernel = self.kernel.context("kernel path required")?;
@@ -2595,6 +2606,7 @@ impl SttVmBuilder {
             performance_mode: self.performance_mode,
             pinning_plan,
             mbind_nodes,
+            cpu_locks,
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
         })
@@ -2605,7 +2617,7 @@ impl SttVmBuilder {
     /// for NUMA node discovery). Errors are fatal (oversubscription,
     /// unsatisfiable topology). Warnings are printed for degraded conditions.
     fn validate_performance_mode(
-        &self,
+        &mut self,
     ) -> Result<(host_topology::PinningPlan, host_topology::HostTopology)> {
         let host_topo = host_topology::HostTopology::from_sysfs()
             .context("performance_mode: read host topology")?;
@@ -2636,21 +2648,12 @@ impl SttVmBuilder {
             );
         }
 
-        // Reserve an LLC slot via flock so concurrent VMs pin to
-        // different LLC groups.
-        let (llc_offset, llc_lock) =
-            host_topology::acquire_llc_lock(host_topo.llc_groups.len(), t.sockets as usize);
-
-        let mut plan = host_topo
-            .compute_pinning(
-                t.sockets,
-                t.cores_per_socket,
-                t.threads_per_core,
-                true,
-                llc_offset,
-            )
-            .context("performance_mode: topology mapping")?;
-        plan.llc_lock = llc_lock;
+        let plan = acquire_slot_with_locks(
+            &host_topo,
+            t.sockets,
+            t.cores_per_socket,
+            t.threads_per_core,
+        )?;
 
         // WARN: hugepages.
         let free = host_topology::hugepages_free();
@@ -2681,6 +2684,68 @@ impl SttVmBuilder {
         }
 
         Ok((plan, host_topo))
+    }
+}
+
+/// Try each LLC slot, compute a pinning plan, and acquire resource
+/// locks. Polls with 500ms sleep until a slot is acquired or the
+/// deadline expires. Returns a `ResourceContention` error when the
+/// deadline expires.
+fn acquire_slot_with_locks(
+    host_topo: &host_topology::HostTopology,
+    sockets: u32,
+    cores_per_socket: u32,
+    threads_per_core: u32,
+) -> Result<host_topology::PinningPlan> {
+    let deadline = crate::test_support::resource_deadline();
+    let num_llcs = host_topo.llc_groups.len();
+    let sockets_needed = sockets as usize;
+    let max_slots = num_llcs
+        .checked_div(sockets_needed)
+        .unwrap_or(num_llcs)
+        .max(1);
+    let llc_mode = host_topology::LlcLockMode::Exclusive;
+    let start = std::time::Instant::now();
+
+    loop {
+        for slot in 0..max_slots {
+            let offset = slot * sockets_needed;
+            let llc_indices: Vec<usize> = (offset..offset + sockets_needed).collect();
+
+            let candidate = host_topo
+                .compute_pinning(sockets, cores_per_socket, threads_per_core, true, offset)
+                .context("performance_mode: topology mapping")?;
+
+            match host_topology::acquire_resource_locks(
+                &candidate,
+                &llc_indices,
+                llc_mode,
+                std::time::Duration::ZERO,
+            )? {
+                host_topology::LockOutcome::Acquired { locks, .. } => {
+                    let mut plan = candidate;
+                    plan.locks = locks;
+                    eprintln!(
+                        "performance_mode: reserved LLC slot {} (offset {}, max {})",
+                        slot, offset, max_slots,
+                    );
+                    return Ok(plan);
+                }
+                host_topology::LockOutcome::Unavailable(_) => continue,
+            }
+        }
+
+        if start.elapsed() >= deadline {
+            return Err(anyhow::Error::new(host_topology::ResourceContention {
+                reason: format!(
+                    "all {} LLC slots busy — waited {}s",
+                    max_slots,
+                    deadline.as_secs(),
+                ),
+            }));
+        }
+        let jitter = (std::process::id() as u64).wrapping_mul(7) % 100;
+        std::thread::sleep(std::time::Duration::from_millis(400 + jitter));
     }
 }
 
