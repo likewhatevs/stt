@@ -688,15 +688,15 @@ pub struct VmResult {
     /// Stimulus events extracted from SHM ring entries.
     pub stimulus_events: Vec<shm_ring::StimulusEvent>,
     /// BPF verifier stats collected from host-side memory reads.
-    pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierInfo>,
+    pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
 }
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Base guest physical address of DRAM.
-/// x86_64: memory starts at PA 0.
+/// Start of the guest physical address space used for RAM.
+/// x86_64: PA 0 (sub-1MB legacy regions share the same PA space).
 /// aarch64: device MMIO below DRAM_START, RAM above.
 #[cfg(target_arch = "x86_64")]
 const DRAM_BASE: u64 = 0;
@@ -1939,7 +1939,10 @@ impl SttVm {
     ///
     /// Enumerates struct_ops programs in the kernel's `prog_idr` and
     /// reads `bpf_prog_aux->verified_insns` for each.
-    fn collect_verifier_stats(&self, vm: &kvm::SttKvm) -> Vec<monitor::bpf_prog::ProgVerifierInfo> {
+    fn collect_verifier_stats(
+        &self,
+        vm: &kvm::SttKvm,
+    ) -> Vec<monitor::bpf_prog::ProgVerifierStats> {
         let vmlinux = match find_vmlinux(&self.kernel) {
             Some(v) => v,
             None => return Vec::new(),

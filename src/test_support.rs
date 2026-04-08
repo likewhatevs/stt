@@ -41,7 +41,7 @@ pub struct SidecarResult {
     #[serde(default = "crate::stats::default_work_type")]
     pub work_type: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub verifier_stats: Vec<crate::monitor::bpf_prog::ProgVerifierInfo>,
+    pub verifier_stats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
 }
 
 /// Scan a directory for stt sidecar JSON files. Recurses one level
@@ -52,8 +52,13 @@ pub fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
         Ok(e) => e,
         Err(_) => return sidecars,
     };
+    let mut subdirs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+            continue;
+        }
         if path.extension().and_then(|e| e.to_str()) == Some("json")
             && path.to_str().is_some_and(|s| s.contains(".stt."))
             && let Ok(data) = std::fs::read_to_string(&path)
@@ -63,21 +68,16 @@ pub fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
         }
     }
     // Recurse one level for gauntlet per-job subdirectories.
-    if let Ok(dirs) = std::fs::read_dir(dir) {
-        for d in dirs.flatten() {
-            let sub = d.path();
-            if sub.is_dir()
-                && let Ok(entries) = std::fs::read_dir(&sub)
-            {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("json")
-                        && path.to_str().is_some_and(|s| s.contains(".stt."))
-                        && let Ok(data) = std::fs::read_to_string(&path)
-                        && let Ok(sc) = serde_json::from_str::<SidecarResult>(&data)
-                    {
-                        sidecars.push(sc);
-                    }
+    for sub in subdirs {
+        if let Ok(entries) = std::fs::read_dir(&sub) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json")
+                    && path.to_str().is_some_and(|s| s.contains(".stt."))
+                    && let Ok(data) = std::fs::read_to_string(&path)
+                    && let Ok(sc) = serde_json::from_str::<SidecarResult>(&data)
+                {
+                    sidecars.push(sc);
                 }
             }
         }
@@ -963,7 +963,6 @@ fn run_stt_test_inner(
     evaluate_vm_result(
         entry,
         &result,
-        scheduler.as_deref(),
         &merged_assert,
         &stimulus_events,
         sockets,
@@ -983,7 +982,6 @@ fn run_stt_test_inner(
 fn evaluate_vm_result(
     entry: &SttTestEntry,
     result: &vmm::VmResult,
-    _scheduler: Option<&Path>,
     merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
     sockets: u32,
@@ -3608,8 +3606,8 @@ mod tests {
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
-            .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("payload produced no output"),
@@ -3634,19 +3632,8 @@ mod tests {
         let entry = sched_entry("__eval_sched_dies__");
         let result = make_vm_result("", "boot ok", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let sched_path = std::path::Path::new("/fake/sched");
-        let err = evaluate_vm_result(
-            &entry,
-            &result,
-            Some(sched_path),
-            &assertions,
-            &[],
-            1,
-            2,
-            1,
-            &no_repro,
-        )
-        .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("scheduler died"),
@@ -3668,19 +3655,8 @@ mod tests {
         let entry = sched_entry("__eval_sched_log__");
         let result = make_vm_result(&sched_log, "", -1, false);
         let assertions = crate::assert::Assert::NONE;
-        let sched_path = std::path::Path::new("/fake/sched");
-        let err = evaluate_vm_result(
-            &entry,
-            &result,
-            Some(sched_path),
-            &assertions,
-            &[],
-            1,
-            2,
-            1,
-            &no_repro,
-        )
-        .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("scheduler died"),
@@ -3703,8 +3679,8 @@ mod tests {
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
-            .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("timed out"),
@@ -3731,8 +3707,8 @@ mod tests {
             false,
         );
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
-            .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("payload produced no output"),
@@ -3750,19 +3726,8 @@ mod tests {
         let entry = sched_entry("__eval_dump__");
         let result = make_vm_result(output, "", -1, false);
         let assertions = crate::assert::Assert::NONE;
-        let sched_path = std::path::Path::new("/fake/sched");
-        let err = evaluate_vm_result(
-            &entry,
-            &result,
-            Some(sched_path),
-            &assertions,
-            &[],
-            1,
-            2,
-            1,
-            &no_repro,
-        )
-        .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("--- sched_ext dump ---"),
@@ -3782,8 +3747,7 @@ mod tests {
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
         assert!(
-            evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro,)
-                .is_ok(),
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro,).is_ok(),
             "passing AssertResult should return Ok",
         );
     }
@@ -3795,8 +3759,8 @@ mod tests {
         let entry = eevdf_entry("__eval_fail_details__");
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
-            .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("failed:"),
@@ -3821,8 +3785,8 @@ mod tests {
         let entry = sched_entry("__eval_fail_no_sched_log__");
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
-            .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("worker 0 stuck 5000ms"),
@@ -3845,19 +3809,8 @@ mod tests {
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
         let assertions = crate::assert::Assert::NONE;
-        let sched_path = std::path::Path::new("/fake/sched");
-        let err = evaluate_vm_result(
-            &entry,
-            &result,
-            Some(sched_path),
-            &assertions,
-            &[],
-            1,
-            2,
-            1,
-            &no_repro,
-        )
-        .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("timed out"),
@@ -3923,8 +3876,8 @@ mod tests {
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
-            .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("init script never started"),
@@ -3939,8 +3892,8 @@ mod tests {
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("STT_INIT_STARTED\n", "boot log", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
-            .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("init started but payload never ran"),
@@ -3956,8 +3909,8 @@ mod tests {
         let output = "STT_INIT_STARTED\nSTT_PAYLOAD_STARTING\ngarbage";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
-            .unwrap_err();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("payload started but produced no test result"),
@@ -3968,7 +3921,7 @@ mod tests {
     // -- format_verifier_stats tests --
 
     fn make_sidecar_with_vstats(
-        vstats: Vec<crate::monitor::bpf_prog::ProgVerifierInfo>,
+        vstats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
     ) -> SidecarResult {
         SidecarResult {
             test_name: "t".to_string(),
@@ -3997,11 +3950,11 @@ mod tests {
     #[test]
     fn format_verifier_stats_table() {
         let sc = make_sidecar_with_vstats(vec![
-            crate::monitor::bpf_prog::ProgVerifierInfo {
+            crate::monitor::bpf_prog::ProgVerifierStats {
                 name: "dispatch".to_string(),
                 verified_insns: 50000,
             },
-            crate::monitor::bpf_prog::ProgVerifierInfo {
+            crate::monitor::bpf_prog::ProgVerifierStats {
                 name: "enqueue".to_string(),
                 verified_insns: 30000,
             },
@@ -4018,7 +3971,7 @@ mod tests {
 
     #[test]
     fn format_verifier_stats_warning() {
-        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierInfo {
+        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
             name: "heavy".to_string(),
             verified_insns: 800000,
         }]);
@@ -4030,7 +3983,7 @@ mod tests {
 
     #[test]
     fn sidecar_verifier_stats_serde_roundtrip() {
-        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierInfo {
+        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
             name: "init".to_string(),
             verified_insns: 5000,
         }]);
@@ -4069,11 +4022,11 @@ mod tests {
 
     #[test]
     fn format_verifier_stats_deduplicates() {
-        let sc1 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierInfo {
+        let sc1 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
             name: "dispatch".to_string(),
             verified_insns: 50000,
         }]);
-        let sc2 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierInfo {
+        let sc2 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
             name: "dispatch".to_string(),
             verified_insns: 50000,
         }]);

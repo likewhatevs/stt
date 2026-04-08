@@ -398,7 +398,7 @@ pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> V
             Ok(t) => t,
             Err(_) => return None,
         };
-        for _ in 0..10 {
+        for _ in 0..20 {
             match &t {
                 Type::Ptr(_)
                 | Type::Const(_)
@@ -432,7 +432,7 @@ pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> V
             Ok(t) => t,
             Err(_) => return false,
         };
-        for _ in 0..10 {
+        for _ in 0..20 {
             match &t {
                 Type::Ptr(_)
                 | Type::Const(_)
@@ -915,7 +915,7 @@ pub(super) fn resolve_ops_callback_proto<'a>(
         }
         // Follow the member type to find FuncProto (through Ptr if needed).
         let mut t = vmlinux.type_by_id::<BtfType<'_>>(member.ty)?;
-        for _ in 0..10 {
+        for _ in 0..20 {
             let inner = t.skip_mods_and_typedefs();
             match inner.kind() {
                 BtfKind::Ptr => {

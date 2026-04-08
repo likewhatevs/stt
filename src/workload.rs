@@ -116,7 +116,6 @@ impl WorkType {
         "FutexFanOut",
     ];
 
-    #[allow(dead_code)]
     pub fn name(&self) -> &'static str {
         match self {
             WorkType::CpuSpin => "CpuSpin",

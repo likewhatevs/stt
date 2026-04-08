@@ -18,7 +18,7 @@ const BPF_OBJ_NAME_LEN: usize = 16;
 
 /// Per-program BPF verifier statistics collected from the host.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProgVerifierInfo {
+pub struct ProgVerifierStats {
     pub name: String,
     pub verified_insns: u32,
 }
@@ -35,7 +35,7 @@ pub(crate) fn find_struct_ops_progs(
     prog_idr_kva: u64,
     offsets: &BpfProgOffsets,
     l5: bool,
-) -> Vec<ProgVerifierInfo> {
+) -> Vec<ProgVerifierStats> {
     let idr_pa = text_kva_to_pa(prog_idr_kva);
 
     let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
@@ -91,7 +91,7 @@ pub(crate) fn find_struct_ops_progs(
             .unwrap_or(BPF_OBJ_NAME_LEN);
         let name = String::from_utf8_lossy(&name_buf[..name_len]).to_string();
 
-        progs.push(ProgVerifierInfo {
+        progs.push(ProgVerifierStats {
             name,
             verified_insns,
         });
@@ -259,7 +259,7 @@ impl<'a> BpfProgAccessor<'a> {
     }
 
     /// Enumerate struct_ops BPF programs and collect verifier stats.
-    pub fn struct_ops_progs(&self) -> Vec<ProgVerifierInfo> {
+    pub fn struct_ops_progs(&self) -> Vec<ProgVerifierStats> {
         find_struct_ops_progs(
             self.kernel.mem(),
             self.kernel.cr3_pa(),
@@ -276,31 +276,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prog_verifier_info_serde_roundtrip() {
-        let info = ProgVerifierInfo {
+    fn prog_verifier_stats_serde_roundtrip() {
+        let info = ProgVerifierStats {
             name: "dispatch".to_string(),
             verified_insns: 42000,
         };
         let json = serde_json::to_string(&info).unwrap();
-        let loaded: ProgVerifierInfo = serde_json::from_str(&json).unwrap();
+        let loaded: ProgVerifierStats = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.name, "dispatch");
         assert_eq!(loaded.verified_insns, 42000);
     }
 
     #[test]
-    fn prog_verifier_info_vec_serde_roundtrip() {
+    fn prog_verifier_stats_vec_serde_roundtrip() {
         let stats = vec![
-            ProgVerifierInfo {
+            ProgVerifierStats {
                 name: "dispatch".to_string(),
                 verified_insns: 100000,
             },
-            ProgVerifierInfo {
+            ProgVerifierStats {
                 name: "enqueue".to_string(),
                 verified_insns: 50000,
             },
         ];
         let json = serde_json::to_vec(&stats).unwrap();
-        let loaded: Vec<ProgVerifierInfo> = serde_json::from_slice(&json).unwrap();
+        let loaded: Vec<ProgVerifierStats> = serde_json::from_slice(&json).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].name, "dispatch");
         assert_eq!(loaded[0].verified_insns, 100000);
@@ -309,25 +309,25 @@ mod tests {
     }
 
     #[test]
-    fn prog_verifier_info_empty_name() {
-        let info = ProgVerifierInfo {
+    fn prog_verifier_stats_empty_name() {
+        let info = ProgVerifierStats {
             name: String::new(),
             verified_insns: 0,
         };
         let json = serde_json::to_string(&info).unwrap();
-        let loaded: ProgVerifierInfo = serde_json::from_str(&json).unwrap();
+        let loaded: ProgVerifierStats = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.name, "");
         assert_eq!(loaded.verified_insns, 0);
     }
 
     #[test]
-    fn prog_verifier_info_max_values() {
-        let info = ProgVerifierInfo {
+    fn prog_verifier_stats_max_values() {
+        let info = ProgVerifierStats {
             name: "x".repeat(16),
             verified_insns: u32::MAX,
         };
         let json = serde_json::to_string(&info).unwrap();
-        let loaded: ProgVerifierInfo = serde_json::from_str(&json).unwrap();
+        let loaded: ProgVerifierStats = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.verified_insns, u32::MAX);
         assert_eq!(loaded.name.len(), 16);
     }

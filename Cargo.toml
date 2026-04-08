@@ -17,7 +17,6 @@ publish = false
 [dependencies]
 anyhow = "1"
 crc32fast = "1.5"
-console = "0.16"
 flate2 = "1"
 ctor = "0.8"
 gix = "0.81"

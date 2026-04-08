@@ -26,7 +26,7 @@ pub const DSQ_BYPASS: u32 = 3;
 // ---- Enqueue flags (SCX_ENQ_*) ----
 
 pub const ENQ_WAKEUP: u64 = 1 << 0;
-pub const ENQ_HEAD: u64 = 1 << 1;
+pub const ENQ_HEAD: u64 = 1 << 16;
 pub const ENQ_PREEMPT: u64 = 1 << 32;
 pub const ENQ_REENQ: u64 = 1 << 40;
 pub const ENQ_LAST: u64 = 1 << 41;
@@ -70,6 +70,19 @@ pub const EXIT_KIND_NAMES: &[(u64, &str)] = &[
     (EXIT_ERROR_BPF, "ERROR_BPF"),
     (EXIT_ERROR_STALL, "ERROR_STALL"),
 ];
+
+// ---- Kick flags (SCX_KICK_*) ----
+
+pub const KICK_IDLE: u64 = 1;
+pub const KICK_PREEMPT: u64 = 2;
+pub const KICK_WAIT: u64 = 4;
+
+// ---- Ops state (scx.ops_state lower 8 bits) ----
+
+pub const OPS_NONE: u64 = 0;
+pub const OPS_QUEUEING: u64 = 1;
+pub const OPS_QUEUED: u64 = 2;
+pub const OPS_DISPATCHING: u64 = 3;
 
 // ---- Task scx flags (task_struct.scx.flags) ----
 

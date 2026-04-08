@@ -5,6 +5,9 @@ use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
 use stt::test_support::{Scheduler, SchedulerSpec, SttTestEntry};
 
 fn main() {
+    if stt::test_support::is_pid1() {
+        stt::test_support::stt_guest_init();
+    }
     let args = libtest_mimic::Arguments::from_args();
     let mut trials = stt::test_support::build_stt_trials();
 
@@ -139,5 +142,6 @@ static __STT_ENTRY_VERIFY_REJECT: SttTestEntry = SttTestEntry {
     extra_sched_args: &["--verify-loop"],
     duration_s: 5,
     workers_per_cgroup: 2,
+    expect_err: true,
     ..SttTestEntry::DEFAULT
 };

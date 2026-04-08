@@ -19,7 +19,8 @@ pub struct VmConfig {
     pub memory_mb: usize,
     pub timeout: Option<Duration>,
     /// Linux source tree with built kernel. Resolves to
-    /// `{kernel_dir}/arch/x86/boot/bzImage`.
+    /// `{kernel_dir}/arch/x86/boot/bzImage` on x86_64 or
+    /// `{kernel_dir}/arch/arm64/boot/Image` on aarch64.
     pub kernel_dir: Option<String>,
 }
 

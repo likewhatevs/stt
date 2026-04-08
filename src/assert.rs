@@ -847,8 +847,6 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         0.0
     };
 
-    let cg_ext = BTreeMap::new();
-
     let cg = CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
@@ -866,7 +864,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         total_iterations: total_iters,
         mean_run_delay_us: mean_run_delay,
         worst_run_delay_us: worst_run_delay,
-        ext_metrics: cg_ext,
+        ext_metrics: BTreeMap::new(),
     };
 
     // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup
@@ -899,7 +897,6 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 
     // Store this cgroup's stats - merge accumulates cgroups
     r.stats = ScenarioStats {
-        cgroups: vec![cg.clone()],
         total_workers: reports.len(),
         total_cpus: cpus.len(),
         total_migrations: reports.iter().map(|w| w.migration_count).sum(),
@@ -914,6 +911,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         mean_run_delay_us: cg.mean_run_delay_us,
         worst_run_delay_us: cg.worst_run_delay_us,
         ext_metrics: cg.ext_metrics.clone(),
+        cgroups: vec![cg],
     };
 
     r

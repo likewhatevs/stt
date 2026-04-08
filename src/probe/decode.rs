@@ -204,14 +204,15 @@ pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
 }
 
 pub(crate) fn decode_kick_flags(flags: u64) -> String {
+    use super::scx_defs::*;
     let mut parts = Vec::new();
-    if flags & 1 != 0 {
+    if flags & KICK_IDLE != 0 {
         parts.push("IDLE");
     }
-    if flags & 2 != 0 {
+    if flags & KICK_PREEMPT != 0 {
         parts.push("PREEMPT");
     }
-    if flags & 4 != 0 {
+    if flags & KICK_WAIT != 0 {
         parts.push("WAIT");
     }
     if parts.is_empty() {
@@ -222,11 +223,12 @@ pub(crate) fn decode_kick_flags(flags: u64) -> String {
 }
 
 pub(crate) fn decode_ops_state(state: u64) -> String {
+    use super::scx_defs::*;
     match state & 0xff {
-        0 => "NONE".into(),
-        1 => "QUEUEING".into(),
-        2 => "QUEUED".into(),
-        3 => "DISPATCHING".into(),
+        OPS_NONE => "NONE".into(),
+        OPS_QUEUEING => "QUEUEING".into(),
+        OPS_QUEUED => "QUEUED".into(),
+        OPS_DISPATCHING => "DISPATCHING".into(),
         v => format!("OPSS({v})"),
     }
 }
@@ -673,6 +675,60 @@ mod tests {
     fn decode_cpumask_multi_word3_high() {
         // CPU 255: highest bit of word 3.
         assert_eq!(decode_cpumask_multi(&[0, 0, 0, 1u64 << 63]), "255");
+    }
+
+    // -- decode_kick_flags --
+
+    #[test]
+    fn decode_kick_flags_idle() {
+        assert_eq!(decode_kick_flags(1), "IDLE");
+    }
+
+    #[test]
+    fn decode_kick_flags_preempt() {
+        assert_eq!(decode_kick_flags(2), "PREEMPT");
+    }
+
+    #[test]
+    fn decode_kick_flags_wait() {
+        assert_eq!(decode_kick_flags(4), "WAIT");
+    }
+
+    #[test]
+    fn decode_kick_flags_combo() {
+        assert_eq!(decode_kick_flags(1 | 2), "IDLE|PREEMPT");
+    }
+
+    #[test]
+    fn decode_kick_flags_none() {
+        assert_eq!(decode_kick_flags(0), "NONE");
+    }
+
+    // -- decode_ops_state --
+
+    #[test]
+    fn decode_ops_state_none() {
+        assert_eq!(decode_ops_state(0), "NONE");
+    }
+
+    #[test]
+    fn decode_ops_state_queueing() {
+        assert_eq!(decode_ops_state(1), "QUEUEING");
+    }
+
+    #[test]
+    fn decode_ops_state_queued() {
+        assert_eq!(decode_ops_state(2), "QUEUED");
+    }
+
+    #[test]
+    fn decode_ops_state_dispatching() {
+        assert_eq!(decode_ops_state(3), "DISPATCHING");
+    }
+
+    #[test]
+    fn decode_ops_state_unknown() {
+        assert_eq!(decode_ops_state(99), "OPSS(99)");
     }
 
     // -- decode_named_value with cpumask_N keys --

@@ -21,7 +21,6 @@ use crate::topology::TestTopology;
 /// Controls scheduler binary, flag selection, durations, and
 /// verification behavior.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct RunConfig {
     pub scheduler_bin: Option<String>,
     pub scheduler_args: Vec<String>,

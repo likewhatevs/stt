@@ -329,8 +329,17 @@ fn format_probe_events_inner(
                 }
             }
             let merged_cpumask = super::decode::decode_cpumask_multi(&cpumask_words);
-            let merged_hex: u64 = cpumask_words[0];
-            let merged_cpumask_str = format!("0x{merged_hex:x}({merged_cpumask})");
+            let merged_cpumask_str = if cpumask_words[1..].iter().any(|&w| w != 0) {
+                let hex_parts: Vec<String> = cpumask_words
+                    .iter()
+                    .rev()
+                    .skip_while(|&&w| w == 0)
+                    .map(|w| format!("{w:016x}"))
+                    .collect();
+                format!("0x{}({merged_cpumask})", hex_parts.join("_"))
+            } else {
+                format!("0x{:x}({merged_cpumask})", cpumask_words[0])
+            };
 
             // Group fields by parameter, emit type headers for struct params.
             let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
@@ -957,6 +966,63 @@ mod tests {
             out.contains("main.bpf.c:42"),
             "should show BPF source loc: {out}",
         );
+    }
+
+    // -- cpumask multi-word hex display --
+
+    #[test]
+    fn cpumask_multi_word_hex_format() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            tid: 1,
+            ts: 100,
+            args: [0; 6],
+            fields: vec![
+                ("p:cpumask.cpumask_0".to_string(), 0xff),
+                ("p:cpumask.cpumask_1".to_string(), 0x1),
+                ("p:cpumask.cpumask_2".to_string(), 0),
+                ("p:cpumask.cpumask_3".to_string(), 0),
+            ],
+            kstack: vec![],
+            str_val: None,
+        }];
+        let func_names = vec![(0u32, "test_fn".to_string())];
+        let out = format_probe_events(&events, &func_names, None, false);
+        // Multi-word: should have underscore-separated 16-digit hex words.
+        assert!(
+            out.contains("_"),
+            "multi-word should use _ separator: {out}"
+        );
+        // Should list CPUs 0-7 (word 0 = 0xff) and CPU 64 (word 1 = 0x1).
+        assert!(out.contains("0-7"), "should list CPUs 0-7: {out}");
+        assert!(out.contains("64"), "should list CPU 64: {out}");
+    }
+
+    #[test]
+    fn cpumask_single_word_compact() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            tid: 1,
+            ts: 100,
+            args: [0; 6],
+            fields: vec![
+                ("p:cpumask.cpumask_0".to_string(), 0xf),
+                ("p:cpumask.cpumask_1".to_string(), 0),
+                ("p:cpumask.cpumask_2".to_string(), 0),
+                ("p:cpumask.cpumask_3".to_string(), 0),
+            ],
+            kstack: vec![],
+            str_val: None,
+        }];
+        let func_names = vec![(0u32, "test_fn".to_string())];
+        let out = format_probe_events(&events, &func_names, None, false);
+        // Single word: compact hex without leading zeros.
+        assert!(out.contains("0xf("), "single-word should be compact: {out}");
+        assert!(out.contains("0-3"), "should list CPUs 0-3: {out}");
     }
 
     // -- struct type header grouping --

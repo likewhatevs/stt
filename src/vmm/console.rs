@@ -1,8 +1,9 @@
 /// 16550A UART emulation via vm-superio.
 ///
 /// Thin wrapper around vm-superio::Serial providing port-based I/O
-/// dispatch and output capture. Each instance is parameterized by base
-/// I/O port: COM1 (0x3F8) for kernel console, COM2 (0x2F8) for
+/// dispatch and output capture. On x86_64, UARTs are accessed via port
+/// I/O at COM1 (0x3F8) and COM2 (0x2F8). On aarch64, UARTs are
+/// MMIO-mapped. COM1 carries the kernel console, COM2 carries
 /// application stdout/stderr.
 pub(crate) const COM1_BASE: u16 = 0x3F8;
 pub(crate) const COM2_BASE: u16 = 0x2F8;

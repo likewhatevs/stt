@@ -67,7 +67,6 @@ pub mod flags {
     /// typed `requires` pointers instead of string matching.
     pub struct FlagDecl {
         pub name: &'static str,
-        #[allow(dead_code)]
         pub args: &'static [&'static str],
         pub requires: &'static [&'static FlagDecl],
         /// Shell commands to run in the guest to enable this flag
@@ -372,7 +371,6 @@ impl<'a> CgroupGroup<'a> {
     }
 
     /// Create a cgroup and set its cpuset. The cgroup is tracked for cleanup on drop.
-    #[allow(dead_code)]
     pub fn add_cgroup(&mut self, name: &str, cpuset: &BTreeSet<usize>) -> Result<()> {
         self.cgroups.create_cgroup(name)?;
         self.cgroups.set_cpuset(name, cpuset)?;
@@ -388,7 +386,6 @@ impl<'a> CgroupGroup<'a> {
     }
 
     /// Names of all tracked cgroups.
-    #[allow(dead_code)]
     pub fn names(&self) -> &[String] {
         &self.names
     }

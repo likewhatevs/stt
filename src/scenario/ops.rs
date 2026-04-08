@@ -30,7 +30,6 @@ use super::{CgroupGroup, Ctx, process_alive};
 ///
 /// Names use `Cow<'static, str>` so ops can reference compile-time
 /// literals (zero-cost) or runtime-generated strings (owned).
-#[allow(dead_code)]
 pub enum Op {
     AddCgroup {
         name: Cow<'static, str>,
@@ -83,7 +82,6 @@ pub enum Op {
 
 /// How to compute a cpuset from topology.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub enum CpusetSpec {
     /// All CPUs in a given LLC index.
     Llc(usize),
@@ -159,14 +157,12 @@ impl CgroupDef {
     }
 
     /// Set the Linux scheduling policy for workers.
-    #[allow(dead_code)]
     pub fn sched_policy(mut self, p: crate::workload::SchedPolicy) -> Self {
         self.sched_policy = p;
         self
     }
 
     /// When true, `--work-type` CLI override replaces this def's work type.
-    #[allow(dead_code)]
     pub fn swappable(mut self, v: bool) -> Self {
         self.swappable = v;
         self
@@ -232,7 +228,6 @@ pub struct Step {
 
 impl Step {
     /// Create a step with ops only (no CgroupDef setup).
-    #[cfg(test)]
     pub fn new(ops: Vec<Op>, hold: HoldSpec) -> Self {
         Self {
             setup: Setup::Defs(vec![]),
@@ -243,7 +238,6 @@ impl Step {
 }
 
 /// How long to hold after a step's ops are applied.
-#[allow(dead_code)]
 pub enum HoldSpec {
     /// Fraction of the total scenario duration.
     Frac(f64),
@@ -796,7 +790,6 @@ fn collect_result(state: &mut StepState<'_>, checks: &crate::assert::Assert) -> 
 // ---------------------------------------------------------------------------
 
 /// Layout strategy for Traverse phases.
-#[allow(dead_code)]
 pub enum Layout {
     Disjoint,
     /// Overlapping cpusets. (min_frac, max_frac) — PRNG picks a value in range.
@@ -815,7 +808,6 @@ pub enum Layout {
 ///
 /// `cgroup_workloads` controls the workload for each cgroup index. If the
 /// vec has fewer entries than the cgroup index, the last entry repeats.
-#[allow(dead_code)]
 pub struct Traverse {
     pub seed: Option<u64>,
     pub cgroup_count: RangeInclusive<usize>,
@@ -829,7 +821,6 @@ pub struct Traverse {
     pub cgroup_workloads: Vec<WorkloadConfig>,
 }
 
-#[allow(dead_code)]
 impl Traverse {
     /// Generate a `Vec<Step>` from the Traverse configuration.
     pub fn generate(&self, ctx: &Ctx) -> Vec<Step> {

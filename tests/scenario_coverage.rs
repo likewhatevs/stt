@@ -387,6 +387,7 @@ static __STT_ENTRY_DEMO_BPF_CRASH: SttTestEntry = SttTestEntry {
     cores: 4,
     scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
+    expect_err: true,
     ..SttTestEntry::DEFAULT
 };
 
@@ -410,6 +411,7 @@ static __STT_ENTRY_DEMO_HOST_CRASH: SttTestEntry = SttTestEntry {
     cores: 4,
     scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
+    expect_err: true,
     ..SttTestEntry::DEFAULT
 };
 

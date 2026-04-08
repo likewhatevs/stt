@@ -118,7 +118,7 @@ pub mod prelude {
 
     pub use crate::assert::{Assert, AssertPlan, AssertResult};
     pub use crate::cgroup::CgroupManager;
-    pub use crate::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
+    pub use crate::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
     pub use crate::scenario::{CgroupGroup, Ctx};
     pub use crate::stt_test;
     pub use crate::test_support::{Scheduler, SchedulerSpec};
