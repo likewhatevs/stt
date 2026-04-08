@@ -1,4 +1,4 @@
-//! Host-side BPF map discovery and write via guest physical memory.
+//! Host-side BPF map discovery, read/write, and iteration via guest physical memory.
 //!
 //! Walks the kernel's `map_idr` xarray from the host, finds a BPF map
 //! by name suffix, and provides read/write access to the map's value
@@ -16,8 +16,11 @@ use super::idr::{translate_any_kva, xa_load};
 use super::reader::GuestMem;
 use super::symbols::text_kva_to_pa;
 
+/// BPF_MAP_TYPE_HASH from include/uapi/linux/bpf.h.
+pub const BPF_MAP_TYPE_HASH: u32 = 1;
+
 /// BPF_MAP_TYPE_ARRAY from include/uapi/linux/bpf.h.
-const BPF_MAP_TYPE_ARRAY: u32 = 2;
+pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 
 /// BPF_OBJ_NAME_LEN from include/linux/bpf.h.
 const BPF_OBJ_NAME_LEN: usize = 16;
@@ -27,12 +30,18 @@ const BPF_OBJ_NAME_LEN: usize = 16;
 pub struct BpfMapInfo {
     /// Guest physical address of the `struct bpf_map`.
     pub map_pa: u64,
+    /// Guest KVA of the `struct bpf_map` (or containing struct like
+    /// `bpf_array`/`bpf_htab`). Needed for hash map iteration to
+    /// read `bpf_htab` fields relative to this base.
+    pub map_kva: u64,
     /// Map name (null-terminated, up to BPF_OBJ_NAME_LEN).
     pub name: String,
     /// `map_type` field value.
     pub map_type: u32,
     /// `map_flags` field value.
     pub map_flags: u32,
+    /// `key_size` field value.
+    pub key_size: u32,
     /// `value_size` field value.
     pub value_size: u32,
     /// Guest KVA of the value region start (bpf_array.value).
@@ -103,6 +112,7 @@ pub(crate) fn find_all_bpf_maps(
 
         let map_type = mem.read_u32(map_pa, offsets.map_type);
         let map_flags = mem.read_u32(map_pa, offsets.map_flags);
+        let key_size = mem.read_u32(map_pa, offsets.key_size);
         let value_size = mem.read_u32(map_pa, offsets.value_size);
 
         // value_kva is only meaningful for ARRAY maps where bpf_array
@@ -118,9 +128,11 @@ pub(crate) fn find_all_bpf_maps(
 
         maps.push(BpfMapInfo {
             map_pa,
+            map_kva: entry,
             name,
             map_type,
             map_flags,
+            key_size,
             value_size,
             value_kva,
             btf_kva,
@@ -236,6 +248,113 @@ pub(crate) fn read_bpf_map_value_u32(
 ) -> Option<u32> {
     let bytes = read_bpf_map_value(mem, cr3_pa, map_info, offset, 4, l5)?;
     Some(u32::from_ne_bytes(bytes.try_into().unwrap()))
+}
+
+/// Maximum number of entries to iterate when walking a hash map.
+/// Prevents unbounded iteration on corrupted or very large maps.
+const HTAB_ITER_MAX: usize = 1_000_000;
+
+/// Iterate all entries in a BPF_MAP_TYPE_HASH map, yielding (key, value)
+/// byte pairs.
+///
+/// Walks the `bpf_htab.buckets` array, following `hlist_nulls` chains
+/// in each bucket to reach `htab_elem` entries. Key bytes start at the
+/// end of `struct htab_elem` (the `key[]` flex array), and value bytes
+/// follow at `round_up(key_size, 8)` from the key start.
+///
+/// `buckets` is allocated via `bpf_map_area_alloc` (vmalloc for large
+/// allocations, kmalloc for small), so addresses are translated via
+/// `translate_any_kva`. Element pointers within bucket chains are
+/// SLAB-allocated (direct mapping) or from `bpf_mem_alloc`.
+///
+/// Returns an empty vec if the map is not `BPF_MAP_TYPE_HASH`, htab
+/// offsets are unavailable, or the htab struct itself is untranslatable.
+/// Untranslatable buckets are skipped; an untranslatable element breaks
+/// the current bucket's chain and advances to the next bucket.
+fn iter_htab_entries(
+    mem: &GuestMem,
+    cr3_pa: u64,
+    page_offset: u64,
+    map: &BpfMapInfo,
+    offsets: &BpfMapOffsets,
+    l5: bool,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if map.map_type != BPF_MAP_TYPE_HASH {
+        return Vec::new();
+    }
+    let Some(htab) = &offsets.htab_offsets else {
+        return Vec::new();
+    };
+
+    // bpf_htab embeds bpf_map at offset 0, so map_kva == htab_kva.
+    let htab_kva = map.map_kva;
+
+    // Read n_buckets and buckets pointer from the bpf_htab struct.
+    let Some(htab_pa) = translate_any_kva(mem, cr3_pa, page_offset, htab_kva, l5) else {
+        return Vec::new();
+    };
+    let n_buckets = mem.read_u32(htab_pa, htab.htab_n_buckets);
+    let buckets_kva = mem.read_u64(htab_pa, htab.htab_buckets);
+    if n_buckets == 0 || buckets_kva == 0 {
+        return Vec::new();
+    }
+
+    let key_size = map.key_size as usize;
+    let value_size = map.value_size as usize;
+    // Value follows key at round_up(key_size, 8) within htab_elem.
+    let value_off_in_elem = htab.htab_elem_size_base + ((key_size + 7) & !7);
+    let key_off_in_elem = htab.htab_elem_size_base;
+
+    let mut entries = Vec::new();
+    let mut total_visited = 0usize;
+
+    for i in 0..n_buckets {
+        // bucket[i] is at buckets_kva + i * bucket_size.
+        let bucket_kva = buckets_kva + (i as u64) * (htab.bucket_size as u64);
+        let Some(bucket_pa) = translate_any_kva(mem, cr3_pa, page_offset, bucket_kva, l5) else {
+            continue;
+        };
+
+        // Read hlist_nulls_head.first from the bucket.
+        let first_ptr = mem.read_u64(bucket_pa, htab.bucket_head + htab.hlist_nulls_head_first);
+
+        // Walk the hlist_nulls chain.
+        let mut node_ptr = first_ptr;
+        loop {
+            // hlist_nulls termination: bit 0 set means end-of-list marker.
+            if node_ptr & 1 != 0 || node_ptr == 0 {
+                break;
+            }
+            total_visited += 1;
+            if total_visited > HTAB_ITER_MAX {
+                return entries;
+            }
+
+            // node_ptr is the KVA of the hlist_nulls_node, which is at
+            // offset 0 of htab_elem (hash_node is first in the union).
+            // So elem_kva == node_ptr.
+            let elem_kva = node_ptr;
+            let Some(elem_pa) = translate_any_kva(mem, cr3_pa, page_offset, elem_kva, l5) else {
+                break;
+            };
+
+            // Read key bytes.
+            let mut key_buf = vec![0u8; key_size];
+            mem.read_bytes(elem_pa + key_off_in_elem as u64, &mut key_buf);
+
+            // Read value bytes.
+            let mut val_buf = vec![0u8; value_size];
+            mem.read_bytes(elem_pa + value_off_in_elem as u64, &mut val_buf);
+
+            entries.push((key_buf, val_buf));
+
+            // Follow next pointer. hlist_nulls_node.next is at
+            // hlist_nulls_node_next offset within the node.
+            node_ptr = mem.read_u64(elem_pa, htab.hlist_nulls_node_next);
+        }
+    }
+
+    entries
 }
 
 /// Typed value read from or written to a BPF map field.
@@ -595,6 +714,18 @@ impl<'a> BpfMapAccessor<'a> {
         )
     }
 
+    /// Iterate all entries in a `BPF_MAP_TYPE_HASH` map.
+    pub fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
+        iter_htab_entries(
+            self.kernel.mem(),
+            self.kernel.cr3_pa(),
+            self.kernel.page_offset(),
+            map,
+            &self.offsets,
+            self.kernel.l5(),
+        )
+    }
+
     /// Resolve the value layout from the map's BTF.
     ///
     /// Reads `struct btf` from guest memory (kmalloc'd, direct mapping),
@@ -759,6 +890,11 @@ impl<'a> BpfMapAccessorOwned<'a> {
     /// Read a u32 from a map's value region.
     pub fn read_value_u32(&self, map: &BpfMapInfo, offset: usize) -> Option<u32> {
         self.as_accessor().read_value_u32(map, offset)
+    }
+
+    /// Iterate all entries in a `BPF_MAP_TYPE_HASH` map.
+    pub fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.as_accessor().iter_hash_map(map)
     }
 
     /// Resolve the value layout from the map's BTF.
@@ -1100,9 +1236,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -1300,6 +1438,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -1310,6 +1449,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
 
         // Physical layout:
@@ -1450,6 +1590,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -1460,6 +1601,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
         let idr_pa: u64 = 0x1000;
         let size = 0x2000;
@@ -1583,9 +1725,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 16,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -1609,9 +1753,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 16,
             value_kva: Some(0xFFFF_FFFF_8000_0000), // Unmapped KVA.
             btf_kva: 0,
@@ -1751,6 +1897,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -1761,6 +1908,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
 
         // Physical layout:
@@ -1945,9 +2093,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -1975,9 +2125,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -1998,9 +2150,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2136,6 +2290,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -2146,6 +2301,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
 
         let idr_pa: u64 = 0x1000;
@@ -2191,6 +2347,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -2201,6 +2358,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
 
         let map_kva: u64 = 0xFF11_C900_0000_0000;
@@ -2320,9 +2478,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 0x2000,
             // value_kva at the start of page 1.
             value_kva: Some(kva),
@@ -2355,9 +2515,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 0x2000,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2385,6 +2547,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -2395,6 +2558,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
 
         // Physical layout:
@@ -2504,9 +2668,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2526,9 +2692,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2547,9 +2715,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2568,9 +2738,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 16,
             value_kva: Some(0xFFFF_FFFF_8000_0000), // Unmapped KVA.
             btf_kva: 0,
@@ -2589,9 +2761,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2637,9 +2811,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 0x2000,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2659,9 +2835,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2728,6 +2906,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -2738,6 +2917,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
         let buf = vec![0u8; 0x2000];
         let start_kernel_map: u64 = START_KERNEL_MAP;
@@ -2765,9 +2945,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "hash.map".into(),
             map_type: 1, // HASH
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: None,
             btf_kva: 0,
@@ -2786,9 +2968,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "hash.map".into(),
             map_type: 1, // HASH
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: None,
             btf_kva: 0,
@@ -2864,6 +3048,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -2874,6 +3059,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
 
         let pgd_pa: u64 = 0x10000;
@@ -2968,9 +3154,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 8,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2995,9 +3183,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 8,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -3091,9 +3281,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -3127,9 +3319,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -3325,9 +3519,11 @@ mod tests {
 
         let info = BpfMapInfo {
             map_pa: 0,
+            map_kva: 0,
             name: "test.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 64,
             value_kva: Some(kva),
             btf_kva: 0,
@@ -3406,9 +3602,11 @@ mod tests {
     fn bpf_map_info_btf_fields_default_zero() {
         let info = BpfMapInfo {
             map_pa: 0x1000,
+            map_kva: 0,
             name: "test".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 32,
             value_kva: None,
             btf_kva: 0,
@@ -3422,9 +3620,11 @@ mod tests {
     fn bpf_map_info_btf_fields_populated() {
         let info = BpfMapInfo {
             map_pa: 0x1000,
+            map_kva: 0,
             name: "test".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             map_flags: 0,
+            key_size: 0,
             value_size: 32,
             value_kva: None,
             btf_kva: 0xFFFF_8880_0001_0000,
@@ -3491,6 +3691,7 @@ mod tests {
             map_name: 32,
             map_type: 24,
             map_flags: 28,
+            key_size: 44,
             value_size: 48,
             array_value: 256,
             xa_node_slots: 16,
@@ -3501,6 +3702,7 @@ mod tests {
             map_btf_value_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            htab_offsets: None,
         };
 
         let pgd_pa: u64 = 0x10000;
@@ -3747,5 +3949,364 @@ mod tests {
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let unmapped = kva + (1u64 << 42);
         assert_eq!(mem.translate_kva(cr3_pa, unmapped, false), None);
+    }
+
+    // -- iter_htab_entries tests --
+
+    use crate::monitor::btf_offsets::HtabOffsets;
+
+    /// Simplified htab offsets for synthetic buffer tests.
+    /// htab_elem_size_base=32 is a test value, not the real kernel size.
+    fn test_htab_offsets() -> HtabOffsets {
+        HtabOffsets {
+            htab_buckets: 200,
+            htab_n_buckets: 208,
+            bucket_size: 16,
+            bucket_head: 0,
+            hlist_nulls_head_first: 0,
+            hlist_nulls_node_next: 0,
+            htab_elem_size_base: 32,
+        }
+    }
+
+    fn test_htab_map_offsets() -> BpfMapOffsets {
+        BpfMapOffsets {
+            map_name: 32,
+            map_type: 24,
+            map_flags: 28,
+            key_size: 44,
+            value_size: 48,
+            array_value: 256,
+            xa_node_slots: 16,
+            xa_node_shift: 0,
+            idr_xa_head: 8,
+            idr_next: 20,
+            map_btf: 0,
+            map_btf_value_type_id: 0,
+            btf_data: 0,
+            btf_data_size: 0,
+            htab_offsets: Some(test_htab_offsets()),
+        }
+    }
+
+    #[test]
+    fn iter_htab_entries_non_hash_map_returns_empty() {
+        let buf = [0u8; 256];
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let offsets = test_htab_map_offsets();
+        let map = BpfMapInfo {
+            map_pa: 0,
+            map_kva: 0,
+            name: "test.bss".into(),
+            map_type: BPF_MAP_TYPE_ARRAY,
+            map_flags: 0,
+            key_size: 4,
+            value_size: 8,
+            value_kva: None,
+            btf_kva: 0,
+            btf_value_type_id: 0,
+        };
+        let entries = iter_htab_entries(&mem, 0, 0, &map, &offsets, false);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn iter_htab_entries_no_htab_offsets_returns_empty() {
+        let buf = [0u8; 256];
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let mut offsets = test_htab_map_offsets();
+        offsets.htab_offsets = None;
+        let map = BpfMapInfo {
+            map_pa: 0,
+            map_kva: 0,
+            name: "test".into(),
+            map_type: BPF_MAP_TYPE_HASH,
+            map_flags: 0,
+            key_size: 4,
+            value_size: 8,
+            value_kva: None,
+            btf_kva: 0,
+            btf_value_type_id: 0,
+        };
+        let entries = iter_htab_entries(&mem, 0, 0, &map, &offsets, false);
+        assert!(entries.is_empty());
+    }
+
+    /// Build a synthetic hash map in a flat buffer with direct-mapping
+    /// address translation. All structures are laid out at known PAs;
+    /// page_offset is chosen so kva = pa + page_offset.
+    ///
+    /// Layout:
+    ///   PA 0x0000: bpf_htab struct (contains bpf_map + htab fields)
+    ///   PA 0x1000: buckets array (n_buckets * bucket_size)
+    ///   PA 0x2000+: htab_elem entries (elem_size each)
+    ///
+    /// Each htab_elem has: hlist_nulls_node at offset 0, key at
+    /// htab_elem_size_base, value at htab_elem_size_base + round_up(key_size, 8).
+    fn setup_htab_direct(
+        key_size: u32,
+        value_size: u32,
+        entries: &[(&[u8], &[u8])],
+        n_buckets: u32,
+    ) -> (Vec<u8>, u64, BpfMapInfo, BpfMapOffsets) {
+        let htab = test_htab_offsets();
+        let offsets = test_htab_map_offsets();
+        let page_offset: u64 = 0xFFFF_8880_0000_0000;
+
+        let htab_pa: u64 = 0x0000;
+        let buckets_pa: u64 = 0x1000;
+        let elems_start: u64 = 0x2000;
+        let elem_data_size = htab.htab_elem_size_base
+            + ((key_size as usize + 7) & !7)
+            + ((value_size as usize + 7) & !7);
+        let elem_stride = elem_data_size.max(64); // padding for safety
+
+        let buf_size = elems_start as usize + entries.len() * elem_stride + 0x1000;
+        let mut buf = vec![0u8; buf_size];
+
+        let write_u32 = |buf: &mut Vec<u8>, pa: u64, val: u32| {
+            let off = pa as usize;
+            buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+        };
+        let write_u64 = |buf: &mut Vec<u8>, pa: u64, val: u64| {
+            let off = pa as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        // Write bpf_htab fields.
+        write_u32(
+            &mut buf,
+            htab_pa + offsets.map_type as u64,
+            BPF_MAP_TYPE_HASH,
+        );
+        write_u32(&mut buf, htab_pa + offsets.key_size as u64, key_size);
+        write_u32(&mut buf, htab_pa + offsets.value_size as u64, value_size);
+        write_u64(
+            &mut buf,
+            htab_pa + htab.htab_buckets as u64,
+            buckets_pa + page_offset,
+        );
+        write_u32(&mut buf, htab_pa + htab.htab_n_buckets as u64, n_buckets);
+
+        // Initialize all bucket heads to nulls marker (bit 0 set = empty).
+        for i in 0..n_buckets {
+            let bucket_pa = buckets_pa + (i as u64) * (htab.bucket_size as u64);
+            write_u64(
+                &mut buf,
+                bucket_pa + htab.bucket_head as u64 + htab.hlist_nulls_head_first as u64,
+                (i as u64) << 1 | 1, // nulls marker with bucket index
+            );
+        }
+
+        // Place all entries in bucket 0 as a linked list.
+        let mut prev_node_pa: Option<u64> = None;
+        for (idx, (key, val)) in entries.iter().enumerate().rev() {
+            let elem_pa = elems_start + (idx as u64) * (elem_stride as u64);
+            let elem_kva = elem_pa + page_offset;
+
+            // Write key at htab_elem_size_base offset.
+            let key_off = elem_pa + htab.htab_elem_size_base as u64;
+            buf[key_off as usize..key_off as usize + key.len()].copy_from_slice(key);
+
+            // Write value at htab_elem_size_base + round_up(key_size, 8).
+            let val_off = elem_pa + htab.htab_elem_size_base as u64 + ((key_size as u64 + 7) & !7);
+            buf[val_off as usize..val_off as usize + val.len()].copy_from_slice(val);
+
+            // Set next pointer: points to previous element or nulls marker.
+            let next = match prev_node_pa {
+                Some(prev_pa) => prev_pa + page_offset, // KVA of previous elem
+                None => 1u64,                           // nulls end marker
+            };
+            write_u64(&mut buf, elem_pa + htab.hlist_nulls_node_next as u64, next);
+
+            prev_node_pa = Some(elem_pa);
+
+            // First element in reverse order becomes the head.
+            if idx == 0 {
+                // Update bucket 0's head to point to this element.
+                write_u64(
+                    &mut buf,
+                    buckets_pa + htab.bucket_head as u64 + htab.hlist_nulls_head_first as u64,
+                    elem_kva,
+                );
+            }
+        }
+
+        // If entries is non-empty, fix the chain: bucket head -> entries[0],
+        // entries[0].next -> entries[1], ..., entries[last].next -> nulls.
+        // The reverse iteration above already built this correctly:
+        // prev_node_pa tracks the previous elem for forward chaining.
+
+        let map = BpfMapInfo {
+            map_pa: htab_pa,
+            map_kva: htab_pa + page_offset,
+            name: "test_hash".into(),
+            map_type: BPF_MAP_TYPE_HASH,
+            map_flags: 0,
+            key_size,
+            value_size,
+            value_kva: None,
+            btf_kva: 0,
+            btf_value_type_id: 0,
+        };
+
+        (buf, page_offset, map, offsets)
+    }
+
+    #[test]
+    fn iter_htab_entries_empty_map() {
+        let (buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[], 4);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn iter_htab_entries_single_entry() {
+        let key = 42u32.to_ne_bytes();
+        let val = 0xDEAD_BEEF_CAFE_1234u64.to_ne_bytes();
+        let (buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, key);
+        assert_eq!(entries[0].1, val);
+    }
+
+    #[test]
+    fn iter_htab_entries_multiple_entries() {
+        let k1 = 1u32.to_ne_bytes();
+        let v1 = 100u64.to_ne_bytes();
+        let k2 = 2u32.to_ne_bytes();
+        let v2 = 200u64.to_ne_bytes();
+        let k3 = 3u32.to_ne_bytes();
+        let v3 = 300u64.to_ne_bytes();
+        let (buf, page_offset, map, offsets) =
+            setup_htab_direct(4, 8, &[(&k1, &v1), (&k2, &v2), (&k3, &v3)], 4);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        assert_eq!(entries.len(), 3);
+        // All entries are in bucket 0, chained in order.
+        assert_eq!(entries[0].0, k1);
+        assert_eq!(entries[0].1, v1);
+        assert_eq!(entries[1].0, k2);
+        assert_eq!(entries[1].1, v2);
+        assert_eq!(entries[2].0, k3);
+        assert_eq!(entries[2].1, v3);
+    }
+
+    #[test]
+    fn iter_htab_entries_zero_buckets() {
+        let key = 1u32.to_ne_bytes();
+        let val = 1u64.to_ne_bytes();
+        let (mut buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
+        // Override n_buckets to 0.
+        let htab = test_htab_offsets();
+        buf[htab.htab_n_buckets..htab.htab_n_buckets + 4].copy_from_slice(&0u32.to_ne_bytes());
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn iter_htab_entries_larger_key_and_value() {
+        // 8-byte key, 16-byte value.
+        let key = 0xAAAA_BBBB_CCCC_DDDDu64.to_ne_bytes();
+        let val = [
+            0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+        let (buf, page_offset, map, offsets) = setup_htab_direct(8, 16, &[(&key, &val)], 2);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, key);
+        assert_eq!(entries[0].1, val);
+    }
+
+    #[test]
+    fn iter_htab_entries_multi_bucket() {
+        // Entry in bucket 2, buckets 0 and 1 empty. Exercises the
+        // bucket stride calculation: buckets_kva + i * bucket_size.
+        let htab = test_htab_offsets();
+        let offsets = test_htab_map_offsets();
+        let page_offset: u64 = 0xFFFF_8880_0000_0000;
+        let key_size: u32 = 4;
+        let value_size: u32 = 8;
+
+        let htab_pa: u64 = 0x0000;
+        let buckets_pa: u64 = 0x1000;
+        let elem_pa: u64 = 0x2000;
+        let n_buckets: u32 = 4;
+
+        let buf_size = 0x3000;
+        let mut buf = vec![0u8; buf_size];
+
+        let write_u32 = |buf: &mut Vec<u8>, pa: u64, val: u32| {
+            let off = pa as usize;
+            buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+        };
+        let write_u64 = |buf: &mut Vec<u8>, pa: u64, val: u64| {
+            let off = pa as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        // bpf_htab fields.
+        write_u32(
+            &mut buf,
+            htab_pa + offsets.map_type as u64,
+            BPF_MAP_TYPE_HASH,
+        );
+        write_u32(&mut buf, htab_pa + offsets.key_size as u64, key_size);
+        write_u32(&mut buf, htab_pa + offsets.value_size as u64, value_size);
+        write_u64(
+            &mut buf,
+            htab_pa + htab.htab_buckets as u64,
+            buckets_pa + page_offset,
+        );
+        write_u32(&mut buf, htab_pa + htab.htab_n_buckets as u64, n_buckets);
+
+        // All buckets get nulls markers (empty).
+        for i in 0..n_buckets {
+            let bp = buckets_pa + (i as u64) * (htab.bucket_size as u64);
+            write_u64(&mut buf, bp, (i as u64) << 1 | 1);
+        }
+
+        // Place one entry in bucket 2.
+        let bucket2_pa = buckets_pa + 2 * (htab.bucket_size as u64);
+        let elem_kva = elem_pa + page_offset;
+        write_u64(&mut buf, bucket2_pa, elem_kva); // bucket 2 head -> elem
+
+        // elem next = nulls marker (end).
+        write_u64(&mut buf, elem_pa + htab.hlist_nulls_node_next as u64, 1);
+
+        // key at htab_elem_size_base.
+        let key_bytes = 99u32.to_ne_bytes();
+        let key_off = elem_pa + htab.htab_elem_size_base as u64;
+        buf[key_off as usize..key_off as usize + 4].copy_from_slice(&key_bytes);
+
+        // value at htab_elem_size_base + round_up(key_size, 8).
+        let val_bytes = 0xBEEF_CAFEu64.to_ne_bytes();
+        let val_off = elem_pa + htab.htab_elem_size_base as u64 + ((key_size as u64 + 7) & !7);
+        buf[val_off as usize..val_off as usize + 8].copy_from_slice(&val_bytes);
+
+        let map = BpfMapInfo {
+            map_pa: htab_pa,
+            map_kva: htab_pa + page_offset,
+            name: "multi_bucket".into(),
+            map_type: BPF_MAP_TYPE_HASH,
+            map_flags: 0,
+            key_size,
+            value_size,
+            value_kva: None,
+            btf_kva: 0,
+            btf_value_type_id: 0,
+        };
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, key_bytes);
+        assert_eq!(entries[0].1, val_bytes);
     }
 }

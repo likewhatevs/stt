@@ -4,7 +4,9 @@
 //! to resolve byte offsets of kernel struct fields needed for
 //! host-side memory reads: runqueue monitoring ([`KernelOffsets`]),
 //! scx event counters ([`ScxEventOffsets`]), schedstat fields
-//! ([`SchedstatOffsets`]), and BPF map discovery ([`BpfMapOffsets`]).
+//! ([`SchedstatOffsets`]), BPF map discovery ([`BpfMapOffsets`]),
+//! BPF hash map iteration ([`HtabOffsets`]), and BPF program
+//! enumeration ([`BpfProgOffsets`]).
 
 use std::path::Path;
 
@@ -350,6 +352,8 @@ pub struct BpfMapOffsets {
     pub map_type: usize,
     /// Offset of `map_flags` (u32) within `struct bpf_map`.
     pub map_flags: usize,
+    /// Offset of `key_size` (u32) within `struct bpf_map`.
+    pub key_size: usize,
     /// Offset of `value_size` (u32) within `struct bpf_map`.
     pub value_size: usize,
     /// Offset of `value` flex array (DECLARE_FLEX_ARRAY) within `struct bpf_array`.
@@ -374,6 +378,9 @@ pub struct BpfMapOffsets {
     pub btf_data: usize,
     /// Offset of `data_size` (u32) within `struct btf`.
     pub btf_data_size: usize,
+    /// Offsets for hash table structures. None if BTF lacks the
+    /// required types (e.g. `bpf_htab` is not in vmlinux BTF).
+    pub htab_offsets: Option<HtabOffsets>,
 }
 
 impl BpfMapOffsets {
@@ -390,6 +397,7 @@ impl BpfMapOffsets {
         let map_name = member_byte_offset(btf, &bpf_map, "name")?;
         let map_type = member_byte_offset(btf, &bpf_map, "map_type")?;
         let map_flags = member_byte_offset(btf, &bpf_map, "map_flags")?;
+        let key_size = member_byte_offset(btf, &bpf_map, "key_size")?;
         let value_size = member_byte_offset(btf, &bpf_map, "value_size")?;
 
         let (bpf_array, _) = find_struct(btf, "bpf_array")?;
@@ -418,10 +426,13 @@ impl BpfMapOffsets {
         let btf_data = member_byte_offset(btf, &btf_struct, "data")?;
         let btf_data_size = member_byte_offset(btf, &btf_struct, "data_size")?;
 
+        let htab_offsets = resolve_htab_offsets(btf).ok();
+
         Ok(Self {
             map_name,
             map_type,
             map_flags,
+            key_size,
             value_size,
             array_value,
             xa_node_slots,
@@ -432,8 +443,83 @@ impl BpfMapOffsets {
             map_btf_value_type_id,
             btf_data,
             btf_data_size,
+            htab_offsets,
         })
     }
+}
+
+/// Byte offsets within kernel BPF hash table structures needed for
+/// host-side hash map iteration.
+///
+/// Resolution is optional — `resolve_htab_offsets()` returns `Err`
+/// when the required types are missing from BTF.
+#[derive(Debug, Clone)]
+pub struct HtabOffsets {
+    /// Offset of `buckets` pointer within `struct bpf_htab`.
+    pub htab_buckets: usize,
+    /// Offset of `n_buckets` (u32) within `struct bpf_htab`.
+    pub htab_n_buckets: usize,
+    /// Size of `struct bucket` in bytes.
+    pub bucket_size: usize,
+    /// Offset of `head` (`struct hlist_nulls_head`) within `struct bucket`.
+    pub bucket_head: usize,
+    /// Offset of `first` pointer within `struct hlist_nulls_head`.
+    pub hlist_nulls_head_first: usize,
+    /// Offset of `next` pointer within `struct hlist_nulls_node`.
+    pub hlist_nulls_node_next: usize,
+    /// Size of `struct htab_elem` (base size, before flex key[]).
+    pub htab_elem_size_base: usize,
+}
+
+/// Find the BPF hashtab `struct bucket` among possibly multiple BTF
+/// structs named `bucket`. Returns the struct and its `head` field offset.
+/// The BPF bucket has a `head` field (`hlist_nulls_head`); other `bucket`
+/// structs (e.g. bcache) do not.
+fn find_bucket_struct(btf: &Btf) -> Result<(btf_rs::Struct, usize)> {
+    let types = btf
+        .resolve_types_by_name("bucket")
+        .with_context(|| "btf: type 'bucket' not found")?;
+
+    for t in &types {
+        if let Type::Struct(s) = t
+            && let Ok(head_off) = member_byte_offset(btf, s, "head")
+        {
+            return Ok((s.clone(), head_off));
+        }
+    }
+    bail!("btf: no 'bucket' struct with 'head' field found");
+}
+
+/// Resolve BTF offsets for BPF hash table structures.
+/// Returns Err if any required type/field is missing.
+fn resolve_htab_offsets(btf: &Btf) -> Result<HtabOffsets> {
+    let (bpf_htab, _) = find_struct(btf, "bpf_htab")?;
+    let htab_buckets = member_byte_offset(btf, &bpf_htab, "buckets")?;
+    let htab_n_buckets = member_byte_offset(btf, &bpf_htab, "n_buckets")?;
+
+    // Multiple structs named `bucket` may exist in BTF (e.g. bcache).
+    // Find the one with a `head` field (BPF hashtab's bucket).
+    let (bucket_struct, bucket_head) = find_bucket_struct(btf)?;
+    let bucket_size = bucket_struct.size();
+
+    let (hlist_nulls_head, _) = find_struct(btf, "hlist_nulls_head")?;
+    let hlist_nulls_head_first = member_byte_offset(btf, &hlist_nulls_head, "first")?;
+
+    let (hlist_nulls_node, _) = find_struct(btf, "hlist_nulls_node")?;
+    let hlist_nulls_node_next = member_byte_offset(btf, &hlist_nulls_node, "next")?;
+
+    let (htab_elem, _) = find_struct(btf, "htab_elem")?;
+    let htab_elem_size_base = htab_elem.size();
+
+    Ok(HtabOffsets {
+        htab_buckets,
+        htab_n_buckets,
+        bucket_size,
+        bucket_head,
+        hlist_nulls_head_first,
+        hlist_nulls_node_next,
+        htab_elem_size_base,
+    })
 }
 
 /// Byte offsets within kernel BPF program structures needed for
