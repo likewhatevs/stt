@@ -1281,12 +1281,19 @@ fn worker_main(
                 migration_count += 1;
                 cpus_used.insert(cpu);
                 migrations.push(Migration {
-                    at_ns: start.elapsed().as_nanos() as u64,
+                    at_ns: now.duration_since(start).as_nanos() as u64,
                     from_cpu: last_cpu,
                     to_cpu: cpu,
                 });
                 last_cpu = cpu;
             }
+        }
+    }
+
+    // Final iteration count store for host-side sampling.
+    if !iter_slot.is_null() {
+        unsafe {
+            std::sync::atomic::AtomicU64::from_ptr(iter_slot).store(iterations, Ordering::Relaxed);
         }
     }
 

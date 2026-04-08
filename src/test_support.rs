@@ -1705,11 +1705,17 @@ pub(crate) fn try_flush_profraw() {
     };
     let slide = pie_load_bias(&exe);
 
+    // Resolve both symbols in a single pass through the ELF .symtab.
+    let vaddrs = find_symbol_vaddrs(
+        &exe,
+        &["__llvm_profile_initialize", "__llvm_profile_write_file"],
+    );
+
     // Set profraw output path, then call __llvm_profile_initialize to
     // read it and register the atexit handler.
     // SAFETY: single-threaded guest dispatch context.
     unsafe { std::env::set_var("LLVM_PROFILE_FILE", "/tmp/stt.profraw") };
-    if let Some(vaddr) = find_symbol_vaddr(&exe, "__llvm_profile_initialize")
+    if let Some(vaddr) = vaddrs[0]
         && vaddr != 0
     {
         let f: extern "C" fn() =
@@ -1718,7 +1724,7 @@ pub(crate) fn try_flush_profraw() {
     }
 
     // Write profraw to the file.
-    let write_file_vaddr = match find_symbol_vaddr(&exe, "__llvm_profile_write_file") {
+    let write_file_vaddr = match vaddrs[1] {
         Some(v) if v != 0 => v,
         _ => return,
     };
@@ -1736,17 +1742,36 @@ pub(crate) fn try_flush_profraw() {
     let _ = write_to_shm_ring(shm_base, shm_size, MSG_TYPE_PROFRAW, &data);
 }
 
-/// Find a symbol's file virtual address in an ELF binary's .symtab.
-fn find_symbol_vaddr(data: &[u8], name: &str) -> Option<u64> {
+/// Resolve multiple symbol virtual addresses in a single pass through
+/// the ELF .symtab. Returns addresses in the same order as `names`.
+fn find_symbol_vaddrs(data: &[u8], names: &[&str]) -> Vec<Option<u64>> {
     use object::elf;
     use object::read::elf::{FileHeader, Sym};
 
-    let header = elf::FileHeader64::<object::Endianness>::parse(data).ok()?;
-    let endian = header.endian().ok()?;
-    let sections = header.sections(endian, data).ok()?;
-    let symbols = sections.symbols(endian, data, elf::SHT_SYMTAB).ok()?;
+    let mut results = vec![None; names.len()];
+    let mut remaining = names.len();
+
+    let header = match elf::FileHeader64::<object::Endianness>::parse(data) {
+        Ok(h) => h,
+        Err(_) => return results,
+    };
+    let endian = match header.endian() {
+        Ok(e) => e,
+        Err(_) => return results,
+    };
+    let sections = match header.sections(endian, data) {
+        Ok(s) => s,
+        Err(_) => return results,
+    };
+    let symbols = match sections.symbols(endian, data, elf::SHT_SYMTAB) {
+        Ok(s) => s,
+        Err(_) => return results,
+    };
 
     for sym in symbols.iter() {
+        if remaining == 0 {
+            break;
+        }
         if sym.st_size(endian) == 0 {
             continue;
         }
@@ -1754,11 +1779,15 @@ fn find_symbol_vaddr(data: &[u8], name: &str) -> Option<u64> {
             Ok(n) => n,
             Err(_) => continue,
         };
-        if sym_name == name.as_bytes() {
-            return Some(sym.st_value(endian));
+        for (i, name) in names.iter().enumerate() {
+            if results[i].is_none() && sym_name == name.as_bytes() {
+                results[i] = Some(sym.st_value(endian));
+                remaining -= 1;
+                break;
+            }
         }
     }
-    None
+    results
 }
 
 /// Compute the ASLR load bias for a PIE binary.
