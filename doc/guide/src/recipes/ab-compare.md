@@ -1,6 +1,7 @@
 # A/B Compare Branches
 
-Compare scheduler behavior between two branches using git worktrees.
+Compare scheduler behavior between two branches by running the
+same `#[stt_test]` suite against each.
 
 ## Setup worktrees
 
@@ -15,21 +16,17 @@ git worktree add ~/opensource/scx-main upstream/main
 
 ```sh
 cd ~/opensource/scx-main
-stt vm --sockets 2 --cores 4 --threads 2 \
-  --scheduler-bin ./target/release/scx_mitosis \
-  -- cgroup_steady --flags=llc,borrow
+cargo nextest run --workspace
 ```
 
 ## Run experimental and compare
 
 ```sh
 cd ~/opensource/scx
-stt vm --sockets 2 --cores 4 --threads 2 \
-  --scheduler-bin ./target/release/scx_mitosis \
-  -- cgroup_steady --flags=llc,borrow
+cargo nextest run --workspace
 ```
 
-Compare output between the two runs.
+Compare test output between the two runs.
 
 ## Cleanup
 

@@ -1,19 +1,8 @@
 # Test a New Scheduler
 
-End-to-end workflow: build a scheduler, run it through stt, analyze
-results.
+End-to-end workflow: define a scheduler, write tests, run them.
 
-## 1. Run a single scenario
-
-```sh
-stt vm --sockets 2 --cores 4 --threads 2 \
-  --scheduler-bin ./target/release/scx_my_scheduler \
-  -- cgroup_steady --flags=llc,borrow --duration-s 30
-```
-
-## 2. Write integration tests
-
-Define the scheduler for `#[stt_test]`:
+## 1. Define the scheduler
 
 ```rust,ignore
 use stt::prelude::*;
@@ -24,7 +13,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
     .flags(&[&LLC_DECL, &BORROW_DECL, &STEAL_DECL, &REBAL_DECL]);
 ```
 
-Write a test:
+## 2. Write integration tests
 
 ```rust,ignore
 use stt::prelude::*;
@@ -39,7 +28,11 @@ fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Run with `cargo nextest run`.
+## 3. Run
+
+```sh
+cargo nextest run
+```
 
 See [The #\[stt_test\] Macro](../writing-tests/stt-test-macro.md) for
 all available attributes and

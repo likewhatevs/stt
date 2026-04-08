@@ -1,13 +1,5 @@
 # Writing Tests
 
-stt supports two kinds of tests:
-
-1. **Data-driven scenarios** -- declared as `Scenario` structs in the
-   catalog. These run via `stt vm`.
-
-2. **Integration tests** -- Rust functions annotated with `#[stt_test]`.
-   These run via `cargo nextest run`.
-
-Most scheduler testing uses data-driven scenarios. Integration tests
-are for cases that need custom host/guest interaction or precise control
-over the test lifecycle.
+Tests are Rust functions annotated with `#[stt_test]`. Each test
+boots a KVM VM, runs the scenario inside it, and evaluates results
+on the host. Run with `cargo nextest run`.

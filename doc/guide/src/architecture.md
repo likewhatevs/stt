@@ -2,11 +2,11 @@
 
 stt has three execution domains:
 
-1. **Host process** -- the `stt` binary running on the host. Manages
+1. **Host process** -- the test binary running on the host. Manages
    [VM lifecycle](architecture/vmm.md), monitors guest memory, evaluates
    results.
 
-2. **Guest process** -- the same `stt` binary running inside the VM.
+2. **Guest process** -- the same test binary running inside the VM.
    Creates cgroups, forks [workers](architecture/workers.md), runs
    scenarios, writes results to the serial console.
 
@@ -19,14 +19,14 @@ stt has three execution domains:
 ```text
 Host                          Guest
 ----                          -----
-stt vm                        
+test binary                   
   |                           
   +-- build initramfs         
-  |   (stt binary + busybox   
+  |   (test binary + busybox  
   |    + optional scheduler)  
   |                           
   +-- boot KVM VM             
-  |                           stt run
+  |                           test binary (ctor dispatch)
   |                             |
   +-- start monitor thread      +-- start scheduler (if any)
   |   (reads guest memory)      +-- create cgroups
@@ -45,11 +45,10 @@ stt vm
 
 ## Key design decisions
 
-**Same binary, two roles.** The `stt` binary serves as both host
+**Same binary, two roles.** The test binary serves as both host
 controller and guest test runner. The initramfs embeds the binary.
-For `#[stt_test]` integration tests, guest-side execution is triggered
-by `ctor` early dispatch (before `main()`). For `stt vm`, the guest
-runs `main()` and dispatches via the `run` subcommand.
+Guest-side execution is triggered by `ctor` early dispatch (before
+`main()`).
 
 **Forked workers, not threads.** Workers are `fork()`ed processes
 because cgroups operate on PIDs. Each worker must be a separate

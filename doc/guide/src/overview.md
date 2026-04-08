@@ -24,16 +24,10 @@ scheduler binary loads each program with `BPF_LOG_STATS` and emits
 structured output; the host has no BPF dependency. Cycle collapse
 reduces repetitive loop unrolling instead of truncating.
 
-The same `stt` binary runs on both sides. On the host it manages the
-VM, runs the monitor, and evaluates results. Inside the VM it creates
-cgroups, forks workers, and executes test scenarios.
-
 ## Quick taste
 
 ```sh
-stt vm --sockets 2 --cores 4 --threads 2 \
-    -- cgroup_steady --duration-s 10
-PASS cgroup_steady/default (10.2s)
+cargo nextest run --workspace
 ```
 
 ## What it tests
@@ -49,14 +43,13 @@ PASS cgroup_steady/default (10.2s)
 
 ## BPF verifier analysis
 
-`stt verifier` boots a scheduler in a VM and captures per-program
-verifier output from the real kernel verifier. The scheduler binary
-loads each BPF program inside the VM with `BPF_LOG_STATS` enabled --
-there is no host-side BPF loading. Per-program statistics include
-instruction counts, states explored, verification time, and stack
-depth. The default output applies **cycle collapse** to reduce
-repetitive loop unrolling. A/B diff mode boots two VMs and compares
-instruction counts between builds. See
+The `verifier_pipeline` test boots a scheduler in a VM and captures
+per-program verifier output from the real kernel verifier. The
+scheduler binary loads each BPF program inside the VM with
+`BPF_LOG_STATS` enabled -- there is no host-side BPF loading.
+Per-program statistics include instruction counts, states explored,
+verification time, and stack depth. The default output applies
+**cycle collapse** to reduce repetitive loop unrolling. See
 [BPF Verifier](running-tests/verifier.md) for details.
 
 ## Auto-repro probe pipeline
@@ -111,9 +104,12 @@ assertions config, and `WorkerReport` for telemetry access.
 
 | Crate | Purpose |
 |---|---|
-| `stt` | Core library and CLI binary |
+| `stt` | Core library |
 | `stt-macros` | `#[stt_test]` proc macro |
 | `stt-sched` | Minimal BPF scheduler for testing |
 
-See [CLI Reference](cli-reference.md) for the complete subcommand
-listing.
+## Kernel config
+
+`stt.kconfig` in the repo root contains the kernel config fragment
+needed for scheduler testing (sched_ext, BPF, kprobes, cgroups).
+Copy it to your kernel source tree and run `make olddefconfig`.

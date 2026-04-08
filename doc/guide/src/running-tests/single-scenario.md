@@ -1,45 +1,33 @@
 # Single Scenario
 
-## Basic invocation
+## Running a specific test
 
 ```sh
-stt vm --sockets 2 --cores 4 --threads 2 \
-  -- cgroup_steady --duration-s 30
+cargo nextest run -E 'test(sched_basic_proportional)'
 ```
 
-Arguments before `--` configure the VM. Arguments after `--` configure
-the test scenarios (names, flags, duration).
+## Running with verbose output
 
-## VM arguments
-
-| Argument | Default | Description |
-|---|---|---|
-| `--sockets N` | 2 | CPU sockets |
-| `--cores N` | 2 | Cores per socket |
-| `--threads N` | 2 | Threads per core |
-| `--memory-mb N` | 4096 | VM memory |
-| `--kernel PATH` | -- | Kernel image (falls back to `/boot/vmlinuz` if neither `--kernel` nor `--kernel-dir` is set) |
-| `--kernel-dir PATH` | -- | Linux source tree (uses `arch/x86/boot/bzImage`) |
-| `--scheduler-bin PATH` | -- | Scheduler binary to inject |
-
-## Run arguments (after --)
-
-| Argument | Default | Description |
-|---|---|---|
-| `SCENARIO...` | all | Scenario names to run |
-| `--duration-s N` | 15 | Per-scenario duration in seconds |
-| `--workers N` | 4 | Workers per cgroup |
-| `--flags=X,Y` | none | Flags to enable |
-| `--all-flags` | -- | Run all valid flag combinations |
-| `--verbose` | -- | Verbose output |
-| `--json` | -- | JSON output |
-| `--work-type NAME` | -- | Override work type. Valid names: `CpuSpin`, `YieldHeavy`, `Mixed`, `IoSync`, `Bursty`, `PipeIo`, `FutexPingPong`, `CachePressure`, `CacheYield`, `CachePipe`, `FutexFanOut`. WorkProgram presets: `cpu_spin`, `mixed`, `bursty`, `yield`, `io`, `pipe`, `cache_l1`, `cache_yield`, `cache_pipe`, `futex`, `fanout`. |
+```sh
+RUST_BACKTRACE=1 cargo nextest run -E 'test(sched_basic_proportional)'
+```
 
 ## Investigating failures
 
-Run one scenario with specific flags and a longer duration:
+Run one test with verbose output to see scheduler logs and kernel
+console:
 
 ```sh
-stt vm --sockets 2 --cores 4 --threads 2 \
-  -- cgroup_cpuset_crossllc_race --flags=llc,rebal --duration-s 60
+RUST_BACKTRACE=1 cargo nextest run -E 'test(cover_cgroup_cpuset_crossllc_race)'
 ```
+
+## VM topology
+
+Each `#[stt_test]` declares its topology via macro attributes:
+
+```rust,ignore
+#[stt_test(sockets = 2, cores = 4, threads = 2)]
+```
+
+The test framework boots a VM with the specified topology
+automatically.

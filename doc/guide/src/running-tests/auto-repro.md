@@ -38,13 +38,6 @@ each point in the crash path.
 
 ## Enabling auto-repro
 
-From the CLI:
-
-```sh
-stt vm --sockets 2 --cores 4 --threads 2 \
-  -- cgroup_steady --auto-repro
-```
-
 In `#[stt_test]`:
 
 ```rust,ignore
@@ -52,8 +45,7 @@ In `#[stt_test]`:
 fn my_test(ctx: &Ctx) -> Result<AssertResult> { ... }
 ```
 
-`auto_repro` defaults to `true` in `#[stt_test]` but `false` on the
-CLI (`--auto-repro` is a flag, not set by default).
+`auto_repro` defaults to `true` in `#[stt_test]`.
 
 ## Repro mode
 

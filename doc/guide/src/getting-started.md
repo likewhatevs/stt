@@ -72,86 +72,21 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
 
 Run with `cargo nextest run` (requires `/dev/kvm`).
 
-## CLI installation
-
-Build with:
-
-```sh
-cargo build -p stt
-```
-
-Or install:
-
-```sh
-cargo install --path .
-```
-
 ## Build a kernel
 
-stt embeds a kernel config fragment tuned for scheduler testing
-(sched_ext, BPF, kprobes, minimal boot). To build a kernel from a
-Linux source tree:
+`stt.kconfig` in the repo root contains a kernel config fragment
+tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
+To build a kernel from a Linux source tree:
 
 ```sh
-stt kernel build ~/linux
+cd /path/to/linux
+make defconfig
+cat /path/to/stt/stt.kconfig >> .config
+make olddefconfig
+make -j$(nproc)
 ```
-
-This runs `make defconfig`, merges the stt config fragment, and
-builds with `make -j$(nproc)`. To clean:
-
-```sh
-stt kernel clean ~/linux
-```
-
-Print the config fragment to stdout:
-
-```sh
-stt kernel kconfig
-```
-
-## Run a scenario
-
-```sh
-stt vm --sockets 2 --cores 4 --threads 2 \
-  -- cgroup_steady --duration-s 30
-```
-
-`vm` boots a KVM virtual machine with the specified CPU topology.
-Arguments after `--` configure the test scenarios (names, flags,
-duration).
-
-To test with a pre-built scheduler binary:
-
-```sh
-stt vm --sockets 2 --cores 4 --threads 2 \
-  --scheduler-bin ./target/release/scx_mitosis \
-  -- cgroup_steady --duration-s 30
-```
-
-Expected output:
-
-```text
-PASS cgroup_steady/default (30.1s)
-```
-
-Omit the scenario name to run all scenarios:
-
-```sh
-stt vm --sockets 2 --cores 4 --threads 2
-```
-
-## View topology
-
-```sh
-stt topo
-```
-
-Prints the host CPU topology (LLCs, NUMA nodes, CPU IDs).
 
 ## Next steps
-
-To run existing tests with different flags, topologies, or schedulers:
-[Running Tests](running-tests.md).
 
 To understand scenarios, flags, and verification:
 [Core Concepts](concepts.md).

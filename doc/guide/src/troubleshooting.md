@@ -34,7 +34,7 @@ stt needs a bootable Linux kernel image (bzImage). It searches:
 
 **Fixes:**
 
-- Build a kernel with `stt kernel build ~/linux` (see
+- Build a kernel using `stt.kconfig` (see
   [Getting Started](getting-started.md#build-a-kernel)).
 - Set `STT_TEST_KERNEL` to an explicit path.
 - Build a kernel in a sibling `linux/` directory.
@@ -60,7 +60,7 @@ binary in:
 - Build the scheduler first: `cargo build -p scx_mitosis`.
 - Set `STT_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path.
-- Use `--scheduler-bin` with `stt vm` to inject a pre-built binary.
+- Use `SchedulerSpec::Path` for an explicit path in `#[stt_test]`.
 
 ## Scheduler died
 
@@ -76,8 +76,8 @@ the VM.
 
 - Check the `dmesg` output in the test failure for a BPF error or
   kernel oops.
-- Rerun with `--auto-repro` to capture the crash path with BPF
-  probes. See [Auto-Repro](running-tests/auto-repro.md).
+- Enable `auto_repro` in the test to capture the crash path with
+  BPF probes. See [Auto-Repro](running-tests/auto-repro.md).
 - Run with a longer duration and specific flags to narrow the
   reproducer.
 

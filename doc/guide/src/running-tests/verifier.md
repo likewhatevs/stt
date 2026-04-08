@@ -25,17 +25,8 @@ instead of truncating.
 ## Quick start
 
 ```sh
-# Brief stats + collapsed verifier log (default)
-stt verifier -p stt-sched
-
-# Full raw verifier log (no collapse)
-RUST_BACKTRACE=1 stt verifier -p stt-sched
-
-# A/B instruction count delta between two builds
-stt verifier -p stt-sched --diff other-sched
-
-# Use a specific kernel image
-stt verifier -p stt-sched --kernel /path/to/bzImage
+# Run the verifier pipeline test
+cargo nextest run -E 'test(verifier_)'
 ```
 
 ## How it works
