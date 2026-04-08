@@ -1,6 +1,6 @@
 # BPF Verifier
 
-`cargo stt verifier` boots a scheduler in a KVM VM and captures
+`stt verifier` boots a scheduler in a KVM VM and captures
 per-program verifier statistics from the real kernel verifier.
 
 ## Design
@@ -10,12 +10,11 @@ The verifier subcommand follows stt's two core principles.
 **Fidelity without overhead.** The scheduler binary runs inside a VM
 on the same kernel the scheduler will run on in production. The
 `--dump-verifier` mode uses the same `scx_ops_open!` / `scx_ops_load!`
-macros as the normal startup path, with `BPF_LOG_STATS` added to each
-program's log level and `set_autoload(false)` on non-target programs
-to isolate per-program verification state. The verifier that runs is
-the real verifier in the real kernel -- no host-side BPF loading, no
-version skew between the host kernel's verifier and the target kernel's
-verifier.
+macros as the normal startup path. When load fails, libbpf prints
+the verifier's instruction traces to stderr. The verifier that runs
+is the real verifier
+in the real kernel -- no host-side BPF loading, no version skew between
+the host kernel's verifier and the target kernel's verifier.
 
 **Direct access over tooling layers.** No subprocess to bpftool or
 veristat. The scheduler binary emits structured output directly
@@ -27,16 +26,16 @@ instead of truncating.
 
 ```sh
 # Brief stats + collapsed verifier log (default)
-cargo stt verifier -p stt-sched
+stt verifier -p stt-sched
 
 # Full raw verifier log (no collapse)
-cargo stt verifier -p stt-sched -v
+RUST_BACKTRACE=1 stt verifier -p stt-sched
 
 # A/B instruction count delta between two builds
-cargo stt verifier -p stt-sched --diff other-sched
+stt verifier -p stt-sched --diff other-sched
 
 # Use a specific kernel image
-cargo stt verifier -p stt-sched --kernel /path/to/bzImage
+stt verifier -p stt-sched --kernel /path/to/bzImage
 ```
 
 ## How it works
@@ -45,9 +44,9 @@ cargo stt verifier -p stt-sched --kernel /path/to/bzImage
    binary.
 
 2. **Boot VM** -- a single-CPU VM boots with the scheduler binary
-   passed as `--dump-verifier`. The scheduler opens the BPF object
-   once per program, disables autoload on all other programs, sets
-   `BPF_LOG_STATS` on the target, and calls `scx_ops_load!`.
+   passed as `--dump-verifier`. The scheduler opens the BPF object,
+   records pre-load instruction counts, and calls `scx_ops_load!`.
+   On failure, libbpf prints the verifier log to stderr.
 
 3. **Capture** -- the scheduler writes structured lines to stdout,
    which the guest init script forwards to COM2 after exit:
@@ -59,7 +58,7 @@ cargo stt verifier -p stt-sched --kernel /path/to/bzImage
    stats (name, instruction count, verifier log text).
 
 5. **Format** -- per-program summary lines, then verifier logs with
-   cycle collapse applied (unless `-v`).
+   cycle collapse applied (unless `RUST_BACKTRACE=1` or `full`).
 
 ## Output
 
@@ -91,7 +90,7 @@ an omission marker, and the last iteration:
 --- end repeat ---
 ```
 
-### Verbose (`-v`)
+### Raw (`RUST_BACKTRACE=1`)
 
 Full raw verifier log without cycle collapse. Use for debugging
 verification failures where the exact register state at each iteration
@@ -144,9 +143,9 @@ This produces a real verification failure for negative testing.
 
 ## `--dump-verifier` flag
 
-`stt-sched --dump-verifier` opens the BPF object once per program,
-disables autoload on non-targets, sets `BPF_LOG_STATS` on the target,
-calls `scx_ops_load!`, and emits structured verifier output. This is
-the mechanism `cargo stt verifier` uses to capture per-program stats
-from inside the VM. Add `--dump-verifier-verbose` for full
-`BPF_LOG_LEVEL1` traces.
+`stt-sched --dump-verifier` opens the BPF object, records pre-load
+instruction counts, and calls `scx_ops_load!`. On success, it emits
+structured verifier output (`STT_VERIFIER_PROG`, `STT_VERIFIER_DONE`).
+On failure (e.g. `--fail-verify` or `--verify-loop`), libbpf prints
+the verifier's instruction traces to stderr, which the VM captures
+as the scheduler log.

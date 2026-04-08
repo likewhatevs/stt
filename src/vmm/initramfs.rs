@@ -519,6 +519,109 @@ pub fn shm_unlink_base(content_hash: u64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compressed SHM cache — stores gzip'd base for COW overlay into guest RAM
+// ---------------------------------------------------------------------------
+
+/// Segment name for the compressed (gzip) version of a base initramfs.
+fn shm_gz_segment_name(content_hash: u64) -> String {
+    format!("/stt-gz-{content_hash:016x}")
+}
+
+/// Open the compressed SHM segment and return a held fd + size.
+/// The fd has a shared flock held — caller must close it when done.
+/// Returns `None` on miss or error.
+pub(crate) fn shm_open_gz(content_hash: u64) -> Option<(std::os::unix::io::RawFd, usize)> {
+    let name = std::ffi::CString::new(shm_gz_segment_name(content_hash)).ok()?;
+    unsafe {
+        let fd = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
+        if fd < 0 {
+            return None;
+        }
+        if libc::flock(fd, libc::LOCK_SH) != 0 {
+            libc::close(fd);
+            return None;
+        }
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut stat) != 0 || stat.st_size <= 0 {
+            libc::flock(fd, libc::LOCK_UN);
+            libc::close(fd);
+            return None;
+        }
+        Some((fd, stat.st_size as usize))
+    }
+}
+
+/// Store compressed initramfs data into a gz SHM segment.
+pub(crate) fn shm_store_gz(content_hash: u64, data: &[u8]) -> Result<()> {
+    let name = std::ffi::CString::new(shm_gz_segment_name(content_hash)).context("shm gz name")?;
+    unsafe {
+        let fd = libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644);
+        anyhow::ensure!(fd >= 0, "shm_open gz: {}", std::io::Error::last_os_error());
+        if libc::flock(fd, libc::LOCK_EX) != 0 {
+            libc::close(fd);
+            anyhow::bail!("flock gz: {}", std::io::Error::last_os_error());
+        }
+        if libc::ftruncate(fd, data.len() as libc::off_t) != 0 {
+            libc::flock(fd, libc::LOCK_UN);
+            libc::close(fd);
+            anyhow::bail!("ftruncate gz: {}", std::io::Error::last_os_error());
+        }
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            data.len(),
+            libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            libc::flock(fd, libc::LOCK_UN);
+            libc::close(fd);
+            anyhow::bail!("mmap gz: {}", std::io::Error::last_os_error());
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+        libc::munmap(ptr, data.len());
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
+    }
+    Ok(())
+}
+
+/// COW-overlay `len` bytes from `shm_fd` at `host_addr` using
+/// MAP_PRIVATE | MAP_FIXED. The guest sees the SHM content but
+/// writes go to private anonymous pages (copy-on-write).
+///
+/// Returns `true` on success, `false` on failure (caller should
+/// fall back to write_slice).
+pub(crate) unsafe fn cow_overlay(
+    host_addr: *mut u8,
+    len: usize,
+    shm_fd: std::os::unix::io::RawFd,
+) -> bool {
+    // SAFETY: caller guarantees host_addr points into a valid guest
+    // memory region of at least `len` bytes and shm_fd is a valid fd.
+    let ptr = unsafe {
+        libc::mmap(
+            host_addr as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            shm_fd,
+            0,
+        )
+    };
+    ptr != libc::MAP_FAILED
+}
+
+/// Close a SHM fd and release its shared flock.
+pub(crate) fn shm_close_fd(fd: std::os::unix::io::RawFd) {
+    unsafe {
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
+    }
+}
+
 /// Load an initramfs into guest memory at the given address.
 /// Returns (address, size) for boot_params.
 #[cfg(test)]

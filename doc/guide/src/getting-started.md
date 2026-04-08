@@ -70,31 +70,21 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Run with `cargo test` (requires `/dev/kvm`).
+Run with `cargo nextest run` (requires `/dev/kvm`).
 
 ## CLI installation
 
-The stt workspace has two binaries:
+Build with:
 
-- **`stt`** -- the core binary (host-side VM management, guest-side
-  test runner, kernel builds, topology display). Build it with:
+```sh
+cargo build -p stt
+```
 
-  ```sh
-  cargo build -p stt
-  ```
+Or install:
 
-  Or install it:
-
-  ```sh
-  cargo install --path .
-  ```
-
-- **`cargo-stt`** -- cargo plugin that wraps `stt` with test discovery,
-  scheduler builds, and gauntlet orchestration. Install it with:
-
-  ```sh
-  cargo install --path cargo-stt
-  ```
+```sh
+cargo install --path .
+```
 
 ## Build a kernel
 
@@ -122,7 +112,7 @@ stt kernel kconfig
 ## Run a scenario
 
 ```sh
-cargo stt vm --sockets 2 --cores 4 --threads 2 \
+stt vm --sockets 2 --cores 4 --threads 2 \
   -- cgroup_steady --duration-s 30
 ```
 
@@ -130,10 +120,11 @@ cargo stt vm --sockets 2 --cores 4 --threads 2 \
 Arguments after `--` configure the test scenarios (names, flags,
 duration).
 
-To test with a scheduler, use `-p` to build and inject it:
+To test with a pre-built scheduler binary:
 
 ```sh
-cargo stt vm -p scx_mitosis --sockets 2 --cores 4 --threads 2 \
+stt vm --sockets 2 --cores 4 --threads 2 \
+  --scheduler-bin ./target/release/scx_mitosis \
   -- cgroup_steady --duration-s 30
 ```
 
@@ -148,21 +139,13 @@ Expected output:
 Omit the scenario name to run all scenarios:
 
 ```sh
-cargo stt vm --sockets 2 --cores 4 --threads 2
-```
-
-## List scenarios
-
-List `#[stt_test]` integration tests:
-
-```sh
-cargo stt list
+stt vm --sockets 2 --cores 4 --threads 2
 ```
 
 ## View topology
 
 ```sh
-cargo stt topo
+stt topo
 ```
 
 Prints the host CPU topology (LLCs, NUMA nodes, CPU IDs).

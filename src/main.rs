@@ -5,7 +5,7 @@ use clap::Parser;
 use console::style;
 
 use runner::{RunConfig, Runner};
-use stt::{assert, probe, runner, scenario, topology, workload};
+use stt::{probe, runner, scenario, topology, workload};
 use topology::TestTopology;
 
 #[derive(Debug, Parser)]
@@ -26,6 +26,10 @@ enum Command {
     Topo,
     /// Kernel build, clean, and config management
     Kernel(KernelArgs),
+    /// Load scheduler BPF programs and report verifier statistics
+    Verifier(VerifierArgs),
+    /// Boot a VM and run scenarios inside it
+    Vm(VmArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -60,8 +64,6 @@ struct RunArgs {
     /// Extra scheduler arguments (repeatable)
     #[clap(long)]
     scheduler_arg: Vec<String>,
-    #[clap(long, hide = true)]
-    mitosis_bin: Option<String>,
     #[clap(long, default_value = "/sys/fs/cgroup/stt")]
     parent_cgroup: String,
     #[clap(long, default_value = "15")]
@@ -120,44 +122,57 @@ enum KernelAction {
 }
 
 #[derive(Debug, Parser)]
+struct VmArgs {
+    /// Path to kernel image
+    #[clap(long)]
+    kernel: Option<String>,
+    /// Number of sockets
+    #[clap(long, default_value = "2")]
+    sockets: u32,
+    /// Cores per socket
+    #[clap(long, default_value = "2")]
+    cores: u32,
+    /// Threads per core
+    #[clap(long, default_value = "2")]
+    threads: u32,
+    /// Memory in MB
+    #[clap(long, default_value = "4096")]
+    memory_mb: usize,
+    /// Scheduler binary path
+    #[clap(long)]
+    scheduler_bin: Option<String>,
+    /// Linux source tree with built kernel
+    #[clap(long)]
+    kernel_dir: Option<String>,
+    /// VM timeout in seconds
+    #[clap(long)]
+    timeout: Option<u64>,
+    /// Extra arguments passed to stt run inside the VM
+    #[clap(last = true)]
+    run_args: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct VerifierArgs {
+    /// Cargo package containing the scheduler
+    #[clap(long, short, default_value = "stt-sched")]
+    package: String,
+    /// Second package for A/B instruction count delta
+    #[clap(long)]
+    diff: Option<String>,
+    /// Path to kernel image for the VM
+    #[clap(long)]
+    kernel: Option<String>,
+    /// Extra arguments passed to the scheduler binary
+    #[clap(last = true)]
+    sched_args: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
 struct KernelPathArg {
     /// Path to linux source tree (default: current directory)
     #[clap(default_value = ".")]
     path: String,
-}
-
-/// Extract auto-repro function names from scenario result details.
-///
-/// Looks for a "functions:" line first, then falls back to stack extraction.
-/// Returns `None` if no function names are found.
-fn extract_auto_repro_functions(results: &[runner::ScenarioResult]) -> Option<String> {
-    let all_text: String = results
-        .iter()
-        .flat_map(|r| r.details.iter())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-    all_text
-        .lines()
-        .find(|l| l.contains("functions:"))
-        .map(|l| {
-            l.split("functions:")
-                .nth(1)
-                .unwrap_or("")
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .or_else(|| {
-            let fns = runner::extract_stack_functions_all_pub(&all_text);
-            if fns.is_empty() {
-                None
-            } else {
-                Some(fns.join(","))
-            }
-        })
 }
 
 fn main() -> Result<()> {
@@ -173,6 +188,8 @@ fn main() -> Result<()> {
         Command::Run(a) => cmd_run(a),
         Command::Probe(a) => cmd_probe(a),
         Command::Topo => cmd_topo(),
+        Command::Verifier(a) => cmd_verifier(a),
+        Command::Vm(a) => cmd_vm(a),
         Command::Kernel(k) => match k.action {
             KernelAction::Build(a) => cmd_build_kernel(a),
             KernelAction::Clean(a) => cmd_clean_kernel(a),
@@ -260,14 +277,8 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         args.all || args.scenarios.is_empty(),
     )?;
     let active_flags = parse_flags(&args)?;
-    let scheduler_bin = args.scheduler_bin.or(args.mitosis_bin);
-    if args.warn_unfair {
-        assert::set_warn_unfair(true);
-    }
+    let scheduler_bin = args.scheduler_bin;
     let repro = args.repro || args.probe_stack.is_some() || args.auto_repro;
-    if repro {
-        workload::set_repro_mode(true);
-    }
     let work_type_override = match args.work_type.as_deref() {
         Some(s) => Some(resolve_work_type(s)?),
         None => None,
@@ -290,13 +301,14 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         scheduler_startup_ms: 500,
         cleanup_ms: 200,
         work_type_override,
+        warn_unfair: args.warn_unfair,
     };
     let mut results = Runner::new(config.clone(), topo.clone())?.run_scenarios(&selected)?;
     let failed = results.iter().filter(|r| !r.passed).count();
 
     // Auto-repro: if run 1 crashed, extract function names and rerun with --probe-stack
     if config.auto_repro && failed > 0 && config.probe_stack.is_none() {
-        let names = extract_auto_repro_functions(&results);
+        let names = runner::extract_auto_repro_functions(&results);
         if let Some(ref names) = names {
             let fn_count = names.split(',').count();
             println!(
@@ -468,6 +480,86 @@ fn cmd_probe(args: ProbeArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_vm(args: VmArgs) -> Result<()> {
+    use stt::vm::{VmConfig, run_in_vm};
+    use stt::vmm::Topology;
+
+    let cfg = VmConfig {
+        kernel: args.kernel,
+        topology: Topology {
+            sockets: args.sockets,
+            cores_per_socket: args.cores,
+            threads_per_core: args.threads,
+        },
+        memory_mb: args.memory_mb,
+        timeout: args.timeout.map(std::time::Duration::from_secs),
+        kernel_dir: args.kernel_dir,
+    };
+
+    let mut stt_args = Vec::new();
+    if let Some(ref bin) = args.scheduler_bin {
+        stt_args.push("--scheduler-bin".to_string());
+        stt_args.push(bin.clone());
+    }
+    stt_args.extend(args.run_args);
+
+    let result = run_in_vm(&cfg, &stt_args)?;
+    print!("{}", result.output);
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+    if result.exit_code != 0 {
+        std::process::exit(result.exit_code);
+    }
+    Ok(())
+}
+
+fn resolve_verifier_kernel(kernel: Option<&str>) -> Result<std::path::PathBuf> {
+    match kernel {
+        Some(k) => Ok(std::path::PathBuf::from(k)),
+        None => stt::find_kernel()
+            .ok_or_else(|| anyhow::anyhow!("no kernel found; use --kernel to specify one")),
+    }
+}
+
+fn cmd_verifier(args: VerifierArgs) -> Result<()> {
+    let raw = std::env::var("RUST_BACKTRACE")
+        .map(|v| v == "1" || v == "full")
+        .unwrap_or(false);
+
+    let sched_bin = stt::build_and_find_binary(&args.package)?;
+    let stt_bin = std::env::current_exe()?;
+    let kernel = resolve_verifier_kernel(args.kernel.as_deref())?;
+
+    let result_a =
+        stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &args.sched_args)?;
+    print!(
+        "{}",
+        stt::verifier::format_verifier_output(&args.package, &result_a, raw)
+    );
+
+    if let Some(ref diff_pkg) = args.diff {
+        let diff_bin = stt::build_and_find_binary(diff_pkg)?;
+        let result_b =
+            stt::verifier::collect_verifier_output(&diff_bin, &stt_bin, &kernel, &args.sched_args)?;
+        print!(
+            "{}",
+            stt::verifier::format_verifier_output(diff_pkg, &result_b, raw)
+        );
+        print!(
+            "{}",
+            stt::verifier::format_verifier_diff(
+                &args.package,
+                &result_a.stats,
+                diff_pkg,
+                &result_b.stats,
+            )
+        );
+    }
+
+    Ok(())
+}
+
 /// Embedded kernel config fragment for stt kernel builds.
 const KERNEL_CONFIG: &str = include_str!("../kernel.config");
 
@@ -558,7 +650,6 @@ fn cmd_clean_kernel(args: KernelPathArg) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stt::{monitor, stats, test_support};
 
     fn sr(name: &str, passed: bool, dur: f64, details: Vec<&str>) -> runner::ScenarioResult {
         runner::ScenarioResult {
@@ -807,7 +898,7 @@ mod tests {
             all: false,
             scheduler_bin: None,
             scheduler_arg: vec![],
-            mitosis_bin: None,
+
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 15,
             workers: 4,
@@ -834,7 +925,7 @@ mod tests {
             all: false,
             scheduler_bin: None,
             scheduler_arg: vec![],
-            mitosis_bin: None,
+
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 15,
             workers: 4,
@@ -861,7 +952,7 @@ mod tests {
             all: false,
             scheduler_bin: None,
             scheduler_arg: vec![],
-            mitosis_bin: None,
+
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 15,
             workers: 4,
@@ -979,27 +1070,27 @@ mod tests {
             1.0,
             vec!["  functions: scx_exit, do_exit, panic"],
         )];
-        let names = extract_auto_repro_functions(&results);
+        let names = runner::extract_auto_repro_functions(&results);
         assert_eq!(names, Some("scx_exit,do_exit,panic".to_string()));
     }
 
     #[test]
     fn extract_auto_repro_functions_no_match() {
         let results = vec![sr("test", false, 1.0, vec!["unfair cgroup: spread=85%"])];
-        let names = extract_auto_repro_functions(&results);
+        let names = runner::extract_auto_repro_functions(&results);
         assert!(names.is_none());
     }
 
     #[test]
     fn extract_auto_repro_functions_empty_results() {
-        let names = extract_auto_repro_functions(&[]);
+        let names = runner::extract_auto_repro_functions(&[]);
         assert!(names.is_none());
     }
 
     #[test]
     fn extract_auto_repro_functions_empty_functions_line() {
         let results = vec![sr("test", false, 1.0, vec!["  functions:"])];
-        let names = extract_auto_repro_functions(&results);
+        let names = runner::extract_auto_repro_functions(&results);
         // "functions:" with nothing after -> all filtered out -> empty join -> Some("")
         // but the caller checks for non-empty, this is the raw extraction.
         assert_eq!(names, Some("".to_string()));
@@ -1008,7 +1099,7 @@ mod tests {
     #[test]
     fn extract_auto_repro_functions_pass_results_no_details() {
         let results = vec![sr("test", true, 5.0, vec![])];
-        let names = extract_auto_repro_functions(&results);
+        let names = runner::extract_auto_repro_functions(&results);
         assert!(names.is_none());
     }
 
@@ -1018,127 +1109,7 @@ mod tests {
             sr("a", false, 1.0, vec!["stuck 3000ms"]),
             sr("b", false, 1.0, vec!["  functions: func_a, func_b"]),
         ];
-        let names = extract_auto_repro_functions(&results);
+        let names = runner::extract_auto_repro_functions(&results);
         assert_eq!(names, Some("func_a,func_b".to_string()));
-    }
-
-    // -- sidecar_to_row tests --
-
-    #[test]
-    fn sidecar_to_row_basic() {
-        let sc = test_support::SidecarResult {
-            test_name: "my_test".to_string(),
-            topology: "2s4c2t".to_string(),
-            scheduler: "scx_mitosis".to_string(),
-            passed: true,
-            stats: assert::ScenarioStats {
-                cgroups: vec![],
-                total_workers: 4,
-                total_cpus: 8,
-                total_migrations: 12,
-                worst_spread: 15.0,
-                worst_gap_ms: 200,
-                worst_gap_cpu: 3,
-                ..Default::default()
-            },
-            monitor: Some(monitor::MonitorSummary {
-                total_samples: 10,
-                max_imbalance_ratio: 2.5,
-                max_local_dsq_depth: 4,
-                stall_detected: true,
-                event_deltas: Some(monitor::ScxEventDeltas {
-                    total_fallback: 7,
-                    fallback_rate: 0.5,
-                    max_fallback_burst: 2,
-                    total_dispatch_offline: 0,
-                    total_dispatch_keep_last: 3,
-                    keep_last_rate: 0.2,
-                    total_enq_skip_exiting: 0,
-                    total_enq_skip_migration_disabled: 0,
-                }),
-            }),
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-        };
-        let row = stats::sidecar_to_row(&sc);
-        assert_eq!(row.scenario, "my_test");
-        assert_eq!(row.topology, "2s4c2t");
-        assert!(row.passed);
-        assert_eq!(row.spread, 15.0);
-        assert_eq!(row.gap_ms, 200);
-        assert_eq!(row.migrations, 12);
-        assert_eq!(row.imbalance_ratio, 2.5);
-        assert_eq!(row.max_dsq_depth, 4);
-        assert_eq!(row.stall_count, 1);
-        assert_eq!(row.fallback_count, 7);
-        assert_eq!(row.keep_last_count, 3);
-        assert!(row.flags.is_empty());
-        assert_eq!(row.replica, 1);
-    }
-
-    #[test]
-    fn sidecar_to_row_no_monitor() {
-        let sc = test_support::SidecarResult {
-            test_name: "eevdf_test".to_string(),
-            topology: "1s2c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            passed: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-        };
-        let row = stats::sidecar_to_row(&sc);
-        assert_eq!(row.scenario, "eevdf_test");
-        assert!(!row.passed);
-        assert_eq!(row.imbalance_ratio, 0.0);
-        assert_eq!(row.max_dsq_depth, 0);
-        assert_eq!(row.stall_count, 0);
-        assert_eq!(row.fallback_count, 0);
-        assert_eq!(row.keep_last_count, 0);
-    }
-
-    #[test]
-    fn sidecar_to_row_no_stall() {
-        let sc = test_support::SidecarResult {
-            test_name: "t".to_string(),
-            topology: "1s1c1t".to_string(),
-            scheduler: "test".to_string(),
-            passed: true,
-            stats: Default::default(),
-            monitor: Some(monitor::MonitorSummary {
-                total_samples: 5,
-                max_imbalance_ratio: 1.0,
-                max_local_dsq_depth: 0,
-                stall_detected: false,
-                event_deltas: None,
-            }),
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-        };
-        let row = stats::sidecar_to_row(&sc);
-        assert_eq!(row.stall_count, 0);
-        assert_eq!(row.fallback_count, 0);
-        assert_eq!(row.keep_last_count, 0);
-    }
-
-    // -- sidecar_to_row_labeled tests --
-
-    #[test]
-    fn sidecar_to_row_labeled_basic() {
-        let sc = test_support::SidecarResult {
-            test_name: "fallback".to_string(),
-            topology: "1s2c1t".to_string(),
-            scheduler: "test".to_string(),
-            passed: true,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-        };
-        let row = stats::sidecar_to_row_labeled(&sc, "tiny-1llc/proportional/borrow");
-        assert_eq!(row.topology, "tiny-1llc");
-        assert_eq!(row.scenario, "proportional");
-        assert_eq!(row.flags, "borrow");
     }
 }

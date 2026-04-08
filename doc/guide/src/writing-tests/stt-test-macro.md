@@ -46,7 +46,7 @@ All attributes are optional with defaults.
 |---|---|---|
 | `scheduler = CONST` | `Scheduler::EEVDF` | Rust const path to a `Scheduler` definition |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler |
-| `watchdog_timeout_jiffies` | 0 | scx watchdog override |
+| `watchdog_timeout_s` | 4 | scx watchdog override |
 
 ### Verification
 
@@ -96,7 +96,7 @@ Values are string arrays of flag names:
 These constrain `generate_profiles()`: `required_flags` are always
 included, `excluded_flags` are never included. Invalid combinations
 (e.g. `steal` without `llc`) are still rejected by dependency checks.
-`cargo stt gauntlet` reads these attributes to determine which flag
+The gauntlet uses these attributes to determine which flag
 profiles each test runs with. See
 [Gauntlet](../running-tests/gauntlet.md#flag-profiles).
 
@@ -111,7 +111,7 @@ profiles each test runs with. See
 
 The gauntlet skips topology presets that do not satisfy these
 constraints. A test with `min_llcs = 3` will not run on `tiny-1llc`
-(1 LLC) or `tiny-2llc` (2 LLCs). `cargo stt gauntlet` reads these
+(1 LLC) or `tiny-2llc` (2 LLCs). The gauntlet uses these
 attributes to filter which presets each test runs on. See
 [Gauntlet](../running-tests/gauntlet.md#topology-presets).
 
@@ -121,10 +121,11 @@ attributes to filter which presets each test runs on. See
 |---|---|---|
 | `auto_repro` | `true` | Auto-repro on crash |
 | `replicas` | 1 | Number of times to run |
-| `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling; `cargo stt test` reserves host threads per LLC group via nextest |
+| `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling |
 | `super_perf_mode` | `false` | Implies `performance_mode`; additionally validates LLC exclusivity at build time |
-| `duration_s` | 0 | Per-scenario duration override (0 = use default 2s) |
-| `workers_per_cgroup` | 0 | Workers per cgroup override (0 = use default 2) |
+| `duration_s` | 2 | Per-scenario duration in seconds |
+| `workers_per_cgroup` | 2 | Workers per cgroup |
+| `expect_err` | `false` | Test expects `run_stt_test` to return `Err`; disables auto-repro |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
 what `performance_mode` and `super_perf_mode` enable, prerequisites,

@@ -134,10 +134,9 @@ pub struct StimulusPayload {
     pub cgroup_count: u16,
     /// Total worker handles after this step.
     pub worker_count: u16,
-    /// Total CPUs across all cpusets after this step.
-    pub total_cpuset_cpus: u32,
-    /// Reserved for future use.
-    pub _pad: u32,
+    /// Sum of all workers' iteration counts at this step boundary.
+    /// Read from shared MAP_SHARED counters in the step executor.
+    pub total_iterations: u64,
 }
 
 const _STIMULUS_SIZE: () = assert!(std::mem::size_of::<StimulusPayload>() == 24);
@@ -152,7 +151,7 @@ pub struct StimulusEvent {
     pub op_kinds: u32,
     pub cgroup_count: u16,
     pub worker_count: u16,
-    pub total_cpuset_cpus: u32,
+    pub total_iterations: u64,
 }
 
 impl StimulusEvent {
@@ -168,8 +167,7 @@ impl StimulusEvent {
             op_kinds: u32::from_ne_bytes(data[8..12].try_into().ok()?),
             cgroup_count: u16::from_ne_bytes(data[12..14].try_into().ok()?),
             worker_count: u16::from_ne_bytes(data[14..16].try_into().ok()?),
-            total_cpuset_cpus: u32::from_ne_bytes(data[16..20].try_into().ok()?),
-            // bytes 20..24 are padding
+            total_iterations: u64::from_ne_bytes(data[16..24].try_into().ok()?),
         })
     }
 }
@@ -696,8 +694,7 @@ mod tests {
             op_kinds: 0b1010_0101,
             cgroup_count: 4,
             worker_count: 16,
-            total_cpuset_cpus: 8,
-            _pad: 0,
+            total_iterations: 99999,
         };
         let bytes = payload.as_bytes();
         let event = StimulusEvent::from_payload(bytes).unwrap();
@@ -707,7 +704,7 @@ mod tests {
         assert_eq!(event.op_kinds, 0b1010_0101);
         assert_eq!(event.cgroup_count, 4);
         assert_eq!(event.worker_count, 16);
-        assert_eq!(event.total_cpuset_cpus, 8);
+        assert_eq!(event.total_iterations, 99999);
     }
 
     #[test]
@@ -726,8 +723,7 @@ mod tests {
             op_kinds: 7,
             cgroup_count: 2,
             worker_count: 8,
-            total_cpuset_cpus: 6,
-            _pad: 0,
+            total_iterations: 42000,
         };
         let written = shm_write(&mut buf, 0, MSG_TYPE_STIMULUS, payload.as_bytes());
         assert_eq!(written, MSG_HEADER_SIZE + 24);
@@ -808,8 +804,7 @@ mod tests {
             op_kinds: 0xFF,
             cgroup_count: 2,
             worker_count: 10,
-            total_cpuset_cpus: 4,
-            _pad: 0,
+            total_iterations: 4,
         };
         let bytes = payload.as_bytes();
         assert_eq!(bytes.len(), 24);
@@ -820,7 +815,7 @@ mod tests {
         assert_eq!(event.op_kinds, 0xFF);
         assert_eq!(event.cgroup_count, 2);
         assert_eq!(event.worker_count, 10);
-        assert_eq!(event.total_cpuset_cpus, 4);
+        assert_eq!(event.total_iterations, 4);
     }
 
     #[test]
@@ -872,7 +867,7 @@ mod tests {
             op_kinds: 0xF0,
             cgroup_count: 5,
             worker_count: 20,
-            total_cpuset_cpus: 16,
+            total_iterations: 16,
         };
         let c = event.clone();
         assert_eq!(c.elapsed_ms, 999);
@@ -881,7 +876,7 @@ mod tests {
         assert_eq!(c.op_kinds, 0xF0);
         assert_eq!(c.cgroup_count, 5);
         assert_eq!(c.worker_count, 20);
-        assert_eq!(c.total_cpuset_cpus, 16);
+        assert_eq!(c.total_iterations, 16);
     }
 
     #[test]
@@ -947,8 +942,7 @@ mod tests {
             op_kinds: u32::MAX,
             cgroup_count: u16::MAX,
             worker_count: u16::MAX,
-            total_cpuset_cpus: u32::MAX,
-            _pad: 0,
+            total_iterations: u64::MAX,
         };
         let bytes = p.as_bytes();
         let e = StimulusEvent::from_payload(bytes).unwrap();
@@ -958,7 +952,7 @@ mod tests {
         assert_eq!(e.op_kinds, u32::MAX);
         assert_eq!(e.cgroup_count, u16::MAX);
         assert_eq!(e.worker_count, u16::MAX);
-        assert_eq!(e.total_cpuset_cpus, u32::MAX);
+        assert_eq!(e.total_iterations, u64::MAX);
     }
 
     #[test]

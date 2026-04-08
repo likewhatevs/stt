@@ -120,7 +120,7 @@ fn perf_negative() {
         min_llcs: 1,
         requires_smt: false,
         min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
+        watchdog_timeout_s: 4,
         bpf_map_write: None,
         performance_mode: true,
         super_perf_mode: false,

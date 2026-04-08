@@ -41,7 +41,7 @@ each point in the crash path.
 From the CLI:
 
 ```sh
-cargo stt vm --sockets 2 --cores 4 --threads 2 \
+stt vm --sockets 2 --cores 4 --threads 2 \
   -- cgroup_steady --auto-repro
 ```
 
@@ -141,5 +141,5 @@ fn scenario(ctx: &Ctx) -> Result<AssertResult> {
 Run manually to see full output:
 
 ```sh
-cargo test demo_host_crash_auto_repro -- --ignored --nocapture
+cargo nextest run --run-ignored ignored-only -E 'test(demo_host_crash_auto_repro)'
 ```

@@ -1,52 +1,25 @@
 # Gauntlet
 
-Gauntlet runs every scenario across 13 topology presets in parallel
-VMs.
-
-## Two entry points
-
-There are two ways to run gauntlet mode:
-
-**`cargo stt vm --gauntlet`** -- runs data-driven scenarios (from
-`all_scenarios()`) across topology presets.
+The gauntlet runs every scenario across 13 topology presets.
+Gauntlet variants are prefixed with `gauntlet/` and ignored by default.
 
 ```sh
-cargo stt vm --gauntlet --parallel 4
+# Run only base tests (default)
+cargo nextest run
+
+# Run only gauntlet variants
+cargo nextest run --run-ignored ignored-only -E 'test(gauntlet/)'
+
+# Run everything
+cargo nextest run --run-ignored all
 ```
 
-To test a scheduler, use `-p` to build and inject it:
-
-```sh
-cargo stt vm --gauntlet -p scx_mitosis --parallel 4
-```
-
-**`cargo stt gauntlet`** -- runs `#[stt_test]` integration tests across
-topology presets. No separate gauntlet configuration exists. Each
-test's `#[stt_test]` attributes -- `required_flags`, `excluded_flags`,
-`min_sockets`, `min_llcs`, `requires_smt`, `min_cpus`, and its
-scheduler's flag declarations -- fully determine which cells of the
-topology x flag_profile matrix that test populates. The test
-definition is the spec.
-
-`cargo stt gauntlet` discovers all `#[stt_test]` functions by building
-the test binary and querying it via `--stt-list`. For each discovered
-test, it:
-
-1. Filters topology presets against the test's constraints
-   (`min_sockets`, `min_llcs`, `requires_smt`, `min_cpus`).
-2. Generates valid flag profiles from the scheduler's flag declarations
-   constrained by the test's `required_flags` and `excluded_flags`.
-3. Creates one VM job per (test, matching topology, valid flag profile)
-   triple.
-
-```sh
-cargo stt gauntlet --parallel 4
-```
-
-Use `cargo stt vm --gauntlet` for the catalog scenarios. Use
-`cargo stt gauntlet` for `#[stt_test]` functions.
-
-`--parallel N` controls concurrent VMs (default: host CPUs / 8).
+`#[stt_test]` functions declare topology constraints that filter which
+presets they run on. Each test's attributes -- `required_flags`,
+`excluded_flags`, `min_sockets`, `min_llcs`, `requires_smt`,
+`min_cpus`, and its scheduler's flag declarations -- fully determine
+which cells of the topology x flag_profile matrix that test populates.
+The test definition is the spec.
 
 ## Topology presets
 
@@ -96,31 +69,3 @@ By default, gauntlet runs each test with all valid flag combinations
 generated from the scheduler's flag declarations and the test's
 `required_flags` / `excluded_flags` constraints. This adds a flag
 profile dimension to the matrix: tests x topologies x flag_profiles.
-
-Override with `--flags` to run a single profile:
-
-```sh
-cargo stt vm --gauntlet --flags=borrow,rebal
-cargo stt gauntlet --flags=borrow,rebal
-```
-
-## Work type override
-
-`--work-types` adds a work type dimension. Each test runs once per
-specified work type (overriding the default `CpuSpin`):
-
-```sh
-cargo stt vm --gauntlet --work-types=CpuSpin,Bursty
-cargo stt gauntlet --work-types=CpuSpin,Bursty
-```
-
-## Retry on failure
-
-`cargo stt vm --gauntlet` retries failed scenarios automatically.
-`--retries N` sets the total number of attempts (default: 3):
-
-```sh
-cargo stt vm --gauntlet --retries 5
-```
-
-`cargo stt gauntlet` does not have `--retries`.

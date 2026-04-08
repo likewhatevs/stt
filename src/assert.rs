@@ -22,10 +22,8 @@ static WARN_UNFAIR: AtomicBool = AtomicBool::new(false);
 static COVERAGE_GAP_MS: AtomicU64 = AtomicU64::new(0);
 
 /// When true, unfair spread produces a warning detail but does not fail the result.
-///
-/// `pub` because main.rs is a separate binary crate.
 #[doc(hidden)]
-pub fn set_warn_unfair(v: bool) {
+pub(crate) fn set_warn_unfair(v: bool) {
     WARN_UNFAIR.store(v, Ordering::Relaxed);
 }
 
@@ -34,10 +32,9 @@ pub fn set_warn_unfair(v: bool) {
 /// Set to a higher value for coverage-instrumented runs where
 /// instrumentation overhead increases scheduling latency.
 /// 0 means use the default (2000ms release, 3000ms debug).
-///
-/// `pub` because main.rs is a separate binary crate.
 #[doc(hidden)]
-pub fn set_coverage_gap_ms(ms: u64) {
+#[allow(dead_code)]
+pub(crate) fn set_coverage_gap_ms(ms: u64) {
     COVERAGE_GAP_MS.store(ms, Ordering::Relaxed);
 }
 
@@ -395,16 +392,6 @@ impl AssertPlan {
         }
         r
     }
-
-    /// Backward-compatible alias for [`assert_cgroup`](Self::assert_cgroup).
-    #[doc(hidden)]
-    pub fn verify_cgroup(
-        &self,
-        reports: &[WorkerReport],
-        cpuset: Option<&BTreeSet<usize>>,
-    ) -> AssertResult {
-        self.assert_cgroup(reports, cpuset)
-    }
 }
 
 impl Default for AssertPlan {
@@ -593,6 +580,20 @@ impl Assert {
         self
     }
 
+    /// True when any worker-level check field is `Some`.
+    pub const fn has_worker_checks(&self) -> bool {
+        self.not_starved.is_some()
+            || self.isolation.is_some()
+            || self.max_gap_ms.is_some()
+            || self.max_spread_pct.is_some()
+            || self.max_throughput_cv.is_some()
+            || self.min_work_rate.is_some()
+            || self.max_p99_wake_latency_ns.is_some()
+            || self.max_wake_latency_cv.is_some()
+            || self.min_iteration_rate.is_some()
+            || self.max_migration_ratio.is_some()
+    }
+
     /// Merge `other` on top of `self`. Each `Some` field in `other`
     /// overrides the corresponding field in `self`; `None` fields
     /// inherit from `self`.
@@ -693,16 +694,6 @@ impl Assert {
         cpuset: Option<&BTreeSet<usize>>,
     ) -> AssertResult {
         self.worker_plan().assert_cgroup(reports, cpuset)
-    }
-
-    /// Backward-compatible alias for [`assert_cgroup`](Self::assert_cgroup).
-    #[doc(hidden)]
-    pub fn verify_cgroup(
-        &self,
-        reports: &[crate::workload::WorkerReport],
-        cpuset: Option<&BTreeSet<usize>>,
-    ) -> AssertResult {
-        self.assert_cgroup(reports, cpuset)
     }
 
     /// Extract `MonitorThresholds` for monitor-side evaluation.
@@ -1099,23 +1090,6 @@ pub fn assert_benchmarks(
 
     r
 }
-
-// Backward-compatible aliases for the pre-rename API.
-#[doc(hidden)]
-pub type VerifyResult = AssertResult;
-#[doc(hidden)]
-pub type VerificationPlan = AssertPlan;
-#[doc(hidden)]
-pub type Verify = Assert;
-
-#[doc(hidden)]
-pub use assert_benchmarks as verify_benchmarks;
-#[doc(hidden)]
-pub use assert_isolation as verify_isolation;
-#[doc(hidden)]
-pub use assert_not_starved as verify_not_starved;
-#[doc(hidden)]
-pub use assert_throughput_parity as verify_throughput_parity;
 
 #[cfg(test)]
 mod tests {

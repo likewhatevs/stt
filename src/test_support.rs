@@ -83,21 +83,17 @@ pub fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
     sidecars
 }
 
-/// Early dispatch for `#[stt_test]` guest-side execution.
+/// Early dispatch for `#[stt_test]` test execution.
 ///
 /// Runs before `main()` in any binary that links against stt.
 ///
-/// - `--stt-list`: dumps registered test entries as JSON and exits.
 /// - `--stt-test-fn=NAME --stt-topo=NsNcNt`: host-side dispatch —
 ///   boots a VM with the specified topology and runs the test inside it.
 /// - `--stt-test-fn=NAME` (without `--stt-topo`): guest-side dispatch —
 ///   runs the test function directly (inside a VM that was already booted).
 /// - Otherwise: no-op.
 #[ctor::ctor]
-fn stt_test_early_dispatch() {
-    if maybe_list_tests() {
-        std::process::exit(0);
-    }
+pub fn stt_test_early_dispatch() {
     if let Some(code) = maybe_dispatch_host_test() {
         std::process::exit(code);
     }
@@ -139,7 +135,7 @@ fn maybe_dispatch_host_test() -> Option<i32> {
     };
 
     let cpus = sockets * cores * threads;
-    let memory_mb = (cpus * 256).max(entry.memory_mb);
+    let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
     let topo = TopoOverride {
         sockets,
         cores,
@@ -341,9 +337,8 @@ pub struct SttTestEntry {
     pub replicas: u32,
     pub assert: crate::assert::Assert,
     pub extra_sched_args: &'static [&'static str],
-    /// Override for scx_watchdog_timeout in the guest kernel (jiffies).
-    /// 0 = no override (use kernel default).
-    pub watchdog_timeout_jiffies: u64,
+    /// scx_watchdog_timeout in the guest kernel (seconds).
+    pub watchdog_timeout_s: u64,
     /// Host-side BPF map write to perform during VM execution.
     pub bpf_map_write: Option<&'static BpfMapWrite>,
     /// Flags that must be present in every flag profile for this test.
@@ -366,10 +361,58 @@ pub struct SttTestEntry {
     /// LLC exclusivity mode. Implies performance_mode. Each virtual socket
     /// reserves an entire physical LLC group.
     pub super_perf_mode: bool,
-    /// Override workload duration in seconds. 0 = use default (2s).
+    /// Workload duration in seconds.
     pub duration_s: u64,
-    /// Override workers per cgroup. 0 = use default (2).
+    /// Workers per cgroup.
     pub workers_per_cgroup: u32,
+    /// When true, the test expects run_stt_test to return Err.
+    /// Disables auto_repro (no point probing a deliberately failing test).
+    pub expect_err: bool,
+}
+
+/// Placeholder function for `SttTestEntry::DEFAULT`. Panics if called.
+fn default_test_func(_ctx: &Ctx) -> Result<AssertResult> {
+    anyhow::bail!("SttTestEntry::DEFAULT func called — override func before use")
+}
+
+impl SttTestEntry {
+    /// Sensible defaults for all fields. Override `name`, `func`, and
+    /// `scheduler` (at minimum) via struct update syntax:
+    ///
+    /// ```ignore
+    /// static ENTRY: SttTestEntry = SttTestEntry {
+    ///     name: "my_test",
+    ///     func: my_test_fn,
+    ///     scheduler: &MITOSIS,
+    ///     ..SttTestEntry::DEFAULT
+    /// };
+    /// ```
+    pub const DEFAULT: SttTestEntry = SttTestEntry {
+        name: "",
+        func: default_test_func,
+        sockets: 1,
+        cores: 2,
+        threads: 1,
+        memory_mb: 128,
+        scheduler: &Scheduler::EEVDF,
+        auto_repro: true,
+        replicas: 1,
+        assert: crate::assert::Assert::NONE,
+        extra_sched_args: &[],
+        watchdog_timeout_s: 4,
+        bpf_map_write: None,
+        required_flags: &[],
+        excluded_flags: &[],
+        min_sockets: 1,
+        min_llcs: 1,
+        requires_smt: false,
+        min_cpus: 1,
+        performance_mode: false,
+        super_perf_mode: false,
+        duration_s: 2,
+        workers_per_cgroup: 2,
+        expect_err: false,
+    };
 }
 
 /// Distributed slice collecting all `#[stt_test]` entries via linkme.
@@ -379,90 +422,6 @@ pub static STT_TESTS: [SttTestEntry];
 /// Look up a registered test function by name.
 pub fn find_test(name: &str) -> Option<&'static SttTestEntry> {
     STT_TESTS.iter().find(|e| e.name == name)
-}
-
-/// Serializable test entry info for `--stt-list` output.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct SttTestInfo {
-    pub name: String,
-    pub sockets: u32,
-    pub cores: u32,
-    pub threads: u32,
-    pub memory_mb: u32,
-    pub scheduler: String,
-    pub replicas: u32,
-    #[serde(default)]
-    pub required_flags: Vec<String>,
-    #[serde(default)]
-    pub excluded_flags: Vec<String>,
-    #[serde(default = "default_one")]
-    pub min_sockets: u32,
-    #[serde(default = "default_one")]
-    pub min_llcs: u32,
-    #[serde(default)]
-    pub requires_smt: bool,
-    #[serde(default = "default_one")]
-    pub min_cpus: u32,
-    /// Flag names supported by this test's scheduler.
-    #[serde(default)]
-    pub scheduler_flags: Vec<String>,
-    /// When true, the test pins vCPUs to host CPUs for stable timing.
-    #[serde(default)]
-    pub performance_mode: bool,
-    /// LLC exclusivity mode. Implies performance_mode.
-    #[serde(default)]
-    pub super_perf_mode: bool,
-    /// Total vCPUs requested (sockets * cores * threads).
-    #[serde(default)]
-    pub total_vcpus: u32,
-}
-
-fn default_one() -> u32 {
-    1
-}
-
-impl SttTestInfo {
-    fn from_entry(e: &SttTestEntry) -> Self {
-        Self {
-            name: e.name.to_string(),
-            sockets: e.sockets,
-            cores: e.cores,
-            threads: e.threads,
-            memory_mb: e.memory_mb,
-            scheduler: e.scheduler.name.to_string(),
-            replicas: e.replicas,
-            required_flags: e.required_flags.iter().map(|s| s.to_string()).collect(),
-            excluded_flags: e.excluded_flags.iter().map(|s| s.to_string()).collect(),
-            min_sockets: e.min_sockets,
-            min_llcs: e.min_llcs,
-            requires_smt: e.requires_smt,
-            min_cpus: e.min_cpus,
-            scheduler_flags: e
-                .scheduler
-                .supported_flag_names()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
-            performance_mode: e.performance_mode || e.super_perf_mode,
-            super_perf_mode: e.super_perf_mode,
-            total_vcpus: e.sockets * e.cores * e.threads,
-        }
-    }
-}
-
-/// Check for `--stt-list` in args, dump all registered test entries as
-/// JSON to stdout, and return true. Returns false if not an stt-list
-/// invocation.
-fn maybe_list_tests() -> bool {
-    let args: Vec<String> = std::env::args().collect();
-    if !args.iter().any(|a| a == "--stt-list") {
-        return false;
-    }
-    let infos: Vec<SttTestInfo> = STT_TESTS.iter().map(SttTestInfo::from_entry).collect();
-    if let Ok(json) = serde_json::to_string_pretty(&infos) {
-        println!("{json}");
-    }
-    true
 }
 
 /// Optional topology override for `run_stt_test`.
@@ -489,6 +448,45 @@ pub fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
         return None;
     }
     Some((sockets, cores, threads))
+}
+
+/// Check whether a gauntlet preset is compatible with a test entry
+/// on this host. `host_llc_count` is the number of LLC groups on
+/// the host -- performance_mode tests need one LLC per virtual socket.
+pub fn preset_matches(
+    preset: &crate::vm::TopoPreset,
+    entry: &SttTestEntry,
+    host_llc_count: usize,
+) -> bool {
+    let t = &preset.topology;
+    t.sockets >= entry.min_sockets
+        && t.num_llcs() >= entry.min_llcs
+        && (!entry.requires_smt || t.threads_per_core >= 2)
+        && t.total_cpus() >= entry.min_cpus
+        // performance_mode maps each virtual socket to a host LLC.
+        // +1 for the service CPU that must land outside pinned LLCs.
+        && (!entry.performance_mode || (t.sockets as usize) < host_llc_count)
+}
+
+/// Number of LLC groups on this host. Returns 0 on error.
+pub fn host_llc_count() -> usize {
+    crate::vmm::host_topology::HostTopology::from_sysfs()
+        .map(|h| h.llc_groups.len())
+        .unwrap_or(0)
+}
+
+/// Check whether the host has enough CPUs and LLC groups to satisfy
+/// a gauntlet preset's topology without oversubscription.
+pub fn host_preset_compatible(
+    preset: &crate::vm::TopoPreset,
+    host: &crate::vmm::host_topology::HostTopology,
+) -> bool {
+    let t = &preset.topology;
+    let total_vcpus = t.total_cpus();
+    let vcpus_per_socket = t.cores_per_socket * t.threads_per_core;
+    total_vcpus as usize <= host.total_cpus()
+        && (t.sockets as usize) <= host.llc_groups.len()
+        && (vcpus_per_socket as usize) <= host.max_cores_per_llc()
 }
 
 /// Host-side entry point: build a VM, boot it with `--stt-test-fn=NAME`,
@@ -548,8 +546,16 @@ fn run_stt_test_inner(
 
     let (sockets, cores, threads, memory_mb) = match topo {
         Some(t) => (t.sockets, t.cores, t.threads, t.memory_mb),
-        None => (entry.sockets, entry.cores, entry.threads, entry.memory_mb),
+        None => {
+            let cpus = entry.sockets * entry.cores * entry.threads;
+            let mem = (cpus * 64).max(256).max(entry.memory_mb);
+            (entry.sockets, entry.cores, entry.threads, mem)
+        }
     };
+
+    // Enforce memory floor based on initramfs size estimate.
+    let initrd_floor = vmm::estimate_min_memory_mb(&stt_bin, scheduler.as_deref());
+    let memory_mb = memory_mb.max(initrd_floor);
 
     let mut builder = vmm::SttVm::builder()
         .kernel(&kernel)
@@ -595,9 +601,7 @@ fn run_stt_test_inner(
         builder = builder.sched_args(&sched_args);
     }
 
-    if entry.watchdog_timeout_jiffies > 0 {
-        builder = builder.watchdog_timeout_jiffies(entry.watchdog_timeout_jiffies);
-    }
+    builder = builder.watchdog_timeout_s(entry.watchdog_timeout_s);
 
     if let Some(bpf_write) = entry.bpf_map_write {
         builder =
@@ -628,16 +632,26 @@ fn run_stt_test_inner(
                     label: format!("StepStart[{}]", ev.step_index),
                     op_kind: Some(format!("ops={}", ev.op_count)),
                     detail: Some(format!(
-                        "{} cgroups, {} workers, {} cpuset cpus",
-                        ev.cgroup_count, ev.worker_count, ev.total_cpuset_cpus,
+                        "{} cgroups, {} workers",
+                        ev.cgroup_count, ev.worker_count,
                     )),
+                    total_iterations: if ev.total_iterations > 0 {
+                        Some(ev.total_iterations)
+                    } else {
+                        None
+                    },
                 });
             }
         }
     }
 
+    // auto_repro is enabled when:
+    // - entry.auto_repro is true (default)
+    // - a scheduler is running (not EEVDF)
+    // - the test does not expect failure (expect_err = false)
+    let effective_auto_repro = entry.auto_repro && scheduler.is_some() && !entry.expect_err;
     let repro_fn = |output: &str| -> Option<String> {
-        if !entry.auto_repro || scheduler.is_none() {
+        if !effective_auto_repro {
             return None;
         }
         attempt_auto_repro(entry, &kernel, scheduler.as_deref(), &stt_bin, output, topo)
@@ -682,17 +696,15 @@ fn evaluate_vm_result(
 
     let sched_label = scheduler_label(&entry.scheduler.binary);
     let output = &result.output;
-    let verbose = verbose();
     let dump_section = extract_sched_ext_dump(output)
         .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
         .unwrap_or_default();
-    let sched_log_section = if verbose {
-        parse_sched_output(output)
-            .map(|s| format!("\n\n--- scheduler log ---\n{s}"))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let sched_log_section = parse_sched_output(output)
+        .map(|s| {
+            let collapsed = crate::verifier::collapse_cycles(s);
+            format!("\n\n--- scheduler log ---\n{collapsed}")
+        })
+        .unwrap_or_default();
 
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
@@ -707,26 +719,6 @@ fn evaluate_vm_result(
         scenario: Some(entry.name.to_string()),
         duration_s: Some(result.duration.as_secs_f64()),
     };
-
-    if verbose {
-        eprintln!(
-            "stt_test: evaluate_vm_result: COM2 len={} has_sched_start={} has_sched_end={} has_json_start={} has_json_end={} has_DIED={}",
-            output.len(),
-            output.contains("===SCHED_OUTPUT_START==="),
-            output.contains("===SCHED_OUTPUT_END==="),
-            output.contains("===STT_JSON_START==="),
-            output.contains("===STT_JSON_END==="),
-            output.contains("SCHEDULER_DIED"),
-        );
-        if output.len() < 2000 {
-            eprintln!("stt_test: evaluate_vm_result: COM2 full:\n{output}");
-        } else {
-            eprintln!(
-                "stt_test: evaluate_vm_result: COM2 first 500 chars:\n{}",
-                &output[..500],
-            );
-        }
-    }
 
     if let Ok(verify_result) = parse_assert_result(output) {
         // Write sidecar before checking pass/fail so both outcomes are captured.
@@ -747,26 +739,59 @@ fn evaluate_vm_result(
                 .filter(|t| !t.phases.is_empty())
                 .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
                 .unwrap_or_default();
-            anyhow::bail!(
+            let stats_section = if !verify_result.stats.cgroups.is_empty() {
+                let s = &verify_result.stats;
+                let mut lines = vec![format!(
+                    "\n\n--- stats ---\n{} workers, {} cpus, {} migrations, worst_spread={:.1}%, worst_gap={}ms",
+                    s.total_workers,
+                    s.total_cpus,
+                    s.total_migrations,
+                    s.worst_spread,
+                    s.worst_gap_ms,
+                )];
+                for (i, cg) in s.cgroups.iter().enumerate() {
+                    lines.push(format!(
+                        "  cg{}: workers={} cpus={} spread={:.1}% gap={}ms migrations={} iter={}",
+                        i,
+                        cg.num_workers,
+                        cg.num_cpus,
+                        cg.spread,
+                        cg.max_gap_ms,
+                        cg.total_migrations,
+                        cg.total_iterations,
+                    ));
+                }
+                lines.join("\n")
+            } else {
+                String::new()
+            };
+            let msg = format!(
                 "stt_test '{}'{} failed:\n  {}{}{}{}{}",
                 entry.name,
                 sched_label,
                 details,
+                stats_section,
                 timeline_section,
-                sched_log_section,
                 dump_section,
                 repro_section,
             );
+            anyhow::bail!("{msg}");
         }
 
         // Evaluate monitor data against thresholds when a scheduler is running.
         // Without a scheduler (EEVDF), monitor reads rq data that may be
         // uninitialized or irrelevant — skip evaluation in that case.
+        //
+        // Skip early monitor warmup samples: during boot, BPF verification,
+        // and initramfs unpacking the scheduler tick may not fire for hundreds
+        // of milliseconds. These transient stalls are real but not indicative
+        // of scheduler bugs.
         if entry.scheduler.binary.has_active_scheduling()
             && let Some(ref monitor) = result.monitor
         {
+            let eval_report = trim_settle_samples(monitor);
             let thresholds = merged_assert.monitor_thresholds();
-            let verdict = thresholds.evaluate(monitor);
+            let verdict = thresholds.evaluate(&eval_report);
             if !verdict.passed {
                 let details = verdict.details.join("\n  ");
                 let timeline_section = timeline
@@ -774,14 +799,11 @@ fn evaluate_vm_result(
                     .filter(|t| !t.phases.is_empty())
                     .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
                     .unwrap_or_default();
-                anyhow::bail!(
+                let msg = format!(
                     "stt_test '{}'{} passed scenario but monitor failed:\n  {}{}{}",
-                    entry.name,
-                    sched_label,
-                    details,
-                    timeline_section,
-                    dump_section,
+                    entry.name, sched_label, details, timeline_section, dump_section,
                 );
+                anyhow::bail!("{msg}");
             }
         }
 
@@ -793,7 +815,9 @@ fn evaluate_vm_result(
     // without a scheduler (EEVDF) it means the payload itself failed.
     // Attempt auto-repro if enabled and a scheduler was running.
     let repro_section = if entry.scheduler.binary.has_active_scheduling()
-        && (output.contains("SCHEDULER_DIED") || output.contains("scheduler died"))
+        && (output.contains("SCHEDULER_DIED")
+            || output.contains("scheduler died")
+            || (result.stderr.contains("sched_ext:") && result.stderr.contains("disabled")))
     {
         repro_fn(output)
             .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
@@ -803,21 +827,62 @@ fn evaluate_vm_result(
     };
 
     // Build a diagnostic section from COM1 kernel console output and exit code.
-    let console_section = if verbose {
+    // When COM2 has scheduler output markers, sched_log_section and dump_section
+    // carry the diagnostics and the kernel console is noise (BIOS, ACPI boot).
+    // When COM2 has NO scheduler output (crash before writing), the kernel console
+    // is the ONLY source of crash info — include it unconditionally as a fallback.
+    let has_sched_output = output.contains("===SCHED_OUTPUT_START===");
+    let console_section = if !has_sched_output || verbose() {
         let init_stage = classify_init_stage(output);
         format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
     } else {
         String::new()
     };
 
+    let timeline_section = timeline
+        .as_ref()
+        .filter(|t| !t.phases.is_empty())
+        .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
+        .unwrap_or_default();
+
+    // Build monitor section for error paths where COM2 had no parseable result.
+    let monitor_section = if entry.scheduler.binary.has_active_scheduling()
+        && let Some(ref monitor) = result.monitor
+    {
+        let s = &monitor.summary;
+        let eval_report = trim_settle_samples(monitor);
+        let thresholds = merged_assert.monitor_thresholds();
+        let verdict = thresholds.evaluate(&eval_report);
+        let verdict_line = if verdict.passed {
+            verdict.summary.clone()
+        } else {
+            format!("{}: {}", verdict.summary, verdict.details.join("; "))
+        };
+        format!(
+            "\n\n--- monitor ---\nsamples={} max_imbalance={:.2} max_dsq_depth={} stall={}\nverdict: {}",
+            s.total_samples,
+            s.max_imbalance_ratio,
+            s.max_local_dsq_depth,
+            s.stall_detected,
+            verdict_line,
+        )
+    } else {
+        String::new()
+    };
+
     if result.timed_out {
-        anyhow::bail!(
-            "stt_test '{}'{} timed out (no result in COM2){}{}",
+        let msg = format!(
+            "stt_test '{}'{} timed out (no result in COM2){}{}{}{}{}{}",
             entry.name,
             sched_label,
             console_section,
+            timeline_section,
+            sched_log_section,
+            dump_section,
+            monitor_section,
             repro_section,
         );
+        anyhow::bail!("{msg}");
     }
 
     let reason = if entry.scheduler.binary.has_active_scheduling() {
@@ -825,16 +890,50 @@ fn evaluate_vm_result(
     } else {
         "payload produced no output (no test result in COM2)"
     };
-    anyhow::bail!(
-        "stt_test '{}'{} {}{}{}{}{}",
+    let msg = format!(
+        "stt_test '{}'{} {}{}{}{}{}{}{}",
         entry.name,
         sched_label,
         reason,
         console_section,
+        timeline_section,
         sched_log_section,
         dump_section,
+        monitor_section,
         repro_section,
-    )
+    );
+    anyhow::bail!("{msg}")
+}
+
+/// Number of monitor samples to skip at the start of evaluation.
+///
+/// During VM boot the kernel performs BPF verification, initramfs
+/// unpacking, and scheduler loading. These memory-intensive operations
+/// cause the scheduler tick to stall for hundreds of milliseconds.
+/// The stalls are real but transient — evaluating them produces false
+/// positives, especially in low-memory VMs.
+///
+/// 20 samples at ~100ms interval = ~2 seconds of warmup. This covers
+/// the boot settling period after the scheduler attaches.
+const MONITOR_WARMUP_SAMPLES: usize = 20;
+
+/// Skip boot-settle samples from a MonitorReport for threshold evaluation.
+///
+/// Returns a report with the first `MONITOR_WARMUP_SAMPLES` removed so
+/// that transient boot-time stalls don't trigger sustained-window
+/// violations.
+fn trim_settle_samples(report: &crate::monitor::MonitorReport) -> crate::monitor::MonitorReport {
+    if report.samples.len() <= MONITOR_WARMUP_SAMPLES {
+        return report.clone();
+    }
+
+    let trimmed = report.samples[MONITOR_WARMUP_SAMPLES..].to_vec();
+    let summary = crate::monitor::MonitorSummary::from_samples(&trimmed);
+    crate::monitor::MonitorReport {
+        samples: trimmed,
+        summary,
+        preemption_threshold_ns: report.preemption_threshold_ns,
+    }
 }
 
 /// Attempt auto-repro: extract stack functions from the scheduler output,
@@ -897,7 +996,11 @@ fn attempt_auto_repro(
 
     let (sockets, cores, threads, memory_mb) = match topo {
         Some(t) => (t.sockets, t.cores, t.threads, t.memory_mb),
-        None => (entry.sockets, entry.cores, entry.threads, entry.memory_mb),
+        None => {
+            let cpus = entry.sockets * entry.cores * entry.threads;
+            let mem = (cpus * 64).max(256).max(entry.memory_mb);
+            (entry.sockets, entry.cores, entry.threads, mem)
+        }
     };
 
     let mut builder = vmm::SttVm::builder()
@@ -1042,8 +1145,9 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
 /// and exit. Profraw flush is handled by `try_flush_profraw()` in the
 /// ctor before `std::process::exit()`.
 ///
-/// Call this early in main(). Returns `Some(exit_code)` if dispatched,
-/// `None` if not an stt_test invocation.
+/// Called from `stt_test_early_dispatch()` (ctor) before `main()`.
+/// Returns `Some(exit_code)` if dispatched, `None` if not an
+/// stt_test invocation.
 pub fn maybe_dispatch_vm_test() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
     let name = extract_test_fn_arg(&args)?;
@@ -1164,16 +1268,12 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
-    let duration = if entry.duration_s > 0 {
-        Duration::from_secs(entry.duration_s)
-    } else {
-        Duration::from_secs(2)
-    };
-    let workers_per_cgroup = if entry.workers_per_cgroup > 0 {
-        entry.workers_per_cgroup as usize
-    } else {
-        2
-    };
+    let duration = Duration::from_secs(entry.duration_s);
+    let workers_per_cgroup = entry.workers_per_cgroup as usize;
+    // Three-layer merge: default_checks -> scheduler.assert -> entry.assert.
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(&entry.scheduler.assert)
+        .merge(&entry.assert);
     let ctx = Ctx {
         cgroups: &cgroups,
         topo: &topo,
@@ -1182,6 +1282,7 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
         sched_pid,
         settle_ms: 500,
         work_type_override,
+        assert: merged_assert,
     };
 
     let result = match (entry.func)(&ctx) {
@@ -1844,27 +1945,7 @@ mod tests {
     static __STT_ENTRY_UNIT_TEST_DUMMY: SttTestEntry = SttTestEntry {
         name: "__unit_test_dummy__",
         func: __stt_inner_unit_test_dummy,
-        sockets: 1,
-        cores: 2,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &Scheduler::EEVDF,
-        auto_repro: true,
-        replicas: 1,
-        assert: crate::assert::Assert::NONE,
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: None,
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
+        ..SttTestEntry::DEFAULT
     };
 
     #[test]
@@ -2727,6 +2808,7 @@ mod tests {
                 label: "StepStart[0]".to_string(),
                 op_kind: Some("SetCpuset".to_string()),
                 detail: Some("4 cpus".to_string()),
+                total_iterations: None,
             }],
             work_type: "CpuSpin".to_string(),
         };
@@ -2772,71 +2854,6 @@ mod tests {
         assert!(loaded.stimulus_events.is_empty());
         // monitor field should be absent from JSON when None
         assert!(!json.contains("\"monitor\""));
-    }
-
-    // -- SttTestInfo tests --
-
-    #[test]
-    fn stt_test_info_from_entry() {
-        let entry = find_test("__unit_test_dummy__").unwrap();
-        let info = SttTestInfo::from_entry(entry);
-        assert_eq!(info.name, "__unit_test_dummy__");
-        assert_eq!(info.sockets, 1);
-        assert_eq!(info.cores, 2);
-        assert_eq!(info.threads, 1);
-        assert_eq!(info.memory_mb, 2048);
-        assert_eq!(info.scheduler, "eevdf");
-        assert_eq!(info.replicas, 1);
-    }
-
-    #[test]
-    fn stt_test_info_roundtrip() {
-        let info = SttTestInfo {
-            name: "test_fn".to_string(),
-            sockets: 2,
-            cores: 4,
-            threads: 2,
-            memory_mb: 4096,
-            scheduler: "scx_mitosis".to_string(),
-            replicas: 3,
-            required_flags: vec!["borrow".into()],
-            excluded_flags: vec!["steal".into()],
-            min_sockets: 2,
-            min_llcs: 4,
-            requires_smt: true,
-            min_cpus: 8,
-            scheduler_flags: vec!["borrow".into(), "rebal".into()],
-            performance_mode: true,
-            super_perf_mode: false,
-            total_vcpus: 16,
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        let loaded: SttTestInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.name, "test_fn");
-        assert_eq!(loaded.sockets, 2);
-        assert_eq!(loaded.cores, 4);
-        assert_eq!(loaded.threads, 2);
-        assert_eq!(loaded.memory_mb, 4096);
-        assert_eq!(loaded.scheduler, "scx_mitosis");
-        assert_eq!(loaded.replicas, 3);
-        assert_eq!(loaded.required_flags, vec!["borrow"]);
-        assert_eq!(loaded.excluded_flags, vec!["steal"]);
-        assert_eq!(loaded.min_sockets, 2);
-        assert_eq!(loaded.min_llcs, 4);
-        assert!(loaded.requires_smt);
-        assert_eq!(loaded.min_cpus, 8);
-        assert_eq!(loaded.scheduler_flags, vec!["borrow", "rebal"]);
-        assert!(loaded.performance_mode);
-        assert_eq!(loaded.total_vcpus, 16);
-    }
-
-    #[test]
-    fn stt_test_info_list_serializable() {
-        let infos: Vec<SttTestInfo> = STT_TESTS.iter().map(SttTestInfo::from_entry).collect();
-        let json = serde_json::to_string_pretty(&infos).unwrap();
-        let loaded: Vec<SttTestInfo> = serde_json::from_str(&json).unwrap();
-        assert!(!loaded.is_empty());
-        assert!(loaded.iter().any(|i| i.name == "__unit_test_dummy__"));
     }
 
     // -- parse_topo_string tests --
@@ -3124,27 +3141,8 @@ mod tests {
         let entry = SttTestEntry {
             name: "__sidecar_noop__",
             func: dummy,
-            sockets: 1,
-            cores: 2,
-            threads: 1,
-            memory_mb: 2048,
-            scheduler: &Scheduler::EEVDF,
             auto_repro: false,
-            replicas: 1,
-            assert: crate::assert::Assert::NONE,
-            extra_sched_args: &[],
-            required_flags: &[],
-            excluded_flags: &[],
-            min_sockets: 1,
-            min_llcs: 1,
-            requires_smt: false,
-            min_cpus: 1,
-            watchdog_timeout_jiffies: 0,
-            bpf_map_write: None,
-            performance_mode: false,
-            super_perf_mode: false,
-            duration_s: 0,
-            workers_per_cgroup: 0,
+            ..SttTestEntry::DEFAULT
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -3182,27 +3180,8 @@ mod tests {
         let entry = SttTestEntry {
             name: "__sidecar_write_test__",
             func: dummy,
-            sockets: 1,
-            cores: 2,
-            threads: 1,
-            memory_mb: 2048,
-            scheduler: &Scheduler::EEVDF,
             auto_repro: false,
-            replicas: 1,
-            assert: crate::assert::Assert::NONE,
-            extra_sched_args: &[],
-            required_flags: &[],
-            excluded_flags: &[],
-            min_sockets: 1,
-            min_llcs: 1,
-            requires_smt: false,
-            min_cpus: 1,
-            watchdog_timeout_jiffies: 0,
-            bpf_map_write: None,
-            performance_mode: false,
-            super_perf_mode: false,
-            duration_s: 0,
-            workers_per_cgroup: 0,
+            ..SttTestEntry::DEFAULT
         };
         let vm_result = crate::vmm::VmResult {
             success: true,
@@ -3267,27 +3246,8 @@ mod tests {
         SttTestEntry {
             name,
             func: dummy_test_fn,
-            sockets: 1,
-            cores: 2,
-            threads: 1,
-            memory_mb: 2048,
-            scheduler: &Scheduler::EEVDF,
             auto_repro: false,
-            replicas: 1,
-            assert: crate::assert::Assert::NONE,
-            extra_sched_args: &[],
-            required_flags: &[],
-            excluded_flags: &[],
-            min_sockets: 1,
-            min_llcs: 1,
-            requires_smt: false,
-            min_cpus: 1,
-            watchdog_timeout_jiffies: 0,
-            bpf_map_write: None,
-            performance_mode: false,
-            super_perf_mode: false,
-            duration_s: 0,
-            workers_per_cgroup: 0,
+            ..SttTestEntry::DEFAULT
         }
     }
 
@@ -3304,27 +3264,9 @@ mod tests {
         SttTestEntry {
             name,
             func: dummy_test_fn,
-            sockets: 1,
-            cores: 2,
-            threads: 1,
-            memory_mb: 2048,
             scheduler: &SCHED_TEST,
             auto_repro: false,
-            replicas: 1,
-            assert: crate::assert::Assert::NONE,
-            extra_sched_args: &[],
-            required_flags: &[],
-            excluded_flags: &[],
-            min_sockets: 1,
-            min_llcs: 1,
-            requires_smt: false,
-            min_cpus: 1,
-            watchdog_timeout_jiffies: 0,
-            bpf_map_write: None,
-            performance_mode: false,
-            super_perf_mode: false,
-            duration_s: 0,
-            workers_per_cgroup: 0,
+            ..SttTestEntry::DEFAULT
         }
     }
 
@@ -3559,6 +3501,32 @@ mod tests {
         assert!(
             msg.contains("spread 45%"),
             "should include all failure details, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_assert_failure_excludes_sched_log() {
+        let json = r#"{"passed":false,"details":["worker 0 stuck 5000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!(
+            "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
+        );
+        let entry = sched_entry("__eval_fail_no_sched_log__");
+        let result = make_vm_result(&output, "", 0, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(&entry, &result, None, &assertions, &[], 1, 2, 1, &no_repro)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("worker 0 stuck 5000ms"),
+            "should include assertion details, got: {msg}",
+        );
+        assert!(
+            !msg.contains("scheduler noise"),
+            "assertion failure should not include scheduler log, got: {msg}",
+        );
+        assert!(
+            !msg.contains("--- scheduler log ---"),
+            "assertion failure should not include scheduler log header, got: {msg}",
         );
     }
 

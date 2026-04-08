@@ -20,7 +20,7 @@ use crate::assert::{self, AssertResult};
 use crate::vmm::shm_ring::{self, StimulusPayload};
 use crate::workload::{WorkType, WorkloadConfig, WorkloadHandle};
 
-use super::{CgroupGroup, Ctx, process_alive, read_kmsg};
+use super::{CgroupGroup, Ctx, process_alive};
 
 // ---------------------------------------------------------------------------
 // Op / CpusetSpec
@@ -439,13 +439,14 @@ pub fn execute_steps(ctx: &Ctx, steps: Vec<Step>) -> Result<AssertResult> {
 }
 
 /// Execute steps with an explicit [`Assert`](crate::assert::Assert) for
-/// worker checks. Use when the scenario needs custom gap, spread, or
-/// monitor thresholds. Pass `None` for default `assert_not_starved` behavior.
+/// worker checks. When `checks` is `Some`, it overrides `ctx.assert`.
+/// When `None`, uses `ctx.assert` (the merged three-layer config).
 pub fn execute_steps_with(
     ctx: &Ctx,
     steps: Vec<Step>,
     checks: Option<&crate::assert::Assert>,
 ) -> Result<AssertResult> {
+    let effective_checks = checks.unwrap_or(&ctx.assert);
     let mut state = StepState {
         cgroups: CgroupGroup::new(ctx.cgroups),
         handles: Vec::new(),
@@ -464,12 +465,9 @@ pub fn execute_steps_with(
     for (step_idx, step) in steps.iter().enumerate() {
         // Check scheduler liveness between steps (skip before first).
         if step_idx > 0 && !process_alive(ctx.sched_pid) {
-            let mut r = collect_result(&mut state, checks);
+            let mut r = collect_result(&mut state, effective_checks);
             r.passed = false;
             r.details.push("scheduler died between steps".into());
-            for line in read_kmsg().lines() {
-                r.details.push(line.to_string());
-            }
             return Ok(r);
         }
 
@@ -526,13 +524,7 @@ pub fn execute_steps_with(
     // Final liveness check.
     let sched_dead = !process_alive(ctx.sched_pid);
 
-    let mut result = collect_result(&mut state, checks);
-
-    if !result.passed {
-        for line in read_kmsg().lines() {
-            result.details.push(line.to_string());
-        }
-    }
+    let mut result = collect_result(&mut state, effective_checks);
 
     if sched_dead {
         result.passed = false;
@@ -554,6 +546,12 @@ fn build_stimulus(
         op_kinds |= 1 << op.discriminant();
     }
 
+    let total_iterations: u64 = state
+        .handles
+        .iter()
+        .flat_map(|(_, h)| h.snapshot_iterations())
+        .sum();
+
     StimulusPayload {
         elapsed_ms: scenario_start.elapsed().as_millis() as u32,
         step_index: step_idx as u16,
@@ -561,8 +559,7 @@ fn build_stimulus(
         op_kinds,
         cgroup_count: state.cgroups.names().len() as u16,
         worker_count: state.handles.len() as u16,
-        total_cpuset_cpus: 0, // cpuset CPU count not tracked in StepState
-        _pad: 0,
+        total_iterations,
     }
 }
 
@@ -732,19 +729,18 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
 
 /// Collect all worker results and produce an AssertResult.
 ///
-/// When `checks` is provided, uses its worker plan. Otherwise falls
-/// back to `assert_not_starved`.
-fn collect_result(
-    state: &mut StepState<'_>,
-    checks: Option<&crate::assert::Assert>,
-) -> AssertResult {
+/// Uses `checks` for worker evaluation. When the Assert has no
+/// worker-level checks configured (all fields None), falls back
+/// to `assert_not_starved`.
+fn collect_result(state: &mut StepState<'_>, checks: &crate::assert::Assert) -> AssertResult {
     let mut result = AssertResult::pass();
     let handles = std::mem::take(&mut state.handles);
     for (_name, h) in handles {
         let reports = h.stop_and_collect();
-        match checks {
-            Some(v) => result.merge(v.assert_cgroup(&reports, None)),
-            None => result.merge(assert::assert_not_starved(&reports)),
+        if checks.has_worker_checks() {
+            result.merge(checks.assert_cgroup(&reports, None));
+        } else {
+            result.merge(assert::assert_not_starved(&reports));
         }
     }
     result
@@ -1045,6 +1041,7 @@ mod tests {
             sched_pid: 0,
             settle_ms: 1000,
             work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
         };
         let resolved = spec.resolve(&ctx);
         assert_eq!(resolved, cpus);
@@ -1089,6 +1086,7 @@ mod tests {
             sched_pid: 0,
             settle_ms: 0,
             work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
         }
     }
 

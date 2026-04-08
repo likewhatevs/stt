@@ -16,9 +16,6 @@ use crate::probe::stack::{
 use crate::scenario::{self, Ctx, FlagProfile, Scenario, flags};
 use crate::topology::TestTopology;
 
-// Re-export public API used by main.rs
-pub use crate::probe::stack::extract_stack_functions_all_pub;
-
 /// Full configuration for a scenario run session.
 ///
 /// Controls scheduler binary, flag selection, durations, and
@@ -50,6 +47,8 @@ pub struct RunConfig {
     pub cleanup_ms: u64,
     /// Override work_type for all swappable CgroupDefs and steady-state cgroups.
     pub work_type_override: Option<crate::workload::WorkType>,
+    /// Log unfairness but don't fail on it.
+    pub warn_unfair: bool,
 }
 
 /// Result of running a single scenario with a specific flag profile.
@@ -61,6 +60,40 @@ pub struct ScenarioResult {
     pub details: Vec<String>,
     #[serde(default)]
     pub stats: ScenarioStats,
+}
+
+/// Extract auto-repro function names from scenario result details.
+///
+/// Looks for a "functions:" line first, then falls back to stack extraction.
+/// Returns `None` if no function names are found.
+pub fn extract_auto_repro_functions(results: &[ScenarioResult]) -> Option<String> {
+    let all_text: String = results
+        .iter()
+        .flat_map(|r| r.details.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    all_text
+        .lines()
+        .find(|l| l.contains("functions:"))
+        .map(|l| {
+            l.split("functions:")
+                .nth(1)
+                .unwrap_or("")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .or_else(|| {
+            let fns = crate::probe::stack::extract_stack_functions_all_pub(&all_text);
+            if fns.is_empty() {
+                None
+            } else {
+                Some(fns.join(","))
+            }
+        })
 }
 
 /// Expand scenarios into (scenario, profile) runs based on active_flags config.
@@ -105,6 +138,10 @@ pub struct Runner {
 impl Runner {
     /// Create a runner with the given configuration and topology.
     pub fn new(config: RunConfig, topo: TestTopology) -> Result<Self> {
+        crate::assert::set_warn_unfair(config.warn_unfair);
+        if config.repro {
+            crate::workload::set_repro_mode(true);
+        }
         Ok(Self { config, topo })
     }
 
@@ -155,6 +192,7 @@ impl Runner {
                 sched_pid,
                 settle_ms: self.config.settle_ms,
                 work_type_override: self.config.work_type_override,
+                assert: crate::assert::Assert::default_checks(),
             };
 
             // Start BPF skeleton probes for auto-probe.
@@ -841,6 +879,7 @@ mod tests {
             scheduler_startup_ms: 2000,
             cleanup_ms: 300,
             work_type_override: None,
+            warn_unfair: false,
         };
         let runner = Runner::new(config, topo).unwrap();
         // Verify topology was correctly propagated (2*4*2=16 CPUs).
@@ -878,6 +917,7 @@ mod tests {
             scheduler_startup_ms: 1000,
             cleanup_ms: 200,
             work_type_override: Some(crate::workload::WorkType::Mixed),
+            warn_unfair: false,
         };
         assert!(config.repro);
         assert!(config.auto_repro);
@@ -929,6 +969,7 @@ mod tests {
             scheduler_startup_ms: 1000,
             cleanup_ms: 200,
             work_type_override: None,
+            warn_unfair: false,
         };
         let s = format!("{:?}", config);
         assert!(s.contains("scx_mitosis"), "must show scheduler_bin value");
@@ -956,6 +997,7 @@ mod tests {
             scheduler_startup_ms: 2000,
             cleanup_ms: 100,
             work_type_override: Some(crate::workload::WorkType::CpuSpin),
+            warn_unfair: false,
         };
         let c2 = config.clone();
         assert_eq!(c2.scheduler_bin, config.scheduler_bin);

@@ -52,11 +52,22 @@ use crate::monitor;
 pub(crate) fn allocate_hugepage_memory(size: usize, base: GuestAddress) -> Result<GuestMemoryMmap> {
     use vm_memory::mmap::{GuestRegionMmap, MmapRegionBuilder};
 
-    let flags = libc::MAP_ANONYMOUS
-        | libc::MAP_PRIVATE
-        | libc::MAP_NORESERVE
-        | libc::MAP_HUGETLB
-        | libc::MAP_HUGE_2MB;
+    let needed_pages = size / (2 << 20);
+    let free_pages = host_topology::hugepages_free();
+    if free_pages < needed_pages as u64 {
+        eprintln!(
+            "performance_mode: WARNING: not enough hugepages \
+             (needed {} MB = {} pages, available {} pages). \
+             Using regular pages.",
+            size >> 20,
+            needed_pages,
+            free_pages,
+        );
+        return GuestMemoryMmap::<()>::from_ranges(&[(base, size)])
+            .context("allocate guest memory (hugepage fallback)");
+    }
+
+    let flags = libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_HUGETLB | libc::MAP_HUGE_2MB;
 
     let region = MmapRegionBuilder::new(size)
         .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
@@ -66,6 +77,27 @@ pub(crate) fn allocate_hugepage_memory(size: usize, base: GuestAddress) -> Resul
 
     match region {
         Ok(r) => {
+            // Pre-fault hugepages to detect allocation failures now rather
+            // than as cryptic guest-side "uncompression error" page faults.
+            let ret = unsafe {
+                libc::madvise(
+                    r.as_ptr() as *mut libc::c_void,
+                    r.size(),
+                    libc::MADV_POPULATE_WRITE,
+                )
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!(
+                    "performance_mode: WARNING: hugepage pre-fault failed ({err}), \
+                     not enough hugepages (needed: {} MB, available: {} pages). \
+                     Using regular pages.",
+                    size >> 20,
+                    free_pages,
+                );
+                return GuestMemoryMmap::<()>::from_ranges(&[(base, size)])
+                    .context("allocate guest memory (hugepage fallback)");
+            }
             eprintln!(
                 "performance_mode: allocated {} MB with 2MB hugepages",
                 size >> 20
@@ -78,7 +110,10 @@ pub(crate) fn allocate_hugepage_memory(size: usize, base: GuestAddress) -> Resul
         Err(e) => {
             eprintln!(
                 "performance_mode: WARNING: hugepage allocation failed ({e}), \
-                 falling back to regular pages",
+                 not enough hugepages (needed: {} MB, available: {} pages). \
+                 Using regular pages.",
+                size >> 20,
+                free_pages,
             );
             GuestMemoryMmap::<()>::from_ranges(&[(base, size)])
                 .context("allocate guest memory (hugepage fallback)")
@@ -181,36 +216,11 @@ impl<T> Drop for PiMutexGuard<'_, T> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(u64);
 
-/// Hash a file for cache keying. Samples length + first 4KB + last 4KB
-/// rather than reading the entire file, so the cost is constant regardless
-/// of binary size.
-pub(crate) fn hash_file_sample(path: &Path) -> Result<u64> {
-    use std::io::{Seek, SeekFrom};
-    const SAMPLE: usize = 4096;
-
-    let mut f =
-        std::fs::File::open(path).with_context(|| format!("open for hash: {}", path.display()))?;
-    let len = f
-        .metadata()
-        .with_context(|| format!("stat for hash: {}", path.display()))?
-        .len();
-
+/// Hash a file's full content for cache keying.
+pub(crate) fn hash_file(path: &Path) -> Result<u64> {
+    let data = std::fs::read(path).with_context(|| format!("read for hash: {}", path.display()))?;
     let mut hasher = std::hash::DefaultHasher::new();
-    len.hash(&mut hasher);
-
-    let mut buf = [0u8; SAMPLE];
-    let n = std::io::Read::read(&mut f, &mut buf)
-        .with_context(|| format!("read head: {}", path.display()))?;
-    hasher.write(&buf[..n]);
-
-    if len > SAMPLE as u64 {
-        f.seek(SeekFrom::End(-(SAMPLE as i64)))
-            .with_context(|| format!("seek tail: {}", path.display()))?;
-        let n = std::io::Read::read(&mut f, &mut buf)
-            .with_context(|| format!("read tail: {}", path.display()))?;
-        hasher.write(&buf[..n]);
-    }
-
+    hasher.write(&data);
     Ok(hasher.finish())
 }
 
@@ -218,13 +228,13 @@ impl BaseKey {
     pub(crate) fn new(payload: &Path, scheduler: Option<&Path>) -> Result<Self> {
         let mut hasher = std::hash::DefaultHasher::new();
 
-        hash_file_sample(payload)?.hash(&mut hasher);
+        hash_file(payload)?.hash(&mut hasher);
         Self::hash_shared_libs(payload, &mut hasher);
 
         match scheduler {
             Some(s) => {
                 1u8.hash(&mut hasher);
-                hash_file_sample(s)?.hash(&mut hasher);
+                hash_file(s)?.hash(&mut hasher);
                 Self::hash_shared_libs(s, &mut hasher);
             }
             None => 0u8.hash(&mut hasher),
@@ -241,7 +251,7 @@ impl BaseKey {
             entries.sort();
             for p in &entries {
                 p.to_str().unwrap_or("").hash(hasher);
-                if let Ok(sample) = hash_file_sample(p) {
+                if let Ok(sample) = hash_file(p) {
                     sample.hash(hasher);
                 }
             }
@@ -431,6 +441,9 @@ fn shm_write_and_release(fd: std::os::unix::io::RawFd, data: &[u8], seg_name: &s
             0,
         );
         if ptr == libc::MAP_FAILED {
+            // Zero the size so readers blocked on LOCK_SH see st_size=0
+            // from fstat and return None instead of mapping zero-filled bytes.
+            libc::ftruncate(fd, 0);
             if let Ok(cname) = std::ffi::CString::new(seg_name) {
                 libc::shm_unlink(cname.as_ptr());
             }
@@ -442,6 +455,51 @@ fn shm_write_and_release(fd: std::os::unix::io::RawFd, data: &[u8], seg_name: &s
         libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Initramfs memory floor
+// ---------------------------------------------------------------------------
+
+/// Minimum guest memory (in MB) needed to extract an initramfs.
+///
+/// During kernel boot the compressed cpio sits in the ramdisk region
+/// while the kernel decompresses it into tmpfs. Both coexist until
+/// free_initrd_mem() releases the compressed copy. The uncompressed
+/// content dominates: `2 * cpio_size` bounds the peak, plus 128 MB
+/// for kernel image, page tables, slab, and process execution.
+pub fn initramfs_min_memory_mb(initramfs_bytes: u64) -> u32 {
+    let initramfs_mb = ((initramfs_bytes + (1 << 20) - 1) >> 20) as u32;
+    2 * initramfs_mb + 128
+}
+
+/// Estimate minimum guest memory from binary file sizes.
+///
+/// The uncompressed cpio is approximately the sum of the payload,
+/// scheduler, and shared library sizes plus cpio metadata (~5%).
+pub fn estimate_min_memory_mb(
+    payload: &std::path::Path,
+    scheduler: Option<&std::path::Path>,
+) -> u32 {
+    // Debug binaries are stripped before packing into the initramfs.
+    // Estimate stripped size as 1/3 of debug size (conservative; actual
+    // ratio varies from 4% to 30% depending on crate).
+    let payload_size = std::fs::metadata(payload).map(|m| m.len()).unwrap_or(0) / 3;
+    let sched_size = scheduler
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() / 3)
+        .unwrap_or(0);
+    let lib_size: u64 = [Some(payload), scheduler]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| initramfs::resolve_shared_libs(p).ok())
+        .flat_map(|libs| libs.into_iter().map(|(_, p)| p))
+        .filter_map(|p| std::fs::metadata(&p).ok())
+        .map(|m| m.len())
+        .sum();
+    // 5% overhead for cpio headers and alignment.
+    let uncompressed = ((payload_size + sched_size + lib_size) as f64 * 1.05) as u64;
+    initramfs_min_memory_mb(uncompressed)
 }
 
 // ---------------------------------------------------------------------------
@@ -676,9 +734,9 @@ pub struct SttVm {
     /// Thresholds for reactive SysRq-D dump. When set and the monitor
     /// detects a sustained violation, it writes the dump flag to guest SHM.
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
-    /// Override for `scx_watchdog_timeout` in the guest kernel (jiffies).
-    /// Written to guest memory via the monitor thread after the kernel boots.
-    watchdog_timeout_jiffies: Option<u64>,
+    /// Override for `scx_watchdog_timeout` in the guest kernel (seconds).
+    /// Converted to jiffies via CONFIG_HZ at monitor start time.
+    watchdog_timeout_s: Option<u64>,
     /// Host-side BPF map write parameters. When set, a thread polls for
     /// BPF map discoverability, waits for scenario start via SHM ring,
     /// then writes a u32 value at the specified offset.
@@ -792,33 +850,38 @@ impl SttVm {
 
     /// Spawn initramfs resolution on a background thread.
     /// Returns the handle to join later (after KVM creation completes).
-    fn spawn_initramfs_resolve(&self) -> Option<JoinHandle<Result<BaseRef>>> {
+    fn spawn_initramfs_resolve(&self) -> Option<JoinHandle<Result<(BaseRef, BaseKey)>>> {
         let bin = self.init_binary.as_ref()?;
         let payload = bin.clone();
         let scheduler = self.scheduler_binary.clone();
         std::thread::Builder::new()
             .name("initramfs-resolve".into())
-            .spawn(move || -> Result<BaseRef> {
+            .spawn(move || -> Result<(BaseRef, BaseKey)> {
                 let extras: Vec<(&str, &std::path::Path)> = scheduler
                     .as_deref()
                     .map(|p| vec![("scheduler", p)])
                     .unwrap_or_default();
                 let key = BaseKey::new(&payload, scheduler.as_deref())?;
-                get_or_build_base(&payload, &extras, &key)
+                let base = get_or_build_base(&payload, &extras, &key)?;
+                Ok((base, key))
             })
             .ok()
     }
 
     /// Join the initramfs thread and load the result into guest memory.
+    ///
+    /// Compresses base+suffix with gzip. Attempts COW overlay from a
+    /// compressed SHM segment to share physical pages across VMs.
+    /// Falls back to write_slice if COW fails.
     #[cfg(target_arch = "x86_64")]
     fn join_and_load_initramfs(
         &self,
         vm: &kvm::SttKvm,
-        handle: JoinHandle<Result<BaseRef>>,
+        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
         load_addr: u64,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
-        let base = handle
+        let (base, key) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
@@ -834,6 +897,7 @@ impl SttVm {
             &enable_refs,
             &disable_refs,
         )?;
+        let uncompressed_size = base_bytes.len() + suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
             base_bytes = base_bytes.len(),
@@ -841,11 +905,123 @@ impl SttVm {
             "build_suffix",
         );
 
+        // Enforce minimum memory for initramfs extraction.
+        let min_mb = initramfs_min_memory_mb(uncompressed_size as u64);
+        if self.memory_mb < min_mb {
+            anyhow::bail!(
+                "VM memory {}MB insufficient for initramfs \
+                 (uncompressed={}MB): need {}MB",
+                self.memory_mb,
+                uncompressed_size >> 20,
+                min_mb,
+            );
+        }
+
+        // Compress base and suffix as separate gzip streams. The kernel
+        // initramfs decompressor handles concatenated gzip natively.
+        // Keeping them separate lets us COW-map the base from SHM.
         let t0 = Instant::now();
-        let (addr, size) =
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[base_bytes, &suffix], load_addr)?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_initramfs");
-        Ok((Some(addr), Some(size)))
+        let gz_base = self.get_or_compress_base(base_bytes, &key)?;
+        let gz_suffix = {
+            use flate2::write::GzEncoder;
+            use std::io::Write;
+            let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&suffix).context("gzip suffix")?;
+            enc.finish().context("finish gzip suffix")?
+        };
+        let total_compressed = gz_base.len() + gz_suffix.len();
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            uncompressed = uncompressed_size,
+            gz_base = gz_base.len(),
+            gz_suffix = gz_suffix.len(),
+            ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
+            "gzip_initramfs",
+        );
+
+        // Try COW overlay: mmap compressed base from SHM fd directly
+        // into guest memory, sharing physical pages across VMs.
+        let t0 = Instant::now();
+        let cow_ok = self.try_cow_overlay(vm, &key, gz_base.len(), load_addr);
+        if cow_ok {
+            // Base is COW-mapped. Write suffix after it.
+            vm.guest_mem
+                .write_slice(&gz_suffix, GuestAddress(load_addr + gz_base.len() as u64))
+                .context("write gz suffix after COW base")?;
+            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cow_initramfs");
+        } else {
+            // Fallback: write both parts via write_slice.
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[&gz_base, &gz_suffix], load_addr)?;
+            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "copy_initramfs");
+        }
+
+        Ok((Some(load_addr), Some(total_compressed as u32)))
+    }
+
+    /// Get or build the compressed base. Checks gz SHM first, then
+    /// compresses and stores.
+    #[cfg(target_arch = "x86_64")]
+    fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
+        // Try loading compressed base from gz SHM.
+        if let Some((fd, len)) = initramfs::shm_open_gz(key.0) {
+            let mut buf = vec![0u8; len];
+            unsafe {
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                if ptr != libc::MAP_FAILED {
+                    std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
+                    libc::munmap(ptr, len);
+                    initramfs::shm_close_fd(fd);
+                    tracing::debug!(bytes = len, "gz_base cache hit (shm)");
+                    return Ok(buf);
+                }
+            }
+            initramfs::shm_close_fd(fd);
+        }
+
+        // Compress and store.
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(base_bytes).context("gzip base")?;
+        let gz = enc.finish().context("finish gzip base")?;
+
+        if let Err(e) = initramfs::shm_store_gz(key.0, &gz) {
+            tracing::warn!("shm_store_gz: {e:#}");
+        }
+        Ok(gz)
+    }
+
+    /// Try to COW-overlay the compressed base from gz SHM into guest
+    /// memory. Returns true on success.
+    #[cfg(target_arch = "x86_64")]
+    fn try_cow_overlay(
+        &self,
+        vm: &kvm::SttKvm,
+        key: &BaseKey,
+        expected_len: usize,
+        load_addr: u64,
+    ) -> bool {
+        let Some((fd, len)) = initramfs::shm_open_gz(key.0) else {
+            return false;
+        };
+        if len != expected_len {
+            initramfs::shm_close_fd(fd);
+            return false;
+        }
+        let Ok(host_addr) = vm.guest_mem.get_host_address(GuestAddress(load_addr)) else {
+            initramfs::shm_close_fd(fd);
+            return false;
+        };
+        let ok = unsafe { initramfs::cow_overlay(host_addr, len, fd) };
+        initramfs::shm_close_fd(fd);
+        ok
     }
 
     /// Write cmdline, boot params, SHM header, and topology tables to guest memory.
@@ -854,7 +1030,7 @@ impl SttVm {
         &self,
         vm: &kvm::SttKvm,
         kernel_result: &boot::KernelLoadResult,
-        initramfs_handle: Option<JoinHandle<Result<BaseRef>>>,
+        initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
     ) -> Result<()> {
         let (initrd_addr, initrd_size) = match initramfs_handle {
             Some(handle) => self.join_and_load_initramfs(vm, handle, INITRD_ADDR)?,
@@ -1248,7 +1424,8 @@ impl SttVm {
                     }
                 });
 
-        let watchdog_jiffies = self.watchdog_timeout_jiffies;
+        let hz = monitor::guest_kernel_hz(Some(&self.kernel));
+        let watchdog_jiffies = self.watchdog_timeout_s.map(|s| s * hz);
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
         let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
@@ -1653,13 +1830,13 @@ impl SttVm {
         &self,
         vm: &kvm::SttKvm,
         _kernel_result: &boot::KernelLoadResult,
-        initramfs_handle: Option<JoinHandle<Result<BaseRef>>>,
+        initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
     ) -> Result<()> {
         // Build initramfs data, then place it at the high end of DRAM
         // (just below FDT) to avoid conflicts with early kernel allocations.
         let (initrd_addr, initrd_size) = match initramfs_handle {
             Some(handle) => {
-                let base = handle
+                let (base, _key) = handle
                     .join()
                     .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
                 let base_bytes: &[u8] = base.as_ref();
@@ -2210,7 +2387,7 @@ pub struct SttVmBuilder {
     timeout: Duration,
     shm_size: u64,
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
-    watchdog_timeout_jiffies: Option<u64>,
+    watchdog_timeout_s: Option<u64>,
     super_perf_mode: bool,
     bpf_map_write: Option<BpfMapWriteParams>,
     performance_mode: bool,
@@ -2236,7 +2413,7 @@ impl Default for SttVmBuilder {
             timeout: Duration::from_secs(60),
             shm_size: 0,
             monitor_thresholds: None,
-            watchdog_timeout_jiffies: None,
+            watchdog_timeout_s: Some(4),
             bpf_map_write: None,
             performance_mode: false,
             super_perf_mode: false,
@@ -2325,8 +2502,8 @@ impl SttVmBuilder {
     }
 
     #[allow(dead_code)]
-    pub fn watchdog_timeout_jiffies(mut self, jiffies: u64) -> Self {
-        self.watchdog_timeout_jiffies = Some(jiffies);
+    pub fn watchdog_timeout_s(mut self, seconds: u64) -> Self {
+        self.watchdog_timeout_s = Some(seconds);
         self
     }
 
@@ -2413,7 +2590,7 @@ impl SttVmBuilder {
             timeout: self.timeout,
             shm_size: self.shm_size,
             monitor_thresholds: self.monitor_thresholds,
-            watchdog_timeout_jiffies: self.watchdog_timeout_jiffies,
+            watchdog_timeout_s: self.watchdog_timeout_s,
             bpf_map_write: self.bpf_map_write,
             performance_mode: self.performance_mode,
             pinning_plan,
@@ -2459,11 +2636,21 @@ impl SttVmBuilder {
             );
         }
 
-        // compute_pinning validates oversubscription internally,
-        // accounting for the reserved service CPU.
-        let plan = host_topo
-            .compute_pinning(t.sockets, t.cores_per_socket, t.threads_per_core, true)
+        // Reserve an LLC slot via flock so concurrent VMs pin to
+        // different LLC groups.
+        let (llc_offset, llc_lock) =
+            host_topology::acquire_llc_lock(host_topo.llc_groups.len(), t.sockets as usize);
+
+        let mut plan = host_topo
+            .compute_pinning(
+                t.sockets,
+                t.cores_per_socket,
+                t.threads_per_core,
+                true,
+                llc_offset,
+            )
             .context("performance_mode: topology mapping")?;
+        plan.llc_lock = llc_lock;
 
         // WARN: hugepages.
         let free = host_topology::hugepages_free();
@@ -2504,7 +2691,40 @@ mod tests {
     /// Serialize boot tests that create full VMs. Running multiple VMs
     /// simultaneously causes signal delivery contention (SIGRTMIN for
     /// vCPU kick) and serial output loss.
+    ///
+    /// The in-process Mutex handles `cargo test` (threads). The file
+    /// lock handles `cargo nextest` (separate processes).
     static BOOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that holds both the in-process Mutex and a file-based
+    /// flock for cross-process serialization (nextest).
+    struct BootLockGuard {
+        _mutex: std::sync::MutexGuard<'static, ()>,
+        _file: std::fs::File,
+    }
+
+    impl Drop for BootLockGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::flock(
+                    std::os::unix::io::AsRawFd::as_raw_fd(&self._file),
+                    libc::LOCK_UN,
+                );
+            }
+        }
+    }
+
+    fn acquire_boot_lock() -> BootLockGuard {
+        let mutex = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file = std::fs::File::create("/tmp/stt-vm-boot.lock").expect("create boot lock file");
+        unsafe {
+            libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX);
+        }
+        BootLockGuard {
+            _mutex: mutex,
+            _file: file,
+        }
+    }
 
     #[test]
     fn builder_default() {
@@ -2682,7 +2902,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_produces_output() {
-        let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = acquire_boot_lock();
         let Some(kernel) = crate::find_kernel() else {
             return;
         };
@@ -2705,7 +2925,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_smp_topology() {
-        let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = acquire_boot_lock();
         let Some(kernel) = crate::find_kernel() else {
             return;
         };
@@ -2728,7 +2948,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn bench_boot_time() {
-        let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = acquire_boot_lock();
         let Some(kernel) = crate::find_kernel() else {
             return;
         };
@@ -3026,7 +3246,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
-        let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = acquire_boot_lock();
         let Some(kernel) = crate::find_kernel() else {
             return;
         };
@@ -3070,7 +3290,8 @@ mod tests {
 
     #[test]
     fn base_key_different_content_differs() {
-        let tmp = std::env::temp_dir().join("stt-cache-content-test");
+        let tmp =
+            std::env::temp_dir().join(format!("stt-cache-content-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let bin = tmp.join("payload");
 
@@ -3096,16 +3317,16 @@ mod tests {
     }
 
     #[test]
-    fn hash_file_sample_large_file() {
-        let tmp = std::env::temp_dir().join("stt-hash-sample-test");
+    fn hash_file_large_file() {
+        let tmp = std::env::temp_dir().join(format!("stt-hash-sample-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("big");
         // 16KB file — exercises both head and tail sampling.
         let data: Vec<u8> = (0..16384).map(|i| (i % 256) as u8).collect();
         std::fs::write(&f, &data).unwrap();
-        let h = hash_file_sample(&f).unwrap();
+        let h = hash_file(&f).unwrap();
         // Same content should produce same hash.
-        assert_eq!(h, hash_file_sample(&f).unwrap());
+        assert_eq!(h, hash_file(&f).unwrap());
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -3245,12 +3466,18 @@ mod tests {
         assert_eq!(*m.lock(), 1);
     }
 
-    // -- builder watchdog_timeout_jiffies --
+    // -- builder watchdog_timeout_s --
 
     #[test]
-    fn builder_watchdog_timeout() {
-        let b = SttVmBuilder::default().watchdog_timeout_jiffies(5000);
-        assert_eq!(b.watchdog_timeout_jiffies, Some(5000));
+    fn builder_watchdog_timeout_default() {
+        let b = SttVmBuilder::default();
+        assert_eq!(b.watchdog_timeout_s, Some(4));
+    }
+
+    #[test]
+    fn builder_watchdog_timeout_override() {
+        let b = SttVmBuilder::default().watchdog_timeout_s(5);
+        assert_eq!(b.watchdog_timeout_s, Some(5));
     }
 
     #[test]
@@ -3564,7 +3791,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn boot_kernel_produces_output_aarch64() {
-        let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = acquire_boot_lock();
         let Some(kernel) = find_aarch64_image() else {
             eprintln!("skipping: no aarch64 Image found (only compressed vmlinuz available)");
             return;
@@ -3588,7 +3815,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn boot_kernel_smp_topology_aarch64() {
-        let _lock = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = acquire_boot_lock();
         let Some(kernel) = find_aarch64_image() else {
             eprintln!("skipping: no aarch64 Image found");
             return;

@@ -2,7 +2,97 @@ use anyhow::Result;
 use stt::assert::AssertResult;
 use stt::scenario::Ctx;
 use stt::stt_test;
-use stt::test_support::{Scheduler, SchedulerSpec};
+use stt::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
+
+fn main() {
+    let args = libtest_mimic::Arguments::from_args();
+    let presets = stt::vm::gauntlet_presets();
+    let host_llcs = stt::test_support::host_llc_count();
+    let host_topo = stt::vmm::host_topology::HostTopology::from_sysfs().ok();
+    let mut trials = Vec::new();
+
+    for entry in stt::test_support::STT_TESTS.iter() {
+        let profiles = entry
+            .scheduler
+            .generate_profiles(entry.required_flags, entry.excluded_flags);
+
+        // Base trial: runs with the entry's own topology, not ignored
+        // unless it's a demo_ test.
+        let expect_err = entry.expect_err;
+        trials.push(
+            libtest_mimic::Trial::test(entry.name.to_string(), move || {
+                match stt::test_support::run_stt_test(entry) {
+                    Ok(_) if expect_err => Err("expected error but test passed".into()),
+                    Ok(_) => Ok(()),
+                    Err(_) if expect_err => Ok(()),
+                    Err(e) => Err(format!("{e:#}").into()),
+                }
+            })
+            .with_ignored_flag(entry.name.starts_with("demo_")),
+        );
+
+        // Gauntlet variants: topology x flags, always ignored by default.
+        for preset in &presets {
+            if !stt::test_support::preset_matches(preset, entry, host_llcs) {
+                continue;
+            }
+            if let Some(ref host) = host_topo
+                && !stt::test_support::host_preset_compatible(preset, host)
+            {
+                continue;
+            }
+            let t = &preset.topology;
+            let topo_str = format!(
+                "{}s{}c{}t",
+                t.sockets, t.cores_per_socket, t.threads_per_core,
+            );
+            let cpus = t.total_cpus();
+            let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
+            let preset_name = preset.name;
+
+            for profile in &profiles {
+                let pname = profile.name();
+                let name = format!("gauntlet/{}/{}/{}", entry.name, preset_name, pname);
+                let topo_str = topo_str.clone();
+                let flags: Vec<String> = profile.flags.iter().map(|s| s.to_string()).collect();
+
+                let expect_err = entry.expect_err;
+                trials.push(
+                    libtest_mimic::Trial::test(name, move || {
+                        let (sockets, cores, threads) =
+                            stt::test_support::parse_topo_string(&topo_str)
+                                .expect("invalid topo string");
+                        let topo = stt::test_support::TopoOverride {
+                            sockets,
+                            cores,
+                            threads,
+                            memory_mb,
+                        };
+                        match stt::test_support::run_stt_test_with_topo_and_flags(
+                            entry, &topo, &flags,
+                        ) {
+                            Ok(_) if expect_err => Err("expected error but test passed".into()),
+                            Ok(_) => Ok(()),
+                            Err(_) if expect_err => Ok(()),
+                            Err(e) => Err(format!("{e:#}").into()),
+                        }
+                    })
+                    .with_ignored_flag(true),
+                );
+            }
+        }
+    }
+
+    let conclusion = libtest_mimic::run(&args, trials);
+    if let Ok(dir) = std::env::var("STT_SIDECAR_DIR") {
+        let sidecars = stt::test_support::collect_sidecars(std::path::Path::new(&dir));
+        let rows: Vec<_> = sidecars.iter().map(stt::stats::sidecar_to_row).collect();
+        if !rows.is_empty() {
+            eprintln!("{}", stt::stats::analyze_rows(&rows));
+        }
+    }
+    conclusion.exit();
+}
 
 const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
@@ -257,7 +347,7 @@ fn cover_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
 #[stt_test(
     scheduler = STT_SCHED,
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
-    watchdog_timeout_jiffies = 60000,
+    watchdog_timeout_s = 60,
     max_imbalance_ratio = 10.0,
     fail_on_stall = false,
 )]
@@ -265,575 +355,149 @@ fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::basic::custom_sched_mixed(ctx)
 }
 
-#[test]
-fn cover_watchdog_forced_stall() {
-    use stt::test_support::{SttTestEntry, run_stt_test};
+// -- watchdog forced stall (expects scheduler death) --
 
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        stt::scenario::basic::custom_sched_mixed(_ctx)
-    }
-
-    static STALL_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_FORCED_STALL: SttTestEntry = SttTestEntry {
-        name: "cover_watchdog_forced_stall",
-        func: scenario,
-        sockets: 1,
-        cores: 4,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &STALL_SCHED,
-        auto_repro: true,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &["--stall-after", "1"],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 2000,
-        bpf_map_write: None,
-        performance_mode: true,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_FORCED_STALL);
-    assert!(
-        result.is_err(),
-        "expected error from watchdog-killed scheduler"
-    );
-    let err = format!("{:#}", result.unwrap_err());
-    assert!(
-        err.contains("scheduler died")
-            || err.contains("SCHEDULER_DIED")
-            || err.contains("timed out"),
-        "expected scheduler death or timeout, got: {err}"
-    );
-    // The error must reference the test name in the stt_test error wrapper.
-    assert!(
-        err.contains("cover_watchdog_forced_stall"),
-        "error must reference the test name: {err}"
-    );
-    // With watchdog_timeout_jiffies=2000 (2s) and --stall-after 1,
-    // the stall fires at ~1s and watchdog kills at ~2s. The error
-    // should NOT reference default 5s watchdog behavior.
-    assert!(
-        !err.contains("5.0s") && !err.contains("5000ms"),
-        "error should reflect lowered watchdog timeout, not default 5s: {err}"
-    );
+fn scenario_sched_mixed(_ctx: &Ctx) -> Result<AssertResult> {
+    stt::scenario::basic::custom_sched_mixed(_ctx)
 }
 
-// -- negative: stall detection with SCX_EXIT_ERROR_STALL --
-
-#[test]
-fn neg_stall_detection_scx_exit() {
-    use stt::test_support::{SttTestEntry, run_stt_test};
-
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        stt::scenario::basic::custom_sched_mixed(_ctx)
-    }
-
-    static STALL_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_STALL_DETECT: SttTestEntry = SttTestEntry {
-        name: "neg_stall_detection_scx_exit",
-        func: scenario,
-        sockets: 1,
-        cores: 4,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &STALL_SCHED,
-        auto_repro: false,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &["--stall-after", "1"],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 3000,
-        bpf_map_write: None,
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_STALL_DETECT);
-    assert!(result.is_err(), "stalled scheduler must cause test failure");
-    let err = format!("{:#}", result.unwrap_err());
-    assert!(
-        err.contains("scheduler died")
-            || err.contains("SCHEDULER_DIED")
-            || err.contains("timed out")
-            || err.contains("stall"),
-        "expected stall-related error, got: {err}"
-    );
-    // Error must reference the test name.
-    assert!(
-        err.contains("neg_stall_detection_scx_exit"),
-        "error must reference the test name: {err}"
-    );
+fn scenario_forced_failure(_ctx: &Ctx) -> Result<AssertResult> {
+    let mut r = stt::scenario::basic::custom_sched_mixed(_ctx)?;
+    r.passed = false;
+    r.details.push("forced failure for auto-repro test".into());
+    Ok(r)
 }
 
-// -- negative: scheduler death without AssertResult --
-
-#[test]
-fn neg_sched_death_no_verify_result() {
-    use stt::test_support::{SttTestEntry, run_stt_test};
-
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        stt::scenario::basic::custom_sched_mixed(_ctx)
-    }
-
-    static DEATH_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
-        name: "neg_sched_death_no_verify_result",
-        func: scenario,
-        sockets: 1,
-        cores: 4,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &DEATH_SCHED,
-        auto_repro: true,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &["--stall-after", "1"],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 3000,
-        bpf_map_write: None,
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 10,
-        workers_per_cgroup: 0,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_SCHED_DEATH);
-    // Scheduler stalls after 1s, kernel watchdog kills it.
-    // No AssertResult is produced — the error path handles this.
-    assert!(result.is_err(), "stalled scheduler must cause failure");
-    let err = format!("{:#}", result.unwrap_err());
-    assert!(
-        err.contains("scheduler died")
-            || err.contains("SCHEDULER_DIED")
-            || err.contains("timed out"),
-        "expected scheduler death, got: {err}"
-    );
-    // Error must reference the test name.
-    assert!(
-        err.contains("neg_sched_death_no_verify_result"),
-        "error must reference the test name: {err}"
-    );
-    // The error message format from run_stt_test_inner includes
-    // "[sched=stt-sched]" or "[sched=stt_sched]" when a scheduler is set.
-    assert!(
-        err.contains("[sched="),
-        "error must include scheduler label: {err}"
-    );
-}
-
-// -- negative: auto-repro exercises attempt_auto_repro path --
-
-#[test]
-fn neg_auto_repro_on_verify_failure() {
-    use stt::test_support::{SttTestEntry, run_stt_test};
-
-    // Scenario completes normally but forces passed=false, triggering
-    // the verify-failure branch with auto_repro=true. attempt_auto_repro
-    // extracts functions from the scheduler log; a normal exit has no
-    // stack traces, so it returns None. No --stall-after: the scheduler
-    // must stay alive so the AssertResult reaches COM2.
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let mut r = stt::scenario::basic::custom_sched_mixed(_ctx)?;
-        r.passed = false;
-        r.details.push("forced failure for auto-repro test".into());
-        Ok(r)
-    }
-
-    static REPRO_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_AUTO_REPRO_VERIFY: SttTestEntry = SttTestEntry {
-        name: "neg_auto_repro_on_verify_failure",
-        func: scenario,
-        sockets: 1,
-        cores: 4,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &REPRO_SCHED,
-        auto_repro: true,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: None,
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_AUTO_REPRO_VERIFY);
-    assert!(result.is_err(), "forced failure must propagate");
-    let err = format!("{:#}", result.unwrap_err());
-    // The error must contain the forced failure detail string.
-    assert!(
-        err.contains("forced failure for auto-repro test"),
-        "error must contain the forced failure detail, got: {err}"
-    );
-    // The error wrapper format is: "stt_test 'NAME' [sched=X] failed:\n  DETAILS"
-    assert!(
-        err.contains("neg_auto_repro_on_verify_failure"),
-        "error must reference the test name: {err}"
-    );
-    assert!(
-        err.contains("failed"),
-        "error must contain 'failed' from the stt_test wrapper: {err}"
-    );
-    assert!(
-        err.contains("[sched="),
-        "error must include scheduler label: {err}"
-    );
-    // Auto-repro was attempted but returned None (no stack traces
-    // in a normal scheduler exit). Verify "auto-repro" section is
-    // NOT present — confirming attempt_auto_repro returned None.
-    assert!(
-        !err.contains("--- auto-repro ---"),
-        "auto-repro section should be absent (no crash stack in normal exit): {err}"
-    );
-}
-
-// -- negative: host-side BPF map write triggers scheduler crash --
-
-#[test]
-fn neg_crash_after_auto_repro() {
-    use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
-
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        stt::scenario::basic::custom_sched_mixed(_ctx)
-    }
-
-    static CRASH_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    /// Write crash=1 to the scheduler's .bss map after scenario starts.
-    /// `crash` is at offset 4 (after `stall`, both volatile int).
-    static BPF_CRASH: BpfMapWrite = BpfMapWrite {
-        map_name_suffix: ".bss",
-        offset: 4,
-        value: 1,
-    };
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_CRASH_AFTER: SttTestEntry = SttTestEntry {
-        name: "neg_crash_after_auto_repro",
-        func: scenario,
-        sockets: 1,
-        cores: 4,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &CRASH_SCHED,
-        auto_repro: true,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: Some(&BPF_CRASH),
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_CRASH_AFTER);
-    assert!(result.is_err(), "scheduler crash must cause test failure");
-    let err = format!("{:#}", result.unwrap_err());
-    // A scheduler crash can manifest as:
-    // - "scheduler died" — COM2 never received a result
-    // - "SCHEDULER_DIED" — exit info in guest output
-    // - "timed out" — VM timed out waiting for completion
-    // - "monitor failed" — scenario completed but post-crash stalls
-    //   triggered monitor threshold violations
-    assert!(
-        err.contains("scheduler died")
-            || err.contains("SCHEDULER_DIED")
-            || err.contains("timed out")
-            || err.contains("monitor failed"),
-        "expected scheduler death, timeout, or monitor failure, got: {err}"
-    );
-    assert!(
-        err.contains("neg_crash_after_auto_repro"),
-        "error must reference the test name: {err}"
-    );
-    assert!(
-        err.contains("[sched="),
-        "error must include scheduler label: {err}"
-    );
-}
-
-// -- demo: host-triggered crash with auto-repro pipeline --
-
-/// Demo test: triggers a scheduler crash via host-side BPF map write,
-/// then verifies auto-repro extracts stack traces and attaches probes.
-/// Run manually with `cargo test demo_bpf_crash_auto_repro -- --ignored`.
-#[ignore]
-#[test]
-fn demo_bpf_crash_auto_repro() {
-    use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
-
-    fn scenario(_ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        stt::scenario::basic::custom_sched_mixed(_ctx)
-    }
-
-    static CRASH_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    /// Write crash=1 to the scheduler's .bss map after scenario starts.
-    /// `crash` is at offset 4 (after `stall`, both volatile int).
-    static BPF_CRASH: BpfMapWrite = BpfMapWrite {
-        map_name_suffix: ".bss",
-        offset: 4,
-        value: 1,
-    };
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_DEMO_CRASH: SttTestEntry = SttTestEntry {
-        name: "demo_bpf_crash_auto_repro",
-        func: scenario,
-        sockets: 1,
-        cores: 4,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &CRASH_SCHED,
-        auto_repro: true,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: Some(&BPF_CRASH),
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_DEMO_CRASH);
-    assert!(result.is_err(), "scheduler crash must cause test failure");
-    let err = format!("{:#}", result.unwrap_err());
-
-    // The scheduler must die from the host-triggered crash.
-    assert!(
-        err.contains("scheduler died")
-            || err.contains("SCHEDULER_DIED")
-            || err.contains("timed out"),
-        "expected scheduler death or timeout, got: {err}"
-    );
-    // Auto-repro should have found stack traces and attached probes.
-    assert!(
-        err.contains("--- auto-repro ---"),
-        "auto-repro section must be present: {err}"
-    );
-}
-
-// -- demo: host-triggered crash with auto-repro (inline scenario) --
-
-/// Demo test: defines an inline yield-heavy scenario, triggers a
-/// scheduler crash via host-side BPF map write after 3 seconds, then
-/// verifies auto-repro extracts stack traces and attaches probes.
-///
-// -- host-triggered crash: validation (runs in CI) --
-
-#[test]
-fn neg_host_crash_auto_repro() {
+fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
     use std::time::Duration;
     use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-    use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
     use stt::workload::WorkType;
-
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let steps = vec![Step {
-            setup: vec![
-                CgroupDef::named("demo_workers")
-                    .work_type(WorkType::YieldHeavy)
-                    .workers(4),
-            ]
-            .into(),
-            ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_secs(8)),
-        }];
-        execute_steps(ctx, steps)
-    }
-
-    static CRASH_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    static BPF_CRASH: BpfMapWrite = BpfMapWrite {
-        map_name_suffix: ".bss",
-        offset: 4,
-        value: 1,
-    };
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_HOST_CRASH: SttTestEntry = SttTestEntry {
-        name: "neg_host_crash_auto_repro",
-        func: scenario,
-        sockets: 1,
-        cores: 4,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &CRASH_SCHED,
-        auto_repro: true,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: Some(&BPF_CRASH),
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_HOST_CRASH);
-    assert!(result.is_err(), "scheduler crash must cause test failure");
-    let err = format!("{:#}", result.unwrap_err());
-    assert!(
-        err.contains("scheduler died")
-            || err.contains("SCHEDULER_DIED")
-            || err.contains("timed out"),
-        "expected scheduler death or timeout, got: {err}"
-    );
-    assert!(
-        err.contains("--- auto-repro ---"),
-        "auto-repro section must be present: {err}"
-    );
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("demo_workers")
+                .work_type(WorkType::YieldHeavy)
+                .workers(4),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::Fixed(Duration::from_secs(8)),
+    }];
+    execute_steps(ctx, steps)
 }
 
-// -- host-triggered crash: demo (run manually to see full output) --
+static BPF_CRASH: BpfMapWrite = BpfMapWrite {
+    map_name_suffix: ".bss",
+    offset: 4,
+    value: 1,
+};
 
-/// Run manually to see the full auto-repro output:
-///   cargo test demo_host_crash_auto_repro -- --ignored --nocapture
-#[ignore]
-#[test]
-fn demo_host_crash_auto_repro() {
-    use std::time::Duration;
-    use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-    use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
-    use stt::workload::WorkType;
+use stt::test_support::SttTestEntry;
 
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let steps = vec![Step {
-            setup: vec![
-                CgroupDef::named("demo_workers")
-                    .work_type(WorkType::YieldHeavy)
-                    .workers(4),
-            ]
-            .into(),
-            ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_secs(8)),
-        }];
-        execute_steps(ctx, steps)
-    }
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_FORCED_STALL: SttTestEntry = SttTestEntry {
+    name: "cover_watchdog_forced_stall",
+    func: scenario_sched_mixed,
+    cores: 4,
+    scheduler: &STT_SCHED,
+    extra_sched_args: &["--stall-after", "1"],
+    watchdog_timeout_s: 2,
+    performance_mode: true,
+    expect_err: true,
+    ..SttTestEntry::DEFAULT
+};
 
-    static CRASH_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_STALL_DETECT: SttTestEntry = SttTestEntry {
+    name: "neg_stall_detection_scx_exit",
+    func: scenario_sched_mixed,
+    cores: 4,
+    scheduler: &STT_SCHED,
+    auto_repro: false,
+    extra_sched_args: &["--stall-after", "1"],
+    watchdog_timeout_s: 3,
+    expect_err: true,
+    ..SttTestEntry::DEFAULT
+};
 
-    static BPF_CRASH: BpfMapWrite = BpfMapWrite {
-        map_name_suffix: ".bss",
-        offset: 4,
-        value: 1,
-    };
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
+    name: "neg_sched_death_no_verify_result",
+    func: scenario_sched_mixed,
+    cores: 4,
+    scheduler: &STT_SCHED,
+    extra_sched_args: &["--stall-after", "1"],
+    watchdog_timeout_s: 3,
+    duration_s: 10,
+    expect_err: true,
+    ..SttTestEntry::DEFAULT
+};
 
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_DEMO_CRASH: SttTestEntry = SttTestEntry {
-        name: "demo_host_crash_auto_repro",
-        func: scenario,
-        sockets: 1,
-        cores: 4,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &CRASH_SCHED,
-        auto_repro: true,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: Some(&BPF_CRASH),
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
-    };
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_AUTO_REPRO_VERIFY: SttTestEntry = SttTestEntry {
+    name: "neg_auto_repro_on_verify_failure",
+    func: scenario_forced_failure,
+    cores: 4,
+    scheduler: &STT_SCHED,
+    expect_err: true,
+    ..SttTestEntry::DEFAULT
+};
 
-    let result = run_stt_test(&__STT_ENTRY_DEMO_CRASH);
-    let err = format!("{:#}", result.unwrap_err());
-    // Print the full error so the user sees the auto-repro output.
-    panic!("{err}");
-}
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_CRASH_AFTER: SttTestEntry = SttTestEntry {
+    name: "neg_crash_after_auto_repro",
+    func: scenario_sched_mixed,
+    cores: 4,
+    scheduler: &STT_SCHED,
+    bpf_map_write: Some(&BPF_CRASH),
+    expect_err: true,
+    ..SttTestEntry::DEFAULT
+};
+
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_DEMO_BPF_CRASH: SttTestEntry = SttTestEntry {
+    name: "demo_bpf_crash_auto_repro",
+    func: scenario_sched_mixed,
+    cores: 4,
+    scheduler: &STT_SCHED,
+    bpf_map_write: Some(&BPF_CRASH),
+    ..SttTestEntry::DEFAULT
+};
+
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_HOST_CRASH: SttTestEntry = SttTestEntry {
+    name: "neg_host_crash_auto_repro",
+    func: scenario_yield_heavy,
+    cores: 4,
+    scheduler: &STT_SCHED,
+    bpf_map_write: Some(&BPF_CRASH),
+    expect_err: true,
+    ..SttTestEntry::DEFAULT
+};
+
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_DEMO_HOST_CRASH: SttTestEntry = SttTestEntry {
+    name: "demo_host_crash_auto_repro",
+    func: scenario_yield_heavy,
+    cores: 4,
+    scheduler: &STT_SCHED,
+    bpf_map_write: Some(&BPF_CRASH),
+    ..SttTestEntry::DEFAULT
+};
 
 // -- monitor evaluation path with default thresholds --
 
 #[stt_test(
     scheduler = STT_SCHED,
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
-    watchdog_timeout_jiffies = 60000,
+    watchdog_timeout_s = 60,
     max_imbalance_ratio = 20.0,
     sustained_samples = 15,
 )]

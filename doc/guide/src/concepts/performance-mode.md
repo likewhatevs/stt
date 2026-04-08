@@ -103,21 +103,8 @@ isolation, starvation detection) where pass/fail is binary.
 
 The gauntlet runs many VMs in parallel. Performance mode on
 parallel VMs can oversubscribe the host if scheduled naively.
-`cargo stt test` handles this automatically (see below). For
-gauntlet sweeps, avoid `performance_mode` unless the host has
-enough CPUs for the topology matrix.
-
-## Automatic concurrency scheduling
-
-`cargo stt test` generates a nextest tool config that assigns
-`threads-required` to each `performance_mode` test based on host LLC
-topology. The formula sums the actual CPU count of each LLC group used
-by the test's virtual sockets, plus one for the service CPU:
-`sum(llc_groups[i].cpus.len() for i in 0..sockets) + 1`. This handles
-asymmetric LLC sizes correctly. Nextest uses this to limit concurrency
-so pinned vCPU LLC groups never overlap on the host. Falls back to
-`vcpus + 1` when host topology is unavailable. Non-performance tests
-are unaffected and run at full parallelism.
+Avoid `performance_mode` unless the host has enough CPUs for the
+topology matrix.
 
 ## Two dimensions
 
@@ -145,12 +132,8 @@ sums the actual CPU count of each LLC group and checks the total
 (plus service CPU) fits within the host's online CPUs.
 
 `super_perf_mode` validates at build time that sufficient LLC groups
-exist for the test topology. Scheduling reserves the LLC groups' total
-CPU count via nextest `threads-required`, which prevents overcommit
-but does not enforce per-LLC mutual exclusion between concurrent tests.
-Both modes apply the same runtime optimizations (pinning, hugepages,
-NUMA mbind, RT scheduling) and the same LLC-aware `threads-required`
-formula.
+exist for the test topology. Both modes apply the same runtime
+optimizations (pinning, hugepages, NUMA mbind, RT scheduling).
 
 ```rust,ignore
 #[stt_test(

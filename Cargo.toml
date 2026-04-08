@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "stt-macros", "stt-sched", "cargo-stt"]
+members = [".", "stt-macros", "stt-sched"]
 
 [package]
 name = "stt"
@@ -55,5 +55,24 @@ integration = []
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
 
+[dev-dependencies]
+libtest-mimic = "0.8"
+
 [build-dependencies]
 libbpf-cargo = "0.26"
+
+[[test]]
+name = "stt_sched_tests"
+harness = false
+
+[[test]]
+name = "scenario_coverage"
+harness = false
+
+[[test]]
+name = "assert_gate_matrix"
+harness = false
+
+[[test]]
+name = "verifier_pipeline"
+harness = false

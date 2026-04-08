@@ -3,7 +3,7 @@
 ## Basic invocation
 
 ```sh
-cargo stt vm --sockets 2 --cores 4 --threads 2 \
+stt vm --sockets 2 --cores 4 --threads 2 \
   -- cgroup_steady --duration-s 30
 ```
 
@@ -20,8 +20,7 @@ the test scenarios (names, flags, duration).
 | `--memory-mb N` | 4096 | VM memory |
 | `--kernel PATH` | -- | Kernel image (falls back to `/boot/vmlinuz` if neither `--kernel` nor `--kernel-dir` is set) |
 | `--kernel-dir PATH` | -- | Linux source tree (uses `arch/x86/boot/bzImage`) |
-| `-p, --package PKG` | -- | Build scheduler from cargo package and inject |
-| `--scheduler-bin PATH` | -- | Scheduler binary to inject (direct path, skips build) |
+| `--scheduler-bin PATH` | -- | Scheduler binary to inject |
 
 ## Run arguments (after --)
 
@@ -41,6 +40,6 @@ the test scenarios (names, flags, duration).
 Run one scenario with specific flags and a longer duration:
 
 ```sh
-cargo stt vm --sockets 2 --cores 4 --threads 2 \
+stt vm --sockets 2 --cores 4 --threads 2 \
   -- cgroup_cpuset_crossllc_race --flags=llc,rebal --duration-s 60
 ```

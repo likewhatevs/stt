@@ -18,15 +18,12 @@ volatile int stall;
  * via BPF map write to the .bss section. */
 volatile int crash;
 
-/* When non-zero, stt_dispatch skips 63 out of 64 calls and
- * burns ~5ms via bpf_loop on the 64th before dispatching.
- * Uses SCX_SLICE_DFL so the scheduler process stays alive
- * (1us timeslice causes ~1M dispatch/s/CPU which starves
- * userspace). The combination of skipped dispatches plus
- * the 5ms delay on every 64th call produces scheduling gaps
- * above the test's max_gap_ms(50) threshold.
- * const volatile (.rodata) so the verifier prunes the
- * bpf_loop path when degrade=0. Set via rodata before load. */
+/* When non-zero, stt_enqueue inserts tasks onto a random online
+ * CPU's local DSQ and stt_dispatch skips every other call.
+ * Random placement drives up migrations; skipped dispatches
+ * reduce throughput. Slows scheduling without stalling.
+ * const volatile (.rodata) so the verifier prunes the path
+ * when degrade=0. Set via rodata before load. */
 const volatile int degrade = 0;
 
 /* When non-zero, stt_dispatch performs an out-of-bounds map
@@ -46,6 +43,21 @@ const volatile int scattershot = 0;
  * spin of --degrade. Mutually exclusive with scattershot (see above). */
 const volatile int slow = 0;
 
+/* When non-zero, stt_dispatch contains an infinite loop that the
+ * BPF verifier rejects. The verifier traces the back-edge at the
+ * same instruction addresses each iteration, producing repetitive
+ * output that collapse_cycles() compresses. libbpf prints the
+ * verifier log to stderr on load failure.
+ * const volatile (.rodata) so the verifier prunes the path when
+ * verify_loop=0. Set via rodata before load. */
+const volatile int verify_loop = 0;
+
+/* Runtime-mutable degrade flag. Set from userspace via .bss map write,
+ * --degrade-after timer, or /tmp/stt_degrade sentinel. Same behavior
+ * as const volatile degrade: random enqueue + skip 1/2 dispatches.
+ * volatile (.bss) so the verifier always verifies the path. */
+volatile int degrade_rt;
+
 /* Skip 3 out of 4 dispatches (mask 0x3 = skip when any of low 2
  * bits set). Not configurable from CLI — fixed ratio. */
 #define SLOW_SKIP_MASK 0x3
@@ -53,15 +65,10 @@ const volatile int slow = 0;
 u32 degrade_cnt;
 u32 slow_cnt;
 
-static int degrade_spin_cb(u32 idx, void *ctx)
-{
-	u64 *deadline = ctx;
-	return bpf_ktime_get_ns() >= *deadline ? 1 : 0;
-}
 
 void BPF_STRUCT_OPS(stt_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	if (scattershot) {
+	if (scattershot || degrade || degrade_rt) {
 		const struct cpumask *online;
 		u32 nr = scx_bpf_nr_cpu_ids();
 		u32 cpu;
@@ -85,18 +92,21 @@ void BPF_STRUCT_OPS(stt_dispatch, s32 cpu, struct task_struct *prev)
 		scx_bpf_error("stt: host-triggered crash");
 	if (stall)
 		return;
+	if (degrade || degrade_rt) {
+		/* Skip half of dispatches. Tasks stay in the shared DSQ
+		 * longer, slowing throughput without fully stalling. */
+		if (++degrade_cnt & 1)
+			return;
+	}
+	if (verify_loop) {
+		volatile u32 acc = 0;
+		while (1)
+			acc += bpf_ktime_get_ns();
+	}
 	if (fail_verify) {
-		/* Unbounded pointer arithmetic — verifier rejects this. */
+		/* Null pointer dereference — verifier rejects this. */
 		volatile int *p = (volatile int *)0;
 		*p = 1;
-	}
-	if (degrade) {
-		if (++degrade_cnt & 0x3F)
-			return;
-		{
-			u64 deadline = bpf_ktime_get_ns() + 5000000ULL;
-			bpf_loop(1 << 20, degrade_spin_cb, &deadline, 0);
-		}
 	}
 	if (slow) {
 		if (++slow_cnt & SLOW_SKIP_MASK)

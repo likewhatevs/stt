@@ -44,11 +44,7 @@
 //! }
 //! ```
 //!
-//! Run with `cargo test` (requires `/dev/kvm`), or via the CLI:
-//!
-//! ```sh
-//! cargo stt test --filter my_scheduler_test
-//! ```
+//! Run with `cargo nextest run` (requires `/dev/kvm`).
 //!
 //! See the [`prelude`] module for the full set of re-exports.
 //!
@@ -99,9 +95,8 @@ pub mod stats;
 pub mod test_support;
 pub mod timeline;
 pub mod topology;
-/// Backward-compatible module alias.
-#[doc(hidden)]
-pub use assert as verify;
+
+pub mod verifier;
 pub mod vm;
 pub mod vmm;
 pub mod workload;
@@ -127,9 +122,6 @@ pub mod prelude {
     pub use crate::scenario::{CgroupGroup, Ctx};
     pub use crate::stt_test;
     pub use crate::test_support::{Scheduler, SchedulerSpec};
-    // Backward-compatible aliases
-    #[doc(hidden)]
-    pub use crate::assert::{VerificationPlan, Verify, VerifyResult};
     pub use crate::workload::{
         WorkProgram, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle,
     };
@@ -177,6 +169,43 @@ pub fn find_kernel() -> Option<std::path::PathBuf> {
     candidates
         .into_iter()
         .find(|p| std::fs::File::open(p).is_ok())
+}
+
+/// Build a cargo binary package and return its output path.
+pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf> {
+    let output = std::process::Command::new("cargo")
+        .args(["build", "-p", package, "--message-format=json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| anyhow::anyhow!("cargo build: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("cargo build -p {package} failed:\n{stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line)
+            && msg.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact")
+            && msg
+                .get("profile")
+                .and_then(|p| p.get("test"))
+                .and_then(|t| t.as_bool())
+                == Some(false)
+            && msg
+                .get("target")
+                .and_then(|t| t.get("kind"))
+                .and_then(|k| k.as_array())
+                .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("bin")))
+            && let Some(filenames) = msg.get("filenames").and_then(|f| f.as_array())
+            && let Some(path) = filenames.first().and_then(|f| f.as_str())
+        {
+            return Ok(std::path::PathBuf::from(path));
+        }
+    }
+    anyhow::bail!("no binary artifact found for package '{package}'")
 }
 
 /// Resolve the current executable path, falling back to `/proc/self/exe`

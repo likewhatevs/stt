@@ -31,7 +31,7 @@ cgroups, forks workers, and executes test scenarios.
 ## Quick taste
 
 ```sh
-cargo stt vm --sockets 2 --cores 4 --threads 2 \
+stt vm --sockets 2 --cores 4 --threads 2 \
     -- cgroup_steady --duration-s 10
 [stt] booting VM: 2s4c2t (16 cpus), 4096 MB
 [stt] running: cgroup_steady/default
@@ -51,7 +51,7 @@ cargo stt vm --sockets 2 --cores 4 --threads 2 \
 
 ## BPF verifier analysis
 
-`cargo stt verifier` boots a scheduler in a VM and captures per-program
+`stt verifier` boots a scheduler in a VM and captures per-program
 verifier output from the real kernel verifier. The scheduler binary
 loads each BPF program inside the VM with `BPF_LOG_STATS` enabled --
 there is no host-side BPF loading. Per-program statistics include
@@ -109,22 +109,6 @@ The prelude also exports ops types (`CgroupDef`, `CpusetSpec`,
 `Step`, `execute_steps`), `Assert` for composable assertions
 config, and `WorkerReport` for telemetry access.
 
-## Two binaries
-
-stt ships two binaries:
-
-- **`stt`** -- core binary. Hosts the VM manager, guest-side test
-  runner, kernel build tools (`stt kernel build`), topology display
-  (`stt topo`), and crash probe (`stt probe`).
-- **`cargo-stt`** -- cargo plugin. Adds test discovery, scheduler
-  builds, and gauntlet orchestration on top of `stt`. Provides
-  `cargo stt vm`, `cargo stt test`, `cargo stt gauntlet`,
-  `cargo stt list`, `cargo stt topo`, `cargo stt probe`, and
-  `cargo stt verifier`.
-
-See [CLI Reference](cli-reference.md) for the complete subcommand
-listing.
-
 ## Crate structure
 
 | Crate | Purpose |
@@ -132,4 +116,6 @@ listing.
 | `stt` | Core library and CLI binary |
 | `stt-macros` | `#[stt_test]` proc macro |
 | `stt-sched` | Minimal BPF scheduler for testing |
-| `cargo-stt` | Cargo plugin (`cargo stt vm`, `cargo stt test`, `cargo stt gauntlet`, `cargo stt list`, `cargo stt topo`, `cargo stt probe`, `cargo stt verifier`) |
+
+See [CLI Reference](cli-reference.md) for the complete subcommand
+listing.

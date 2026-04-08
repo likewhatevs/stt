@@ -426,6 +426,10 @@ pub struct Ctx<'a> {
     pub settle_ms: u64,
     /// Override work type for scenarios that use `CpuSpin` by default.
     pub work_type_override: Option<WorkType>,
+    /// Merged assertion config (default_checks + scheduler + per-test).
+    /// Used by `execute_steps` as the default when no explicit checks
+    /// are passed to `execute_steps_with`.
+    pub assert: crate::assert::Assert,
 }
 
 /// Run a scenario. Returns assertion result.
@@ -513,9 +517,6 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         h.start();
     }
 
-    // Host-level noise disabled - was causing scheduler stalls in no-ctrl mode
-    // TODO: investigate why forked host noise workers cause "No queueing decisions"
-
     tracing::debug!(duration_s = ctx.duration.as_secs(), "running workload");
 
     // Poll scheduler liveness during the workload phase instead of a
@@ -536,7 +537,6 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     if !sched_dead {
         sched_dead = !process_alive(ctx.sched_pid);
     }
-    // host noise disabled
 
     let mut result = AssertResult::pass();
     for (i, h) in handles.into_iter().enumerate() {
@@ -1113,6 +1113,7 @@ mod tests {
             sched_pid: 0,
             settle_ms: 3000,
             work_type_override: None,
+            assert: assert::Assert::default_checks(),
         };
         let (a, b) = split_half(&ctx);
         // Last CPU reserved for cgroup 0 → 7 usable, split 3/4
@@ -1132,6 +1133,7 @@ mod tests {
             sched_pid: 0,
             settle_ms: 3000,
             work_type_override: None,
+            assert: assert::Assert::default_checks(),
         };
         let (a, b) = split_half(&ctx);
         assert_eq!(a.len() + b.len(), 2);
@@ -1149,6 +1151,7 @@ mod tests {
             sched_pid: 0,
             settle_ms: 3000,
             work_type_override: None,
+            assert: assert::Assert::default_checks(),
         };
         let wl = dfl_wl(&ctx);
         assert_eq!(wl.num_workers, 7);

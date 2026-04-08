@@ -60,7 +60,9 @@ memory (per-CPU runqueue structs via BTF offsets) and evaluates:
   consecutive samples. CPUs with `rq_clock == 0` are excluded (not
   yet initialized). Idle CPUs (`nr_running == 0` in both samples) are
   also excluded -- the kernel stops the tick (NOHZ) on idle CPUs, so
-  `rq_clock` legitimately does not advance. Stalls use the same
+  `rq_clock` legitimately does not advance. Preempted vCPUs are also excluded -- when the vCPU thread's
+  CPU time didn't advance past the preemption threshold, the host
+  preempted the vCPU. Stalls use the same
   `sustained_samples` window as other monitor checks.
 - **Event rates**: scx fallback and keep-last event counters.
 
@@ -141,7 +143,7 @@ instrumented builds.
 |---|---|---|
 | `max_imbalance_ratio` | 4.0 | Max/min `nr_running` across CPUs. Lower values (2-3) false-positive during cpuset transitions. |
 | `max_local_dsq_depth` | 50 | Per-CPU dispatch queue overflow. Sustained depth above this means the scheduler is not consuming dispatched tasks. |
-| `fail_on_stall` | true | Fail when `rq_clock` does not advance on a CPU with runnable tasks. Idle CPUs (NOHZ) are exempt. |
+| `fail_on_stall` | true | Fail when `rq_clock` does not advance on a CPU with runnable tasks. Idle CPUs (NOHZ) and preempted vCPUs are exempt. |
 | `sustained_samples` | 5 | At ~100ms sample interval, requires ~500ms of sustained violation. Filters transient spikes from cpuset reconfiguration. |
 | `max_fallback_rate` | 200.0/s | `select_cpu_fallback` events per second across all CPUs. Sustained rate indicates systematic `select_cpu` failure. |
 | `max_keep_last_rate` | 100.0/s | `dispatch_keep_last` events per second across all CPUs. Sustained rate indicates dispatch starvation. |

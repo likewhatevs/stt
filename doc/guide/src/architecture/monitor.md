@@ -47,12 +47,16 @@ transitions and cgroup creation/destruction.
 ### Stall detection
 
 A stall is detected when a CPU's `rq_clock` does not advance between
-consecutive samples. Two exemptions prevent false positives:
+consecutive samples. Three exemptions prevent false positives:
 
 - **Idle CPUs**: when `nr_running == 0` in both the current and previous
   sample, the CPU has no runnable tasks. The kernel stops the tick
   (NOHZ) on idle CPUs, so `rq_clock` legitimately does not advance.
   These CPUs are excluded from stall checks.
+
+- **Preempted vCPUs**: when the vCPU thread's CPU time did not advance
+  past the preemption threshold between samples, the host preempted the
+  vCPU. These samples are excluded from stall checks.
 
 - **Sustained window**: stall detection uses per-CPU consecutive
   counters and the `sustained_samples` threshold, matching how

@@ -51,7 +51,7 @@ without `llc` is rejected.
 From the CLI, pass `--flags=borrow,rebal`:
 
 ```sh
-cargo stt vm --sockets 2 --cores 4 --threads 2 \
+stt vm --sockets 2 --cores 4 --threads 2 \
   -- cgroup_steady --flags=borrow,rebal
 ```
 

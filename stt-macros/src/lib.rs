@@ -69,11 +69,13 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut min_llcs: u32 = 1;
     let mut requires_smt: bool = false;
     let mut min_cpus: u32 = 1;
-    let mut watchdog_timeout_jiffies: u64 = 0;
+    let mut watchdog_timeout_s: u64 = 4;
     let mut performance_mode: bool = false;
     let mut super_perf_mode: bool = false;
-    let mut duration_s: u64 = 0;
-    let mut workers_per_cgroup: u32 = 0;
+    let mut duration_s: u64 = 2;
+    let mut workers_per_cgroup: u32 = 2;
+    let mut bpf_map_write: Option<syn::Path> = None;
+    let mut expect_err: bool = false;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -107,8 +109,22 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         scheduler = Some(p);
                     }
+                    "bpf_map_write" => {
+                        let p = match value {
+                            syn::Expr::Path(ep) => ep.path.clone(),
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected path for bpf_map_write (e.g. BPF_CRASH)",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        bpf_map_write = Some(p);
+                    }
                     "auto_repro" | "not_starved" | "isolation" | "performance_mode"
-                    | "super_perf_mode" | "requires_smt" => {
+                    | "super_perf_mode" | "requires_smt" | "expect_err" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -130,6 +146,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "performance_mode" => performance_mode = lit_bool.value(),
                             "super_perf_mode" => super_perf_mode = lit_bool.value(),
                             "requires_smt" => requires_smt = lit_bool.value(),
+                            "expect_err" => expect_err = lit_bool.value(),
                             _ => unreachable!(),
                         }
                     }
@@ -140,7 +157,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "replicas"
                     | "sustained_samples"
                     | "max_gap_ms"
-                    | "watchdog_timeout_jiffies"
+                    | "watchdog_timeout_s"
                     | "duration_s"
                     | "workers_per_cgroup"
                     | "max_local_dsq_depth"
@@ -199,8 +216,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         .unwrap_or_else(|e| panic!("{e}")),
                                 )
                             }
-                            "watchdog_timeout_jiffies" => {
-                                watchdog_timeout_jiffies = lit_int
+                            "watchdog_timeout_s" => {
+                                watchdog_timeout_s = lit_int
                                     .base10_parse::<u64>()
                                     .unwrap_or_else(|e| panic!("{e}"))
                             }
@@ -340,7 +357,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_jiffies, performance_mode, super_perf_mode, duration_s, workers_per_cgroup"),
+                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_s, performance_mode, super_perf_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
                         )
                         .to_compile_error()
                         .into();
@@ -473,6 +490,25 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         performance_mode = true;
     }
 
+    let bpf_map_write_tokens = match &bpf_map_write {
+        Some(p) => quote! { Some(&#p) },
+        None => quote! { None },
+    };
+
+    let test_body = if expect_err {
+        quote! {
+            let result = ::stt::test_support::run_stt_test(&#entry_name);
+            assert!(
+                result.is_err(),
+                "expected test to fail but it passed",
+            );
+        }
+    } else {
+        quote! {
+            ::stt::test_support::run_stt_test(&#entry_name).unwrap();
+        }
+    };
+
     let expanded = quote! {
         #(#attrs)*
         #vis #inner_sig #block
@@ -514,17 +550,18 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             min_llcs: #min_llcs,
             requires_smt: #requires_smt,
             min_cpus: #min_cpus,
-            watchdog_timeout_jiffies: #watchdog_timeout_jiffies,
-            bpf_map_write: None,
+            watchdog_timeout_s: #watchdog_timeout_s,
+            bpf_map_write: #bpf_map_write_tokens,
             performance_mode: #performance_mode,
             super_perf_mode: #super_perf_mode,
             duration_s: #duration_s,
             workers_per_cgroup: #workers_per_cgroup,
+            expect_err: #expect_err,
         };
 
         #[test]
         fn #orig_name() {
-            ::stt::test_support::run_stt_test(&#entry_name).unwrap();
+            #test_body
         }
     };
 

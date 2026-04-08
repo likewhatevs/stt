@@ -8,7 +8,7 @@ investigation: auto-repro and manual probe.
 Run a scenario with `--auto-repro`:
 
 ```sh
-cargo stt vm --sockets 2 --cores 4 --threads 2 \
+stt vm --sockets 2 --cores 4 --threads 2 \
   --scheduler-bin ./target/release/scx_my_scheduler \
   -- cgroup_steady --flags=llc,borrow --auto-repro
 ```
@@ -29,25 +29,25 @@ disabled so the scheduler stays alive for BPF probes.
 If you have a crash stack from dmesg:
 
 ```sh
-cargo stt probe --dmesg
+stt probe --dmesg
 ```
 
 Or from a file:
 
 ```sh
-cargo stt probe crash_stack.txt
+stt probe crash_stack.txt
 ```
 
 Specify functions directly:
 
 ```sh
-cargo stt probe --functions "scx_bpf_dispatch,put_prev_task_scx"
+stt probe --functions "scx_bpf_dispatch,put_prev_task_scx"
 ```
 
 Add `--kernel-dir` for source-level symbolization:
 
 ```sh
-cargo stt probe --dmesg --kernel-dir ../linux
+stt probe --dmesg --kernel-dir ../linux
 ```
 
 ## Reading the output

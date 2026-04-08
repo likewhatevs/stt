@@ -5,6 +5,96 @@ use stt::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
 use stt::stt_test;
 use stt::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
+fn main() {
+    let args = libtest_mimic::Arguments::from_args();
+    let presets = stt::vm::gauntlet_presets();
+    let host_llcs = stt::test_support::host_llc_count();
+    let host_topo = stt::vmm::host_topology::HostTopology::from_sysfs().ok();
+    let mut trials = Vec::new();
+
+    for entry in stt::test_support::STT_TESTS.iter() {
+        let profiles = entry
+            .scheduler
+            .generate_profiles(entry.required_flags, entry.excluded_flags);
+
+        // Base trial: runs with the entry's own topology, not ignored
+        // unless it's a demo_ test.
+        let expect_err = entry.expect_err;
+        trials.push(
+            libtest_mimic::Trial::test(entry.name.to_string(), move || {
+                match stt::test_support::run_stt_test(entry) {
+                    Ok(_) if expect_err => Err("expected error but test passed".into()),
+                    Ok(_) => Ok(()),
+                    Err(_) if expect_err => Ok(()),
+                    Err(e) => Err(format!("{e:#}").into()),
+                }
+            })
+            .with_ignored_flag(entry.name.starts_with("demo_")),
+        );
+
+        // Gauntlet variants: topology x flags, always ignored by default.
+        for preset in &presets {
+            if !stt::test_support::preset_matches(preset, entry, host_llcs) {
+                continue;
+            }
+            if let Some(ref host) = host_topo
+                && !stt::test_support::host_preset_compatible(preset, host)
+            {
+                continue;
+            }
+            let t = &preset.topology;
+            let topo_str = format!(
+                "{}s{}c{}t",
+                t.sockets, t.cores_per_socket, t.threads_per_core,
+            );
+            let cpus = t.total_cpus();
+            let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
+            let preset_name = preset.name;
+
+            for profile in &profiles {
+                let pname = profile.name();
+                let name = format!("gauntlet/{}/{}/{}", entry.name, preset_name, pname);
+                let topo_str = topo_str.clone();
+                let flags: Vec<String> = profile.flags.iter().map(|s| s.to_string()).collect();
+
+                let expect_err = entry.expect_err;
+                trials.push(
+                    libtest_mimic::Trial::test(name, move || {
+                        let (sockets, cores, threads) =
+                            stt::test_support::parse_topo_string(&topo_str)
+                                .expect("invalid topo string");
+                        let topo = stt::test_support::TopoOverride {
+                            sockets,
+                            cores,
+                            threads,
+                            memory_mb,
+                        };
+                        match stt::test_support::run_stt_test_with_topo_and_flags(
+                            entry, &topo, &flags,
+                        ) {
+                            Ok(_) if expect_err => Err("expected error but test passed".into()),
+                            Ok(_) => Ok(()),
+                            Err(_) if expect_err => Ok(()),
+                            Err(e) => Err(format!("{e:#}").into()),
+                        }
+                    })
+                    .with_ignored_flag(true),
+                );
+            }
+        }
+    }
+
+    let conclusion = libtest_mimic::run(&args, trials);
+    if let Ok(dir) = std::env::var("STT_SIDECAR_DIR") {
+        let sidecars = stt::test_support::collect_sidecars(std::path::Path::new(&dir));
+        let rows: Vec<_> = sidecars.iter().map(stt::stats::sidecar_to_row).collect();
+        if !rows.is_empty() {
+            eprintln!("{}", stt::stats::analyze_rows(&rows));
+        }
+    }
+    conclusion.exit();
+}
+
 const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
 #[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 2, threads = 1, sustained_samples = 15)]
@@ -52,70 +142,36 @@ fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-/// Integration test for the host-side BPF map API.
-///
-/// Boots a VM with stt-sched, uses bpf_map_write to exercise
-/// BpfMapAccessorOwned::new() -> maps() -> find_map() ->
-/// read_value_u32() -> write_value_u32() end-to-end. Writes
-/// stall=0 (no-op) to confirm the pipeline works without
-/// disrupting the scheduler.
-#[test]
-fn sched_bpf_map_api_integration() {
-    use stt::test_support::{SttTestEntry, run_stt_test};
-
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let steps = vec![Step {
-            setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
-            ops: vec![],
-            hold: HoldSpec::Frac(1.0),
-        }];
-        execute_steps(ctx, steps)
-    }
-
-    /// Write stall=0 to the .bss map after scenario starts.
-    /// stall is at offset 0, already 0 — this is a no-op write
-    /// that exercises the full BPF map API pipeline.
-    static BPF_NOOP: BpfMapWrite = BpfMapWrite {
-        map_name_suffix: ".bss",
-        offset: 0,
-        value: 0,
-    };
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_BPF_API: SttTestEntry = SttTestEntry {
-        name: "sched_bpf_map_api_integration",
-        func: scenario,
-        sockets: 1,
-        cores: 2,
-        threads: 1,
-        memory_mb: 1024,
-        scheduler: &STT_SCHED,
-        auto_repro: false,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE.fail_on_stall(false),
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: Some(&BPF_NOOP),
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 0,
-        workers_per_cgroup: 0,
-    };
-
-    // The bpf_map_write thread exercises the full API:
-    // BpfMapAccessorOwned::new(), maps(), find_map(".bss"),
-    // read_value_u32(), write_value_u32().
-    // If any step fails, it logs to stderr but doesn't fail the test.
-    // The test passes if the scheduler runs normally through the scenario.
-    run_stt_test(&__STT_ENTRY_BPF_API).unwrap();
+fn scenario_bpf_api(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0),
+    }];
+    execute_steps(ctx, steps)
 }
+
+/// Write stall=0 to the .bss map after scenario starts.
+/// stall is at offset 0, already 0 — this is a no-op write
+/// that exercises the full BPF map API pipeline.
+static BPF_NOOP: BpfMapWrite = BpfMapWrite {
+    map_name_suffix: ".bss",
+    offset: 0,
+    value: 0,
+};
+
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_BPF_API: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
+    name: "sched_bpf_map_api_integration",
+    func: scenario_bpf_api,
+    scheduler: &STT_SCHED,
+    auto_repro: false,
+    assert: stt::assert::Assert::NONE.fail_on_stall(false),
+    bpf_map_write: Some(&BPF_NOOP),
+    duration_s: 10,
+    ..stt::test_support::SttTestEntry::DEFAULT
+};
 
 /// Positive benchmarking test: stt-sched under performance_mode passes
 /// min_iteration_rate and max_gap_ms gates.
@@ -142,362 +198,179 @@ fn sched_perf_positive(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-/// Negative benchmarking test: stt-sched with --degrade skips 63 out
-/// of 64 dispatch calls and burns ~5ms via bpf_loop on the 64th.
-/// With 4 workers on 2 CPUs, skipped dispatches plus the periodic
-/// delay produce scheduling gaps that exceed the max_gap_ms(50) threshold.
-#[test]
-fn sched_perf_negative() {
+fn scenario_perf_negative(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
     use stt::scenario::ops::execute_steps_with;
-    use stt::test_support::{SttTestEntry, run_stt_test};
-
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let checks = stt::assert::Assert::default_checks().max_gap_ms(50);
-        let steps = vec![Step {
-            setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
-            ops: vec![],
-            hold: HoldSpec::Frac(1.0),
-        }];
-        execute_steps_with(ctx, steps, Some(&checks))
-    }
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_PERF_NEG: SttTestEntry = SttTestEntry {
-        name: "sched_perf_negative",
-        func: scenario,
-        sockets: 1,
-        cores: 2,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &STT_SCHED,
-        auto_repro: false,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &["--degrade"],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: None,
-        performance_mode: true,
-        super_perf_mode: false,
-        duration_s: 5,
-        workers_per_cgroup: 4,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_PERF_NEG);
-    assert!(
-        result.is_err(),
-        "degraded scheduler should fail benchmarking gates, but test passed"
-    );
-    let err_msg = format!("{:#}", result.unwrap_err());
-    assert!(
-        err_msg.contains("stuck") || err_msg.contains("failed"),
-        "error should indicate degraded scheduling: {err_msg}"
-    );
+    let checks = stt::assert::Assert::default_checks().max_gap_ms(50);
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0),
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
 }
 
-/// Showcase: --scattershot dispatches tasks to random CPUs, causing
-/// cross-LLC migrations. The scenario asserts that total migrations
-/// are non-zero — random CPU placement guarantees cross-CPU movement
-/// with 4 workers across 4 CPUs.
-///
-/// Run manually: `cargo test sched_scattershot_migration_regression -- --ignored --nocapture`
-#[ignore]
-#[test]
-fn sched_scattershot_migration_regression() {
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_PERF_NEG: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
+    name: "sched_perf_negative",
+    func: scenario_perf_negative,
+    scheduler: &STT_SCHED,
+    auto_repro: false,
+    extra_sched_args: &["--degrade"],
+    performance_mode: true,
+    duration_s: 5,
+    workers_per_cgroup: 4,
+    expect_err: true,
+    ..stt::test_support::SttTestEntry::DEFAULT
+};
+
+fn scenario_scattershot(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
     use stt::scenario::ops::execute_steps_with;
-    use stt::test_support::{SttTestEntry, run_stt_test};
-
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let checks = stt::assert::Assert::default_checks()
-            .max_gap_ms(10000)
-            .max_spread_pct(80.0);
-        let steps = vec![Step {
-            setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
-            ops: vec![],
-            hold: HoldSpec::Frac(1.0),
-        }];
-        execute_steps_with(ctx, steps, Some(&checks))
-    }
-
-    const SCATTER_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_SCATTER: SttTestEntry = SttTestEntry {
-        name: "sched_scattershot_migration_regression",
-        func: scenario,
-        sockets: 2,
-        cores: 2,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &SCATTER_SCHED,
-        auto_repro: false,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &["--scattershot"],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: None,
-        performance_mode: true,
-        super_perf_mode: false,
-        duration_s: 5,
-        workers_per_cgroup: 4,
-    };
-
-    let assert_result =
-        run_stt_test(&__STT_ENTRY_SCATTER).expect("scattershot scenario should pass");
-    let total_migrations: u64 = assert_result
-        .stats
-        .cgroups
-        .iter()
-        .map(|c| c.total_migrations)
-        .sum();
-    assert!(
-        total_migrations > 0,
-        "scattershot should cause migrations, got 0",
-    );
+    let checks = stt::assert::Assert::default_checks()
+        .max_gap_ms(10000)
+        .max_spread_pct(80.0);
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0),
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
 }
 
-/// Showcase: --slow skips 3/4 of dispatch calls, creating throughput
-/// degradation detectable by the min_iteration_rate gate.
-///
-/// Run manually: `cargo test sched_throughput_regression -- --ignored --nocapture`
-#[ignore]
-#[test]
-fn sched_throughput_regression() {
+const SCATTER_SCHED: Scheduler =
+    Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
+
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_SCATTER: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
+    name: "demo_scattershot_migration",
+    func: scenario_scattershot,
+    sockets: 2,
+    scheduler: &SCATTER_SCHED,
+    extra_sched_args: &["--scattershot"],
+    performance_mode: true,
+    duration_s: 5,
+    workers_per_cgroup: 4,
+    ..stt::test_support::SttTestEntry::DEFAULT
+};
+
+fn scenario_throughput_regression(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
     use stt::scenario::ops::execute_steps_with;
-    use stt::test_support::{SttTestEntry, run_stt_test};
-
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        // CpuSpin workers do ~50K-300K iterations/sec on modern hardware.
-        // 5000/s is well below normal but detects the throughput collapse
-        // from --slow skipping 3/4 of dispatch calls.
-        let checks = stt::assert::Assert::default_checks()
-            .min_iteration_rate(5000.0)
-            .max_gap_ms(500);
-        let steps = vec![Step {
-            setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
-            ops: vec![],
-            hold: HoldSpec::Frac(1.0),
-        }];
-        execute_steps_with(ctx, steps, Some(&checks))
-    }
-
-    const SLOW_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_SLOW: SttTestEntry = SttTestEntry {
-        name: "sched_throughput_regression",
-        func: scenario,
-        sockets: 1,
-        cores: 2,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &SLOW_SCHED,
-        auto_repro: false,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &["--slow"],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: None,
-        performance_mode: true,
-        super_perf_mode: false,
-        duration_s: 5,
-        workers_per_cgroup: 4,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_SLOW);
-    assert!(
-        result.is_err(),
-        "--slow scheduler should fail throughput/gap gates, but test passed"
-    );
-    let err_msg = format!("{:#}", result.unwrap_err());
-    assert!(
-        err_msg.contains("stuck") || err_msg.contains("iteration") || err_msg.contains("failed"),
-        "error should indicate throughput regression: {err_msg}"
-    );
+    let checks = stt::assert::Assert::default_checks()
+        .min_iteration_rate(5000.0)
+        .max_gap_ms(500);
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0),
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
 }
 
-/// Showcase: auto-repro. Stalls the scheduler after 1s to trigger a
-/// watchdog kill, then verifies that the error output contains the
-/// auto-repro rerun hint with extracted stack functions.
-///
-/// Run manually: `cargo test sched_auto_repro_showcase -- --ignored --nocapture`
-#[ignore]
-#[test]
-fn sched_auto_repro_showcase() {
-    use stt::test_support::{SttTestEntry, run_stt_test};
+const SLOW_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let steps = vec![Step {
-            setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
-            ops: vec![],
-            hold: HoldSpec::Frac(1.0),
-        }];
-        execute_steps(ctx, steps)
-    }
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_SLOW: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
+    name: "demo_throughput_regression",
+    func: scenario_throughput_regression,
+    scheduler: &SLOW_SCHED,
+    extra_sched_args: &["--slow"],
+    performance_mode: true,
+    duration_s: 5,
+    workers_per_cgroup: 4,
+    ..stt::test_support::SttTestEntry::DEFAULT
+};
 
-    const STALL_SCHED: Scheduler =
-        Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_AUTO_REPRO: SttTestEntry = SttTestEntry {
-        name: "sched_auto_repro_showcase",
-        func: scenario,
-        sockets: 1,
-        cores: 2,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &STALL_SCHED,
-        auto_repro: true,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &["--stall-after=1"],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 3000,
-        bpf_map_write: None,
-        performance_mode: false,
-        super_perf_mode: false,
-        duration_s: 10,
-        workers_per_cgroup: 2,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY_AUTO_REPRO);
-    assert!(result.is_err(), "stalled scheduler should fail");
-    let err_msg = format!("{:#}", result.unwrap_err());
-    // The scheduler stalls after 1s, watchdog kills it. The error
-    // should indicate scheduler death.
-    assert!(
-        err_msg.contains("scheduler died")
-            || err_msg.contains("SCHEDULER_DIED")
-            || err_msg.contains("timed out")
-            || err_msg.contains("no test result"),
-        "error should indicate scheduler death: {err_msg}"
-    );
+fn scenario_auto_repro(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0),
+    }];
+    execute_steps(ctx, steps)
 }
 
-/// EEVDF baseline: runs the same workload as sched_baseline_scx under
-/// the kernel default scheduler. Compare the two results to verify scx
-/// performs at least as well as EEVDF.
-///
-/// Run: `cargo test sched_baseline_eevdf -- --ignored --nocapture`
-#[ignore]
-#[test]
-fn sched_baseline_eevdf() {
-    use stt::test_support::{SttTestEntry, run_stt_test};
+const STALL_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let steps = vec![Step {
-            setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
-            ops: vec![],
-            hold: HoldSpec::Frac(1.0),
-        }];
-        execute_steps(ctx, steps)
-    }
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_AUTO_REPRO: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
+    name: "demo_auto_repro",
+    func: scenario_auto_repro,
+    scheduler: &STALL_SCHED,
+    extra_sched_args: &["--stall-after=1"],
+    watchdog_timeout_s: 3,
+    duration_s: 10,
+    workers_per_cgroup: 2,
+    ..stt::test_support::SttTestEntry::DEFAULT
+};
 
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_EEVDF: SttTestEntry = SttTestEntry {
-        name: "sched_baseline_eevdf",
-        func: scenario,
-        sockets: 1,
-        cores: 2,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &stt::test_support::Scheduler::EEVDF,
-        auto_repro: false,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: None,
-        performance_mode: true,
-        super_perf_mode: false,
-        duration_s: 3,
-        workers_per_cgroup: 4,
-    };
-
-    run_stt_test(&__STT_ENTRY_EEVDF).unwrap();
+fn scenario_baseline(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0),
+    }];
+    execute_steps(ctx, steps)
 }
 
-/// scx baseline: runs the same workload as sched_baseline_eevdf under
-/// stt-sched. Compare the two results to verify scx performs at least
-/// as well as EEVDF.
-///
-/// Run: `cargo test sched_baseline_scx -- --ignored --nocapture`
-#[ignore]
-#[test]
-fn sched_baseline_scx() {
-    use stt::test_support::{SttTestEntry, run_stt_test};
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_EEVDF: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
+    name: "demo_baseline_eevdf",
+    func: scenario_baseline,
+    auto_repro: false,
+    performance_mode: true,
+    duration_s: 3,
+    workers_per_cgroup: 4,
+    ..stt::test_support::SttTestEntry::DEFAULT
+};
 
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
-        let steps = vec![Step {
-            setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_SCX: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
+    name: "demo_baseline_scx",
+    func: scenario_baseline,
+    scheduler: &STT_SCHED,
+    performance_mode: true,
+    duration_s: 3,
+    workers_per_cgroup: 4,
+    ..stt::test_support::SttTestEntry::DEFAULT
+};
+
+fn scenario_mid_degrade(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResult> {
+    use stt::scenario::ops::execute_steps_with;
+    let checks = stt::assert::Assert::default_checks().max_gap_ms(50);
+    let steps = vec![
+        Step {
+            setup: vec![
+                CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
+                CgroupDef::named("cg_1").workers(ctx.workers_per_cgroup),
+            ]
+            .into(),
             ops: vec![],
-            hold: HoldSpec::Frac(1.0),
-        }];
-        execute_steps(ctx, steps)
-    }
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY_SCX: SttTestEntry = SttTestEntry {
-        name: "sched_baseline_scx",
-        func: scenario,
-        sockets: 1,
-        cores: 2,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &STT_SCHED,
-        auto_repro: false,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &[],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_jiffies: 0,
-        bpf_map_write: None,
-        performance_mode: true,
-        super_perf_mode: false,
-        duration_s: 3,
-        workers_per_cgroup: 4,
-    };
-
-    run_stt_test(&__STT_ENTRY_SCX).unwrap();
+            hold: HoldSpec::Fixed(std::time::Duration::from_secs(3)),
+        },
+        Step {
+            setup: vec![].into(),
+            ops: vec![],
+            hold: HoldSpec::Fixed(std::time::Duration::from_secs(5)),
+        },
+    ];
+    execute_steps_with(ctx, steps, Some(&checks))
 }
+
+#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = linkme)]
+static __STT_ENTRY_MID_DEGRADE: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
+    name: "demo_mid_run_degrade",
+    func: scenario_mid_degrade,
+    scheduler: &STT_SCHED,
+    extra_sched_args: &["--degrade-after=3"],
+    performance_mode: true,
+    duration_s: 10,
+    workers_per_cgroup: 4,
+    watchdog_timeout_s: 60,
+    ..stt::test_support::SttTestEntry::DEFAULT
+};

@@ -3,20 +3,6 @@
 stt can save test results as baselines and compare subsequent runs
 against them.
 
-## Saving a baseline
-
-```sh
-cargo stt vm --gauntlet --save-baseline before.json
-```
-
-Saves `GauntletBaseline` (a set of `GauntletRow` entries) as JSON.
-
-## Comparing against a baseline
-
-```sh
-cargo stt vm --gauntlet --compare before.json
-```
-
 `compare_baselines()` diffs two sets of gauntlet rows. The output
 groups cells into four categories:
 
@@ -31,13 +17,6 @@ groups cells into four categories:
 
 The summary line shows how many cells were unchanged (within
 tolerance).
-
-## Integration tests
-
-```sh
-cargo stt test --save-baseline baseline.json
-cargo stt test --compare baseline.json
-```
 
 Sidecar results (`SidecarResult` JSON files) are written to
 `STT_SIDECAR_DIR` and collected for analysis.

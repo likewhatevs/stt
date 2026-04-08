@@ -60,7 +60,7 @@ binary in:
 - Build the scheduler first: `cargo build -p scx_mitosis`.
 - Set `STT_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path.
-- Use `-p scx_mitosis` with `cargo stt vm` to build automatically.
+- Use `--scheduler-bin` with `stt vm` to inject a pre-built binary.
 
 ## Scheduler died
 

@@ -430,17 +430,15 @@ static REPRO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// Set the scheduler PID for the work-conservation watchdog.
 ///
 /// Workers send SIGUSR2 to this PID when stuck > 2 seconds.
-/// `pub` because main.rs is a separate binary crate.
 #[doc(hidden)]
-pub fn set_sched_pid(pid: u32) {
+pub(crate) fn set_sched_pid(pid: u32) {
     SCHED_PID.store(pid as i32, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Enable/disable repro mode. When true, the watchdog is suppressed
 /// so the scheduler stays alive for BPF kprobe assertions.
-/// `pub` because main.rs is a separate binary crate.
 #[doc(hidden)]
-pub fn set_repro_mode(v: bool) {
+pub(crate) fn set_repro_mode(v: bool) {
     REPRO_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -451,10 +449,18 @@ pub struct WorkloadHandle {
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
+    /// MAP_SHARED region of per-worker u64 iteration counters. Workers
+    /// atomically store their iteration count; parent reads via
+    /// `snapshot_iterations()`. Pointer to the first element; length
+    /// is `children.len()`.
+    iter_counters: *mut u64,
+    /// Number of u64 slots in iter_counters (== num_workers at spawn time).
+    iter_counter_len: usize,
 }
 
-// SAFETY: futex_ptrs are MAP_SHARED anonymous pages owned exclusively by this
-// handle. Only the parent process accesses them for munmap on drop.
+// SAFETY: futex_ptrs and iter_counters are MAP_SHARED anonymous pages owned
+// exclusively by this handle. Only the parent process accesses them for
+// munmap on drop.
 unsafe impl Send for WorkloadHandle {}
 unsafe impl Sync for WorkloadHandle {}
 
@@ -520,6 +526,33 @@ impl WorkloadHandle {
             }
         }
 
+        // Per-worker iteration counter region (MAP_SHARED). Each worker
+        // atomically stores its iteration count to slot [i]. The parent
+        // reads all slots via snapshot_iterations().
+        let iter_counter_len = config.num_workers;
+        let iter_counters = if iter_counter_len > 0 {
+            let size = iter_counter_len * std::mem::size_of::<u64>();
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                anyhow::bail!(
+                    "mmap iter_counters failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            ptr as *mut u64
+        } else {
+            std::ptr::null_mut()
+        };
+
         let mut children = Vec::with_capacity(config.num_workers);
 
         for i in 0..config.num_workers {
@@ -547,6 +580,13 @@ impl WorkloadHandle {
                 Some((futex_ptrs[group_idx], is_first))
             } else {
                 None
+            };
+
+            // Shared iteration counter slot for this worker.
+            let iter_slot: *mut u64 = if !iter_counters.is_null() {
+                unsafe { iter_counters.add(i) }
+            } else {
+                std::ptr::null_mut()
             };
 
             // Create pipe for report and a second pipe for "start" signal
@@ -634,6 +674,7 @@ impl WorkloadHandle {
                         config.sched_policy,
                         worker_pipe_fds,
                         worker_futex,
+                        iter_slot,
                     );
                     let json = serde_json::to_vec(&report).unwrap_or_default();
                     let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
@@ -668,6 +709,8 @@ impl WorkloadHandle {
             children,
             started: false,
             futex_ptrs,
+            iter_counters,
+            iter_counter_len,
         })
     }
 
@@ -698,6 +741,23 @@ impl WorkloadHandle {
         set_thread_affinity(pid, cpus)
     }
 
+    /// Read all workers' current iteration counts from shared memory.
+    ///
+    /// Each element is the monotonically increasing iteration count for
+    /// that worker, read with Relaxed ordering. Returns an empty vec
+    /// if no workers were spawned.
+    pub fn snapshot_iterations(&self) -> Vec<u64> {
+        if self.iter_counters.is_null() || self.iter_counter_len == 0 {
+            return Vec::new();
+        }
+        (0..self.iter_counter_len)
+            .map(|i| {
+                let ptr = unsafe { self.iter_counters.add(i) };
+                unsafe { std::sync::atomic::AtomicU64::from_ptr(ptr).load(Ordering::Relaxed) }
+            })
+            .collect()
+    }
+
     /// Send SIGUSR1 to all workers, collect their reports, and wait for exit.
     ///
     /// Auto-starts workers if [`start()`](Self::start) was not called.
@@ -725,21 +785,31 @@ impl WorkloadHandle {
             );
         }
 
-        // Collect reports and wait for exit.
-        // Poll each report fd with a 30s timeout before reading, so a
-        // hung child doesn't block collection forever.
+        // Collect reports with a shared 5s deadline across all workers.
+        // Each worker gets the remaining budget, so starved workers
+        // (e.g. under degrade mode) don't serially exhaust the VM
+        // timeout.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         for (pid, read_fd, _) in children {
             let mut buf = Vec::new();
-            let mut pfd = libc::pollfd {
-                fd: read_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut pfd, 1, 30_000) };
-            if ready > 0 {
-                let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
-                let _ = f.read_to_end(&mut buf);
-                drop(f);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            if ms > 0 {
+                let mut pfd = libc::pollfd {
+                    fd: read_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+                if ready > 0 {
+                    let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
+                    let _ = f.read_to_end(&mut buf);
+                    drop(f);
+                } else {
+                    unsafe {
+                        libc::close(read_fd);
+                    }
+                }
             } else {
                 unsafe {
                     libc::close(read_fd);
@@ -792,6 +862,14 @@ impl Drop for WorkloadHandle {
                 libc::munmap(ptr as *mut libc::c_void, std::mem::size_of::<u32>());
             }
         }
+        if !self.iter_counters.is_null() && self.iter_counter_len > 0 {
+            unsafe {
+                libc::munmap(
+                    self.iter_counters as *mut libc::c_void,
+                    self.iter_counter_len * std::mem::size_of::<u64>(),
+                );
+            }
+        }
     }
 }
 
@@ -806,6 +884,7 @@ fn worker_main(
     sched_policy: SchedPolicy,
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, bool)>,
+    iter_slot: *mut u64,
 ) -> WorkerReport {
     let tid = unsafe { libc::getpid() } as u32;
 
@@ -1163,6 +1242,14 @@ fn worker_main(
                 }
                 last_iter_time = Instant::now();
                 iterations += 1;
+            }
+        }
+
+        // Publish iteration count to shared memory for host-side sampling.
+        if !iter_slot.is_null() {
+            unsafe {
+                std::sync::atomic::AtomicU64::from_ptr(iter_slot)
+                    .store(iterations, Ordering::Relaxed);
             }
         }
 

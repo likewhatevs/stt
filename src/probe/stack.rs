@@ -130,7 +130,7 @@ pub struct StackFunction {
 }
 
 /// Public API for auto-repro: extract function names as strings.
-pub fn extract_stack_functions_all_pub(stack: &str) -> Vec<String> {
+pub(crate) fn extract_stack_functions_all_pub(stack: &str) -> Vec<String> {
     extract_stack_functions_all(stack)
         .into_iter()
         .map(|f| f.raw_name)

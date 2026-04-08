@@ -44,6 +44,10 @@ pub struct StimulusEvent {
     pub op_kind: Option<String>,
     /// Additional context (e.g. "4 cpus", "cgroup=cg_0").
     pub detail: Option<String>,
+    /// Cumulative worker iterations at this event. Used to compute
+    /// per-phase throughput (iterations/s).
+    #[serde(default)]
+    pub total_iterations: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +67,9 @@ pub struct PhaseMetrics {
     pub fallback_rate: Option<f64>,
     /// dispatch_keep_last events per second. None when event counters unavailable.
     pub keep_last_rate: Option<f64>,
+    /// Worker iterations per second during this phase. Computed from
+    /// cumulative iteration counts in consecutive stimulus events.
+    pub iteration_rate: Option<f64>,
 }
 
 /// Direction of change at a phase boundary.
@@ -123,6 +130,9 @@ const DSQ_THRESHOLD: f64 = 3.0;
 const FALLBACK_RATE_THRESHOLD: f64 = 10.0;
 /// Minimum delta in keep_last rate (events/s) to flag a change.
 const KEEP_LAST_RATE_THRESHOLD: f64 = 10.0;
+/// Minimum relative change in iteration rate to flag a throughput change.
+/// 0.3 = 30% drop or increase.
+const ITERATION_RATE_REL_THRESHOLD: f64 = 0.3;
 
 impl Timeline {
     /// Build a timeline from stimulus events and monitor samples.
@@ -196,6 +206,25 @@ impl Timeline {
             });
         }
 
+        // Compute per-phase iteration rate from consecutive stimulus
+        // event iteration totals. Index-based: accesses both phases[i] and events[i+1].
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..phases.len() {
+            let iter_start = if i == 0 {
+                events.first().and_then(|e| e.total_iterations)
+            } else {
+                events.get(i).and_then(|e| e.total_iterations)
+            };
+            let iter_end = events.get(i + 1).and_then(|e| e.total_iterations);
+            if let (Some(s), Some(e)) = (iter_start, iter_end) {
+                let duration_s =
+                    phases[i].end_ms.saturating_sub(phases[i].start_ms) as f64 / 1000.0;
+                if duration_s > 0.0 && e > s {
+                    phases[i].metrics.iteration_rate = Some((e - s) as f64 / duration_s);
+                }
+            }
+        }
+
         // Detect changes at each phase boundary.
         for i in 1..phases.len() {
             let before = &phases[i - 1].metrics;
@@ -263,6 +292,25 @@ impl Timeline {
                             metric: "keep_last".to_string(),
                             before: before_kl,
                             after: after_kl,
+                        });
+                    }
+                }
+
+                if let (Some(before_ir), Some(after_ir)) =
+                    (before.iteration_rate, after_metrics.iteration_rate)
+                    && before_ir > 0.0
+                {
+                    let rel_delta = (after_ir - before_ir) / before_ir;
+                    if rel_delta.abs() > ITERATION_RATE_REL_THRESHOLD {
+                        changes.push(PhaseChange {
+                            direction: if rel_delta < 0.0 {
+                                ChangeDirection::Degraded
+                            } else {
+                                ChangeDirection::Improved
+                            },
+                            metric: "throughput".to_string(),
+                            before: before_ir,
+                            after: after_ir,
                         });
                     }
                 }
@@ -365,6 +413,9 @@ impl Timeline {
                 }
                 if let Some(kl) = m.keep_last_rate {
                     out.push_str(&format!(" | keep_last: {:.0}/s", kl));
+                }
+                if let Some(ir) = m.iteration_rate {
+                    out.push_str(&format!(" | throughput: {:.0} iter/s", ir));
                 }
                 out.push('\n');
                 if m.stall_count > 0 {
@@ -512,6 +563,7 @@ fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
         stall_count,
         fallback_rate,
         keep_last_rate,
+        iteration_rate: None,
     }
 }
 
@@ -548,6 +600,7 @@ mod tests {
             label: label.to_string(),
             op_kind: None,
             detail: None,
+            total_iterations: None,
         }
     }
 
@@ -748,6 +801,7 @@ mod tests {
             label: "StepStart[0]".to_string(),
             op_kind: Some("SetCpuset".to_string()),
             detail: Some("4 cpus".to_string()),
+            total_iterations: None,
         };
         let events = vec![stimulus(0, "ScenarioStart"), e];
         let samples: Vec<MonitorSample> = (5..25)

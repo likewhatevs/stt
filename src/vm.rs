@@ -61,20 +61,17 @@ pub fn run_in_vm(cfg: &VmConfig, stt_args: &[String]) -> Result<VmResult> {
     // Find stt binary (ourselves)
     let stt_bin = crate::resolve_current_exe()?;
 
-    // Build guest args: strip --scheduler-bin / --mitosis-bin (host path)
-    // and append the guest-side path (/scheduler) so the inner stt finds
-    // the binary.
+    // Build guest args: strip --scheduler-bin (host path) and append
+    // the guest-side path (/scheduler) so the inner stt finds the binary.
     let mut sched_bin: Option<PathBuf> = None;
     let mut guest_args = Vec::with_capacity(stt_args.len() + 2);
     let mut iter = stt_args.iter();
     while let Some(a) = iter.next() {
-        if a == "--scheduler-bin" || a == "--mitosis-bin" {
+        if a == "--scheduler-bin" {
             if let Some(val) = iter.next() {
                 sched_bin = Some(PathBuf::from(val));
             }
         } else if let Some(val) = a.strip_prefix("--scheduler-bin=") {
-            sched_bin = Some(PathBuf::from(val));
-        } else if let Some(val) = a.strip_prefix("--mitosis-bin=") {
             sched_bin = Some(PathBuf::from(val));
         } else {
             guest_args.push(a.clone());

@@ -48,7 +48,7 @@ pub(crate) fn vcpu_preemption_threshold_ns(kernel_path: Option<&std::path::Path>
 }
 
 /// Determine CONFIG_HZ for the guest kernel.
-fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
+pub(crate) fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
     if let Some(kp) = kernel_path {
         // Try embedded IKCONFIG in the vmlinux.
         if let Some(vmlinux) = find_vmlinux_from_kernel(kp)
@@ -496,7 +496,9 @@ impl MonitorThresholds {
     /// - fail_on_stall true: rq_clock not advancing on a CPU with
     ///   runnable tasks means the scheduler stalled. Idle CPUs
     ///   (nr_running==0 in both samples) are exempt because NOHZ
-    ///   stops the tick. Uses the sustained_samples window.
+    ///   stops the tick. Preempted vCPUs are exempt when the vCPU
+    ///   thread's CPU time didn't advance past the preemption
+    ///   threshold. Uses the sustained_samples window.
     /// - sustained_samples 5: at ~100ms sample interval, requires ~500ms
     ///   of sustained violation. Filters transient spikes from cpuset
     ///   reconfiguration, cgroup creation, and scheduler restart.
