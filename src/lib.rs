@@ -52,17 +52,11 @@
 //!
 //! - [`cgroup`] -- cgroup v2 filesystem operations
 //! - [`scenario`] -- test case definitions, flag system, cgroup helpers
-//! - [`runner`] -- scenario execution engine with scheduler lifecycle
 //! - [`assert`] -- pass/fail assertions (starvation, isolation, fairness)
 //! - [`workload`] -- worker process types and telemetry collection
-//! - [`monitor`] -- host-side guest memory observation via BTF
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
-//! - [`vm`] -- VM launch configuration and gauntlet presets
-//! - [`vmm`] -- KVM virtual machine monitor implementation
+//! - [`verifier`] -- BPF verifier complexity analysis
 //! - [`test_support`] -- `#[stt_test]` runtime and registration
-//! - [`probe`] -- crash investigation via BPF kprobes
-//! - [`stats`] -- gauntlet analysis and baseline comparison
-//! - [`timeline`] -- stimulus/phase correlation
 
 #[allow(
     clippy::all,
@@ -76,7 +70,7 @@ mod bpf_skel;
 pub mod cgroup;
 
 /// Read the kernel ring buffer (equivalent to `dmesg --notime`).
-pub fn read_kmsg() -> String {
+pub(crate) fn read_kmsg() -> String {
     match rmesg::log_entries(rmesg::Backend::Default, false) {
         Ok(entries) => entries
             .iter()
@@ -87,21 +81,31 @@ pub fn read_kmsg() -> String {
     }
 }
 pub mod assert;
-pub mod monitor;
-pub mod probe;
-pub mod runner;
+#[allow(dead_code)]
+pub(crate) mod monitor;
+#[allow(dead_code)]
+pub(crate) mod probe;
+#[allow(dead_code)]
+pub(crate) mod runner;
 pub mod scenario;
-pub mod stats;
+#[allow(dead_code)]
+pub(crate) mod stats;
 pub mod test_support;
-pub mod timeline;
+#[allow(dead_code)]
+pub(crate) mod timeline;
 pub mod topology;
 
 pub mod verifier;
-pub mod vm;
-pub mod vmm;
+#[allow(dead_code)]
+pub(crate) mod vm;
+#[allow(dead_code)]
+pub(crate) mod vmm;
 pub mod workload;
 
 pub use stt_macros::stt_test;
+
+#[cfg(feature = "integration")]
+pub use crate::probe::process::resolve_func_ip;
 
 /// Re-exports for writing `#[stt_test]` functions.
 ///
@@ -118,12 +122,15 @@ pub mod prelude {
 
     pub use crate::assert::{Assert, AssertPlan, AssertResult};
     pub use crate::cgroup::CgroupManager;
-    pub use crate::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
+    pub use crate::scenario::ops::{
+        CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execute_steps_with,
+    };
     pub use crate::scenario::{CgroupGroup, Ctx};
     pub use crate::stt_test;
-    pub use crate::test_support::{Scheduler, SchedulerSpec};
+    pub use crate::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
     pub use crate::workload::{
-        WorkProgram, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle,
+        AffinityMode, SchedPolicy, WorkProgram, WorkType, WorkerReport, WorkloadConfig,
+        WorkloadHandle,
     };
 }
 
@@ -216,7 +223,7 @@ pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf
 /// the readlink target, producing a path that does not exist on disk.
 /// `/proc/self/exe` itself remains usable as a file path because the
 /// kernel keeps the inode alive, so we fall back to it.
-pub fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
     let exe = std::env::current_exe().context("resolve current exe")?;
     if exe.exists() {

@@ -49,7 +49,7 @@ fn process_alive(pid: u32) -> bool {
     kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
-pub use crate::read_kmsg;
+pub(crate) use crate::read_kmsg;
 
 // ---------------------------------------------------------------------------
 // Flag system

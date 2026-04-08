@@ -29,7 +29,7 @@ fn verbose() -> bool {
 
 /// Test result sidecar written to STT_SIDECAR_DIR for `stt test` collection.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct SidecarResult {
+pub(crate) struct SidecarResult {
     pub test_name: String,
     pub topology: String,
     pub scheduler: String,
@@ -46,7 +46,7 @@ pub struct SidecarResult {
 
 /// Scan a directory for stt sidecar JSON files. Recurses one level
 /// into subdirectories to handle per-job gauntlet layouts.
-pub fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
+pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
     let mut sidecars = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -98,6 +98,7 @@ pub fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
 /// - `--stt-test-fn=NAME` (without `--stt-topo`): guest-side dispatch —
 ///   runs the test function directly (inside a VM that was already booted).
 /// - Otherwise: no-op.
+#[doc(hidden)]
 #[ctor::ctor]
 pub fn stt_test_early_dispatch() {
     // PID 1: the binary is /init in the VM. Perform full init lifecycle
@@ -178,7 +179,7 @@ fn maybe_dispatch_host_test() -> Option<i32> {
 }
 
 /// SHM ring message type for profraw data.
-pub const MSG_TYPE_PROFRAW: u32 = 0x50524157; // "PRAW"
+pub(crate) const MSG_TYPE_PROFRAW: u32 = 0x50524157; // "PRAW"
 
 /// SHM size for stt_test VMs: 16 MB.
 /// Sized for profraw (1-2 MB), stimulus events, exit code, and test
@@ -479,7 +480,7 @@ pub fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
 /// Check whether a gauntlet preset is compatible with a test entry
 /// on this host. `host_llc_count` is the number of LLC groups on
 /// the host -- performance_mode tests need one LLC per virtual socket.
-pub fn preset_matches(
+pub(crate) fn preset_matches(
     preset: &crate::vm::TopoPreset,
     entry: &SttTestEntry,
     host_llc_count: usize,
@@ -495,7 +496,7 @@ pub fn preset_matches(
 }
 
 /// Number of LLC groups on this host. Returns 0 on error.
-pub fn host_llc_count() -> usize {
+pub(crate) fn host_llc_count() -> usize {
     crate::vmm::host_topology::HostTopology::from_sysfs()
         .map(|h| h.llc_groups.len())
         .unwrap_or(0)
@@ -503,7 +504,7 @@ pub fn host_llc_count() -> usize {
 
 /// Check whether the host has enough CPUs and LLC groups to satisfy
 /// a gauntlet preset's topology without oversubscription.
-pub fn host_preset_compatible(
+pub(crate) fn host_preset_compatible(
     preset: &crate::vm::TopoPreset,
     host: &crate::vmm::host_topology::HostTopology,
 ) -> bool {

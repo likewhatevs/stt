@@ -23,6 +23,7 @@ static COVERAGE_GAP_MS: AtomicU64 = AtomicU64::new(0);
 
 /// When true, unfair spread produces a warning detail but does not fail the result.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub(crate) fn set_warn_unfair(v: bool) {
     WARN_UNFAIR.store(v, Ordering::Relaxed);
 }
@@ -476,8 +477,9 @@ impl Assert {
         max_keep_last_rate: None,
     };
 
-    /// Default checks: not_starved enabled, monitor thresholds from
-    /// `MonitorThresholds::DEFAULT`.
+    /// Default checks: not_starved enabled, monitor thresholds
+    /// (imbalance 4.0, dsq_depth 50, stall on, sustained 5,
+    /// fallback 200.0, keep_last 100.0).
     pub const fn default_checks() -> Assert {
         use crate::monitor::MonitorThresholds;
         Assert {
@@ -697,7 +699,7 @@ impl Assert {
     }
 
     /// Extract `MonitorThresholds` for monitor-side evaluation.
-    pub fn monitor_thresholds(&self) -> crate::monitor::MonitorThresholds {
+    pub(crate) fn monitor_thresholds(&self) -> crate::monitor::MonitorThresholds {
         use crate::monitor::MonitorThresholds;
         let d = MonitorThresholds::DEFAULT;
         MonitorThresholds {

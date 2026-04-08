@@ -35,7 +35,7 @@ fn default_attrs_compile(ctx: &Ctx) -> Result<AssertResult> {
 #[stt_test(sockets = 1, cores = 1, threads = 1)]
 fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
-    let ip = stt::probe::process::resolve_func_ip("schedule");
+    let ip = stt::resolve_func_ip("schedule");
     if let Some(addr) = ip
         && addr > 0
     {

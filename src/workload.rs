@@ -200,8 +200,8 @@ impl WorkType {
 /// Composable work program that resolves to a [`WorkType`].
 ///
 /// Provides named presets for common workload patterns. Resolves to a
-/// concrete `WorkType` via [`resolve()`](Self::resolve). CLI uses preset
-/// names via [`from_name()`](Self::from_name).
+/// concrete `WorkType` via [`resolve()`](Self::resolve). Preset names
+/// are looked up via [`from_name()`](Self::from_name).
 ///
 /// ```
 /// # use stt::workload::WorkProgram;
@@ -430,6 +430,7 @@ static REPRO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 ///
 /// Workers send SIGUSR2 to this PID when stuck > 2 seconds.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub(crate) fn set_sched_pid(pid: u32) {
     SCHED_PID.store(pid as i32, std::sync::atomic::Ordering::Relaxed);
 }
@@ -437,6 +438,7 @@ pub(crate) fn set_sched_pid(pid: u32) {
 /// Enable/disable repro mode. When true, the watchdog is suppressed
 /// so the scheduler stays alive for BPF kprobe assertions.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub(crate) fn set_repro_mode(v: bool) {
     REPRO_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
 }

@@ -162,9 +162,9 @@ impl CgroupDef {
         self
     }
 
-    /// When true, `--work-type` CLI override replaces this def's work type.
-    pub fn swappable(mut self, v: bool) -> Self {
-        self.swappable = v;
+    /// When true, the gauntlet work_type override replaces this def's work type.
+    pub fn swappable(mut self, swappable: bool) -> Self {
+        self.swappable = swappable;
         self
     }
 }
