@@ -3,8 +3,8 @@
 //! Parses BTF from a vmlinux ELF (or raw `/sys/kernel/btf/vmlinux`)
 //! to resolve byte offsets of kernel struct fields needed for
 //! host-side memory reads: runqueue monitoring ([`KernelOffsets`]),
-//! scx event counters ([`ScxEventOffsets`]), and BPF map discovery
-//! ([`BpfMapOffsets`]).
+//! scx event counters ([`ScxEventOffsets`]), schedstat fields
+//! ([`SchedstatOffsets`]), and BPF map discovery ([`BpfMapOffsets`]).
 
 use std::path::Path;
 
@@ -52,6 +52,9 @@ pub struct KernelOffsets {
     pub dsq_nr: usize,
     /// Offsets for scx event counters. None if BTF lacks the required types.
     pub event_offsets: Option<ScxEventOffsets>,
+    /// Offsets for struct rq schedstat fields. None if CONFIG_SCHEDSTATS
+    /// is not enabled (BTF lacks the required fields).
+    pub schedstat_offsets: Option<SchedstatOffsets>,
 }
 
 /// Byte offsets for reading scx event counters from guest memory.
@@ -103,6 +106,7 @@ impl KernelOffsets {
         let dsq_nr = member_byte_offset(&btf, &dsq_struct, "nr")?;
 
         let event_offsets = resolve_event_offsets(&btf).ok();
+        let schedstat_offsets = resolve_schedstat_offsets(&btf).ok();
 
         Ok(Self {
             rq_nr_running,
@@ -113,6 +117,7 @@ impl KernelOffsets {
             scx_rq_flags,
             dsq_nr,
             event_offsets,
+            schedstat_offsets,
         })
     }
 }
@@ -274,6 +279,65 @@ fn resolve_member_struct(btf: &Btf, member: &btf_rs::Member) -> Result<btf_rs::S
         }
     }
     bail!("btf: type chain too deep resolving member struct");
+}
+
+/// Byte offsets for reading struct rq schedstat fields from guest memory.
+///
+/// Schedstat fields are guarded by `CONFIG_SCHEDSTATS` in the kernel.
+/// Resolution is optional — `resolve_schedstat_offsets()` returns `Err`
+/// when the required fields are missing from BTF.
+#[derive(Debug, Clone)]
+pub struct SchedstatOffsets {
+    /// Offset of `rq_sched_info` (struct sched_info) within `struct rq`.
+    pub rq_sched_info: usize,
+    /// Offset of `run_delay` within `struct sched_info`.
+    pub sched_info_run_delay: usize,
+    /// Offset of `pcount` within `struct sched_info`.
+    pub sched_info_pcount: usize,
+    /// Offset of `yld_count` within `struct rq`.
+    pub rq_yld_count: usize,
+    /// Offset of `sched_count` within `struct rq`.
+    pub rq_sched_count: usize,
+    /// Offset of `sched_goidle` within `struct rq`.
+    pub rq_sched_goidle: usize,
+    /// Offset of `ttwu_count` within `struct rq`.
+    pub rq_ttwu_count: usize,
+    /// Offset of `ttwu_local` within `struct rq`.
+    pub rq_ttwu_local: usize,
+}
+
+/// Resolve BTF offsets for struct rq schedstat fields.
+/// Returns Err if any required type/field is missing (CONFIG_SCHEDSTATS
+/// not enabled in the kernel).
+fn resolve_schedstat_offsets(btf: &Btf) -> Result<SchedstatOffsets> {
+    let (rq_struct, _) = find_struct(btf, "rq")?;
+
+    // rq.rq_sched_info is struct sched_info embedded in struct rq.
+    let (rq_sched_info, sched_info_member) =
+        member_byte_offset_with_member(btf, &rq_struct, "rq_sched_info")?;
+
+    let sched_info_struct = resolve_member_struct(btf, &sched_info_member)
+        .context("btf: resolve type of rq.rq_sched_info")?;
+    let sched_info_run_delay = member_byte_offset(btf, &sched_info_struct, "run_delay")?;
+    let sched_info_pcount = member_byte_offset(btf, &sched_info_struct, "pcount")?;
+
+    // Direct unsigned int fields on struct rq.
+    let rq_yld_count = member_byte_offset(btf, &rq_struct, "yld_count")?;
+    let rq_sched_count = member_byte_offset(btf, &rq_struct, "sched_count")?;
+    let rq_sched_goidle = member_byte_offset(btf, &rq_struct, "sched_goidle")?;
+    let rq_ttwu_count = member_byte_offset(btf, &rq_struct, "ttwu_count")?;
+    let rq_ttwu_local = member_byte_offset(btf, &rq_struct, "ttwu_local")?;
+
+    Ok(SchedstatOffsets {
+        rq_sched_info,
+        sched_info_run_delay,
+        sched_info_pcount,
+        rq_yld_count,
+        rq_sched_count,
+        rq_sched_goidle,
+        rq_ttwu_count,
+        rq_ttwu_local,
+    })
 }
 
 /// Byte offsets within kernel BPF structures needed for host-side
@@ -491,6 +555,50 @@ mod tests {
             for i in 0..all.len() {
                 for j in (i + 1)..all.len() {
                     assert_ne!(all[i], all[j], "event counter offsets must be distinct");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_schedstat_offsets_from_vmlinux() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        let offsets = KernelOffsets::from_vmlinux(&path).unwrap();
+        // Schedstat offsets are optional — only assert if present.
+        if let Some(ss) = &offsets.schedstat_offsets {
+            // rq_sched_info must be at a nonzero offset (it's not the first
+            // field of struct rq).
+            assert!(ss.rq_sched_info > 0);
+            // pcount is the first field in struct sched_info, so its offset
+            // can be 0. run_delay follows pcount, so it must be > 0.
+            assert!(
+                ss.sched_info_run_delay > 0,
+                "run_delay must follow pcount in struct sched_info"
+            );
+            assert_ne!(
+                ss.sched_info_pcount, ss.sched_info_run_delay,
+                "pcount and run_delay offsets must be distinct"
+            );
+            // All rq-level fields must be at distinct nonzero offsets.
+            let rq_fields = [
+                ss.rq_yld_count,
+                ss.rq_sched_count,
+                ss.rq_sched_goidle,
+                ss.rq_ttwu_count,
+                ss.rq_ttwu_local,
+            ];
+            for &off in &rq_fields {
+                assert!(off > 0, "schedstat rq field offset must be nonzero");
+            }
+            for i in 0..rq_fields.len() {
+                for j in (i + 1)..rq_fields.len() {
+                    assert_ne!(
+                        rq_fields[i], rq_fields[j],
+                        "schedstat rq field offsets must be distinct"
+                    );
                 }
             }
         }

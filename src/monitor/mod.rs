@@ -291,10 +291,37 @@ pub struct CpuSnapshot {
     /// offsets are unavailable or scx_root is not set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_counters: Option<ScxEventCounters>,
+    /// Runqueue schedstat fields (cumulative). None when CONFIG_SCHEDSTATS
+    /// is not enabled (schedstat offsets unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedstat: Option<RqSchedstat>,
     /// Cumulative CPU time (ns) of the vCPU thread hosting this CPU.
     /// Used by evaluate() to distinguish real stalls from host preemption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpu_cpu_time_ns: Option<u64>,
+}
+
+/// Per-CPU runqueue schedstat fields read from guest memory.
+///
+/// Matches kernel `struct rq` schedstat fields (guarded by CONFIG_SCHEDSTATS).
+/// `run_delay` and `pcount` come from the embedded `struct sched_info`;
+/// the remaining fields are direct members of `struct rq`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RqSchedstat {
+    /// Cumulative scheduling delay (ns) on this CPU (`rq.rq_sched_info.run_delay`).
+    pub run_delay: u64,
+    /// Count of non-idle task arrivals on this CPU (`rq.rq_sched_info.pcount`).
+    pub pcount: u64,
+    /// Yield count (`rq.yld_count`).
+    pub yld_count: u32,
+    /// Context switch count (`rq.sched_count`).
+    pub sched_count: u32,
+    /// Go-idle count (`rq.sched_goidle`).
+    pub sched_goidle: u32,
+    /// Try-to-wake-up count (`rq.ttwu_count`).
+    pub ttwu_count: u32,
+    /// Try-to-wake-up local count (`rq.ttwu_local`).
+    pub ttwu_local: u32,
 }
 
 /// Cumulative scx event counter values for a single CPU.
@@ -329,6 +356,10 @@ pub struct MonitorSummary {
     /// None when event counters are not available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_deltas: Option<ScxEventDeltas>,
+    /// Aggregate schedstat deltas over the monitoring window.
+    /// None when CONFIG_SCHEDSTATS is not enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedstat_deltas: Option<SchedstatDeltas>,
     /// Per-program BPF callback profile over the monitoring window.
     /// None when no struct_ops programs are loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,6 +377,32 @@ pub struct ProgStatsDelta {
     pub nsecs: u64,
     /// Average nanoseconds per call (nsecs / cnt). 0 when cnt is 0.
     pub nsecs_per_call: f64,
+}
+
+/// Aggregate schedstat deltas computed from first/last monitor samples.
+///
+/// All values are summed across CPUs and represent the delta over the
+/// monitoring window. Rates are per second.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SchedstatDeltas {
+    /// Total scheduling delay increase (ns) across all CPUs.
+    pub total_run_delay: u64,
+    /// Run delay per second (ns/s) across all CPUs.
+    pub run_delay_rate: f64,
+    /// Total pcount increase across all CPUs.
+    pub total_pcount: u64,
+    /// Total context switch increase across all CPUs.
+    pub total_sched_count: u64,
+    /// Context switches per second across all CPUs.
+    pub sched_count_rate: f64,
+    /// Total yield count increase across all CPUs.
+    pub total_yld_count: u64,
+    /// Total go-idle count increase across all CPUs.
+    pub total_sched_goidle: u64,
+    /// Total ttwu count increase across all CPUs.
+    pub total_ttwu_count: u64,
+    /// Total ttwu_local count increase across all CPUs.
+    pub total_ttwu_local: u64,
 }
 
 /// Aggregate event counter statistics computed from first/last samples.
@@ -431,6 +488,7 @@ impl MonitorSummary {
         }
 
         let event_deltas = Self::compute_event_deltas(samples);
+        let schedstat_deltas = Self::compute_schedstat_deltas(samples);
         let prog_stats_deltas = Self::compute_prog_stats_deltas(samples);
 
         Self {
@@ -439,6 +497,7 @@ impl MonitorSummary {
             max_local_dsq_depth,
             stall_detected,
             event_deltas,
+            schedstat_deltas,
             prog_stats_deltas,
         }
     }
@@ -497,6 +556,67 @@ impl MonitorSummary {
             keep_last_rate,
             total_enq_skip_exiting: delta(|e| e.enq_skip_exiting),
             total_enq_skip_migration_disabled: delta(|e| e.enq_skip_migration_disabled),
+        })
+    }
+
+    /// Compute schedstat deltas from the sample series.
+    /// Returns None if no samples have schedstat data on any CPU.
+    fn compute_schedstat_deltas(samples: &[MonitorSample]) -> Option<SchedstatDeltas> {
+        let has_schedstat = |s: &MonitorSample| s.cpus.iter().any(|c| c.schedstat.is_some());
+        let first = samples.iter().find(|s| has_schedstat(s))?;
+        let last = samples.iter().rev().find(|s| has_schedstat(s))?;
+
+        let sum_field = |s: &MonitorSample, f: fn(&RqSchedstat) -> u64| -> u64 {
+            s.cpus
+                .iter()
+                .filter_map(|c| c.schedstat.as_ref().map(&f))
+                .sum()
+        };
+        let sum_field_u32 = |s: &MonitorSample, f: fn(&RqSchedstat) -> u32| -> u64 {
+            s.cpus
+                .iter()
+                .filter_map(|c| c.schedstat.as_ref().map(|ss| f(ss) as u64))
+                .sum()
+        };
+
+        let total_run_delay =
+            sum_field(last, |ss| ss.run_delay).saturating_sub(sum_field(first, |ss| ss.run_delay));
+        let total_pcount =
+            sum_field(last, |ss| ss.pcount).saturating_sub(sum_field(first, |ss| ss.pcount));
+        let total_sched_count = sum_field_u32(last, |ss| ss.sched_count)
+            .saturating_sub(sum_field_u32(first, |ss| ss.sched_count));
+        let total_yld_count = sum_field_u32(last, |ss| ss.yld_count)
+            .saturating_sub(sum_field_u32(first, |ss| ss.yld_count));
+        let total_sched_goidle = sum_field_u32(last, |ss| ss.sched_goidle)
+            .saturating_sub(sum_field_u32(first, |ss| ss.sched_goidle));
+        let total_ttwu_count = sum_field_u32(last, |ss| ss.ttwu_count)
+            .saturating_sub(sum_field_u32(first, |ss| ss.ttwu_count));
+        let total_ttwu_local = sum_field_u32(last, |ss| ss.ttwu_local)
+            .saturating_sub(sum_field_u32(first, |ss| ss.ttwu_local));
+
+        let duration_ms = last.elapsed_ms.saturating_sub(first.elapsed_ms);
+        let duration_secs = duration_ms as f64 / 1000.0;
+        let run_delay_rate = if duration_secs > 0.0 {
+            total_run_delay as f64 / duration_secs
+        } else {
+            0.0
+        };
+        let sched_count_rate = if duration_secs > 0.0 {
+            total_sched_count as f64 / duration_secs
+        } else {
+            0.0
+        };
+
+        Some(SchedstatDeltas {
+            total_run_delay,
+            run_delay_rate,
+            total_pcount,
+            total_sched_count,
+            sched_count_rate,
+            total_yld_count,
+            total_sched_goidle,
+            total_ttwu_count,
+            total_ttwu_local,
         })
     }
 
@@ -2548,6 +2668,7 @@ mod tests {
                             dispatch_keep_last: i as i64,
                             ..Default::default()
                         }),
+                        schedstat: None,
                         vcpu_cpu_time_ns: None,
                     },
                     CpuSnapshot {
@@ -2561,6 +2682,7 @@ mod tests {
                             dispatch_keep_last: i as i64 * 2,
                             ..Default::default()
                         }),
+                        schedstat: None,
                         vcpu_cpu_time_ns: None,
                     },
                 ],
@@ -3549,5 +3671,140 @@ mod tests {
             !summary.stall_detected,
             "preempted vCPU should not flag stall"
         );
+    }
+
+    // -- SchedstatDeltas tests --
+
+    fn sample_with_schedstat(
+        elapsed_ms: u64,
+        clock_base: u64,
+        run_delay: u64,
+        pcount: u64,
+        sched_count: u32,
+        ttwu_count: u32,
+    ) -> MonitorSample {
+        MonitorSample {
+            prog_stats: None,
+            elapsed_ms,
+            cpus: vec![
+                CpuSnapshot {
+                    nr_running: 2,
+                    rq_clock: clock_base,
+                    schedstat: Some(RqSchedstat {
+                        run_delay,
+                        pcount,
+                        sched_count,
+                        ttwu_count,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                CpuSnapshot {
+                    nr_running: 2,
+                    rq_clock: clock_base + 100,
+                    schedstat: Some(RqSchedstat {
+                        run_delay,
+                        pcount,
+                        sched_count,
+                        ttwu_count,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn schedstat_deltas_computed_from_samples() {
+        // 2 CPUs, each starting at run_delay=1000, ending at 5000.
+        // Total delta = 2 * (5000 - 1000) = 8000.
+        let samples = vec![
+            sample_with_schedstat(0, 1000, 1000, 10, 50, 30),
+            sample_with_schedstat(1000, 2000, 5000, 20, 100, 60),
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        let d = summary.schedstat_deltas.unwrap();
+        assert_eq!(d.total_run_delay, 8000);
+        assert_eq!(d.total_pcount, 20);
+        assert_eq!(d.total_sched_count, 100);
+        assert_eq!(d.total_ttwu_count, 60);
+        // Rate: 8000 ns / 1.0 s = 8000.0 ns/s.
+        assert!((d.run_delay_rate - 8000.0).abs() < f64::EPSILON);
+        assert!((d.sched_count_rate - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn schedstat_deltas_none_without_schedstat() {
+        let samples = vec![balanced_sample(100, 1000), balanced_sample(200, 1500)];
+        let summary = MonitorSummary::from_samples(&samples);
+        assert!(summary.schedstat_deltas.is_none());
+    }
+
+    #[test]
+    fn schedstat_deltas_single_sample() {
+        // Single sample -> first == last, duration=0, rates=0.
+        let samples = vec![sample_with_schedstat(100, 1000, 5000, 10, 50, 30)];
+        let summary = MonitorSummary::from_samples(&samples);
+        let d = summary.schedstat_deltas.unwrap();
+        assert_eq!(d.run_delay_rate, 0.0);
+        assert_eq!(d.sched_count_rate, 0.0);
+        assert_eq!(d.total_run_delay, 0);
+    }
+
+    #[test]
+    fn schedstat_deltas_rates() {
+        // 1 CPU, 500ms window. run_delay increases by 2000, sched_count by 40.
+        // run_delay_rate = 2000 / 0.5 = 4000.0 ns/s.
+        // sched_count_rate = 40 / 0.5 = 80.0 /s.
+        let samples = vec![
+            sample_with_schedstat(0, 1000, 1000, 5, 10, 20),
+            sample_with_schedstat(500, 2000, 3000, 15, 50, 40),
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        let d = summary.schedstat_deltas.unwrap();
+        // 2 CPUs, each delta = 2000, total = 4000.
+        assert_eq!(d.total_run_delay, 4000);
+        // rate = 4000 / 0.5s = 8000.0
+        assert!((d.run_delay_rate - 8000.0).abs() < f64::EPSILON);
+        // 2 CPUs, each sched_count delta = 40, total = 80.
+        assert_eq!(d.total_sched_count, 80);
+        // rate = 80 / 0.5s = 160.0
+        assert!((d.sched_count_rate - 160.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn schedstat_deltas_all_fields() {
+        let make = |elapsed_ms, rd, pc, yc, sc, sg, tc, tl| MonitorSample {
+            prog_stats: None,
+            elapsed_ms,
+            cpus: vec![CpuSnapshot {
+                nr_running: 1,
+                rq_clock: elapsed_ms * 10,
+                schedstat: Some(RqSchedstat {
+                    run_delay: rd,
+                    pcount: pc,
+                    yld_count: yc,
+                    sched_count: sc,
+                    sched_goidle: sg,
+                    ttwu_count: tc,
+                    ttwu_local: tl,
+                }),
+                ..Default::default()
+            }],
+        };
+        let samples = vec![
+            make(100, 100, 10, 1, 20, 5, 30, 15),
+            make(200, 500, 25, 4, 50, 12, 70, 35),
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        let d = summary.schedstat_deltas.unwrap();
+        assert_eq!(d.total_run_delay, 400);
+        assert_eq!(d.total_pcount, 15);
+        assert_eq!(d.total_yld_count, 3);
+        assert_eq!(d.total_sched_count, 30);
+        assert_eq!(d.total_sched_goidle, 7);
+        assert_eq!(d.total_ttwu_count, 40);
+        assert_eq!(d.total_ttwu_local, 20);
     }
 }

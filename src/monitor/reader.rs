@@ -8,8 +8,8 @@
 //! The monitor loop (`monitor_loop`) periodically reads per-CPU
 //! runqueue state from guest memory and collects `MonitorSample`s.
 
-use super::btf_offsets::{KernelOffsets, ScxEventOffsets};
-use super::{CpuSnapshot, MonitorSample, ScxEventCounters};
+use super::btf_offsets::{KernelOffsets, SchedstatOffsets, ScxEventOffsets};
+use super::{CpuSnapshot, MonitorSample, RqSchedstat, ScxEventCounters};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -308,6 +308,7 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
         rq_clock: mem.read_u64(rq_pa, offsets.rq_clock),
         scx_flags: mem.read_u32(rq_pa, offsets.rq_scx + offsets.scx_rq_flags),
         event_counters: None,
+        schedstat: None,
         vcpu_cpu_time_ns: None,
     }
 }
@@ -325,6 +326,20 @@ pub(crate) fn read_event_stats(
         dispatch_keep_last: mem.read_i64(base, ev.ev_dispatch_keep_last),
         enq_skip_exiting: mem.read_i64(base, ev.ev_enq_skip_exiting),
         enq_skip_migration_disabled: mem.read_i64(base, ev.ev_enq_skip_migration_disabled),
+    }
+}
+
+/// Read schedstat fields from one CPU's struct rq at the given physical address.
+pub(crate) fn read_rq_schedstat(mem: &GuestMem, rq_pa: u64, ss: &SchedstatOffsets) -> RqSchedstat {
+    let sched_info_pa = rq_pa + ss.rq_sched_info as u64;
+    RqSchedstat {
+        run_delay: mem.read_u64(sched_info_pa, ss.sched_info_run_delay),
+        pcount: mem.read_u64(sched_info_pa, ss.sched_info_pcount),
+        yld_count: mem.read_u32(rq_pa, ss.rq_yld_count),
+        sched_count: mem.read_u32(rq_pa, ss.rq_sched_count),
+        sched_goidle: mem.read_u32(rq_pa, ss.rq_sched_goidle),
+        ttwu_count: mem.read_u32(rq_pa, ss.rq_ttwu_count),
+        ttwu_local: mem.read_u32(rq_pa, ss.rq_ttwu_local),
     }
 }
 
@@ -486,6 +501,15 @@ pub(crate) fn monitor_loop(
             }
         }
 
+        // Overlay schedstat fields if available.
+        if let Some(ss) = &offsets.schedstat_offsets {
+            for (i, cpu) in cpus.iter_mut().enumerate() {
+                if let Some(&rq_pa) = rq_pas.get(i) {
+                    cpu.schedstat = Some(read_rq_schedstat(mem, rq_pa, ss));
+                }
+            }
+        }
+
         // Read vCPU CPU times and store in snapshots for post-hoc analysis.
         let curr_vcpu_times = vcpu_timing.map(|vt| vt.read_cpu_times());
         if let Some(ref times) = curr_vcpu_times {
@@ -618,6 +642,7 @@ mod tests {
             scx_rq_flags: 8,
             dsq_nr: 0,
             event_offsets: None,
+            schedstat_offsets: None,
         }
     }
 
@@ -1729,5 +1754,174 @@ mod tests {
             "evaluate: idle CPU should pass: {:?}",
             verdict.details
         );
+    }
+
+    fn test_schedstat_offsets() -> super::super::btf_offsets::SchedstatOffsets {
+        super::super::btf_offsets::SchedstatOffsets {
+            rq_sched_info: 200,
+            sched_info_run_delay: 8,
+            sched_info_pcount: 0,
+            rq_yld_count: 300,
+            rq_sched_count: 304,
+            rq_sched_goidle: 308,
+            rq_ttwu_count: 312,
+            rq_ttwu_local: 316,
+        }
+    }
+
+    /// Build a byte buffer simulating a struct rq with schedstat fields.
+    #[allow(clippy::too_many_arguments)]
+    fn make_schedstat_buffer(
+        ss: &super::super::btf_offsets::SchedstatOffsets,
+        run_delay: u64,
+        pcount: u64,
+        yld_count: u32,
+        sched_count: u32,
+        sched_goidle: u32,
+        ttwu_count: u32,
+        ttwu_local: u32,
+    ) -> Vec<u8> {
+        let size = ss.rq_ttwu_local + 4 + 8;
+        let mut buf = vec![0u8; size];
+
+        let si_base = ss.rq_sched_info;
+        buf[si_base + ss.sched_info_pcount..si_base + ss.sched_info_pcount + 8]
+            .copy_from_slice(&pcount.to_ne_bytes());
+        buf[si_base + ss.sched_info_run_delay..si_base + ss.sched_info_run_delay + 8]
+            .copy_from_slice(&run_delay.to_ne_bytes());
+
+        buf[ss.rq_yld_count..ss.rq_yld_count + 4].copy_from_slice(&yld_count.to_ne_bytes());
+        buf[ss.rq_sched_count..ss.rq_sched_count + 4].copy_from_slice(&sched_count.to_ne_bytes());
+        buf[ss.rq_sched_goidle..ss.rq_sched_goidle + 4]
+            .copy_from_slice(&sched_goidle.to_ne_bytes());
+        buf[ss.rq_ttwu_count..ss.rq_ttwu_count + 4].copy_from_slice(&ttwu_count.to_ne_bytes());
+        buf[ss.rq_ttwu_local..ss.rq_ttwu_local + 4].copy_from_slice(&ttwu_local.to_ne_bytes());
+        buf
+    }
+
+    #[test]
+    fn read_rq_schedstat_known_values() {
+        let ss = test_schedstat_offsets();
+        let buf = make_schedstat_buffer(&ss, 50000, 10, 3, 100, 20, 80, 40);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let stats = read_rq_schedstat(&mem, 0, &ss);
+        assert_eq!(stats.run_delay, 50000);
+        assert_eq!(stats.pcount, 10);
+        assert_eq!(stats.yld_count, 3);
+        assert_eq!(stats.sched_count, 100);
+        assert_eq!(stats.sched_goidle, 20);
+        assert_eq!(stats.ttwu_count, 80);
+        assert_eq!(stats.ttwu_local, 40);
+    }
+
+    #[test]
+    fn read_rq_schedstat_zeros() {
+        let ss = test_schedstat_offsets();
+        let buf = make_schedstat_buffer(&ss, 0, 0, 0, 0, 0, 0, 0);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let stats = read_rq_schedstat(&mem, 0, &ss);
+        assert_eq!(stats.run_delay, 0);
+        assert_eq!(stats.pcount, 0);
+        assert_eq!(stats.yld_count, 0);
+        assert_eq!(stats.sched_count, 0);
+        assert_eq!(stats.sched_goidle, 0);
+        assert_eq!(stats.ttwu_count, 0);
+        assert_eq!(stats.ttwu_local, 0);
+    }
+
+    #[test]
+    fn monitor_loop_with_schedstat_overlay() {
+        let ss = test_schedstat_offsets();
+        let mut offsets = test_offsets();
+        offsets.schedstat_offsets = Some(ss.clone());
+
+        // Build a buffer that contains both rq fields and schedstat fields.
+        // The rq buffer must be large enough to cover schedstat offsets.
+        let rq_size = ss.rq_ttwu_local + 4 + 8;
+        let mut buf = vec![0u8; rq_size];
+
+        // Write rq base fields.
+        buf[offsets.rq_nr_running..offsets.rq_nr_running + 4].copy_from_slice(&2u32.to_ne_bytes());
+        buf[offsets.rq_clock..offsets.rq_clock + 8].copy_from_slice(&500u64.to_ne_bytes());
+
+        // Write schedstat fields.
+        let si_base = ss.rq_sched_info;
+        buf[si_base + ss.sched_info_run_delay..si_base + ss.sched_info_run_delay + 8]
+            .copy_from_slice(&12345u64.to_ne_bytes());
+        buf[si_base + ss.sched_info_pcount..si_base + ss.sched_info_pcount + 8]
+            .copy_from_slice(&7u64.to_ne_bytes());
+        buf[ss.rq_sched_count..ss.rq_sched_count + 4].copy_from_slice(&42u32.to_ne_bytes());
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let (samples, _) = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            None,
+            Duration::from_millis(10),
+            &kill,
+            Instant::now(),
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+        );
+        handle.join().unwrap();
+
+        assert!(!samples.is_empty());
+        let ss_snap = samples[0].cpus[0].schedstat.as_ref().unwrap();
+        assert_eq!(ss_snap.run_delay, 12345);
+        assert_eq!(ss_snap.pcount, 7);
+        assert_eq!(ss_snap.sched_count, 42);
+    }
+
+    #[test]
+    fn monitor_loop_no_schedstat_when_none() {
+        let offsets = test_offsets();
+        assert!(offsets.schedstat_offsets.is_none());
+
+        let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let (samples, _) = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            None,
+            Duration::from_millis(10),
+            &kill,
+            Instant::now(),
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+        );
+        handle.join().unwrap();
+
+        assert!(!samples.is_empty());
+        assert!(samples[0].cpus[0].schedstat.is_none());
     }
 }

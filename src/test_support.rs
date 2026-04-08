@@ -3130,6 +3130,7 @@ mod tests {
                     total_enq_skip_exiting: 0,
                     total_enq_skip_migration_disabled: 0,
                 }),
+                schedstat_deltas: None,
             }),
             stimulus_events: vec![crate::timeline::StimulusEvent {
                 elapsed_ms: 500,

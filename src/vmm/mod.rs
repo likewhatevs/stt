@@ -3421,6 +3421,7 @@ mod tests {
             max_local_dsq_depth: 10,
             stall_detected: true,
             event_deltas: None,
+            schedstat_deltas: None,
         };
         let report = monitor::MonitorReport {
             samples: vec![],

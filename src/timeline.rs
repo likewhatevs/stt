@@ -589,6 +589,7 @@ mod tests {
                     rq_clock,
                     scx_flags: 0,
                     event_counters: None,
+                    schedstat: None,
                     vcpu_cpu_time_ns: None,
                 })
                 .collect(),
@@ -867,6 +868,7 @@ mod tests {
                     dispatch_keep_last: 5,
                     ..Default::default()
                 }),
+                schedstat: None,
                 vcpu_cpu_time_ns: None,
             }],
         };
@@ -884,6 +886,7 @@ mod tests {
                     dispatch_keep_last: 55,
                     ..Default::default()
                 }),
+                schedstat: None,
                 vcpu_cpu_time_ns: None,
             }],
         };
@@ -964,6 +967,7 @@ mod tests {
                         dispatch_keep_last: 0,
                         ..Default::default()
                     }),
+                    schedstat: None,
                     vcpu_cpu_time_ns: None,
                 }],
             });
@@ -986,6 +990,7 @@ mod tests {
                         dispatch_keep_last: 0,
                         ..Default::default()
                     }),
+                    schedstat: None,
                     vcpu_cpu_time_ns: None,
                 }],
             });
