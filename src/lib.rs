@@ -52,6 +52,7 @@
 //!
 //! - [`cgroup`] -- cgroup v2 filesystem operations
 //! - [`scenario`] -- test case definitions, flag system, cgroup helpers
+//! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
 //! - [`assert`] -- pass/fail assertions (starvation, isolation, fairness)
 //! - [`workload`] -- worker process types and telemetry collection
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
@@ -117,6 +118,8 @@ pub use crate::probe::process::resolve_func_ip;
 ///     Ok(AssertResult::pass())
 /// }
 /// ```
+///
+/// For curated canned scenarios, see [`scenario::scenarios`].
 pub mod prelude {
     pub use anyhow::Result;
 
@@ -125,6 +128,7 @@ pub mod prelude {
     pub use crate::scenario::ops::{
         CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execute_steps_with,
     };
+    pub use crate::scenario::scenarios;
     pub use crate::scenario::{CgroupGroup, Ctx};
     pub use crate::stt_test;
     pub use crate::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};

@@ -26,6 +26,7 @@ pub mod interaction;
 pub mod nested;
 pub mod ops;
 pub mod performance;
+pub mod scenarios;
 pub mod stress;
 
 pub use catalog::all_scenarios;
@@ -67,6 +68,7 @@ pub mod flags {
     /// typed `requires` pointers instead of string matching.
     pub struct FlagDecl {
         pub name: &'static str,
+        /// Extra CLI arguments passed to the scheduler when this flag is active.
         pub args: &'static [&'static str],
         pub requires: &'static [&'static FlagDecl],
         /// Shell commands to run in the guest to enable this flag

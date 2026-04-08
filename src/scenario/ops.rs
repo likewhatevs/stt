@@ -31,42 +31,38 @@ use super::{CgroupGroup, Ctx, process_alive};
 /// Names use `Cow<'static, str>` so ops can reference compile-time
 /// literals (zero-cost) or runtime-generated strings (owned).
 pub enum Op {
-    AddCgroup {
-        name: Cow<'static, str>,
-    },
-    RemoveCgroup {
-        name: Cow<'static, str>,
-    },
+    /// Create a new cgroup under the managed cgroup parent.
+    AddCgroup { name: Cow<'static, str> },
+    /// Remove a cgroup (stops its workers first).
+    RemoveCgroup { name: Cow<'static, str> },
+    /// Set a cgroup's cpuset to the resolved CPU set.
     SetCpuset {
         cgroup: Cow<'static, str>,
         cpus: CpusetSpec,
     },
-    ClearCpuset {
-        cgroup: Cow<'static, str>,
-    },
+    /// Clear a cgroup's cpuset (allow all CPUs).
+    ClearCpuset { cgroup: Cow<'static, str> },
+    /// Read both cgroups' cpusets and swap them.
     SwapCpusets {
         a: Cow<'static, str>,
         b: Cow<'static, str>,
     },
+    /// Spawn workers and move them into the target cgroup.
     Spawn {
         cgroup: Cow<'static, str>,
         workload: WorkloadConfig,
     },
-    StopCgroup {
-        cgroup: Cow<'static, str>,
-    },
-    RandomizeAffinity {
-        cgroup: Cow<'static, str>,
-    },
+    /// Stop all workers in a cgroup (does not remove the cgroup).
+    StopCgroup { cgroup: Cow<'static, str> },
+    /// Set each worker in a cgroup to a random CPU subset.
+    RandomizeAffinity { cgroup: Cow<'static, str> },
     /// Set all workers in a cgroup to the given affinity mask.
     SetAffinity {
         cgroup: Cow<'static, str>,
         cpus: BTreeSet<usize>,
     },
     /// Spawn workers in the parent cgroup (not in a managed cgroup).
-    SpawnHost {
-        workload: WorkloadConfig,
-    },
+    SpawnHost { workload: WorkloadConfig },
     /// Move all tasks from one cgroup to another via cgroup.procs.
     MoveAllTasks {
         from: Cow<'static, str>,
@@ -234,6 +230,24 @@ impl Step {
             ops,
             hold,
         }
+    }
+
+    /// Create a step with CgroupDef setup and a hold period.
+    ///
+    /// Most steps only need cgroup definitions and a hold duration.
+    /// Use [`with_ops`](Step::with_ops) to chain ops onto the step.
+    pub fn with_defs(defs: Vec<CgroupDef>, hold: HoldSpec) -> Self {
+        Self {
+            setup: Setup::Defs(defs),
+            ops: vec![],
+            hold,
+        }
+    }
+
+    /// Replace the ops for a step, consuming and returning it.
+    pub fn with_ops(mut self, ops: Vec<Op>) -> Self {
+        self.ops = ops;
+        self
     }
 }
 
@@ -1468,5 +1482,49 @@ mod tests {
     fn setup_factory_not_empty() {
         let setup = Setup::Factory(|_| vec![CgroupDef::named("generated")]);
         assert!(!setup.is_empty());
+    }
+
+    // -- Step::with_defs / with_ops --
+
+    #[test]
+    fn step_with_defs_empty() {
+        let step = Step::with_defs(vec![], HoldSpec::Frac(0.5));
+        assert!(step.setup.is_empty());
+        assert!(step.ops.is_empty());
+    }
+
+    #[test]
+    fn step_with_defs_populated() {
+        let step = Step::with_defs(
+            vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
+            HoldSpec::Fixed(Duration::from_secs(5)),
+        );
+        assert!(!step.setup.is_empty());
+        assert!(step.ops.is_empty());
+    }
+
+    #[test]
+    fn step_with_defs_then_ops() {
+        let step =
+            Step::with_defs(vec![CgroupDef::named("cg_0")], HoldSpec::Frac(1.0)).with_ops(vec![
+                Op::AddCgroup {
+                    name: "cg_1".into(),
+                },
+            ]);
+        assert!(!step.setup.is_empty());
+        assert_eq!(step.ops.len(), 1);
+    }
+
+    #[test]
+    fn step_with_ops_replaces() {
+        let step = Step::new(
+            vec![Op::AddCgroup { name: "a".into() }],
+            HoldSpec::Frac(0.5),
+        )
+        .with_ops(vec![
+            Op::AddCgroup { name: "b".into() },
+            Op::RemoveCgroup { name: "c".into() },
+        ]);
+        assert_eq!(step.ops.len(), 2);
     }
 }
