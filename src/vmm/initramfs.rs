@@ -1,104 +1,11 @@
 /// Minimal initramfs (cpio newc format) creation via the `cpio` crate.
-/// Packs files into a cpio archive for use as Linux initrd.
-/// Includes a shell init script that mounts essential filesystems
-/// before running the payload.
+/// Packs the test binary as `/init` along with scheduler binaries and
+/// shared libraries into a cpio archive for use as Linux initrd.
+/// Init setup is handled by Rust code in `vmm::rust_init`.
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-/// Shell init script that mounts proc/sys/dev/cgroup, runs the payload,
-/// captures the exit code via serial, and powers off.
-///
-/// Payload stdout/stderr and STT_EXIT are directed to the app tty
-/// to separate them from kernel console output on the console tty.
-/// Both x86_64 and aarch64 use ns16550a UART (ttyS0/ttyS1).
-const INIT_SCRIPT: &str = r#"#!/bin/sh
-export PATH=/bin
-export LD_LIBRARY_PATH=/lib:/lib64:/usr/lib:/usr/lib64
-busybox mkdir -p /proc /sys /dev /tmp
-busybox mount -t proc proc /proc
-busybox mount -t sysfs sys /sys
-busybox mount -t devtmpfs dev /dev
-busybox mkdir -p /sys/kernel/debug
-busybox mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
-busybox mkdir -p /sys/kernel/tracing
-busybox mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
-busybox mkdir -p /sys/fs/bpf
-busybox mount -t bpf bpffs /sys/fs/bpf 2>/dev/null
-echo "STT_INIT_STARTED" > /dev/ttyS1
-busybox mkdir -p /sys/fs/cgroup
-busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
-busybox mount -t tmpfs tmpfs /tmp
-if [ -f /sched_enable ]; then
-    . /sched_enable
-fi
-if [ -x /scheduler ]; then
-    SCHED_ARGS=$(busybox cat /sched_args 2>/dev/null)
-    /scheduler $SCHED_ARGS >/tmp/sched.log 2>&1 &
-    SCHED_PID=$!
-    export SCHED_PID
-    busybox sleep 1
-    if ! busybox kill -0 $SCHED_PID 2>/dev/null; then
-        echo "===SCHED_OUTPUT_START===" > /dev/ttyS1
-        busybox cat /tmp/sched.log > /dev/ttyS1 2>/dev/null
-        echo "===SCHED_OUTPUT_END===" > /dev/ttyS1
-        echo "SCHEDULER_DIED" > /dev/ttyS1
-        echo "STT_EXIT=1" > /dev/ttyS1
-        busybox reboot -f
-    fi
-fi
-TRACE_EVENTS=/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable
-if [ -f "$TRACE_EVENTS" ]; then
-    echo 1 > "$TRACE_EVENTS"
-    busybox cat /sys/kernel/tracing/trace_pipe > /dev/ttyS0 &
-fi
-SHM_BASE=
-for _w in $(busybox cat /proc/cmdline); do
-    case $_w in STT_SHM_BASE=*) SHM_BASE=${_w#STT_SHM_BASE=} ;; esac
-done
-if [ -n "$SHM_BASE" ]; then
-    DUMP_ADDR=$(( SHM_BASE + 12 ))
-    STALL_ADDR=$(( SHM_BASE + 13 ))
-    printf 'D' > /tmp/dump_req
-    printf 'S' > /tmp/stall_req
-    while true; do
-        busybox dd if=/dev/mem bs=1 count=1 skip=$DUMP_ADDR of=/tmp/dump_byte 2>/dev/null
-        if busybox cmp -s /tmp/dump_byte /tmp/dump_req; then
-            echo D > /proc/sysrq-trigger
-            printf '\0' | busybox dd of=/dev/mem bs=1 count=1 seek=$DUMP_ADDR conv=notrunc 2>/dev/null
-        fi
-        busybox dd if=/dev/mem bs=1 count=1 skip=$STALL_ADDR of=/tmp/stall_byte 2>/dev/null
-        if busybox cmp -s /tmp/stall_byte /tmp/stall_req; then
-            busybox touch /tmp/stt_stall
-            printf '\0' | busybox dd of=/dev/mem bs=1 count=1 seek=$STALL_ADDR conv=notrunc 2>/dev/null
-        fi
-        busybox sleep 1
-    done &
-fi
-ARGS=$(busybox cat /args 2>/dev/null)
-echo "STT_PAYLOAD_STARTING" > /dev/ttyS1
-echo "===STT_JSON_START===" > /dev/ttyS1
-/payload $ARGS >/dev/ttyS1 2>&1
-RC=$?
-echo "===STT_JSON_END===" > /dev/ttyS1
-if [ -n "$SCHED_PID" ]; then
-    busybox kill $SCHED_PID 2>/dev/null
-    busybox wait $SCHED_PID 2>/dev/null
-    echo "===SCHED_OUTPUT_START===" > /dev/ttyS1
-    busybox cat /tmp/sched.log > /dev/ttyS1 2>/dev/null
-    echo "===SCHED_OUTPUT_END===" > /dev/ttyS1
-fi
-if [ -f /sched_disable ]; then
-    . /sched_disable
-fi
-echo "STT_EXIT=$RC" > /dev/ttyS1
-busybox usleep 100000
-busybox reboot -f
-"#;
-
-/// Statically-linked busybox binary, embedded at compile time via build.rs.
-const BUSYBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
 
 /// Resolve shared library dependencies for a dynamically-linked binary.
 /// Runs `ldd`, parses output, returns `(guest_path, host_path)` pairs.
@@ -232,21 +139,23 @@ fn is_deleted_self(path: &Path) -> bool {
         && target_str.trim_end_matches(" (deleted)") == path.to_string_lossy().as_ref()
 }
 
-/// Build the base cpio archive: directories, busybox, init script, payload,
-/// extra binaries, and shared libraries. Does NOT include /args, trailer,
-/// or 512-byte padding. The returned bytes are a valid cpio prefix that
-/// `build_suffix` can complete with per-invocation args.
+/// Build the base cpio archive: /init binary, extra binaries, and shared
+/// libraries. Does NOT include /args, trailer, or 512-byte padding. The
+/// returned bytes are a valid cpio prefix that `build_suffix` can complete
+/// with per-invocation args.
+///
+/// The test binary is packed as `/init` (the kernel's rdinit entry point).
+/// Init setup (mounts, scheduler start, etc.) is handled by the Rust init
+/// code in `vmm::rust_init`, which runs when the binary detects PID 1.
 pub fn create_initramfs_base(payload: &Path, extra_binaries: &[(&str, &Path)]) -> Result<Vec<u8>> {
     let binary = strip_debug(payload)
         .with_context(|| format!("strip/read binary: {}", payload.display()))?;
-    let busybox = BUSYBOX;
     let mut archive = Vec::new();
 
-    // Collect directory entries needed.
+    // Collect directory entries needed for shared libraries.
     let mut dirs = BTreeSet::new();
-    dirs.insert("bin".to_string());
 
-    // Resolve shared library dependencies for payload and extra binaries.
+    // Resolve shared library dependencies for init binary and extras.
     let mut shared_libs: Vec<(String, PathBuf)> = Vec::new();
     let all_binaries: Vec<&Path> = std::iter::once(payload)
         .chain(extra_binaries.iter().map(|(_, p)| *p))
@@ -273,11 +182,9 @@ pub fn create_initramfs_base(payload: &Path, extra_binaries: &[(&str, &Path)]) -
         write_entry(&mut archive, dir, &[], 0o40755)?;
     }
 
-    // Core files
-    write_entry(&mut archive, "bin/busybox", busybox, 0o100755)?;
-    write_entry(&mut archive, "bin/sh", busybox, 0o100755)?;
-    write_entry(&mut archive, "init", INIT_SCRIPT.as_bytes(), 0o100755)?;
-    write_entry(&mut archive, "payload", &binary, 0o100755)?;
+    // Test binary as /init — the Rust init code detects PID 1 and performs
+    // all setup (mounts, scheduler, etc.) before running the test function.
+    write_entry(&mut archive, "init", &binary, 0o100755)?;
 
     // Extra binaries (stripped to reduce initramfs size)
     for (name, path) in extra_binaries {
@@ -677,34 +584,12 @@ mod tests {
     }
 
     #[test]
-    fn create_initramfs_has_init_and_payload() {
+    fn create_initramfs_has_init() {
         let exe = crate::resolve_current_exe().unwrap();
         let initrd = create_initramfs(&exe, &[], &[]).unwrap();
         let s = String::from_utf8_lossy(&initrd);
         assert!(s.contains("init"), "should contain init entry");
-        assert!(s.contains("payload"), "should contain payload entry");
         assert!(s.contains("TRAILER!!!"));
-    }
-
-    #[test]
-    fn create_initramfs_init_script_content() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let initrd = create_initramfs(&exe, &[], &[]).unwrap();
-        let s = String::from_utf8_lossy(&initrd);
-        assert!(s.contains("mount -t proc"));
-        assert!(s.contains("mount -t sysfs"));
-        assert!(s.contains("mount -t devtmpfs"));
-        assert!(s.contains("STT_EXIT="));
-        assert!(s.contains("===STT_JSON_START==="));
-        assert!(s.contains("===STT_JSON_END==="));
-        assert!(s.contains("===SCHED_OUTPUT_START==="));
-        assert!(s.contains("===SCHED_OUTPUT_END==="));
-        assert!(s.contains("sched_ext_dump/enable"));
-        assert!(s.contains("trace_pipe"));
-        assert!(s.contains("sysrq-trigger"));
-        assert!(s.contains("STT_SHM_BASE="));
-        assert!(s.contains("STT_INIT_STARTED"));
-        assert!(s.contains("STT_PAYLOAD_STARTING"));
     }
 
     #[test]
@@ -855,11 +740,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_shared_libs_static_binary() {
-        let busybox_path = std::path::PathBuf::from(env!("OUT_DIR")).join("busybox");
-        if busybox_path.exists() {
-            let libs = resolve_shared_libs(&busybox_path).unwrap();
-            assert!(libs.is_empty(), "static binary should have no shared libs");
+    fn resolve_shared_libs_nonexistent_returns_error() {
+        let result = resolve_shared_libs(Path::new("/nonexistent/binary"));
+        // ldd on a nonexistent binary fails, returning empty or error.
+        if let Ok(libs) = result {
+            assert!(libs.is_empty());
         }
     }
 
@@ -1019,12 +904,11 @@ mod tests {
     }
 
     #[test]
-    fn create_initramfs_base_contains_busybox() {
+    fn create_initramfs_base_contains_init() {
         let exe = crate::resolve_current_exe().unwrap();
         let base = create_initramfs_base(&exe, &[]).unwrap();
         let s = String::from_utf8_lossy(&base);
-        assert!(s.contains("bin/busybox"), "base should contain busybox");
-        assert!(s.contains("bin/sh"), "base should contain sh symlink");
+        assert!(s.contains("init"), "base should contain init entry");
     }
 
     #[test]

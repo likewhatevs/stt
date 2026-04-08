@@ -22,7 +22,7 @@ flate2 = "1"
 ctor = "0.8"
 gix = "0.81"
 libc = "0.2"
-nix = { version = "0.31", features = ["sched", "signal", "process"] }
+nix = { version = "0.31", features = ["fs", "mount", "process", "reboot", "sched", "signal"] }
 blazesym = { version = "0.2", features = ["dwarf"] }
 rand = "0.10"
 rmesg = { version = "1", default-features = false, features = ["sync"] }

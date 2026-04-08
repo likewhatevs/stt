@@ -1,6 +1,7 @@
 pub mod console;
 pub mod host_topology;
 pub mod initramfs;
+pub(crate) mod rust_init;
 pub mod shm_ring;
 pub mod topology;
 
@@ -1555,9 +1556,9 @@ impl SttVm {
     /// Spawn a thread that writes to a BPF map in guest memory.
     ///
     /// Event-driven sequence:
-    /// 1. Poll `find_map` until the scheduler's BPF maps are discoverable
-    /// 2. Poll the SHM ring for MSG_TYPE_SCENARIO_START
-    /// 3. Write the crash value
+    /// 1. Poll `BpfMapAccessorOwned::new` until kernel page tables are up
+    /// 2. Poll `find_map` until the scheduler's BPF maps are discoverable
+    /// 3. Write the crash value and signal guest via SHM slot 0
     fn start_bpf_map_write(
         &self,
         vm: &kvm::SttKvm,
@@ -1633,44 +1634,10 @@ impl SttVm {
                     map_info.name, attempt,
                 );
 
-                // Phase 3: poll SHM ring for MSG_TYPE_SCENARIO_START.
-                if shm_size == 0 {
-                    eprintln!(
-                        "bpf_map_write: SHM disabled, no scenario synchronization — \
-                         write timing is not deterministic",
-                    );
-                } else {
-                    let shm_base = (mem.size() - shm_size) as usize;
-                    let shm_len = shm_size as usize;
-                    let scenario_deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    let mut found_start = false;
-                    while std::time::Instant::now() < scenario_deadline {
-                        if kill_clone.load(Ordering::Acquire) {
-                            eprintln!("bpf_map_write: VM exited waiting for scenario start");
-                            return;
-                        }
-                        let mut shm_buf = vec![0u8; shm_len];
-                        mem.read_bytes(shm_base as u64, &mut shm_buf);
-                        let drain = shm_ring::shm_drain(&shm_buf, 0);
-                        if drain
-                            .entries
-                            .iter()
-                            .any(|e| e.msg_type == shm_ring::MSG_TYPE_SCENARIO_START && e.crc_ok)
-                        {
-                            found_start = true;
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    if !found_start {
-                        eprintln!("bpf_map_write: scenario start not seen, writing anyway");
-                    }
-                }
-
-                if kill_clone.load(Ordering::Acquire) {
-                    return;
-                }
+                // Phase 3: write the crash trigger and signal the guest.
+                // The guest blocks on wait_for(0, timeout) before starting
+                // the scenario. Signaling immediately after the BPF write
+                // ensures the crash is active when the scenario runs.
 
                 // Log all maps for diagnostic visibility.
                 let all_maps = accessor.maps();
@@ -1693,6 +1660,13 @@ impl SttVm {
                     "bpf_map_write: map '{}' write={} (value={} offset={} before={:?} after={:?})",
                     map_info.name, ok, params.value, params.offset, before, after,
                 );
+
+                // Signal the guest that the BPF map write is done.
+                if ok && shm_size > 0 {
+                    let shm_base = mem.size() - shm_size;
+                    shm_ring::signal_guest(&mem, shm_base, 0);
+                    eprintln!("bpf_map_write: signaled slot 0");
+                }
             })
             .context("spawn bpf-map-write thread")?;
 

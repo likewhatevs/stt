@@ -6,9 +6,10 @@ stt has three execution domains:
    [VM lifecycle](architecture/vmm.md), monitors guest memory, evaluates
    results.
 
-2. **Guest process** -- the same test binary running inside the VM.
-   Creates cgroups, forks [workers](architecture/workers.md), runs
-   scenarios, writes results to the serial console.
+2. **Guest process** -- the same test binary running inside the VM
+   as PID 1. Mounts filesystems, starts the scheduler, creates
+   cgroups, forks [workers](architecture/workers.md), runs scenarios,
+   writes results to COM2.
 
 3. **[Monitor](architecture/monitor.md) thread** -- runs on the host
    while the guest executes. Reads guest VM memory directly to observe
@@ -22,23 +23,24 @@ Host                          Guest
 test binary                   
   |                           
   +-- build initramfs         
-  |   (test binary + busybox  
+  |   (test binary as /init   
   |    + optional scheduler)  
   |                           
   +-- boot KVM VM             
-  |                           test binary (ctor dispatch)
+  |                           test binary (PID 1 init)
   |                             |
-  +-- start monitor thread      +-- start scheduler (if any)
-  |   (reads guest memory)      +-- create cgroups
+  +-- start monitor thread      +-- mount filesystems
+  |   (reads guest memory)      +-- start scheduler (if any)
+  |                             +-- create cgroups
   |                             +-- fork workers
   |                             +-- move workers to cgroups
   |                             +-- signal workers to start
   |                             +-- poll scheduler liveness
   |                             +-- stop workers, collect reports
   |                             +-- evaluate results
-  |                             +-- write result to serial
+  |                             +-- write result to COM2
   |                           
-  +-- read result from serial 
+  +-- read result from COM2   
   +-- evaluate monitor data   
   +-- report pass/fail        
 ```
@@ -46,9 +48,10 @@ test binary
 ## Key design decisions
 
 **Same binary, two roles.** The test binary serves as both host
-controller and guest test runner. The initramfs embeds the binary.
-Guest-side execution is triggered by `ctor` early dispatch (before
-`main()`).
+controller and guest test runner. The initramfs embeds the binary
+as `/init`. When running as PID 1, the Rust init code
+(`vmm::rust_init`) handles the full guest lifecycle: mounts,
+scheduler start, test dispatch, and reboot.
 
 **Forked workers, not threads.** Workers are `fork()`ed processes
 because cgroups operate on PIDs. Each worker must be a separate

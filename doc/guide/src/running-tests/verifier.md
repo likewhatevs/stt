@@ -1,11 +1,11 @@
 # BPF Verifier
 
-`stt verifier` boots a scheduler in a KVM VM and captures
+The verifier pipeline boots a scheduler in a KVM VM and captures
 per-program verifier statistics from the real kernel verifier.
 
 ## Design
 
-The verifier subcommand follows stt's two core principles.
+The verifier pipeline follows stt's two core principles.
 
 **Fidelity without overhead.** The scheduler binary runs inside a VM
 on the same kernel the scheduler will run on in production. The

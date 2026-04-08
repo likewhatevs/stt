@@ -87,6 +87,10 @@ pub fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
 ///
 /// Runs before `main()` in any binary that links against stt.
 ///
+/// When running as PID 1 (the binary is `/init` in the VM), returns
+/// immediately — init duties are handled by `stt_guest_init()` called
+/// from the test harness `main()`.
+///
 /// - `--stt-test-fn=NAME --stt-topo=NsNcNt`: host-side dispatch —
 ///   boots a VM with the specified topology and runs the test inside it.
 /// - `--stt-test-fn=NAME` (without `--stt-topo`): guest-side dispatch —
@@ -94,6 +98,12 @@ pub fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
 /// - Otherwise: no-op.
 #[ctor::ctor]
 pub fn stt_test_early_dispatch() {
+    // PID 1: the binary is /init in the VM. Perform full init lifecycle
+    // (mounts, scheduler, test dispatch, reboot). Never returns.
+    if unsafe { libc::getpid() } == 1 {
+        stt_guest_init();
+    }
+
     if let Some(code) = maybe_dispatch_host_test() {
         std::process::exit(code);
     }
@@ -108,6 +118,18 @@ pub fn stt_test_early_dispatch() {
         try_flush_profraw();
         std::process::exit(code);
     }
+}
+
+/// Returns true when running as PID 1 (the binary is `/init` in a VM).
+pub fn is_pid1() -> bool {
+    vmm::rust_init::is_pid1()
+}
+
+/// Guest init entry point. Called when running as PID 1 (the binary is
+/// `/init` in the VM). Handles the full init lifecycle: mounts,
+/// scheduler start, test dispatch, cleanup, and reboot. Never returns.
+pub fn stt_guest_init() -> ! {
+    vmm::rust_init::stt_guest_init()
 }
 
 /// Host-side dispatch: if both `--stt-test-fn` and `--stt-topo` are
@@ -1292,12 +1314,22 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
 /// and exit. Profraw flush is handled by `try_flush_profraw()` in the
 /// ctor before `std::process::exit()`.
 ///
-/// Called from `stt_test_early_dispatch()` (ctor) before `main()`.
+/// Called from `stt_test_early_dispatch()` (ctor) before `main()`, or
+/// from `stt_guest_init()` when running as PID 1.
+///
+/// When called from PID 1 context, args must be pre-loaded into the
+/// process args (the caller reads `/args` from the initramfs).
 /// Returns `Some(exit_code)` if dispatched, `None` if not an
 /// stt_test invocation.
 pub fn maybe_dispatch_vm_test() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
-    let name = extract_test_fn_arg(&args)?;
+    maybe_dispatch_vm_test_with_args(&args)
+}
+
+/// Like `maybe_dispatch_vm_test` but with explicit args. Used by
+/// `stt_guest_init()` which reads args from `/args` in the initramfs.
+pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
+    let name = extract_test_fn_arg(args)?;
 
     // Propagate RUST_BACKTRACE from kernel cmdline to env.
     if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline")
@@ -1329,10 +1361,10 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
     };
 
     // Parse --stt-probe-stack=func1,func2,... for auto-repro mode.
-    let probe_stack = extract_probe_stack_arg(&args);
+    let probe_stack = extract_probe_stack_arg(args);
 
     // Parse --stt-work-type=NAME for work type override.
-    let work_type_override = extract_work_type_arg(&args).and_then(|s| {
+    let work_type_override = extract_work_type_arg(args).and_then(|s| {
         crate::workload::WorkType::from_name(&s).or_else(|| {
             eprintln!("stt_test: unknown work type '{s}'");
             None
@@ -1430,6 +1462,7 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
         settle_ms: 500,
         work_type_override,
         assert: merged_assert,
+        wait_for_map_write: entry.bpf_map_write.is_some(),
     };
 
     let result = match (entry.func)(&ctx) {
@@ -1526,7 +1559,7 @@ fn collect_and_print_probe_data(
 ///
 /// No-op when built without `-C instrument-coverage` or when SHM
 /// parameters are absent from the kernel command line.
-fn try_flush_profraw() {
+pub(crate) fn try_flush_profraw() {
     let Some((shm_base, shm_size)) = parse_shm_params() else {
         return;
     };
@@ -1662,34 +1695,19 @@ fn write_to_shm_ring(shm_base: u64, shm_size: u64, msg_type: u32, payload: &[u8]
         .open("/dev/mem")
         .context("open /dev/mem")?;
 
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-    let aligned_base = shm_base & !(page_size - 1);
-    let offset_in_page = (shm_base - aligned_base) as usize;
-    let map_size = shm_size as usize + offset_in_page;
+    let m = vmm::shm_ring::mmap_devmem(
+        std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+        shm_base,
+        shm_size,
+    )
+    .ok_or_else(|| anyhow::anyhow!("mmap /dev/mem failed"))?;
 
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            map_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            std::os::unix::io::AsRawFd::as_raw_fd(&fd),
-            aligned_base as libc::off_t,
-        )
-    };
-
-    if ptr == libc::MAP_FAILED {
-        anyhow::bail!("mmap /dev/mem failed");
-    }
-
-    let shm_buf = unsafe {
-        std::slice::from_raw_parts_mut((ptr as *mut u8).add(offset_in_page), shm_size as usize)
-    };
+    let shm_buf = unsafe { std::slice::from_raw_parts_mut(m.ptr, shm_size as usize) };
 
     let written = vmm::shm_ring::shm_write(shm_buf, 0, msg_type, payload);
 
     unsafe {
-        libc::munmap(ptr, map_size);
+        libc::munmap(m.map_base, m.map_size);
     }
 
     if written == 0 {
@@ -1816,14 +1834,14 @@ fn extract_kernel_version(console: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Init script sentinels (written to COM2 by the init script)
+// Init sentinels (written to COM2 by the Rust init and guest dispatch)
 // ---------------------------------------------------------------------------
 
-/// Written to COM2 after proc/sys/devtmpfs mounts, before scheduler start.
+/// Written to COM2 by Rust init after filesystem mounts complete.
 const SENTINEL_INIT_STARTED: &str = "STT_INIT_STARTED";
 
-/// Written to COM2 after mounts, scheduler start, and trace setup —
-/// immediately before the payload binary is exec'd.
+/// Written to COM2 by guest dispatch immediately before the test
+/// function is called.
 const SENTINEL_PAYLOAD_STARTING: &str = "STT_PAYLOAD_STARTING";
 
 /// Classify the failure stage based on which sentinels appear in COM2 output.

@@ -13,6 +13,50 @@
 /// command line.
 use zerocopy::IntoBytes;
 
+/// Result of a successful `/dev/mem` mmap of the SHM region.
+pub(crate) struct ShmMmap {
+    /// Pointer to the start of the SHM region (page-offset adjusted).
+    pub ptr: *mut u8,
+    /// Base address passed to munmap (page-aligned).
+    pub map_base: *mut libc::c_void,
+    /// Size passed to munmap.
+    pub map_size: usize,
+}
+
+/// Page-aligned mmap of a physical address range via an open `/dev/mem` fd.
+/// Returns the adjusted pointer to `shm_base` within the mapping.
+pub(crate) fn mmap_devmem(
+    fd: std::os::unix::io::RawFd,
+    shm_base: u64,
+    shm_size: u64,
+) -> Option<ShmMmap> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let aligned_base = shm_base & !(page_size - 1);
+    let offset_in_page = (shm_base - aligned_base) as usize;
+    let map_size = shm_size as usize + offset_in_page;
+
+    let map_base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            aligned_base as libc::off_t,
+        )
+    };
+    if map_base == libc::MAP_FAILED {
+        return None;
+    }
+
+    let ptr = unsafe { (map_base as *mut u8).add(offset_in_page) };
+    Some(ShmMmap {
+        ptr,
+        map_base,
+        map_size,
+    })
+}
+
 /// Magic value identifying a valid SHM ring header.
 pub const SHM_RING_MAGIC: u32 = 0x5354_4d52; // "STMR"
 
@@ -45,6 +89,123 @@ pub const STALL_REQ_OFFSET: usize = 13;
 
 /// Value written to STALL_REQ_OFFSET to request a scheduler stall.
 pub const STALL_REQ_ACTIVATE: u8 = b'S';
+
+/// Base offset within the SHM region for numbered signal slots.
+/// Slots occupy bytes starting at offset 14 (third byte of `_pad`)
+/// and extending into byte 15 (fourth byte of `_pad`), providing
+/// 2 slots (0..1). AtomicU8 with Acquire/Release ordering.
+pub const SIGNAL_SLOT_BASE: usize = 14;
+
+/// Number of available signal slots.
+const SIGNAL_SLOT_COUNT: usize = 2;
+
+/// Guest-side: poll SHM slot until non-zero or timeout.
+/// Reads via AtomicU8 with Acquire ordering. The SHM mmap pointer
+/// is cached in a OnceLock, initialized from /proc/cmdline during
+/// the first call (or from `init_shm_ptr`).
+pub fn wait_for(slot: u8, timeout: std::time::Duration) -> anyhow::Result<()> {
+    assert!(
+        (slot as usize) < SIGNAL_SLOT_COUNT,
+        "signal slot {slot} out of range"
+    );
+    let ptr = shm_ptr()?;
+    let offset = SIGNAL_SLOT_BASE + slot as usize;
+    let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if atom.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    anyhow::bail!("signal slot {slot} timed out after {timeout:?}")
+}
+
+/// Guest-side: set a slot to non-zero.
+/// Writes via AtomicU8 with Release ordering.
+pub fn signal(slot: u8) {
+    assert!(
+        (slot as usize) < SIGNAL_SLOT_COUNT,
+        "signal slot {slot} out of range"
+    );
+    let Ok(ptr) = shm_ptr() else { return };
+    let offset = SIGNAL_SLOT_BASE + slot as usize;
+    let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
+    atom.store(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Host-side: write 1 to a signal slot in guest memory.
+/// `mem` provides direct access to guest physical memory;
+/// `shm_base` is the guest physical address of the SHM region.
+pub fn signal_guest(mem: &crate::monitor::reader::GuestMem, shm_base: u64, slot: u8) {
+    assert!(
+        (slot as usize) < SIGNAL_SLOT_COUNT,
+        "signal slot {slot} out of range"
+    );
+    mem.write_u8(shm_base, SIGNAL_SLOT_BASE + slot as usize, 1);
+}
+
+/// Set the cached SHM base pointer. Called from `start_shm_poll` in
+/// the guest init after parsing /proc/cmdline.
+pub fn init_shm_ptr(base: *mut u8) {
+    let _ = SHM_PTR.set(ShmPtr(base));
+}
+
+/// Wrapper for a raw pointer that is Send+Sync.
+/// SAFETY: The SHM pointer is set once during single-threaded init and
+/// points into a /dev/mem mmap that outlives all guest threads.
+struct ShmPtr(*mut u8);
+unsafe impl Send for ShmPtr {}
+unsafe impl Sync for ShmPtr {}
+
+/// Cached SHM mmap pointer for guest-side signal operations.
+static SHM_PTR: std::sync::OnceLock<ShmPtr> = std::sync::OnceLock::new();
+
+/// Get the cached SHM mmap pointer, initializing from /proc/cmdline
+/// if not already set.
+fn shm_ptr() -> anyhow::Result<*mut u8> {
+    if let Some(p) = SHM_PTR.get() {
+        return Ok(p.0);
+    }
+    // Lazy init from /proc/cmdline.
+    let cmdline = std::fs::read_to_string("/proc/cmdline")
+        .map_err(|e| anyhow::anyhow!("/proc/cmdline: {e}"))?;
+    let (shm_base, shm_size) = parse_shm_params_from_str(&cmdline)
+        .ok_or_else(|| anyhow::anyhow!("no SHM params in cmdline"))?;
+
+    let fd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/mem")
+        .map_err(|e| anyhow::anyhow!("/dev/mem open: {e}"))?;
+
+    let m = mmap_devmem(
+        std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+        shm_base,
+        shm_size,
+    )
+    .ok_or_else(|| anyhow::anyhow!("/dev/mem mmap failed: {}", std::io::Error::last_os_error()))?;
+
+    let _ = SHM_PTR.set(ShmPtr(m.ptr));
+    Ok(m.ptr)
+}
+
+/// Parse STT_SHM_BASE and STT_SHM_SIZE from a kernel command line string.
+pub(crate) fn parse_shm_params_from_str(cmdline: &str) -> Option<(u64, u64)> {
+    let base = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("STT_SHM_BASE="))?
+        .strip_prefix("STT_SHM_BASE=")?;
+    let size = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("STT_SHM_SIZE="))?
+        .strip_prefix("STT_SHM_SIZE=")?;
+    let base =
+        u64::from_str_radix(base.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
+    let size =
+        u64::from_str_radix(size.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
+    Some((base, size))
+}
 
 /// Default SHM region size (64 KB).
 #[allow(dead_code)]

@@ -6,6 +6,9 @@ use stt::stt_test;
 use stt::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
 fn main() {
+    if stt::test_support::is_pid1() {
+        stt::test_support::stt_guest_init();
+    }
     let args = libtest_mimic::Arguments::from_args();
     let trials = stt::test_support::build_stt_trials();
     let conclusion = libtest_mimic::run(&args, trials);

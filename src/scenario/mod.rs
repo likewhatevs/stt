@@ -430,6 +430,10 @@ pub struct Ctx<'a> {
     /// Used by `execute_steps` as the default when no explicit checks
     /// are passed to `execute_steps_with`.
     pub assert: crate::assert::Assert,
+    /// When true, `execute_steps` polls SHM signal slot 0 after writing
+    /// the scenario start marker, blocking until the host confirms its
+    /// BPF map write is complete.
+    pub wait_for_map_write: bool,
 }
 
 /// Run a scenario. Returns assertion result.
@@ -1114,6 +1118,7 @@ mod tests {
             settle_ms: 3000,
             work_type_override: None,
             assert: assert::Assert::default_checks(),
+            wait_for_map_write: false,
         };
         let (a, b) = split_half(&ctx);
         // Last CPU reserved for cgroup 0 → 7 usable, split 3/4
@@ -1134,6 +1139,7 @@ mod tests {
             settle_ms: 3000,
             work_type_override: None,
             assert: assert::Assert::default_checks(),
+            wait_for_map_write: false,
         };
         let (a, b) = split_half(&ctx);
         assert_eq!(a.len() + b.len(), 2);
@@ -1152,6 +1158,7 @@ mod tests {
             settle_ms: 3000,
             work_type_override: None,
             assert: assert::Assert::default_checks(),
+            wait_for_map_write: false,
         };
         let wl = dfl_wl(&ctx);
         assert_eq!(wl.num_workers, 7);

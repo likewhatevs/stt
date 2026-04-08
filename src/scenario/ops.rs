@@ -278,13 +278,25 @@ impl Op {
 // SHM writer for stimulus events
 // ---------------------------------------------------------------------------
 
-/// RAII wrapper around a /dev/mem mmap for writing stimulus events to the
-/// SHM ring buffer. No-op when SHM params are absent (non-VM runs).
-struct ShmWriter {
-    ptr: *mut u8,
-    map_base: *mut libc::c_void,
-    map_size: usize,
-    shm_size: usize,
+/// SHM ring writer for guest-to-host data transfer.
+///
+/// Prefers mmap of /dev/mem for zero-copy access. Falls back to
+/// pread/pwrite when mmap of the E820 gap fails (common on kernels
+/// that restrict mmap of non-RAM physical ranges).
+enum ShmWriter {
+    /// mmap succeeded — direct pointer access.
+    Mapped {
+        ptr: *mut u8,
+        map_base: *mut libc::c_void,
+        map_size: usize,
+        shm_size: usize,
+    },
+    /// mmap failed — use pread/pwrite on the /dev/mem fd.
+    Fd {
+        fd: std::fs::File,
+        shm_base: u64,
+        shm_size: usize,
+    },
 }
 
 impl ShmWriter {
@@ -292,7 +304,7 @@ impl ShmWriter {
     /// from /proc/cmdline or /dev/mem cannot be opened.
     fn try_open() -> Option<Self> {
         let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
-        let (shm_base, shm_size) = parse_shm_params_from_str(&cmdline)?;
+        let (shm_base, shm_size) = shm_ring::parse_shm_params_from_str(&cmdline)?;
 
         use std::fs::OpenOptions;
         use std::os::unix::fs::OpenOptionsExt;
@@ -304,66 +316,85 @@ impl ShmWriter {
             .open("/dev/mem")
             .ok()?;
 
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-        let aligned_base = shm_base & !(page_size - 1);
-        let offset_in_page = (shm_base - aligned_base) as usize;
-        let map_size = shm_size as usize + offset_in_page;
-
-        let map_base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                map_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                std::os::unix::io::AsRawFd::as_raw_fd(&fd),
-                aligned_base as libc::off_t,
-            )
-        };
-
-        if map_base == libc::MAP_FAILED {
-            return None;
+        match shm_ring::mmap_devmem(
+            std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+            shm_base,
+            shm_size,
+        ) {
+            Some(m) => Some(ShmWriter::Mapped {
+                ptr: m.ptr,
+                map_base: m.map_base,
+                map_size: m.map_size,
+                shm_size: shm_size as usize,
+            }),
+            None => {
+                eprintln!(
+                    "stt: SHM mmap failed ({}), using pread/pwrite fallback",
+                    std::io::Error::last_os_error(),
+                );
+                Some(ShmWriter::Fd {
+                    fd,
+                    shm_base,
+                    shm_size: shm_size as usize,
+                })
+            }
         }
-
-        let ptr = unsafe { (map_base as *mut u8).add(offset_in_page) };
-
-        Some(ShmWriter {
-            ptr,
-            map_base,
-            map_size,
-            shm_size: shm_size as usize,
-        })
     }
 
     /// Write a TLV message to the SHM ring.
     fn write(&self, msg_type: u32, payload: &[u8]) {
-        let buf = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.shm_size) };
-        shm_ring::shm_write(buf, 0, msg_type, payload);
+        match self {
+            ShmWriter::Mapped { ptr, shm_size, .. } => {
+                let buf = unsafe { std::slice::from_raw_parts_mut(*ptr, *shm_size) };
+                shm_ring::shm_write(buf, 0, msg_type, payload);
+            }
+            ShmWriter::Fd {
+                fd,
+                shm_base,
+                shm_size,
+            } => {
+                use std::os::unix::io::AsRawFd;
+
+                // Read current SHM state, apply the ring write, write back.
+                let mut buf = vec![0u8; *shm_size];
+                let n = unsafe {
+                    libc::pread(
+                        fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        *shm_base as libc::off_t,
+                    )
+                };
+                if n < 0 {
+                    return;
+                }
+
+                shm_ring::shm_write(&mut buf, 0, msg_type, payload);
+
+                unsafe {
+                    libc::pwrite(
+                        fd.as_raw_fd(),
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                        *shm_base as libc::off_t,
+                    );
+                }
+            }
+        }
     }
 }
 
 impl Drop for ShmWriter {
     fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.map_base, self.map_size);
+        if let ShmWriter::Mapped {
+            map_base, map_size, ..
+        } = self
+        {
+            unsafe {
+                libc::munmap(*map_base, *map_size);
+            }
         }
     }
-}
-
-/// Parse STT_SHM_BASE and STT_SHM_SIZE from a kernel command line string.
-fn parse_shm_params_from_str(cmdline: &str) -> Option<(u64, u64)> {
-    let base = cmdline
-        .split_whitespace()
-        .find(|s| s.starts_with("STT_SHM_BASE="))?
-        .strip_prefix("STT_SHM_BASE=")?;
-    let size = cmdline
-        .split_whitespace()
-        .find(|s| s.starts_with("STT_SHM_SIZE="))?
-        .strip_prefix("STT_SHM_SIZE=")?;
-    let base =
-        u64::from_str_radix(base.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
-    let size =
-        u64::from_str_radix(size.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
-    Some((base, size))
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +491,20 @@ pub fn execute_steps_with(
     // ScenarioStart marker.
     if let Some(ref w) = shm {
         w.write(shm_ring::MSG_TYPE_SCENARIO_START, &[]);
+    }
+
+    // When a host-side BPF map write is configured, wait for the host
+    // to complete the write before starting the workload.
+    if ctx.wait_for_map_write {
+        match shm_ring::wait_for(0, std::time::Duration::from_secs(10)) {
+            Ok(()) => {
+                // Brief delay for the crash trigger to propagate.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => {
+                eprintln!("stt: signal slot 0 wait failed: {e} — proceeding without sync");
+            }
+        }
     }
 
     for (step_idx, step) in steps.iter().enumerate() {
@@ -894,6 +939,7 @@ fn seeded_rng(seed: u64) -> rand::rngs::StdRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmm::shm_ring::parse_shm_params_from_str;
 
     // -- Op discriminant tests --
 
@@ -1042,12 +1088,13 @@ mod tests {
             settle_ms: 1000,
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
         };
         let resolved = spec.resolve(&ctx);
         assert_eq!(resolved, cpus);
     }
 
-    // -- parse_shm_params_from_str (ops.rs local copy) --
+    // -- parse_shm_params_from_str (from shm_ring) --
 
     #[test]
     fn ops_parse_shm_params_valid() {
@@ -1087,6 +1134,7 @@ mod tests {
             settle_ms: 0,
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
         }
     }
 

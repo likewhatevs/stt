@@ -193,6 +193,7 @@ impl Runner {
                 settle_ms: self.config.settle_ms,
                 work_type_override: self.config.work_type_override,
                 assert: crate::assert::Assert::default_checks(),
+                wait_for_map_write: false,
             };
 
             // Start BPF skeleton probes for auto-probe.

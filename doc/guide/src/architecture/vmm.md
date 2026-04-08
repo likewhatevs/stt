@@ -11,7 +11,7 @@ let result = vmm::SttVm::builder()
     .init_binary(&stt_binary)
     .topology(sockets, cores_per_socket, threads_per_core)
     .memory_mb(4096)
-    .run_args(&["run", "cgroup_steady"])
+    .run_args(&["run", "--stt-test-fn", "my_test"])
     .build()?
     .run()?;
 ```
@@ -38,17 +38,19 @@ pub struct Topology {
 
 The VMM builds a cpio initramfs containing:
 
-- The stt binary (as `/init`)
-- Busybox (for shell utilities)
+- The test binary (as `/init`)
 - Optional scheduler binary (as `/scheduler`)
+- Shared library dependencies (resolved via `ldd`)
 
-Busybox is built statically from source by `build.rs`. The initramfs
-is cached based on a `BaseKey` derived from the binary contents.
+The initramfs is cached based on a `BaseKey` derived from the binary
+contents. A compressed SHM segment enables COW overlay into guest
+memory, sharing physical pages across concurrent VMs.
 
 ## Guest-host communication
 
-**Serial console** -- the guest writes test results (JSON) to COM2.
-The host reads results from the serial output after VM exit.
+**Serial console** -- the guest writes delimited test results to COM2
+(between `===STT_TEST_RESULT_START===` / `===STT_TEST_RESULT_END===`
+sentinels). The host parses results from the serial output after VM exit.
 
 **SHM ring buffer** -- a shared memory ring buffer passes data from
 guest to host. Used for profraw data (`MSG_TYPE_PROFRAW`) and stimulus
@@ -74,23 +76,22 @@ warning -- the VM runs with regular pages rather than failing.
 See [Performance Mode](../concepts/performance-mode.md) for usage
 and prerequisites.
 
-## Dual-binary architecture
+## Dual-role architecture
 
-The same `stt` binary serves two roles:
+The same test binary serves two roles:
 
 **Host side** -- manages the VM lifecycle: builds the initramfs, boots
 the kernel, runs the monitor, and evaluates results.
 
-**Guest side** -- runs inside the VM as `/init`. Creates cgroups,
-forks workers, runs scenarios, and writes results to the serial
-console.
+**Guest side** -- runs inside the VM as `/init` (PID 1). The Rust init
+code (`vmm::rust_init`) mounts filesystems, starts the scheduler,
+dispatches the test function, then reboots.
 
-The role is determined at runtime by how the binary is invoked:
+The role is determined at runtime:
 
-- **`stt vm`** (host): `main()` builds and boots a KVM VM with the
-  stt binary embedded in the initramfs as `/init`.
-- **`stt run`** (guest): `main()` dispatches to the scenario runner.
-  This is the command the host passes to the VM via `run_args`.
+- **PID 1 detection**: when running as PID 1, the test harness
+  `main()` calls `stt_guest_init()` which handles the full guest
+  lifecycle. The `ctor` early dispatch also checks for PID 1.
 - **`#[stt_test]` host dispatch**: a `#[ctor::ctor]` function
   (`stt_test_early_dispatch`) runs before `main()` in any binary
   that links against stt. When both `--stt-test-fn` and `--stt-topo`
@@ -110,6 +111,6 @@ that built it.
 3. Build and load initramfs.
 4. Set up serial devices (COM1 for console, COM2 for results).
 5. Boot the kernel.
-6. Kernel starts `/init` (the stt binary).
-7. For `#[stt_test]`: `ctor` early dispatch runs the test function.
-   For `stt vm`: `main()` dispatches via the `run` subcommand.
+6. Kernel starts `/init` (the test binary).
+7. PID 1 detected: `stt_guest_init()` mounts filesystems, starts
+   the scheduler, dispatches the test function, and reboots.
