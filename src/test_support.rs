@@ -393,7 +393,7 @@ impl SttTestEntry {
         sockets: 1,
         cores: 2,
         threads: 1,
-        memory_mb: 128,
+        memory_mb: 2048,
         scheduler: &Scheduler::EEVDF,
         auto_repro: true,
         replicas: 1,

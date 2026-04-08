@@ -421,7 +421,7 @@ static __STT_ENTRY_DEMO_HOST_CRASH: SttTestEntry = SttTestEntry {
 )]
 fn cover_monitor_evaluation(ctx: &Ctx) -> Result<AssertResult> {
     // Exercises the host-side monitor threshold evaluation path in
-    // run_stt_test_inner (lines 550-571). The scenario passes, then
-    // the host evaluates monitor samples against merged thresholds.
+    // run_stt_test_inner. The scenario passes, then the host evaluates
+    // monitor samples against merged thresholds.
     stt::scenario::basic::custom_sched_mixed(ctx)
 }

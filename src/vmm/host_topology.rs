@@ -345,11 +345,16 @@ fn try_acquire_all(
 /// stepping by `count` if any CPU in the window is busy. Returns the held
 /// fds on success, or `ResourceContention` when the deadline expires.
 ///
+/// When `host_topo` is provided, also acquires `LOCK_SH` on the LLC lock
+/// files containing the acquired CPUs. This prevents a perf VM from
+/// grabbing exclusive LLC access while non-perf VMs hold CPUs in that LLC.
+///
 /// `total_host_cpus` bounds the search space.
 pub fn acquire_cpu_locks(
     count: usize,
     total_host_cpus: usize,
     deadline: std::time::Duration,
+    host_topo: Option<&HostTopology>,
 ) -> Result<Vec<std::os::fd::OwnedFd>> {
     if count == 0 {
         return Ok(Vec::new());
@@ -360,7 +365,23 @@ pub fn acquire_cpu_locks(
         let mut offset = 0;
         while offset + count <= total_host_cpus {
             match try_acquire_cpu_window(offset, count) {
-                Ok(locks) => return Ok(locks),
+                Ok(mut locks) => {
+                    // Acquire shared LLC locks so perf VMs cannot take
+                    // exclusive access to LLCs we are using.
+                    if let Some(topo) = host_topo {
+                        let cpus: Vec<usize> = (offset..offset + count).collect();
+                        match acquire_llc_shared_locks(topo, &cpus) {
+                            Ok(llc_locks) => locks.extend(llc_locks),
+                            Err(_) => {
+                                // LLC lock busy — drop CPU locks and try next window.
+                                drop(locks);
+                                offset += count;
+                                continue;
+                            }
+                        }
+                    }
+                    return Ok(locks);
+                }
                 Err(_) => {
                     offset += count;
                 }
@@ -378,6 +399,31 @@ pub fn acquire_cpu_locks(
         let jitter = (std::process::id() as u64).wrapping_mul(7) % 100;
         std::thread::sleep(std::time::Duration::from_millis(400 + jitter));
     }
+}
+
+/// Acquire `LOCK_SH` on LLC lock files for the LLCs containing `cpus`.
+fn acquire_llc_shared_locks(
+    topo: &HostTopology,
+    cpus: &[usize],
+) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
+    let mut llc_indices: Vec<usize> = Vec::new();
+    for &cpu in cpus {
+        for (idx, group) in topo.llc_groups.iter().enumerate() {
+            if group.cpus.contains(&cpu) && !llc_indices.contains(&idx) {
+                llc_indices.push(idx);
+            }
+        }
+    }
+    let mut locks = Vec::new();
+    for &llc_idx in &llc_indices {
+        let path = format!("/tmp/stt-llc-{llc_idx}.lock");
+        match try_flock(&path, libc::LOCK_SH) {
+            Ok(Some(fd)) => locks.push(fd),
+            Ok(None) => return Err(format!("LLC {llc_idx} exclusively held")),
+            Err(e) => return Err(format!("LLC {llc_idx}: {e}")),
+        }
+    }
+    Ok(locks)
 }
 
 /// Try to flock CPUs [offset..offset+count) exclusively.

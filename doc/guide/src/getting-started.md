@@ -131,9 +131,7 @@ stt vm --sockets 2 --cores 4 --threads 2 \
 Expected output:
 
 ```text
-[stt] booting VM: 2s4c2t (16 cpus), 4096 MB
-[stt] running: cgroup_steady/default
-[stt]   PASS  cgroup_steady/default (30.1s)
+PASS cgroup_steady/default (30.1s)
 ```
 
 Omit the scenario name to run all scenarios:

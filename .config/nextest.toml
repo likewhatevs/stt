@@ -70,7 +70,7 @@ retries = 1
 filter = "test(sched_) | test(cover_)"
 retries = 1
 
-# Demo tests: showcase tests run manually (--run-ignored ignored-only).
+# Demo tests: demo_ tests from the custom harness are ignored by default.
 # Auto-repro demos boot two VMs sequentially; verifier demos load BPF.
 [[profile.default.overrides]]
 filter = "test(demo_)"

@@ -93,8 +93,10 @@ void BPF_STRUCT_OPS(stt_dispatch, s32 cpu, struct task_struct *prev)
 	if (stall)
 		return;
 	if (degrade || degrade_rt) {
-		/* Skip half of dispatches. Tasks stay in the shared DSQ
-		 * longer, slowing throughput without fully stalling. */
+		/* Skip half of dispatches. Under degrade, stt_enqueue
+		 * inserts to random LOCAL DSQs so this skip is effectively
+		 * dead for those tasks, but slows any tasks that reached
+		 * the shared DSQ via the normal path. */
 		if (++degrade_cnt & 1)
 			return;
 	}

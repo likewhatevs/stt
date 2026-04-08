@@ -216,11 +216,22 @@ impl<T> Drop for PiMutexGuard<'_, T> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(u64);
 
-/// Hash a file's full content for cache keying.
+/// Hash a file's content for cache keying via streaming reads.
 pub(crate) fn hash_file(path: &Path) -> Result<u64> {
-    let data = std::fs::read(path).with_context(|| format!("read for hash: {}", path.display()))?;
+    use std::io::Read;
+    let mut f =
+        std::fs::File::open(path).with_context(|| format!("open for hash: {}", path.display()))?;
     let mut hasher = std::hash::DefaultHasher::new();
-    hasher.write(&data);
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("read for hash: {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.write(&buf[..n]);
+    }
     Ok(hasher.finish())
 }
 
@@ -293,6 +304,9 @@ pub(crate) fn get_or_build_base(
     extras: &[(&str, &Path)],
     key: &BaseKey,
 ) -> Result<BaseRef> {
+    // Clean stale SHM segments from previous runs.
+    cleanup_stale_shm(key);
+
     // 1. Process-local cache
     if let Some(arc) = base_cache().lock().unwrap().get(key).cloned() {
         tracing::debug!("initramfs base cache hit (process)");
@@ -372,6 +386,39 @@ pub(crate) fn get_or_build_base(
     }
 
     Ok(BaseRef::Owned(arc))
+}
+
+/// Remove stale SHM segments from `/dev/shm` that don't match `current`.
+/// Scans for `stt-base-*` and `stt-gz-*` entries and unlinks any whose
+/// hash suffix differs from the current key.
+fn cleanup_stale_shm(current: &BaseKey) {
+    let current_suffix = format!("{:016x}", current.0);
+    let shm_dir = match std::fs::read_dir("/dev/shm") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    for entry in shm_dir.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let hash_suffix = if let Some(s) = name_str.strip_prefix("stt-base-") {
+            s
+        } else if let Some(s) = name_str.strip_prefix("stt-gz-") {
+            s
+        } else {
+            continue;
+        };
+        if hash_suffix == current_suffix {
+            continue;
+        }
+        let shm_name = format!("/{name_str}");
+        if let Ok(cname) = std::ffi::CString::new(shm_name) {
+            unsafe {
+                libc::shm_unlink(cname.as_ptr());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2562,11 +2609,18 @@ impl SttVmBuilder {
             (Some(plan), nodes, Vec::new())
         } else {
             let total_cpus = self.topology.total_cpus() as usize;
-            let host_cpus = host_topology::HostTopology::from_sysfs()
+            let host_topo = host_topology::HostTopology::from_sysfs().ok();
+            let host_cpus = host_topo
+                .as_ref()
                 .map(|h| h.total_cpus())
                 .unwrap_or(total_cpus);
             let deadline = crate::test_support::resource_deadline();
-            let locks = host_topology::acquire_cpu_locks(total_cpus, host_cpus, deadline)?;
+            let locks = host_topology::acquire_cpu_locks(
+                total_cpus,
+                host_cpus,
+                deadline,
+                host_topo.as_ref(),
+            )?;
             (None, Vec::new(), locks)
         };
 

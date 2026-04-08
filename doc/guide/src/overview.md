@@ -33,9 +33,7 @@ cgroups, forks workers, and executes test scenarios.
 ```sh
 stt vm --sockets 2 --cores 4 --threads 2 \
     -- cgroup_steady --duration-s 10
-[stt] booting VM: 2s4c2t (16 cpus), 4096 MB
-[stt] running: cgroup_steady/default
-[stt]   PASS  cgroup_steady/default (10.2s)
+PASS cgroup_steady/default (10.2s)
 ```
 
 ## What it tests
@@ -106,8 +104,8 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 The prelude also exports ops types (`CgroupDef`, `CpusetSpec`,
-`Step`, `execute_steps`), `Assert` for composable assertions
-config, and `WorkerReport` for telemetry access.
+`HoldSpec`, `Step`, `execute_steps`), `Assert` for composable
+assertions config, and `WorkerReport` for telemetry access.
 
 ## Crate structure
 
