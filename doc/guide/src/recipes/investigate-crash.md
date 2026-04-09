@@ -20,14 +20,32 @@ If the scheduler crashes, stt automatically:
 3. Reruns the scenario to capture function arguments at each crash
    point.
 
-The second run uses "repro mode" -- the work-conservation watchdog is
-disabled so the scheduler stays alive for BPF probes.
+The second run reruns the same workload with BPF probes attached.
 
-## Reading the output
+## Reading failure output
+
+A test failure message contains up to eight sections, each present
+only when relevant:
+
+| Section | Content |
+|---|---|
+| Error line | Test name, scheduler, failure reason. |
+| `--- stats ---` | Per-cgroup worker count, CPU count, spread, gap, migrations, iterations. |
+| `--- diagnostics ---` | Init stage classification, VM exit code, last 20 lines of kernel console. |
+| `--- timeline ---` | Kernel version, topology, scheduler, scenario duration, phase breakdown with monitor samples. |
+| `--- scheduler log ---` | Scheduler process stdout+stderr (cycle-collapsed). |
+| `--- monitor ---` | Host-side monitor: sample count, max imbalance, max DSQ depth, stall flag, threshold verdict. |
+| `--- sched_ext dump ---` | `sched_ext_dump` trace lines from the guest kernel. |
+| `--- auto-repro ---` | BPF kprobe data from a second VM run (when `auto_repro = true`). |
+
+`--- diagnostics ---` appears automatically when the scheduler died
+or when `RUST_BACKTRACE=1` is set.
+
+## Reading auto-repro output
 
 The probe output shows each function in the crash chain with:
 
-- Function signature and argument values at the time of the crash
+- Function signature and argument values during execution of the same workload
 - Source file and line number
 - Call chain context
 

@@ -59,23 +59,36 @@ binary in:
 
 - Build the scheduler first: `cargo build -p scx_mitosis`.
 - Set `STT_SCHEDULER=/path/to/binary`.
-- Use `SchedulerSpec::Path` for an explicit path.
 - Use `SchedulerSpec::Path` for an explicit path in `#[stt_test]`.
 
 ## Scheduler died
 
 ```text
-scheduler died between steps
+scheduler died between step 2 and step 3 (of 5), 12.3s into scenario
 ```
 
 The scheduler process exited while the scenario was running. This
-is usually a crash. The error output includes `dmesg` lines from
-the VM.
+is usually a crash. The exact message varies by when the death was
+detected (between steps, during workload, after completion).
+
+The failure output contains diagnostic sections (each present only
+when relevant):
+
+- `--- scheduler log ---`: the scheduler's stdout and stderr,
+  cycle-collapsed for readability.
+- `--- diagnostics ---`: init stage classification, VM exit code,
+  and the last 20 lines of kernel console output.
+- `--- sched_ext dump ---`: `sched_ext_dump` trace lines from the
+  guest kernel (present when a SysRq-D dump fired).
+
+Set `RUST_BACKTRACE=1` to force `--- diagnostics ---` on all
+failures, not just scheduler deaths.
 
 **Next steps:**
 
-- Check the `dmesg` output in the test failure for a BPF error or
-  kernel oops.
+- Check the `--- scheduler log ---` for the crash reason.
+- Check `--- diagnostics ---` for BPF errors or kernel oops in
+  the kernel console.
 - Enable `auto_repro` in the test to capture the crash path with
   BPF probes. See [Auto-Repro](running-tests/auto-repro.md).
 - Run with a longer duration and specific flags to narrow the
