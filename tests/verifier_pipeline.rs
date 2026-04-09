@@ -110,7 +110,7 @@ fn scenario_fail_verify(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(2)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps_with(ctx, steps, None)
 }

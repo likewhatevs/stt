@@ -118,6 +118,9 @@ How long to hold after a step completes:
 | `Fixed(Duration)` | Fixed time |
 | `Loop { interval }` | Repeat ops at interval until time runs out |
 
+`HoldSpec::FULL` is a constant for `Frac(1.0)` (hold for the full
+scenario duration).
+
 ## execute_defs
 
 `execute_defs(ctx, defs)` is a convenience wrapper for the common
@@ -130,7 +133,7 @@ execute_defs(ctx, vec![
 ])
 ```
 
-Equivalent to `execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::Frac(1.0))])`.
+Equivalent to `execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])`.
 
 ## execute_steps
 

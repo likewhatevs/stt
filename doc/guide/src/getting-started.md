@@ -62,7 +62,7 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
             CgroupDef::named("cg_0").workers(2),
             CgroupDef::named("cg_1").workers(2),
         ],
-        HoldSpec::Frac(1.0),
+        HoldSpec::FULL,
     )];
     execute_steps(ctx, steps)
 }

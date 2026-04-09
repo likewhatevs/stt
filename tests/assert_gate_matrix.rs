@@ -10,7 +10,7 @@ fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps_with(ctx, steps, Some(checks))
 }

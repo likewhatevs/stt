@@ -294,6 +294,11 @@ pub enum HoldSpec {
     Loop { interval: Duration },
 }
 
+impl HoldSpec {
+    /// Hold for the full scenario duration (`Frac(1.0)`).
+    pub const FULL: HoldSpec = HoldSpec::Frac(1.0);
+}
+
 impl Op {
     /// Return a unique bit index for each Op variant (for op_kinds bitmask).
     fn discriminant(&self) -> u32 {
@@ -556,9 +561,9 @@ struct StepState<'a> {
 /// Execute a single step with CgroupDefs that hold for the full duration.
 ///
 /// Convenience wrapper around [`execute_steps`] for the common pattern
-/// of creating cgroups and running them for `HoldSpec::Frac(1.0)`.
+/// of creating cgroups and running them for [`HoldSpec::FULL`].
 pub fn execute_defs(ctx: &Ctx, defs: Vec<CgroupDef>) -> Result<AssertResult> {
-    execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::Frac(1.0))])
+    execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])
 }
 
 /// Execute a sequence of steps against the given context.
@@ -1608,12 +1613,11 @@ mod tests {
 
     #[test]
     fn step_with_defs_then_ops() {
-        let step =
-            Step::with_defs(vec![CgroupDef::named("cg_0")], HoldSpec::Frac(1.0)).with_ops(vec![
-                Op::AddCgroup {
-                    name: "cg_1".into(),
-                },
-            ]);
+        let step = Step::with_defs(vec![CgroupDef::named("cg_0")], HoldSpec::FULL).with_ops(vec![
+            Op::AddCgroup {
+                name: "cg_1".into(),
+            },
+        ]);
         assert!(!step.setup.is_empty());
         assert_eq!(step.ops.len(), 1);
     }

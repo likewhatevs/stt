@@ -16,7 +16,7 @@ fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps(ctx, steps)
 }
@@ -30,7 +30,7 @@ fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps(ctx, steps)
 }
@@ -56,7 +56,7 @@ fn scenario_bpf_api(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResul
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps(ctx, steps)
 }
@@ -103,7 +103,7 @@ fn sched_perf_positive(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps_with(ctx, steps, Some(&checks))
 }
@@ -114,7 +114,7 @@ fn scenario_perf_negative(ctx: &stt::scenario::Ctx) -> Result<stt::assert::Asser
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps_with(ctx, steps, Some(&checks))
 }
@@ -142,7 +142,7 @@ fn scenario_scattershot(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertR
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps_with(ctx, steps, Some(&checks))
 }
@@ -176,7 +176,7 @@ fn scenario_throughput_regression(ctx: &stt::scenario::Ctx) -> Result<stt::asser
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps_with(ctx, steps, Some(&checks))
 }
@@ -201,7 +201,7 @@ fn scenario_auto_repro(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertRe
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps(ctx, steps)
 }
@@ -226,7 +226,7 @@ fn scenario_baseline(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResu
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps(ctx, steps)
 }
@@ -262,7 +262,7 @@ fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps(ctx, steps)
 }

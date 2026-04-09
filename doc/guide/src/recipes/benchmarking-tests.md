@@ -50,7 +50,7 @@ fn perf_positive(ctx: &Ctx) -> Result<AssertResult> {
             CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
         ].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps_with(ctx, steps, Some(&checks))
 }
@@ -96,7 +96,7 @@ fn perf_negative(ctx: &Ctx) -> Result<AssertResult> {
             CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
         ].into(),
         ops: vec![],
-        hold: HoldSpec::Frac(1.0),
+        hold: HoldSpec::FULL,
     }];
     execute_steps_with(ctx, steps, Some(&checks))
 }
