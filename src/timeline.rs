@@ -591,6 +591,7 @@ mod tests {
                     event_counters: None,
                     schedstat: None,
                     vcpu_cpu_time_ns: None,
+                    sched_domains: None,
                 })
                 .collect(),
         }
@@ -870,6 +871,7 @@ mod tests {
                 }),
                 schedstat: None,
                 vcpu_cpu_time_ns: None,
+                sched_domains: None,
             }],
         };
         let s2 = MonitorSample {
@@ -888,6 +890,7 @@ mod tests {
                 }),
                 schedstat: None,
                 vcpu_cpu_time_ns: None,
+                sched_domains: None,
             }],
         };
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
@@ -969,6 +972,7 @@ mod tests {
                     }),
                     schedstat: None,
                     vcpu_cpu_time_ns: None,
+                    sched_domains: None,
                 }],
             });
         }
@@ -992,6 +996,7 @@ mod tests {
                     }),
                     schedstat: None,
                     vcpu_cpu_time_ns: None,
+                    sched_domains: None,
                 }],
             });
         }

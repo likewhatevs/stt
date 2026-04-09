@@ -1605,6 +1605,7 @@ impl SttVm {
                     preemption_threshold_ns,
                     shm_base_pa,
                     prog_stats_ctx.as_ref(),
+                    page_offset,
                 )
             })
             .context("spawn monitor thread")?;

@@ -299,6 +299,11 @@ pub struct CpuSnapshot {
     /// Used by evaluate() to distinguish real stalls from host preemption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpu_cpu_time_ns: Option<u64>,
+    /// Sched domain tree for this CPU. Each entry is one domain level,
+    /// ordered from lowest (e.g. SMT) to highest (e.g. NUMA). None when
+    /// sched_domain offsets are unavailable or `rq->sd` is null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sched_domains: Option<Vec<SchedDomainSnapshot>>,
 }
 
 /// Per-CPU runqueue schedstat fields read from guest memory.
@@ -322,6 +327,109 @@ pub struct RqSchedstat {
     pub ttwu_count: u32,
     /// Try-to-wake-up local count (`rq.ttwu_local`).
     pub ttwu_local: u32,
+}
+
+/// Snapshot of one `struct sched_domain` level for a single CPU.
+///
+/// Domains are ordered from lowest (e.g. SMT, level 0) to highest
+/// (e.g. NUMA, level N) following the kernel's `sd->parent` chain.
+/// Runtime fields are always present. CONFIG_SCHEDSTATS load balancing
+/// stats are in the optional `stats` field.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SchedDomainSnapshot {
+    /// Domain level number (`sd->level`). 0 = innermost (e.g. SMT).
+    pub level: i32,
+    /// Domain name from `sd->name` (e.g. "SMT", "MC", "DIE", "NUMA").
+    pub name: String,
+    /// Domain flags (`sd->flags`). SD_* values.
+    pub flags: i32,
+    /// Number of CPUs in this domain's span (`sd->span_weight`).
+    pub span_weight: u32,
+
+    // -- Runtime fields (always present) --
+    /// Current balance interval in ms (`sd->balance_interval`).
+    pub balance_interval: u32,
+    /// Consecutive load balance failures (`sd->nr_balance_failed`).
+    pub nr_balance_failed: u32,
+    /// Number of newidle balance calls (`sd->newidle_call`).
+    pub newidle_call: u32,
+    /// Successful newidle balance calls (`sd->newidle_success`).
+    pub newidle_success: u32,
+    /// Newidle balance ratio (`sd->newidle_ratio`).
+    pub newidle_ratio: u32,
+    /// Max cost of newidle load balancing in ns (`sd->max_newidle_lb_cost`).
+    pub max_newidle_lb_cost: u64,
+
+    /// CONFIG_SCHEDSTATS load balancing stats. None when
+    /// CONFIG_SCHEDSTATS is not enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SchedDomainStats>,
+}
+
+/// CONFIG_SCHEDSTATS load balancing stats for one `struct sched_domain`.
+///
+/// Array fields have `CPU_MAX_IDLE_TYPES` (3) elements indexed by
+/// `cpu_idle_type`: [0] = CPU_NOT_IDLE, [1] = CPU_IDLE,
+/// [2] = CPU_NEWLY_IDLE. All counters are cumulative — compute
+/// deltas between samples to get rates.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SchedDomainStats {
+    /// `sd->lb_count[CPU_MAX_IDLE_TYPES]`: number of load balance calls.
+    pub lb_count: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_failed[CPU_MAX_IDLE_TYPES]`: load balance calls that found
+    /// imbalance but failed to move any task.
+    pub lb_failed: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_balanced[CPU_MAX_IDLE_TYPES]`: load balance calls that
+    /// found no imbalance.
+    pub lb_balanced: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_imbalance_load[CPU_MAX_IDLE_TYPES]`: times imbalance was
+    /// load-based.
+    pub lb_imbalance_load: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_imbalance_util[CPU_MAX_IDLE_TYPES]`: times imbalance was
+    /// utilization-based.
+    pub lb_imbalance_util: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_imbalance_task[CPU_MAX_IDLE_TYPES]`: times imbalance was
+    /// task-count-based.
+    pub lb_imbalance_task: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_imbalance_misfit[CPU_MAX_IDLE_TYPES]`: times imbalance was
+    /// due to misfit task.
+    pub lb_imbalance_misfit: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_gained[CPU_MAX_IDLE_TYPES]`: tasks pulled during load balance.
+    pub lb_gained: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_hot_gained[CPU_MAX_IDLE_TYPES]`: cache-hot tasks pulled.
+    pub lb_hot_gained: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_nobusyg[CPU_MAX_IDLE_TYPES]`: times no busy group was found.
+    pub lb_nobusyg: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+    /// `sd->lb_nobusyq[CPU_MAX_IDLE_TYPES]`: times no busy queue was found.
+    pub lb_nobusyq: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
+
+    /// `sd->alb_count`: active load balance attempts.
+    pub alb_count: u32,
+    /// `sd->alb_failed`: active load balance failures.
+    pub alb_failed: u32,
+    /// `sd->alb_pushed`: tasks pushed via active load balancing.
+    pub alb_pushed: u32,
+
+    /// `sd->sbe_count`: exec balance attempts.
+    pub sbe_count: u32,
+    /// `sd->sbe_balanced`: exec balance found no imbalance.
+    pub sbe_balanced: u32,
+    /// `sd->sbe_pushed`: tasks pushed via exec balancing.
+    pub sbe_pushed: u32,
+
+    /// `sd->sbf_count`: fork balance attempts.
+    pub sbf_count: u32,
+    /// `sd->sbf_balanced`: fork balance found no imbalance.
+    pub sbf_balanced: u32,
+    /// `sd->sbf_pushed`: tasks pushed via fork balancing.
+    pub sbf_pushed: u32,
+
+    /// `sd->ttwu_wake_remote`: wakeups targeting a remote CPU.
+    pub ttwu_wake_remote: u32,
+    /// `sd->ttwu_move_affine`: wakeups moved to an affine CPU.
+    pub ttwu_move_affine: u32,
+    /// `sd->ttwu_move_balance`: wakeups moved for load balance.
+    pub ttwu_move_balance: u32,
 }
 
 /// Cumulative scx event counter values for a single CPU.
@@ -2670,6 +2778,7 @@ mod tests {
                         }),
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
+                        sched_domains: None,
                     },
                     CpuSnapshot {
                         nr_running: (i as u32 + 2),
@@ -2684,6 +2793,7 @@ mod tests {
                         }),
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
+                        sched_domains: None,
                     },
                 ],
             })

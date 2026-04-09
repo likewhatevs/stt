@@ -8,8 +8,14 @@
 //! The monitor loop (`monitor_loop`) periodically reads per-CPU
 //! runqueue state from guest memory and collects `MonitorSample`s.
 
-use super::btf_offsets::{KernelOffsets, SchedstatOffsets, ScxEventOffsets};
-use super::{CpuSnapshot, MonitorSample, RqSchedstat, ScxEventCounters};
+use super::btf_offsets::{
+    CPU_MAX_IDLE_TYPES, KernelOffsets, SchedDomainOffsets, SchedDomainStatsOffsets,
+    SchedstatOffsets, ScxEventOffsets,
+};
+use super::{
+    CpuSnapshot, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
+    ScxEventCounters,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -310,6 +316,7 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
         event_counters: None,
         schedstat: None,
         vcpu_cpu_time_ns: None,
+        sched_domains: None,
     }
 }
 
@@ -341,6 +348,146 @@ pub(crate) fn read_rq_schedstat(mem: &GuestMem, rq_pa: u64, ss: &SchedstatOffset
         ttwu_count: mem.read_u32(rq_pa, ss.rq_ttwu_count),
         ttwu_local: mem.read_u32(rq_pa, ss.rq_ttwu_local),
     }
+}
+
+/// Read a u32 array of `CPU_MAX_IDLE_TYPES` elements from guest memory.
+fn read_u32_array(mem: &GuestMem, pa: u64, base_offset: usize) -> [u32; CPU_MAX_IDLE_TYPES] {
+    std::array::from_fn(|i| mem.read_u32(pa, base_offset + i * 4))
+}
+
+/// Read CONFIG_SCHEDSTATS fields from one sched_domain.
+fn read_sd_stats(mem: &GuestMem, sd_pa: u64, so: &SchedDomainStatsOffsets) -> SchedDomainStats {
+    SchedDomainStats {
+        lb_count: read_u32_array(mem, sd_pa, so.sd_lb_count),
+        lb_failed: read_u32_array(mem, sd_pa, so.sd_lb_failed),
+        lb_balanced: read_u32_array(mem, sd_pa, so.sd_lb_balanced),
+        lb_imbalance_load: read_u32_array(mem, sd_pa, so.sd_lb_imbalance_load),
+        lb_imbalance_util: read_u32_array(mem, sd_pa, so.sd_lb_imbalance_util),
+        lb_imbalance_task: read_u32_array(mem, sd_pa, so.sd_lb_imbalance_task),
+        lb_imbalance_misfit: read_u32_array(mem, sd_pa, so.sd_lb_imbalance_misfit),
+        lb_gained: read_u32_array(mem, sd_pa, so.sd_lb_gained),
+        lb_hot_gained: read_u32_array(mem, sd_pa, so.sd_lb_hot_gained),
+        lb_nobusyg: read_u32_array(mem, sd_pa, so.sd_lb_nobusyg),
+        lb_nobusyq: read_u32_array(mem, sd_pa, so.sd_lb_nobusyq),
+        alb_count: mem.read_u32(sd_pa, so.sd_alb_count),
+        alb_failed: mem.read_u32(sd_pa, so.sd_alb_failed),
+        alb_pushed: mem.read_u32(sd_pa, so.sd_alb_pushed),
+        sbe_count: mem.read_u32(sd_pa, so.sd_sbe_count),
+        sbe_balanced: mem.read_u32(sd_pa, so.sd_sbe_balanced),
+        sbe_pushed: mem.read_u32(sd_pa, so.sd_sbe_pushed),
+        sbf_count: mem.read_u32(sd_pa, so.sd_sbf_count),
+        sbf_balanced: mem.read_u32(sd_pa, so.sd_sbf_balanced),
+        sbf_pushed: mem.read_u32(sd_pa, so.sd_sbf_pushed),
+        ttwu_wake_remote: mem.read_u32(sd_pa, so.sd_ttwu_wake_remote),
+        ttwu_move_affine: mem.read_u32(sd_pa, so.sd_ttwu_move_affine),
+        ttwu_move_balance: mem.read_u32(sd_pa, so.sd_ttwu_move_balance),
+    }
+}
+
+/// Read the `sd->name` string from guest memory.
+///
+/// `sd->name` is a `char *` pointer to a static string in kernel rodata.
+/// Rodata lives in the text mapping (`__START_KERNEL_map`), so
+/// `text_kva_to_pa` is tried first. Falls back to direct mapping
+/// (`kva_to_pa`) for kernels that place topology name strings
+/// differently. Returns an empty string if the pointer is null or
+/// translation fails.
+fn read_sd_name(mem: &GuestMem, sd_pa: u64, name_offset: usize, page_offset: u64) -> String {
+    let name_kva = mem.read_u64(sd_pa, name_offset);
+    if name_kva == 0 {
+        return String::new();
+    }
+    // Try text mapping first (rodata), then direct mapping.
+    let text_pa = super::symbols::text_kva_to_pa(name_kva);
+    let name_pa = if text_pa < mem.size() {
+        text_pa
+    } else {
+        let direct_pa = super::symbols::kva_to_pa(name_kva, page_offset);
+        if direct_pa >= mem.size() {
+            return String::new();
+        }
+        direct_pa
+    };
+    // Domain names are short static strings ("SMT", "MC", "DIE", "NUMA",
+    // "PKG", "BOOK", "DRAWER"). Read up to 16 bytes.
+    let mut buf = [0u8; 16];
+    let n = mem.read_bytes(name_pa, &mut buf);
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Read the sched_domain tree for one CPU.
+///
+/// Starts at `rq->sd` (the lowest-level domain), walks `sd->parent`
+/// until NULL. Each domain is kmalloc'd and lives in the direct mapping.
+///
+/// `page_offset` is the runtime `PAGE_OFFSET` for direct-mapping translation.
+///
+/// Returns `None` if `rq->sd` is null (domain not yet built, or CPU
+/// offline). Returns an empty `Vec` if the first domain pointer cannot
+/// be translated.
+///
+/// Maximum depth is bounded to 8 levels to prevent infinite loops from
+/// corrupted `sd->parent` chains.
+pub(crate) fn read_sched_domain_tree(
+    mem: &GuestMem,
+    rq_pa: u64,
+    sd_offsets: &SchedDomainOffsets,
+    page_offset: u64,
+) -> Option<Vec<SchedDomainSnapshot>> {
+    const MAX_DEPTH: usize = 8;
+
+    // rq->sd is a pointer (KVA).
+    let sd_kva = mem.read_u64(rq_pa, sd_offsets.rq_sd);
+    if sd_kva == 0 {
+        return None;
+    }
+
+    let mut domains = Vec::new();
+    let mut current_kva = sd_kva;
+
+    for _ in 0..MAX_DEPTH {
+        if current_kva == 0 {
+            break;
+        }
+
+        // sched_domain is kmalloc'd — lives in direct mapping.
+        let sd_pa = super::symbols::kva_to_pa(current_kva, page_offset);
+        if sd_pa >= mem.size() {
+            break;
+        }
+
+        let level = mem.read_u32(sd_pa, sd_offsets.sd_level) as i32;
+        let name = read_sd_name(mem, sd_pa, sd_offsets.sd_name, page_offset);
+        let flags = mem.read_u32(sd_pa, sd_offsets.sd_flags) as i32;
+        let span_weight = mem.read_u32(sd_pa, sd_offsets.sd_span_weight);
+
+        let stats = sd_offsets
+            .stats_offsets
+            .as_ref()
+            .map(|so| read_sd_stats(mem, sd_pa, so));
+
+        let snap = SchedDomainSnapshot {
+            level,
+            name,
+            flags,
+            span_weight,
+            balance_interval: mem.read_u32(sd_pa, sd_offsets.sd_balance_interval),
+            nr_balance_failed: mem.read_u32(sd_pa, sd_offsets.sd_nr_balance_failed),
+            newidle_call: mem.read_u32(sd_pa, sd_offsets.sd_newidle_call),
+            newidle_success: mem.read_u32(sd_pa, sd_offsets.sd_newidle_success),
+            newidle_ratio: mem.read_u32(sd_pa, sd_offsets.sd_newidle_ratio),
+            max_newidle_lb_cost: mem.read_u64(sd_pa, sd_offsets.sd_max_newidle_lb_cost),
+            stats,
+        };
+
+        domains.push(snap);
+
+        // Follow sd->parent.
+        current_kva = mem.read_u64(sd_pa, sd_offsets.sd_parent);
+    }
+
+    Some(domains)
 }
 
 /// Resolve per-CPU physical addresses for `scx_sched_pcpu`.
@@ -451,6 +598,10 @@ pub(crate) struct ProgStatsCtx {
 /// `dump_trigger`: optional reactive dump configuration. When a sustained
 /// threshold violation is detected, writes the dump request flag to guest
 /// SHM to trigger a SysRq-D dump inside the guest.
+///
+/// `page_offset`: runtime `PAGE_OFFSET` for direct-mapping KVA translation.
+/// Used by sched_domain tree walking to translate `rq->sd` and
+/// `sd->parent` pointers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
@@ -466,6 +617,7 @@ pub(crate) fn monitor_loop(
     preemption_threshold_ns: u64,
     shm_base_pa: Option<u64>,
     prog_stats_ctx: Option<&ProgStatsCtx>,
+    page_offset: u64,
 ) -> (Vec<MonitorSample>, crate::vmm::shm_ring::ShmDrainResult) {
     let preemption_threshold_ns = if preemption_threshold_ns > 0 {
         preemption_threshold_ns
@@ -506,6 +658,15 @@ pub(crate) fn monitor_loop(
             for (i, cpu) in cpus.iter_mut().enumerate() {
                 if let Some(&rq_pa) = rq_pas.get(i) {
                     cpu.schedstat = Some(read_rq_schedstat(mem, rq_pa, ss));
+                }
+            }
+        }
+
+        // Overlay sched domain tree if available.
+        if let Some(sd) = &offsets.sched_domain_offsets {
+            for (i, cpu) in cpus.iter_mut().enumerate() {
+                if let Some(&rq_pa) = rq_pas.get(i) {
+                    cpu.sched_domains = read_sched_domain_tree(mem, rq_pa, sd, page_offset);
                 }
             }
         }
@@ -643,6 +804,7 @@ mod tests {
             dsq_nr: 0,
             event_offsets: None,
             schedstat_offsets: None,
+            sched_domain_offsets: None,
         }
     }
 
@@ -757,6 +919,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         assert!(samples.is_empty());
     }
@@ -790,6 +953,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -883,6 +1047,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -928,6 +1093,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1122,6 +1288,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1163,6 +1330,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1219,6 +1387,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1280,6 +1449,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1344,6 +1514,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1409,6 +1580,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1483,6 +1655,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
         sleeper_kill.store(true, Ordering::Release);
@@ -1559,6 +1732,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
         spinner_kill.store(true, Ordering::Release);
@@ -1633,6 +1807,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1717,6 +1892,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1877,6 +2053,7 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
@@ -1918,10 +2095,254 @@ mod tests {
             0,
             None,
             None,
+            0,
         );
         handle.join().unwrap();
 
         assert!(!samples.is_empty());
         assert!(samples[0].cpus[0].schedstat.is_none());
+    }
+
+    fn test_sched_domain_offsets() -> SchedDomainOffsets {
+        // Synthetic offsets for a sched_domain struct.
+        // Layout: parent(0) level(8) flags(12) name(16) span_weight(24)
+        //         balance_interval(28) nr_balance_failed(32)
+        //         newidle_call(36) newidle_success(40) newidle_ratio(44)
+        //         max_newidle_lb_cost(48)
+        //         [stats at 56+]
+        SchedDomainOffsets {
+            rq_sd: 400,
+            sd_parent: 0,
+            sd_level: 8,
+            sd_flags: 12,
+            sd_name: 16,
+            sd_span_weight: 24,
+            sd_balance_interval: 28,
+            sd_nr_balance_failed: 32,
+            sd_newidle_call: 36,
+            sd_newidle_success: 40,
+            sd_newidle_ratio: 44,
+            sd_max_newidle_lb_cost: 48,
+            stats_offsets: Some(test_sd_stats_offsets()),
+        }
+    }
+
+    fn test_sd_stats_offsets() -> SchedDomainStatsOffsets {
+        SchedDomainStatsOffsets {
+            sd_lb_count: 56,
+            sd_lb_failed: 68,
+            sd_lb_balanced: 80,
+            sd_lb_imbalance_load: 92,
+            sd_lb_imbalance_util: 104,
+            sd_lb_imbalance_task: 116,
+            sd_lb_imbalance_misfit: 128,
+            sd_lb_gained: 140,
+            sd_lb_hot_gained: 152,
+            sd_lb_nobusyg: 164,
+            sd_lb_nobusyq: 176,
+            sd_alb_count: 188,
+            sd_alb_failed: 192,
+            sd_alb_pushed: 196,
+            sd_sbe_count: 200,
+            sd_sbe_balanced: 204,
+            sd_sbe_pushed: 208,
+            sd_sbf_count: 212,
+            sd_sbf_balanced: 216,
+            sd_sbf_pushed: 220,
+            sd_ttwu_wake_remote: 224,
+            sd_ttwu_move_affine: 228,
+            sd_ttwu_move_balance: 232,
+        }
+    }
+
+    /// Build a synthetic sched_domain buffer with known values.
+    /// `parent_kva`: KVA of parent domain (0 = no parent).
+    /// `name_kva`: KVA of name string (0 = no name).
+    /// Returns a buffer representing one sched_domain struct.
+    #[allow(clippy::too_many_arguments)]
+    fn make_sd_buffer(
+        sd: &SchedDomainOffsets,
+        parent_kva: u64,
+        level: i32,
+        flags: i32,
+        name_kva: u64,
+        span_weight: u32,
+        balance_interval: u32,
+        newidle_call: u32,
+        lb_count_0: u32,
+        alb_pushed: u32,
+        ttwu_wake_remote: u32,
+    ) -> Vec<u8> {
+        // Size must cover the highest offset used.
+        let so = sd.stats_offsets.as_ref().unwrap();
+        let size = so.sd_ttwu_move_balance + 4 + 8;
+        let mut buf = vec![0u8; size];
+
+        buf[sd.sd_parent..sd.sd_parent + 8].copy_from_slice(&parent_kva.to_ne_bytes());
+        buf[sd.sd_level..sd.sd_level + 4].copy_from_slice(&level.to_ne_bytes());
+        buf[sd.sd_flags..sd.sd_flags + 4].copy_from_slice(&flags.to_ne_bytes());
+        buf[sd.sd_name..sd.sd_name + 8].copy_from_slice(&name_kva.to_ne_bytes());
+        buf[sd.sd_span_weight..sd.sd_span_weight + 4].copy_from_slice(&span_weight.to_ne_bytes());
+        buf[sd.sd_balance_interval..sd.sd_balance_interval + 4]
+            .copy_from_slice(&balance_interval.to_ne_bytes());
+        buf[sd.sd_newidle_call..sd.sd_newidle_call + 4]
+            .copy_from_slice(&newidle_call.to_ne_bytes());
+        buf[so.sd_lb_count..so.sd_lb_count + 4].copy_from_slice(&lb_count_0.to_ne_bytes());
+        buf[so.sd_alb_pushed..so.sd_alb_pushed + 4].copy_from_slice(&alb_pushed.to_ne_bytes());
+        buf[so.sd_ttwu_wake_remote..so.sd_ttwu_wake_remote + 4]
+            .copy_from_slice(&ttwu_wake_remote.to_ne_bytes());
+        buf
+    }
+
+    #[test]
+    fn read_sched_domain_tree_null_sd() {
+        // rq->sd is null — should return None.
+        let sd_off = test_sched_domain_offsets();
+        let buf = vec![0u8; 512];
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let result = read_sched_domain_tree(&mem, 0, &sd_off, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn read_sched_domain_tree_single_domain() {
+        let sd_off = test_sched_domain_offsets();
+
+        // Build: rq at PA 0 with rq->sd pointing to a domain.
+        // Domain at some offset in the buffer, parent=0 (no parent).
+        // page_offset=0 so KVA == PA for testing.
+        let sd_pa: u64 = 1024;
+        let name_pa: u64 = 2048;
+
+        let sd_buf = make_sd_buffer(&sd_off, 0, 0, 0x42, name_pa, 4, 64, 15, 10, 3, 7);
+        let name_bytes = b"SMT\0";
+
+        // Build combined buffer: rq region + sd region + name region.
+        let total_size = (name_pa as usize) + 16;
+        let mut buf = vec![0u8; total_size];
+
+        // Write rq->sd pointer (KVA == PA since page_offset=0).
+        buf[sd_off.rq_sd..sd_off.rq_sd + 8].copy_from_slice(&sd_pa.to_ne_bytes());
+
+        // Write sched_domain at sd_pa.
+        buf[sd_pa as usize..sd_pa as usize + sd_buf.len()].copy_from_slice(&sd_buf);
+
+        // Write name string.
+        buf[name_pa as usize..name_pa as usize + name_bytes.len()].copy_from_slice(name_bytes);
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].level, 0);
+        assert_eq!(domains[0].name, "SMT");
+        assert_eq!(domains[0].flags, 0x42);
+        assert_eq!(domains[0].span_weight, 4);
+        assert_eq!(domains[0].balance_interval, 64);
+        assert_eq!(domains[0].newidle_call, 15);
+        let stats = domains[0].stats.as_ref().unwrap();
+        assert_eq!(stats.lb_count[0], 10);
+        assert_eq!(stats.alb_pushed, 3);
+        assert_eq!(stats.ttwu_wake_remote, 7);
+    }
+
+    #[test]
+    fn read_sched_domain_tree_two_levels() {
+        let sd_off = test_sched_domain_offsets();
+
+        // page_offset=0 so KVA == PA.
+        let sd0_pa: u64 = 1024;
+        let sd1_pa: u64 = 2048;
+        let name0_pa: u64 = 3072;
+        let name1_pa: u64 = 3088;
+
+        // Domain 0 (SMT, level 0) -> parent = Domain 1
+        let sd0_buf = make_sd_buffer(&sd_off, sd1_pa, 0, 0x10, name0_pa, 2, 32, 8, 5, 1, 2);
+        // Domain 1 (MC, level 1) -> parent = 0 (top)
+        let sd1_buf = make_sd_buffer(&sd_off, 0, 1, 0x20, name1_pa, 8, 128, 22, 20, 4, 10);
+
+        let total_size = 3104;
+        let mut buf = vec![0u8; total_size];
+
+        // rq->sd -> domain 0
+        buf[sd_off.rq_sd..sd_off.rq_sd + 8].copy_from_slice(&sd0_pa.to_ne_bytes());
+        buf[sd0_pa as usize..sd0_pa as usize + sd0_buf.len()].copy_from_slice(&sd0_buf);
+        buf[sd1_pa as usize..sd1_pa as usize + sd1_buf.len()].copy_from_slice(&sd1_buf);
+        buf[name0_pa as usize..name0_pa as usize + 4].copy_from_slice(b"SMT\0");
+        buf[name1_pa as usize..name1_pa as usize + 3].copy_from_slice(b"MC\0");
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+
+        assert_eq!(domains.len(), 2);
+        // First = lowest level (SMT).
+        assert_eq!(domains[0].level, 0);
+        assert_eq!(domains[0].name, "SMT");
+        assert_eq!(domains[0].span_weight, 2);
+        assert_eq!(domains[0].balance_interval, 32);
+        assert_eq!(domains[0].newidle_call, 8);
+        let s0 = domains[0].stats.as_ref().unwrap();
+        assert_eq!(s0.lb_count[0], 5);
+        // Second = higher level (MC).
+        assert_eq!(domains[1].level, 1);
+        assert_eq!(domains[1].name, "MC");
+        assert_eq!(domains[1].span_weight, 8);
+        assert_eq!(domains[1].balance_interval, 128);
+        assert_eq!(domains[1].newidle_call, 22);
+        let s1 = domains[1].stats.as_ref().unwrap();
+        assert_eq!(s1.lb_count[0], 20);
+        assert_eq!(s1.alb_pushed, 4);
+        assert_eq!(s1.ttwu_wake_remote, 10);
+    }
+
+    #[test]
+    fn read_sched_domain_tree_max_depth_bound() {
+        let sd_off = test_sched_domain_offsets();
+
+        // Create a circular chain: sd->parent points to itself.
+        // The MAX_DEPTH bound (8) should prevent infinite loop.
+        let sd_pa: u64 = 1024;
+        // Self-referential: parent == self.
+        let sd_buf = make_sd_buffer(&sd_off, sd_pa, 0, 0, 0, 1, 0, 0, 0, 0, 0);
+
+        let total_size = sd_pa as usize + sd_buf.len();
+        let mut buf = vec![0u8; total_size];
+        buf[sd_off.rq_sd..sd_off.rq_sd + 8].copy_from_slice(&sd_pa.to_ne_bytes());
+        buf[sd_pa as usize..sd_pa as usize + sd_buf.len()].copy_from_slice(&sd_buf);
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+
+        // Should stop at MAX_DEPTH=8.
+        assert_eq!(domains.len(), 8);
+    }
+
+    #[test]
+    fn read_sched_domain_tree_out_of_bounds_pa() {
+        let sd_off = test_sched_domain_offsets();
+
+        // rq->sd points to a KVA that translates to a PA beyond guest memory.
+        let bad_kva: u64 = 0xFFFF_FFFF_FFFF_0000;
+        let mut buf = vec![0u8; 512];
+        buf[sd_off.rq_sd..sd_off.rq_sd + 8].copy_from_slice(&bad_kva.to_ne_bytes());
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // page_offset=0 -> PA = bad_kva which is > buf.len().
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0);
+
+        // Should return Some(empty vec) — non-null sd but untranslatable.
+        assert!(domains.is_some());
+        assert!(domains.unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_u32_array_known_values() {
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&10u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&20u32.to_ne_bytes());
+        buf[8..12].copy_from_slice(&30u32.to_ne_bytes());
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let arr = read_u32_array(&mem, 0, 0);
+        assert_eq!(arr, [10, 20, 30]);
     }
 }
