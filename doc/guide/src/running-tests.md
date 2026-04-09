@@ -29,6 +29,33 @@ Available flags: `llc`, `borrow`, `steal`, `rebal`, `reject-pin`,
 See [Flags](concepts/flags.md) for details on flag declarations
 and profile generation.
 
+## Budget-based test selection
+
+Set `STT_BUDGET_SECS` to select the subset of tests that maximizes
+feature coverage within a time budget. Useful for CI pipelines or
+quick smoke tests.
+
+```sh
+# Run the best 5 minutes of tests
+STT_BUDGET_SECS=300 cargo nextest run --workspace
+
+# Budget applies to gauntlet variants too
+STT_BUDGET_SECS=600 cargo nextest run --run-ignored all
+```
+
+The selector encodes each test as a bitset of properties (scheduler,
+flags, topology class, SMT, workload characteristics) and greedily
+picks tests with the highest marginal coverage per estimated second.
+Duration estimates account for VM boot overhead based on vCPU count.
+
+A summary is printed to stderr during `--list`:
+
+```
+stt budget: 42/1200 tests, 295/300s used, 38/38 configurations covered
+```
+
+When `STT_BUDGET_SECS` is not set, all tests are listed as usual.
+
 ## Custom scheduler
 
 Define a `Scheduler` with `SchedulerSpec::Name` or

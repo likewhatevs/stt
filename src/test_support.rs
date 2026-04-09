@@ -630,7 +630,33 @@ fn is_ignored(entry: &SttTestEntry) -> bool {
 ///
 /// Gauntlet variants are always ignored. Base tests are ignored when
 /// their name starts with `demo_`.
+///
+/// When `STT_BUDGET_SECS` is set, applies greedy coverage maximization
+/// to select the subset of tests that maximizes feature coverage within
+/// the time budget. Only selected tests are printed.
 fn list_tests(ignored_only: bool) {
+    let raw = std::env::var("STT_BUDGET_SECS").ok();
+    let budget_secs: Option<f64> = raw.as_deref().and_then(|s| match s.parse::<f64>() {
+        Ok(v) if v > 0.0 => Some(v),
+        Ok(v) => {
+            eprintln!("stt: STT_BUDGET_SECS={v}: must be positive, ignoring");
+            None
+        }
+        Err(e) => {
+            eprintln!("stt: STT_BUDGET_SECS={s:?}: {e}, ignoring");
+            None
+        }
+    });
+
+    if let Some(budget) = budget_secs {
+        list_tests_budget(ignored_only, budget);
+    } else {
+        list_tests_all(ignored_only);
+    }
+}
+
+/// List all tests without budget filtering.
+fn list_tests_all(ignored_only: bool) {
     let presets = crate::vm::gauntlet_presets();
 
     for entry in STT_TESTS.iter() {
@@ -664,6 +690,75 @@ fn list_tests(ignored_only: bool) {
             }
         }
     }
+}
+
+/// List tests with budget-based coverage maximization.
+///
+/// Collects all eligible tests as candidates, runs greedy selection,
+/// and prints only the selected subset.
+fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
+    use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
+
+    let presets = crate::vm::gauntlet_presets();
+    let mut candidates: Vec<TestCandidate> = Vec::new();
+
+    for entry in STT_TESTS.iter() {
+        let base_ignored = is_ignored(entry);
+        let base_topo = entry.topology;
+
+        // Base test
+        if !ignored_only || base_ignored {
+            candidates.push(TestCandidate {
+                name: format!("{}: test", entry.name),
+                features: extract_features(entry, &base_topo, &[], false, entry.name),
+                estimated_secs: estimate_duration(entry, &base_topo),
+            });
+        }
+
+        if entry.host_only {
+            continue;
+        }
+
+        let profiles = entry
+            .scheduler
+            .generate_profiles(entry.required_flags, entry.excluded_flags);
+
+        for preset in &presets {
+            let t = &preset.topology;
+            if t.sockets < entry.constraints.min_sockets
+                || t.num_llcs() < entry.constraints.min_llcs
+                || (entry.constraints.requires_smt && t.threads_per_core < 2)
+                || t.total_cpus() < entry.constraints.min_cpus
+            {
+                continue;
+            }
+            for profile in &profiles {
+                let pname = profile.name();
+                let test_name = format!("gauntlet/{}/{}/{}", entry.name, preset.name, pname);
+                candidates.push(TestCandidate {
+                    name: format!("{}: test", test_name),
+                    features: extract_features(entry, t, &profile.flags, true, &test_name),
+                    estimated_secs: estimate_duration(entry, t),
+                });
+            }
+        }
+    }
+
+    let selected = select(&candidates, budget_secs);
+    for &i in &selected {
+        println!("{}", candidates[i].name);
+    }
+
+    let stats = crate::budget::selection_stats(&candidates, &selected, budget_secs);
+    eprintln!(
+        "stt budget: {}/{} tests, {:.0}/{:.0}s used, {}/{} configurations covered",
+        stats.selected,
+        stats.total,
+        stats.budget_used,
+        stats.budget_total,
+        stats.bits_covered,
+        stats.bits_possible,
+    );
 }
 
 /// Parse a nextest-style test name and run it.

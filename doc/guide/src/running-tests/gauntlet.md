@@ -63,6 +63,17 @@ See [Topology Constraints](../writing-tests/stt-test-macro.md#topology-constrain
 and [Flag Constraints](../writing-tests/stt-test-macro.md#flag-constraints)
 for the full attribute lists.
 
+## Budget interaction
+
+When `STT_BUDGET_SECS` is set, the budget selector considers gauntlet
+variants alongside base tests. Gauntlet variants contribute topology
+and flag profile diversity to the feature coverage model, so a
+budget-constrained run may select a mix of base tests (cheap, default
+topology) and gauntlet variants (expensive, diverse topologies)
+depending on the budget.
+
+See [Budget-based test selection](../running-tests.md#budget-based-test-selection).
+
 ## Flag profiles
 
 By default, gauntlet runs each test with all valid flag combinations
