@@ -796,9 +796,9 @@ pub struct SttVm {
     /// BPF map discoverability, waits for scenario start via SHM ring,
     /// then writes a u32 value at the specified offset.
     bpf_map_write: Option<BpfMapWriteParams>,
-    /// Performance mode: pin vCPU threads to host cores matching the virtual
-    /// topology's LLC structure, allocate guest memory with 2MB hugepages,
-    /// and validate no oversubscription.
+    /// Performance mode: vCPU pinning to host LLCs, hugepage-backed guest
+    /// memory, KVM_HINTS_REALTIME CPUID hint, PAUSE VM exit disabling via
+    /// KVM_CAP_X86_DISABLE_EXITS, and oversubscription validation.
     performance_mode: bool,
     /// Pinning plan computed during build() when performance_mode is enabled.
     /// Stored so topology is read once and the plan is reused at VM start.
@@ -2666,9 +2666,10 @@ impl SttVmBuilder {
     }
 
     /// Enable performance mode: vCPU pinning to host LLCs,
-    /// hugepage-backed guest memory, and KVM_HINTS_REALTIME CPUID
+    /// hugepage-backed guest memory, KVM_HINTS_REALTIME CPUID
     /// hint (disables PV spinlocks, PV TLB flush, PV sched_yield;
-    /// enables haltpoll cpuidle). Validated at build time --
+    /// enables haltpoll cpuidle), and PAUSE VM exit disabling via
+    /// KVM_CAP_X86_DISABLE_EXITS. Validated at build time --
     /// oversubscription is a fatal error, insufficient hugepages
     /// is a warning.
     #[allow(dead_code)]

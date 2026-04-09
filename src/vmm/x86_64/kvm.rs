@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
-    KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_PIT_SPEAKER_DUMMY,
-    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS, kvm_enable_cap,
-    kvm_pit_config, kvm_userspace_memory_region,
+    KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS, KVM_PIT_SPEAKER_DUMMY,
+    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
+    KVM_X86_DISABLE_EXITS_PAUSE, kvm_enable_cap, kvm_pit_config, kvm_userspace_memory_region,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
@@ -185,6 +185,21 @@ impl SttKvm {
                 ..Default::default()
             };
             vm_fd.create_pit2(pit_config).context("create PIT")?;
+        }
+
+        // Disable PAUSE VM exits to reduce vmexit overhead during spinlocks.
+        // Only PAUSE — HLT exits must remain enabled (BSP shutdown detection).
+        if performance_mode {
+            let mut cap = kvm_enable_cap {
+                cap: KVM_CAP_X86_DISABLE_EXITS,
+                ..Default::default()
+            };
+            cap.args[0] = KVM_X86_DISABLE_EXITS_PAUSE as u64;
+            if let Err(e) = vm_fd.enable_cap(&cap) {
+                eprintln!(
+                    "performance_mode: WARNING: KVM_CAP_X86_DISABLE_EXITS not supported: {e}"
+                );
+            }
         }
 
         // Allocate guest memory
@@ -427,5 +442,32 @@ mod tests {
         let vm = SttKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT is available since Linux 4.12.
         assert!(vm.has_immediate_exit);
+    }
+
+    #[test]
+    fn performance_mode_succeeds() {
+        let topo = Topology {
+            sockets: 1,
+            cores_per_socket: 2,
+            threads_per_core: 1,
+        };
+        let vm = SttKvm::new(topo, 128, true);
+        assert!(
+            vm.is_ok(),
+            "performance_mode VM creation failed: {:?}",
+            vm.err()
+        );
+    }
+
+    #[test]
+    fn performance_mode_does_not_affect_vcpu_count() {
+        let topo = Topology {
+            sockets: 2,
+            cores_per_socket: 2,
+            threads_per_core: 2,
+        };
+        let vm_normal = SttKvm::new(topo, 256, false).unwrap();
+        let vm_perf = SttKvm::new(topo, 256, true).unwrap();
+        assert_eq!(vm_normal.vcpus.len(), vm_perf.vcpus.len());
     }
 }

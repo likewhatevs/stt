@@ -2,12 +2,13 @@
 
 Performance mode reduces noise during VM execution by applying
 host-side isolation (vCPU pinning, hugepages, NUMA mbind, RT
-scheduling) and a guest-visible CPUID hint (KVM_HINTS_REALTIME).
+scheduling), a guest-visible CPUID hint (KVM_HINTS_REALTIME), and
+KVM exit suppression (PAUSE VM exits disabled).
 
 ## What it does
 
-Five optimizations are applied when `performance_mode` is enabled
-(four host-side, one guest-visible via CPUID):
+Six optimizations are applied when `performance_mode` is enabled
+(five host-side, one guest-visible via CPUID):
 
 **vCPU pinning** -- each virtual socket is mapped to a physical LLC
 group on the host. vCPU threads are pinned to cores within their
@@ -30,6 +31,15 @@ host CPU not assigned to any vCPU, so they can preempt for
 timeout/sampling without competing for vCPU cores. The serial console
 mutex uses `PTHREAD_PRIO_INHERIT` to avoid priority inversion between
 RT vCPU threads and service threads.
+
+**Disable PAUSE VM exits** -- `KVM_CAP_X86_DISABLE_EXITS` with
+`KVM_X86_DISABLE_EXITS_PAUSE` suppresses VM exits on PAUSE
+instructions. Guest spinlocks execute PAUSE in tight loops; each
+PAUSE normally causes a vmexit so the hypervisor can schedule other
+vCPUs. With dedicated cores (vCPU pinning), this reschedule is
+unnecessary overhead. HLT exits remain enabled because the BSP uses
+`VcpuExit::Hlt` for shutdown detection. The capability is optional --
+if unsupported, a warning is logged and the VM proceeds without it.
 
 **KVM_HINTS_REALTIME CPUID** -- sets bit 0 of CPUID leaf 0x40000001
 EDX, telling the guest kernel that vCPUs are pinned to dedicated host
@@ -128,8 +138,9 @@ topology matrix.
 
 Performance mode serves two purposes:
 
-**Noise reduction** -- pinning, hugepages, RT scheduling, and the
-KVM_HINTS_REALTIME CPUID hint reduce measurement variance. Scheduling gaps, spread, and throughput checks
+**Noise reduction** -- pinning, hugepages, RT scheduling, PAUSE VM
+exit disabling, and the KVM_HINTS_REALTIME CPUID hint reduce measurement
+variance. Scheduling gaps, spread, and throughput checks
 become meaningful because host jitter is controlled. Without
 performance mode, a 50ms gap could be host noise; with it, the same
 gap indicates a scheduler problem.
@@ -161,7 +172,7 @@ sums the actual CPU count of each LLC group and checks the total
 `super_perf_mode` validates at build time that sufficient LLC groups
 exist for the test topology. Both modes apply the same runtime
 optimizations (pinning, hugepages, NUMA mbind, RT scheduling,
-KVM_HINTS_REALTIME CPUID hint).
+PAUSE VM exit disabling, KVM_HINTS_REALTIME CPUID hint).
 
 ```rust,ignore
 #[stt_test(

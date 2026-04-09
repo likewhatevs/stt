@@ -71,6 +71,8 @@ optimizations after vCPU threads are spawned:
 5. Sets KVM_HINTS_REALTIME in CPUID leaf 0x40000001 EDX,
    disabling PV spinlocks, PV TLB flush, and PV sched_yield
    in the guest, and enabling haltpoll cpuidle.
+6. Disables PAUSE VM exits via `KVM_CAP_X86_DISABLE_EXITS`
+   (PAUSE bit only; HLT exits remain for BSP shutdown detection).
 
 Validation runs at build time. Oversubscription and unsatisfiable
 topology mappings are fatal errors. Insufficient hugepages is a
