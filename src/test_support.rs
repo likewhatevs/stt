@@ -2232,13 +2232,24 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
                 }
             }
 
-            // 2. Sibling of current executable
+            // 2. Sibling of current executable (or parent of deps/)
             if let Ok(exe) = crate::resolve_current_exe()
                 && let Some(dir) = exe.parent()
             {
                 let candidate = dir.join(name);
                 if candidate.exists() {
                     return Ok(Some(candidate));
+                }
+                // Integration tests and nextest place test binaries in
+                // target/{debug,release}/deps/. The scheduler binary is
+                // one level up in target/{debug,release}/.
+                if dir.file_name().is_some_and(|d| d == "deps")
+                    && let Some(parent) = dir.parent()
+                {
+                    let candidate = parent.join(name);
+                    if candidate.exists() {
+                        return Ok(Some(candidate));
+                    }
                 }
             }
 
