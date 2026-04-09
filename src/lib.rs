@@ -144,6 +144,7 @@ pub mod prelude {
 
     pub use crate::assert::{Assert, AssertResult};
     pub use crate::cgroup::CgroupManager;
+    pub use crate::scenario::flags::FlagDecl;
     pub use crate::scenario::ops::{
         CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execute_steps_with,
     };

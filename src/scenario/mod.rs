@@ -56,20 +56,55 @@ pub(crate) use crate::read_kmsg;
 // Flag system
 // ---------------------------------------------------------------------------
 
-/// Well-known flag declarations for scenarios.
+/// Flag declarations and name constants.
 ///
-/// Each flag is a static `FlagDecl` with typed `requires` pointers.
-/// String name constants are re-exported for backward compatibility
-/// with `Scenario.required_flags` and `Scenario.excluded_flags`.
+/// The built-in `*_DECL` constants (`LLC_DECL`, `BORROW_DECL`, etc.)
+/// have empty `args` fields. They define flag names and dependencies
+/// for stt's internal scenario catalog. External consumers define
+/// their own `FlagDecl` statics with populated `args` fields
+/// containing their scheduler's actual CLI arguments.
+///
+/// String name constants (`LLC`, `BORROW`, etc.) are used in
+/// [`FlagProfile::flags`] and [`generate_profiles()`](Scheduler::generate_profiles).
 pub mod flags {
-    /// Typed flag declaration for a scheduler.
+    /// A scheduler feature flag with CLI arguments and dependencies.
     ///
-    /// Each flag is a `static` item so flags can reference each other via
-    /// typed `requires` pointers instead of string matching.
+    /// Each scheduler defines its own `FlagDecl` statics. The `args`
+    /// field contains CLI arguments passed to the scheduler binary when
+    /// the flag is active. The `requires` field expresses dependencies
+    /// between flags (e.g. work-stealing requires LLC awareness).
+    ///
+    /// `FlagDecl` is re-exported in the [prelude](crate::prelude).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use stt::prelude::*;
+    ///
+    /// static MY_LLC: FlagDecl = FlagDecl {
+    ///     name: "llc",
+    ///     args: &["--enable-llc-awareness"],
+    ///     requires: &[],
+    /// };
+    ///
+    /// static MY_STEAL: FlagDecl = FlagDecl {
+    ///     name: "steal",
+    ///     args: &["--enable-work-stealing"],
+    ///     requires: &[&MY_LLC],
+    /// };
+    /// ```
     pub struct FlagDecl {
+        /// Flag name used in profiles and constraint matching
+        /// (e.g. `"llc"`, `"borrow"`, `"steal"`).
         pub name: &'static str,
-        /// Extra CLI arguments passed to the scheduler when this flag is active.
+        /// CLI arguments passed to the scheduler binary when this flag
+        /// is active. Empty for the built-in `*_DECL` constants;
+        /// external consumers populate this with their scheduler's
+        /// actual flags (e.g. `&["--enable-llc-awareness"]`).
         pub args: &'static [&'static str],
+        /// Flags that must also be active when this flag is active.
+        /// `generate_profiles()` rejects combinations where a
+        /// required flag is missing.
         pub requires: &'static [&'static FlagDecl],
     }
 

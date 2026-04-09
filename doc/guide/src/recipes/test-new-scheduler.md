@@ -6,11 +6,22 @@ End-to-end workflow: define a scheduler, write tests, run them.
 
 ```rust,ignore
 use stt::prelude::*;
-use stt::scenario::flags::*;
+
+static MY_LLC: FlagDecl = FlagDecl {
+    name: "llc",
+    args: &["--enable-llc"],
+    requires: &[],
+};
+
+static MY_STEAL: FlagDecl = FlagDecl {
+    name: "steal",
+    args: &["--enable-stealing"],
+    requires: &[&MY_LLC],
+};
 
 const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
     .binary(SchedulerSpec::Name("scx_my_scheduler"))
-    .flags(&[&LLC_DECL, &BORROW_DECL, &STEAL_DECL, &REBAL_DECL]);
+    .flags(&[&MY_LLC, &MY_STEAL]);
 ```
 
 ## 2. Write integration tests

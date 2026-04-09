@@ -55,11 +55,22 @@ Use the const builder pattern:
 
 ```rust,ignore
 use stt::prelude::*;
-use stt::scenario::flags::*;
+
+static MY_LLC: FlagDecl = FlagDecl {
+    name: "llc",
+    args: &["--enable-llc"],
+    requires: &[],
+};
+
+static MY_STEAL: FlagDecl = FlagDecl {
+    name: "steal",
+    args: &["--enable-stealing"],
+    requires: &[&MY_LLC],
+};
 
 const MY_SCHEDULER: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
-    .flags(&[&LLC_DECL, &BORROW_DECL, &STEAL_DECL, &REBAL_DECL])
+    .flags(&[&MY_LLC, &MY_STEAL])
     .assert(Assert::NONE.max_imbalance_ratio(2.0));
 ```
 
@@ -95,6 +106,49 @@ const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
 Merge order: `cgroup_parent` injection, then `sched_args`, then
 per-test `extra_sched_args`, then flag-derived args.
 
+## Defining flags
+
+Each scheduler defines its own `FlagDecl` statics with the CLI args
+that activate each feature. `FlagDecl` is re-exported from the
+prelude.
+
+```rust,ignore
+use stt::prelude::*;
+
+static MITOSIS_LLC: FlagDecl = FlagDecl {
+    name: "llc",
+    args: &["--enable-llc-awareness"],
+    requires: &[],
+};
+
+static MITOSIS_BORROW: FlagDecl = FlagDecl {
+    name: "borrow",
+    args: &["--enable-borrowing"],
+    requires: &[],
+};
+
+static MITOSIS_STEAL: FlagDecl = FlagDecl {
+    name: "steal",
+    args: &["--enable-work-stealing"],
+    requires: &[&MITOSIS_LLC],
+};
+
+const MITOSIS: Scheduler = Scheduler::new("mitosis")
+    .binary(SchedulerSpec::Name("scx_mitosis"))
+    .flags(&[&MITOSIS_LLC, &MITOSIS_BORROW, &MITOSIS_STEAL]);
+```
+
+The `args` field contains the scheduler CLI arguments passed when the
+flag is active. The `requires` field expresses dependencies: `steal`
+requires `llc`, so any profile containing `steal` automatically
+includes `llc`. Invalid combinations are rejected by
+`generate_profiles()`.
+
+The built-in `*_DECL` constants in `stt::scenario::flags` (e.g.
+`LLC_DECL`, `BORROW_DECL`) have empty `args` fields. They exist for
+stt's internal scenario catalog. External consumers must define their
+own `FlagDecl` statics with their scheduler's actual CLI arguments.
+
 ## Flag scoping
 
 `Scheduler.flags` defines which flags the scheduler supports.
@@ -124,7 +178,6 @@ activate/deactivate the scheduler:
 
 ```rust,ignore
 use stt::prelude::*;
-use stt::scenario::flags::FlagDecl;
 
 static MINLAT_LLC: FlagDecl = FlagDecl {
     name: "llc",

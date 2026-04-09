@@ -26,9 +26,9 @@ pub struct Scenario {
 `performance`.
 
 **`required_flags` / `excluded_flags`** -- typed `&[&flags::FlagDecl]`
-references that constrain which flag profiles are valid. Import path:
-`stt::scenario::flags::FlagDecl`. Example with constraints:
-`required_flags: &[&flags::LLC_DECL]`.
+references that constrain which flag profiles are valid. `FlagDecl` is
+in the [prelude](../writing-tests/scheduler-definitions.md#defining-flags).
+Example: `required_flags: &[&MY_LLC_DECL]`.
 
 **`num_cgroups`** -- number of cgroups to create.
 

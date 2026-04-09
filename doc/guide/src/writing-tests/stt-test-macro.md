@@ -135,26 +135,31 @@ what `performance_mode` enables, prerequisites, and validation behavior.
 ```rust,ignore
 use stt::prelude::*;
 
-const MITOSIS: Scheduler = Scheduler::new("mitosis")
-    .binary(SchedulerSpec::Name("scx_mitosis"))
-    .flags(&[
-        &stt::scenario::flags::LLC_DECL,
-        &stt::scenario::flags::BORROW_DECL,
-        &stt::scenario::flags::STEAL_DECL,
-        &stt::scenario::flags::REBAL_DECL,
-        &stt::scenario::flags::REJECT_PIN_DECL,
-        &stt::scenario::flags::NO_CTRL_DECL,
-    ]);
+static MY_LLC: FlagDecl = FlagDecl {
+    name: "llc",
+    args: &["--enable-llc-awareness"],
+    requires: &[],
+};
+
+static MY_STEAL: FlagDecl = FlagDecl {
+    name: "steal",
+    args: &["--enable-work-stealing"],
+    requires: &[&MY_LLC],
+};
+
+const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
+    .binary(SchedulerSpec::Name("scx_my_scheduler"))
+    .flags(&[&MY_LLC, &MY_STEAL]);
 
 #[stt_test(
     sockets = 2,
     cores = 4,
     threads = 2,
-    scheduler = MITOSIS,
+    scheduler = MY_SCHED,
     not_starved = true,
     max_gap_ms = 5000,
 )]
-fn mitosis_basic(ctx: &Ctx) -> Result<AssertResult> {
+fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
     // Test logic here
     Ok(AssertResult::pass())
 }

@@ -9,9 +9,23 @@ or relaxed event rates.
 Define a `Scheduler` with custom verification:
 
 ```rust,ignore
+use stt::prelude::*;
+
+static MY_LLC: FlagDecl = FlagDecl {
+    name: "llc",
+    args: &["--enable-llc"],
+    requires: &[],
+};
+
+static MY_BORROW: FlagDecl = FlagDecl {
+    name: "borrow",
+    args: &["--enable-borrowing"],
+    requires: &[],
+};
+
 const RELAXED: Scheduler = Scheduler::new("relaxed_sched")
     .binary(SchedulerSpec::Name("scx_relaxed"))
-    .flags(&[&LLC_DECL, &BORROW_DECL])
+    .flags(&[&MY_LLC, &MY_BORROW])
     .assert(
         Assert::NONE
             .max_imbalance_ratio(5.0)    // tolerate 5:1 imbalance
