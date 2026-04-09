@@ -979,7 +979,13 @@ fn run_stt_test_inner(
 /// `run_stt_test_inner` so that error message formatting can be tested
 /// without booting a VM. The `repro_fn` callback handles auto-repro
 /// (which requires a second VM boot) when provided.
-#[allow(clippy::too_many_arguments)]
+///
+/// In coverage mode (`#[cfg(coverage)]`), all assertions are skipped.
+/// Coverage answers "what code was exercised" — scheduling correctness
+/// under instrumented code is not meaningful because instrumentation
+/// changes the workload. Profraw is still collected (before this
+/// function is called).
+#[allow(clippy::too_many_arguments, unreachable_code)]
 fn evaluate_vm_result(
     entry: &SttTestEntry,
     result: &vmm::VmResult,
@@ -990,6 +996,23 @@ fn evaluate_vm_result(
     threads: u32,
     repro_fn: &dyn Fn(&str) -> Option<String>,
 ) -> Result<AssertResult> {
+    // Coverage gate: skip all assertions. The instrumented binary
+    // already ran the scenario and flushed profraw via SHM. Parse
+    // the result for sidecar stats but never fail on assertions.
+    #[cfg(coverage)]
+    {
+        let _ = (merged_assert, sockets, cores, threads, repro_fn);
+        eprintln!(
+            "stt_test: coverage mode: assertions skipped for '{}' (instrumentation changes workload)",
+            entry.name,
+        );
+        let verify_result = parse_assert_result_shm(result.shm_data.as_ref())
+            .or_else(|_| parse_assert_result(&result.output))
+            .unwrap_or_else(|_| AssertResult::pass());
+        write_sidecar(entry, result, stimulus_events, &verify_result, "CpuSpin");
+        return Ok(verify_result);
+    }
+
     // Build timeline from stimulus events + monitor samples.
     let timeline = result
         .monitor
@@ -1476,15 +1499,6 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         // SAFETY: guest-side dispatch runs single-threaded before
         // any test threads are spawned.
         unsafe { std::env::set_var("RUST_BACKTRACE", val) };
-    }
-
-    // Coverage instrumentation adds overhead that affects scheduling
-    // fairness and causes larger scheduling gaps. Downgrade spread
-    // violations to warnings and relax the gap threshold.
-    #[cfg(coverage)]
-    {
-        crate::assert::set_warn_unfair(true);
-        crate::assert::set_coverage_gap_ms(5000);
     }
 
     let entry = match find_test(name) {

@@ -46,8 +46,6 @@ pub struct RunConfig {
     pub cleanup_ms: u64,
     /// Override work_type for all swappable CgroupDefs and steady-state cgroups.
     pub work_type_override: Option<crate::workload::WorkType>,
-    /// Log unfairness but don't fail on it.
-    pub warn_unfair: bool,
 }
 
 /// Result of running a single scenario with a specific flag profile.
@@ -137,7 +135,6 @@ pub struct Runner {
 impl Runner {
     /// Create a runner with the given configuration and topology.
     pub fn new(config: RunConfig, topo: TestTopology) -> Result<Self> {
-        crate::assert::set_warn_unfair(config.warn_unfair);
         if config.repro {
             crate::workload::set_repro_mode(true);
         }
@@ -879,7 +876,6 @@ mod tests {
             scheduler_startup_ms: 2000,
             cleanup_ms: 300,
             work_type_override: None,
-            warn_unfair: false,
         };
         let runner = Runner::new(config, topo).unwrap();
         // Verify topology was correctly propagated (2*4*2=16 CPUs).
@@ -917,7 +913,6 @@ mod tests {
             scheduler_startup_ms: 1000,
             cleanup_ms: 200,
             work_type_override: Some(crate::workload::WorkType::Mixed),
-            warn_unfair: false,
         };
         assert!(config.repro);
         assert!(config.auto_repro);
@@ -969,7 +964,6 @@ mod tests {
             scheduler_startup_ms: 1000,
             cleanup_ms: 200,
             work_type_override: None,
-            warn_unfair: false,
         };
         let s = format!("{:?}", config);
         assert!(s.contains("scx_mitosis"), "must show scheduler_bin value");
@@ -997,7 +991,6 @@ mod tests {
             scheduler_startup_ms: 2000,
             cleanup_ms: 100,
             work_type_override: Some(crate::workload::WorkType::CpuSpin),
-            warn_unfair: false,
         };
         let c2 = config.clone();
         assert_eq!(c2.scheduler_bin, config.scheduler_bin);

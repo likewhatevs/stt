@@ -14,36 +14,8 @@
 
 use crate::workload::WorkerReport;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-static WARN_UNFAIR: AtomicBool = AtomicBool::new(false);
-
-/// Override for the default 2000ms gap threshold. 0 means use default.
-static COVERAGE_GAP_MS: AtomicU64 = AtomicU64::new(0);
-
-/// When true, unfair spread produces a warning detail but does not fail the result.
-#[doc(hidden)]
-#[allow(dead_code)]
-pub(crate) fn set_warn_unfair(v: bool) {
-    WARN_UNFAIR.store(v, Ordering::Relaxed);
-}
-
-/// Override the default scheduling gap threshold (ms).
-///
-/// Set to a higher value for coverage-instrumented runs where
-/// instrumentation overhead increases scheduling latency.
-/// 0 means use the default (2000ms release, 3000ms debug).
-#[doc(hidden)]
-#[allow(dead_code)]
-pub(crate) fn set_coverage_gap_ms(ms: u64) {
-    COVERAGE_GAP_MS.store(ms, Ordering::Relaxed);
-}
 
 fn gap_threshold_ms() -> u64 {
-    let v = COVERAGE_GAP_MS.load(Ordering::Relaxed);
-    if v > 0 {
-        return v;
-    }
     // Unoptimized debug builds have higher scheduling overhead.
     if cfg!(debug_assertions) { 3000 } else { 2000 }
 }
@@ -872,9 +844,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup
     let spread_limit = spread_threshold_pct();
     if spread > spread_limit && pcts.len() >= 2 {
-        if !WARN_UNFAIR.load(Ordering::Relaxed) {
-            r.passed = false;
-        }
+        r.passed = false;
         r.details.push(format!(
             "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus",
             spread,
@@ -1095,10 +1065,6 @@ pub fn assert_benchmarks(
 mod tests {
     use super::*;
     use crate::workload::WorkerReport;
-    use std::sync::Mutex;
-
-    /// Serializes tests that mutate the global WARN_UNFAIR flag.
-    static WARN_UNFAIR_LOCK: Mutex<()> = Mutex::new(());
 
     fn rpt(
         tid: u32,
@@ -1150,7 +1116,6 @@ mod tests {
 
     #[test]
     fn unfair_spread_fail() {
-        let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
         let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50), // 10%
             rpt(2, 500, 5e9 as u64, 4e9 as u64, &[0, 1], 50),  // 80%
@@ -1225,7 +1190,6 @@ mod tests {
 
     #[test]
     fn spread_boundary() {
-        let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
         let threshold = spread_threshold_pct();
         // At threshold exactly - pass
         // Worker 1: 10% runnable, Worker 2: 10%+threshold runnable
@@ -1597,24 +1561,6 @@ mod tests {
     }
 
     #[test]
-    fn warn_unfair_downgrades_to_warning() {
-        let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
-        // With WARN_UNFAIR=true, unfair spread should NOT fail the result
-        // (it still adds the detail string but passed stays true).
-        set_warn_unfair(true);
-        let r = assert_not_starved(&[
-            rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50), // 10%
-            rpt(2, 500, 5e9 as u64, 4e9 as u64, &[0, 1], 50),  // 80%
-        ]);
-        // Reset before assertions so other tests are unaffected.
-        set_warn_unfair(false);
-        // The detail about unfair should still be present.
-        assert!(r.details.iter().any(|d| d.contains("unfair")));
-        // But passed should be true because WARN_UNFAIR was set.
-        assert!(r.passed, "with WARN_UNFAIR=true, unfair should not fail");
-    }
-
-    #[test]
     fn plan_starved_still_fails_with_custom_gap() {
         // A starved worker (work_units=0) must still cause failure even
         // when the custom max_gap_ms threshold is high enough that the
@@ -1632,19 +1578,6 @@ mod tests {
         assert!(r.details.iter().any(|d| d.contains("starved")));
         // The gap (1500ms) is below the 5000ms threshold, so no "stuck" detail.
         assert!(!r.details.iter().any(|d| d.contains("stuck")));
-    }
-
-    #[test]
-    fn warn_unfair_false_fails() {
-        let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
-        // With WARN_UNFAIR=false (default), unfair spread fails.
-        set_warn_unfair(false);
-        let r = assert_not_starved(&[
-            rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50), // 10%
-            rpt(2, 500, 5e9 as u64, 4e9 as u64, &[0, 1], 50),  // 80%
-        ]);
-        assert!(!r.passed);
-        assert!(r.details.iter().any(|d| d.contains("unfair")));
     }
 
     // -- Assert merge tests --
@@ -1812,29 +1745,16 @@ mod tests {
         assert_eq!(v.max_keep_last_rate, Some(50.0));
     }
 
-    // -- gap_threshold_ms / set_coverage_gap_ms tests --
-
-    /// Serializes tests that mutate COVERAGE_GAP_MS.
-    static GAP_LOCK: Mutex<()> = Mutex::new(());
+    // -- gap_threshold_ms tests --
 
     #[test]
     fn gap_threshold_default() {
-        let _guard = GAP_LOCK.lock().unwrap();
-        set_coverage_gap_ms(0);
         let t = gap_threshold_ms();
         if cfg!(debug_assertions) {
             assert_eq!(t, 3000);
         } else {
             assert_eq!(t, 2000);
         }
-    }
-
-    #[test]
-    fn gap_threshold_custom() {
-        let _guard = GAP_LOCK.lock().unwrap();
-        set_coverage_gap_ms(5000);
-        assert_eq!(gap_threshold_ms(), 5000);
-        set_coverage_gap_ms(0);
     }
 
     #[test]
@@ -1971,8 +1891,6 @@ mod tests {
 
     #[test]
     fn neg_unfairness_extreme_spread_detected() {
-        let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
-        set_warn_unfair(false);
         let r = assert_not_starved(&[
             rpt(1, 100, 5e9 as u64, 25e7 as u64, &[0, 1], 50), // 5%
             rpt(2, 5000, 5e9 as u64, 475e7 as u64, &[0, 1], 50), // 95%
@@ -2062,8 +1980,6 @@ mod tests {
 
     #[test]
     fn neg_isolation_plus_starvation_both_reported() {
-        let _guard = WARN_UNFAIR_LOCK.lock().unwrap();
-        set_warn_unfair(false);
         let plan = AssertPlan::new().check_not_starved().check_isolation();
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
         let reports = [
@@ -2190,14 +2106,6 @@ mod tests {
         let t = gap_threshold_ms();
         // In test builds (debug_assertions=true), threshold is 3000.
         assert!(t >= 2000, "threshold should be at least 2000ms: {t}");
-    }
-
-    #[test]
-    fn set_coverage_gap_ms_overrides_default() {
-        let prev = COVERAGE_GAP_MS.load(Ordering::Relaxed);
-        set_coverage_gap_ms(9999);
-        assert_eq!(gap_threshold_ms(), 9999);
-        set_coverage_gap_ms(prev);
     }
 
     #[test]

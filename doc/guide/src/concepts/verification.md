@@ -133,9 +133,10 @@ let final_assert = Assert::default_checks()
 | Fairness spread | 15% | 35% |
 
 Debug builds run in small VMs with higher scheduling overhead, so
-thresholds are relaxed. The coverage gap override
-(`set_coverage_gap_ms`) further raises the gap threshold for
-instrumented builds.
+thresholds are relaxed. In coverage-instrumented builds
+(`#[cfg(coverage)]`), all assertions are skipped entirely --
+coverage measures what code paths tests exercise, not scheduling
+correctness under instrumented workloads.
 
 ### Monitor checks
 
