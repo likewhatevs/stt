@@ -673,7 +673,7 @@ fn resolve_affinity_kind(
         AffinityKind::RandomSubset => {
             let pool = cpusets
                 .map(|cs| cs[cgroup_idx].clone())
-                .unwrap_or_else(|| topo.all_cpus().iter().copied().collect());
+                .unwrap_or_else(|| topo.all_cpuset());
             let count = (pool.len() / 2).max(1);
             AffinityMode::Random { from: pool, count }
         }
@@ -681,7 +681,7 @@ fn resolve_affinity_kind(
             let idx = cgroup_idx % topo.num_llcs();
             AffinityMode::Fixed(topo.llc_aligned_cpuset(idx))
         }
-        AffinityKind::CrossCgroup => AffinityMode::Fixed(topo.all_cpus().iter().copied().collect()),
+        AffinityKind::CrossCgroup => AffinityMode::Fixed(topo.all_cpuset()),
         AffinityKind::SingleCpu => {
             let cpu = topo.all_cpus()[cgroup_idx % topo.total_cpus()];
             AffinityMode::SingleCpu(cpu)

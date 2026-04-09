@@ -809,8 +809,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
             Op::RandomizeAffinity { cgroup } => {
                 for (name, handle) in &state.handles {
                     if name.as_str() == *cgroup {
-                        let all = ctx.topo.all_cpus();
-                        let pool: BTreeSet<usize> = all.iter().copied().collect();
+                        let pool = ctx.topo.all_cpuset();
                         for idx in 0..handle.tids().len() {
                             let count = (pool.len() / 2).max(1);
                             use rand::seq::IndexedRandom;
@@ -1262,7 +1261,7 @@ mod tests {
         // Partitions must be disjoint.
         assert!(a.is_disjoint(&b), "partitions overlap: {:?} vs {:?}", a, b);
         // Together they cover all usable CPUs.
-        let usable: BTreeSet<usize> = ctx.topo.usable_cpus().iter().copied().collect();
+        let usable = ctx.topo.usable_cpuset();
         let union: BTreeSet<usize> = a.union(&b).copied().collect();
         assert_eq!(union, usable);
     }
@@ -1290,7 +1289,7 @@ mod tests {
         let (cg, topo) = make_ctx(1, 4, 1);
         let ctx = ctx_from(&cg, &topo);
         let all = CpusetSpec::Disjoint { index: 0, of: 1 }.resolve(&ctx);
-        let usable: BTreeSet<usize> = ctx.topo.usable_cpus().iter().copied().collect();
+        let usable = ctx.topo.usable_cpuset();
         assert_eq!(all, usable);
     }
 
@@ -1340,7 +1339,7 @@ mod tests {
             end_frac: 1.0,
         }
         .resolve(&ctx);
-        let usable: BTreeSet<usize> = ctx.topo.usable_cpus().iter().copied().collect();
+        let usable = ctx.topo.usable_cpuset();
         assert_eq!(cpus, usable);
     }
 
@@ -1366,7 +1365,7 @@ mod tests {
             end_frac: 2.0,
         }
         .resolve(&ctx);
-        let usable: BTreeSet<usize> = ctx.topo.usable_cpus().iter().copied().collect();
+        let usable = ctx.topo.usable_cpuset();
         assert_eq!(cpus, usable);
     }
 

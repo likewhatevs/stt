@@ -31,13 +31,12 @@
 //!
 //! ```rust
 //! use stt::prelude::*;
-//! use std::collections::BTreeSet;
 //!
 //! #[stt_test(sockets = 1, cores = 2, threads = 1)]
 //! fn my_low_level_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     let mut group = CgroupGroup::new(ctx.cgroups);
 //!     group.add_cgroup_no_cpuset("workers")?;
-//!     let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
+//!     let cpus = ctx.topo.all_cpuset();
 //!     ctx.cgroups.set_cpuset("workers", &cpus)?;
 //!
 //!     let cfg = WorkloadConfig {

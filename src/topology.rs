@@ -270,6 +270,10 @@ impl TestTopology {
     pub fn all_cpus(&self) -> &[usize] {
         &self.cpus
     }
+    /// All CPU IDs as a `BTreeSet`.
+    pub fn all_cpuset(&self) -> BTreeSet<usize> {
+        self.cpus.iter().copied().collect()
+    }
 
     /// CPUs available for workload placement. Reserves the last CPU for
     /// the root cgroup (cgroup 0) when the topology has more than 2 CPUs.
@@ -279,6 +283,10 @@ impl TestTopology {
         } else {
             &self.cpus
         }
+    }
+    /// Usable CPUs as a `BTreeSet`.
+    pub fn usable_cpuset(&self) -> BTreeSet<usize> {
+        self.usable_cpus().iter().copied().collect()
     }
     /// CPUs belonging to LLC at index `idx`.
     pub fn cpus_in_llc(&self, idx: usize) -> &[usize] {

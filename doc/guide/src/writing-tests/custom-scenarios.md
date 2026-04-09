@@ -73,8 +73,10 @@ moves all tasks in a slice (calls `move_task` per TID).
 Key methods:
 
 - `all_cpus() -> &[usize]` -- all CPU IDs, sorted.
+- `all_cpuset() -> BTreeSet<usize>` -- all CPU IDs as a set.
 - `usable_cpus() -> &[usize]` -- all CPUs except the last (reserved
   for root cgroup) when topology has >2 CPUs.
+- `usable_cpuset() -> BTreeSet<usize>` -- usable CPUs as a set.
 - `split_by_llc() -> Vec<BTreeSet<usize>>` -- one BTreeSet per LLC.
 - `num_llcs()`, `total_cpus()`, `num_numa_nodes()` -- counts.
 - `cpus_in_llc(idx) -> &[usize]` -- CPUs in LLC at index.
