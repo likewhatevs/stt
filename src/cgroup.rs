@@ -43,6 +43,7 @@ fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> 
 ///
 /// Creates, configures, and removes cgroups under a parent directory.
 /// Provides cpuset assignment and task migration.
+#[derive(Debug)]
 pub struct CgroupManager {
     parent: PathBuf,
 }

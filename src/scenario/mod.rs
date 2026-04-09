@@ -76,6 +76,18 @@ pub mod flags {
         pub shell_cmds: &'static [&'static str],
     }
 
+    impl std::fmt::Debug for FlagDecl {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let req_names: Vec<&str> = self.requires.iter().map(|d| d.name).collect();
+            f.debug_struct("FlagDecl")
+                .field("name", &self.name)
+                .field("args", &self.args)
+                .field("requires", &req_names)
+                .field("shell_cmds", &self.shell_cmds)
+                .finish()
+        }
+    }
+
     pub static LLC_DECL: FlagDecl = FlagDecl {
         name: "llc",
         args: &[],
@@ -314,7 +326,7 @@ impl Default for CgroupWork {
 /// let profiles = first.profiles();
 /// assert!(!profiles.is_empty());
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Scenario {
     /// Unique identifier (e.g. `"cgroup_steady"`).
     pub name: &'static str,
@@ -372,6 +384,7 @@ impl Scenario {
 ///
 /// Prevents cgroup leaks when workload spawning or other operations fail
 /// between cgroup creation and cleanup.
+#[derive(Debug)]
 pub struct CgroupGroup<'a> {
     cgroups: &'a CgroupManager,
     names: Vec<String>,
@@ -425,6 +438,7 @@ impl Drop for CgroupGroup<'_> {
 /// Provides access to cgroup management, topology information, and
 /// test configuration. Custom scenarios (`Action::Custom`) receive
 /// this as their sole parameter.
+#[derive(Debug)]
 pub struct Ctx<'a> {
     /// Cgroup filesystem manager for creating/removing cgroups.
     pub cgroups: &'a CgroupManager,

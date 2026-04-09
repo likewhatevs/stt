@@ -236,8 +236,10 @@ impl From<Vec<CgroupDef>> for Setup {
 
 /// A sequence of ops followed by a hold period.
 ///
-/// `setup` cgroups are created, configured, and populated before `ops`
-/// are applied. Use `Step::new` to create a step with only ops (no setup).
+/// For non-`Loop` steps, `ops` are applied first, then `setup` cgroups
+/// are created, configured, and populated. For `Loop` steps, `setup`
+/// runs once before the ops loop. Use `Step::new` to create a step
+/// with only ops (no setup).
 #[derive(Clone, Debug)]
 pub struct Step {
     pub setup: Setup,
@@ -495,8 +497,8 @@ struct StepState<'a> {
 /// Execute a sequence of steps against the given context.
 ///
 /// Convenience wrapper around [`execute_steps_with`] that passes
-/// `None` for checks, falling back to `assert_not_starved`. Use
-/// [`execute_steps_with`] when you need custom thresholds.
+/// `None` for checks, falling back to `ctx.assert`. Use
+/// [`execute_steps_with`] when you need to override `ctx.assert`.
 pub fn execute_steps(ctx: &Ctx, steps: Vec<Step>) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, None)
 }
@@ -828,6 +830,7 @@ fn collect_result(state: &mut StepState<'_>, checks: &crate::assert::Assert) -> 
 // ---------------------------------------------------------------------------
 
 /// Layout strategy for Traverse phases.
+#[derive(Debug)]
 pub enum Layout {
     Disjoint,
     /// Overlapping cpusets. (min_frac, max_frac) — PRNG picks a value in range.
@@ -846,6 +849,7 @@ pub enum Layout {
 ///
 /// `cgroup_workloads` controls the workload for each cgroup index. If the
 /// vec has fewer entries than the cgroup index, the last entry repeats.
+#[derive(Debug)]
 pub struct Traverse {
     pub seed: Option<u64>,
     pub cgroup_count: RangeInclusive<usize>,
