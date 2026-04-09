@@ -81,8 +81,8 @@ static BPF_NOOP: BpfMapWrite = BpfMapWrite {
     value: 0,
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_BPF_API: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "sched_bpf_map_api_integration",
     func: scenario_bpf_api,
@@ -130,8 +130,8 @@ fn scenario_perf_negative(ctx: &stt::scenario::Ctx) -> Result<stt::assert::Asser
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_PERF_NEG: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "sched_perf_negative",
     func: scenario_perf_negative,
@@ -161,8 +161,8 @@ fn scenario_scattershot(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertR
 const SCATTER_SCHED: Scheduler =
     Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_SCATTER: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "demo_scattershot_migration",
     func: scenario_scattershot,
@@ -194,8 +194,8 @@ fn scenario_throughput_regression(ctx: &stt::scenario::Ctx) -> Result<stt::asser
 
 const SLOW_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_SLOW: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "demo_throughput_regression",
     func: scenario_throughput_regression,
@@ -219,8 +219,8 @@ fn scenario_auto_repro(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertRe
 
 const STALL_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_AUTO_REPRO: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "demo_auto_repro",
     func: scenario_auto_repro,
@@ -242,8 +242,8 @@ fn scenario_baseline(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertResu
     execute_steps(ctx, steps)
 }
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_EEVDF: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "demo_baseline_eevdf",
     func: scenario_baseline,
@@ -254,8 +254,8 @@ static __STT_ENTRY_EEVDF: stt::test_support::SttTestEntry = stt::test_support::S
     ..stt::test_support::SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_SCX: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "demo_baseline_scx",
     func: scenario_baseline,
@@ -300,8 +300,8 @@ fn scenario_mid_degrade(ctx: &stt::scenario::Ctx) -> Result<stt::assert::AssertR
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_MID_DEGRADE: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "demo_mid_run_degrade",
     func: scenario_mid_degrade,

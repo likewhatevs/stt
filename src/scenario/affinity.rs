@@ -1,8 +1,8 @@
 //! CPU affinity scenario implementations.
 
 use super::Ctx;
-use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
-use crate::assert::AssertResult;
+use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execute_steps_with};
+use crate::assert::{Assert, AssertResult};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -40,22 +40,33 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
         all.iter().copied().collect()
     };
 
-    let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
-        ops: vec![
-            Op::SetAffinity {
-                cgroup: "cg_0".into(),
-                cpus: pin_cpus.clone(),
-            },
-            Op::SetAffinity {
-                cgroup: "cg_1".into(),
-                cpus: pin_cpus,
-            },
-        ],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
-    }];
+    // Pinning all workers to 2 CPUs concentrates load and increases
+    // spread under EEVDF; relax the default 35% threshold.
+    let checks = Assert::default_checks().max_spread_pct(75.0);
 
-    execute_steps(ctx, steps)
+    let steps = vec![
+        Step {
+            setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
+            ops: vec![],
+            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms)),
+        },
+        Step {
+            setup: vec![].into(),
+            ops: vec![
+                Op::SetAffinity {
+                    cgroup: "cg_0".into(),
+                    cpus: pin_cpus.clone(),
+                },
+                Op::SetAffinity {
+                    cgroup: "cg_1".into(),
+                    cpus: pin_cpus,
+                },
+            ],
+            hold: HoldSpec::Fixed(ctx.duration),
+        },
+    ];
+
+    execute_steps_with(ctx, steps, Some(&checks))
 }
 
 pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
@@ -67,24 +78,35 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let pin_a: BTreeSet<usize> = a.iter().copied().take(2.min(a.len())).collect();
     let pin_b: BTreeSet<usize> = b.iter().copied().take(2.min(b.len())).collect();
 
-    let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
-        ]
-        .into(),
-        ops: vec![
-            Op::SetAffinity {
-                cgroup: "cg_0".into(),
-                cpus: pin_a,
-            },
-            Op::SetAffinity {
-                cgroup: "cg_1".into(),
-                cpus: pin_b,
-            },
-        ],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
-    }];
+    // Pinning workers to 2 CPUs within each cpuset partition
+    // concentrates load and increases spread; relax the threshold.
+    let checks = Assert::default_checks().max_spread_pct(75.0);
 
-    execute_steps(ctx, steps)
+    let steps = vec![
+        Step {
+            setup: vec![
+                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+            ]
+            .into(),
+            ops: vec![],
+            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms)),
+        },
+        Step {
+            setup: vec![].into(),
+            ops: vec![
+                Op::SetAffinity {
+                    cgroup: "cg_0".into(),
+                    cpus: pin_a,
+                },
+                Op::SetAffinity {
+                    cgroup: "cg_1".into(),
+                    cpus: pin_b,
+                },
+            ],
+            hold: HoldSpec::Fixed(ctx.duration),
+        },
+    ];
+
+    execute_steps_with(ctx, steps, Some(&checks))
 }

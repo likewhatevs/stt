@@ -41,8 +41,8 @@ macro_rules! perf_positive_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-        #[linkme(crate = linkme)]
+        #[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+        #[linkme(crate = stt::__linkme)]
         static $name: SttTestEntry = SttTestEntry {
             name: stringify!($name),
             func: $name::scenario,
@@ -67,8 +67,8 @@ macro_rules! perf_negative_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-        #[linkme(crate = linkme)]
+        #[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+        #[linkme(crate = stt::__linkme)]
         static $name: SttTestEntry = SttTestEntry {
             name: stringify!($name),
             func: $name::scenario,
@@ -95,8 +95,8 @@ macro_rules! noperf_positive_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-        #[linkme(crate = linkme)]
+        #[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+        #[linkme(crate = stt::__linkme)]
         static $name: SttTestEntry = SttTestEntry {
             name: stringify!($name),
             func: $name::scenario,
@@ -120,8 +120,8 @@ macro_rules! noperf_negative_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-        #[linkme(crate = linkme)]
+        #[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+        #[linkme(crate = stt::__linkme)]
         static $name: SttTestEntry = SttTestEntry {
             name: stringify!($name),
             func: $name::scenario,

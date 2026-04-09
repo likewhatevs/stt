@@ -41,12 +41,24 @@ fn cover_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::affinity::custom_cgroup_affinity_change(ctx)
 }
 
-#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(
+    sockets = 1,
+    cores = 4,
+    threads = 1,
+    memory_mb = 2048,
+    max_spread_pct = 80.0
+)]
 fn cover_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::affinity::custom_cgroup_multicpu_pin(ctx)
 }
 
-#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(
+    sockets = 1,
+    cores = 4,
+    threads = 1,
+    memory_mb = 2048,
+    max_spread_pct = 80.0
+)]
 fn cover_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     stt::scenario::affinity::custom_cgroup_cpuset_multicpu_pin(ctx)
 }
@@ -314,8 +326,8 @@ static BPF_CRASH: BpfMapWrite = BpfMapWrite {
 
 use stt::test_support::{SttTestEntry, Topology};
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_FORCED_STALL: SttTestEntry = SttTestEntry {
     name: "cover_watchdog_forced_stall",
     func: scenario_sched_mixed,
@@ -332,8 +344,8 @@ static __STT_ENTRY_FORCED_STALL: SttTestEntry = SttTestEntry {
     ..SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_STALL_DETECT: SttTestEntry = SttTestEntry {
     name: "neg_stall_detection_scx_exit",
     func: scenario_sched_mixed,
@@ -350,8 +362,8 @@ static __STT_ENTRY_STALL_DETECT: SttTestEntry = SttTestEntry {
     ..SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
     name: "neg_sched_death_no_verify_result",
     func: scenario_sched_mixed,
@@ -368,8 +380,8 @@ static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
     ..SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_AUTO_REPRO_VERIFY: SttTestEntry = SttTestEntry {
     name: "neg_auto_repro_on_verify_failure",
     func: scenario_forced_failure,
@@ -383,8 +395,8 @@ static __STT_ENTRY_AUTO_REPRO_VERIFY: SttTestEntry = SttTestEntry {
     ..SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_CRASH_AFTER: SttTestEntry = SttTestEntry {
     name: "neg_crash_after_auto_repro",
     func: scenario_sched_mixed,
@@ -399,8 +411,8 @@ static __STT_ENTRY_CRASH_AFTER: SttTestEntry = SttTestEntry {
     ..SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_DEMO_BPF_CRASH: SttTestEntry = SttTestEntry {
     name: "demo_bpf_crash_auto_repro",
     func: scenario_sched_mixed,
@@ -415,8 +427,8 @@ static __STT_ENTRY_DEMO_BPF_CRASH: SttTestEntry = SttTestEntry {
     ..SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_HOST_CRASH: SttTestEntry = SttTestEntry {
     name: "neg_host_crash_auto_repro",
     func: scenario_yield_heavy,
@@ -431,8 +443,8 @@ static __STT_ENTRY_HOST_CRASH: SttTestEntry = SttTestEntry {
     ..SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_DEMO_HOST_CRASH: SttTestEntry = SttTestEntry {
     name: "demo_host_crash_auto_repro",
     func: scenario_yield_heavy,

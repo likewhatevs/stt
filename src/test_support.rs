@@ -722,6 +722,24 @@ pub fn collect_and_print_sidecar_stats() {
     }
 }
 
+/// Harness entry point for `#[stt_test]` binaries.
+///
+/// Parses `libtest_mimic` CLI args, builds trials from the `STT_TESTS`
+/// distributed slice, runs them, prints sidecar stats, and exits.
+///
+/// Consumers use this so they only need `stt` as a dependency:
+///
+/// ```rust,ignore
+/// fn main() { stt::test_support::stt_main(); }
+/// ```
+pub fn stt_main() -> ! {
+    let args = libtest_mimic::Arguments::from_args();
+    let trials = build_stt_trials();
+    let conclusion = libtest_mimic::run(&args, trials);
+    collect_and_print_sidecar_stats();
+    conclusion.exit()
+}
+
 /// BPF verifier complexity limit (BPF_COMPLEXITY_LIMIT_INSNS).
 const VERIFIER_INSN_LIMIT: u32 = 1_000_000;
 

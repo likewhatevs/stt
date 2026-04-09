@@ -118,6 +118,9 @@ pub(crate) mod vm;
 pub(crate) mod vmm;
 pub mod workload;
 
+#[doc(hidden)]
+pub use linkme as __linkme;
+
 pub use stt_macros::stt_test;
 
 #[cfg(feature = "integration")]

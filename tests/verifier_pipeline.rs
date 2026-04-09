@@ -117,8 +117,8 @@ fn scenario_fail_verify(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, None)
 }
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_FAIL_VERIFY: SttTestEntry = SttTestEntry {
     name: "demo_verifier_fail_verify",
     func: scenario_fail_verify,
@@ -130,8 +130,8 @@ static __STT_ENTRY_FAIL_VERIFY: SttTestEntry = SttTestEntry {
     ..SttTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = linkme)]
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
 static __STT_ENTRY_VERIFY_REJECT: SttTestEntry = SttTestEntry {
     name: "demo_verifier_cycle_collapse",
     func: scenario_fail_verify,

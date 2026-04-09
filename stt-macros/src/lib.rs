@@ -506,8 +506,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis #inner_sig #block
 
-        #[::linkme::distributed_slice(::stt::test_support::STT_TESTS)]
-        #[linkme(crate = ::linkme)]
+        #[::stt::__linkme::distributed_slice(::stt::test_support::STT_TESTS)]
+        #[linkme(crate = ::stt::__linkme)]
         static #entry_name: ::stt::test_support::SttTestEntry = ::stt::test_support::SttTestEntry {
             name: #name_str,
             func: #inner_name,
