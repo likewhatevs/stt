@@ -182,9 +182,13 @@ are only meaningful under performance mode's controlled environment.
 Performance-mode tests each consume one LLC group on the host.
 The `perf-vm` test group in `.config/nextest.toml` sets a static
 `max-threads` limit. The flock-based LLC slot reservation
-(`acquire_slot_with_locks`) handles runtime contention: if all LLC
-slots are busy, the test is skipped with a `ResourceContention`
-error rather than silently degrading to a shared LLC.
+(`acquire_resource_locks`) handles runtime contention: if all LLC
+slots are busy, the test returns `ResourceContention`.
+
+On contention, nextest retries with exponential backoff (configured
+in `.config/nextest.toml`). Non-final attempts return exit code 1
+so nextest retries; the final attempt returns exit code 0 with an
+"ignored" message so the test does not fail the suite.
 
 ## LLC exclusivity validation
 

@@ -529,20 +529,21 @@ pub fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
     Some((sockets, cores, threads))
 }
 
-/// Default seconds to wait for LLC/CPU resource locks before skipping.
-/// 55s leaves 5s margin before nextest's 60s default slow-timeout.
-const RESOURCE_WAIT_DEADLINE_SECS: u64 = 55;
-
-/// Deadline for resource acquisition polling. Uses
-/// `STT_RESOURCE_WAIT_SECS` env var if set, otherwise
-/// `RESOURCE_WAIT_DEADLINE_SECS` (55s).
-pub(crate) fn resource_deadline() -> std::time::Duration {
-    if let Ok(val) = std::env::var("STT_RESOURCE_WAIT_SECS")
-        && let Ok(secs) = val.parse::<u64>()
-    {
-        return std::time::Duration::from_secs(secs);
-    }
-    std::time::Duration::from_secs(RESOURCE_WAIT_DEADLINE_SECS)
+/// Whether this is the final nextest attempt for the current test.
+///
+/// Reads `NEXTEST_ATTEMPT` and `NEXTEST_TOTAL_ATTEMPTS` env vars.
+/// Returns `true` when not running under nextest (no retries available)
+/// or when on the last attempt.
+pub(crate) fn is_final_nextest_attempt() -> bool {
+    let attempt = std::env::var("NEXTEST_ATTEMPT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    let total = std::env::var("NEXTEST_TOTAL_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    attempt >= total
 }
 
 /// Host-side entry point: build a VM, boot it with `--stt-test-fn=NAME`,
@@ -574,8 +575,13 @@ pub fn run_stt_test_with_topo_and_flags(
 
 /// Run a test result through expect_err logic and return an exit code.
 ///
-/// Returns 0 on pass, 1 on failure. Resource contention is logged and
-/// returns 0 (nextest retry handles contention via backoff).
+/// Returns 0 on pass, 1 on failure.
+///
+/// On `ResourceContention`:
+/// - Non-final nextest attempt: return 1 so nextest retries with
+///   exponential backoff.
+/// - Final attempt (or not running under nextest): return 0 with
+///   "ignored" message so the test doesn't fail the suite.
 fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
     match result {
         Ok(_) if expect_err => {
@@ -592,8 +598,13 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                 .unwrap()
                 .reason
                 .clone();
-            eprintln!("resource contention (ignored): {reason}");
-            0
+            if is_final_nextest_attempt() {
+                eprintln!("resource contention (ignored): {reason}");
+                0
+            } else {
+                eprintln!("resource contention (will retry): {reason}");
+                1
+            }
         }
         Err(_) if expect_err => 0,
         Err(e) => {

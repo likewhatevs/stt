@@ -2661,13 +2661,8 @@ impl SttVmBuilder {
                 .as_ref()
                 .map(|h| h.total_cpus())
                 .unwrap_or(total_cpus);
-            let deadline = crate::test_support::resource_deadline();
-            let locks = host_topology::acquire_cpu_locks(
-                total_cpus,
-                host_cpus,
-                deadline,
-                host_topo.as_ref(),
-            )?;
+            let locks =
+                host_topology::acquire_cpu_locks(total_cpus, host_cpus, host_topo.as_ref())?;
             (None, Vec::new(), locks)
         };
 
@@ -2791,16 +2786,15 @@ impl SttVmBuilder {
 }
 
 /// Try each LLC slot, compute a pinning plan, and acquire resource
-/// locks. Polls with 500ms sleep until a slot is acquired or the
-/// deadline expires. Returns a `ResourceContention` error when the
-/// deadline expires.
+/// locks (non-blocking). Single pass through all available slots.
+/// Returns `ResourceContention` when all slots are busy; callers
+/// rely on nextest retry backoff for contention resolution.
 fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
     sockets: u32,
     cores_per_socket: u32,
     threads_per_core: u32,
 ) -> Result<host_topology::PinningPlan> {
-    let deadline = crate::test_support::resource_deadline();
     let num_llcs = host_topo.llc_groups.len();
     let sockets_needed = sockets as usize;
     let max_slots = num_llcs
@@ -2808,48 +2802,32 @@ fn acquire_slot_with_locks(
         .unwrap_or(num_llcs)
         .max(1);
     let llc_mode = host_topology::LlcLockMode::Exclusive;
-    let start = std::time::Instant::now();
 
-    loop {
-        for slot in 0..max_slots {
-            let offset = slot * sockets_needed;
-            let llc_indices: Vec<usize> = (offset..offset + sockets_needed).collect();
+    for slot in 0..max_slots {
+        let offset = slot * sockets_needed;
+        let llc_indices: Vec<usize> = (offset..offset + sockets_needed).collect();
 
-            let candidate = host_topo
-                .compute_pinning(sockets, cores_per_socket, threads_per_core, true, offset)
-                .context("performance_mode: topology mapping")?;
+        let candidate = host_topo
+            .compute_pinning(sockets, cores_per_socket, threads_per_core, true, offset)
+            .context("performance_mode: topology mapping")?;
 
-            match host_topology::acquire_resource_locks(
-                &candidate,
-                &llc_indices,
-                llc_mode,
-                std::time::Duration::ZERO,
-            )? {
-                host_topology::LockOutcome::Acquired { locks, .. } => {
-                    let mut plan = candidate;
-                    plan.locks = locks;
-                    eprintln!(
-                        "performance_mode: reserved LLC slot {} (offset {}, max {})",
-                        slot, offset, max_slots,
-                    );
-                    return Ok(plan);
-                }
-                host_topology::LockOutcome::Unavailable(_) => continue,
+        match host_topology::acquire_resource_locks(&candidate, &llc_indices, llc_mode)? {
+            host_topology::LockOutcome::Acquired { locks, .. } => {
+                let mut plan = candidate;
+                plan.locks = locks;
+                eprintln!(
+                    "performance_mode: reserved LLC slot {} (offset {}, max {})",
+                    slot, offset, max_slots,
+                );
+                return Ok(plan);
             }
+            host_topology::LockOutcome::Unavailable(_) => continue,
         }
-
-        if start.elapsed() >= deadline {
-            return Err(anyhow::Error::new(host_topology::ResourceContention {
-                reason: format!(
-                    "all {} LLC slots busy — waited {}s",
-                    max_slots,
-                    deadline.as_secs(),
-                ),
-            }));
-        }
-        let jitter = (std::process::id() as u64).wrapping_mul(7) % 100;
-        std::thread::sleep(std::time::Duration::from_millis(400 + jitter));
     }
+
+    Err(anyhow::Error::new(host_topology::ResourceContention {
+        reason: format!("all {max_slots} LLC slots busy"),
+    }))
 }
 
 #[cfg(test)]

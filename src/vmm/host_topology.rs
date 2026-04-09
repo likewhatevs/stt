@@ -216,7 +216,7 @@ pub enum LockOutcome {
         llc_offset: usize,
         locks: Vec<std::os::fd::OwnedFd>,
     },
-    /// Resources busy and deadline reached.
+    /// Resources busy.
     Unavailable(String),
 }
 
@@ -251,7 +251,7 @@ fn try_flock(path: &str, mode: i32) -> Result<Option<std::os::fd::OwnedFd>> {
     }
 }
 
-/// Acquire resource locks for a pinning plan.
+/// Acquire resource locks for a pinning plan (non-blocking).
 ///
 /// **LLC locks** (`/tmp/stt-llc-{N}.lock`):
 /// - `Exclusive`: `flock(LOCK_EX | LOCK_NB)` — sole access to the LLC.
@@ -262,32 +262,20 @@ fn try_flock(path: &str, mode: i32) -> Result<Option<std::os::fd::OwnedFd>> {
 /// - Skipped for `Exclusive` LLC mode (the LLC lock already provides
 ///   exclusivity over all CPUs in the group).
 ///
-/// Polls with 500ms sleep until locks are acquired or `deadline`
-/// is reached. Returns `LockOutcome::Unavailable` when the deadline
-/// expires without acquiring all locks.
+/// Single non-blocking attempt. Returns `LockOutcome::Unavailable`
+/// immediately when any resource is busy. Callers rely on nextest
+/// retry backoff for contention resolution.
 pub fn acquire_resource_locks(
     plan: &PinningPlan,
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
-    deadline: std::time::Duration,
 ) -> Result<LockOutcome> {
-    let start = std::time::Instant::now();
-
-    loop {
-        match try_acquire_all(plan, llc_indices, llc_mode) {
-            Ok(locks) => {
-                return Ok(LockOutcome::Acquired {
-                    llc_offset: llc_indices.first().copied().unwrap_or(0),
-                    locks,
-                });
-            }
-            Err(reason) => {
-                if start.elapsed() >= deadline {
-                    return Ok(LockOutcome::Unavailable(reason));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-        }
+    match try_acquire_all(plan, llc_indices, llc_mode) {
+        Ok(locks) => Ok(LockOutcome::Acquired {
+            llc_offset: llc_indices.first().copied().unwrap_or(0),
+            locks,
+        }),
+        Err(reason) => Ok(LockOutcome::Unavailable(reason)),
     }
 }
 
@@ -339,66 +327,56 @@ fn try_acquire_all(
     Ok(locks)
 }
 
-/// Acquire exclusive CPU locks for a non-perf VM.
+/// Acquire exclusive CPU locks for a non-perf VM (non-blocking).
 ///
 /// Tries to flock `count` consecutive CPU files starting from offset 0,
-/// stepping by `count` if any CPU in the window is busy. Returns the held
-/// fds on success, or `ResourceContention` when the deadline expires.
+/// stepping by 1 if any CPU in the window is busy. Returns the held
+/// fds on success, or `ResourceContention` when no window is available.
 ///
 /// When `host_topo` is provided, also acquires `LOCK_SH` on the LLC lock
 /// files containing the acquired CPUs. This prevents a perf VM from
 /// grabbing exclusive LLC access while non-perf VMs hold CPUs in that LLC.
 ///
-/// `total_host_cpus` bounds the search space.
+/// `total_host_cpus` bounds the search space. Single non-blocking pass;
+/// callers rely on nextest retry backoff for contention resolution.
 pub fn acquire_cpu_locks(
     count: usize,
     total_host_cpus: usize,
-    deadline: std::time::Duration,
     host_topo: Option<&HostTopology>,
 ) -> Result<Vec<std::os::fd::OwnedFd>> {
     if count == 0 {
         return Ok(Vec::new());
     }
-    let start = std::time::Instant::now();
 
-    loop {
-        let mut offset = 0;
-        while offset + count <= total_host_cpus {
-            match try_acquire_cpu_window(offset, count) {
-                Ok(mut locks) => {
-                    // Acquire shared LLC locks so perf VMs cannot take
-                    // exclusive access to LLCs we are using.
-                    if let Some(topo) = host_topo {
-                        let cpus: Vec<usize> = (offset..offset + count).collect();
-                        match acquire_llc_shared_locks(topo, &cpus) {
-                            Ok(llc_locks) => locks.extend(llc_locks),
-                            Err(_) => {
-                                // LLC lock busy — drop CPU locks and try next window.
-                                drop(locks);
-                                offset += count;
-                                continue;
-                            }
+    let mut offset = 0;
+    while offset + count <= total_host_cpus {
+        match try_acquire_cpu_window(offset, count) {
+            Ok(mut locks) => {
+                // Acquire shared LLC locks so perf VMs cannot take
+                // exclusive access to LLCs we are using.
+                if let Some(topo) = host_topo {
+                    let cpus: Vec<usize> = (offset..offset + count).collect();
+                    match acquire_llc_shared_locks(topo, &cpus) {
+                        Ok(llc_locks) => locks.extend(llc_locks),
+                        Err(_) => {
+                            // LLC lock busy — drop CPU locks and try next window.
+                            drop(locks);
+                            offset += 1;
+                            continue;
                         }
                     }
-                    return Ok(locks);
                 }
-                Err(_) => {
-                    offset += count;
-                }
+                return Ok(locks);
+            }
+            Err(_) => {
+                offset += 1;
             }
         }
-
-        if start.elapsed() >= deadline {
-            return Err(anyhow::Error::new(ResourceContention {
-                reason: format!(
-                    "no {count} consecutive CPUs available — waited {}s",
-                    deadline.as_secs(),
-                ),
-            }));
-        }
-        let jitter = (std::process::id() as u64).wrapping_mul(7) % 100;
-        std::thread::sleep(std::time::Duration::from_millis(400 + jitter));
     }
+
+    Err(anyhow::Error::new(ResourceContention {
+        reason: format!("no {count} consecutive CPUs available"),
+    }))
 }
 
 /// Acquire `LOCK_SH` on LLC lock files for the LLCs containing `cpus`.
