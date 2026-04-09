@@ -5,10 +5,6 @@ use stt::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
 use stt::stt_test;
 use stt::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
-fn main() {
-    stt::test_support::stt_main();
-}
-
 const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
 #[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 2, threads = 1, sustained_samples = 15)]

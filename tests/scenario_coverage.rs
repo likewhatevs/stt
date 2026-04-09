@@ -4,10 +4,6 @@ use stt::scenario::Ctx;
 use stt::stt_test;
 use stt::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
-fn main() {
-    stt::test_support::stt_main();
-}
-
 const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
 // -- basic --

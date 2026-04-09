@@ -58,16 +58,12 @@ libbpf-cargo = "0.26"
 
 [[test]]
 name = "stt_sched_tests"
-harness = false
 
 [[test]]
 name = "scenario_coverage"
-harness = false
 
 [[test]]
 name = "assert_gate_matrix"
-harness = false
 
 [[test]]
 name = "verifier_pipeline"
-harness = false

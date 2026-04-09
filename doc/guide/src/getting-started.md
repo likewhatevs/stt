@@ -70,27 +70,14 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
 
 ## Test binary setup
 
-Tests that use the `#[stt_test]` macro work with both `cargo test` and
-`cargo nextest run` out of the box. For test binaries that register
-tests via distributed slice (manual `SttTestEntry` statics), use
-`harness = false` and call `stt_main()`:
+No special setup is needed. `#[stt_test]` functions work with both
+`cargo test` and `cargo nextest run` out of the box. The stt ctor
+automatically intercepts nextest protocol args (`--list`, `--exact`)
+for gauntlet expansion and budget-driven test selection.
 
-```toml
-# Cargo.toml
-[[test]]
-name = "my_sched_tests"
-harness = false
-```
-
-```rust,ignore
-// tests/my_sched_tests.rs
-fn main() {
-    stt::test_support::stt_main();
-}
-```
-
-`stt_main()` implements the nextest protocol directly: `--list` for
-test discovery, `--exact NAME` for execution.
+- `cargo nextest run`: ctor intercepts, runs gauntlet-expanded tests.
+- `cargo test`: standard harness runs the `#[test]` wrappers (base
+  topology only, no gauntlet expansion).
 
 ## Kernel discovery
 

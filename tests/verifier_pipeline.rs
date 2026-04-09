@@ -4,10 +4,6 @@ use stt::scenario::Ctx;
 use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
 use stt::test_support::{Scheduler, SchedulerSpec, SttTestEntry};
 
-fn main() {
-    stt::test_support::stt_main();
-}
-
 /// Build a scheduler package and resolve paths for verifier tests.
 fn resolve_verifier_paths(
     package: &str,

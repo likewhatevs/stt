@@ -4,10 +4,6 @@ use stt::scenario::Ctx;
 use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
 use stt::test_support::{Scheduler, SchedulerSpec, SttTestEntry};
 
-fn main() {
-    stt::test_support::stt_main();
-}
-
 const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
 fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
