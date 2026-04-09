@@ -22,15 +22,17 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 
 # ── Overrides ─────────────────────────────────────────────────────────
 
-# Boot tests: long timeout, retry in CI.
+# Boot tests: long timeout, serialized via boot-vm test-group.
 # Coverage instrumentation (llvm-cov) makes VM boots 5-10x slower,
 # so the budget must accommodate the slowest observed coverage run.
 [[profile.default.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"
+test-group = "boot-vm"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"
+test-group = "boot-vm"
 slow-timeout = { period = "60s", terminate-after = 2 }
 retries = 1
 
@@ -58,7 +60,7 @@ filter = "test(neg_)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
 
-# Negative/auto-repro tests: boot two VMs (main + repro). Need more
+# Negative/auto-repro tests: boot two VMs (crash + repro). Need more
 # time than single-VM coverage tests.
 [[profile.default.overrides]]
 filter = "test(neg_)"
@@ -88,6 +90,13 @@ retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max
 filter = "test(gauntlet/)"
 slow-timeout = { period = "120s", terminate-after = 2 }
 retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
+
+# Boot tests: serialize to avoid signal contention on vCPU kick
+# (SIGRTMIN). CPU flock prevents overlapping CPUs but these
+# lightweight boot-to-panic tests benefit from full serialization.
+# ── boot-vm ─────────────────────────────────────────────────────────
+[test-groups.boot-vm]
+max-threads = 1
 
 # Performance-mode tests: each perf test acquires LLC locks at
 # runtime via flock, so nextest parallelism is a soft limit.
