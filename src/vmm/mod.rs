@@ -2834,10 +2834,6 @@ fn acquire_slot_with_locks(
 mod tests {
     use super::*;
 
-    /// Serialize boot tests within a single `cargo test` process.
-    /// Cross-process serialization uses the `boot-vm` nextest test-group.
-    static BOOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn builder_default() {
         let b = SttVmBuilder::default();
@@ -3018,7 +3014,6 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_produces_output() {
-        let _lock = BOOT_LOCK.lock().unwrap();
         let Some(kernel) = crate::find_kernel() else {
             return;
         };
@@ -3041,7 +3036,6 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_smp_topology() {
-        let _lock = BOOT_LOCK.lock().unwrap();
         let Some(kernel) = crate::find_kernel() else {
             return;
         };
@@ -3065,7 +3059,6 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn bench_boot_time() {
-        let _lock = BOOT_LOCK.lock().unwrap();
         let Some(kernel) = crate::find_kernel() else {
             return;
         };
@@ -3369,7 +3362,6 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
-        let _lock = BOOT_LOCK.lock().unwrap();
         let Some(kernel) = crate::find_kernel() else {
             return;
         };
@@ -3875,7 +3867,6 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn boot_kernel_produces_output_aarch64() {
-        let _lock = BOOT_LOCK.lock().unwrap();
         let Some(kernel) = find_aarch64_image() else {
             eprintln!("skipping: no aarch64 Image found (only compressed vmlinuz available)");
             return;
@@ -3899,7 +3890,6 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn boot_kernel_smp_topology_aarch64() {
-        let _lock = BOOT_LOCK.lock().unwrap();
         let Some(kernel) = find_aarch64_image() else {
             eprintln!("skipping: no aarch64 Image found");
             return;
