@@ -7,8 +7,8 @@ use stt::stt_test;
 /// linkme registration + test wrapper resolve correctly from an
 /// integration test.
 ///
-/// The test body skips at runtime if no kernel is available, since
-/// actually booting a VM requires a bzImage.
+/// The generated `#[test]` wrapper calls `run_stt_test`, which requires
+/// KVM and a kernel image — it errors if either is unavailable.
 #[stt_test(sockets = 1, cores = 2, threads = 1, memory_mb = 2048)]
 fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();

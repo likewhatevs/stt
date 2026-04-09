@@ -2601,4 +2601,217 @@ mod tests {
             None
         );
     }
+
+    // -- WorkType::from_preset tests --
+
+    #[test]
+    fn work_type_from_preset_all_names() {
+        for &name in WorkType::PRESET_NAMES {
+            assert!(
+                WorkType::from_preset(name).is_some(),
+                "preset {name} should resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn work_type_from_preset_unknown() {
+        assert!(WorkType::from_preset("nonexistent").is_none());
+    }
+
+    #[test]
+    fn work_type_from_preset_cpu_spin() {
+        let wt = WorkType::from_preset("cpu_spin").unwrap();
+        assert!(matches!(wt, WorkType::CpuSpin));
+    }
+
+    #[test]
+    fn work_type_from_preset_bursty_defaults() {
+        let wt = WorkType::from_preset("bursty").unwrap();
+        match wt {
+            WorkType::Bursty { burst_ms, sleep_ms } => {
+                assert_eq!(burst_ms, 50);
+                assert_eq!(sleep_ms, 100);
+            }
+            _ => panic!("expected Bursty"),
+        }
+    }
+
+    #[test]
+    fn work_type_from_preset_fanout() {
+        let wt = WorkType::from_preset("fanout").unwrap();
+        match wt {
+            WorkType::FutexFanOut {
+                fan_out,
+                spin_iters,
+            } => {
+                assert_eq!(fan_out, 4);
+                assert_eq!(spin_iters, 1024);
+            }
+            _ => panic!("expected FutexFanOut"),
+        }
+    }
+
+    #[test]
+    fn work_type_from_preset_cache_l1() {
+        let wt = WorkType::from_preset("cache_l1").unwrap();
+        match wt {
+            WorkType::CachePressure { size_kb, stride } => {
+                assert_eq!(size_kb, 32);
+                assert_eq!(stride, 64);
+            }
+            _ => panic!("expected CachePressure"),
+        }
+    }
+
+    // -- WorkType::needs_cache_buf tests --
+
+    #[test]
+    fn work_type_needs_cache_buf_cache_types() {
+        assert!(
+            WorkType::CachePressure {
+                size_kb: 32,
+                stride: 64
+            }
+            .needs_cache_buf()
+        );
+        assert!(
+            WorkType::CacheYield {
+                size_kb: 32,
+                stride: 64
+            }
+            .needs_cache_buf()
+        );
+        assert!(
+            WorkType::CachePipe {
+                size_kb: 32,
+                burst_iters: 1024
+            }
+            .needs_cache_buf()
+        );
+    }
+
+    #[test]
+    fn work_type_needs_cache_buf_non_cache_types() {
+        assert!(!WorkType::CpuSpin.needs_cache_buf());
+        assert!(!WorkType::YieldHeavy.needs_cache_buf());
+        assert!(!WorkType::Mixed.needs_cache_buf());
+        assert!(!WorkType::IoSync.needs_cache_buf());
+        assert!(
+            !WorkType::Bursty {
+                burst_ms: 50,
+                sleep_ms: 100
+            }
+            .needs_cache_buf()
+        );
+        assert!(!WorkType::PipeIo { burst_iters: 1024 }.needs_cache_buf());
+        assert!(!WorkType::FutexPingPong { spin_iters: 1024 }.needs_cache_buf());
+        assert!(
+            !WorkType::FutexFanOut {
+                fan_out: 4,
+                spin_iters: 1024
+            }
+            .needs_cache_buf()
+        );
+    }
+
+    // -- resolve_work_type tests --
+
+    #[test]
+    fn resolve_work_type_not_swappable_returns_base() {
+        let base = WorkType::CpuSpin;
+        let override_wt = Some(WorkType::YieldHeavy);
+        let result = resolve_work_type(base, override_wt, false, 4);
+        assert!(matches!(result, WorkType::CpuSpin));
+    }
+
+    #[test]
+    fn resolve_work_type_swappable_no_override_returns_base() {
+        let base = WorkType::CpuSpin;
+        let result = resolve_work_type(base, None, true, 4);
+        assert!(matches!(result, WorkType::CpuSpin));
+    }
+
+    #[test]
+    fn resolve_work_type_swappable_ungrouped_override() {
+        let base = WorkType::CpuSpin;
+        let override_wt = Some(WorkType::YieldHeavy);
+        let result = resolve_work_type(base, override_wt, true, 4);
+        assert!(matches!(result, WorkType::YieldHeavy));
+    }
+
+    #[test]
+    fn resolve_work_type_swappable_grouped_override_compatible() {
+        let base = WorkType::CpuSpin;
+        let override_wt = Some(WorkType::PipeIo { burst_iters: 1024 });
+        // num_workers=4 is divisible by group_size=2
+        let result = resolve_work_type(base, override_wt, true, 4);
+        assert!(matches!(result, WorkType::PipeIo { .. }));
+    }
+
+    #[test]
+    fn resolve_work_type_swappable_grouped_override_incompatible() {
+        let base = WorkType::CpuSpin;
+        let override_wt = Some(WorkType::PipeIo { burst_iters: 1024 });
+        // num_workers=3 is not divisible by group_size=2, falls back to base
+        let result = resolve_work_type(base, override_wt, true, 3);
+        assert!(matches!(result, WorkType::CpuSpin));
+    }
+
+    #[test]
+    fn resolve_work_type_swappable_fanout_compatible() {
+        let base = WorkType::CpuSpin;
+        let override_wt = Some(WorkType::FutexFanOut {
+            fan_out: 4,
+            spin_iters: 1024,
+        });
+        // num_workers=10 is divisible by group_size=5
+        let result = resolve_work_type(base, override_wt, true, 10);
+        assert!(matches!(result, WorkType::FutexFanOut { .. }));
+    }
+
+    #[test]
+    fn resolve_work_type_swappable_fanout_incompatible() {
+        let base = WorkType::CpuSpin;
+        let override_wt = Some(WorkType::FutexFanOut {
+            fan_out: 4,
+            spin_iters: 1024,
+        });
+        // num_workers=7 is not divisible by group_size=5, falls back to base
+        let result = resolve_work_type(base, override_wt, true, 7);
+        assert!(matches!(result, WorkType::CpuSpin));
+    }
+
+    // -- snapshot_iterations tests --
+
+    #[test]
+    fn snapshot_iterations_empty_handle() {
+        let config = WorkloadConfig {
+            num_workers: 0,
+            ..Default::default()
+        };
+        let h = WorkloadHandle::spawn(&config).unwrap();
+        assert!(h.snapshot_iterations().is_empty());
+        drop(h);
+    }
+
+    #[test]
+    fn snapshot_iterations_running_workers() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            affinity: AffinityMode::None,
+            work_type: WorkType::CpuSpin,
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let iters = h.snapshot_iterations();
+        assert_eq!(iters.len(), 2);
+        // After 200ms of CpuSpin, workers should have done iterations.
+        for (i, &v) in iters.iter().enumerate() {
+            assert!(v > 0, "worker {i} should have iterations > 0, got {v}");
+        }
+        drop(h);
+    }
 }

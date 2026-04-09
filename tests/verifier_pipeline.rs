@@ -11,7 +11,7 @@ fn main() {
     let args = libtest_mimic::Arguments::from_args();
     let mut trials = stt::test_support::build_stt_trials();
 
-    // Verifier tests: build scheduler once, call library with paths.
+    // Verifier tests: build scheduler per test, call library with paths.
     trials.push(
         libtest_mimic::Trial::test("demo_verifier_brief", || {
             let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;

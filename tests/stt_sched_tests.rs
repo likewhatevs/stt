@@ -267,7 +267,7 @@ static __STT_ENTRY_SCX: stt::test_support::SttTestEntry = stt::test_support::Stt
 };
 
 /// Minimal scheduler test that exercises host-side BPF program enumeration.
-/// The framework asserts verifier_stats is non-empty for scheduler tests.
+/// The framework warns when verifier_stats is empty for scheduler tests.
 #[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 2, threads = 1, duration_s = 3)]
 fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {

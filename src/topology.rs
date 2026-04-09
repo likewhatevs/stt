@@ -701,4 +701,53 @@ mod tests {
         };
         assert_eq!(llc.num_cores(), 4);
     }
+
+    #[test]
+    fn parse_cpu_list_lenient_simple() {
+        assert_eq!(parse_cpu_list_lenient("0,1,2,3"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_cpu_list_lenient_range() {
+        assert_eq!(parse_cpu_list_lenient("0-3"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_cpu_list_lenient_mixed() {
+        assert_eq!(
+            parse_cpu_list_lenient("0-2,5,7-9"),
+            vec![0, 1, 2, 5, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn parse_cpu_list_lenient_empty() {
+        assert!(parse_cpu_list_lenient("").is_empty());
+    }
+
+    #[test]
+    fn parse_cpu_list_lenient_skips_garbage() {
+        assert_eq!(parse_cpu_list_lenient("0,abc,2,xyz-3,4"), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn parse_cpu_list_lenient_whitespace() {
+        assert_eq!(parse_cpu_list_lenient("  0 , 1 , 2  "), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cache_size_bare_number() {
+        // Bare number without suffix is treated as bytes, converted to KB.
+        assert_eq!(parse_cache_size("1024"), Some(1));
+    }
+
+    #[test]
+    fn cache_size_empty_string() {
+        assert_eq!(parse_cache_size(""), None);
+    }
+
+    #[test]
+    fn cache_size_whitespace_only() {
+        assert_eq!(parse_cache_size("   "), None);
+    }
 }

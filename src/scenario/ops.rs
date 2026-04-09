@@ -1613,4 +1613,97 @@ mod tests {
         ]);
         assert_eq!(step.ops.len(), 2);
     }
+
+    // -- CpusetSpec::validate --
+
+    #[test]
+    fn cpusetspec_validate_disjoint_of_zero() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 0, of: 0 };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_disjoint_index_ge_of() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 3, of: 3 };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("index 3 >= partition count 3"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_of_zero() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 0,
+            frac: 0.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_index_ge_of() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 2,
+            of: 2,
+            frac: 0.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("index 2 >= partition count 2"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_start_ge_end() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.8,
+            end_frac: 0.2,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("start_frac"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_too_few_cpus_for_partitions() {
+        // 1 socket, 2 cores, 1 thread => 2 total cpus, 2 usable
+        let (cg, topo) = make_ctx(1, 2, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 0, of: 5 };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not enough usable CPUs"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_exact_always_ok() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Exact([99].into_iter().collect());
+        assert!(spec.validate(&ctx).is_ok());
+    }
+
+    #[test]
+    fn cpusetspec_validate_llc_out_of_range() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Llc(5);
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_valid_disjoint_ok() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 1, of: 2 };
+        assert!(spec.validate(&ctx).is_ok());
+    }
 }

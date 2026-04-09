@@ -2425,4 +2425,86 @@ mod tests {
         assert!(!r.passed, "2/s < 1000/s floor");
         assert!(r.details.iter().any(|d| d.contains("iteration rate")));
     }
+
+    // -- AssertResult::skip --
+
+    #[test]
+    fn assert_result_skip_is_pass_with_reason() {
+        let r = AssertResult::skip("topology too small");
+        assert!(r.passed);
+        assert_eq!(r.details.len(), 1);
+        assert_eq!(r.details[0], "topology too small");
+    }
+
+    #[test]
+    fn assert_result_skip_default_stats() {
+        let r = AssertResult::skip("skipped");
+        assert_eq!(r.stats.total_workers, 0);
+        assert!(r.stats.cgroups.is_empty());
+    }
+
+    // -- Assert::has_worker_checks --
+
+    #[test]
+    fn assert_none_has_no_worker_checks() {
+        assert!(!Assert::NONE.has_worker_checks());
+    }
+
+    #[test]
+    fn assert_default_checks_has_worker_checks() {
+        assert!(Assert::default_checks().has_worker_checks());
+    }
+
+    #[test]
+    fn assert_single_field_has_worker_checks() {
+        assert!(Assert::NONE.max_gap_ms(5000).has_worker_checks());
+        assert!(Assert::NONE.check_isolation().has_worker_checks());
+        assert!(Assert::NONE.max_spread_pct(10.0).has_worker_checks());
+        assert!(Assert::NONE.max_throughput_cv(0.5).has_worker_checks());
+        assert!(Assert::NONE.min_work_rate(100.0).has_worker_checks());
+        assert!(
+            Assert::NONE
+                .max_p99_wake_latency_ns(1000)
+                .has_worker_checks()
+        );
+        assert!(Assert::NONE.max_wake_latency_cv(0.5).has_worker_checks());
+        assert!(Assert::NONE.min_iteration_rate(10.0).has_worker_checks());
+        assert!(Assert::NONE.max_migration_ratio(0.5).has_worker_checks());
+    }
+
+    #[test]
+    fn assert_monitor_only_no_worker_checks() {
+        let a = Assert::NONE.max_imbalance_ratio(5.0).fail_on_stall(true);
+        assert!(!a.has_worker_checks());
+    }
+
+    // -- AssertResult::merge ext_metrics --
+
+    #[test]
+    fn assert_result_merge_ext_metrics_max_value() {
+        let mut a = AssertResult::pass();
+        a.stats.ext_metrics.insert("latency".into(), 10.0);
+        a.stats.ext_metrics.insert("throughput".into(), 100.0);
+
+        let mut b = AssertResult::pass();
+        b.stats.ext_metrics.insert("latency".into(), 20.0);
+        b.stats.ext_metrics.insert("jitter".into(), 5.0);
+
+        a.merge(b);
+        assert_eq!(a.stats.ext_metrics["latency"], 20.0);
+        assert_eq!(a.stats.ext_metrics["throughput"], 100.0);
+        assert_eq!(a.stats.ext_metrics["jitter"], 5.0);
+    }
+
+    #[test]
+    fn assert_result_merge_ext_metrics_keeps_larger() {
+        let mut a = AssertResult::pass();
+        a.stats.ext_metrics.insert("x".into(), 50.0);
+
+        let mut b = AssertResult::pass();
+        b.stats.ext_metrics.insert("x".into(), 30.0);
+
+        a.merge(b);
+        assert_eq!(a.stats.ext_metrics["x"], 50.0);
+    }
 }

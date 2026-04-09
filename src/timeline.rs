@@ -1310,4 +1310,43 @@ mod tests {
             );
         }
     }
+
+    // -- detect_change direct tests --
+
+    #[test]
+    fn detect_change_higher_is_worse_positive_delta_degraded() {
+        let c = detect_change(1.0, 5.0, 0.5, "imbalance", true).unwrap();
+        assert_eq!(c.direction, ChangeDirection::Degraded);
+        assert_eq!(c.metric, "imbalance");
+        assert!((c.before - 1.0).abs() < f64::EPSILON);
+        assert!((c.after - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn detect_change_higher_is_worse_negative_delta_improved() {
+        let c = detect_change(5.0, 1.0, 0.5, "imbalance", true).unwrap();
+        assert_eq!(c.direction, ChangeDirection::Improved);
+    }
+
+    #[test]
+    fn detect_change_lower_is_worse_negative_delta_degraded() {
+        let c = detect_change(100.0, 50.0, 10.0, "throughput", false).unwrap();
+        assert_eq!(c.direction, ChangeDirection::Degraded);
+    }
+
+    #[test]
+    fn detect_change_lower_is_worse_positive_delta_improved() {
+        let c = detect_change(50.0, 100.0, 10.0, "throughput", false).unwrap();
+        assert_eq!(c.direction, ChangeDirection::Improved);
+    }
+
+    #[test]
+    fn detect_change_below_threshold_returns_none() {
+        assert!(detect_change(1.0, 1.3, 0.5, "imbalance", true).is_none());
+    }
+
+    #[test]
+    fn detect_change_exactly_at_threshold_returns_none() {
+        assert!(detect_change(1.0, 1.5, 0.5, "imbalance", true).is_none());
+    }
 }
