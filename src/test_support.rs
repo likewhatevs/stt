@@ -217,8 +217,8 @@ pub use crate::scenario::flags::FlagDecl;
 /// Definition of a scheduler for the test framework.
 ///
 /// Captures everything the framework needs to know about a scheduler:
-/// its binary, flag declarations, sysctls, kernel args, and monitor
-/// thresholds.
+/// its binary, flag declarations, sysctls, kernel args, cgroup parent,
+/// scheduler args, and monitor thresholds.
 pub struct Scheduler {
     pub name: &'static str,
     pub binary: SchedulerSpec,
@@ -226,6 +226,12 @@ pub struct Scheduler {
     pub sysctls: &'static [(&'static str, &'static str)],
     pub kargs: &'static [&'static str],
     pub assert: crate::assert::Assert,
+    /// Cgroup parent path. When set, the init creates
+    /// `/sys/fs/cgroup/{path}` before starting the scheduler, and
+    /// `--cell-parent-cgroup {path}` is injected into scheduler args.
+    pub cgroup_parent: Option<&'static str>,
+    /// Scheduler CLI args, prepended before per-test `extra_sched_args`.
+    pub sched_args: &'static [&'static str],
 }
 
 impl Scheduler {
@@ -236,6 +242,8 @@ impl Scheduler {
         sysctls: &[],
         kargs: &[],
         assert: crate::assert::Assert::NONE,
+        cgroup_parent: None,
+        sched_args: &[],
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -247,6 +255,8 @@ impl Scheduler {
             sysctls: &[],
             kargs: &[],
             assert: crate::assert::Assert::NONE,
+            cgroup_parent: None,
+            sched_args: &[],
         }
     }
 
@@ -277,6 +287,21 @@ impl Scheduler {
     /// Set assertion config. Returns self for const chaining.
     pub const fn assert(mut self, assert: crate::assert::Assert) -> Self {
         self.assert = assert;
+        self
+    }
+
+    /// Set cgroup parent path. The init creates
+    /// `/sys/fs/cgroup/{path}` before starting the scheduler, and
+    /// `--cell-parent-cgroup {path}` is injected into scheduler args.
+    pub const fn cgroup_parent(mut self, path: &'static str) -> Self {
+        self.cgroup_parent = Some(path);
+        self
+    }
+
+    /// Set scheduler CLI args prepended before per-test
+    /// `extra_sched_args`.
+    pub const fn sched_args(mut self, args: &'static [&'static str]) -> Self {
+        self.sched_args = args;
         self
     }
 
@@ -419,6 +444,10 @@ pub struct SttTestEntry {
     /// When true, the test expects run_stt_test to return Err.
     /// Disables auto_repro (no point probing a deliberately failing test).
     pub expect_err: bool,
+    /// When true, the test runs directly on the host instead of
+    /// booting a VM. Used for tests that need host tools (cargo,
+    /// nested VMs) unavailable in the guest initramfs.
+    pub host_only: bool,
 }
 
 /// Placeholder function for `SttTestEntry::DEFAULT`. Panics if called.
@@ -461,6 +490,7 @@ impl SttTestEntry {
         duration_s: 2,
         workers_per_cgroup: 2,
         expect_err: false,
+        host_only: false,
     };
 }
 
@@ -499,45 +529,6 @@ pub fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
     Some((sockets, cores, threads))
 }
 
-/// Check whether a gauntlet preset is compatible with a test entry
-/// on this host. `host_llc_count` is the number of LLC groups on
-/// the host -- performance_mode tests need one LLC per virtual socket.
-pub(crate) fn preset_matches(
-    preset: &crate::vm::TopoPreset,
-    entry: &SttTestEntry,
-    host_llc_count: usize,
-) -> bool {
-    let t = &preset.topology;
-    t.sockets >= entry.constraints.min_sockets
-        && t.num_llcs() >= entry.constraints.min_llcs
-        && (!entry.constraints.requires_smt || t.threads_per_core >= 2)
-        && t.total_cpus() >= entry.constraints.min_cpus
-        // performance_mode maps each virtual socket to a host LLC.
-        // +1 for the service CPU that must land outside pinned LLCs.
-        && (!entry.performance_mode || (t.sockets as usize) < host_llc_count)
-}
-
-/// Number of LLC groups on this host. Returns 0 on error.
-pub(crate) fn host_llc_count() -> usize {
-    crate::vmm::host_topology::HostTopology::from_sysfs()
-        .map(|h| h.llc_groups.len())
-        .unwrap_or(0)
-}
-
-/// Check whether the host has enough CPUs and LLC groups to satisfy
-/// a gauntlet preset's topology without oversubscription.
-pub(crate) fn host_preset_compatible(
-    preset: &crate::vm::TopoPreset,
-    host: &crate::vmm::host_topology::HostTopology,
-) -> bool {
-    let t = &preset.topology;
-    let total_vcpus = t.total_cpus();
-    let vcpus_per_socket = t.cores_per_socket * t.threads_per_core;
-    total_vcpus as usize <= host.total_cpus()
-        && (t.sockets as usize) <= host.llc_groups.len()
-        && (vcpus_per_socket as usize) <= host.max_cores_per_llc()
-}
-
 /// Default seconds to wait for LLC/CPU resource locks before skipping.
 /// 55s leaves 5s margin before nextest's 60s default slow-timeout.
 const RESOURCE_WAIT_DEADLINE_SECS: u64 = 55;
@@ -560,6 +551,9 @@ pub(crate) fn resource_deadline() -> std::time::Duration {
 /// Validates KVM access and auto-discovers a kernel image via
 /// `resolve_kernel()` when `STT_TEST_KERNEL` is not set.
 pub fn run_stt_test(entry: &SttTestEntry) -> Result<AssertResult> {
+    if entry.host_only {
+        return run_host_only_test_inner(entry);
+    }
     run_stt_test_inner(entry, None, &[])
 }
 
@@ -578,15 +572,17 @@ pub fn run_stt_test_with_topo_and_flags(
     run_stt_test_inner(entry, Some(topo), active_flags)
 }
 
-/// Run a test result through expect_err logic and return a
-/// `Completion` or `Failed`.
-fn result_to_completion(
-    result: Result<AssertResult>,
-    expect_err: bool,
-) -> std::result::Result<libtest_mimic::Completion, libtest_mimic::Failed> {
+/// Run a test result through expect_err logic and return an exit code.
+///
+/// Returns 0 on pass, 1 on failure. Resource contention is logged and
+/// returns 0 (nextest retry handles contention via backoff).
+fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
     match result {
-        Ok(_) if expect_err => Err("expected error but test passed".into()),
-        Ok(_) => Ok(libtest_mimic::Completion::Completed),
+        Ok(_) if expect_err => {
+            eprintln!("expected error but test passed");
+            1
+        }
+        Ok(_) => 0,
         Err(e)
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some() =>
@@ -596,110 +592,184 @@ fn result_to_completion(
                 .unwrap()
                 .reason
                 .clone();
-            Ok(libtest_mimic::Completion::ignored_with(reason))
+            eprintln!("resource contention (ignored): {reason}");
+            0
         }
-        Err(_) if expect_err => Ok(libtest_mimic::Completion::Completed),
-        Err(e) => Err(format!("{e:#}").into()),
+        Err(_) if expect_err => 0,
+        Err(e) => {
+            eprintln!("{e:#}");
+            1
+        }
     }
 }
 
-/// Build `libtest_mimic::Trial` entries for all registered `#[stt_test]`
-/// entries. Includes base trials and gauntlet variants.
+/// Whether a base test entry is "ignored" (skipped by default).
 ///
-/// Uses `Trial::ignorable_test()` so performance_mode tests that cannot
-/// acquire resources within the deadline appear as "ignored" instead of
-/// failing.
-pub fn build_stt_trials() -> Vec<libtest_mimic::Trial> {
+/// Tests whose names start with `demo_` are ignored -- they are
+/// demonstration/benchmarking tests that require manual opt-in.
+fn is_ignored(entry: &SttTestEntry) -> bool {
+    entry.name.starts_with("demo_")
+}
+
+/// Collect test names for nextest discovery (--list --format terse).
+///
+/// Nextest calls the binary twice:
+/// - Without `--ignored`: prints ALL tests (ignored and non-ignored).
+/// - With `--ignored`: prints ONLY ignored tests.
+///
+/// Gauntlet variants are always ignored. Base tests are ignored when
+/// their name starts with `demo_`.
+fn list_tests(ignored_only: bool) {
     let presets = crate::vm::gauntlet_presets();
-    let host_llcs = host_llc_count();
-    let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
-    let mut trials = Vec::new();
 
     for entry in STT_TESTS.iter() {
+        if !ignored_only || is_ignored(entry) {
+            println!("{}: test", entry.name);
+        }
+
+        // Host-only tests run on the host without a VM -- gauntlet
+        // topology variants are meaningless.
+        if entry.host_only {
+            continue;
+        }
+
         let profiles = entry
             .scheduler
             .generate_profiles(entry.required_flags, entry.excluded_flags);
 
-        // Skip base trial entirely when the host cannot possibly
-        // satisfy the entry's topology. performance_mode tests need
-        // one LLC per virtual socket plus a service CPU.
-        let base_runnable = if entry.performance_mode {
-            host_topo.as_ref().is_some_and(|h| {
-                (entry.topology.sockets as usize) < h.llc_groups.len()
-                    && (entry.topology.total_cpus() as usize) < h.total_cpus()
-                    && (entry.topology.cores_per_socket * entry.topology.threads_per_core) as usize
-                        <= h.max_cores_per_llc()
-            })
-        } else {
-            true
-        };
-
-        if !base_runnable {
-            continue;
-        }
-
-        // Base trial: runs with the entry's own topology.
-        // Resource contention (performance_mode) is handled by
-        // result_to_completion via ResourceContention downcast.
-        let expect_err = entry.expect_err;
-        trials.push(
-            libtest_mimic::Trial::ignorable_test(entry.name.to_string(), move || {
-                let result = run_stt_test_inner(entry, None, &[]);
-                result_to_completion(result, expect_err)
-            })
-            .with_ignored_flag(entry.name.starts_with("demo_")),
-        );
-
-        // Gauntlet variants: topology x flags, always ignored by default.
+        // Gauntlet variants are always ignored.
         for preset in &presets {
-            if !preset_matches(preset, entry, host_llcs) {
-                continue;
-            }
-            if let Some(ref host) = host_topo
-                && !host_preset_compatible(preset, host)
+            let t = &preset.topology;
+            if t.sockets < entry.constraints.min_sockets
+                || t.num_llcs() < entry.constraints.min_llcs
+                || (entry.constraints.requires_smt && t.threads_per_core < 2)
+                || t.total_cpus() < entry.constraints.min_cpus
             {
                 continue;
             }
-            let t = &preset.topology;
-            let topo_str = format!(
-                "{}s{}c{}t",
-                t.sockets, t.cores_per_socket, t.threads_per_core,
-            );
-            let cpus = t.total_cpus();
-            let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
-            let preset_name = preset.name;
-
             for profile in &profiles {
                 let pname = profile.name();
-                let name = format!("gauntlet/{}/{}/{}", entry.name, preset_name, pname);
-                let topo_str = topo_str.clone();
-                let flags: Vec<String> = profile.flags.iter().map(|s| s.to_string()).collect();
-
-                let expect_err = entry.expect_err;
-                trials.push(
-                    libtest_mimic::Trial::ignorable_test(name, move || {
-                        let (sockets, cores, threads) =
-                            parse_topo_string(&topo_str).expect("invalid topo string");
-                        let topo = TopoOverride {
-                            sockets,
-                            cores,
-                            threads,
-                            memory_mb,
-                        };
-                        let result = run_stt_test_inner(entry, Some(&topo), &flags);
-                        result_to_completion(result, expect_err)
-                    })
-                    .with_ignored_flag(true),
-                );
+                println!("gauntlet/{}/{}/{}: test", entry.name, preset.name, pname,);
             }
         }
     }
-
-    trials
 }
 
-/// Run sidecar collection and stats summary. Called from harness
-/// main() after `libtest_mimic::run()`.
+/// Parse a nextest-style test name and run it.
+///
+/// Handles both base tests (`entry.name`) and gauntlet variants
+/// (`gauntlet/{name}/{preset}/{profile}`). Returns an exit code.
+fn run_named_test(test_name: &str) -> i32 {
+    if let Some(rest) = test_name.strip_prefix("gauntlet/") {
+        return run_gauntlet_test(rest);
+    }
+
+    let entry = match find_test(test_name) {
+        Some(e) => e,
+        None => {
+            eprintln!("unknown test: {test_name}");
+            return 1;
+        }
+    };
+
+    if entry.host_only {
+        return run_host_only_test(entry);
+    }
+
+    let result = run_stt_test_inner(entry, None, &[]);
+    result_to_exit_code(result, entry.expect_err)
+}
+
+/// Run a host-only test directly without booting a VM.
+/// Returns an exit code for nextest dispatch.
+fn run_host_only_test(entry: &SttTestEntry) -> i32 {
+    let result = run_host_only_test_inner(entry);
+    result_to_exit_code(result, entry.expect_err)
+}
+
+/// Inner host-only dispatch returning `Result<AssertResult>`.
+///
+/// Builds a minimal Ctx and calls the test function on the host.
+/// Used for tests that need host tools (cargo, nested VMs).
+fn run_host_only_test_inner(entry: &SttTestEntry) -> Result<AssertResult> {
+    let topo = crate::topology::TestTopology::from_spec(
+        entry.topology.sockets,
+        entry.topology.cores_per_socket,
+        entry.topology.threads_per_core,
+    );
+    let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/stt");
+    let duration = Duration::from_secs(entry.duration_s);
+    let workers_per_cgroup = entry.workers_per_cgroup as usize;
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(&entry.scheduler.assert)
+        .merge(&entry.assert);
+    let ctx = crate::scenario::Ctx {
+        cgroups: &cgroups,
+        topo: &topo,
+        duration,
+        workers_per_cgroup,
+        sched_pid: 0,
+        settle_ms: 500,
+        work_type_override: None,
+        assert: merged_assert,
+        wait_for_map_write: false,
+    };
+    (entry.func)(&ctx)
+}
+
+/// Run a gauntlet variant test. `rest` is `{name}/{preset}/{profile}`.
+fn run_gauntlet_test(rest: &str) -> i32 {
+    let parts: Vec<&str> = rest.splitn(3, '/').collect();
+    if parts.len() != 3 {
+        eprintln!("invalid gauntlet test name: gauntlet/{rest}");
+        return 1;
+    }
+    let (test_name, preset_name, profile_name) = (parts[0], parts[1], parts[2]);
+
+    let entry = match find_test(test_name) {
+        Some(e) => e,
+        None => {
+            eprintln!("unknown test: {test_name}");
+            return 1;
+        }
+    };
+
+    let presets = crate::vm::gauntlet_presets();
+    let preset = match presets.iter().find(|p| p.name == preset_name) {
+        Some(p) => p,
+        None => {
+            eprintln!("unknown gauntlet preset: {preset_name}");
+            return 1;
+        }
+    };
+
+    let t = &preset.topology;
+    let cpus = t.total_cpus();
+    let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
+    let topo = TopoOverride {
+        sockets: t.sockets,
+        cores: t.cores_per_socket,
+        threads: t.threads_per_core,
+        memory_mb,
+    };
+
+    let profiles = entry
+        .scheduler
+        .generate_profiles(entry.required_flags, entry.excluded_flags);
+    let flags: Vec<String> = match profiles.iter().find(|p| p.name() == profile_name) {
+        Some(p) => p.flags.iter().map(|s| s.to_string()).collect(),
+        None => {
+            eprintln!("unknown flag profile: {profile_name}");
+            return 1;
+        }
+    };
+
+    let result = run_stt_test_inner(entry, Some(&topo), &flags);
+    result_to_exit_code(result, entry.expect_err)
+}
+
+/// Run sidecar collection and stats summary. Called after test
+/// execution completes.
 pub fn collect_and_print_sidecar_stats() {
     if let Ok(dir) = std::env::var("STT_SIDECAR_DIR") {
         let sidecars = collect_sidecars(std::path::Path::new(&dir));
@@ -724,20 +794,38 @@ pub fn collect_and_print_sidecar_stats() {
 
 /// Harness entry point for `#[stt_test]` binaries.
 ///
-/// Parses `libtest_mimic` CLI args, builds trials from the `STT_TESTS`
-/// distributed slice, runs them, prints sidecar stats, and exits.
-///
-/// Consumers use this so they only need `stt` as a dependency:
+/// Implements the nextest protocol directly:
+/// - `--list --format terse`: output `name: test\n` for each test.
+/// - `--exact NAME --nocapture`: run the named test, exit 0/1.
 ///
 /// ```rust,ignore
 /// fn main() { stt::test_support::stt_main(); }
 /// ```
 pub fn stt_main() -> ! {
-    let args = libtest_mimic::Arguments::from_args();
-    let trials = build_stt_trials();
-    let conclusion = libtest_mimic::run(&args, trials);
-    collect_and_print_sidecar_stats();
-    conclusion.exit()
+    let args: Vec<String> = std::env::args().collect();
+
+    // Discovery mode: --list --format terse [--ignored]
+    if args.iter().any(|a| a == "--list") {
+        let ignored_only = args.iter().any(|a| a == "--ignored");
+        list_tests(ignored_only);
+        std::process::exit(0);
+    }
+
+    // Execution mode: --exact NAME [--nocapture] [--ignored] [--bench]
+    if let Some(pos) = args.iter().position(|a| a == "--exact") {
+        if let Some(name) = args.get(pos + 1) {
+            let code = run_named_test(name);
+            collect_and_print_sidecar_stats();
+            std::process::exit(code);
+        }
+        eprintln!("--exact requires a test name");
+        std::process::exit(1);
+    }
+
+    // Fallback: no recognized arguments.
+    eprintln!("usage: <binary> --list --format terse [--ignored]");
+    eprintln!("       <binary> --exact <test_name> --nocapture");
+    std::process::exit(1)
 }
 
 /// BPF verifier complexity limit (BPF_COMPLEXITY_LIMIT_INSNS).
@@ -1000,13 +1088,15 @@ fn run_stt_test_inner(
         builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
     }
 
-    // Merge scheduler args: extra_sched_args from the entry + args derived
-    // from active flags via Scheduler::flag_args().
-    let mut sched_args: Vec<String> = entry
-        .extra_sched_args
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    // Merge scheduler args: cgroup_parent injection + scheduler sched_args +
+    // per-test extra_sched_args + flag-derived args.
+    let mut sched_args: Vec<String> = Vec::new();
+    if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
+        sched_args.push("--cell-parent-cgroup".to_string());
+        sched_args.push(cgroup_path.to_string());
+    }
+    sched_args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
+    sched_args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
     for flag_name in active_flags {
         if let Some(args) = entry.scheduler.flag_args(flag_name) {
             sched_args.extend(args.iter().map(|s| s.to_string()));
@@ -1522,13 +1612,18 @@ fn attempt_auto_repro(
         builder = builder.scheduler_binary(sched_path);
     }
 
-    if !entry.extra_sched_args.is_empty() {
-        let args: Vec<String> = entry
-            .extra_sched_args
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        builder = builder.sched_args(&args);
+    // Merge scheduler args: cgroup_parent + scheduler sched_args + per-test.
+    {
+        let mut args: Vec<String> = Vec::new();
+        if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
+            args.push("--cell-parent-cgroup".to_string());
+            args.push(cgroup_path.to_string());
+        }
+        args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
+        args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
+        if !args.is_empty() {
+            builder = builder.sched_args(&args);
+        }
     }
 
     // Do NOT forward bpf_map_write to the repro VM. The repro VM
@@ -1769,7 +1864,8 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             entry.topology.threads_per_core,
         )
     });
-    let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/stt");
+    let cgroup_root = resolve_cgroup_root(args);
+    let cgroups = crate::cgroup::CgroupManager::new(&cgroup_root);
     if let Err(e) = cgroups.setup(false) {
         eprintln!("stt_test: cgroup setup failed: {e}");
     }
@@ -2419,6 +2515,36 @@ fn extract_work_type_arg(args: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// Derive the CgroupManager root path for guest-side dispatch.
+///
+/// Reads `/sched_args` to find `--cell-parent-cgroup <path>`. When
+/// found, constructs `/sys/fs/cgroup{path}`. Falls back to
+/// `/sys/fs/cgroup/stt` when the arg is absent.
+fn resolve_cgroup_root(args: &[String]) -> String {
+    // Check guest args for --cell-parent-cgroup (passed via sched_args
+    // which are written to /sched_args in the initramfs).
+    let sched_args = std::fs::read_to_string("/sched_args").unwrap_or_default();
+    let parts: Vec<&str> = sched_args.split_whitespace().collect();
+    for i in 0..parts.len() {
+        if parts[i] == "--cell-parent-cgroup"
+            && let Some(&path) = parts.get(i + 1)
+        {
+            return format!("/sys/fs/cgroup{path}");
+        }
+    }
+    // Also check the process args in case --cell-parent-cgroup was
+    // passed directly (e.g., via extra_sched_args on the test entry).
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a == "--cell-parent-cgroup"
+            && let Some(path) = iter.next()
+        {
+            return format!("/sys/fs/cgroup{path}");
+        }
+    }
+    "/sys/fs/cgroup/stt".to_string()
 }
 
 /// Write a sidecar JSON file to STT_SIDECAR_DIR if the env var is set.
@@ -3803,6 +3929,8 @@ mod tests {
         sysctls: &[],
         kargs: &[],
         assert: crate::assert::Assert::NONE,
+        cgroup_parent: None,
+        sched_args: &[],
     };
 
     fn sched_entry(name: &'static str) -> SttTestEntry {

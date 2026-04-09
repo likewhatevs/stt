@@ -553,6 +553,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             duration_s: #duration_s,
             workers_per_cgroup: #workers_per_cgroup,
             expect_err: #expect_err,
+            host_only: false,
         };
 
         #[test]

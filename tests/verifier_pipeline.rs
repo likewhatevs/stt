@@ -5,104 +5,106 @@ use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
 use stt::test_support::{Scheduler, SchedulerSpec, SttTestEntry};
 
 fn main() {
-    if stt::test_support::is_pid1() {
-        stt::test_support::stt_guest_init();
-    }
-    let args = libtest_mimic::Arguments::from_args();
-    let mut trials = stt::test_support::build_stt_trials();
-
-    // Verifier tests: build scheduler per test, call library with paths.
-    trials.push(
-        libtest_mimic::Trial::test("demo_verifier_brief", || {
-            let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
-            let result = stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])
-                .map_err(|e| format!("{e:#}"))?;
-            let output = stt::verifier::format_verifier_output("stt-sched", &result, false);
-            if !output.contains("stt_enqueue") {
-                return Err("output should list stt_enqueue".into());
-            }
-            if !output.contains("stt_dispatch") {
-                return Err("output should list stt_dispatch".into());
-            }
-            if !output.contains("verified_insns=") {
-                return Err("output should contain verified_insns=".into());
-            }
-            Ok(())
-        })
-        .with_ignored_flag(true),
-    );
-
-    trials.push(
-        libtest_mimic::Trial::test("demo_verifier_diff", || {
-            let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
-            let result_a =
-                stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])
-                    .map_err(|e| format!("{e:#}"))?;
-            let result_b =
-                stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])
-                    .map_err(|e| format!("{e:#}"))?;
-            let output = stt::verifier::format_verifier_diff(
-                "stt-sched",
-                &result_a.stats,
-                "stt-sched",
-                &result_b.stats,
-            );
-            if !output.contains("delta") {
-                return Err("diff output should contain 'delta' header".into());
-            }
-            if !output.contains("program") {
-                return Err("diff output should contain 'program' column".into());
-            }
-            if !output.contains("+0") {
-                return Err("self-comparison deltas should be 0".into());
-            }
-            Ok(())
-        })
-        .with_ignored_flag(true),
-    );
-
-    // Non-ignored: programmatic check that cycle collapse works.
-    // --verify-loop causes BPF load failure; libbpf prints the
-    // verifier log (with unrolled loop traces) to stderr, captured
-    // in the scheduler log between ===SCHED_OUTPUT_START/END===.
-    trials.push(libtest_mimic::Trial::test(
-        "verifier_cycle_collapse",
-        || {
-            let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
-            let sched_args = vec!["--verify-loop".to_string()];
-            let result =
-                stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &sched_args)
-                    .map_err(|e| format!("{e:#}"))?;
-            let output = stt::verifier::format_verifier_output("stt-sched", &result, false);
-            if !output.contains("scheduler log") {
-                return Err("output should contain scheduler log section".into());
-            }
-            if !output.contains("identical iterations omitted") {
-                return Err("cycle collapse should compress verifier loop traces".into());
-            }
-            Ok(())
-        },
-    ));
-
-    let conclusion = libtest_mimic::run(&args, trials);
-    stt::test_support::collect_and_print_sidecar_stats();
-    conclusion.exit();
+    stt::test_support::stt_main();
 }
 
 /// Build a scheduler package and resolve paths for verifier tests.
 fn resolve_verifier_paths(
     package: &str,
-) -> std::result::Result<
-    (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf),
-    libtest_mimic::Failed,
-> {
-    let sched_bin =
-        stt::build_and_find_binary(package).map_err(|e| format!("build {package}: {e:#}"))?;
-    let stt_bin = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let kernel =
-        stt::find_kernel().ok_or_else(|| libtest_mimic::Failed::from("no kernel found"))?;
+) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let sched_bin = stt::build_and_find_binary(package)?;
+    let stt_bin = std::env::current_exe()?;
+    let kernel = stt::find_kernel().ok_or_else(|| anyhow::anyhow!("no kernel found"))?;
     Ok((sched_bin, stt_bin, kernel))
 }
+
+fn __stt_inner_demo_verifier_brief(_ctx: &Ctx) -> Result<AssertResult> {
+    let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
+    let result = stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])?;
+    let output = stt::verifier::format_verifier_output("stt-sched", &result, false);
+    anyhow::ensure!(
+        output.contains("stt_enqueue"),
+        "output should list stt_enqueue"
+    );
+    anyhow::ensure!(
+        output.contains("stt_dispatch"),
+        "output should list stt_dispatch"
+    );
+    anyhow::ensure!(
+        output.contains("verified_insns="),
+        "output should contain verified_insns="
+    );
+    Ok(AssertResult::pass())
+}
+
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_VERIFIER_BRIEF: SttTestEntry = SttTestEntry {
+    name: "demo_verifier_brief",
+    func: __stt_inner_demo_verifier_brief,
+    auto_repro: false,
+    host_only: true,
+    ..SttTestEntry::DEFAULT
+};
+
+fn __stt_inner_demo_verifier_diff(_ctx: &Ctx) -> Result<AssertResult> {
+    let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
+    let result_a = stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])?;
+    let result_b = stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])?;
+    let output = stt::verifier::format_verifier_diff(
+        "stt-sched",
+        &result_a.stats,
+        "stt-sched",
+        &result_b.stats,
+    );
+    anyhow::ensure!(
+        output.contains("delta"),
+        "diff output should contain 'delta' header"
+    );
+    anyhow::ensure!(
+        output.contains("program"),
+        "diff output should contain 'program' column"
+    );
+    anyhow::ensure!(output.contains("+0"), "self-comparison deltas should be 0");
+    Ok(AssertResult::pass())
+}
+
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_VERIFIER_DIFF: SttTestEntry = SttTestEntry {
+    name: "demo_verifier_diff",
+    func: __stt_inner_demo_verifier_diff,
+    auto_repro: false,
+    host_only: true,
+    ..SttTestEntry::DEFAULT
+};
+
+fn __stt_inner_verifier_cycle_collapse(_ctx: &Ctx) -> Result<AssertResult> {
+    let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
+    let sched_args = vec!["--verify-loop".to_string()];
+    let result =
+        stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &sched_args)?;
+    let output = stt::verifier::format_verifier_output("stt-sched", &result, false);
+    anyhow::ensure!(
+        output.contains("scheduler log"),
+        "output should contain scheduler log section"
+    );
+    anyhow::ensure!(
+        output.contains("identical iterations omitted"),
+        "cycle collapse should compress verifier loop traces"
+    );
+    Ok(AssertResult::pass())
+}
+
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_CYCLE_COLLAPSE: SttTestEntry = SttTestEntry {
+    name: "verifier_cycle_collapse",
+    func: __stt_inner_verifier_cycle_collapse,
+    auto_repro: false,
+    host_only: true,
+    ..SttTestEntry::DEFAULT
+};
 
 // -- demo_verifier_fail_verify: BPF load rejection via --fail-verify --
 

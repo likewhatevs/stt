@@ -72,7 +72,10 @@ pub(crate) fn stt_guest_init() -> ! {
         std::env::set_var("LD_LIBRARY_PATH", "/lib:/lib64:/usr/lib:/usr/lib64");
     }
 
-    // Phase 3: Scheduler.
+    // Phase 3: Cgroup parent + Scheduler.
+    // Create the cgroup parent directory before starting the scheduler
+    // so it exists when the scheduler looks for it.
+    create_cgroup_parent_from_sched_args();
     exec_shell_script("/sched_enable");
     let (mut sched_child, sched_log_path) = start_scheduler();
 
@@ -221,6 +224,32 @@ fn write_com2(msg: &str) {
         // Write to kernel console as fallback so the host sees
         // something on COM1.
         eprintln!("stt-init [COM1 fallback]: {msg}");
+    }
+}
+
+/// Create the cgroup parent directory specified by `--cell-parent-cgroup`
+/// in `/sched_args`. The directory must exist before the scheduler starts
+/// because the scheduler expects it at startup.
+fn create_cgroup_parent_from_sched_args() {
+    let sched_args = match fs::read_to_string("/sched_args") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let args: Vec<&str> = sched_args.split_whitespace().collect();
+    for i in 0..args.len() {
+        if args[i] == "--cell-parent-cgroup"
+            && let Some(&path) = args.get(i + 1)
+        {
+            let cgroup_dir = format!("/sys/fs/cgroup{path}");
+            mkdir_p(&cgroup_dir);
+            // Enable cgroup controllers for the parent.
+            let parent = Path::new(&cgroup_dir)
+                .parent()
+                .unwrap_or(Path::new("/sys/fs/cgroup"));
+            let control = parent.join("cgroup.subtree_control");
+            let _ = fs::write(&control, "+cpuset +cpu");
+            return;
+        }
     }
 }
 

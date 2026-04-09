@@ -13,6 +13,8 @@ pub struct Scheduler {
     pub sysctls: &'static [(&'static str, &'static str)],
     pub kargs: &'static [&'static str],
     pub assert: Assert,
+    pub cgroup_parent: Option<&'static str>,
+    pub sched_args: &'static [&'static str],
 }
 ```
 
@@ -60,6 +62,38 @@ const MY_SCHEDULER: Scheduler = Scheduler::new("my_sched")
     .flags(&[&LLC_DECL, &BORROW_DECL, &STEAL_DECL, &REBAL_DECL])
     .assert(Assert::NONE.max_imbalance_ratio(2.0));
 ```
+
+## Cgroup parent
+
+`Scheduler.cgroup_parent` specifies a cgroup subtree under
+`/sys/fs/cgroup` for the scheduler to manage. When set, the VM init
+creates the directory before starting the scheduler, and
+`--cell-parent-cgroup <path>` is injected into the scheduler args.
+
+```rust,ignore
+const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
+    .binary(SchedulerSpec::Name("scx_mitosis"))
+    .cgroup_parent("/stt");
+```
+
+This creates `/sys/fs/cgroup/stt` in the guest and passes
+`--cell-parent-cgroup /stt` to the scheduler binary.
+
+## Scheduler args
+
+`Scheduler.sched_args` provides default CLI args that apply to every
+test using this scheduler. They are prepended before per-test
+`extra_sched_args` and flag-derived args.
+
+```rust,ignore
+const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
+    .binary(SchedulerSpec::Name("scx_mitosis"))
+    .cgroup_parent("/stt")
+    .sched_args(&["--exit-dump-len", "1048576"]);
+```
+
+Merge order: `cgroup_parent` injection, then `sched_args`, then
+per-test `extra_sched_args`, then flag-derived args.
 
 ## Flag scoping
 

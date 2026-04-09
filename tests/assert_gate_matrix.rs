@@ -5,14 +5,7 @@ use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
 use stt::test_support::{Scheduler, SchedulerSpec, SttTestEntry};
 
 fn main() {
-    if stt::test_support::is_pid1() {
-        stt::test_support::stt_guest_init();
-    }
-    let args = libtest_mimic::Arguments::from_args();
-    let trials = stt::test_support::build_stt_trials();
-    let conclusion = libtest_mimic::run(&args, trials);
-    stt::test_support::collect_and_print_sidecar_stats();
-    conclusion.exit();
+    stt::test_support::stt_main();
 }
 
 const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));

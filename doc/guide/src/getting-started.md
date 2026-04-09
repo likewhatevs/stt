@@ -68,6 +68,30 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
+## Test binary setup
+
+Tests that use the `#[stt_test]` macro work with both `cargo test` and
+`cargo nextest run` out of the box. For test binaries that register
+tests via distributed slice (manual `SttTestEntry` statics), use
+`harness = false` and call `stt_main()`:
+
+```toml
+# Cargo.toml
+[[test]]
+name = "my_sched_tests"
+harness = false
+```
+
+```rust,ignore
+// tests/my_sched_tests.rs
+fn main() {
+    stt::test_support::stt_main();
+}
+```
+
+`stt_main()` implements the nextest protocol directly: `--list` for
+test discovery, `--exact NAME` for execution.
+
 ## Kernel discovery
 
 Tests require a bootable Linux kernel. stt searches (in order):
