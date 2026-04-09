@@ -54,8 +54,8 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
     let reports = handle.stop_and_collect();
 
     // Assert: no worker was starved.
-    let plan = AssertPlan::new().check_not_starved();
-    Ok(plan.assert_cgroup(&reports, None))
+    let a = Assert::default_checks();
+    Ok(a.assert_cgroup(&reports, None))
 }
 ```
 

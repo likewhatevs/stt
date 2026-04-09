@@ -13,4 +13,4 @@ Standalone examples for common tasks. Each recipe is self-contained.
 - [Customize verification](recipes/custom-verification.md) -- scheduler
   thresholds, per-test overrides
 - [Benchmarking and negative tests](recipes/benchmarking-tests.md) --
-  performance gates, intentional degradation, Assert vs AssertPlan
+  performance gates, intentional degradation, Assert verification

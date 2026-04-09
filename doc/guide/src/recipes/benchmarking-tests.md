@@ -4,24 +4,22 @@ Recipes for writing tests that verify scheduler performance gates
 (positive tests) and confirm that degraded schedulers fail those gates
 (negative tests).
 
-## Assert vs AssertPlan
+## Using Assert for verification
 
-`Assert` and `AssertPlan` both carry verification thresholds but serve
-different roles:
+`Assert` carries all verification thresholds. Every field is `Option`;
+`None` means "inherit from parent layer."
 
-- **`Assert`** -- `Option`-based fields. Used in the three-layer merge
-  chain: `Assert::default_checks()` -> `Scheduler.assert` ->
-  per-test `#[stt_test]` attributes. Use with `execute_steps_with()`
+- In the merge chain: `Assert::default_checks()` -> `Scheduler.assert`
+  -> per-test `#[stt_test]` attributes. Use with `execute_steps_with()`
   for ops-based scenarios. See
   [Verification](../concepts/verification.md#merge-layers).
 
-- **`AssertPlan`** -- concrete fields (not `Option`). Used in custom
-  scenarios that call `plan.assert_cgroup(reports, cpuset)` directly.
-  `Assert::worker_plan()` extracts an `AssertPlan` from an `Assert`.
+- For direct report checking: call `Assert::assert_cgroup(reports, cpuset)`.
 
-When writing ops-based tests, prefer `Assert` with
-`execute_steps_with()`. When writing raw custom scenarios with manual
-report collection, use `AssertPlan`.
+```rust,ignore
+let a = Assert::default_checks().max_gap_ms(500);
+let result = a.assert_cgroup(&reports, None);
+```
 
 ## Positive benchmarking test
 

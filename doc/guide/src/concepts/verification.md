@@ -46,8 +46,8 @@ and iteration throughput. Three thresholds:
 - `min_iteration_rate`: minimum outer-loop iterations per wall-clock
   second per worker.
 
-None are set by default. Set via `Assert` setters,
-`AssertPlan` builder methods, or `#[stt_test]` attributes.
+None are set by default. Set via `Assert` setters or `#[stt_test]`
+attributes.
 
 ## Monitor checks
 
@@ -152,33 +152,18 @@ correctness under instrumented workloads.
 All monitor thresholds use the `sustained_samples` window -- a
 violation must persist for N consecutive samples before failing.
 
-## AssertPlan
+## Worker checks via Assert
 
-`AssertPlan` is the worker-side check configuration used in
-custom scenarios. It has concrete bool/threshold fields (not `Option`):
+`Assert` provides `assert_cgroup()` for running worker-side checks
+directly against collected reports:
 
 ```rust,ignore
-pub struct AssertPlan {
-    pub not_starved: bool,
-    pub isolation: bool,
-    pub max_gap_ms: Option<u64>,
-    pub max_spread_pct: Option<f64>,
-    pub max_throughput_cv: Option<f64>,
-    pub min_work_rate: Option<f64>,
-    pub max_p99_wake_latency_ns: Option<u64>,
-    pub max_wake_latency_cv: Option<f64>,
-    pub min_iteration_rate: Option<f64>,
-    pub max_migration_ratio: Option<f64>,
-}
+let a = Assert::default_checks().max_gap_ms(5000);
+let result = a.assert_cgroup(&reports, Some(&cpuset));
 ```
 
-Use `AssertPlan` when writing custom scenarios that call
-`plan.assert_cgroup(reports, cpuset)` directly. Use `Assert` for the
-merge chain (`#[stt_test]` attributes, `Scheduler.assert`,
-`execute_steps_with`).
-
-`Assert::worker_plan()` extracts an `AssertPlan` from an `Assert`,
-resolving `Option` fields to concrete values.
+Use `Assert` for both the merge chain (`#[stt_test]` attributes,
+`Scheduler.assert`, `execute_steps_with`) and direct report checking.
 
 ## Constants
 

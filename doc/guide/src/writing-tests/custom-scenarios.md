@@ -68,11 +68,10 @@ to stabilize.
 
 ## Verification in custom scenarios
 
-Use `AssertPlan` when calling `plan.assert_cgroup(reports, cpuset)`
-directly. Use `Assert` with `execute_steps_with()` for ops-based
-scenarios. See
-[Assert vs AssertPlan](../recipes/benchmarking-tests.md#assert-vs-assertplan)
-and [Verification](../concepts/verification.md#assertplan).
+Use `Assert` for both direct report checking and ops-based scenarios.
+Call `assert.assert_cgroup(reports, cpuset)` for manual report
+collection, or use `execute_steps_with()` for ops-based scenarios. See
+[Verification](../concepts/verification.md#worker-checks-via-assert).
 
 ## Registering a custom scenario
 

@@ -91,8 +91,8 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     std::thread::sleep(ctx.duration);
     let reports = handle.stop_and_collect();
 
-    let plan = AssertPlan::new().check_not_starved();
-    Ok(plan.assert_cgroup(&reports, None))
+    let a = Assert::default_checks();
+    Ok(a.assert_cgroup(&reports, None))
 }
 ```
 

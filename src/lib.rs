@@ -39,8 +39,8 @@
 //!     let reports = handle.stop_and_collect();
 //!
 //!     // Assert: no worker was starved.
-//!     let plan = AssertPlan::new().check_not_starved();
-//!     Ok(plan.assert_cgroup(&reports, None))
+//!     let a = Assert::default_checks();
+//!     Ok(a.assert_cgroup(&reports, None))
 //! }
 //! ```
 //!
@@ -123,7 +123,7 @@ pub use crate::probe::process::resolve_func_ip;
 pub mod prelude {
     pub use anyhow::Result;
 
-    pub use crate::assert::{Assert, AssertPlan, AssertResult};
+    pub use crate::assert::{Assert, AssertResult};
     pub use crate::cgroup::CgroupManager;
     pub use crate::scenario::ops::{
         CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execute_steps_with,

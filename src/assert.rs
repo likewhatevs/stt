@@ -3,7 +3,7 @@
 //! Key types:
 //! - [`AssertResult`] -- pass/fail status with diagnostics and statistics
 //! - [`Assert`] -- composable assertion config (worker + monitor checks)
-//! - [`AssertPlan`] -- worker-side check configuration
+//! - `AssertPlan` -- worker-side check configuration (crate-internal)
 //! - [`ScenarioStats`] / [`CgroupStats`] -- aggregated telemetry
 //!
 //! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->
@@ -175,36 +175,27 @@ impl AssertResult {
     }
 }
 
-/// Composable assertion plan. Specifies which checks to run on worker
-/// reports after collection.
+/// Worker-side assertion plan (crate-internal). Specifies which checks
+/// to run on worker reports after collection.
 ///
-/// ```
-/// # use stt::assert::AssertPlan;
-/// let plan = AssertPlan::new()
-///     .check_not_starved()
-///     .check_isolation()
-///     .max_gap_ms(5000);
-///
-/// assert!(plan.not_starved);
-/// assert!(plan.isolation);
-/// assert_eq!(plan.max_gap_ms, Some(5000));
-/// ```
+/// External users should use [`Assert`] and its `assert_cgroup()` method
+/// instead.
 #[derive(Clone, Debug)]
-pub struct AssertPlan {
-    pub not_starved: bool,
-    pub isolation: bool,
-    pub max_gap_ms: Option<u64>,
-    pub max_spread_pct: Option<f64>,
-    pub max_throughput_cv: Option<f64>,
-    pub min_work_rate: Option<f64>,
-    pub max_p99_wake_latency_ns: Option<u64>,
-    pub max_wake_latency_cv: Option<f64>,
-    pub min_iteration_rate: Option<f64>,
-    pub max_migration_ratio: Option<f64>,
+pub(crate) struct AssertPlan {
+    pub(crate) not_starved: bool,
+    pub(crate) isolation: bool,
+    pub(crate) max_gap_ms: Option<u64>,
+    pub(crate) max_spread_pct: Option<f64>,
+    pub(crate) max_throughput_cv: Option<f64>,
+    pub(crate) min_work_rate: Option<f64>,
+    pub(crate) max_p99_wake_latency_ns: Option<u64>,
+    pub(crate) max_wake_latency_cv: Option<f64>,
+    pub(crate) min_iteration_rate: Option<f64>,
+    pub(crate) max_migration_ratio: Option<f64>,
 }
 
 impl AssertPlan {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             not_starved: false,
             isolation: false,
@@ -219,54 +210,12 @@ impl AssertPlan {
         }
     }
 
-    /// Enable the not-starved check (zero work units, spread, scheduling gaps).
-    pub fn check_not_starved(mut self) -> Self {
-        self.not_starved = true;
-        self
-    }
-
-    /// Enable cpuset isolation check. Only applied when a cpuset is provided
-    /// to `assert_cgroup`.
-    pub fn check_isolation(mut self) -> Self {
-        self.isolation = true;
-        self
-    }
-
-    /// Override the default max scheduling gap threshold.
-    pub fn max_gap_ms(mut self, ms: u64) -> Self {
-        self.max_gap_ms = Some(ms);
-        self
-    }
-
-    /// Override the default max spread threshold (%).
-    pub fn max_spread_pct(mut self, pct: f64) -> Self {
-        self.max_spread_pct = Some(pct);
-        self
-    }
-
     /// Run all configured checks against one cgroup's reports.
     ///
     /// `cpuset` is the expected CPU set for isolation checks. Pass `None`
     /// when there is no cpuset constraint (isolation check is skipped).
     ///
-    /// ```
-    /// use stt::assert::AssertPlan;
-    /// # use stt::workload::WorkerReport;
-    /// # let report = WorkerReport {
-    /// #     tid: 1, cpus_used: [0].into_iter().collect(),
-    /// #     work_units: 100, cpu_time_ns: 1_000_000,
-    /// #     wall_time_ns: 5_000_000_000, runnable_ns: 500_000_000,
-    /// #     migration_count: 0, migrations: vec![],
-    /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
-    /// #     wake_latencies_ns: vec![], iterations: 0,
-    /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
-    /// #     schedstat_cpu_time_ns: 0,
-    /// # };
-    /// let plan = AssertPlan::new().check_not_starved();
-    /// let r = plan.assert_cgroup(&[report], None);
-    /// assert!(r.passed);
-    /// ```
-    pub fn assert_cgroup(
+    pub(crate) fn assert_cgroup(
         &self,
         reports: &[WorkerReport],
         cpuset: Option<&BTreeSet<usize>>,
@@ -370,6 +319,24 @@ impl AssertPlan {
 impl Default for AssertPlan {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl AssertPlan {
+    fn check_not_starved(mut self) -> Self {
+        self.not_starved = true;
+        self
+    }
+
+    fn check_isolation(mut self) -> Self {
+        self.isolation = true;
+        self
+    }
+
+    fn max_gap_ms(mut self, ms: u64) -> Self {
+        self.max_gap_ms = Some(ms);
+        self
     }
 }
 
@@ -644,7 +611,7 @@ impl Assert {
     }
 
     /// Extract an `AssertPlan` for worker-side checks.
-    pub fn worker_plan(&self) -> AssertPlan {
+    pub(crate) fn worker_plan(&self) -> AssertPlan {
         AssertPlan {
             not_starved: self.not_starved.unwrap_or(false),
             isolation: self.isolation.unwrap_or(false),
@@ -659,9 +626,7 @@ impl Assert {
         }
     }
 
-    /// Run worker checks against one cgroup's reports.
-    ///
-    /// Equivalent to `self.worker_plan().assert_cgroup(reports, cpuset)`.
+    /// Run the configured worker checks against one cgroup's reports.
     pub fn assert_cgroup(
         &self,
         reports: &[crate::workload::WorkerReport],
