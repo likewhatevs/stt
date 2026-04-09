@@ -1220,13 +1220,50 @@ fn evaluate_vm_result(
             } else {
                 String::new()
             };
+            let console_section = if verify_result
+                .details
+                .iter()
+                .any(|d| d.contains("scheduler died"))
+                || verbose()
+            {
+                let init_stage = classify_init_stage(output);
+                format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
+            } else {
+                String::new()
+            };
+            let monitor_section = if entry.scheduler.binary.has_active_scheduling()
+                && let Some(ref monitor) = result.monitor
+            {
+                let s = &monitor.summary;
+                let eval_report = trim_settle_samples(monitor);
+                let thresholds = merged_assert.monitor_thresholds();
+                let verdict = thresholds.evaluate(&eval_report);
+                let verdict_line = if verdict.passed {
+                    verdict.summary.clone()
+                } else {
+                    format!("{}: {}", verdict.summary, verdict.details.join("; "))
+                };
+                format!(
+                    "\n\n--- monitor ---\nsamples={} max_imbalance={:.2} max_dsq_depth={} stall={}\nverdict: {}",
+                    s.total_samples,
+                    s.max_imbalance_ratio,
+                    s.max_local_dsq_depth,
+                    s.stall_detected,
+                    verdict_line,
+                )
+            } else {
+                String::new()
+            };
             let msg = format!(
-                "stt_test '{}'{} failed:\n  {}{}{}{}{}",
+                "stt_test '{}'{} failed:\n  {}{}{}{}{}{}{}{}",
                 entry.name,
                 sched_label,
                 details,
                 stats_section,
+                console_section,
                 timeline_section,
+                sched_log_section,
+                monitor_section,
                 dump_section,
                 repro_section,
             );
@@ -1255,8 +1292,13 @@ fn evaluate_vm_result(
                     .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
                     .unwrap_or_default();
                 let msg = format!(
-                    "stt_test '{}'{} passed scenario but monitor failed:\n  {}{}{}",
-                    entry.name, sched_label, details, timeline_section, dump_section,
+                    "stt_test '{}'{} passed scenario but monitor failed:\n  {}{}{}{}",
+                    entry.name,
+                    sched_label,
+                    details,
+                    timeline_section,
+                    sched_log_section,
+                    dump_section,
                 );
                 anyhow::bail!("{msg}");
             }
@@ -3976,12 +4018,12 @@ mod tests {
     }
 
     #[test]
-    fn eval_assert_failure_excludes_sched_log() {
+    fn eval_assert_failure_includes_sched_log() {
         let json = r#"{"passed":false,"details":["worker 0 stuck 5000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
         );
-        let entry = sched_entry("__eval_fail_no_sched_log__");
+        let entry = sched_entry("__eval_fail_sched_log__");
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
         let err =
@@ -3992,12 +4034,12 @@ mod tests {
             "should include assertion details, got: {msg}",
         );
         assert!(
-            !msg.contains("scheduler noise"),
-            "assertion failure should not include scheduler log, got: {msg}",
+            msg.contains("scheduler noise"),
+            "assertion failure should include scheduler log, got: {msg}",
         );
         assert!(
-            !msg.contains("--- scheduler log ---"),
-            "assertion failure should not include scheduler log header, got: {msg}",
+            msg.contains("--- scheduler log ---"),
+            "assertion failure should include scheduler log header, got: {msg}",
         );
     }
 

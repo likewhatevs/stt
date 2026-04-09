@@ -606,7 +606,13 @@ pub fn execute_steps_with(
         if step_idx > 0 && !process_alive(ctx.sched_pid) {
             let mut r = collect_result(&mut state, effective_checks);
             r.passed = false;
-            r.details.push("scheduler died between steps".into());
+            r.details.push(format!(
+                "scheduler died between step {} and step {} (of {}), {:.1}s into scenario",
+                step_idx,
+                step_idx + 1,
+                steps.len(),
+                scenario_start.elapsed().as_secs_f64(),
+            ));
             return Ok(r);
         }
 
@@ -667,7 +673,10 @@ pub fn execute_steps_with(
 
     if sched_dead {
         result.passed = false;
-        result.details.push("scheduler died".into());
+        result.details.push(format!(
+            "scheduler died after scenario completed, {:.1}s elapsed",
+            scenario_start.elapsed().as_secs_f64(),
+        ));
     }
 
     Ok(result)
