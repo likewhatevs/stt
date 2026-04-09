@@ -541,6 +541,44 @@ pub fn find_test(name: &str) -> Option<&'static SttTestEntry> {
     STT_TESTS.iter().find(|e| e.name == name)
 }
 
+/// Validate that `required_flags` and `excluded_flags` on an entry
+/// reference flags the scheduler actually declares. Panics on unknown
+/// flag names so typos are caught at test discovery time.
+fn validate_entry_flags(entry: &SttTestEntry) {
+    if entry.scheduler.flags.is_empty() {
+        if !entry.required_flags.is_empty() || !entry.excluded_flags.is_empty() {
+            panic!(
+                "stt_test: '{}' specifies flags but scheduler '{}' has no flag declarations",
+                entry.name, entry.scheduler.name,
+            );
+        }
+        return;
+    }
+    let valid: Vec<&str> = entry.scheduler.supported_flag_names();
+    for &flag in entry.required_flags {
+        if !valid.contains(&flag) {
+            panic!(
+                "stt_test: '{}' references unknown required_flag '{}'; valid flags for scheduler '{}': {}",
+                entry.name,
+                flag,
+                entry.scheduler.name,
+                valid.join(", "),
+            );
+        }
+    }
+    for &flag in entry.excluded_flags {
+        if !valid.contains(&flag) {
+            panic!(
+                "stt_test: '{}' references unknown excluded_flag '{}'; valid flags for scheduler '{}': {}",
+                entry.name,
+                flag,
+                entry.scheduler.name,
+                valid.join(", "),
+            );
+        }
+    }
+}
+
 /// Optional topology override for `run_stt_test`.
 pub struct TopoOverride {
     pub sockets: u32,
@@ -698,6 +736,8 @@ fn list_tests_all(ignored_only: bool) {
     let presets = crate::vm::gauntlet_presets();
 
     for entry in STT_TESTS.iter() {
+        validate_entry_flags(entry);
+
         if !ignored_only || is_ignored(entry) {
             println!("{}: test", entry.name);
         }
@@ -741,6 +781,8 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     let mut candidates: Vec<TestCandidate> = Vec::new();
 
     for entry in STT_TESTS.iter() {
+        validate_entry_flags(entry);
+
         let base_ignored = is_ignored(entry);
         let base_topo = entry.topology;
 
@@ -877,6 +919,7 @@ fn run_gauntlet_test(rest: &str) -> i32 {
             return 1;
         }
     };
+    validate_entry_flags(entry);
 
     let presets = crate::vm::gauntlet_presets();
     let preset = match presets.iter().find(|p| p.name == preset_name) {
