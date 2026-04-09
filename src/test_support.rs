@@ -412,9 +412,6 @@ pub struct SttTestEntry {
     /// validate that the host has enough CPUs and LLCs to satisfy the
     /// request without oversubscription.
     pub performance_mode: bool,
-    /// LLC exclusivity mode. Implies performance_mode. Each virtual socket
-    /// reserves an entire physical LLC group.
-    pub super_perf_mode: bool,
     /// Workload duration in seconds.
     pub duration_s: u64,
     /// Workers per cgroup.
@@ -461,7 +458,6 @@ impl SttTestEntry {
         required_flags: &[],
         excluded_flags: &[],
         performance_mode: false,
-        super_perf_mode: false,
         duration_s: 2,
         workers_per_cgroup: 2,
         expect_err: false,
@@ -968,8 +964,7 @@ fn run_stt_test_inner(
         .shm_size(STT_TEST_SHM_SIZE)
         .run_args(&guest_args)
         .timeout(Duration::from_secs(60))
-        .performance_mode(entry.performance_mode || entry.super_perf_mode)
-        .super_perf_mode(entry.super_perf_mode);
+        .performance_mode(entry.performance_mode);
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
     let merged_assert = crate::assert::Assert::default_checks()

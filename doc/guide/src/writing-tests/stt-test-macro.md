@@ -121,15 +121,13 @@ attributes to filter which presets each test runs on. See
 |---|---|---|
 | `auto_repro` | `true` | Auto-repro on crash |
 | `replicas` | 1 | Number of times to run |
-| `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling |
-| `super_perf_mode` | `false` | Implies `performance_mode`; additionally validates LLC exclusivity at build time |
+| `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
 | `duration_s` | 2 | Per-scenario duration in seconds |
 | `workers_per_cgroup` | 2 | Workers per cgroup |
 | `expect_err` | `false` | Test expects `run_stt_test` to return `Err`; disables auto-repro |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
-what `performance_mode` and `super_perf_mode` enable, prerequisites,
-and validation behavior.
+what `performance_mode` enables, prerequisites, and validation behavior.
 
 ## Example with custom scheduler
 

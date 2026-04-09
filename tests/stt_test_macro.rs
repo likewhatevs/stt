@@ -133,20 +133,19 @@ fn entry_topo_constraints_match_attrs() {
     assert_eq!(entry.constraints.min_cpus, 8);
 }
 
-/// Test with super_perf_mode — verifies macro forces performance_mode.
-#[stt_test(sockets = 1, cores = 2, threads = 1, super_perf_mode = true)]
-fn super_perf_mode_compile(ctx: &Ctx) -> Result<AssertResult> {
+/// Test with performance_mode — verifies macro sets the field.
+#[stt_test(sockets = 1, cores = 2, threads = 1, performance_mode = true)]
+fn performance_mode_compile(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
 }
 
-/// Verify super_perf_mode implies performance_mode in generated entry.
+/// Verify performance_mode is set in generated entry.
 #[test]
-fn entry_super_perf_mode_implies_performance_mode() {
-    let entry = stt::test_support::find_test("super_perf_mode_compile").unwrap();
-    assert!(entry.super_perf_mode);
+fn entry_performance_mode_set() {
+    let entry = stt::test_support::find_test("performance_mode_compile").unwrap();
     assert!(
         entry.performance_mode,
-        "super_perf_mode = true must force performance_mode = true",
+        "performance_mode = true must be set in generated entry",
     );
 }

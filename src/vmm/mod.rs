@@ -2588,7 +2588,6 @@ pub struct SttVmBuilder {
     shm_size: u64,
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
     watchdog_timeout_s: Option<u64>,
-    super_perf_mode: bool,
     bpf_map_write: Option<BpfMapWriteParams>,
     performance_mode: bool,
     sched_enable_cmds: Vec<String>,
@@ -2616,7 +2615,6 @@ impl Default for SttVmBuilder {
             watchdog_timeout_s: Some(4),
             bpf_map_write: None,
             performance_mode: false,
-            super_perf_mode: false,
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
         }
@@ -2733,18 +2731,6 @@ impl SttVmBuilder {
         self
     }
 
-    /// Enable super performance mode: implies performance_mode.
-    /// Requires LLC exclusivity — each virtual socket reserves an
-    /// entire physical LLC group.
-    #[allow(dead_code)]
-    pub fn super_perf_mode(mut self, enabled: bool) -> Self {
-        self.super_perf_mode = enabled;
-        if enabled {
-            self.performance_mode = true;
-        }
-        self
-    }
-
     pub fn sched_enable_cmds(mut self, cmds: &[&str]) -> Self {
         self.sched_enable_cmds = cmds.iter().map(|s| s.to_string()).collect();
         self
@@ -2834,28 +2820,26 @@ impl SttVmBuilder {
         let t = &self.topology;
         let total_vcpus = t.total_cpus();
 
-        // super_perf_mode: validate LLC exclusivity. Each virtual socket
-        // must reserve the entire physical LLC group it maps to.
-        // Sum actual per-group CPU counts to handle asymmetric LLCs.
-        if self.super_perf_mode {
-            let llcs_needed = t.sockets as usize;
-            let reserved: usize = host_topo
-                .llc_groups
-                .iter()
-                .take(llcs_needed)
-                .map(|g| g.cpus.len())
-                .sum();
-            let total_reserved = reserved + 1; // +1 for service CPU
-            anyhow::ensure!(
-                total_reserved <= host_topo.total_cpus(),
-                "super_perf_mode: need {} CPUs ({} across {} LLCs + 1 service) \
-                 but only {} host CPUs available",
-                total_reserved,
-                reserved,
-                llcs_needed,
-                host_topo.total_cpus(),
-            );
-        }
+        // Validate LLC exclusivity: each virtual socket should map to
+        // its own physical LLC group. Sum actual per-group CPU counts
+        // to handle asymmetric LLCs.
+        let llcs_needed = t.sockets as usize;
+        let reserved: usize = host_topo
+            .llc_groups
+            .iter()
+            .take(llcs_needed)
+            .map(|g| g.cpus.len())
+            .sum();
+        let total_reserved = reserved + 1; // +1 for service CPU
+        anyhow::ensure!(
+            total_reserved <= host_topo.total_cpus(),
+            "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
+             but only {} host CPUs available",
+            total_reserved,
+            reserved,
+            llcs_needed,
+            host_topo.total_cpus(),
+        );
 
         let plan = acquire_slot_with_locks(
             &host_topo,
@@ -3907,62 +3891,6 @@ mod tests {
             .build()
             .unwrap();
         assert!(!vm.performance_mode);
-    }
-
-    // -- super_perf_mode builder tests --
-
-    #[test]
-    fn builder_super_perf_mode_default_false() {
-        let b = SttVmBuilder::default();
-        assert!(!b.super_perf_mode);
-    }
-
-    #[test]
-    fn builder_super_perf_mode_implies_performance_mode() {
-        let b = SttVmBuilder::default().super_perf_mode(true);
-        assert!(b.super_perf_mode);
-        assert!(b.performance_mode);
-    }
-
-    #[test]
-    fn builder_super_perf_mode_valid_succeeds() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
-        // Need at least max_cores_per_LLC + 1 CPUs for 1 socket.
-        let max_cores = host_topo.max_cores_per_llc();
-        if host_topo.total_cpus() < max_cores + 1 + 2 {
-            return;
-        }
-        let result = SttVmBuilder::default()
-            .kernel(&exe)
-            .topology(1, 2, 1)
-            .super_perf_mode(true)
-            .build();
-        assert!(
-            result.is_ok(),
-            "valid topology with super_perf_mode should build: {:?}",
-            result.err(),
-        );
-    }
-
-    #[test]
-    fn builder_super_perf_mode_mbind_nodes_populated() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
-        if host_topo.total_cpus() < 3 {
-            return;
-        }
-        let vm = SttVmBuilder::default()
-            .kernel(&exe)
-            .topology(1, 2, 1)
-            .super_perf_mode(true)
-            .build();
-        if let Ok(vm) = vm {
-            assert!(
-                !vm.mbind_nodes.is_empty(),
-                "mbind_nodes should be populated for super_perf_mode",
-            );
-        }
     }
 
     #[test]

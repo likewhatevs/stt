@@ -186,28 +186,11 @@ The `perf-vm` test group in `.config/nextest.toml` sets a static
 slots are busy, the test is skipped with a `ResourceContention`
 error rather than silently degrading to a shared LLC.
 
-## super_perf_mode
+## LLC exclusivity validation
 
-`super_perf_mode` implies `performance_mode` and additionally
-validates LLC exclusivity at build time. Each virtual socket must
-reserve the entire physical LLC group it maps to. The validation
-sums the actual CPU count of each LLC group and checks the total
-(plus service CPU) fits within the host's online CPUs.
-
-`super_perf_mode` validates at build time that sufficient LLC groups
-exist for the test topology. Both modes apply the same runtime
-optimizations (pinning, hugepages, NUMA mbind, RT scheduling,
-PAUSE and HLT VM exit disabling, KVM_HINTS_REALTIME CPUID hint,
-no host-side halt poll).
-
-```rust,ignore
-#[stt_test(
-    sockets = 2,
-    cores = 4,
-    threads = 2,
-    super_perf_mode = true,
-)]
-fn my_exclusive_perf_test(ctx: &Ctx) -> Result<AssertResult> {
-    Ok(AssertResult::pass())
-}
-```
+When `performance_mode` is enabled, the build step validates LLC
+exclusivity: each virtual socket must reserve the entire physical
+LLC group it maps to. The validation sums the actual CPU count of
+each LLC group and checks the total (plus service CPU) fits within
+the host's online CPUs. If validation fails, the build returns an
+error (tests skip on resource contention).

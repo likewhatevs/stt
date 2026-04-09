@@ -121,7 +121,6 @@ fn perf_negative() {
         watchdog_timeout_s: 4,
         bpf_map_write: None,
         performance_mode: true,
-        super_perf_mode: false,
         duration_s: 5,
         workers_per_cgroup: 4,
     };

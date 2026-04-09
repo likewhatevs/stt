@@ -71,7 +71,6 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut min_cpus: u32 = 1;
     let mut watchdog_timeout_s: u64 = 4;
     let mut performance_mode: bool = false;
-    let mut super_perf_mode: bool = false;
     let mut duration_s: u64 = 2;
     let mut workers_per_cgroup: u32 = 2;
     let mut bpf_map_write: Option<syn::Path> = None;
@@ -124,7 +123,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         bpf_map_write = Some(p);
                     }
                     "auto_repro" | "not_starved" | "isolation" | "performance_mode"
-                    | "super_perf_mode" | "requires_smt" | "expect_err" => {
+                    | "requires_smt" | "expect_err" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -144,7 +143,6 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "not_starved" => not_starved = Some(lit_bool.value()),
                             "isolation" => isolation = Some(lit_bool.value()),
                             "performance_mode" => performance_mode = lit_bool.value(),
-                            "super_perf_mode" => super_perf_mode = lit_bool.value(),
                             "requires_smt" => requires_smt = lit_bool.value(),
                             "expect_err" => expect_err = lit_bool.value(),
                             _ => unreachable!(),
@@ -357,7 +355,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_s, performance_mode, super_perf_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
+                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
                         )
                         .to_compile_error()
                         .into();
@@ -485,11 +483,6 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { None },
     };
 
-    // super_perf_mode implies performance_mode.
-    if super_perf_mode {
-        performance_mode = true;
-    }
-
     let bpf_map_write_tokens = match &bpf_map_write {
         Some(p) => quote! { Some(&#p) },
         None => quote! { None },
@@ -557,7 +550,6 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             watchdog_timeout_s: #watchdog_timeout_s,
             bpf_map_write: #bpf_map_write_tokens,
             performance_mode: #performance_mode,
-            super_perf_mode: #super_perf_mode,
             duration_s: #duration_s,
             workers_per_cgroup: #workers_per_cgroup,
             expect_err: #expect_err,
