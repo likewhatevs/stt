@@ -20,7 +20,7 @@ pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         },
         Step {
             setup: vec![CgroupDef::named("cg_2").workers(16)].into(),
@@ -48,7 +48,7 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -74,7 +74,7 @@ pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 4),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 4),
     }];
 
     // Phases 1-3: swap load by stopping and respawning.
@@ -125,7 +125,7 @@ pub fn custom_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -149,7 +149,7 @@ pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -180,7 +180,7 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -255,7 +255,7 @@ pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms)),
+        hold: HoldSpec::Fixed(ctx.settle),
     }];
     steps.append(&mut move_steps);
     steps.push(Step {
@@ -276,7 +276,7 @@ pub fn custom_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         },
         // Phase 2: clear cpusets, hold remaining half.
         Step {
@@ -306,7 +306,7 @@ pub fn custom_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -322,7 +322,7 @@ pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)

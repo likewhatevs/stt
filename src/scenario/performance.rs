@@ -5,7 +5,6 @@ use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps_with};
 use crate::assert::{Assert, AssertResult};
 use crate::workload::*;
 use anyhow::Result;
-use std::time::Duration;
 
 /// CachePressure vs CpuSpin cgroups under work conservation.
 ///
@@ -27,7 +26,7 @@ pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps_with(ctx, steps, Some(&checks))
@@ -67,7 +66,7 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps_with(ctx, steps, Some(&checks))
@@ -102,7 +101,7 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult>
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps_with(ctx, steps, Some(&checks))
@@ -137,7 +136,7 @@ pub fn custom_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps_with(ctx, steps, Some(&checks))

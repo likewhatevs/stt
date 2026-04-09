@@ -24,7 +24,7 @@ pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
         Step {
             setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         },
         Step {
             setup: phase2_setup.into(),
@@ -63,7 +63,7 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
         Step {
             setup: phase1_setup.into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         },
         Step {
             setup: vec![].into(),
@@ -103,7 +103,7 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 3),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 3),
         },
         Step {
             setup: vec![
@@ -144,7 +144,7 @@ pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         },
         Step {
             setup: vec![CgroupDef::named("cg_2").workers(4)].into(),

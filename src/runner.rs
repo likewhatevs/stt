@@ -36,8 +36,8 @@ pub struct RunConfig {
     /// Auto-repro: crash -> extract stack -> rerun with probe-stack.
     pub auto_repro: bool,
     pub kernel_dir: Option<String>,
-    /// Sleep after cgroup creation to let scheduler apply config (ms).
-    pub settle_ms: u64,
+    /// Time to wait after cgroup creation for scheduler stabilization.
+    pub settle: Duration,
     /// Sleep after scheduler process start to let it initialize (ms).
     pub scheduler_startup_ms: u64,
     /// Sleep after cgroup cleanup before next scenario (ms).
@@ -63,7 +63,7 @@ impl Default for RunConfig {
             probe_stack: None,
             auto_repro: false,
             kernel_dir: None,
-            settle_ms: 500,
+            settle: Duration::from_millis(500),
             scheduler_startup_ms: 2000,
             cleanup_ms: 200,
             work_type_override: None,
@@ -210,7 +210,7 @@ impl Runner {
                 duration: Duration::from_secs(self.config.duration_s),
                 workers_per_cgroup: self.config.workers_per_cgroup,
                 sched_pid,
-                settle_ms: self.config.settle_ms,
+                settle: self.config.settle,
                 work_type_override: self.config.work_type_override,
                 assert: crate::assert::Assert::default_checks().merge(&self.config.assert),
                 wait_for_map_write: false,
@@ -902,7 +902,7 @@ mod tests {
         assert_eq!(runner.config.workers_per_cgroup, 8);
         assert!(runner.config.json);
         assert!(runner.config.verbose);
-        assert_eq!(runner.config.settle_ms, 500);
+        assert_eq!(runner.config.settle, Duration::from_millis(500));
         assert_eq!(runner.config.scheduler_startup_ms, 2000);
         assert_eq!(runner.config.cleanup_ms, 300);
         assert_eq!(runner.config.active_flags.as_ref().unwrap().len(), 2);
@@ -978,7 +978,7 @@ mod tests {
             probe_stack: Some("func1".into()),
             auto_repro: true,
             kernel_dir: Some("/path".into()),
-            settle_ms: 500,
+            settle: Duration::from_millis(500),
             scheduler_startup_ms: 2000,
             cleanup_ms: 100,
             work_type_override: Some(crate::workload::WorkType::CpuSpin),
@@ -995,7 +995,7 @@ mod tests {
         assert_eq!(c2.auto_repro, config.auto_repro);
         assert_eq!(c2.probe_stack, config.probe_stack);
         assert_eq!(c2.kernel_dir, config.kernel_dir);
-        assert_eq!(c2.settle_ms, config.settle_ms);
+        assert_eq!(c2.settle, config.settle);
     }
 
     #[test]

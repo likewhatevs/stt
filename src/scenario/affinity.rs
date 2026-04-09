@@ -5,13 +5,12 @@ use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execu
 use crate::assert::{Assert, AssertResult};
 use anyhow::Result;
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     let mut steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 5),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 5),
     }];
 
     for _ in 0..4 {
@@ -48,7 +47,7 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
         Step {
             setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms)),
+            hold: HoldSpec::Fixed(ctx.settle),
         },
         Step {
             setup: vec![].into(),
@@ -90,7 +89,7 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms)),
+            hold: HoldSpec::Fixed(ctx.settle),
         },
         Step {
             setup: vec![].into(),

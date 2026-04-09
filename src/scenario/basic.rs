@@ -5,7 +5,6 @@ use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
 use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
-use std::time::Duration;
 
 pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
@@ -16,7 +15,7 @@ pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
                 ..Default::default()
             },
         }],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -61,7 +60,7 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![].into(),
         ops,
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -97,7 +96,7 @@ pub fn custom_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![].into(),
         ops,
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)

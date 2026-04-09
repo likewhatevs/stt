@@ -114,7 +114,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut _guard = CgroupGroup::new(ctx.cgroups);
     _guard.add_cgroup("cg_0", &all[..last].iter().copied().collect())?;
-    thread::sleep(Duration::from_millis(ctx.settle_ms));
+    thread::sleep(ctx.settle);
 
     let n_unpinned = (last * 3).max(8);
     let mut h_cgroup = WorkloadHandle::spawn(&WorkloadConfig {
@@ -181,7 +181,7 @@ pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     for n in &names {
         _guard.add_cgroup_no_cpuset(n)?;
     }
-    thread::sleep(Duration::from_millis(ctx.settle_ms));
+    thread::sleep(ctx.settle);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let handles = spawn_diverse(ctx, &name_refs)?;
     thread::sleep(ctx.duration);
@@ -204,7 +204,7 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> 
         let end = if i == 2 { last } else { (i + 1) * chunk };
         _guard.add_cgroup(n, &all[start..end].iter().copied().collect())?;
     }
-    thread::sleep(Duration::from_millis(ctx.settle_ms));
+    thread::sleep(ctx.settle);
     let handles = spawn_diverse(ctx, &names)?;
     thread::sleep(ctx.duration);
     Ok(collect_all(handles, &ctx.assert))
@@ -223,7 +223,7 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
     for n in &names {
         _guard.add_cgroup_no_cpuset(n)?;
     }
-    thread::sleep(Duration::from_millis(ctx.settle_ms));
+    thread::sleep(ctx.settle);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let mut handles = spawn_diverse(ctx, &name_refs)?;
     thread::sleep(ctx.duration / 3);

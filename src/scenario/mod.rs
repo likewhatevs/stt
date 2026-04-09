@@ -475,8 +475,8 @@ pub struct Ctx<'a> {
     pub workers_per_cgroup: usize,
     /// PID of the running scheduler (for liveness checks).
     pub sched_pid: u32,
-    /// Milliseconds to wait after cgroup creation for scheduler stabilization.
-    pub settle_ms: u64,
+    /// Time to wait after cgroup creation for scheduler stabilization.
+    pub settle: Duration,
     /// Override work type for scenarios that use `CpuSpin` by default.
     pub work_type_override: Option<WorkType>,
     /// Merged assertion config (default_checks + scheduler + per-test).
@@ -517,7 +517,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         }
     }
     tracing::debug!(cgroups = scenario.num_cgroups, "cgroups created, settling");
-    thread::sleep(Duration::from_millis(ctx.settle_ms));
+    thread::sleep(ctx.settle);
 
     // Bail early if the scheduler died after cgroup creation
     if !process_alive(ctx.sched_pid) {
@@ -707,7 +707,7 @@ pub fn setup_cgroups<'a>(
     for i in 0..n {
         guard.add_cgroup_no_cpuset(&format!("cg_{i}"))?;
     }
-    thread::sleep(Duration::from_millis(ctx.settle_ms));
+    thread::sleep(ctx.settle);
     if !process_alive(ctx.sched_pid) {
         anyhow::bail!("scheduler died after cgroup creation");
     }
@@ -1159,7 +1159,7 @@ mod tests {
             duration: std::time::Duration::from_secs(1),
             workers_per_cgroup: 4,
             sched_pid: 0,
-            settle_ms: 3000,
+            settle: Duration::from_millis(3000),
             work_type_override: None,
             assert: assert::Assert::default_checks(),
             wait_for_map_write: false,
@@ -1180,7 +1180,7 @@ mod tests {
             duration: std::time::Duration::from_secs(1),
             workers_per_cgroup: 1,
             sched_pid: 0,
-            settle_ms: 3000,
+            settle: Duration::from_millis(3000),
             work_type_override: None,
             assert: assert::Assert::default_checks(),
             wait_for_map_write: false,
@@ -1199,7 +1199,7 @@ mod tests {
             duration: std::time::Duration::from_secs(1),
             workers_per_cgroup: 7,
             sched_pid: 0,
-            settle_ms: 3000,
+            settle: Duration::from_millis(3000),
             work_type_override: None,
             assert: assert::Assert::default_checks(),
             wait_for_map_write: false,

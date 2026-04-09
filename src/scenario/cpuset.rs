@@ -6,14 +6,13 @@ use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
             setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         },
         Step {
             setup: vec![].into(),
@@ -43,7 +42,7 @@ pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         },
         Step {
             setup: vec![].into(),
@@ -81,7 +80,7 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 3),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 3),
         },
         Step {
             setup: vec![].into(),
@@ -147,7 +146,7 @@ pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 3),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 3),
         },
         Step {
             setup: vec![].into(),
@@ -211,7 +210,7 @@ pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -250,7 +249,7 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> 
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 3),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 3),
         },
         Step {
             setup: vec![].into(),
@@ -290,7 +289,7 @@ pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         },
         // Phase 2: add heavy load to cg_1
         Step {

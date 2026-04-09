@@ -157,7 +157,7 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 name: "cg_1".into(),
             },
         ],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -181,7 +181,7 @@ pub fn custom_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
                 name: "cg_1".into(),
             },
         ],
-        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
+        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
     }];
 
     execute_steps(ctx, steps)

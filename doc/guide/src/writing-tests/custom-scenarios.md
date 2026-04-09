@@ -58,7 +58,7 @@ pub struct Ctx<'a> {
     pub duration: Duration,
     pub workers_per_cgroup: usize,
     pub sched_pid: u32,
-    pub settle_ms: u64,
+    pub settle: Duration,
     pub work_type_override: Option<WorkType>,
     pub assert: Assert,
     pub wait_for_map_write: bool,
@@ -83,7 +83,7 @@ Key methods:
 
 **`sched_pid`** -- scheduler process ID for liveness checks.
 
-**`settle_ms`** -- time to wait after cgroup creation for the scheduler
+**`settle`** -- time to wait after cgroup creation for the scheduler
 to stabilize.
 
 ## Verification in custom scenarios
