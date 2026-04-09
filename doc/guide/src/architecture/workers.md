@@ -88,9 +88,10 @@ start and end. Three fields:
 
 ## Work-conservation watchdog
 
-Workers send SIGUSR2 to the scheduler when stuck > 2 seconds. This
-triggers `scx_bpf_error` in the scheduler's `ops.tick`, producing a
-diagnostic dump.
+Workers send SIGUSR2 to the scheduler when stuck > 2 seconds. The
+default POSIX disposition terminates the scheduler process, which stt
+detects as a scheduler death and captures the sched_ext dump from
+dmesg.
 
 In repro mode, the watchdog is disabled to keep the scheduler alive
 for BPF kprobe assertions.

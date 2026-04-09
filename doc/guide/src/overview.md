@@ -19,8 +19,8 @@ console, COM2 for application I/O) and a shared-memory ring buffer.
 guest memory directly via BTF-resolved struct offsets (`rq.nr_running`,
 `rq.clock`) to observe scheduler state. No BPF instrumentation inside
 the guest, no observer effects on scheduling decisions. Verifier
-statistics come from the real kernel verifier inside the VM -- the
-scheduler binary loads each program with `BPF_LOG_STATS` and emits
+statistics come from the real kernel verifier inside the VM --
+stt-sched captures per-program verifier statistics and emits
 structured output; the host has no BPF dependency. Cycle collapse
 reduces repetitive loop unrolling instead of truncating.
 
@@ -45,8 +45,8 @@ cargo nextest run --workspace
 
 The `verifier_pipeline` test boots a scheduler in a VM and captures
 per-program verifier output from the real kernel verifier. The
-scheduler binary loads each BPF program inside the VM with
-`BPF_LOG_STATS` enabled -- there is no host-side BPF loading.
+stt-sched captures per-program verifier statistics inside the
+VM -- there is no host-side BPF loading.
 Per-program statistics include instruction counts, states explored,
 verification time, and stack depth. The default output applies
 **cycle collapse** to reduce repetitive loop unrolling. See

@@ -110,6 +110,6 @@ Key points:
 - `expect_err = true` tells the harness to assert failure and disable
   auto-repro.
 - `extra_sched_args = ["--degrade"]` passes a flag that makes the
-  scheduler intentionally slow (the scheduler must support this flag).
+  scheduler intentionally slow (the scheduler handles this flag to degrade performance for negative testing).
 - The test function returns the scenario result normally; the harness
   checks that it produces an error.

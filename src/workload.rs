@@ -1203,8 +1203,9 @@ fn worker_main(
                 max_gap_at_ns = now.duration_since(start).as_nanos() as u64;
             }
             // If stuck >2s and not in repro mode, send SIGUSR2 to the
-            // scheduler to trigger scx_bpf_error in ops.tick. In repro
-            // mode, keep it alive for BPF probes.
+            // scheduler. Default POSIX disposition terminates it, which
+            // stt detects as a scheduler death. In repro mode, keep it
+            // alive for BPF probes.
             if gap > 2_000_000_000 && !REPRO_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 let pid = SCHED_PID.load(std::sync::atomic::Ordering::Relaxed);
                 if pid > 0 {
