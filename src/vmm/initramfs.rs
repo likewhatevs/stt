@@ -374,14 +374,15 @@ pub fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
 /// synchronization. The segment name encodes the content hash,
 /// so writes are idempotent -- concurrent writers produce
 /// identical content, and the last write wins harmlessly.
-pub fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
-    let name =
-        std::ffi::CString::new(shm_segment_name(content_hash)).context("shm segment name")?;
+/// Write `data` to a POSIX SHM segment identified by `name`.
+///
+/// Creates the segment (O_CREAT | O_RDWR), takes an exclusive flock,
+/// truncates to `data.len()`, mmaps, copies, and cleans up.
+fn shm_store(name: &std::ffi::CStr, data: &[u8]) -> Result<()> {
     unsafe {
         let fd = libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644);
         anyhow::ensure!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
 
-        // Exclusive lock — blocks readers and other writers.
         if libc::flock(fd, libc::LOCK_EX) != 0 {
             libc::close(fd);
             anyhow::bail!("flock: {}", std::io::Error::last_os_error());
@@ -414,6 +415,12 @@ pub fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
         libc::close(fd);
     }
     Ok(())
+}
+
+pub fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
+    let name =
+        std::ffi::CString::new(shm_segment_name(content_hash)).context("shm segment name")?;
+    shm_store(&name, data)
 }
 
 /// Remove the POSIX shared-memory segment identified by `content_hash`.
@@ -462,37 +469,7 @@ pub(crate) fn shm_open_gz(content_hash: u64) -> Option<(std::os::unix::io::RawFd
 /// Store compressed initramfs data into a gz SHM segment.
 pub(crate) fn shm_store_gz(content_hash: u64, data: &[u8]) -> Result<()> {
     let name = std::ffi::CString::new(shm_gz_segment_name(content_hash)).context("shm gz name")?;
-    unsafe {
-        let fd = libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644);
-        anyhow::ensure!(fd >= 0, "shm_open gz: {}", std::io::Error::last_os_error());
-        if libc::flock(fd, libc::LOCK_EX) != 0 {
-            libc::close(fd);
-            anyhow::bail!("flock gz: {}", std::io::Error::last_os_error());
-        }
-        if libc::ftruncate(fd, data.len() as libc::off_t) != 0 {
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
-            anyhow::bail!("ftruncate gz: {}", std::io::Error::last_os_error());
-        }
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            data.len(),
-            libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
-            anyhow::bail!("mmap gz: {}", std::io::Error::last_os_error());
-        }
-        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
-        libc::munmap(ptr, data.len());
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
-    }
-    Ok(())
+    shm_store(&name, data)
 }
 
 /// COW-overlay `len` bytes from `shm_fd` at `host_addr` using

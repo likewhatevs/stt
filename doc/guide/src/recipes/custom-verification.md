@@ -81,9 +81,9 @@ fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 `execute_steps_with` applies the given `Assert` for worker checks.
-`execute_steps` (without `_with`) passes `None`, using the default
-gap and spread thresholds from `assert_not_starved()` instead of
-per-invocation `Assert` overrides.
+`execute_steps` (without `_with`) passes `None`, falling back to
+`ctx.assert` (the merged three-layer config: `default_checks` ->
+scheduler -> per-test).
 
 See [Ops and Steps](../concepts/ops.md) for the full step execution
 model.

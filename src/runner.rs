@@ -1,6 +1,6 @@
 //! Scenario execution engine with scheduler lifecycle management.
 //!
-//! See the [Running Tests](https://sched-ext.github.io/scx/stt/running-tests.html)
+//! See the [Running Tests](https://likewhatevs.github.io/stt/guide/running-tests.html)
 //! chapter of the guide.
 
 use anyhow::{Context, Result, bail};
@@ -46,6 +46,29 @@ pub struct RunConfig {
     pub work_type_override: Option<crate::workload::WorkType>,
 }
 
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            scheduler_bin: None,
+            scheduler_args: Vec::new(),
+            parent_cgroup: "/sys/fs/cgroup/stt".into(),
+            duration_s: 20,
+            workers_per_cgroup: 4,
+            json: false,
+            verbose: false,
+            active_flags: None,
+            repro: false,
+            probe_stack: None,
+            auto_repro: false,
+            kernel_dir: None,
+            settle_ms: 500,
+            scheduler_startup_ms: 2000,
+            cleanup_ms: 200,
+            work_type_override: None,
+        }
+    }
+}
+
 /// Result of running a single scenario with a specific flag profile.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScenarioResult {
@@ -82,7 +105,7 @@ pub fn extract_auto_repro_functions(results: &[ScenarioResult]) -> Option<String
                 .join(",")
         })
         .or_else(|| {
-            let fns = crate::probe::stack::extract_stack_functions_all_pub(&all_text);
+            let fns = crate::probe::stack::extract_stack_function_names(&all_text);
             if fns.is_empty() {
                 None
             } else {
@@ -177,7 +200,7 @@ impl Runner {
             }
 
             let sched_pid = sched.as_ref().map(|s| s.pid()).unwrap_or(0);
-            crate::workload::set_sched_pid(sched_pid);
+            crate::workload::set_sched_pid(sched_pid as i32);
             let ctx = Ctx {
                 cgroups: &cgroups,
                 topo: &self.topo,
@@ -858,20 +881,13 @@ mod tests {
         let config = RunConfig {
             scheduler_bin: Some("scx_mitosis".into()),
             scheduler_args: vec!["--verbose".into()],
-            parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 30,
             workers_per_cgroup: 8,
             json: true,
             verbose: true,
             active_flags: Some(vec![flags::BORROW, flags::LLC]),
-            repro: false,
-            probe_stack: None,
-            auto_repro: false,
-            kernel_dir: None,
-            settle_ms: 500,
-            scheduler_startup_ms: 2000,
             cleanup_ms: 300,
-            work_type_override: None,
+            ..Default::default()
         };
         let runner = Runner::new(config, topo).unwrap();
         // Verify topology was correctly propagated (2*4*2=16 CPUs).
@@ -892,22 +908,14 @@ mod tests {
     #[test]
     fn run_config_fields_carry_probe_and_repro() {
         let config = RunConfig {
-            scheduler_bin: None,
-            scheduler_args: vec![],
-            parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 5,
             workers_per_cgroup: 2,
-            json: false,
-            verbose: false,
-            active_flags: None,
             repro: true,
             probe_stack: Some("do_enqueue_task,balance_one".into()),
             auto_repro: true,
             kernel_dir: Some("/usr/src/linux".into()),
-            settle_ms: 200,
-            scheduler_startup_ms: 1000,
-            cleanup_ms: 200,
             work_type_override: Some(crate::workload::WorkType::Mixed),
+            ..Default::default()
         };
         assert!(config.repro);
         assert!(config.auto_repro);
@@ -942,21 +950,9 @@ mod tests {
     fn run_config_debug_shows_field_values() {
         let config = RunConfig {
             scheduler_bin: Some("scx_mitosis".into()),
-            scheduler_args: vec![],
-            parent_cgroup: "/sys/fs/cgroup/stt".into(),
             duration_s: 30,
-            workers_per_cgroup: 4,
-            json: false,
             verbose: true,
-            active_flags: None,
-            repro: false,
-            probe_stack: None,
-            auto_repro: false,
-            kernel_dir: None,
-            settle_ms: 200,
-            scheduler_startup_ms: 1000,
-            cleanup_ms: 200,
-            work_type_override: None,
+            ..Default::default()
         };
         let s = format!("{:?}", config);
         assert!(s.contains("scx_mitosis"), "must show scheduler_bin value");

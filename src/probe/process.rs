@@ -6,6 +6,10 @@ use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
 
+/// Ring buffer event type for the trigger kprobe (matches `EVENT_TRIGGER`
+/// in `intf.h`).
+const EVENT_TRIGGER: u32 = 2;
+
 /// Structured probe event captured by the BPF skeleton.
 ///
 /// One per (function, tid) combination. `fields` contains BTF-resolved
@@ -518,8 +522,7 @@ pub fn run_probe_skeleton(
             }
             let raw: &RbEvent = unsafe { &*(data.as_ptr() as *const RbEvent) };
 
-            if raw.type_ == 2 {
-                // EVENT_TRIGGER
+            if raw.type_ == EVENT_TRIGGER {
                 triggered_clone.store(true, Ordering::Relaxed);
 
                 let kstack_sz = (raw.kstack_sz as usize).min(32);
@@ -731,7 +734,6 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
-            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(
@@ -751,7 +753,6 @@ mod tests {
                 is_ptr: false,
                 ..Default::default()
             }],
-            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(keys.iter().any(|k| k.contains("flags:val.flags")));
@@ -767,7 +768,6 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
-            source_loc: None,
         };
         let keys = build_field_keys(&func);
         // Raw pointer with no struct info: no keys generated
@@ -779,7 +779,6 @@ mod tests {
         let func = super::BtfFunc {
             name: "empty".into(),
             params: vec![],
-            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(keys.is_empty());
@@ -800,7 +799,6 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
-            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(keys.is_empty(), "unknown struct should produce no keys");
@@ -827,7 +825,6 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            source_loc: None,
         };
         assert_eq!(detect_str_param(&func), 1);
     }
@@ -850,7 +847,6 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            source_loc: None,
         };
         assert_eq!(detect_str_param(&func), 1);
     }
@@ -865,7 +861,6 @@ mod tests {
                 is_ptr: false,
                 ..Default::default()
             }],
-            source_loc: None,
         };
         assert_eq!(detect_str_param(&func), 0xff);
     }
@@ -880,7 +875,6 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
-            source_loc: None,
         };
         assert_eq!(detect_str_param(&func), 0xff);
     }
@@ -895,7 +889,6 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
-            source_loc: None,
         };
         assert_eq!(detect_str_param(&func), 0);
     }
@@ -917,7 +910,6 @@ mod tests {
                 type_name: Some("task_ctx".into()),
                 ..Default::default()
             }],
-            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert_eq!(keys.len(), 2);
@@ -938,7 +930,6 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
-            source_loc: None,
         };
         let keys = build_field_keys(&func);
         assert!(
@@ -964,7 +955,6 @@ mod tests {
         let func = super::BtfFunc {
             name: "many".into(),
             params,
-            source_loc: None,
         };
         let keys = build_field_keys(&func);
         // Only first 6 params processed

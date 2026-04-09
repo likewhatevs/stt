@@ -11,7 +11,7 @@
 //! in the [`idr`] module) through page table translation. No guest
 //! cooperation is needed.
 //!
-//! See the [Monitor](https://sched-ext.github.io/scx/stt/architecture/monitor.html)
+//! See the [Monitor](https://likewhatevs.github.io/stt/guide/architecture/monitor.html)
 //! chapter of the guide.
 
 pub mod bpf_map;
@@ -55,7 +55,7 @@ pub(crate) fn vcpu_preemption_threshold_ns(kernel_path: Option<&std::path::Path>
 pub(crate) fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
     if let Some(kp) = kernel_path {
         // Try embedded IKCONFIG in the vmlinux.
-        if let Some(vmlinux) = find_vmlinux_from_kernel(kp)
+        if let Some(vmlinux) = find_vmlinux(kp)
             && let Some(hz) = read_hz_from_ikconfig(&vmlinux)
         {
             return hz;
@@ -75,23 +75,7 @@ pub(crate) fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
     DEFAULT_HZ
 }
 
-/// Locate the vmlinux ELF from a kernel image path.
-/// Mirrors the logic in `vmm::find_vmlinux`.
-fn find_vmlinux_from_kernel(kernel_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let dir = kernel_path.parent()?;
-    let candidate = dir.join("vmlinux");
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    // <root>/arch/{x86/boot,arm64/boot}/Image -> <root>/vmlinux
-    if let Ok(root) = dir.join("../../..").canonicalize() {
-        let candidate = root.join("vmlinux");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
+use crate::vmm::find_vmlinux;
 
 /// IKCONFIG marker: gzip data starts immediately after this 8-byte sequence.
 const IKCONFIG_MAGIC: &[u8] = b"IKCFG_ST";
@@ -215,10 +199,45 @@ pub struct MonitorReport {
     /// Aggregated summary statistics.
     pub summary: MonitorSummary,
     /// vCPU preemption threshold (ns) derived from the guest kernel's
-    /// CONFIG_HZ at the time the VM ran. Used by evaluate() and
-    /// from_samples() to gate stall detection. 0 means use a default.
+    /// CONFIG_HZ at the time the VM ran. Used by evaluate() to gate
+    /// stall detection. 0 means use a default.
     #[serde(default)]
     pub preemption_threshold_ns: u64,
+}
+
+/// Tracks consecutive threshold violations and records the worst run.
+///
+/// Used by `MonitorChecks::evaluate` for imbalance, DSQ depth, fallback
+/// rate, keep-last rate, and stall checks. Call `record(true)` on
+/// violation, `record(false)` on pass.
+#[derive(Debug, Clone, Default)]
+struct SustainedViolationTracker {
+    consecutive: usize,
+    worst_run: usize,
+    worst_value: f64,
+    worst_at: usize,
+}
+
+impl SustainedViolationTracker {
+    /// Record a sample. `violated`: whether the threshold was exceeded.
+    /// `value`: the metric value for this sample. `at`: sample index.
+    fn record(&mut self, violated: bool, value: f64, at: usize) {
+        if violated {
+            self.consecutive += 1;
+            if self.consecutive > self.worst_run {
+                self.worst_run = self.consecutive;
+                self.worst_value = value;
+                self.worst_at = at;
+            }
+        } else {
+            self.consecutive = 0;
+        }
+    }
+
+    /// Whether the worst run met or exceeded the sustained threshold.
+    fn sustained(&self, threshold: usize) -> bool {
+        self.worst_run >= threshold
+    }
 }
 
 /// Point-in-time snapshot of all CPUs.
@@ -536,6 +555,16 @@ pub struct ScxEventDeltas {
 
 impl MonitorSummary {
     pub fn from_samples(samples: &[MonitorSample]) -> Self {
+        Self::from_samples_with_threshold(samples, 0)
+    }
+
+    /// Like [`from_samples`](Self::from_samples) but uses an explicit
+    /// preemption threshold (ns) for stall detection. Pass 0 to derive
+    /// the threshold from the host kernel's CONFIG_HZ.
+    pub fn from_samples_with_threshold(
+        samples: &[MonitorSample],
+        preemption_threshold_ns: u64,
+    ) -> Self {
         if samples.is_empty() {
             return Self::default();
         }
@@ -562,7 +591,11 @@ impl MonitorSummary {
         // is stopped (NOHZ) and rq_clock legitimately does not advance.
         // Exempt preempted vCPUs: vcpu_cpu_time_ns didn't advance enough
         // means the host preempted the vCPU thread.
-        let threshold = vcpu_preemption_threshold_ns(None);
+        let threshold = if preemption_threshold_ns > 0 {
+            preemption_threshold_ns
+        } else {
+            vcpu_preemption_threshold_ns(None)
+        };
         let mut stall_detected = false;
         let valid_samples: Vec<&MonitorSample> = samples
             .iter()
@@ -867,86 +900,62 @@ impl MonitorThresholds {
             };
         }
 
-        // Track consecutive imbalance violations per sample.
-        let mut consecutive_imbalance = 0usize;
-        let mut worst_imbalance_run = 0usize;
-        let mut worst_imbalance_ratio = 0.0f64;
-        let mut worst_imbalance_sample_idx = 0usize;
-
-        // Track consecutive DSQ depth violations per sample.
-        let mut consecutive_dsq = 0usize;
-        let mut worst_dsq_run = 0usize;
-        let mut worst_dsq_depth = 0u32;
+        let mut imbalance = SustainedViolationTracker::default();
+        let mut dsq = SustainedViolationTracker::default();
         let mut worst_dsq_cpu = 0usize;
-        let mut worst_dsq_sample_idx = 0usize;
 
         for (i, sample) in report.samples.iter().enumerate() {
             if sample.cpus.is_empty() {
-                consecutive_imbalance = 0;
-                consecutive_dsq = 0;
+                imbalance.record(false, 0.0, i);
+                dsq.record(false, 0.0, i);
                 continue;
             }
 
             // Imbalance check.
             let ratio = sample.imbalance_ratio();
-            if ratio > self.max_imbalance_ratio {
-                consecutive_imbalance += 1;
-                if consecutive_imbalance > worst_imbalance_run {
-                    worst_imbalance_run = consecutive_imbalance;
-                    worst_imbalance_ratio = ratio;
-                    worst_imbalance_sample_idx = i;
-                }
-            } else {
-                consecutive_imbalance = 0;
-            }
+            imbalance.record(ratio > self.max_imbalance_ratio, ratio, i);
 
             // DSQ depth check.
             let mut dsq_violated = false;
+            let mut sample_worst_depth = 0u32;
+            let mut sample_worst_cpu = 0usize;
             for (cpu_idx, cpu) in sample.cpus.iter().enumerate() {
-                if cpu.local_dsq_depth > self.max_local_dsq_depth {
+                if cpu.local_dsq_depth > self.max_local_dsq_depth
+                    && cpu.local_dsq_depth > sample_worst_depth
+                {
                     dsq_violated = true;
-                    if cpu.local_dsq_depth > worst_dsq_depth
-                        || (cpu.local_dsq_depth == worst_dsq_depth
-                            && consecutive_dsq + 1 > worst_dsq_run)
-                    {
-                        worst_dsq_depth = cpu.local_dsq_depth;
-                        worst_dsq_cpu = cpu_idx;
-                    }
+                    sample_worst_depth = cpu.local_dsq_depth;
+                    sample_worst_cpu = cpu_idx;
                 }
             }
-            if dsq_violated {
-                consecutive_dsq += 1;
-                if consecutive_dsq > worst_dsq_run {
-                    worst_dsq_run = consecutive_dsq;
-                    worst_dsq_sample_idx = i;
-                }
-            } else {
-                consecutive_dsq = 0;
+            dsq.record(dsq_violated, sample_worst_depth as f64, i);
+            if dsq_violated && dsq.worst_value == sample_worst_depth as f64 {
+                worst_dsq_cpu = sample_worst_cpu;
             }
         }
 
         let mut failed = false;
 
-        if worst_imbalance_run >= self.sustained_samples {
+        if imbalance.sustained(self.sustained_samples) {
             failed = true;
             details.push(format!(
                 "imbalance ratio {:.1} exceeded threshold {:.1} for {} consecutive samples (ending at sample {})",
-                worst_imbalance_ratio,
+                imbalance.worst_value,
                 self.max_imbalance_ratio,
-                worst_imbalance_run,
-                worst_imbalance_sample_idx,
+                imbalance.worst_run,
+                imbalance.worst_at,
             ));
         }
 
-        if worst_dsq_run >= self.sustained_samples {
+        if dsq.sustained(self.sustained_samples) {
             failed = true;
             details.push(format!(
                 "local DSQ depth {} on cpu{} exceeded threshold {} for {} consecutive samples (ending at sample {})",
-                worst_dsq_depth,
+                dsq.worst_value as u32,
                 worst_dsq_cpu,
                 self.max_local_dsq_depth,
-                worst_dsq_run,
-                worst_dsq_sample_idx,
+                dsq.worst_run,
+                dsq.worst_at,
             ));
         }
 
@@ -962,22 +971,21 @@ impl MonitorThresholds {
                 vcpu_preemption_threshold_ns(None)
             };
 
-            // Per-CPU consecutive stall counters.
             let num_cpus = report
                 .samples
                 .iter()
                 .map(|s| s.cpus.len())
                 .max()
                 .unwrap_or(0);
-            let mut consecutive_stall = vec![0usize; num_cpus];
-            let mut worst_stall_run = vec![0usize; num_cpus];
-            let mut worst_stall_sample_idx = vec![0usize; num_cpus];
-            let mut worst_stall_clock = vec![0u64; num_cpus];
+            let mut stall: Vec<SustainedViolationTracker> =
+                vec![SustainedViolationTracker::default(); num_cpus];
 
             for i in 1..report.samples.len() {
                 let prev = &report.samples[i - 1];
                 let curr = &report.samples[i];
                 let cpu_count = prev.cpus.len().min(curr.cpus.len());
+                #[allow(clippy::needless_range_loop)]
+                // indexes stall[cpu], prev.cpus[cpu], curr.cpus[cpu]
                 for cpu in 0..cpu_count {
                     let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
                     let cpu_time_advanced = match (
@@ -991,28 +999,20 @@ impl MonitorThresholds {
                         && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
                         && !idle
                         && cpu_time_advanced;
-                    if is_stall {
-                        consecutive_stall[cpu] += 1;
-                        if consecutive_stall[cpu] > worst_stall_run[cpu] {
-                            worst_stall_run[cpu] = consecutive_stall[cpu];
-                            worst_stall_sample_idx[cpu] = i;
-                            worst_stall_clock[cpu] = curr.cpus[cpu].rq_clock;
-                        }
-                    } else {
-                        consecutive_stall[cpu] = 0;
-                    }
+                    stall[cpu].record(is_stall, curr.cpus[cpu].rq_clock as f64, i);
                 }
             }
 
+            #[allow(clippy::needless_range_loop)] // cpu index used in format string
             for cpu in 0..num_cpus {
-                if worst_stall_run[cpu] >= self.sustained_samples {
+                if stall[cpu].sustained(self.sustained_samples) {
                     failed = true;
                     details.push(format!(
                         "rq_clock stall on cpu{} for {} consecutive samples (ending at sample {}, clock={})",
                         cpu,
-                        worst_stall_run[cpu],
-                        worst_stall_sample_idx[cpu],
-                        worst_stall_clock[cpu],
+                        stall[cpu].worst_run,
+                        stall[cpu].worst_at,
+                        stall[cpu].worst_value as u64,
                     ));
                 }
             }
@@ -1020,23 +1020,16 @@ impl MonitorThresholds {
 
         // Event counter rate checks: compute per-sample-interval rates
         // and track sustained violations like imbalance.
-        let mut consecutive_fallback_rate = 0usize;
-        let mut worst_fallback_rate_run = 0usize;
-        let mut worst_fallback_rate_value = 0.0f64;
-        let mut worst_fallback_rate_sample_idx = 0usize;
-
-        let mut consecutive_keep_last_rate = 0usize;
-        let mut worst_keep_last_rate_run = 0usize;
-        let mut worst_keep_last_rate_value = 0.0f64;
-        let mut worst_keep_last_rate_sample_idx = 0usize;
+        let mut fallback_rate = SustainedViolationTracker::default();
+        let mut keep_last_rate = SustainedViolationTracker::default();
 
         for i in 1..report.samples.len() {
             let prev = &report.samples[i - 1];
             let curr = &report.samples[i];
             let interval_s = curr.elapsed_ms.saturating_sub(prev.elapsed_ms) as f64 / 1000.0;
             if interval_s <= 0.0 {
-                consecutive_fallback_rate = 0;
-                consecutive_keep_last_rate = 0;
+                fallback_rate.record(false, 0.0, i);
+                keep_last_rate.record(false, 0.0, i);
                 continue;
             }
 
@@ -1046,18 +1039,9 @@ impl MonitorThresholds {
                 curr.sum_event_field(|e| e.select_cpu_fallback),
             ) {
                 let rate = (curr_fb - prev_fb) as f64 / interval_s;
-                if rate > self.max_fallback_rate {
-                    consecutive_fallback_rate += 1;
-                    if consecutive_fallback_rate > worst_fallback_rate_run {
-                        worst_fallback_rate_run = consecutive_fallback_rate;
-                        worst_fallback_rate_value = rate;
-                        worst_fallback_rate_sample_idx = i;
-                    }
-                } else {
-                    consecutive_fallback_rate = 0;
-                }
+                fallback_rate.record(rate > self.max_fallback_rate, rate, i);
             } else {
-                consecutive_fallback_rate = 0;
+                fallback_rate.record(false, 0.0, i);
             }
 
             // Keep-last rate.
@@ -1066,40 +1050,31 @@ impl MonitorThresholds {
                 curr.sum_event_field(|e| e.dispatch_keep_last),
             ) {
                 let rate = (curr_kl - prev_kl) as f64 / interval_s;
-                if rate > self.max_keep_last_rate {
-                    consecutive_keep_last_rate += 1;
-                    if consecutive_keep_last_rate > worst_keep_last_rate_run {
-                        worst_keep_last_rate_run = consecutive_keep_last_rate;
-                        worst_keep_last_rate_value = rate;
-                        worst_keep_last_rate_sample_idx = i;
-                    }
-                } else {
-                    consecutive_keep_last_rate = 0;
-                }
+                keep_last_rate.record(rate > self.max_keep_last_rate, rate, i);
             } else {
-                consecutive_keep_last_rate = 0;
+                keep_last_rate.record(false, 0.0, i);
             }
         }
 
-        if worst_fallback_rate_run >= self.sustained_samples {
+        if fallback_rate.sustained(self.sustained_samples) {
             failed = true;
             details.push(format!(
                 "fallback rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
-                worst_fallback_rate_value,
+                fallback_rate.worst_value,
                 self.max_fallback_rate,
-                worst_fallback_rate_run,
-                worst_fallback_rate_sample_idx,
+                fallback_rate.worst_run,
+                fallback_rate.worst_at,
             ));
         }
 
-        if worst_keep_last_rate_run >= self.sustained_samples {
+        if keep_last_rate.sustained(self.sustained_samples) {
             failed = true;
             details.push(format!(
                 "keep_last rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
-                worst_keep_last_rate_value,
+                keep_last_rate.worst_value,
                 self.max_keep_last_rate,
-                worst_keep_last_rate_run,
-                worst_keep_last_rate_sample_idx,
+                keep_last_rate.worst_run,
+                keep_last_rate.worst_at,
             ));
         }
 

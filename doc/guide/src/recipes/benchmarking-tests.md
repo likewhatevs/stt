@@ -72,77 +72,44 @@ Verify that intentionally degraded scheduling fails the same gates.
 This confirms that the gates actually catch regressions rather than
 passing vacuously.
 
-Negative tests cannot use `#[stt_test]` directly because they need to
-assert that the test *fails*. Instead, construct an `SttTestEntry`
-manually and call `run_stt_test()`:
+Use `expect_err = true` on `#[stt_test]` to assert that the test
+fails. The macro wraps the test with `assert!(result.is_err())` and
+disables auto-repro automatically.
 
 ```rust,ignore
 use stt::prelude::*;
-use stt::test_support::{SttTestEntry, run_stt_test};
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"));
 
-#[test]
-fn perf_negative() {
-    fn scenario(ctx: &stt::scenario::Ctx) -> Result<AssertResult> {
-        use stt::scenario::ops::execute_steps_with;
-        let checks = Assert::default_checks().max_gap_ms(50);
-        let steps = vec![Step {
-            setup: vec![
-                CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
-            ].into(),
-            ops: vec![],
-            hold: HoldSpec::Frac(1.0),
-        }];
-        execute_steps_with(ctx, steps, Some(&checks))
-    }
-
-    #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
-    #[linkme(crate = linkme)]
-    static __STT_ENTRY: SttTestEntry = SttTestEntry {
-        name: "perf_negative",
-        func: scenario,
-        sockets: 1,
-        cores: 2,
-        threads: 1,
-        memory_mb: 2048,
-        scheduler: &MY_SCHED,
-        auto_repro: false,
-        replicas: 1,
-        assert: stt::assert::Assert::NONE,
-        extra_sched_args: &["--degrade"],
-        required_flags: &[],
-        excluded_flags: &[],
-        min_sockets: 1,
-        min_llcs: 1,
-        requires_smt: false,
-        min_cpus: 1,
-        watchdog_timeout_s: 4,
-        bpf_map_write: None,
-        performance_mode: true,
-        duration_s: 5,
-        workers_per_cgroup: 4,
-    };
-
-    let result = run_stt_test(&__STT_ENTRY);
-    assert!(
-        result.is_err(),
-        "degraded scheduler should fail gates, but test passed"
-    );
-    let err_msg = format!("{:#}", result.unwrap_err());
-    assert!(
-        err_msg.contains("stuck"),
-        "error should mention scheduling gap: {err_msg}"
-    );
+#[stt_test(
+    scheduler = MY_SCHED,
+    sockets = 1,
+    cores = 2,
+    threads = 1,
+    performance_mode = true,
+    duration_s = 5,
+    workers_per_cgroup = 4,
+    extra_sched_args = ["--degrade"],
+    expect_err = true,
+)]
+fn perf_negative(ctx: &Ctx) -> Result<AssertResult> {
+    let checks = Assert::default_checks().max_gap_ms(50);
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
+        ].into(),
+        ops: vec![],
+        hold: HoldSpec::Frac(1.0),
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
 }
 ```
 
 Key points:
-- `extra_sched_args: &["--degrade"]` passes a flag that makes the
+- `expect_err = true` tells the harness to assert failure and disable
+  auto-repro.
+- `extra_sched_args = ["--degrade"]` passes a flag that makes the
   scheduler intentionally slow (the scheduler must support this flag).
-- `assert!(result.is_err())` confirms the test fails as expected.
-- Check error message content to verify the *right* gate tripped.
-- `auto_repro: false` -- no point auto-reproing an intentional failure.
-- Manual `SttTestEntry` is needed because `#[stt_test]` expects the
-  scenario function to return success.
+- The test function returns the scenario result normally; the harness
+  checks that it produces an error.

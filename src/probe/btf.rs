@@ -31,10 +31,6 @@ pub struct BtfParam {
 pub struct BtfFunc {
     pub name: String,
     pub params: Vec<BtfParam>,
-    /// Source location from BPF line info (e.g. "sched.bpf.c:450").
-    /// Populated for BPF program functions; None for kernel functions
-    /// (kernel source locations come from blazesym symbolization).
-    pub source_loc: Option<String>,
 }
 
 /// Known struct types and their fields for probe output decoding.
@@ -338,7 +334,7 @@ fn resolve_pointed_struct(
     struct_type: &btf_rs::Struct,
     member_name: &str,
 ) -> Option<btf_rs::Struct> {
-    use btf_rs::{BtfType, Type};
+    use btf_rs::BtfType;
 
     // Strip array index (e.g. "bits[0]" -> "bits").
     let member_name = member_name.split('[').next().unwrap_or(member_name);
@@ -350,26 +346,7 @@ fn resolve_pointed_struct(
     })?;
 
     let tid = member.get_type_id().ok()?;
-    let mut t = btf.resolve_type_by_id(tid).ok()?;
-
-    // Follow qualifiers and pointer to reach the struct.
-    for _ in 0..20 {
-        match t {
-            Type::Ptr(_) => {
-                t = btf.resolve_chained_type(t.as_btf_type()?).ok()?;
-            }
-            Type::Struct(s) | Type::Union(s) => return Some(s),
-            Type::Const(_)
-            | Type::Volatile(_)
-            | Type::Restrict(_)
-            | Type::Typedef(_)
-            | Type::TypeTag(_) => {
-                t = btf.resolve_chained_type(t.as_btf_type()?).ok()?;
-            }
-            _ => return None,
-        }
-    }
-    None
+    crate::monitor::bpf_map::resolve_to_struct(btf, tid)
 }
 
 /// Parse BTF from vmlinux for kernel function signatures.
@@ -487,7 +464,6 @@ pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> V
                 results.push(BtfFunc {
                     name: func_name.to_string(),
                     params,
-                    source_loc: None,
                 });
                 break; // take first match
             }
@@ -765,7 +741,6 @@ pub fn parse_bpf_btf_functions(
                 results.push(BtfFunc {
                     name: func_name.to_string(),
                     params: vec![],
-                    source_loc: None,
                 });
                 continue;
             };
@@ -856,7 +831,6 @@ pub fn parse_bpf_btf_functions(
             results.push(BtfFunc {
                 name: func_name.to_string(),
                 params,
-                source_loc: None,
             });
         }
     }
@@ -871,7 +845,7 @@ pub fn parse_bpf_btf_functions(
 /// Infer scalar param names for sched_ext_ops callbacks.
 /// Used when vmlinux FuncProto has empty names.
 fn infer_scalar_param_name(func_name: &str, param_pos: usize) -> String {
-    // sched_ext_ops callback scalar param names (stable kernel ABI).
+    // Common sched_ext callback param names.
     const OPS_SCALARS: &[(&str, &[&str])] = &[
         ("dispatch", &["cpu"]),
         ("select_cpu", &["", "prev_cpu", "wake_flags"]),
@@ -1371,7 +1345,6 @@ mod tests {
         let f = BtfFunc {
             name: "empty".into(),
             params: vec![],
-            source_loc: None,
         };
         assert_eq!(f.name, "empty");
         assert!(f.params.is_empty());
@@ -1401,7 +1374,6 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            source_loc: None,
         };
         assert_eq!(f.params.len(), 3);
         assert!(f.params[0].is_ptr);

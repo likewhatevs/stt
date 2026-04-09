@@ -13,8 +13,8 @@
 //!
 //! The [`ops`] submodule provides composable cgroup topology operations.
 //!
-//! See the [Scenarios](https://sched-ext.github.io/scx/stt/concepts/scenarios.html)
-//! and [Writing Tests](https://sched-ext.github.io/scx/stt/writing-tests.html)
+//! See the [Scenarios](https://likewhatevs.github.io/stt/guide/concepts/scenarios.html)
+//! and [Writing Tests](https://likewhatevs.github.io/stt/guide/writing-tests.html)
 //! chapters of the guide.
 
 pub mod affinity;
@@ -71,9 +71,6 @@ pub mod flags {
         /// Extra CLI arguments passed to the scheduler when this flag is active.
         pub args: &'static [&'static str],
         pub requires: &'static [&'static FlagDecl],
-        /// Shell commands to run in the guest to enable this flag
-        /// (e.g. debugfs writes for kernel-built scheduler tunables).
-        pub shell_cmds: &'static [&'static str],
     }
 
     impl std::fmt::Debug for FlagDecl {
@@ -83,7 +80,6 @@ pub mod flags {
                 .field("name", &self.name)
                 .field("args", &self.args)
                 .field("requires", &req_names)
-                .field("shell_cmds", &self.shell_cmds)
                 .finish()
         }
     }
@@ -92,37 +88,31 @@ pub mod flags {
         name: "llc",
         args: &[],
         requires: &[],
-        shell_cmds: &[],
     };
     pub static BORROW_DECL: FlagDecl = FlagDecl {
         name: "borrow",
         args: &[],
         requires: &[],
-        shell_cmds: &[],
     };
     pub static STEAL_DECL: FlagDecl = FlagDecl {
         name: "steal",
         args: &[],
         requires: &[&LLC_DECL],
-        shell_cmds: &[],
     };
     pub static REBAL_DECL: FlagDecl = FlagDecl {
         name: "rebal",
         args: &[],
         requires: &[],
-        shell_cmds: &[],
     };
     pub static REJECT_PIN_DECL: FlagDecl = FlagDecl {
         name: "reject-pin",
         args: &[],
         requires: &[],
-        shell_cmds: &[],
     };
     pub static NO_CTRL_DECL: FlagDecl = FlagDecl {
         name: "no-ctrl",
         args: &[],
         requires: &[],
-        shell_cmds: &[],
     };
 
     /// All flag declarations in canonical order.
@@ -135,7 +125,7 @@ pub mod flags {
         &NO_CTRL_DECL,
     ];
 
-    // String name constants for Scenario.required_flags / excluded_flags.
+    // String name constants for FlagProfile.flags.
     pub const LLC: &str = "llc";
     pub const BORROW: &str = "borrow";
     pub const STEAL: &str = "steal";
@@ -331,7 +321,7 @@ pub struct Scenario {
     /// Unique identifier (e.g. `"cgroup_steady"`).
     pub name: &'static str,
     /// Category: basic, cpuset, affinity, sched_class, dynamic, stress,
-    /// stall, advanced, nested, or interaction.
+    /// stall, advanced, nested, interaction, or performance.
     pub category: &'static str,
     /// Human-readable description.
     pub description: &'static str,
@@ -477,11 +467,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     if let Some(ref cs) = cpusets
         && cs.iter().any(|s| s.is_empty())
     {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: not enough CPUs/LLCs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: not enough CPUs/LLCs"));
     }
 
     let names: Vec<String> = (0..scenario.num_cgroups)
@@ -512,20 +498,12 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
             .unwrap_or_default();
         let n = cw.num_workers.unwrap_or(ctx.workers_per_cgroup);
         let affinity = resolve_affinity_kind(&cw.affinity, cpusets.as_deref(), i, ctx.topo);
-        let effective_work_type = if let Some(override_wt) = ctx.work_type_override
-            && matches!(cw.work_type, WorkType::CpuSpin)
-        {
-            // Skip grouped-worker overrides when num_workers is not divisible.
-            if let Some(gs) = override_wt.worker_group_size()
-                && n % gs != 0
-            {
-                cw.work_type
-            } else {
-                override_wt
-            }
-        } else {
-            cw.work_type
-        };
+        let effective_work_type = crate::workload::resolve_work_type(
+            cw.work_type,
+            ctx.work_type_override,
+            matches!(cw.work_type, WorkType::CpuSpin),
+            n,
+        );
         let wl = WorkloadConfig {
             num_workers: n,
             affinity,

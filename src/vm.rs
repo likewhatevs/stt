@@ -1,7 +1,7 @@
 //! VM launch configuration and gauntlet topology presets.
 //!
-//! See the [Running Tests](https://sched-ext.github.io/scx/stt/running-tests.html)
-//! and [Gauntlet](https://sched-ext.github.io/scx/stt/running-tests/gauntlet.html)
+//! See the [Running Tests](https://likewhatevs.github.io/stt/guide/running-tests.html)
+//! and [Gauntlet](https://likewhatevs.github.io/stt/guide/running-tests/gauntlet.html)
 //! chapters of the guide.
 
 use anyhow::{Context, Result};

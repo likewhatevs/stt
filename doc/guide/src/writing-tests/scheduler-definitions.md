@@ -86,8 +86,7 @@ const RELAXED: Scheduler = Scheduler::new("relaxed")
 
 For schedulers compiled into the kernel (no userspace binary),
 use `SchedulerSpec::KernelBuiltin` with shell commands to
-activate/deactivate the scheduler and `FlagDecl.shell_cmds` for
-flag-specific tunables:
+activate/deactivate the scheduler:
 
 ```rust,ignore
 use stt::prelude::*;
@@ -97,9 +96,6 @@ static MINLAT_LLC: FlagDecl = FlagDecl {
     name: "llc",
     args: &[],
     requires: &[],
-    shell_cmds: &[
-        "echo 1 > /sys/kernel/debug/sched/ext/minlat/llc_aware",
-    ],
 };
 
 const MINLAT: Scheduler = Scheduler::new("minlat")
@@ -111,8 +107,7 @@ const MINLAT: Scheduler = Scheduler::new("minlat")
 ```
 
 The `enable` commands run in the guest before scenarios start.
-The `disable` commands run after scenarios complete. Flag
-`shell_cmds` run when the flag is active in the current profile.
+The `disable` commands run after scenarios complete.
 
 For an end-to-end workflow from building a scheduler to running the
 gauntlet, see [Test a New Scheduler](../recipes/test-new-scheduler.md).

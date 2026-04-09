@@ -134,6 +134,38 @@ const KEEP_LAST_RATE_THRESHOLD: f64 = 10.0;
 /// 0.3 = 30% drop or increase.
 const ITERATION_RATE_REL_THRESHOLD: f64 = 0.3;
 
+/// Create a PhaseChange if the delta between `before` and `after` exceeds
+/// `threshold`. `higher_is_worse` determines degradation direction: when
+/// true, a positive delta means Degraded; when false, a negative delta
+/// means Degraded.
+fn detect_change(
+    before: f64,
+    after: f64,
+    threshold: f64,
+    metric: &str,
+    higher_is_worse: bool,
+) -> Option<PhaseChange> {
+    let delta = after - before;
+    if delta.abs() <= threshold {
+        return None;
+    }
+    let degraded = if higher_is_worse {
+        delta > 0.0
+    } else {
+        delta < 0.0
+    };
+    Some(PhaseChange {
+        direction: if degraded {
+            ChangeDirection::Degraded
+        } else {
+            ChangeDirection::Improved
+        },
+        metric: metric.to_string(),
+        before,
+        after,
+    })
+}
+
 impl Timeline {
     /// Build a timeline from stimulus events and monitor samples.
     ///
@@ -232,75 +264,43 @@ impl Timeline {
             let mut changes = Vec::new();
 
             if before.sample_count > 0 && after_metrics.sample_count > 0 {
-                let imb_delta = after_metrics.avg_imbalance - before.avg_imbalance;
-                if imb_delta.abs() > IMBALANCE_THRESHOLD {
-                    changes.push(PhaseChange {
-                        direction: if imb_delta > 0.0 {
-                            ChangeDirection::Degraded
-                        } else {
-                            ChangeDirection::Improved
-                        },
-                        metric: "imbalance".to_string(),
-                        before: before.avg_imbalance,
-                        after: after_metrics.avg_imbalance,
-                    });
+                changes.extend(detect_change(
+                    before.avg_imbalance,
+                    after_metrics.avg_imbalance,
+                    IMBALANCE_THRESHOLD,
+                    "imbalance",
+                    true,
+                ));
+                changes.extend(detect_change(
+                    before.avg_dsq_depth,
+                    after_metrics.avg_dsq_depth,
+                    DSQ_THRESHOLD,
+                    "dsq_depth",
+                    true,
+                ));
+                if let (Some(bf), Some(af)) = (before.fallback_rate, after_metrics.fallback_rate) {
+                    changes.extend(detect_change(
+                        bf,
+                        af,
+                        FALLBACK_RATE_THRESHOLD,
+                        "fallback",
+                        true,
+                    ));
                 }
-
-                let dsq_delta = after_metrics.avg_dsq_depth - before.avg_dsq_depth;
-                if dsq_delta.abs() > DSQ_THRESHOLD {
-                    changes.push(PhaseChange {
-                        direction: if dsq_delta > 0.0 {
-                            ChangeDirection::Degraded
-                        } else {
-                            ChangeDirection::Improved
-                        },
-                        metric: "dsq_depth".to_string(),
-                        before: before.avg_dsq_depth,
-                        after: after_metrics.avg_dsq_depth,
-                    });
-                }
-
-                if let (Some(before_fb), Some(after_fb)) =
-                    (before.fallback_rate, after_metrics.fallback_rate)
+                if let (Some(bk), Some(ak)) = (before.keep_last_rate, after_metrics.keep_last_rate)
                 {
-                    let fb_delta = after_fb - before_fb;
-                    if fb_delta.abs() > FALLBACK_RATE_THRESHOLD {
-                        changes.push(PhaseChange {
-                            direction: if fb_delta > 0.0 {
-                                ChangeDirection::Degraded
-                            } else {
-                                ChangeDirection::Improved
-                            },
-                            metric: "fallback".to_string(),
-                            before: before_fb,
-                            after: after_fb,
-                        });
-                    }
+                    changes.extend(detect_change(
+                        bk,
+                        ak,
+                        KEEP_LAST_RATE_THRESHOLD,
+                        "keep_last",
+                        true,
+                    ));
                 }
-
-                if let (Some(before_kl), Some(after_kl)) =
-                    (before.keep_last_rate, after_metrics.keep_last_rate)
+                if let (Some(bi), Some(ai)) = (before.iteration_rate, after_metrics.iteration_rate)
+                    && bi > 0.0
                 {
-                    let kl_delta = after_kl - before_kl;
-                    if kl_delta.abs() > KEEP_LAST_RATE_THRESHOLD {
-                        changes.push(PhaseChange {
-                            direction: if kl_delta > 0.0 {
-                                ChangeDirection::Degraded
-                            } else {
-                                ChangeDirection::Improved
-                            },
-                            metric: "keep_last".to_string(),
-                            before: before_kl,
-                            after: after_kl,
-                        });
-                    }
-                }
-
-                if let (Some(before_ir), Some(after_ir)) =
-                    (before.iteration_rate, after_metrics.iteration_rate)
-                    && before_ir > 0.0
-                {
-                    let rel_delta = (after_ir - before_ir) / before_ir;
+                    let rel_delta = (ai - bi) / bi;
                     if rel_delta.abs() > ITERATION_RATE_REL_THRESHOLD {
                         changes.push(PhaseChange {
                             direction: if rel_delta < 0.0 {
@@ -309,8 +309,8 @@ impl Timeline {
                                 ChangeDirection::Improved
                             },
                             metric: "throughput".to_string(),
-                            before: before_ir,
-                            after: after_ir,
+                            before: bi,
+                            after: ai,
                         });
                     }
                 }
@@ -524,7 +524,11 @@ fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
         let curr = w[1];
         let cpu_count = prev.cpus.len().min(curr.cpus.len());
         for cpu in 0..cpu_count {
-            if curr.cpus[cpu].rq_clock != 0 && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock {
+            let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
+            if curr.cpus[cpu].rq_clock != 0
+                && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
+                && !idle
+            {
                 stall_count += 1;
             }
         }

@@ -534,12 +534,17 @@ impl BpfValueLayout {
 
 /// Chase modifier chains (Volatile, Const, Typedef, TypeTag, Restrict)
 /// to reach the underlying Struct.
-fn resolve_to_struct(btf: &btf_rs::Btf, type_id: u32) -> Option<btf_rs::Struct> {
+/// Chase modifiers, pointers, and typedefs from `type_id` to find a Struct.
+///
+/// Returns `None` if the chain ends in a non-Struct type or exceeds
+/// depth 20. Also resolves through Ptr (for pointer-to-struct members).
+pub(crate) fn resolve_to_struct(btf: &btf_rs::Btf, type_id: u32) -> Option<btf_rs::Struct> {
     let mut t = btf.resolve_type_by_id(type_id).ok()?;
     for _ in 0..20 {
         match t {
-            btf_rs::Type::Struct(s) => return Some(s),
-            btf_rs::Type::Volatile(_)
+            btf_rs::Type::Struct(s) | btf_rs::Type::Union(s) => return Some(s),
+            btf_rs::Type::Ptr(_)
+            | btf_rs::Type::Volatile(_)
             | btf_rs::Type::Const(_)
             | btf_rs::Type::Typedef(_)
             | btf_rs::Type::TypeTag(_)

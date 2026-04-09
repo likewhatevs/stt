@@ -10,14 +10,8 @@ pub struct FlagDecl {
     pub name: &'static str,
     pub args: &'static [&'static str],
     pub requires: &'static [&'static FlagDecl],
-    pub shell_cmds: &'static [&'static str],
 }
 ```
-
-`shell_cmds` are shell commands run in the guest to enable this flag.
-This is used with `SchedulerSpec::KernelBuiltin` schedulers where
-flags are activated via debugfs writes or sysctl changes rather than
-CLI arguments. For schedulers with a binary, flags use `args` instead.
 
 Six flags are defined:
 
@@ -39,7 +33,6 @@ pub static STEAL_DECL: FlagDecl = FlagDecl {
     name: "steal",
     args: &[],
     requires: &[&LLC_DECL],
-    shell_cmds: &[],
 };
 ```
 
@@ -48,15 +41,15 @@ without `llc` is rejected.
 
 ## Using flags
 
-From the CLI, pass `--flags=borrow,rebal`:
+In `#[stt_test]`, use `required_flags` and `excluded_flags` to
+constrain which flag profiles the test runs with:
 
-```sh
-stt vm --sockets 2 --cores 4 --threads 2 \
-  -- cgroup_steady --flags=borrow,rebal
+```rust,ignore
+#[stt_test(required_flags = ["llc", "borrow"])]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
-`--all-flags` runs every valid flag combination for the selected
-scenarios.
+The gauntlet expands each test across all valid flag profiles.
 
 ## Flag profiles
 
@@ -86,4 +79,4 @@ combinations:
 Unconstrained: 48 profiles. With `steal` required: all profiles
 include both `steal` and `llc`.
 
-For CLI usage, see [Running Tests -- Flags](../running-tests.md#flags).
+For gauntlet flag expansion, see [Gauntlet](../running-tests/gauntlet.md#flag-profiles).

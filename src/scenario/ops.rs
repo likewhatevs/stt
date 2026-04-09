@@ -5,7 +5,7 @@
 //! single declaration. [`execute_steps()`] runs a step sequence with
 //! scheduler liveness checks and stimulus event recording.
 //!
-//! See the [Ops and Steps](https://sched-ext.github.io/scx/stt/concepts/ops.html)
+//! See the [Ops and Steps](https://likewhatevs.github.io/stt/guide/concepts/ops.html)
 //! chapter for a guide.
 
 use std::borrow::Cow;
@@ -101,6 +101,11 @@ pub enum CpusetSpec {
 /// Bundles the three ops that always go together (AddCgroup + SetCpuset +
 /// Spawn) into a single value. The executor creates the cgroup, optionally
 /// sets its cpuset, spawns workers, and moves them into the cgroup.
+///
+/// Use `CgroupDef` in `Step::with_defs` for scenarios where cgroups are
+/// created once and run for the step duration. Use `Op::AddCgroup` +
+/// `Op::Spawn` directly when you need mid-step cgroup creation, removal,
+/// or other dynamic operations between spawn and collect.
 ///
 /// ```
 /// # use stt::scenario::ops::{CgroupDef, CpusetSpec};
@@ -437,11 +442,62 @@ impl Drop for ShmWriter {
 // ---------------------------------------------------------------------------
 
 impl CpusetSpec {
+    /// Check whether this spec can produce a non-empty cpuset for the
+    /// given topology. Returns `Err` with a human-readable reason on
+    /// failure.
+    pub fn validate(&self, ctx: &Ctx) -> std::result::Result<(), String> {
+        let usable = ctx.topo.usable_cpus();
+        match self {
+            CpusetSpec::Llc(idx) if *idx >= ctx.topo.num_llcs() => Err(format!(
+                "Llc({idx}) out of range: topology has {} LLCs",
+                ctx.topo.num_llcs()
+            )),
+            CpusetSpec::Disjoint { of, .. } | CpusetSpec::Overlap { of, .. } if *of == 0 => {
+                Err("partition count (of) must be > 0".into())
+            }
+            CpusetSpec::Disjoint { index, of, .. } | CpusetSpec::Overlap { index, of, .. }
+                if *index >= *of =>
+            {
+                Err(format!("index {index} >= partition count {of}"))
+            }
+            CpusetSpec::Range {
+                start_frac,
+                end_frac,
+            } if start_frac >= end_frac => Err(format!(
+                "Range start_frac ({start_frac}) >= end_frac ({end_frac})"
+            )),
+            CpusetSpec::Disjoint { of, .. } | CpusetSpec::Overlap { of, .. }
+                if usable.len() < *of =>
+            {
+                Err(format!(
+                    "not enough usable CPUs ({}) for {} partitions",
+                    usable.len(),
+                    of
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Resolve to a concrete CPU set given the topology.
     pub fn resolve(&self, ctx: &Ctx) -> BTreeSet<usize> {
         let usable = ctx.topo.usable_cpus();
         match self {
-            CpusetSpec::Llc(idx) => ctx.topo.llc_aligned_cpuset(*idx),
+            CpusetSpec::Llc(idx) => {
+                if *idx >= ctx.topo.num_llcs() {
+                    // Graceful fallback: clamp to last LLC instead of panicking.
+                    let clamped = ctx.topo.num_llcs().saturating_sub(1);
+                    tracing::warn!(
+                        llc_idx = idx,
+                        num_llcs = ctx.topo.num_llcs(),
+                        clamped,
+                        "CpusetSpec::Llc index out of range, clamping",
+                    );
+                    ctx.topo.llc_aligned_cpuset(clamped)
+                } else {
+                    ctx.topo.llc_aligned_cpuset(*idx)
+                }
+            }
             CpusetSpec::Range {
                 start_frac,
                 end_frac,
@@ -650,24 +706,19 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
     for def in defs {
         state.cgroups.add_cgroup_no_cpuset(&def.name)?;
         if let Some(ref cpuset_spec) = def.cpuset {
+            if let Err(reason) = cpuset_spec.validate(ctx) {
+                tracing::warn!(cgroup = %def.name, reason, "CpusetSpec validation failed");
+            }
             let resolved = cpuset_spec.resolve(ctx);
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
         }
         let n = def.num_workers.unwrap_or(ctx.workers_per_cgroup);
-        let effective_work_type = if def.swappable
-            && let Some(override_wt) = ctx.work_type_override
-        {
-            // Skip grouped-worker overrides when num_workers is not divisible.
-            if let Some(gs) = override_wt.worker_group_size()
-                && n % gs != 0
-            {
-                def.work_type
-            } else {
-                override_wt
-            }
-        } else {
-            def.work_type
-        };
+        let effective_work_type = crate::workload::resolve_work_type(
+            def.work_type,
+            ctx.work_type_override,
+            def.swappable,
+            n,
+        );
         let wl = WorkloadConfig {
             num_workers: n,
             affinity: AffinityMode::None,
@@ -695,6 +746,9 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 let _ = ctx.cgroups.remove_cgroup(name);
             }
             Op::SetCpuset { cgroup, cpus } => {
+                if let Err(reason) = cpus.validate(ctx) {
+                    tracing::warn!(cgroup = %cgroup, reason, "CpusetSpec validation failed");
+                }
                 let resolved = cpus.resolve(ctx);
                 ctx.cgroups.set_cpuset(cgroup, &resolved)?;
             }
@@ -789,17 +843,9 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
     if content.is_empty() {
         return None;
     }
-    let mut cpus = BTreeSet::new();
-    for part in content.split(',') {
-        let part = part.trim();
-        if let Some((lo, hi)) = part.split_once('-') {
-            if let (Ok(lo), Ok(hi)) = (lo.parse::<usize>(), hi.parse::<usize>()) {
-                cpus.extend(lo..=hi);
-            }
-        } else if let Ok(cpu) = part.parse::<usize>() {
-            cpus.insert(cpu);
-        }
-    }
+    let cpus: BTreeSet<usize> = crate::topology::parse_cpu_list_lenient(content)
+        .into_iter()
+        .collect();
     Some(cpus)
 }
 

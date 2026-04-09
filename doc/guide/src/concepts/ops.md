@@ -56,7 +56,7 @@ let def = CgroupDef::named("cg_0")
 ### Work type overrides and swappable
 
 `CgroupDef` has a `swappable` flag (default: `false`). When `true`
-and a work type override is active (`--work-type` CLI flag), the
+and a work type override is active (`Ctx.work_type_override`), the
 override replaces this def's work type.
 
 In contrast, the `Scenario`-level override (in `run_scenario()`) only
@@ -128,11 +128,15 @@ fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-When `assertions` is `Some`, the provided thresholds override the defaults
-for gap and spread checks. When `None`, `execute_steps_with` falls
-back to `assert_not_starved()` with the default thresholds.
+When `assertions` is `Some`, the provided `Assert` overrides `ctx.assert`
+for worker checks. When `None`, uses `ctx.assert` (the merged
+three-layer config: `default_checks` -> scheduler -> per-test).
 
 ## Layout
+
+> `Layout` and `Traverse` are `pub(crate)` — available within stt's
+> own scenarios but not exported to external users. External tests
+> use `Step::with_defs` and `execute_steps` directly.
 
 `Layout` controls how `Traverse` assigns cpusets in each phase:
 

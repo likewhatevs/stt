@@ -9,7 +9,7 @@
 //! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->
 //! `Scheduler.assert` -> per-test `assert`.
 //!
-//! See the [Verification](https://sched-ext.github.io/scx/stt/concepts/verification.html)
+//! See the [Verification](https://likewhatevs.github.io/stt/guide/concepts/verification.html)
 //! chapter of the guide.
 
 use crate::workload::WorkerReport;
@@ -126,6 +126,15 @@ impl AssertResult {
         Self {
             passed: true,
             details: vec![],
+            stats: Default::default(),
+        }
+    }
+    /// Pass result with a skip reason. Used when a scenario cannot run
+    /// under the current topology or flag combination but is not a failure.
+    pub fn skip(reason: impl Into<String>) -> Self {
+        Self {
+            passed: true,
+            details: vec![reason.into()],
             stats: Default::default(),
         }
     }
@@ -249,8 +258,9 @@ impl AssertPlan {
             // Apply custom gap threshold if set.
             if let Some(threshold) = self.max_gap_ms {
                 // Re-check gaps against custom threshold. The default
-                // assert_not_starved uses 2000ms; clear those failures
-                // and re-evaluate.
+                // assert_not_starved uses gap_threshold_ms() (2000ms
+                // release, 3000ms debug); clear those failures and
+                // re-evaluate.
                 cgroup_result.details.retain(|d| !d.contains("stuck"));
                 let had_gap_failure = reports.iter().any(|w| w.max_gap_ms > threshold);
                 if had_gap_failure {
@@ -417,8 +427,8 @@ impl Assert {
     };
 
     /// Default checks: not_starved enabled, monitor thresholds
-    /// (imbalance 4.0, dsq_depth 50, stall on, sustained 5,
-    /// fallback 200.0, keep_last 100.0).
+    /// from `MonitorThresholds::DEFAULT` (imbalance 4.0, dsq_depth 50,
+    /// stall on, sustained 5, fallback 200.0/s, keep_last 100.0/s).
     pub const fn default_checks() -> Assert {
         use crate::monitor::MonitorThresholds;
         Assert {

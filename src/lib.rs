@@ -7,22 +7,39 @@
 //!
 //! # Quick start
 //!
-//! Write a test that boots a VM, creates a cgroup, runs a workload, and
-//! checks the result:
+//! Define cgroups declaratively, let the DSL handle cgroup lifecycle,
+//! worker spawning, and assertion:
+//!
+//! ```rust
+//! use stt::prelude::*;
+//!
+//! #[stt_test(sockets = 1, cores = 2, threads = 1)]
+//! fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
+//!     let steps = vec![Step::with_defs(
+//!         vec![
+//!             CgroupDef::named("cg_0").workers(2),
+//!             CgroupDef::named("cg_1").workers(2),
+//!         ],
+//!         HoldSpec::Frac(1.0),
+//!     )];
+//!     execute_steps(ctx, steps)
+//! }
+//! ```
+//!
+//! For full control over cgroup setup, worker spawning, and assertion
+//! you can use the low-level API directly:
 //!
 //! ```rust
 //! use stt::prelude::*;
 //! use std::collections::BTreeSet;
 //!
 //! #[stt_test(sockets = 1, cores = 2, threads = 1)]
-//! fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
-//!     // Create a cgroup and assign all CPUs.
+//! fn my_low_level_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     let mut group = CgroupGroup::new(ctx.cgroups);
 //!     group.add_cgroup_no_cpuset("workers")?;
 //!     let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
 //!     ctx.cgroups.set_cpuset("workers", &cpus)?;
 //!
-//!     // Spawn workers into the cgroup.
 //!     let cfg = WorkloadConfig {
 //!         num_workers: 2,
 //!         work_type: WorkType::CpuSpin,
@@ -34,11 +51,9 @@
 //!     }
 //!     handle.start();
 //!
-//!     // Let workers run, then collect results.
 //!     std::thread::sleep(ctx.duration);
 //!     let reports = handle.stop_and_collect();
 //!
-//!     // Assert: no worker was starved.
 //!     let a = Assert::default_checks();
 //!     Ok(a.assert_cgroup(&reports, None))
 //! }
@@ -133,8 +148,7 @@ pub mod prelude {
     pub use crate::stt_test;
     pub use crate::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
     pub use crate::workload::{
-        AffinityMode, SchedPolicy, WorkProgram, WorkType, WorkerReport, WorkloadConfig,
-        WorkloadHandle,
+        AffinityMode, SchedPolicy, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle,
     };
 }
 

@@ -22,57 +22,26 @@ scheduler.
 
 ### As a library
 
-Write a test that boots a VM, creates a cgroup, runs a workload, and
-checks the result:
+Define cgroups declaratively and let the DSL handle lifecycle,
+worker spawning, and assertion:
 
 ```rust
 use stt::prelude::*;
-use std::collections::BTreeSet;
 
 #[stt_test(sockets = 1, cores = 2, threads = 1)]
 fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
-    // Create a cgroup and assign all CPUs.
-    let mut group = CgroupGroup::new(ctx.cgroups);
-    group.add_cgroup_no_cpuset("workers")?;
-    let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
-    ctx.cgroups.set_cpuset("workers", &cpus)?;
-
-    // Spawn workers into the cgroup.
-    let cfg = WorkloadConfig {
-        num_workers: 2,
-        work_type: WorkType::CpuSpin,
-        ..Default::default()
-    };
-    let mut handle = WorkloadHandle::spawn(&cfg)?;
-    for tid in handle.tids() {
-        ctx.cgroups.move_task("workers", tid)?;
-    }
-    handle.start();
-
-    // Let workers run, then collect results.
-    std::thread::sleep(ctx.duration);
-    let reports = handle.stop_and_collect();
-
-    // Assert: no worker was starved.
-    let a = Assert::default_checks();
-    Ok(a.assert_cgroup(&reports, None))
+    let steps = vec![Step::with_defs(
+        vec![
+            CgroupDef::named("cg_0").workers(2),
+            CgroupDef::named("cg_1").workers(2),
+        ],
+        HoldSpec::Frac(1.0),
+    )];
+    execute_steps(ctx, steps)
 }
 ```
 
-Run with `cargo test` (requires `/dev/kvm`).
-
-### From the CLI
-
-```sh
-cargo install --path .
-
-# single scenario
-stt vm --sockets 2 --cores 4 --threads 2 -- cgroup_steady
-
-# with a scheduler
-stt vm --sockets 2 --cores 4 --threads 2 \
-  --scheduler-bin ./target/release/scx_mitosis -- cgroup_steady
-```
+Run with `cargo nextest run` (requires `/dev/kvm`).
 
 ## Documentation
 

@@ -78,41 +78,6 @@ pub fn expand_bpf_to_kernel_callers(functions: Vec<StackFunction>) -> Vec<StackF
     result
 }
 
-/// Extract function names from a crash stack trace for the next run.
-/// Deduplicates and skips generic functions.
-#[allow(dead_code)]
-pub fn extract_stack_functions(stack: &str) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    stack
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim().trim_start_matches("  ");
-            let func = trimmed.split('+').next()?;
-            let func = func.trim();
-            if func.is_empty()
-                || func.contains(' ')
-                || func.starts_with('[')
-                || func.starts_with('#')
-                || func.starts_with('=')
-                || func.starts_with('-')
-                || func.ends_with(':')
-                || func.starts_with("bpf_prog_")
-                || !func
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-                || should_skip_probe(func)
-            {
-                return None;
-            }
-            if seen.insert(func.to_string()) {
-                Some(func.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 // ---- Auto-probe: crash-stack-driven probing ----
 
 /// A function to probe, from a crash stack or BPF program discovery.
@@ -125,12 +90,11 @@ pub struct StackFunction {
     pub raw_name: String,
     pub display_name: String,
     pub is_bpf: bool,
-    #[allow(dead_code)]
     pub bpf_prog_id: Option<u32>,
 }
 
-/// Public API for auto-repro: extract function names as strings.
-pub(crate) fn extract_stack_functions_all_pub(stack: &str) -> Vec<String> {
+/// Extract function names as strings for auto-repro.
+pub(crate) fn extract_stack_function_names(stack: &str) -> Vec<String> {
     extract_stack_functions_all(stack)
         .into_iter()
         .map(|f| f.raw_name)
@@ -306,6 +270,42 @@ pub fn filter_traceable(functions: Vec<StackFunction>) -> Vec<StackFunction> {
 mod tests {
     use super::*;
 
+    /// Extract function names from a crash stack trace.
+    /// Deduplicates and skips generic functions. Test-only simplified
+    /// variant of `extract_stack_functions_all` that returns bare strings
+    /// and filters out BPF programs.
+    fn extract_stack_functions(stack: &str) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        stack
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim().trim_start_matches("  ");
+                let func = trimmed.split('+').next()?;
+                let func = func.trim();
+                if func.is_empty()
+                    || func.contains(' ')
+                    || func.starts_with('[')
+                    || func.starts_with('#')
+                    || func.starts_with('=')
+                    || func.starts_with('-')
+                    || func.ends_with(':')
+                    || func.starts_with("bpf_prog_")
+                    || !func
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    || should_skip_probe(func)
+                {
+                    return None;
+                }
+                if seen.insert(func.to_string()) {
+                    Some(func.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     // -- should_skip_probe --
 
     #[test]
@@ -383,12 +383,12 @@ mod tests {
         assert!(!fns.iter().any(|f| f.starts_with("bpf_prog_")));
     }
 
-    // -- extract_stack_functions_all_pub --
+    // -- extract_stack_function_names --
 
     #[test]
-    fn extract_stack_functions_all_pub_includes_bpf() {
+    fn extract_stack_function_names_includes_bpf() {
         let stack = "do_enqueue_task+0x100/0x200\nbpf_prog_abc_mitosis_enqueue+0x50/0x80\n";
-        let fns = extract_stack_functions_all_pub(stack);
+        let fns = extract_stack_function_names(stack);
         assert!(fns.contains(&"do_enqueue_task".to_string()));
         assert!(fns.contains(&"bpf_prog_abc_mitosis_enqueue".to_string()));
     }

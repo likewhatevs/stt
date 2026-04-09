@@ -104,17 +104,13 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     // consume path, CPUs go idle and never retry.
     let all = ctx.topo.all_cpus();
     if all.len() < 4 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=4 CPUs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
     }
     let last = all.len() - 1;
 
     let mut _guard = CgroupGroup::new(ctx.cgroups);
     _guard.add_cgroup("cg_0", &all[..last].iter().copied().collect())?;
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_millis(ctx.settle_ms));
 
     let n_unpinned = (last * 3).max(8);
     let mut h_cgroup = WorkloadHandle::spawn(&WorkloadConfig {
@@ -174,18 +170,14 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
 pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     // All workload types across 5 cgroups, no flags. Exercises base dispatch with every work pattern.
     if ctx.topo.all_cpus().len() < 6 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=6 CPUs for 5 cgroups".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: need >=6 CPUs for 5 cgroups"));
     }
     let names: Vec<String> = (0..5).map(|i| format!("cg_{i}")).collect();
     let mut _guard = CgroupGroup::new(ctx.cgroups);
     for n in &names {
         _guard.add_cgroup_no_cpuset(n)?;
     }
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_millis(ctx.settle_ms));
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let handles = spawn_diverse(ctx, &name_refs)?;
     thread::sleep(ctx.duration);
@@ -197,11 +189,7 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> 
     // All workload types with cpusets.
     let all = ctx.topo.all_cpus();
     if all.len() < 6 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=6 CPUs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: need >=6 CPUs"));
     }
     let last = all.len() - 1;
     let chunk = last / 3;
@@ -212,7 +200,7 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> 
         let end = if i == 2 { last } else { (i + 1) * chunk };
         _guard.add_cgroup(n, &all[start..end].iter().copied().collect())?;
     }
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_millis(ctx.settle_ms));
     let handles = spawn_diverse(ctx, &names)?;
     thread::sleep(ctx.duration);
     Ok(collect_all(handles))
@@ -222,18 +210,16 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> 
 pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     // Dynamic cgroup ops with diverse workloads.
     if ctx.topo.all_cpus().len() < 5 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=5 CPUs for dynamic cgroup add".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip(
+            "skipped: need >=5 CPUs for dynamic cgroup add",
+        ));
     }
     let names: Vec<String> = (0..3).map(|i| format!("cg_{i}")).collect();
     let mut _guard = CgroupGroup::new(ctx.cgroups);
     for n in &names {
         _guard.add_cgroup_no_cpuset(n)?;
     }
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_millis(ctx.settle_ms));
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let mut handles = spawn_diverse(ctx, &name_refs)?;
     thread::sleep(ctx.duration / 3);
@@ -266,20 +252,12 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
 pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<AssertResult> {
     // Need at least 2 LLCs to flip cpusets across LLC boundaries.
     if ctx.topo.num_llcs() < 2 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=2 LLCs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: need >=2 LLCs"));
     }
     let llc0_full: BTreeSet<usize> = ctx.topo.llc_aligned_cpuset(0);
     let llc1_full: BTreeSet<usize> = ctx.topo.llc_aligned_cpuset(1);
     if llc0_full.is_empty() {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: LLC0 has no CPUs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: LLC0 has no CPUs"));
     }
 
     // Reserve one CPU from LLC0 for cg_0 to avoid cg_0-starvation.
@@ -291,11 +269,9 @@ pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<AssertResult> {
         .collect();
     let llc1: BTreeSet<usize> = llc1_full.clone();
     if llc0.is_empty() {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: LLC0 too small after reserving for cg_0".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip(
+            "skipped: LLC0 too small after reserving for cg_0",
+        ));
     }
 
     // Two cgroups, initially each on its own LLC.

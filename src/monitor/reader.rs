@@ -3,7 +3,8 @@
 //! [`GuestMem`] wraps a host pointer to guest physical address 0 and
 //! provides bounds-checked volatile reads and writes for scalar types;
 //! `read_bytes` uses `copy_nonoverlapping` for bulk copies. It also implements
-//! 4-level and 5-level x86-64 page table walks for vmalloc'd addresses.
+//! 4-level and 5-level x86-64 page table walks and 3-level aarch64 walks
+//! (64KB granule) for vmalloc'd addresses.
 //!
 //! The monitor loop (`monitor_loop`) periodically reads per-CPU
 //! runqueue state from guest memory and collects `MonitorSample`s.
@@ -137,14 +138,10 @@ impl GuestMem {
         }
     }
 
-    /// 4-level page table walk.
+    /// 4-level page table walk (x86-64).
     ///
-    /// x86-64: CR3 -> PGD -> PUD -> PMD -> PTE. Uses PS bit (bit 7) for
+    /// CR3 -> PGD -> PUD -> PMD -> PTE. Uses PS bit (bit 7) for
     /// huge pages, OA in bits [51:12].
-    ///
-    /// aarch64: TTBR -> L0/PGD -> L1/PUD -> L2/PMD -> L3/PTE. Uses
-    /// descriptor type bits [1:0] (0b11 = table/page, 0b01 = block),
-    /// OA in bits [47:12].
     #[cfg(target_arch = "x86_64")]
     fn walk_4level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
         const PRESENT: u64 = 1;
@@ -198,6 +195,7 @@ impl GuestMem {
 
     /// aarch64 page table walk (64KB granule, 3-level, 48-bit VA).
     ///
+    /// TTBR_EL1 -> PGD -> PMD -> PTE.
     /// With 64KB pages and 48-bit VA, the kernel uses 3 levels:
     ///   PGD: bits [47:42] = 6 bits, 64 entries
     ///   PMD: bits [41:29] = 13 bits, 8192 entries
@@ -602,23 +600,39 @@ pub(crate) struct ProgStatsCtx {
 /// `page_offset`: runtime `PAGE_OFFSET` for direct-mapping KVA translation.
 /// Used by sched_domain tree walking to translate `rq->sd` and
 /// `sd->parent` pointers.
-#[allow(clippy::too_many_arguments)]
+///
+/// Configuration for the monitor sampling loop.
+///
+/// Bundles the parameters that `monitor_loop` needs beyond the
+/// required `mem`, `rq_pas`, `offsets`, `interval`, `kill`, and `start`.
+pub(crate) struct MonitorConfig<'a> {
+    pub event_pcpu_pas: Option<&'a [u64]>,
+    pub dump_trigger: Option<&'a DumpTrigger>,
+    pub watchdog_override: Option<&'a WatchdogOverride>,
+    pub vcpu_timing: Option<&'a VcpuTiming>,
+    pub preemption_threshold_ns: u64,
+    pub shm_base_pa: Option<u64>,
+    pub prog_stats_ctx: Option<&'a ProgStatsCtx>,
+    pub page_offset: u64,
+}
+
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
     rq_pas: &[u64],
     offsets: &KernelOffsets,
-    event_pcpu_pas: Option<&[u64]>,
     interval: Duration,
     kill: &AtomicBool,
     start: Instant,
-    dump_trigger: Option<&DumpTrigger>,
-    watchdog_override: Option<&WatchdogOverride>,
-    vcpu_timing: Option<&VcpuTiming>,
-    preemption_threshold_ns: u64,
-    shm_base_pa: Option<u64>,
-    prog_stats_ctx: Option<&ProgStatsCtx>,
-    page_offset: u64,
+    cfg: &MonitorConfig<'_>,
 ) -> (Vec<MonitorSample>, crate::vmm::shm_ring::ShmDrainResult) {
+    let event_pcpu_pas = cfg.event_pcpu_pas;
+    let dump_trigger = cfg.dump_trigger;
+    let watchdog_override = cfg.watchdog_override;
+    let vcpu_timing = cfg.vcpu_timing;
+    let preemption_threshold_ns = cfg.preemption_threshold_ns;
+    let shm_base_pa = cfg.shm_base_pa;
+    let prog_stats_ctx = cfg.prog_stats_ctx;
+    let page_offset = cfg.page_offset;
     let preemption_threshold_ns = if preemption_threshold_ns > 0 {
         preemption_threshold_ns
     } else {
@@ -793,6 +807,19 @@ mod tests {
     use super::*;
     use std::os::unix::thread::JoinHandleExt;
 
+    fn test_config() -> MonitorConfig<'static> {
+        MonitorConfig {
+            event_pcpu_pas: None,
+            dump_trigger: None,
+            watchdog_override: None,
+            vcpu_timing: None,
+            preemption_threshold_ns: 0,
+            shm_base_pa: None,
+            prog_stats_ctx: None,
+            page_offset: 0,
+        }
+    }
+
     fn test_offsets() -> KernelOffsets {
         KernelOffsets {
             rq_nr_running: 8,
@@ -909,17 +936,10 @@ mod tests {
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &test_config(),
         );
         assert!(samples.is_empty());
     }
@@ -943,17 +963,10 @@ mod tests {
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &test_config(),
         );
         handle.join().unwrap();
 
@@ -1037,17 +1050,10 @@ mod tests {
             &mem,
             &[0, pa1],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &test_config(),
         );
         handle.join().unwrap();
 
@@ -1083,17 +1089,10 @@ mod tests {
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &test_config(),
         );
         handle.join().unwrap();
 
@@ -1274,21 +1273,18 @@ mod tests {
         };
 
         let ev_pas = vec![ev_pa];
+        let cfg = MonitorConfig {
+            event_pcpu_pas: Some(&ev_pas),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[rq_pa],
             &offsets,
-            Some(&ev_pas),
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
 
@@ -1320,17 +1316,10 @@ mod tests {
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &test_config(),
         );
         handle.join().unwrap();
 
@@ -1373,21 +1362,18 @@ mod tests {
             })
         };
 
+        let cfg = MonitorConfig {
+            watchdog_override: Some(&wd),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            Some(&wd),
-            None,
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
 
@@ -1435,21 +1421,18 @@ mod tests {
             })
         };
 
+        let cfg = MonitorConfig {
+            dump_trigger: Some(&trigger),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            Some(&trigger),
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
 
@@ -1500,21 +1483,18 @@ mod tests {
             })
         };
 
+        let cfg = MonitorConfig {
+            dump_trigger: Some(&trigger),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            Some(&trigger),
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
 
@@ -1566,21 +1546,18 @@ mod tests {
             })
         };
 
+        let cfg = MonitorConfig {
+            dump_trigger: Some(&trigger),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            Some(&trigger),
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
 
@@ -1641,21 +1618,19 @@ mod tests {
             })
         };
 
+        let cfg = MonitorConfig {
+            dump_trigger: Some(&trigger),
+            vcpu_timing: Some(&vcpu_timing),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(30),
             &kill,
             Instant::now(),
-            Some(&trigger),
-            None,
-            Some(&vcpu_timing),
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
         sleeper_kill.store(true, Ordering::Release);
@@ -1718,21 +1693,19 @@ mod tests {
             })
         };
 
+        let cfg = MonitorConfig {
+            dump_trigger: Some(&trigger),
+            vcpu_timing: Some(&vcpu_timing),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(30),
             &kill,
             Instant::now(),
-            Some(&trigger),
-            None,
-            Some(&vcpu_timing),
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
         spinner_kill.store(true, Ordering::Release);
@@ -1793,21 +1766,18 @@ mod tests {
             })
         };
 
+        let cfg = MonitorConfig {
+            dump_trigger: Some(&trigger),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            Some(&trigger),
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
 
@@ -1878,21 +1848,18 @@ mod tests {
             })
         };
 
+        let cfg = MonitorConfig {
+            dump_trigger: Some(&trigger),
+            ..test_config()
+        };
         let (samples, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            Some(&trigger),
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &cfg,
         );
         handle.join().unwrap();
 
@@ -2043,17 +2010,10 @@ mod tests {
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &test_config(),
         );
         handle.join().unwrap();
 
@@ -2085,17 +2045,10 @@ mod tests {
             &mem,
             &[0],
             &offsets,
-            None,
             Duration::from_millis(10),
             &kill,
             Instant::now(),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-            0,
+            &test_config(),
         );
         handle.join().unwrap();
 

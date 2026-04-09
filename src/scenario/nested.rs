@@ -104,11 +104,7 @@ pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
 pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     let all = ctx.topo.all_cpus();
     if all.len() < 4 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=4 CPUs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
     }
     let mid = all.len() / 2;
     let set_a: BTreeSet<usize> = all[..mid].iter().copied().collect();
@@ -159,7 +155,7 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 name: "cg_1".into(),
             },
         ],
-        hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration),
+        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -183,7 +179,7 @@ pub fn custom_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
                 name: "cg_1".into(),
             },
         ],
-        hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration),
+        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
     }];
 
     execute_steps(ctx, steps)

@@ -4,7 +4,7 @@
 //! Provides cpuset generation methods used by [`CpusetMode`](crate::scenario::CpusetMode)
 //! and [`CpusetSpec`](crate::scenario::ops::CpusetSpec).
 //!
-//! See the [Scenarios](https://sched-ext.github.io/scx/stt/concepts/scenarios.html)
+//! See the [Scenarios](https://likewhatevs.github.io/stt/guide/concepts/scenarios.html)
 //! chapter for how topology drives cpuset partitioning.
 
 use anyhow::{Context, Result, bail};
@@ -57,7 +57,11 @@ pub struct TestTopology {
 }
 
 /// Parse a CPU list string (e.g., "0-3,5,7-9") into a sorted vec of CPU IDs.
-fn parse_cpu_list(s: &str) -> Result<Vec<usize>> {
+///
+/// Returns an error if any element is not a valid integer or range.
+/// For lenient parsing that skips invalid entries, use
+/// [`parse_cpu_list_lenient`].
+pub fn parse_cpu_list(s: &str) -> Result<Vec<usize>> {
     let mut cpus = Vec::new();
     for part in s.trim().split(',') {
         let part = part.trim();
@@ -74,6 +78,28 @@ fn parse_cpu_list(s: &str) -> Result<Vec<usize>> {
     }
     cpus.sort();
     Ok(cpus)
+}
+
+/// Parse a CPU list string, silently skipping invalid entries.
+///
+/// Unlike [`parse_cpu_list`], this never fails — non-numeric elements
+/// and reversed ranges are ignored.
+pub fn parse_cpu_list_lenient(s: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in s.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (lo.parse::<usize>(), hi.parse::<usize>()) {
+                cpus.extend(lo..=hi);
+            }
+        } else if let Ok(cpu) = part.parse::<usize>() {
+            cpus.push(cpu);
+        }
+    }
+    cpus
 }
 
 /// Find the sysfs index of the highest-level (last-level) cache for a CPU.

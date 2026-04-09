@@ -28,7 +28,7 @@ fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 ## Helper functions
 
 **`setup_cgroups(ctx, n, wl)`** -- creates N cgroups, spawns workers in
-each, starts them. Returns `(Vec<WorkloadHandle>, CgroupGroup)`. The
+each, starts them. Returns `Result<(Vec<WorkloadHandle>, CgroupGroup)>`. The
 `CgroupGroup` is an RAII guard that removes cgroups on drop.
 
 **`collect_all(handles)`** -- stops all workers, collects reports, runs
@@ -54,6 +54,8 @@ pub struct Ctx<'a> {
     pub sched_pid: u32,
     pub settle_ms: u64,
     pub work_type_override: Option<WorkType>,
+    pub assert: Assert,
+    pub wait_for_map_write: bool,
 }
 ```
 

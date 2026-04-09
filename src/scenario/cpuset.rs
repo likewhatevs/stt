@@ -41,7 +41,7 @@ pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
         },
         Step {
             setup: vec![].into(),
@@ -62,11 +62,7 @@ pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
 
 pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 4 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=4 CPUs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
     }
 
     let steps = vec![
@@ -83,7 +79,7 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration / 3),
+            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 3),
         },
         Step {
             setup: vec![].into(),
@@ -132,11 +128,7 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
 
 pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 8 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=8 CPUs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: need >=8 CPUs"));
     }
 
     let steps = vec![
@@ -217,7 +209,7 @@ pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult
         ]
         .into(),
         ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration),
+        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
     }];
 
     execute_steps(ctx, steps)
@@ -225,11 +217,7 @@ pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult
 
 pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 4 {
-        return Ok(AssertResult {
-            passed: true,
-            details: vec!["skipped: need >=4 CPUs".into()],
-            stats: Default::default(),
-        });
+        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
     }
 
     let all = ctx.topo.all_cpus();
@@ -260,7 +248,7 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> 
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration / 3),
+            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 3),
         },
         Step {
             setup: vec![].into(),
@@ -300,7 +288,7 @@ pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
             ]
             .into(),
             ops: vec![],
-            hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration / 2),
+            hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration / 2),
         },
         // Phase 2: add heavy load to cg_1
         Step {

@@ -39,23 +39,23 @@ pub static EXTENSIBLE_METRICS: &[MetricDef] = &[MetricDef {
 }];
 
 /// Monitor data preserved from a gauntlet VM run for timeline analysis.
+#[derive(Debug, Clone)]
 pub struct GauntletMonitorData {
     pub summary: crate::monitor::MonitorSummary,
     pub samples: Vec<crate::monitor::MonitorSample>,
     pub stimulus_events: Vec<shm_ring::StimulusEvent>,
 }
 
-/// Result tuple from a single gauntlet VM run.
-///
-/// Fields: (label, passed, duration_s, detail, scenario_results, monitor_data).
-pub type VmRunResult = (
-    String,
-    bool,
-    f64,
-    String,
-    Vec<crate::runner::ScenarioResult>,
-    Option<GauntletMonitorData>,
-);
+/// Result from a single gauntlet VM run.
+#[derive(Debug, Clone)]
+pub struct VmRunResult {
+    pub label: String,
+    pub passed: bool,
+    pub duration_s: f64,
+    pub detail: String,
+    pub scenario_results: Vec<crate::runner::ScenarioResult>,
+    pub monitor_data: Option<GauntletMonitorData>,
+}
 
 /// Default work type name for serde deserialization.
 pub fn default_work_type() -> String {
@@ -202,6 +202,9 @@ fn op_kinds_to_name(op_kinds: u32) -> &'static str {
         "StopCgroup",        // 6
         "RandomizeAffinity", // 7
         "SetAffinity",       // 8
+        "SpawnHost",         // 9
+        "MoveAllTasks",      // 10
+        "MoveTasks",         // 11
     ];
     // Pick the first set bit as the representative op.
     for (i, name) in NAMES.iter().enumerate() {
@@ -244,6 +247,8 @@ fn extract_worst_degradation(timeline: Option<&Timeline>) -> (String, f64, f64, 
     let mut worst_op = String::new();
     let mut worst_imb = 0.0f64;
     let mut worst_dsq = 0.0f64;
+    let mut worst_fb = 0.0f64;
+    let mut worst_kl = 0.0f64;
     let mut worst_max_delta = 0.0f64;
     let mut count = 0u32;
 
@@ -263,6 +268,12 @@ fn extract_worst_degradation(timeline: Option<&Timeline>) -> (String, f64, f64, 
             "dsq_depth" if delta > worst_dsq => {
                 worst_dsq = delta;
             }
+            "fallback" if delta > worst_fb => {
+                worst_fb = delta;
+            }
+            "keep_last" if delta > worst_kl => {
+                worst_kl = delta;
+            }
             _ => {}
         }
 
@@ -272,22 +283,19 @@ fn extract_worst_degradation(timeline: Option<&Timeline>) -> (String, f64, f64, 
         }
     }
 
-    // fallback and keep_last deltas are not tracked per-phase in the
-    // current timeline (only imbalance and dsq_depth are). Return 0.0
-    // for those until timeline adds event counter tracking.
-    (worst_op, worst_imb, worst_dsq, 0.0, 0.0, count)
+    (worst_op, worst_imb, worst_dsq, worst_fb, worst_kl, count)
 }
 
 /// Extract analysis rows from gauntlet results.
 pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
     let mut rows = Vec::new();
-    for (label, ok, _dur, _detail, inner, mon) in results {
-        let (topo, scenario, flags, work_type, replica) = parse_label(label);
-        let stats = inner.first().map(|r| &r.stats);
-        let summary = mon.as_ref().map(|m| &m.summary);
+    for r in results {
+        let (topo, scenario, flags, work_type, replica) = parse_label(&r.label);
+        let stats = r.scenario_results.first().map(|r| &r.stats);
+        let summary = r.monitor_data.as_ref().map(|m| &m.summary);
 
         // Build timeline from monitor samples + stimulus events.
-        let timeline = mon.as_ref().map(|m| {
+        let timeline = r.monitor_data.as_ref().map(|m| {
             let stim_events: Vec<crate::timeline::StimulusEvent> =
                 shm_stim_to_timeline(&m.stimulus_events);
             Timeline::build(&stim_events, &m.samples)
@@ -309,7 +317,7 @@ pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
             topology: topo.to_string(),
             work_type: work_type.to_string(),
             replica,
-            passed: *ok,
+            passed: r.passed,
             spread: stats.map(|s| s.worst_spread).unwrap_or(0.0),
             gap_ms: stats.map(|s| s.worst_gap_ms).unwrap_or(0),
             migrations: stats.map(|s| s.total_migrations).unwrap_or(0),
@@ -698,12 +706,12 @@ fn topo_bucket(topo: &str) -> &'static str {
     }
 }
 
-/// Decompose a combo flag string like "borrow,rebal" into individual flags.
+/// Decompose a combo flag string like "borrow+rebal" into individual flags.
 fn decompose_flags(flags: &str) -> Vec<&str> {
     if flags == "default" || flags.is_empty() {
         return vec![];
     }
-    flags.split(',').collect()
+    flags.split('+').collect()
 }
 
 /// Format the stimulus cross-tab analysis from the DataFrame.
@@ -1142,14 +1150,14 @@ mod tests {
                 ..Default::default()
             },
         };
-        (
-            label.to_string(),
+        VmRunResult {
+            label: label.to_string(),
             passed,
-            20.0,
-            String::new(),
-            vec![sr],
-            None,
-        )
+            duration_s: 20.0,
+            detail: String::new(),
+            scenario_results: vec![sr],
+            monitor_data: None,
+        }
     }
 
     #[test]
@@ -1337,7 +1345,7 @@ mod tests {
 
     #[test]
     fn decompose_flags_multiple() {
-        assert_eq!(decompose_flags("borrow,rebal"), vec!["borrow", "rebal"]);
+        assert_eq!(decompose_flags("borrow+rebal"), vec!["borrow", "rebal"]);
     }
 
     #[test]
@@ -1439,7 +1447,7 @@ mod tests {
     #[test]
     fn format_stimulus_crosstab_no_degradation_data() {
         let rows = vec![
-            make_row("a", "borrow,rebal", "tiny-1llc", true, 5.0),
+            make_row("a", "borrow+rebal", "tiny-1llc", true, 5.0),
             make_row("b", "rebal", "medium-4llc", true, 8.0),
         ];
         let df = build_dataframe(&rows).unwrap();

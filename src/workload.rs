@@ -8,8 +8,8 @@
 //! - [`WorkerReport`] -- per-worker telemetry collected after stop
 //! - [`AffinityMode`] -- resolved CPU affinity for workers
 //!
-//! See the [Work Types](https://sched-ext.github.io/scx/stt/concepts/work-types.html)
-//! and [Worker Processes](https://sched-ext.github.io/scx/stt/architecture/workers.html)
+//! See the [Work Types](https://likewhatevs.github.io/stt/guide/concepts/work-types.html)
+//! and [Worker Processes](https://likewhatevs.github.io/stt/guide/architecture/workers.html)
 //! chapters of the guide.
 
 use anyhow::{Context, Result};
@@ -195,31 +195,9 @@ impl WorkType {
                 | WorkType::CachePipe { .. }
         )
     }
-}
 
-/// Composable work program that resolves to a [`WorkType`].
-///
-/// Provides named presets for common workload patterns. Resolves to a
-/// concrete `WorkType` via [`resolve()`](Self::resolve). Preset names
-/// are looked up via [`from_name()`](Self::from_name).
-///
-/// ```
-/// # use stt::workload::WorkProgram;
-/// let prog = WorkProgram::from_name("cpu_spin").unwrap();
-/// let wt = prog.resolve();
-/// assert!(matches!(wt, stt::workload::WorkType::CpuSpin));
-///
-/// assert!(WorkProgram::from_name("nonexistent").is_none());
-/// assert!(!WorkProgram::ALL_NAMES.is_empty());
-/// ```
-#[derive(Debug, Clone, Copy)]
-pub enum WorkProgram {
-    /// A single work type, used directly.
-    Single(WorkType),
-}
-
-impl WorkProgram {
-    pub const ALL_NAMES: &[&'static str] = &[
+    /// Snake_case preset names for human-friendly work type selection.
+    pub const PRESET_NAMES: &[&'static str] = &[
         "cpu_spin",
         "mixed",
         "bursty",
@@ -233,99 +211,63 @@ impl WorkProgram {
         "fanout",
     ];
 
-    /// CPU-only spin loop.
-    pub const fn cpu_spin() -> Self {
-        WorkProgram::Single(WorkType::CpuSpin)
-    }
-
-    /// Spin loop interleaved with yield.
-    pub const fn mixed() -> Self {
-        WorkProgram::Single(WorkType::Mixed)
-    }
-
-    /// Burst/sleep cycle.
-    pub const fn bursty() -> Self {
-        WorkProgram::Single(WorkType::Bursty {
-            burst_ms: 50,
-            sleep_ms: 100,
-        })
-    }
-
-    /// Pure yield loop.
-    pub const fn yield_heavy() -> Self {
-        WorkProgram::Single(WorkType::YieldHeavy)
-    }
-
-    /// Synchronous I/O.
-    pub const fn io() -> Self {
-        WorkProgram::Single(WorkType::IoSync)
-    }
-
-    /// Pipe exchange between paired workers.
-    pub const fn pipe() -> Self {
-        WorkProgram::Single(WorkType::PipeIo { burst_iters: 1024 })
-    }
-
-    /// L1-sized cache pressure.
-    pub const fn cache_l1() -> Self {
-        WorkProgram::Single(WorkType::CachePressure {
-            size_kb: 32,
-            stride: 64,
-        })
-    }
-
-    /// Cache pressure then yield.
-    pub const fn cache_yield() -> Self {
-        WorkProgram::Single(WorkType::CacheYield {
-            size_kb: 32,
-            stride: 64,
-        })
-    }
-
-    /// Cache pressure then pipe exchange.
-    pub const fn cache_pipe() -> Self {
-        WorkProgram::Single(WorkType::CachePipe {
-            size_kb: 32,
-            burst_iters: 1024,
-        })
-    }
-
-    /// Futex ping-pong between paired workers.
-    pub const fn futex() -> Self {
-        WorkProgram::Single(WorkType::FutexPingPong { spin_iters: 1024 })
-    }
-
-    /// 1:N fan-out wake (schbench-style).
-    pub const fn fanout() -> Self {
-        WorkProgram::Single(WorkType::FutexFanOut {
-            fan_out: 4,
-            spin_iters: 1024,
-        })
-    }
-
-    /// Resolve a preset name to a WorkProgram.
-    pub fn from_name(s: &str) -> Option<WorkProgram> {
+    /// Resolve a snake_case preset name to a `WorkType` with default parameters.
+    pub fn from_preset(s: &str) -> Option<WorkType> {
         match s {
-            "cpu_spin" => Some(Self::cpu_spin()),
-            "mixed" => Some(Self::mixed()),
-            "bursty" => Some(Self::bursty()),
-            "yield" => Some(Self::yield_heavy()),
-            "io" => Some(Self::io()),
-            "pipe" => Some(Self::pipe()),
-            "cache_l1" => Some(Self::cache_l1()),
-            "cache_yield" => Some(Self::cache_yield()),
-            "cache_pipe" => Some(Self::cache_pipe()),
-            "futex" => Some(Self::futex()),
-            "fanout" => Some(Self::fanout()),
+            "cpu_spin" => Some(WorkType::CpuSpin),
+            "mixed" => Some(WorkType::Mixed),
+            "bursty" => Some(WorkType::Bursty {
+                burst_ms: 50,
+                sleep_ms: 100,
+            }),
+            "yield" => Some(WorkType::YieldHeavy),
+            "io" => Some(WorkType::IoSync),
+            "pipe" => Some(WorkType::PipeIo { burst_iters: 1024 }),
+            "cache_l1" => Some(WorkType::CachePressure {
+                size_kb: 32,
+                stride: 64,
+            }),
+            "cache_yield" => Some(WorkType::CacheYield {
+                size_kb: 32,
+                stride: 64,
+            }),
+            "cache_pipe" => Some(WorkType::CachePipe {
+                size_kb: 32,
+                burst_iters: 1024,
+            }),
+            "futex" => Some(WorkType::FutexPingPong { spin_iters: 1024 }),
+            "fanout" => Some(WorkType::FutexFanOut {
+                fan_out: 4,
+                spin_iters: 1024,
+            }),
             _ => None,
         }
     }
+}
 
-    /// Resolve to a concrete WorkType.
-    pub fn resolve(&self) -> WorkType {
-        match self {
-            WorkProgram::Single(wt) => *wt,
+/// Resolve a work type with an optional override.
+///
+/// Returns `override_wt` when `swappable` is true and the override's
+/// group size (if any) divides `num_workers`. Otherwise returns `base`.
+pub(crate) fn resolve_work_type(
+    base: WorkType,
+    override_wt: Option<WorkType>,
+    swappable: bool,
+    num_workers: usize,
+) -> WorkType {
+    if !swappable {
+        return base;
+    }
+    match override_wt {
+        Some(wt) => {
+            if let Some(gs) = wt.worker_group_size()
+                && !num_workers.is_multiple_of(gs)
+            {
+                return base;
+            }
+            wt
         }
+        None => base,
     }
 }
 
@@ -430,15 +372,13 @@ static REPRO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 ///
 /// Workers send SIGUSR2 to this PID when stuck > 2 seconds.
 #[doc(hidden)]
-#[allow(dead_code)]
-pub(crate) fn set_sched_pid(pid: u32) {
-    SCHED_PID.store(pid as i32, std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn set_sched_pid(pid: i32) {
+    SCHED_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Enable/disable repro mode. When true, the watchdog is suppressed
 /// so the scheduler stays alive for BPF kprobe assertions.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub(crate) fn set_repro_mode(v: bool) {
     REPRO_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2608,27 +2548,6 @@ mod tests {
             spin_iters: 1024,
         };
         assert!(wt.needs_shared_mem());
-    }
-
-    #[test]
-    fn work_program_fanout_resolves() {
-        let wp = WorkProgram::fanout();
-        match wp.resolve() {
-            WorkType::FutexFanOut {
-                fan_out,
-                spin_iters,
-            } => {
-                assert_eq!(fan_out, 4);
-                assert_eq!(spin_iters, 1024);
-            }
-            _ => panic!("expected FutexFanOut"),
-        }
-    }
-
-    #[test]
-    fn work_program_fanout_from_name() {
-        let wp = WorkProgram::from_name("fanout").unwrap();
-        assert!(matches!(wp.resolve(), WorkType::FutexFanOut { .. }));
     }
 
     #[test]

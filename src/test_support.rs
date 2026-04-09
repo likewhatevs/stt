@@ -3,8 +3,8 @@
 //! Provides the registration type, distributed slice, VM launcher, and
 //! guest-side profraw flush for coverage-instrumented test functions.
 //!
-//! See the [Writing Tests](https://sched-ext.github.io/scx/stt/writing-tests.html)
-//! and [`#[stt_test]` Macro](https://sched-ext.github.io/scx/stt/writing-tests/stt-test-macro.html)
+//! See the [Writing Tests](https://likewhatevs.github.io/stt/guide/writing-tests.html)
+//! and [`#[stt_test]` Macro](https://likewhatevs.github.io/stt/guide/writing-tests/stt-test-macro.html)
 //! chapters of the guide.
 
 use anyhow::{Context, Result};
@@ -1365,7 +1365,10 @@ fn trim_settle_samples(report: &crate::monitor::MonitorReport) -> crate::monitor
     }
 
     let trimmed = report.samples[MONITOR_WARMUP_SAMPLES..].to_vec();
-    let summary = crate::monitor::MonitorSummary::from_samples(&trimmed);
+    let summary = crate::monitor::MonitorSummary::from_samples_with_threshold(
+        &trimmed,
+        report.preemption_threshold_ns,
+    );
     crate::monitor::MonitorReport {
         samples: trimmed,
         summary,
@@ -3068,49 +3071,41 @@ mod tests {
         name: "flag_a",
         args: &["--flag-a"],
         requires: &[],
-        shell_cmds: &[],
     };
     static BORROW: FlagDecl = FlagDecl {
         name: "borrow",
         args: &["--borrow"],
         requires: &[],
-        shell_cmds: &[],
     };
     static REBAL: FlagDecl = FlagDecl {
         name: "rebal",
         args: &["--rebal"],
         requires: &[],
-        shell_cmds: &[],
     };
     static TEST_LLC: FlagDecl = FlagDecl {
         name: "llc",
         args: &["--llc"],
         requires: &[],
-        shell_cmds: &[],
     };
     static TEST_STEAL: FlagDecl = FlagDecl {
         name: "steal",
         args: &["--steal"],
         requires: &[&TEST_LLC],
-        shell_cmds: &[],
     };
     static BORROW_LONG: FlagDecl = FlagDecl {
         name: "borrow",
         args: &["--enable-borrow"],
         requires: &[],
-        shell_cmds: &[],
     };
     static TEST_A: FlagDecl = FlagDecl {
         name: "a",
         args: &["-a"],
         requires: &[],
-        shell_cmds: &[],
     };
     static TEST_B: FlagDecl = FlagDecl {
         name: "b",
         args: &["-b"],
         requires: &[],
-        shell_cmds: &[],
     };
 
     // Static flag slices for tests (Scheduler.flags needs &'static).

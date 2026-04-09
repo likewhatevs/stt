@@ -222,10 +222,16 @@ pub fn all_scenarios() -> Vec<Scenario> {
             excluded_flags: &[],
             num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
-            cgroup_works: vec![CgroupWork {
-                num_workers: Some(16),
-                ..Default::default()
-            }],
+            cgroup_works: vec![
+                CgroupWork {
+                    num_workers: Some(16),
+                    ..Default::default()
+                },
+                CgroupWork {
+                    num_workers: Some(0),
+                    ..Default::default()
+                },
+            ],
             action: Action::Steady,
         },
         Scenario {
@@ -605,7 +611,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
         Scenario {
             name: "cgroup_cpuset_overlap_load_imbalance",
             category: "advanced",
-            description: "Imbalanced load with overlapping cpusets",
+            description: "Imbalanced load with overlapping cpusets, rebalancing",
             required_flags: F_REBAL,
             excluded_flags: &[],
             num_cgroups: 3,

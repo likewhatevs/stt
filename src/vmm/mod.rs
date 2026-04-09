@@ -1136,6 +1136,26 @@ impl SttVm {
         ok
     }
 
+    /// Initialize the SHM ring buffer header at `shm_base` in guest memory.
+    fn init_shm_region(&self, guest_mem: &GuestMemoryMmap, shm_base: u64) -> Result<()> {
+        let shm_size = self.shm_size as usize;
+        let header = shm_ring::ShmRingHeader {
+            magic: shm_ring::SHM_RING_MAGIC,
+            version: shm_ring::SHM_RING_VERSION,
+            capacity: (shm_size - shm_ring::HEADER_SIZE) as u32,
+            _pad: 0,
+            write_ptr: 0,
+            read_ptr: 0,
+            drops: 0,
+        };
+        guest_mem
+            .write_slice(
+                zerocopy::IntoBytes::as_bytes(&header),
+                GuestAddress(shm_base),
+            )
+            .context("write SHM header")
+    }
+
     /// Write cmdline, boot params, SHM header, and topology tables to guest memory.
     #[cfg(target_arch = "x86_64")]
     fn setup_memory(
@@ -1202,22 +1222,7 @@ impl SttVm {
         if self.shm_size > 0 {
             let mem_size = (self.memory_mb as u64) << 20;
             let shm_base = mem_size - self.shm_size;
-            let shm_size = self.shm_size as usize;
-            let header = shm_ring::ShmRingHeader {
-                magic: shm_ring::SHM_RING_MAGIC,
-                version: shm_ring::SHM_RING_VERSION,
-                capacity: (shm_size - shm_ring::HEADER_SIZE) as u32,
-                _pad: 0,
-                write_ptr: 0,
-                read_ptr: 0,
-                drops: 0,
-            };
-            vm.guest_mem
-                .write_slice(
-                    zerocopy::IntoBytes::as_bytes(&header),
-                    GuestAddress(shm_base),
-                )
-                .context("write SHM header")?;
+            self.init_shm_region(&vm.guest_mem, shm_base)?;
         }
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "shm_ring_init");
 
@@ -1412,12 +1417,8 @@ impl SttVm {
 
         // BSP run loop.
         eprintln!("BSP: entering run loop");
-        #[cfg(target_arch = "x86_64")]
         let (exit_code, timed_out) =
-            self.run_bsp(&mut bsp, &com1, &com2, &kill, has_immediate_exit, start);
-        #[cfg(target_arch = "aarch64")]
-        let (exit_code, timed_out) =
-            self.run_bsp_aarch64(&mut bsp, &com1, &com2, &kill, has_immediate_exit, start);
+            self.run_bsp_loop(&mut bsp, &com1, &com2, &kill, has_immediate_exit, start);
         bsp_done.store(true, Ordering::Release);
         eprintln!("BSP: exited run loop, code={exit_code} timed_out={timed_out}");
 
@@ -1476,10 +1477,7 @@ impl SttVm {
                     if rt {
                         set_rt_priority(1, &format!("vCPU {}", i + 1));
                     }
-                    #[cfg(target_arch = "x86_64")]
-                    vcpu_run_loop(&mut vcpu, &com1_clone, &com2_clone, &kill_clone);
-                    #[cfg(target_arch = "aarch64")]
-                    vcpu_run_loop_aarch64(&mut vcpu, &com1_clone, &com2_clone, &kill_clone);
+                    vcpu_run_loop_unified(&mut vcpu, &com1_clone, &com2_clone, &kill_clone);
                     exited_clone.store(true, Ordering::Release);
                     vcpu
                 })
@@ -1639,21 +1637,24 @@ impl SttVm {
                             })
                         });
 
+                let mon_cfg = monitor::reader::MonitorConfig {
+                    event_pcpu_pas: event_pcpu_pas.as_deref(),
+                    dump_trigger: dump_trigger.as_ref(),
+                    watchdog_override: watchdog_override.as_ref(),
+                    vcpu_timing: Some(&vcpu_timing),
+                    preemption_threshold_ns,
+                    shm_base_pa,
+                    prog_stats_ctx: prog_stats_ctx.as_ref(),
+                    page_offset,
+                };
                 monitor::reader::monitor_loop(
                     &mem,
                     &rq_pas,
                     &offsets,
-                    event_pcpu_pas.as_deref(),
                     Duration::from_millis(100),
                     &kill_clone,
                     start,
-                    dump_trigger.as_ref(),
-                    watchdog_override.as_ref(),
-                    Some(&vcpu_timing),
-                    preemption_threshold_ns,
-                    shm_base_pa,
-                    prog_stats_ctx.as_ref(),
-                    page_offset,
+                    &mon_cfg,
                 )
             })
             .context("spawn monitor thread")?;
@@ -1781,9 +1782,12 @@ impl SttVm {
         Ok(Some(handle))
     }
 
-    /// BSP KVM_RUN loop. Returns (exit_code, timed_out).
-    #[cfg(target_arch = "x86_64")]
-    fn run_bsp(
+    /// Unified BSP KVM_RUN loop. Returns (exit_code, timed_out).
+    ///
+    /// Handles arch-specific I/O dispatch (port I/O on x86_64, MMIO on
+    /// aarch64) and HLT semantics (x86_64 BSP: check kill + continue;
+    /// aarch64 BSP: shutdown).
+    fn run_bsp_loop(
         &self,
         bsp: &mut kvm_ioctls::VcpuFd,
         com1: &Arc<PiMutex<console::Serial>>,
@@ -1804,50 +1808,39 @@ impl SttVm {
             }
 
             match bsp.run() {
-                Ok(VcpuExit::IoOut(port, data)) => {
-                    if dispatch_io_out(com1, com2, port, data) {
-                        exit_code = 0;
-                        break;
+                Ok(mut exit) => {
+                    // HLT is role-dependent: aarch64 BSP = shutdown,
+                    // x86_64 BSP = check kill + continue.
+                    if matches!(exit, VcpuExit::Hlt) {
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            exit_code = 0;
+                            break;
+                        }
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            if kill.load(Ordering::Acquire) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    match classify_exit(com1, com2, &mut exit) {
+                        Some(ExitAction::Continue) | None => {}
+                        Some(ExitAction::Shutdown) => {
+                            exit_code = 0;
+                            break;
+                        }
+                        Some(ExitAction::Fatal(reason)) => {
+                            if let Some(r) = reason {
+                                tracing::error!(r, "BSP VM entry failed");
+                            } else {
+                                tracing::error!("BSP internal error");
+                            }
+                            break;
+                        }
                     }
                 }
-                Ok(VcpuExit::IoIn(port, data)) => {
-                    dispatch_io_in(com1, com2, port, data);
-                }
-                Ok(VcpuExit::Hlt) => {
-                    // With in-kernel LAPIC, KVM handles HLT internally
-                    // and does not return KVM_EXIT_HLT to userspace.
-                    // This arm is defensive. Check kill and continue.
-                    if kill.load(Ordering::Acquire) {
-                        break;
-                    }
-                }
-                Ok(VcpuExit::Shutdown) => {
-                    exit_code = 0;
-                    break;
-                }
-                Ok(VcpuExit::MmioRead(_addr, data)) => {
-                    for byte in data.iter_mut() {
-                        *byte = 0xff;
-                    }
-                }
-                Ok(VcpuExit::MmioWrite(_addr, _data)) => {}
-                Ok(VcpuExit::FailEntry(reason, _cpu)) => {
-                    tracing::error!(reason, "BSP VM entry failed");
-                    break;
-                }
-                Ok(VcpuExit::InternalError) => {
-                    tracing::error!("BSP internal error");
-                    break;
-                }
-                Ok(VcpuExit::SystemEvent(event_type, _)) => {
-                    if event_type == KVM_SYSTEM_EVENT_SHUTDOWN
-                        || event_type == KVM_SYSTEM_EVENT_RESET
-                    {
-                        exit_code = 0;
-                        break;
-                    }
-                }
-                Ok(_) => continue,
                 Err(e) => {
                     if e.errno() == libc::EAGAIN || e.errno() == libc::EINTR {
                         if has_immediate_exit {
@@ -1886,9 +1879,12 @@ impl SttVm {
         let (monitor_report, mid_flight_drain) =
             match run.monitor_handle.and_then(|h| h.join().ok()) {
                 Some((samples, drain)) => {
-                    let summary = monitor::MonitorSummary::from_samples(&samples);
                     let preemption_threshold_ns =
                         monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
+                    let summary = monitor::MonitorSummary::from_samples_with_threshold(
+                        &samples,
+                        preemption_threshold_ns,
+                    );
                     let report = monitor::MonitorReport {
                         samples,
                         summary,
@@ -2127,22 +2123,7 @@ impl SttVm {
         if self.shm_size > 0 {
             let mem_size = (self.memory_mb as u64) << 20;
             let shm_base = kvm::DRAM_START + mem_size - self.shm_size;
-            let shm_size = self.shm_size as usize;
-            let header = shm_ring::ShmRingHeader {
-                magic: shm_ring::SHM_RING_MAGIC,
-                version: shm_ring::SHM_RING_VERSION,
-                capacity: (shm_size - shm_ring::HEADER_SIZE) as u32,
-                _pad: 0,
-                write_ptr: 0,
-                read_ptr: 0,
-                drops: 0,
-            };
-            vm.guest_mem
-                .write_slice(
-                    zerocopy::IntoBytes::as_bytes(&header),
-                    GuestAddress(shm_base),
-                )
-                .context("write SHM header")?;
+            self.init_shm_region(&vm.guest_mem, shm_base)?;
         }
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "shm_ring_init");
 
@@ -2156,77 +2137,6 @@ impl SttVm {
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "bsp_setup");
         // APs start powered off via PSCI — no register setup needed.
         Ok(())
-    }
-
-    fn run_bsp_aarch64(
-        &self,
-        bsp: &mut kvm_ioctls::VcpuFd,
-        com1: &Arc<PiMutex<console::Serial>>,
-        com2: &Arc<PiMutex<console::Serial>>,
-        kill: &Arc<AtomicBool>,
-        has_immediate_exit: bool,
-        start: Instant,
-    ) -> (i32, bool) {
-        let timeout = self.timeout;
-        let mut exit_code: i32 = -1;
-
-        loop {
-            if start.elapsed() > timeout {
-                return (exit_code, true);
-            }
-            if kill.load(Ordering::Acquire) {
-                break;
-            }
-
-            match bsp.run() {
-                Ok(VcpuExit::MmioWrite(addr, data)) => {
-                    if dispatch_mmio_write(com1, com2, addr, data) {
-                        exit_code = 0;
-                        break;
-                    }
-                }
-                Ok(VcpuExit::MmioRead(addr, data)) => {
-                    dispatch_mmio_read(com1, com2, addr, data);
-                }
-                Ok(VcpuExit::Hlt) => {
-                    exit_code = 0;
-                    break;
-                }
-                Ok(VcpuExit::Shutdown) => {
-                    exit_code = 0;
-                    break;
-                }
-                Ok(VcpuExit::SystemEvent(event_type, _)) => {
-                    if event_type == KVM_SYSTEM_EVENT_SHUTDOWN
-                        || event_type == KVM_SYSTEM_EVENT_RESET
-                    {
-                        exit_code = 0;
-                        break;
-                    }
-                }
-                Ok(VcpuExit::FailEntry(reason, _cpu)) => {
-                    tracing::error!(reason, "BSP VM entry failed");
-                    break;
-                }
-                Ok(VcpuExit::InternalError) => {
-                    tracing::error!("BSP internal error");
-                    break;
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    if e.errno() == libc::EAGAIN || e.errno() == libc::EINTR {
-                        if has_immediate_exit {
-                            bsp.set_kvm_immediate_exit(0);
-                        }
-                        continue;
-                    }
-                    tracing::error!(%e, "BSP run failed");
-                    break;
-                }
-            }
-        }
-
-        (exit_code, false)
     }
 }
 
@@ -2290,9 +2200,12 @@ fn mmio_serial_offset(addr: u64, base: u64) -> Option<u8> {
     }
 }
 
-/// Per-vCPU KVM_RUN loop for AP threads (aarch64).
-#[cfg(target_arch = "aarch64")]
-fn vcpu_run_loop_aarch64(
+/// Unified per-vCPU KVM_RUN loop for AP threads.
+///
+/// HLT on APs: check kill + continue on both arches (KVM delivers
+/// interrupts to wake the vCPU). Shutdown sets the kill flag so all
+/// other vCPUs exit.
+fn vcpu_run_loop_unified(
     vcpu: &mut kvm_ioctls::VcpuFd,
     com1: &Arc<PiMutex<console::Serial>>,
     com2: &Arc<PiMutex<console::Serial>>,
@@ -2304,28 +2217,22 @@ fn vcpu_run_loop_aarch64(
         }
 
         match vcpu.run() {
-            Ok(VcpuExit::MmioWrite(addr, data)) => {
-                if dispatch_mmio_write(com1, com2, addr, data) {
-                    kill.store(true, Ordering::Release);
-                    break;
+            Ok(mut exit) => {
+                if matches!(exit, VcpuExit::Hlt) {
+                    if kill.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                match classify_exit(com1, com2, &mut exit) {
+                    Some(ExitAction::Continue) | None => {}
+                    Some(ExitAction::Shutdown) => {
+                        kill.store(true, Ordering::Release);
+                        break;
+                    }
+                    Some(ExitAction::Fatal(_)) => break,
                 }
             }
-            Ok(VcpuExit::MmioRead(addr, data)) => {
-                dispatch_mmio_read(com1, com2, addr, data);
-            }
-            Ok(VcpuExit::Hlt) => {
-                if kill.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            Ok(VcpuExit::Shutdown) => break,
-            Ok(VcpuExit::SystemEvent(event_type, _)) => {
-                if event_type == KVM_SYSTEM_EVENT_SHUTDOWN || event_type == KVM_SYSTEM_EVENT_RESET {
-                    break;
-                }
-            }
-            Ok(VcpuExit::FailEntry(_, _)) | Ok(VcpuExit::InternalError) => break,
-            Ok(_) => {}
             Err(e) => {
                 if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN {
                     vcpu.set_kvm_immediate_exit(0);
@@ -2352,6 +2259,77 @@ fn vcpu_run_loop_aarch64(
 
 const KVM_SYSTEM_EVENT_SHUTDOWN: u32 = 1;
 const KVM_SYSTEM_EVENT_RESET: u32 = 2;
+
+/// Classified vCPU exit action from `classify_exit`.
+enum ExitAction {
+    /// Continue running (I/O handled, etc.).
+    Continue,
+    /// Clean shutdown (system reset, VcpuExit::Shutdown, etc.).
+    Shutdown,
+    /// Fatal error. `Some(reason)` for FailEntry, `None` for InternalError.
+    Fatal(Option<u64>),
+}
+
+/// Classify a VcpuExit into an ExitAction, dispatching arch-specific I/O.
+///
+/// Returns `None` for HLT (role-dependent) and unknown exits (continue).
+/// Takes the exit by mutable reference so IoIn/MmioRead data buffers
+/// can be written back.
+fn classify_exit(
+    com1: &PiMutex<console::Serial>,
+    com2: &PiMutex<console::Serial>,
+    exit: &mut VcpuExit,
+) -> Option<ExitAction> {
+    match exit {
+        #[cfg(target_arch = "x86_64")]
+        VcpuExit::IoOut(port, data) => {
+            if dispatch_io_out(com1, com2, *port, data) {
+                Some(ExitAction::Shutdown)
+            } else {
+                Some(ExitAction::Continue)
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        VcpuExit::IoIn(port, data) => {
+            dispatch_io_in(com1, com2, *port, data);
+            Some(ExitAction::Continue)
+        }
+        #[cfg(target_arch = "aarch64")]
+        VcpuExit::MmioWrite(addr, data) => {
+            if dispatch_mmio_write(com1, com2, *addr, data) {
+                Some(ExitAction::Shutdown)
+            } else {
+                Some(ExitAction::Continue)
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        VcpuExit::MmioRead(addr, data) => {
+            dispatch_mmio_read(com1, com2, *addr, data);
+            Some(ExitAction::Continue)
+        }
+        VcpuExit::Hlt => None,
+        VcpuExit::Shutdown => Some(ExitAction::Shutdown),
+        VcpuExit::SystemEvent(event_type, _) => {
+            if *event_type == KVM_SYSTEM_EVENT_SHUTDOWN || *event_type == KVM_SYSTEM_EVENT_RESET {
+                Some(ExitAction::Shutdown)
+            } else {
+                Some(ExitAction::Continue)
+            }
+        }
+        VcpuExit::FailEntry(reason, _cpu) => Some(ExitAction::Fatal(Some(*reason))),
+        VcpuExit::InternalError => Some(ExitAction::Fatal(None)),
+        #[cfg(target_arch = "x86_64")]
+        VcpuExit::MmioRead(_addr, data) => {
+            for b in data.iter_mut() {
+                *b = 0xff;
+            }
+            Some(ExitAction::Continue)
+        }
+        #[cfg(target_arch = "x86_64")]
+        VcpuExit::MmioWrite(_addr, _data) => Some(ExitAction::Continue),
+        _ => None,
+    }
+}
 
 /// I8042 ports and commands — minimal emulation for x86 guest reboot.
 /// The kernel's default reboot method (`reboot=k`) writes CMD_RESET_CPU
@@ -2422,80 +2400,6 @@ fn dispatch_io_in(
 // vCPU run loop — Firecracker/CH hybrid pattern
 // ---------------------------------------------------------------------------
 
-/// Per-vCPU KVM_RUN loop for AP threads.
-/// Checks kill flag before and after every KVM_RUN.
-/// On EINTR: clears immediate_exit (QEMU kvm_eat_signals pattern) and
-/// re-checks kill flag before re-entering KVM_RUN.
-/// HLT for APs is normal — KVM wakes them on SIPI/interrupt delivery.
-/// With HLT exits disabled (performance_mode), HLT instructions
-/// execute inside the guest without vmexits.
-#[cfg(target_arch = "x86_64")]
-fn vcpu_run_loop(
-    vcpu: &mut kvm_ioctls::VcpuFd,
-    com1: &Arc<PiMutex<console::Serial>>,
-    com2: &Arc<PiMutex<console::Serial>>,
-    kill: &Arc<AtomicBool>,
-) {
-    loop {
-        if kill.load(Ordering::Acquire) {
-            break;
-        }
-
-        match vcpu.run() {
-            Ok(VcpuExit::IoOut(port, data)) => {
-                if dispatch_io_out(com1, com2, port, data) {
-                    kill.store(true, Ordering::Release);
-                    break;
-                }
-            }
-            Ok(VcpuExit::IoIn(port, data)) => {
-                dispatch_io_in(com1, com2, port, data);
-            }
-            Ok(VcpuExit::Hlt) => {
-                // With in-kernel LAPIC, KVM handles HLT internally
-                // and does not return KVM_EXIT_HLT to userspace.
-                // This arm is defensive. Check kill and continue.
-                if kill.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            Ok(VcpuExit::Shutdown) => break,
-            Ok(VcpuExit::SystemEvent(event_type, _)) => {
-                if event_type == KVM_SYSTEM_EVENT_SHUTDOWN || event_type == KVM_SYSTEM_EVENT_RESET {
-                    break;
-                }
-            }
-            Ok(VcpuExit::MmioRead(_addr, data)) => {
-                for b in data.iter_mut() {
-                    *b = 0xff;
-                }
-            }
-            Ok(VcpuExit::MmioWrite(_addr, _data)) => {}
-            Ok(VcpuExit::FailEntry(_, _)) | Ok(VcpuExit::InternalError) => break,
-            Ok(_) => {}
-            Err(e) => {
-                if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN {
-                    // QEMU kvm_eat_signals pattern: clear immediate_exit so
-                    // the next KVM_RUN doesn't exit immediately again.
-                    vcpu.set_kvm_immediate_exit(0);
-                    if kill.load(Ordering::Acquire) {
-                        break;
-                    }
-                    continue;
-                }
-                // Before SIPI delivery, APs may get errors — check kill.
-                if kill.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-        }
-
-        if kill.load(Ordering::Acquire) {
-            break;
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // vmlinux discovery
 // ---------------------------------------------------------------------------
@@ -2505,7 +2409,7 @@ fn vcpu_run_loop(
 /// On x86_64, checks the bzImage's parent directory and, if the path
 /// looks like `<root>/arch/x86/boot/bzImage`, checks `<root>/vmlinux`.
 #[cfg(target_arch = "x86_64")]
-fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
+pub(crate) fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
     let dir = kernel_path.parent()?;
     let candidate = dir.join("vmlinux");
     if candidate.exists() {
@@ -2530,7 +2434,7 @@ fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
+pub(crate) fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
     let dir = kernel_path.parent()?;
     let candidate = dir.join("vmlinux");
     if candidate.exists() {

@@ -83,19 +83,10 @@ futex wait/wake.
 - `CachePipe`: `size_kb=32`, `burst_iters=1024`
 - `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
 
-## WorkProgram
+## Preset names
 
-`WorkProgram` is a composable layer above `WorkType`. It provides
-named presets for common workload patterns, resolved to a concrete
-`WorkType` via `resolve()`.
-
-```rust,ignore
-pub enum WorkProgram {
-    Single(WorkType),
-}
-```
-
-### Presets
+`WorkType::from_preset()` resolves snake_case preset names to
+`WorkType` values with default parameters:
 
 | Preset | Resolves to |
 |---|---|
@@ -111,8 +102,9 @@ pub enum WorkProgram {
 | `futex` | `FutexPingPong { spin_iters: 1024 }` |
 | `fanout` | `FutexFanOut { fan_out: 4, spin_iters: 1024 }` |
 
-Use `WorkProgram::from_name()` to parse CLI preset names.
-`WorkProgram` is re-exported in the prelude.
+`WorkType::PRESET_NAMES` lists all available preset names.
+`WorkType::from_name()` uses PascalCase names matching the enum
+variants; `from_preset()` uses the snake_case aliases above.
 
 ## Scheduling policies
 
@@ -132,7 +124,8 @@ pub enum SchedPolicy {
 
 ## Overriding work types
 
-The `--work-type` CLI flag overrides the default `CpuSpin` work type
+The work type override (configured via gauntlet or
+`Ctx.work_type_override`) replaces the default `CpuSpin` work type
 for all scenarios that use it. Scenarios with non-`CpuSpin` work types
 are not overridden.
 

@@ -54,7 +54,7 @@ it applies its own holdback fraction to the full CPU set.
 
 ```rust,ignore
 pub struct CgroupWork {
-    pub num_workers: usize,      // 0 = use ctx.workers_per_cgroup
+    pub num_workers: Option<usize>, // None = use ctx.workers_per_cgroup
     pub work_type: WorkType,
     pub policy: SchedPolicy,
     pub affinity: AffinityKind,

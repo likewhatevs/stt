@@ -81,7 +81,7 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
                 cpus: pin_b,
             },
         ],
-        hold: HoldSpec::Fixed(Duration::from_secs(3) + ctx.duration),
+        hold: HoldSpec::Fixed(Duration::from_millis(ctx.settle_ms) + ctx.duration),
     }];
 
     execute_steps(ctx, steps)

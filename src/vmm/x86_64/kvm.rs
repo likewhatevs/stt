@@ -92,7 +92,7 @@ pub struct SttKvm {
     pub has_immediate_exit: bool,
     /// Split IRQ chip mode: LAPIC in kernel, PIC/IOAPIC emulated in userspace.
     /// Enabled when any APIC ID exceeds the 8-bit xAPIC limit (254).
-    pub split_irqchip: bool,
+    pub(crate) split_irqchip: bool,
 }
 
 impl SttKvm {

@@ -64,41 +64,28 @@ for details.
 ## Library API
 
 The `stt::prelude` module re-exports the types needed for writing
-tests. A minimal `#[stt_test]` function:
+tests. A minimal `#[stt_test]` function using the DSL:
 
 ```rust,ignore
 use stt::prelude::*;
-use std::collections::BTreeSet;
 
 #[stt_test(sockets = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    let mut group = CgroupGroup::new(ctx.cgroups);
-    group.add_cgroup_no_cpuset("workers")?;
-    let cpus: BTreeSet<usize> = ctx.topo.all_cpus().iter().copied().collect();
-    ctx.cgroups.set_cpuset("workers", &cpus)?;
-
-    let cfg = WorkloadConfig {
-        num_workers: 2,
-        work_type: WorkType::CpuSpin,
-        ..Default::default()
-    };
-    let mut handle = WorkloadHandle::spawn(&cfg)?;
-    for tid in handle.tids() {
-        ctx.cgroups.move_task("workers", tid)?;
-    }
-    handle.start();
-
-    std::thread::sleep(ctx.duration);
-    let reports = handle.stop_and_collect();
-
-    let a = Assert::default_checks();
-    Ok(a.assert_cgroup(&reports, None))
+    let steps = vec![Step::with_defs(
+        vec![
+            CgroupDef::named("cg_0").workers(2),
+            CgroupDef::named("cg_1").workers(2),
+        ],
+        HoldSpec::Frac(1.0),
+    )];
+    execute_steps(ctx, steps)
 }
 ```
 
-The prelude also exports ops types (`CgroupDef`, `CpusetSpec`,
-`HoldSpec`, `Step`, `execute_steps`), `Assert` for composable
-assertions config, and `WorkerReport` for telemetry access.
+The prelude also exports low-level types (`CgroupGroup`,
+`WorkloadConfig`, `WorkloadHandle`) for manual cgroup and worker
+management, `Assert` for composable assertion config, and
+`WorkerReport` for telemetry access.
 
 ## Crate structure
 

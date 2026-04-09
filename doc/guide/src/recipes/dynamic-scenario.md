@@ -46,10 +46,11 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
 
 ## Using Traverse for random topology walks
 
-```rust,ignore
-use stt::prelude::*;
-use stt::scenario::ops::*;
+> `Traverse` and `Layout` are `pub(crate)` — available within stt's
+> own scenario modules but not exported to external users.
 
+```rust,ignore
+// Inside stt's own scenario code (pub(crate) access):
 fn my_traverse_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let traverse = Traverse {
         seed: Some(42),

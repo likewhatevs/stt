@@ -268,25 +268,9 @@ fn member_byte_offset_with_member(
 /// Follow a Member's type_id through Ptr/Const/Volatile/Typedef/TypeTag
 /// chains to reach the underlying Struct.
 fn resolve_member_struct(btf: &Btf, member: &btf_rs::Member) -> Result<btf_rs::Struct> {
-    let mut t = btf.resolve_chained_type(member)?;
-    for _ in 0..20 {
-        match t {
-            Type::Struct(s) => return Ok(s),
-            Type::Ptr(_)
-            | Type::Const(_)
-            | Type::Volatile(_)
-            | Type::Typedef(_)
-            | Type::Restrict(_)
-            | Type::TypeTag(_) => {
-                t = btf.resolve_chained_type(t.as_btf_type().unwrap())?;
-            }
-            _ => bail!(
-                "btf: unexpected type '{}' while resolving member struct",
-                t.name()
-            ),
-        }
-    }
-    bail!("btf: type chain too deep resolving member struct");
+    use btf_rs::BtfType;
+    let tid = member.get_type_id().context("btf: member type_id")?;
+    super::bpf_map::resolve_to_struct(btf, tid).context("btf: could not resolve member to struct")
 }
 
 /// Byte offsets for reading struct rq schedstat fields from guest memory.

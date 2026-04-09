@@ -513,24 +513,7 @@ pub fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
     }
 }
 
-/// Parse a CPU list string like "0-3,5,7-9" into individual CPU IDs.
-fn parse_cpu_list(s: &str) -> Vec<usize> {
-    let mut cpus = Vec::new();
-    for part in s.trim().split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((start, end)) = part.split_once('-') {
-            if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
-                cpus.extend(s..=e);
-            }
-        } else if let Ok(cpu) = part.parse::<usize>() {
-            cpus.push(cpu);
-        }
-    }
-    cpus
-}
+use crate::topology::parse_cpu_list_lenient;
 
 /// Number of free 2MB hugepages on the host.
 pub fn hugepages_free() -> u64 {
@@ -559,7 +542,7 @@ pub fn host_load_estimate() -> Option<(usize, usize)> {
         .parse::<usize>()
         .ok()?;
     let online = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
-    let total = parse_cpu_list(&online).len();
+    let total = parse_cpu_list_lenient(&online).len();
     Some((procs_running, total))
 }
 
@@ -569,27 +552,30 @@ mod tests {
 
     #[test]
     fn parse_cpu_list_range() {
-        assert_eq!(parse_cpu_list("0-3"), vec![0, 1, 2, 3]);
+        assert_eq!(parse_cpu_list_lenient("0-3"), vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn parse_cpu_list_single() {
-        assert_eq!(parse_cpu_list("5"), vec![5]);
+        assert_eq!(parse_cpu_list_lenient("5"), vec![5]);
     }
 
     #[test]
     fn parse_cpu_list_mixed() {
-        assert_eq!(parse_cpu_list("0-2,5,7-9"), vec![0, 1, 2, 5, 7, 8, 9]);
+        assert_eq!(
+            parse_cpu_list_lenient("0-2,5,7-9"),
+            vec![0, 1, 2, 5, 7, 8, 9]
+        );
     }
 
     #[test]
     fn parse_cpu_list_empty() {
-        assert!(parse_cpu_list("").is_empty());
+        assert!(parse_cpu_list_lenient("").is_empty());
     }
 
     #[test]
     fn parse_cpu_list_whitespace() {
-        assert_eq!(parse_cpu_list("0-3\n"), vec![0, 1, 2, 3]);
+        assert_eq!(parse_cpu_list_lenient("0-3\n"), vec![0, 1, 2, 3]);
     }
 
     #[test]
@@ -654,34 +640,34 @@ mod tests {
 
     #[test]
     fn parse_cpu_list_trailing_comma() {
-        assert_eq!(parse_cpu_list("0,1,2,"), vec![0, 1, 2]);
+        assert_eq!(parse_cpu_list_lenient("0,1,2,"), vec![0, 1, 2]);
     }
 
     #[test]
     fn parse_cpu_list_leading_comma() {
-        assert_eq!(parse_cpu_list(",0,1"), vec![0, 1]);
+        assert_eq!(parse_cpu_list_lenient(",0,1"), vec![0, 1]);
     }
 
     #[test]
     fn parse_cpu_list_single_zero() {
-        assert_eq!(parse_cpu_list("0"), vec![0]);
+        assert_eq!(parse_cpu_list_lenient("0"), vec![0]);
     }
 
     #[test]
     fn parse_cpu_list_large_ids() {
-        assert_eq!(parse_cpu_list("127,255"), vec![127, 255]);
+        assert_eq!(parse_cpu_list_lenient("127,255"), vec![127, 255]);
     }
 
     #[test]
     fn parse_cpu_list_reversed_range() {
         // "5-3" parses as start=5, end=3 — 5..=3 is empty.
-        assert!(parse_cpu_list("5-3").is_empty());
+        assert!(parse_cpu_list_lenient("5-3").is_empty());
     }
 
     #[test]
     fn parse_cpu_list_non_numeric() {
         // Garbage is silently ignored.
-        assert!(parse_cpu_list("abc").is_empty());
+        assert!(parse_cpu_list_lenient("abc").is_empty());
     }
 
     // -- synthetic topology mapping tests --
