@@ -186,3 +186,335 @@ fn entry_performance_mode_set() {
         "performance_mode = true must be set in generated entry",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scheduler derive macro tests
+// ---------------------------------------------------------------------------
+
+#[derive(stt::Scheduler)]
+#[scheduler(
+    name = "test_derive",
+    binary = "test-binary",
+    topology(2, 4, 1),
+    cgroup_parent = "/test",
+    sched_args = ["--arg1", "--arg2"]
+)]
+#[allow(dead_code)]
+enum TestDeriveFlag {
+    #[flag(args = ["--enable-alpha"])]
+    Alpha,
+    #[flag(args = ["--enable-beta"], requires = [Alpha])]
+    Beta,
+    #[flag(args = ["--enable-gamma-delta"])]
+    GammaDelta,
+}
+
+/// Verify the derive generates a const Scheduler with the correct name.
+#[test]
+fn derive_scheduler_const_name() {
+    let _ = &TEST_DERIVE;
+    assert_eq!(TEST_DERIVE.name, "test_derive");
+}
+
+/// Verify scheduler binary spec.
+#[test]
+fn derive_scheduler_binary() {
+    assert!(matches!(
+        TEST_DERIVE.binary,
+        stt::test_support::SchedulerSpec::Name("test-binary")
+    ));
+}
+
+/// Verify scheduler topology.
+#[test]
+fn derive_scheduler_topology() {
+    assert_eq!(TEST_DERIVE.topology.sockets, 2);
+    assert_eq!(TEST_DERIVE.topology.cores_per_socket, 4);
+    assert_eq!(TEST_DERIVE.topology.threads_per_core, 1);
+}
+
+/// Verify scheduler cgroup_parent.
+#[test]
+fn derive_scheduler_cgroup_parent() {
+    assert_eq!(TEST_DERIVE.cgroup_parent, Some("/test"));
+}
+
+/// Verify scheduler sched_args.
+#[test]
+fn derive_scheduler_sched_args() {
+    assert_eq!(TEST_DERIVE.sched_args, &["--arg1", "--arg2"]);
+}
+
+/// Verify the derive generates the correct number of flags.
+#[test]
+fn derive_scheduler_flag_count() {
+    assert_eq!(TEST_DERIVE.flags.len(), 3);
+}
+
+/// Verify flag names are kebab-cased from variant names.
+#[test]
+fn derive_flag_names() {
+    assert_eq!(TEST_DERIVE.flags[0].name, "alpha");
+    assert_eq!(TEST_DERIVE.flags[1].name, "beta");
+    assert_eq!(TEST_DERIVE.flags[2].name, "gamma-delta");
+}
+
+/// Verify flag args.
+#[test]
+fn derive_flag_args() {
+    assert_eq!(TEST_DERIVE.flags[0].args, &["--enable-alpha"]);
+    assert_eq!(TEST_DERIVE.flags[1].args, &["--enable-beta"]);
+    assert_eq!(TEST_DERIVE.flags[2].args, &["--enable-gamma-delta"]);
+}
+
+/// Verify flag requires dependencies.
+#[test]
+fn derive_flag_requires() {
+    assert!(TEST_DERIVE.flags[0].requires.is_empty());
+    assert_eq!(TEST_DERIVE.flags[1].requires.len(), 1);
+    assert_eq!(TEST_DERIVE.flags[1].requires[0].name, "alpha");
+    assert!(TEST_DERIVE.flags[2].requires.is_empty());
+}
+
+/// Verify associated name constants.
+#[test]
+fn derive_name_constants() {
+    assert_eq!(TestDeriveFlag::ALPHA, "alpha");
+    assert_eq!(TestDeriveFlag::BETA, "beta");
+    assert_eq!(TestDeriveFlag::GAMMA_DELTA, "gamma-delta");
+}
+
+/// Verify profile generation respects requires dependencies.
+#[test]
+fn derive_profiles_respect_requires() {
+    let profiles = TEST_DERIVE.generate_profiles(&[TestDeriveFlag::BETA], &[]);
+    for p in &profiles {
+        assert!(
+            p.flags.contains(&TestDeriveFlag::ALPHA),
+            "beta requires alpha: {:?}",
+            p.flags
+        );
+    }
+}
+
+/// Verify typed flag refs work in #[stt_test] required_flags.
+#[stt_test(
+    scheduler = TEST_DERIVE,
+    required_flags = [TestDeriveFlag::ALPHA, TestDeriveFlag::BETA],
+    excluded_flags = [TestDeriveFlag::GAMMA_DELTA]
+)]
+fn typed_flags_compile(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Verify typed flag refs propagate correctly to the entry.
+#[test]
+fn entry_typed_flags_match() {
+    let entry = stt::test_support::find_test("typed_flags_compile").unwrap();
+    assert_eq!(entry.required_flags, &["alpha", "beta"]);
+    assert_eq!(entry.excluded_flags, &["gamma-delta"]);
+}
+
+/// Verify mixed string/path flag refs work.
+#[stt_test(
+    scheduler = TEST_DERIVE,
+    required_flags = ["alpha", TestDeriveFlag::BETA]
+)]
+fn mixed_flags_compile(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Verify mixed flag refs propagate correctly.
+#[test]
+fn entry_mixed_flags_match() {
+    let entry = stt::test_support::find_test("mixed_flags_compile").unwrap();
+    assert_eq!(entry.required_flags, &["alpha", "beta"]);
+}
+
+/// Verify topology inheritance from derived scheduler.
+#[stt_test(scheduler = TEST_DERIVE)]
+fn derive_topo_inherit(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Verify topology inheritance from derived scheduler.
+#[test]
+fn entry_derive_topo_inherit() {
+    let entry = stt::test_support::find_test("derive_topo_inherit").unwrap();
+    assert_eq!(entry.topology.sockets, 2);
+    assert_eq!(entry.topology.cores_per_socket, 4);
+    assert_eq!(entry.topology.threads_per_core, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Empty enum edge case
+// ---------------------------------------------------------------------------
+
+#[derive(stt::Scheduler)]
+#[scheduler(name = "empty_sched", binary = "empty-binary", topology(1, 2, 1))]
+#[allow(dead_code)]
+enum EmptySchedFlag {}
+
+/// Verify the const name is derived correctly for an empty enum.
+#[test]
+fn derive_empty_enum_const_name() {
+    assert_eq!(EMPTY_SCHED.name, "empty_sched");
+}
+
+/// Verify an empty enum produces an empty flags slice.
+#[test]
+fn derive_empty_enum_no_flags() {
+    assert!(EMPTY_SCHED.flags.is_empty());
+}
+
+/// Verify binary is set even with no flags.
+#[test]
+fn derive_empty_enum_binary() {
+    assert!(matches!(
+        EMPTY_SCHED.binary,
+        stt::test_support::SchedulerSpec::Name("empty-binary")
+    ));
+}
+
+/// Verify profile generation works with zero flags: exactly one profile
+/// (the empty "default" profile).
+#[test]
+fn derive_empty_enum_profiles() {
+    let profiles = EMPTY_SCHED.generate_profiles(&[], &[]);
+    assert_eq!(profiles.len(), 1);
+    assert!(profiles[0].flags.is_empty());
+    assert_eq!(profiles[0].name(), "default");
+}
+
+// ---------------------------------------------------------------------------
+// "Flags" (plural) suffix stripping
+// ---------------------------------------------------------------------------
+
+#[derive(stt::Scheduler)]
+#[scheduler(name = "test_flags", topology(1, 2, 1))]
+#[allow(dead_code)]
+enum TestFlags {
+    #[flag(args = ["--x"])]
+    Xray,
+}
+
+/// Verify "Flags" suffix is stripped: TestFlags -> TEST.
+#[test]
+fn derive_flags_suffix_stripping() {
+    assert_eq!(TEST.name, "test_flags");
+    assert_eq!(TEST.flags.len(), 1);
+    assert_eq!(TEST.flags[0].name, "xray");
+    assert_eq!(TestFlags::XRAY, "xray");
+}
+
+// ---------------------------------------------------------------------------
+// No-suffix enum (unwrap_or fallback)
+// ---------------------------------------------------------------------------
+
+#[derive(stt::Scheduler)]
+#[scheduler(name = "plain", topology(1, 2, 1))]
+#[allow(dead_code)]
+enum PlainSched {
+    #[flag(args = ["--y"])]
+    Yankee,
+}
+
+/// Verify enum without "Flag"/"Flags" suffix uses full name: PlainSched -> PLAIN_SCHED.
+#[test]
+fn derive_no_suffix_const_name() {
+    assert_eq!(PLAIN_SCHED.name, "plain");
+    assert_eq!(PLAIN_SCHED.flags[0].name, "yankee");
+    assert_eq!(PlainSched::YANKEE, "yankee");
+}
+
+// ---------------------------------------------------------------------------
+// Variant without #[flag] attribute
+// ---------------------------------------------------------------------------
+
+#[derive(stt::Scheduler)]
+#[scheduler(name = "bare_variant", topology(1, 2, 1))]
+#[allow(dead_code)]
+enum BareVariantFlag {
+    NakedVariant,
+    #[flag(args = ["--with-args"])]
+    WithArgs,
+}
+
+/// Verify a variant without #[flag(...)] produces a FlagDecl with empty
+/// args and empty requires.
+#[test]
+fn derive_bare_variant_empty_args() {
+    let naked = BARE_VARIANT.flags[0];
+    assert_eq!(naked.name, "naked-variant");
+    assert!(naked.args.is_empty());
+    assert!(naked.requires.is_empty());
+}
+
+/// Verify the other variant still has its args.
+#[test]
+fn derive_bare_variant_other_has_args() {
+    let with_args = BARE_VARIANT.flags[1];
+    assert_eq!(with_args.name, "with-args");
+    assert_eq!(with_args.args, &["--with-args"]);
+}
+
+// ---------------------------------------------------------------------------
+// All-caps acronym variants
+// ---------------------------------------------------------------------------
+
+#[derive(stt::Scheduler)]
+#[scheduler(name = "acronym_test", topology(1, 2, 1))]
+#[allow(dead_code, clippy::upper_case_acronyms)]
+enum AcronymFlag {
+    #[flag(args = ["--llc"])]
+    LLC,
+    #[flag(args = ["--io-heavy"])]
+    IOHeavy,
+}
+
+/// Verify all-caps "LLC" produces kebab name "llc".
+/// Note: AcronymFlag::LLC resolves as the enum variant (not the &str
+/// constant) because the variant and constant share the same identifier.
+/// Verify via the flags array instead.
+#[test]
+fn derive_acronym_llc() {
+    assert_eq!(ACRONYM.flags[0].name, "llc");
+    assert_eq!(ACRONYM.flags[0].args, &["--llc"]);
+}
+
+/// Verify "IOHeavy" produces kebab name "io-heavy" and constant IO_HEAVY.
+#[test]
+fn derive_acronym_io_heavy() {
+    assert_eq!(ACRONYM.flags[1].name, "io-heavy");
+    assert_eq!(AcronymFlag::IO_HEAVY, "io-heavy");
+}
+
+// ---------------------------------------------------------------------------
+// Minimal derive (name only, all other attributes use defaults)
+// ---------------------------------------------------------------------------
+
+#[derive(stt::Scheduler)]
+#[scheduler(name = "minimal")]
+#[allow(dead_code)]
+enum MinimalFlag {}
+
+/// Verify a minimal derive with only name produces correct defaults:
+/// no binary, default topology, no flags, no sched_args, no cgroup_parent.
+#[test]
+fn derive_minimal_defaults() {
+    assert_eq!(MINIMAL.name, "minimal");
+    assert!(!MINIMAL.binary.has_active_scheduling());
+    assert!(matches!(
+        MINIMAL.binary,
+        stt::test_support::SchedulerSpec::None
+    ));
+    assert_eq!(MINIMAL.topology.sockets, 1);
+    assert_eq!(MINIMAL.topology.cores_per_socket, 2);
+    assert_eq!(MINIMAL.topology.threads_per_core, 1);
+    assert!(MINIMAL.flags.is_empty());
+    assert!(MINIMAL.sched_args.is_empty());
+    assert!(MINIMAL.cgroup_parent.is_none());
+}

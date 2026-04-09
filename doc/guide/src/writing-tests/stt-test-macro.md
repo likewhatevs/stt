@@ -105,12 +105,20 @@ the merge chain.
 | `required_flags = [...]` | `[]` | Flags that must be present in every flag profile |
 | `excluded_flags = [...]` | `[]` | Flags that must not be present in any flag profile |
 
-Values are string arrays of flag names:
+Values are arrays of string literals or path expressions from
+`#[derive(Scheduler)]`:
 
 ```rust,ignore
+// String literals
 #[stt_test(
     required_flags = ["llc", "borrow"],
     excluded_flags = ["no-ctrl"],
+)]
+
+// Path expressions (typed constants from derive)
+#[stt_test(
+    required_flags = [MySchedulerFlag::LLC, MySchedulerFlag::BORROW],
+    excluded_flags = [MySchedulerFlag::NO_CTRL],
 )]
 ```
 
@@ -153,33 +161,38 @@ what `performance_mode` enables, prerequisites, and validation behavior.
 
 ## Example with custom scheduler
 
+Define the scheduler with `#[derive(Scheduler)]` (see
+[Scheduler Definitions](scheduler-definitions.md)), then reference it
+in `#[stt_test]`:
+
 ```rust,ignore
 use stt::prelude::*;
 
-static MY_LLC: FlagDecl = FlagDecl {
-    name: "llc",
-    args: &["--enable-llc-awareness"],
-    requires: &[],
-};
-
-static MY_STEAL: FlagDecl = FlagDecl {
-    name: "steal",
-    args: &["--enable-work-stealing"],
-    requires: &[&MY_LLC],
-};
-
-const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
-    .binary(SchedulerSpec::Name("scx_my_scheduler"))
-    .flags(&[&MY_LLC, &MY_STEAL])
-    .topology(2, 4, 2);
+#[derive(Scheduler)]
+#[scheduler(
+    name = "my_scheduler",
+    binary = "scx_my_scheduler",
+    topology(2, 4, 2),
+)]
+#[allow(dead_code)]
+enum MySchedulerFlag {
+    #[flag(args = ["--enable-llc-awareness"])]
+    Llc,
+    #[flag(args = ["--enable-work-stealing"], requires = [Llc])]
+    Steal,
+}
 
 #[stt_test(
-    scheduler = MY_SCHED,
+    scheduler = MY_SCHEDULER,
     not_starved = true,
     max_gap_ms = 5000,
+    required_flags = [MySchedulerFlag::LLC],
 )]
 fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 2s4c2t from MY_SCHED
+    // Inherits 2s4c2t from MY_SCHEDULER
     Ok(AssertResult::pass())
 }
 ```
+
+For the manual `FlagDecl` + builder pattern, see
+[Scheduler Definitions: Manual definition](scheduler-definitions.md#manual-definition).

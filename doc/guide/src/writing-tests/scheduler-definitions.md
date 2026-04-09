@@ -52,7 +52,47 @@ kernel's default EEVDF scheduler. Its binary is `SchedulerSpec::None`.
 
 ## Defining a scheduler
 
-Use the const builder pattern:
+Use `#[derive(Scheduler)]` on an enum whose variants are the
+scheduler's flags:
+
+```rust,ignore
+use stt::prelude::*;
+
+#[derive(stt::Scheduler)]
+#[scheduler(
+    name = "my_sched",
+    binary = "scx_my_sched",
+    topology(2, 4, 1),
+    sched_args = ["--exit-dump-len", "1048576"]
+)]
+#[allow(dead_code)]
+enum MySchedFlag {
+    #[flag(args = ["--enable-llc"])]
+    Llc,
+    #[flag(args = ["--enable-stealing"], requires = [Llc])]
+    Steal,
+}
+```
+
+This generates:
+
+- `static` `FlagDecl` entries for each variant
+- A `&[&FlagDecl]` flags array
+- `const MY_SCHED: Scheduler` with all builder methods applied
+- `impl MySchedFlag` with `&'static str` constants for each variant's
+  kebab-case name (e.g. `MySchedFlag::LLC`, `MySchedFlag::STEAL`)
+
+The const name is derived from the enum name by stripping a trailing
+`Flag`/`Flags` suffix and converting to SCREAMING_SNAKE_CASE:
+`MySchedFlag` -> `MY_SCHED`, `EevdfFlags` -> `EEVDF`.
+
+Variant names are converted to kebab-case for the flag name:
+`RejectPin` -> `"reject-pin"`, `NoCtrl` -> `"no-ctrl"`.
+
+### Manual definition
+
+The const builder pattern still works for cases where the derive
+doesn't fit:
 
 ```rust,ignore
 use stt::prelude::*;
@@ -83,6 +123,14 @@ const MY_SCHEDULER: Scheduler = Scheduler::new("my_sched")
 creates the directory before starting the scheduler, and
 `--cell-parent-cgroup <path>` is injected into the scheduler args.
 
+In the derive:
+
+```rust,ignore
+#[scheduler(cgroup_parent = "/stt")]
+```
+
+Or manually:
+
 ```rust,ignore
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
@@ -98,6 +146,14 @@ This creates `/sys/fs/cgroup/stt` in the guest and passes
 `Scheduler.sched_args` provides default CLI args that apply to every
 test using this scheduler. They are prepended before per-test
 `extra_sched_args` and flag-derived args.
+
+In the derive:
+
+```rust,ignore
+#[scheduler(sched_args = ["--exit-dump-len", "1048576"])]
+```
+
+Or manually:
 
 ```rust,ignore
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
@@ -117,11 +173,10 @@ this scheduler. When `#[stt_test]` omits `sockets`, `cores`, and
 `threads`, the scheduler's topology is used. Explicit attributes on
 `#[stt_test]` override the scheduler default.
 
+In the derive:
+
 ```rust,ignore
-const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
-    .binary(SchedulerSpec::Name("scx_mitosis"))
-    .cgroup_parent("/stt")
-    .topology(2, 4, 1);
+#[scheduler(topology(2, 4, 1))]
 ```
 
 Arguments are `(sockets, cores_per_socket, threads_per_core)`.
@@ -138,9 +193,51 @@ fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 
 ## Defining flags
 
-Each scheduler defines its own `FlagDecl` statics with the CLI args
-that activate each feature. `FlagDecl` is re-exported from the
-prelude.
+With the derive, each enum variant is a flag. The `#[flag]` attribute
+specifies CLI args and dependencies:
+
+```rust,ignore
+#[derive(stt::Scheduler)]
+#[scheduler(name = "mitosis", binary = "scx_mitosis", topology(2, 4, 1))]
+#[allow(dead_code)]
+enum MitosisFlag {
+    #[flag(args = ["--enable-llc-awareness"])]
+    Llc,
+    #[flag(args = ["--enable-borrowing"])]
+    Borrow,
+    #[flag(args = ["--enable-work-stealing"], requires = [Llc])]
+    Steal,
+}
+```
+
+The `args` field contains the scheduler CLI arguments passed when the
+flag is active. The `requires` field expresses dependencies: `Steal`
+requires `Llc`, so any profile containing `steal` automatically
+includes `llc`. Invalid combinations are rejected by
+`generate_profiles()`.
+
+The derive generates `&'static str` constants on the enum for typed
+flag references in `required_flags` and `excluded_flags`:
+
+```rust,ignore
+#[stt_test(
+    scheduler = MITOSIS,
+    required_flags = [MitosisFlag::LLC],
+    excluded_flags = [MitosisFlag::REJECT_PIN],
+)]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
+```
+
+String literals still work:
+
+```rust,ignore
+#[stt_test(scheduler = MITOSIS, required_flags = ["llc"])]
+```
+
+### Manual flag definition
+
+The manual pattern still works. Each scheduler defines its own
+`FlagDecl` statics:
 
 ```rust,ignore
 use stt::prelude::*;
@@ -148,12 +245,6 @@ use stt::prelude::*;
 static MITOSIS_LLC: FlagDecl = FlagDecl {
     name: "llc",
     args: &["--enable-llc-awareness"],
-    requires: &[],
-};
-
-static MITOSIS_BORROW: FlagDecl = FlagDecl {
-    name: "borrow",
-    args: &["--enable-borrowing"],
     requires: &[],
 };
 
@@ -165,15 +256,9 @@ static MITOSIS_STEAL: FlagDecl = FlagDecl {
 
 const MITOSIS: Scheduler = Scheduler::new("mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
-    .flags(&[&MITOSIS_LLC, &MITOSIS_BORROW, &MITOSIS_STEAL])
+    .flags(&[&MITOSIS_LLC, &MITOSIS_STEAL])
     .topology(2, 4, 1);
 ```
-
-The `args` field contains the scheduler CLI arguments passed when the
-flag is active. The `requires` field expresses dependencies: `steal`
-requires `llc`, so any profile containing `steal` automatically
-includes `llc`. Invalid combinations are rejected by
-`generate_profiles()`.
 
 The built-in `*_DECL` constants in `stt::scenario::flags` (e.g.
 `LLC_DECL`, `BORROW_DECL`) have empty `args` fields. They exist for

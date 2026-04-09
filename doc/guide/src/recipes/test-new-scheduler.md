@@ -4,26 +4,28 @@ End-to-end workflow: define a scheduler, write tests, run them.
 
 ## 1. Define the scheduler
 
+Use `#[derive(Scheduler)]` on an enum of flags:
+
 ```rust,ignore
 use stt::prelude::*;
 
-static MY_LLC: FlagDecl = FlagDecl {
-    name: "llc",
-    args: &["--enable-llc"],
-    requires: &[],
-};
-
-static MY_STEAL: FlagDecl = FlagDecl {
-    name: "steal",
-    args: &["--enable-stealing"],
-    requires: &[&MY_LLC],
-};
-
-const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
-    .binary(SchedulerSpec::Name("scx_my_scheduler"))
-    .flags(&[&MY_LLC, &MY_STEAL])
-    .topology(2, 4, 2);
+#[derive(Scheduler)]
+#[scheduler(
+    name = "my_scheduler",
+    binary = "scx_my_scheduler",
+    topology(2, 4, 2),
+)]
+#[allow(dead_code)]
+enum MySchedulerFlag {
+    #[flag(args = ["--enable-llc"])]
+    Llc,
+    #[flag(args = ["--enable-stealing"], requires = [Llc])]
+    Steal,
+}
 ```
+
+This generates `const MY_SCHEDULER: Scheduler` and typed flag
+constants (`MySchedulerFlag::LLC`, `MySchedulerFlag::STEAL`).
 
 ## 2. Write integration tests
 
@@ -32,15 +34,19 @@ Tests inherit the scheduler's topology. Override with explicit
 
 ```rust,ignore
 use stt::prelude::*;
-use stt::scenario::*;
 
-#[stt_test(scheduler = MY_SCHED)]
-fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 2s4c2t from MY_SCHED
-    let wl = dfl_wl(ctx);
-    let (handles, _guard) = setup_cgroups(ctx, 2, &wl)?;
-    std::thread::sleep(ctx.duration);
-    Ok(collect_all(handles, &ctx.assert))
+#[stt_test(scheduler = MY_SCHEDULER)]
+fn basic_steady(ctx: &Ctx) -> Result<AssertResult> {
+    // Inherits 2s4c2t from MY_SCHEDULER
+    scenarios::steady(ctx)
+}
+
+#[stt_test(
+    scheduler = MY_SCHEDULER,
+    required_flags = [MySchedulerFlag::LLC],
+)]
+fn llc_aware_test(ctx: &Ctx) -> Result<AssertResult> {
+    scenarios::steady_llc(ctx)
 }
 ```
 
@@ -53,4 +59,4 @@ cargo nextest run
 See [The #\[stt_test\] Macro](../writing-tests/stt-test-macro.md) for
 all available attributes and
 [Scheduler Definitions](../writing-tests/scheduler-definitions.md) for
-the full `Scheduler` builder API.
+the full `Scheduler` type and derive macro.

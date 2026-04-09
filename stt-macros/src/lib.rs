@@ -1,6 +1,16 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{ItemFn, Meta, MetaNameValue, parse::Parser, parse_macro_input};
+use quote::{ToTokens, format_ident, quote};
+use syn::{
+    Data, DeriveInput, Fields, ItemFn, Meta, MetaNameValue, parse::Parser, parse_macro_input,
+};
+
+/// Emit `Some(value)` or `None` as token streams.
+fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenStream {
+    match opt {
+        Some(v) => quote! { Some(#v) },
+        None => quote! { None },
+    }
+}
 
 /// Default topology and memory for stt_test-annotated functions.
 const DEFAULT_SOCKETS: u32 = 1;
@@ -66,8 +76,8 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut min_iteration_rate: Option<f64> = None;
     let mut max_migration_ratio: Option<f64> = None;
     let mut extra_sched_args: Vec<String> = Vec::new();
-    let mut required_flags: Vec<String> = Vec::new();
-    let mut excluded_flags: Vec<String> = Vec::new();
+    let mut required_flags: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut excluded_flags: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut min_sockets: u32 = 1;
     let mut min_llcs: u32 = 1;
     let mut requires_smt: bool = false;
@@ -126,7 +136,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         bpf_map_write = Some(p);
                     }
                     "auto_repro" | "not_starved" | "isolation" | "performance_mode"
-                    | "requires_smt" | "expect_err" => {
+                    | "requires_smt" | "expect_err" | "fail_on_stall" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -148,6 +158,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "performance_mode" => performance_mode = lit_bool.value(),
                             "requires_smt" => requires_smt = lit_bool.value(),
                             "expect_err" => expect_err = lit_bool.value(),
+                            "fail_on_stall" => fail_on_stall = Some(lit_bool.value()),
                             _ => unreachable!(),
                         }
                     }
@@ -306,37 +317,48 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             _ => unreachable!(),
                         }
                     }
-                    "fail_on_stall" => {
-                        let lit_bool = match value {
-                            syn::Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Bool(lb),
-                                ..
-                            }) => lb,
-                            _ => {
-                                return syn::Error::new_spanned(
-                                    value,
-                                    "expected bool literal for fail_on_stall",
-                                )
-                                .to_compile_error()
-                                .into();
-                            }
-                        };
-                        fail_on_stall = Some(lit_bool.value());
-                    }
-                    "extra_sched_args" | "required_flags" | "excluded_flags" => {
+                    "extra_sched_args" => {
                         let arr = match value {
                             syn::Expr::Array(ea) => ea,
                             _ => {
                                 return syn::Error::new_spanned(
                                     value,
-                                    format!("expected array of string literals for {ident}"),
+                                    "expected array of string literals for extra_sched_args",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        for elem in &arr.elems {
+                            match elem {
+                                syn::Expr::Lit(syn::ExprLit {
+                                    lit: syn::Lit::Str(ls),
+                                    ..
+                                }) => extra_sched_args.push(ls.value()),
+                                _ => {
+                                    return syn::Error::new_spanned(
+                                        elem,
+                                        "expected string literal in extra_sched_args",
+                                    )
+                                    .to_compile_error()
+                                    .into();
+                                }
+                            }
+                        }
+                    }
+                    "required_flags" | "excluded_flags" => {
+                        let arr = match value {
+                            syn::Expr::Array(ea) => ea,
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    format!("expected array for {ident}"),
                                 )
                                 .to_compile_error()
                                 .into();
                             }
                         };
                         let target = match ident.as_str() {
-                            "extra_sched_args" => &mut extra_sched_args,
                             "required_flags" => &mut required_flags,
                             "excluded_flags" => &mut excluded_flags,
                             _ => unreachable!(),
@@ -346,11 +368,19 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 syn::Expr::Lit(syn::ExprLit {
                                     lit: syn::Lit::Str(ls),
                                     ..
-                                }) => target.push(ls.value()),
+                                }) => {
+                                    let val = ls.value();
+                                    target.push(quote! { #val });
+                                }
+                                syn::Expr::Path(_) => {
+                                    target.push(quote! { #elem });
+                                }
                                 _ => {
                                     return syn::Error::new_spanned(
                                         elem,
-                                        format!("expected string literal in {ident}"),
+                                        format!(
+                                            "expected string literal or path expression in {ident}"
+                                        ),
                                     )
                                     .to_compile_error()
                                     .into();
@@ -463,70 +493,22 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Build Assert field tokens.
-    let not_starved_tokens = match not_starved {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let isolation_tokens = match isolation {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let gap_tokens = match max_gap_ms {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let spread_tokens = match max_spread_pct {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let imbalance_tokens = match max_imbalance_ratio {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let dsq_tokens = match max_local_dsq_depth {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let stall_tokens = match fail_on_stall {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let sustained_tokens = match sustained_samples {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let throughput_cv_tokens = match max_throughput_cv {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let work_rate_tokens = match min_work_rate {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let fallback_rate_tokens = match max_fallback_rate {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let keep_last_rate_tokens = match max_keep_last_rate {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let p99_wake_tokens = match max_p99_wake_latency_ns {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let wake_cv_tokens = match max_wake_latency_cv {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let iter_rate_tokens = match min_iteration_rate {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
-    let mig_ratio_tokens = match max_migration_ratio {
-        Some(v) => quote! { Some(#v) },
-        None => quote! { None },
-    };
+    let not_starved_tokens = option_tokens(&not_starved);
+    let isolation_tokens = option_tokens(&isolation);
+    let gap_tokens = option_tokens(&max_gap_ms);
+    let spread_tokens = option_tokens(&max_spread_pct);
+    let imbalance_tokens = option_tokens(&max_imbalance_ratio);
+    let dsq_tokens = option_tokens(&max_local_dsq_depth);
+    let stall_tokens = option_tokens(&fail_on_stall);
+    let sustained_tokens = option_tokens(&sustained_samples);
+    let throughput_cv_tokens = option_tokens(&max_throughput_cv);
+    let work_rate_tokens = option_tokens(&min_work_rate);
+    let fallback_rate_tokens = option_tokens(&max_fallback_rate);
+    let keep_last_rate_tokens = option_tokens(&max_keep_last_rate);
+    let p99_wake_tokens = option_tokens(&max_p99_wake_latency_ns);
+    let wake_cv_tokens = option_tokens(&max_wake_latency_cv);
+    let iter_rate_tokens = option_tokens(&min_iteration_rate);
+    let mig_ratio_tokens = option_tokens(&max_migration_ratio);
 
     let bpf_map_write_tokens = match &bpf_map_write {
         Some(p) => quote! { Some(&#p) },
@@ -604,4 +586,444 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// Convert a CamelCase identifier to kebab-case.
+///
+/// Handles acronyms (consecutive uppercase): a separator is inserted
+/// before the last letter of a run when followed by lowercase.
+///
+/// `Llc` -> `"llc"`, `RejectPin` -> `"reject-pin"`, `NoCtrl` -> `"no-ctrl"`,
+/// `LLC` -> `"llc"`, `HTTPServer` -> `"http-server"`.
+fn camel_to_kebab(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            let prev_upper = chars[i - 1].is_uppercase();
+            let next_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+            // Insert separator when:
+            // - previous char is lowercase (standard CamelCase boundary), OR
+            // - previous char is uppercase AND next char is lowercase
+            //   (end of acronym run: "HTTPServer" -> "http-server")
+            if !prev_upper || next_lower {
+                out.push('-');
+            }
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Convert a CamelCase identifier to SCREAMING_SNAKE_CASE.
+///
+/// Handles acronyms (consecutive uppercase): a separator is inserted
+/// before the last letter of a run when followed by lowercase.
+///
+/// `Llc` -> `"LLC"`, `RejectPin` -> `"REJECT_PIN"`, `NoCtrl` -> `"NO_CTRL"`,
+/// `LLC` -> `"LLC"`, `HTTPServer` -> `"HTTP_SERVER"`.
+fn camel_to_screaming_snake(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            let prev_upper = chars[i - 1].is_uppercase();
+            let next_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+            if !prev_upper || next_lower {
+                out.push('_');
+            }
+        }
+        out.push(ch.to_ascii_uppercase());
+    }
+    out
+}
+
+/// Derive macro that generates a `Scheduler` const, `FlagDecl` statics,
+/// and associated name constants from an annotated enum.
+///
+/// # Scheduler attributes (`#[scheduler(...)]`)
+///
+/// | Attribute | Required | Description |
+/// |---|---|---|
+/// | `name = "..."` | yes | Scheduler name passed to `Scheduler::new()` |
+/// | `binary = "..."` | no | Binary name for `SchedulerSpec::Name(...)`. Omit for EEVDF. |
+/// | `topology(S, C, T)` | no | Default VM topology `(sockets, cores, threads)`. Defaults to `(1, 2, 1)`. |
+/// | `cgroup_parent = "..."` | no | Cgroup parent path. |
+/// | `sched_args = [...]` | no | Default scheduler CLI args. |
+///
+/// # Flag attributes (`#[flag(...)]`)
+///
+/// | Attribute | Description |
+/// |---|---|
+/// | `args = ["--flag-a", "--flag-b"]` | CLI args passed when this flag is active |
+/// | `requires = [OtherVariant]` | Variants that must also be active |
+///
+/// # Generated items
+///
+/// Given `enum MitosisFlag { Llc, Steal }`:
+///
+/// - Per-variant `static FlagDecl` entries
+/// - A `static &[&FlagDecl]` flags array
+/// - `const MITOSIS: Scheduler` (see naming below)
+/// - `impl MitosisFlag { pub const LLC: &str = "llc"; pub const STEAL: &str = "steal"; }`
+///
+/// The associated constants enable typed flag references:
+/// `required_flags = [MitosisFlag::LLC]` in `#[stt_test]`.
+///
+/// # Const name derivation
+///
+/// The generated `Scheduler` const name is derived from the enum name:
+/// 1. Strip trailing `"Flag"` or `"Flags"` suffix (if present)
+/// 2. Convert to `SCREAMING_SNAKE_CASE`
+///
+/// Examples: `MitosisFlag` -> `MITOSIS`, `EevdfFlags` -> `EEVDF`,
+/// `MySchedFlag` -> `MY_SCHED`, `Mitosis` -> `MITOSIS`.
+///
+/// # Variant naming
+///
+/// Variant identifiers are converted to kebab-case for the flag name.
+/// Consecutive uppercase letters are treated as acronyms:
+/// `Llc` -> `"llc"`, `RejectPin` -> `"reject-pin"`, `LLC` -> `"llc"`.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[derive(stt::Scheduler)]
+/// #[scheduler(name = "mitosis", binary = "scx_mitosis", topology(2, 4, 1),
+///             cgroup_parent = "/stt", sched_args = ["--exit-dump-len", "1048576"])]
+/// #[allow(dead_code)]
+/// enum MitosisFlag {
+///     #[flag(args = ["--enable-llc-awareness"])]
+///     Llc,
+///     #[flag(args = ["--enable-work-stealing"], requires = [Llc])]
+///     Steal,
+/// }
+/// ```
+#[proc_macro_derive(Scheduler, attributes(scheduler, flag))]
+pub fn derive_scheduler(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match derive_scheduler_inner(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let enum_name = &input.ident;
+
+    // Parse #[scheduler(...)] attributes
+    let mut sched_name: Option<String> = None;
+    let mut sched_binary: Option<String> = None;
+    let mut sched_topology: Option<(u32, u32, u32)> = None;
+    let mut sched_cgroup_parent: Option<String> = None;
+    let mut sched_args: Vec<String> = Vec::new();
+
+    for attr in &input.attrs {
+        if !attr.path().is_ident("scheduler") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                sched_name = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("binary") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                sched_binary = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("topology") {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let sockets: syn::LitInt = content.parse()?;
+                let _: syn::Token![,] = content.parse()?;
+                let cores: syn::LitInt = content.parse()?;
+                let _: syn::Token![,] = content.parse()?;
+                let threads: syn::LitInt = content.parse()?;
+                sched_topology = Some((
+                    sockets.base10_parse()?,
+                    cores.base10_parse()?,
+                    threads.base10_parse()?,
+                ));
+                Ok(())
+            } else if meta.path.is_ident("cgroup_parent") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                sched_cgroup_parent = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("sched_args") {
+                let value = meta.value()?;
+                let arr: syn::ExprArray = value.parse()?;
+                for elem in &arr.elems {
+                    match elem {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(ls),
+                            ..
+                        }) => sched_args.push(ls.value()),
+                        _ => {
+                            return Err(syn::Error::new_spanned(
+                                elem,
+                                "expected string literal in sched_args",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            } else {
+                Err(meta.error(format!(
+                    "unknown scheduler attribute `{}`",
+                    meta.path
+                        .get_ident()
+                        .map(|i| i.to_string())
+                        .unwrap_or_default()
+                )))
+            }
+        })?;
+    }
+
+    let sched_name = sched_name
+        .ok_or_else(|| syn::Error::new_spanned(enum_name, "missing `name` in #[scheduler(...)]"))?;
+
+    // Extract enum variants
+    let variants = match &input.data {
+        Data::Enum(data) => &data.variants,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                enum_name,
+                "Scheduler can only be derived for enums",
+            ));
+        }
+    };
+
+    // Validate all variants are unit variants
+    for v in variants {
+        if !matches!(v.fields, Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                v,
+                "Scheduler derive requires unit variants",
+            ));
+        }
+    }
+
+    // Collect variant info
+    struct FlagInfo {
+        ident: syn::Ident,
+        kebab_name: String,
+        screaming_snake: String,
+        args: Vec<String>,
+        requires: Vec<syn::Ident>,
+    }
+
+    let mut flag_infos: Vec<FlagInfo> = Vec::new();
+
+    for v in variants {
+        let ident = v.ident.clone();
+        let kebab_name = camel_to_kebab(&ident.to_string());
+        let screaming_snake = camel_to_screaming_snake(&ident.to_string());
+        let mut args: Vec<String> = Vec::new();
+        let mut requires: Vec<syn::Ident> = Vec::new();
+
+        for attr in &v.attrs {
+            if !attr.path().is_ident("flag") {
+                continue;
+            }
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("args") {
+                    let value = meta.value()?;
+                    let arr: syn::ExprArray = value.parse()?;
+                    for elem in &arr.elems {
+                        match elem {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(ls),
+                                ..
+                            }) => args.push(ls.value()),
+                            _ => {
+                                return Err(syn::Error::new_spanned(
+                                    elem,
+                                    "expected string literal in flag args",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                } else if meta.path.is_ident("requires") {
+                    let value = meta.value()?;
+                    let arr: syn::ExprArray = value.parse()?;
+                    for elem in &arr.elems {
+                        match elem {
+                            syn::Expr::Path(ep) => {
+                                let req_ident = ep
+                                    .path
+                                    .get_ident()
+                                    .ok_or_else(|| {
+                                        syn::Error::new_spanned(
+                                            ep,
+                                            "expected variant identifier in requires",
+                                        )
+                                    })?
+                                    .clone();
+                                requires.push(req_ident);
+                            }
+                            _ => {
+                                return Err(syn::Error::new_spanned(
+                                    elem,
+                                    "expected variant identifier in requires",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(meta.error(format!(
+                        "unknown flag attribute `{}`",
+                        meta.path
+                            .get_ident()
+                            .map(|i| i.to_string())
+                            .unwrap_or_default()
+                    )))
+                }
+            })?;
+        }
+
+        flag_infos.push(FlagInfo {
+            ident,
+            kebab_name,
+            screaming_snake,
+            args,
+            requires,
+        });
+    }
+
+    // Validate requires references exist
+    let variant_names: Vec<String> = flag_infos.iter().map(|f| f.ident.to_string()).collect();
+    for fi in &flag_infos {
+        for req in &fi.requires {
+            if !variant_names.contains(&req.to_string()) {
+                return Err(syn::Error::new_spanned(
+                    req,
+                    format!(
+                        "unknown variant `{}` in requires (expected one of: {})",
+                        req,
+                        variant_names.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Generate static FlagDecl names
+    let enum_upper = camel_to_screaming_snake(&enum_name.to_string());
+    let decl_idents: Vec<syn::Ident> = flag_infos
+        .iter()
+        .map(|fi| format_ident!("__{}_DECL_{}", enum_upper, fi.screaming_snake))
+        .collect();
+
+    // Generate static FlagDecl entries
+    let mut decl_statics = Vec::new();
+    for (i, fi) in flag_infos.iter().enumerate() {
+        let decl_ident = &decl_idents[i];
+        let name_str = &fi.kebab_name;
+        let args = &fi.args;
+
+        let requires_tokens: Vec<proc_macro2::TokenStream> = fi
+            .requires
+            .iter()
+            .map(|req_ident| {
+                let req_idx = flag_infos
+                    .iter()
+                    .position(|f| f.ident == *req_ident)
+                    .unwrap();
+                let req_decl_ident = &decl_idents[req_idx];
+                quote! { &#req_decl_ident }
+            })
+            .collect();
+
+        decl_statics.push(quote! {
+            static #decl_ident: ::stt::scenario::flags::FlagDecl = ::stt::scenario::flags::FlagDecl {
+                name: #name_str,
+                args: &[#(#args),*],
+                requires: &[#(#requires_tokens),*],
+            };
+        });
+    }
+
+    // Generate the flags array
+    let flags_array_ident = format_ident!("__{}_FLAGS", enum_upper);
+    let decl_refs: Vec<proc_macro2::TokenStream> =
+        decl_idents.iter().map(|di| quote! { &#di }).collect();
+
+    // Generate associated name constants
+    let name_consts: Vec<proc_macro2::TokenStream> = flag_infos
+        .iter()
+        .map(|fi| {
+            let const_ident = format_ident!("{}", fi.screaming_snake);
+            let name_str = &fi.kebab_name;
+            quote! {
+                pub const #const_ident: &'static str = #name_str;
+            }
+        })
+        .collect();
+
+    // Derive the const name from enum name: strip "Flag"/"Flags" suffix, uppercase
+    let enum_str = enum_name.to_string();
+    let base_name = enum_str
+        .strip_suffix("Flags")
+        .or_else(|| enum_str.strip_suffix("Flag"))
+        .unwrap_or(&enum_str);
+    if base_name.is_empty() {
+        return Err(syn::Error::new(
+            enum_name.span(),
+            "enum name cannot be just \"Flag\" or \"Flags\"",
+        ));
+    }
+    let const_name = format_ident!("{}", camel_to_screaming_snake(base_name));
+
+    // Build the Scheduler const with builder chain
+    let sched_name_str = &sched_name;
+    let mut builder_chain = quote! {
+        ::stt::test_support::Scheduler::new(#sched_name_str)
+    };
+
+    if let Some(ref binary) = sched_binary {
+        builder_chain = quote! {
+            #builder_chain.binary(::stt::test_support::SchedulerSpec::Name(#binary))
+        };
+    }
+
+    builder_chain = quote! {
+        #builder_chain.flags(#flags_array_ident)
+    };
+
+    if let Some((s, c, t)) = sched_topology {
+        builder_chain = quote! {
+            #builder_chain.topology(#s, #c, #t)
+        };
+    }
+
+    if let Some(ref parent) = sched_cgroup_parent {
+        builder_chain = quote! {
+            #builder_chain.cgroup_parent(#parent)
+        };
+    }
+
+    if !sched_args.is_empty() {
+        builder_chain = quote! {
+            #builder_chain.sched_args(&[#(#sched_args),*])
+        };
+    }
+
+    let expanded = quote! {
+        #(#decl_statics)*
+
+        static #flags_array_ident: &[&::stt::scenario::flags::FlagDecl] = &[#(#decl_refs),*];
+
+        const #const_name: ::stt::test_support::Scheduler = #builder_chain;
+
+        impl #enum_name {
+            #(#name_consts)*
+        }
+    };
+
+    Ok(expanded)
 }

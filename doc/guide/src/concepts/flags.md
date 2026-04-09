@@ -42,11 +42,17 @@ without `llc` is rejected.
 ## Using flags
 
 In `#[stt_test]`, use `required_flags` and `excluded_flags` to
-constrain which flag profiles the test runs with:
+constrain which flag profiles the test runs with. Both string literals
+and path expressions (from `#[derive(Scheduler)]`) work:
 
 ```rust,ignore
+// String literals
 #[stt_test(required_flags = ["llc", "borrow"])]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
+
+// Path expressions (from derive)
+#[stt_test(required_flags = [MitosisFlag::LLC, MitosisFlag::BORROW])]
+fn my_test2(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
 The gauntlet expands each test across all valid flag profiles.

@@ -122,6 +122,7 @@ pub mod workload;
 #[doc(hidden)]
 pub use linkme as __linkme;
 
+pub use stt_macros::Scheduler;
 pub use stt_macros::stt_test;
 
 #[cfg(feature = "integration")]
@@ -142,6 +143,7 @@ pub use crate::probe::process::resolve_func_ip;
 pub mod prelude {
     pub use anyhow::Result;
 
+    pub use crate::Scheduler;
     pub use crate::assert::{Assert, AssertResult};
     pub use crate::cgroup::CgroupManager;
     pub use crate::scenario::flags::FlagDecl;
