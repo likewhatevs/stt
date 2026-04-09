@@ -383,8 +383,9 @@ pub struct SttTestEntry {
     /// Pin vCPU threads to host cores matching the virtual topology's LLC
     /// structure, use 2MB hugepages for guest memory, set KVM_HINTS_REALTIME
     /// CPUID hint (disables PV spinlocks, PV TLB flush, PV sched_yield;
-    /// enables haltpoll cpuidle), disable PAUSE VM exits via
-    /// KVM_CAP_X86_DISABLE_EXITS, skip KVM_CAP_HALT_POLL (guest haltpoll
+    /// enables haltpoll cpuidle), disable PAUSE and HLT VM exits via
+    /// KVM_CAP_X86_DISABLE_EXITS (HLT falls back to PAUSE-only when
+    /// mitigate_smt_rsb is active), skip KVM_CAP_HALT_POLL (guest haltpoll
     /// cpuidle disables host halt polling via MSR_KVM_POLL_CONTROL), and
     /// validate that the host has enough CPUs and LLCs to satisfy the
     /// request without oversubscription.

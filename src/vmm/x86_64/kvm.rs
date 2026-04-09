@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_CAP_HALT_POLL, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS,
     KVM_PIT_SPEAKER_DUMMY, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
-    KVM_X86_DISABLE_EXITS_PAUSE, kvm_enable_cap, kvm_pit_config, kvm_userspace_memory_region,
+    KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE, kvm_enable_cap, kvm_pit_config,
+    kvm_userspace_memory_region,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
@@ -193,17 +194,39 @@ impl SttKvm {
             vm_fd.create_pit2(pit_config).context("create PIT")?;
         }
 
-        // Disable PAUSE VM exits to reduce vmexit overhead during spinlocks.
-        // Only PAUSE — HLT exits must remain enabled (BSP shutdown detection).
+        // Disable PAUSE and HLT VM exits in performance mode.
+        // Two separate enable_cap calls: kvm_disable_exits() uses |=
+        // (additive), so multiple calls accumulate. Separate calls
+        // ensure PAUSE succeeds unconditionally even if HLT is rejected.
+        //
+        // PAUSE: reduces vmexit overhead during guest spinlocks.
+        //        Unconditionally allowed by KVM.
+        // HLT:   eliminates the most frequent exit type during boot/idle.
+        //        BSP shutdown uses I8042 reset (port 0x64, 0xFE via
+        //        reboot=k) and VcpuExit::Shutdown, not VcpuExit::Hlt.
+        //        KVM blocks HLT disable when mitigate_smt_rsb is active
+        //        (host has X86_BUG_SMT_RSB and cpu_smt_possible()).
         if performance_mode {
             let mut cap = kvm_enable_cap {
                 cap: KVM_CAP_X86_DISABLE_EXITS,
                 ..Default::default()
             };
+
+            // 1. PAUSE — always allowed.
             cap.args[0] = KVM_X86_DISABLE_EXITS_PAUSE as u64;
             if let Err(e) = vm_fd.enable_cap(&cap) {
                 eprintln!(
-                    "performance_mode: WARNING: KVM_CAP_X86_DISABLE_EXITS not supported: {e}"
+                    "performance_mode: WARNING: \
+                     KVM_CAP_X86_DISABLE_EXITS (PAUSE) not supported: {e}"
+                );
+            }
+
+            // 2. HLT — may fail on mitigate_smt_rsb hosts.
+            cap.args[0] = KVM_X86_DISABLE_EXITS_HLT as u64;
+            if let Err(e) = vm_fd.enable_cap(&cap) {
+                eprintln!(
+                    "performance_mode: WARNING: \
+                     KVM_CAP_X86_DISABLE_EXITS (HLT) rejected: {e}"
                 );
             }
         }
@@ -520,6 +543,43 @@ mod tests {
         assert!(
             vm.is_ok(),
             "non-perf VM with halt poll failed: {:?}",
+            vm.err()
+        );
+    }
+
+    #[test]
+    fn disable_exits_hlt_bit_value() {
+        // KVM_X86_DISABLE_EXITS_HLT is bit 1 (value 2) in the kernel ABI.
+        assert_eq!(KVM_X86_DISABLE_EXITS_HLT, 2);
+    }
+
+    #[test]
+    fn disable_exits_pause_and_hlt_no_overlap() {
+        assert_ne!(
+            KVM_X86_DISABLE_EXITS_PAUSE, KVM_X86_DISABLE_EXITS_HLT,
+            "PAUSE and HLT bits must be distinct"
+        );
+        assert_eq!(
+            KVM_X86_DISABLE_EXITS_PAUSE & KVM_X86_DISABLE_EXITS_HLT,
+            0,
+            "PAUSE and HLT bits must not overlap"
+        );
+    }
+
+    #[test]
+    fn performance_mode_with_hlt_disable_succeeds() {
+        // performance_mode issues two separate enable_cap calls:
+        // PAUSE (always succeeds) then HLT (may be rejected by
+        // mitigate_smt_rsb). Either way, VM creation must succeed.
+        let topo = Topology {
+            sockets: 1,
+            cores_per_socket: 2,
+            threads_per_core: 1,
+        };
+        let vm = SttKvm::new(topo, 128, true);
+        assert!(
+            vm.is_ok(),
+            "performance_mode with HLT disable failed: {:?}",
             vm.err()
         );
     }

@@ -3,12 +3,12 @@
 Performance mode reduces noise during VM execution by applying
 host-side isolation (vCPU pinning, hugepages, NUMA mbind, RT
 scheduling), a guest-visible CPUID hint (KVM_HINTS_REALTIME), and
-KVM exit suppression (PAUSE VM exits disabled).
+KVM exit suppression (PAUSE and HLT VM exits disabled).
 
 ## What it does
 
-Six optimizations are applied when `performance_mode` is enabled
-(five host-side, one guest-visible via CPUID). Host-side
+Seven optimizations are applied when `performance_mode` is enabled
+(six host-side, one guest-visible via CPUID). Host-side
 `KVM_CAP_HALT_POLL` is explicitly skipped — the guest haltpoll
 cpuidle driver disables it via `MSR_KVM_POLL_CONTROL` (see below):
 
@@ -39,9 +39,16 @@ RT vCPU threads and service threads.
 instructions. Guest spinlocks execute PAUSE in tight loops; each
 PAUSE normally causes a vmexit so the hypervisor can schedule other
 vCPUs. With dedicated cores (vCPU pinning), this reschedule is
-unnecessary overhead. HLT exits remain enabled because the BSP uses
-`VcpuExit::Hlt` for shutdown detection. The capability is optional --
+unnecessary overhead. The capability is optional --
 if unsupported, a warning is logged and the VM proceeds without it.
+
+**Disable HLT VM exits** -- `KVM_X86_DISABLE_EXITS_HLT` suppresses
+VM exits on HLT instructions, the most frequent exit type during
+boot and idle. BSP shutdown detection uses I8042 reset (port 0x64,
+value 0xFE via `reboot=k`) and `VcpuExit::Shutdown` instead of
+`VcpuExit::Hlt`. KVM blocks HLT disable when `mitigate_smt_rsb` is
+active (host has `X86_BUG_SMT_RSB` and `cpu_smt_possible()`); in that case,
+only PAUSE exits are disabled.
 
 **KVM_HINTS_REALTIME CPUID** -- sets bit 0 of CPUID leaf 0x40000001
 EDX, telling the guest kernel that vCPUs are pinned to dedicated host
@@ -152,8 +159,8 @@ topology matrix.
 Performance mode serves two purposes:
 
 **Noise reduction** -- pinning, hugepages, NUMA mbind, RT scheduling,
-PAUSE VM exit disabling, the KVM_HINTS_REALTIME CPUID hint, and
-skipping host-side halt poll (guest haltpoll disables it via
+PAUSE and HLT VM exit disabling, the KVM_HINTS_REALTIME CPUID hint,
+and skipping host-side halt poll (guest haltpoll disables it via
 MSR_KVM_POLL_CONTROL) reduce measurement variance. Scheduling gaps, spread, and throughput checks
 become meaningful because host jitter is controlled. Without
 performance mode, a 50ms gap could be host noise; with it, the same
@@ -186,8 +193,8 @@ sums the actual CPU count of each LLC group and checks the total
 `super_perf_mode` validates at build time that sufficient LLC groups
 exist for the test topology. Both modes apply the same runtime
 optimizations (pinning, hugepages, NUMA mbind, RT scheduling,
-PAUSE VM exit disabling, KVM_HINTS_REALTIME CPUID hint, no host-side
-halt poll).
+PAUSE and HLT VM exit disabling, KVM_HINTS_REALTIME CPUID hint,
+no host-side halt poll).
 
 ```rust,ignore
 #[stt_test(

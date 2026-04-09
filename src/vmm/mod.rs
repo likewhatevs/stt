@@ -797,10 +797,10 @@ pub struct SttVm {
     /// then writes a u32 value at the specified offset.
     bpf_map_write: Option<BpfMapWriteParams>,
     /// Performance mode: vCPU pinning to host LLCs, hugepage-backed guest
-    /// memory, KVM_HINTS_REALTIME CPUID hint, PAUSE VM exit disabling via
-    /// KVM_CAP_X86_DISABLE_EXITS, and oversubscription validation.
-    /// KVM_CAP_HALT_POLL is skipped (guest haltpoll cpuidle disables
-    /// host halt polling via MSR_KVM_POLL_CONTROL).
+    /// memory, KVM_HINTS_REALTIME CPUID hint, PAUSE and HLT VM exit
+    /// disabling via KVM_CAP_X86_DISABLE_EXITS, and oversubscription
+    /// validation. KVM_CAP_HALT_POLL is skipped (guest haltpoll cpuidle
+    /// disables host halt polling via MSR_KVM_POLL_CONTROL).
     performance_mode: bool,
     /// Pinning plan computed during build() when performance_mode is enabled.
     /// Stored so topology is read once and the plan is reused at VM start.
@@ -830,7 +830,7 @@ impl SttVm {
         SttVmBuilder::default()
     }
 
-    /// Boot the VM, run until halt/shutdown/timeout, return captured output.
+    /// Boot the VM, run until shutdown/timeout, return captured output.
     pub fn run(&self) -> Result<VmResult> {
         let start = Instant::now();
 
@@ -1778,8 +1778,12 @@ impl SttVm {
                     dispatch_io_in(com1, com2, port, data);
                 }
                 Ok(VcpuExit::Hlt) => {
-                    exit_code = 0;
-                    break;
+                    // With in-kernel LAPIC, KVM handles HLT internally
+                    // and does not return KVM_EXIT_HLT to userspace.
+                    // This arm is defensive. Check kill and continue.
+                    if kill.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
                 Ok(VcpuExit::Shutdown) => {
                     exit_code = 0;
@@ -2398,6 +2402,8 @@ fn dispatch_io_in(
 /// On EINTR: clears immediate_exit (QEMU kvm_eat_signals pattern) and
 /// re-checks kill flag before re-entering KVM_RUN.
 /// HLT for APs is normal — KVM wakes them on SIPI/interrupt delivery.
+/// With HLT exits disabled (performance_mode), HLT instructions
+/// execute inside the guest without vmexits.
 #[cfg(target_arch = "x86_64")]
 fn vcpu_run_loop(
     vcpu: &mut kvm_ioctls::VcpuFd,
@@ -2421,8 +2427,9 @@ fn vcpu_run_loop(
                 dispatch_io_in(com1, com2, port, data);
             }
             Ok(VcpuExit::Hlt) => {
-                // AP halted — KVM wakes it on interrupt delivery (SIPI/timer).
-                // Check kill between HLT exits for clean shutdown.
+                // With in-kernel LAPIC, KVM handles HLT internally
+                // and does not return KVM_EXIT_HLT to userspace.
+                // This arm is defensive. Check kill and continue.
                 if kill.load(Ordering::Acquire) {
                     break;
                 }
@@ -2688,12 +2695,13 @@ impl SttVmBuilder {
     /// Enable performance mode: vCPU pinning to host LLCs,
     /// hugepage-backed guest memory, KVM_HINTS_REALTIME CPUID
     /// hint (disables PV spinlocks, PV TLB flush, PV sched_yield;
-    /// enables haltpoll cpuidle), and PAUSE VM exit disabling via
-    /// KVM_CAP_X86_DISABLE_EXITS. KVM_CAP_HALT_POLL is skipped
-    /// (guest haltpoll cpuidle disables host halt polling via
-    /// MSR_KVM_POLL_CONTROL). Validated at build time --
-    /// oversubscription is a fatal error, insufficient hugepages
-    /// is a warning.
+    /// enables haltpoll cpuidle), and PAUSE + HLT VM exit disabling
+    /// via KVM_CAP_X86_DISABLE_EXITS. HLT disable falls back to
+    /// PAUSE-only when mitigate_smt_rsb is active on the host.
+    /// KVM_CAP_HALT_POLL is skipped (guest haltpoll cpuidle disables
+    /// host halt polling via MSR_KVM_POLL_CONTROL). Validated at
+    /// build time -- oversubscription is a fatal error, insufficient
+    /// hugepages is a warning.
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {
         self.performance_mode = enabled;
@@ -3186,8 +3194,9 @@ mod tests {
 
     /// Benchmark: measure VM boot time to kernel panic (no init = fastest path).
     /// The kernel boots, finds no initramfs, panics. The panic timestamp
-    /// IS the boot time. With `panic=-1`, the kernel halts immediately
-    /// on panic, causing KVM_EXIT_HLT which returns to userspace.
+    /// IS the boot time. With `panic=-1`, the kernel calls
+    /// `emergency_restart()` which triggers an I8042 reset (port 0x64,
+    /// 0xFE via `reboot=k`), returning to userspace.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn bench_boot_time() {
@@ -3613,15 +3622,16 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_out_i8042_reset() {
+    fn dispatch_io_out_i8042_reset_is_shutdown_signal() {
+        // The BSP relies on I8042 reset (port 0x64, 0xFE) for shutdown
+        // detection instead of VcpuExit::Hlt. Verify that dispatch_io_out
+        // returns true for the reset command.
         let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
         let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        assert!(dispatch_io_out(
-            &com1,
-            &com2,
-            I8042_CMD_PORT,
-            &[I8042_CMD_RESET_CPU]
-        ));
+        assert!(
+            dispatch_io_out(&com1, &com2, I8042_CMD_PORT, &[I8042_CMD_RESET_CPU]),
+            "I8042 reset (0xFE to port 0x64) must signal shutdown"
+        );
     }
 
     #[test]

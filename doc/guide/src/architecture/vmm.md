@@ -71,8 +71,11 @@ optimizations across VM build, creation, and thread spawn:
 5. Sets KVM_HINTS_REALTIME in CPUID leaf 0x40000001 EDX,
    disabling PV spinlocks, PV TLB flush, and PV sched_yield
    in the guest, and enabling haltpoll cpuidle.
-6. Disables PAUSE VM exits via `KVM_CAP_X86_DISABLE_EXITS`
-   (PAUSE bit only; HLT exits remain for BSP shutdown detection).
+6. Disables PAUSE and HLT VM exits via `KVM_CAP_X86_DISABLE_EXITS`.
+   HLT is the most frequent exit type during boot/idle. BSP shutdown
+   uses I8042 reset and VcpuExit::Shutdown instead of VcpuExit::Hlt.
+   HLT disable falls back to PAUSE-only when mitigate_smt_rsb is
+   active on the host.
 7. Skips `KVM_CAP_HALT_POLL` (guest haltpoll cpuidle disables
    host halt polling via `MSR_KVM_POLL_CONTROL`).
 
