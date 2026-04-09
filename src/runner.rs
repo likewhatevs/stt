@@ -44,6 +44,8 @@ pub struct RunConfig {
     pub cleanup_ms: u64,
     /// Override work_type for all swappable CgroupDefs and steady-state cgroups.
     pub work_type_override: Option<crate::workload::WorkType>,
+    /// Caller-level assertion overrides merged onto `Assert::default_checks()`.
+    pub assert: crate::assert::Assert,
 }
 
 impl Default for RunConfig {
@@ -65,6 +67,7 @@ impl Default for RunConfig {
             scheduler_startup_ms: 2000,
             cleanup_ms: 200,
             work_type_override: None,
+            assert: crate::assert::Assert::NONE,
         }
     }
 }
@@ -209,7 +212,7 @@ impl Runner {
                 sched_pid,
                 settle_ms: self.config.settle_ms,
                 work_type_override: self.config.work_type_override,
-                assert: crate::assert::Assert::default_checks(),
+                assert: crate::assert::Assert::default_checks().merge(&self.config.assert),
                 wait_for_map_write: false,
             };
 
@@ -979,6 +982,7 @@ mod tests {
             scheduler_startup_ms: 2000,
             cleanup_ms: 100,
             work_type_override: Some(crate::workload::WorkType::CpuSpin),
+            assert: crate::assert::Assert::NONE.max_gap_ms(5000),
         };
         let c2 = config.clone();
         assert_eq!(c2.scheduler_bin, config.scheduler_bin);

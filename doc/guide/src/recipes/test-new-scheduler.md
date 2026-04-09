@@ -24,7 +24,7 @@ fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     let wl = dfl_wl(ctx);
     let (handles, _guard) = setup_cgroups(ctx, 2, &wl)?;
     std::thread::sleep(ctx.duration);
-    Ok(collect_all(handles))
+    Ok(collect_all(handles, &ctx.assert))
 }
 ```
 

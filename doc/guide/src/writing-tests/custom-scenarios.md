@@ -21,7 +21,7 @@ fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
     // Custom logic: resize cpusets, move workers, etc.
     std::thread::sleep(ctx.duration);
 
-    Ok(collect_all(handles))
+    Ok(collect_all(handles, &ctx.assert))
 }
 ```
 
@@ -31,9 +31,10 @@ fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 each, starts them. Returns `Result<(Vec<WorkloadHandle>, CgroupGroup)>`. The
 `CgroupGroup` is an RAII guard that removes cgroups on drop.
 
-**`collect_all(handles)`** -- stops all workers, collects reports, runs
-`assert_not_starved()` on each. Merges results: if any worker group
-fails, the overall result fails. Details from all groups are combined.
+**`collect_all(handles, checks)`** -- stops all workers, collects reports,
+runs `checks.assert_cgroup()` when worker-level checks are configured,
+otherwise falls back to `assert_not_starved()`. Merges results: if any
+worker group fails, the overall result fails.
 
 **`dfl_wl(ctx)`** -- creates a `WorkloadConfig` with
 `ctx.workers_per_cgroup` workers and default settings.

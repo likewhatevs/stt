@@ -445,8 +445,9 @@ pub struct Ctx<'a> {
     /// Override work type for scenarios that use `CpuSpin` by default.
     pub work_type_override: Option<WorkType>,
     /// Merged assertion config (default_checks + scheduler + per-test).
-    /// Used by `execute_steps` as the default when no explicit checks
-    /// are passed to `execute_steps_with`.
+    /// Used by `run_scenario` for data-driven scenarios and by
+    /// `execute_steps` as the default when no explicit checks are
+    /// passed to `execute_steps_with`.
     pub assert: crate::assert::Assert,
     /// When true, `execute_steps` polls SHM signal slot 0 after writing
     /// the scenario start marker, blocking until the host confirms its
@@ -547,10 +548,8 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     let mut result = AssertResult::pass();
     for (i, h) in handles.into_iter().enumerate() {
         let reports = h.stop_and_collect();
-        result.merge(assert::assert_not_starved(&reports));
-        if let Some(ref cs) = cpusets {
-            result.merge(assert::assert_isolation(&reports, &cs[i]));
-        }
+        let cs = cpusets.as_ref().map(|v| &v[i]);
+        result.merge(ctx.assert.assert_cgroup(&reports, cs));
     }
 
     // Capture kernel log on failure
@@ -691,13 +690,21 @@ pub fn setup_cgroups<'a>(
     Ok((handles, guard))
 }
 
-/// Stop all workers, collect reports, and run starvation checks.
+/// Stop all workers, collect reports, and run assertion checks.
 ///
-/// Returns a merged [`AssertResult`] across all workers.
-pub fn collect_all(handles: Vec<WorkloadHandle>) -> AssertResult {
+/// Uses `checks` for worker evaluation. When the Assert has no
+/// worker-level checks configured (all fields None), falls back
+/// to `assert_not_starved`. Returns a merged [`AssertResult`]
+/// across all workers.
+pub fn collect_all(handles: Vec<WorkloadHandle>, checks: &crate::assert::Assert) -> AssertResult {
     let mut r = AssertResult::pass();
     for h in handles {
-        r.merge(assert::assert_not_starved(&h.stop_and_collect()));
+        let reports = h.stop_and_collect();
+        if checks.has_worker_checks() {
+            r.merge(checks.assert_cgroup(&reports, None));
+        } else {
+            r.merge(assert::assert_not_starved(&reports));
+        }
     }
     r
 }

@@ -549,6 +549,8 @@ struct StepState<'a> {
     cgroups: CgroupGroup<'a>,
     /// Active workload handles keyed by cgroup name.
     handles: Vec<(String, WorkloadHandle)>,
+    /// Resolved cpusets per cgroup name, for isolation checks.
+    cpusets: std::collections::HashMap<String, BTreeSet<usize>>,
 }
 
 /// Execute a sequence of steps against the given context.
@@ -572,6 +574,7 @@ pub fn execute_steps_with(
     let mut state = StepState {
         cgroups: CgroupGroup::new(ctx.cgroups),
         handles: Vec::new(),
+        cpusets: std::collections::HashMap::new(),
     };
 
     // Open SHM once for the entire step sequence. No-op outside a VM.
@@ -711,6 +714,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             }
             let resolved = cpuset_spec.resolve(ctx);
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
+            state.cpusets.insert(def.name.to_string(), resolved);
         }
         let n = def.num_workers.unwrap_or(ctx.workers_per_cgroup);
         let effective_work_type = crate::workload::resolve_work_type(
@@ -743,6 +747,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
             Op::RemoveCgroup { name } => {
                 // Stop workers in this cgroup first.
                 state.handles.retain(|(n, _)| n.as_str() != *name);
+                state.cpusets.remove(name.as_ref());
                 let _ = ctx.cgroups.remove_cgroup(name);
             }
             Op::SetCpuset { cgroup, cpus } => {
@@ -751,9 +756,11 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 }
                 let resolved = cpus.resolve(ctx);
                 ctx.cgroups.set_cpuset(cgroup, &resolved)?;
+                state.cpusets.insert(cgroup.to_string(), resolved);
             }
             Op::ClearCpuset { cgroup } => {
                 ctx.cgroups.clear_cpuset(cgroup)?;
+                state.cpusets.remove(cgroup.as_ref());
             }
             Op::SwapCpusets { a, b } => {
                 // Read current cpusets from the cgroup filesystem, swap them.
@@ -761,9 +768,11 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 let cpus_b = read_cpuset(ctx, b);
                 if let Some(ref ca) = cpus_a {
                     ctx.cgroups.set_cpuset(b, ca)?;
+                    state.cpusets.insert(b.to_string(), ca.clone());
                 }
                 if let Some(ref cb) = cpus_b {
                     ctx.cgroups.set_cpuset(a, cb)?;
+                    state.cpusets.insert(a.to_string(), cb.clone());
                 }
             }
             Op::Spawn { cgroup, workload } => {
@@ -851,16 +860,18 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
 
 /// Collect all worker results and produce an AssertResult.
 ///
-/// Uses `checks` for worker evaluation. When the Assert has no
-/// worker-level checks configured (all fields None), falls back
-/// to `assert_not_starved`.
+/// Uses `checks` for worker evaluation, passing each cgroup's
+/// tracked cpuset (if any) for isolation checks. When the Assert
+/// has no worker-level checks configured (all fields None), falls
+/// back to `assert_not_starved`.
 fn collect_result(state: &mut StepState<'_>, checks: &crate::assert::Assert) -> AssertResult {
     let mut result = AssertResult::pass();
     let handles = std::mem::take(&mut state.handles);
-    for (_name, h) in handles {
+    for (name, h) in handles {
         let reports = h.stop_and_collect();
+        let cpuset = state.cpusets.get(&name);
         if checks.has_worker_checks() {
-            result.merge(checks.assert_cgroup(&reports, None));
+            result.merge(checks.assert_cgroup(&reports, cpuset));
         } else {
             result.merge(assert::assert_not_starved(&reports));
         }

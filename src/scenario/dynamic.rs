@@ -83,7 +83,7 @@ pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
         let _ = ctx.cgroups.remove_cgroup(&n);
         i += 1;
     }
-    Ok(collect_all(handles))
+    Ok(collect_all(handles, &ctx.assert))
 }
 
 pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {

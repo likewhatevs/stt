@@ -96,7 +96,7 @@ pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
         let _ = ctx.cgroups.remove_cgroup(&path);
         i += 1;
     }
-    Ok(collect_all(handles))
+    Ok(collect_all(handles, &ctx.assert))
 }
 
 /// Nested cgroups with cpusets + subtree_control filesystem writes.

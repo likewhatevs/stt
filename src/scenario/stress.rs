@@ -181,7 +181,7 @@ pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let handles = spawn_diverse(ctx, &name_refs)?;
     thread::sleep(ctx.duration);
-    Ok(collect_all(handles))
+    Ok(collect_all(handles, &ctx.assert))
 }
 
 /// Uses spawn_diverse for workload variety + manual cpuset partitioning.
@@ -203,7 +203,7 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> 
     thread::sleep(Duration::from_millis(ctx.settle_ms));
     let handles = spawn_diverse(ctx, &names)?;
     thread::sleep(ctx.duration);
-    Ok(collect_all(handles))
+    Ok(collect_all(handles, &ctx.assert))
 }
 
 /// spawn_diverse + dynamic cgroup add/remove mid-run.
@@ -244,7 +244,7 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
     }
     let _ = ctx.cgroups.remove_cgroup("cg_3");
     thread::sleep(ctx.duration / 3);
-    Ok(collect_all(handles))
+    Ok(collect_all(handles, &ctx.assert))
 }
 
 /// LLC-specific cpusets + tight flip loop. Uses Instant::now() deadline
