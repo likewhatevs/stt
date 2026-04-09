@@ -112,6 +112,79 @@ Allocate hugepages before the run:
 echo 2048 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 ```
 
+## Monitor threshold failures
+
+```text
+worker gap 4500ms exceeds max_gap_ms 3000
+worker spread 0.42 exceeds max_spread 0.35
+```
+
+The Assert checks (`max_gap_ms`, `max_spread`, etc.) detected a
+worker metric outside the configured thresholds.
+
+**Fixes:**
+
+- Check whether the topology has enough CPUs for the scenario. Small
+  topologies produce higher contention, larger gaps, and more spread.
+- Use `execute_steps_with()` with a custom `Assert` to override
+  thresholds for scenarios that need relaxed limits.
+- Check the scheduler's behavior under the specific flag profile that
+  triggered the failure.
+
+## Cgroup name typos
+
+```text
+No such file or directory: /sys/fs/cgroup/.../nonexistent/cgroup.procs
+```
+
+A cgroup name passed to `Op::SetCpuset`, `Op::Spawn`, or
+`CgroupManager::move_tasks` does not match a previously created
+cgroup. Cgroup names are case-sensitive strings.
+
+**Fixes:**
+
+- Verify the cgroup name matches the `name` in `Op::AddCgroup` or
+  `CgroupDef::named()`.
+- When using dynamic cgroup names (e.g. `format!("cg_{i}")`), ensure
+  the same formatting is used in all ops referencing that cgroup.
+
+## CpusetSpec errors
+
+```text
+CpusetSpec validation failed: not enough usable CPUs (4) for 8 partitions
+CpusetSpec validation failed: index 3 >= partition count 3
+```
+
+A `CpusetSpec` cannot produce a valid cpuset for the test topology.
+`execute_steps` logs a warning and proceeds (the resolved cpuset may
+be empty or unexpected).
+
+**Fixes:**
+
+- Guard with a topology check before creating the step:
+  `if ctx.topo.usable_cpus().len() < needed { return Ok(AssertResult::skip(...)); }`
+- Use `CpusetSpec::validate(&ctx)` to check before resolve.
+- Reduce the partition count or use `CpusetSpec::Llc` instead of
+  `Disjoint` on topologies with fewer CPUs than partitions.
+
+## Worker count mismatches
+
+```text
+grouped work type PipeIo requires even num_workers, got 3
+```
+
+Grouped work types (`PipeIo`, `FutexPingPong`, `CachePipe`,
+`FutexFanOut`) require `num_workers` divisible by their group size.
+`WorkType::worker_group_size()` returns the divisor.
+
+**Fixes:**
+
+- Set `CgroupDef::workers(n)` to a value divisible by the work
+  type's group size (2 for pipe/futex pairs, `fan_out + 1` for
+  FutexFanOut).
+- Use an ungrouped work type (`CpuSpin`, `Mixed`, `Bursty`,
+  `IoSync`, `YieldHeavy`) if worker count flexibility is needed.
+
 ## Tests pass locally but fail in CI
 
 Common causes:

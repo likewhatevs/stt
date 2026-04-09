@@ -53,6 +53,15 @@ let def = CgroupDef::named("cg_0")
     .work_type(WorkType::CpuSpin);
 ```
 
+### Builder methods
+
+- `.with_cpuset(CpusetSpec)` -- set the cpuset.
+- `.workers(n)` -- set worker count.
+- `.work_type(WorkType)` -- set work type (default: `CpuSpin`).
+- `.sched_policy(SchedPolicy)` -- set Linux scheduling policy
+  (default: `Normal`). See [Work Types](work-types.md#scheduling-policies).
+- `.swappable(bool)` -- opt into gauntlet work type override.
+
 ### Work type overrides and swappable
 
 `CgroupDef` has a `swappable` flag (default: `false`). When `true`
@@ -85,6 +94,20 @@ pub struct Step {
 `Vec<CgroupDef>` implements `Into<Setup>`, so you can write
 `setup: vec![...].into()` instead of `setup: Setup::Defs(vec![...])`.
 
+### Constructors
+
+**`Step::new(ops, hold)`** -- creates a step with ops only (no
+CgroupDef setup). Use when the step only applies dynamic operations
+to an existing topology.
+
+**`Step::with_defs(defs, hold)`** -- creates a step with CgroupDef
+setup and a hold period. The primary constructor for steps that
+create cgroups with workers.
+
+**`Step::with_ops(self, ops)`** -- replaces the ops on a step
+(builder method). Chain after `with_defs` to add dynamic operations
+to a step that also creates cgroups.
+
 ## HoldSpec
 
 How long to hold after a step completes:
@@ -94,6 +117,20 @@ How long to hold after a step completes:
 | `Frac(f64)` | Fraction of the total scenario duration |
 | `Fixed(Duration)` | Fixed time |
 | `Loop { interval }` | Repeat ops at interval until time runs out |
+
+## execute_defs
+
+`execute_defs(ctx, defs)` is a convenience wrapper for the common
+pattern of creating cgroups and running them for the full duration:
+
+```rust,ignore
+execute_defs(ctx, vec![
+    CgroupDef::named("cg_0").workers(4),
+    CgroupDef::named("cg_1").workers(4),
+])
+```
+
+Equivalent to `execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::Frac(1.0))])`.
 
 ## execute_steps
 

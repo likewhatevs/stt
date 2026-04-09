@@ -35,7 +35,7 @@ pub enum Op {
     /// Create a new cgroup under the managed cgroup parent.
     AddCgroup { name: Cow<'static, str> },
     /// Remove a cgroup (stops its workers first).
-    RemoveCgroup { name: Cow<'static, str> },
+    RemoveCgroup { cgroup: Cow<'static, str> },
     /// Set a cgroup's cpuset to the resolved CPU set.
     SetCpuset {
         cgroup: Cow<'static, str>,
@@ -553,6 +553,14 @@ struct StepState<'a> {
     cpusets: std::collections::HashMap<String, BTreeSet<usize>>,
 }
 
+/// Execute a single step with CgroupDefs that hold for the full duration.
+///
+/// Convenience wrapper around [`execute_steps`] for the common pattern
+/// of creating cgroups and running them for `HoldSpec::Frac(1.0)`.
+pub fn execute_defs(ctx: &Ctx, defs: Vec<CgroupDef>) -> Result<AssertResult> {
+    execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::Frac(1.0))])
+}
+
 /// Execute a sequence of steps against the given context.
 ///
 /// Convenience wrapper around [`execute_steps_with`] that passes
@@ -753,11 +761,11 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
             Op::AddCgroup { name } => {
                 state.cgroups.add_cgroup_no_cpuset(name)?;
             }
-            Op::RemoveCgroup { name } => {
+            Op::RemoveCgroup { cgroup } => {
                 // Stop workers in this cgroup first.
-                state.handles.retain(|(n, _)| n.as_str() != *name);
-                state.cpusets.remove(name.as_ref());
-                let _ = ctx.cgroups.remove_cgroup(name);
+                state.handles.retain(|(n, _)| n.as_str() != *cgroup);
+                state.cpusets.remove(cgroup.as_ref());
+                let _ = ctx.cgroups.remove_cgroup(cgroup);
             }
             Op::SetCpuset { cgroup, cpus } => {
                 if let Err(reason) = cpus.validate(ctx) {
@@ -981,7 +989,7 @@ impl Traverse {
                     ops.push(Op::StopCgroup {
                         cgroup: name.clone(),
                     });
-                    ops.push(Op::RemoveCgroup { name });
+                    ops.push(Op::RemoveCgroup { cgroup: name });
                 }
             }
 
@@ -1047,7 +1055,7 @@ mod tests {
     fn op_discriminant_unique() {
         let ops: Vec<Op> = vec![
             Op::AddCgroup { name: "a".into() },
-            Op::RemoveCgroup { name: "a".into() },
+            Op::RemoveCgroup { cgroup: "a".into() },
             Op::SetCpuset {
                 cgroup: "a".into(),
                 cpus: CpusetSpec::Exact(Default::default()),
@@ -1089,7 +1097,7 @@ mod tests {
     #[test]
     fn op_discriminant_values() {
         assert_eq!(Op::AddCgroup { name: "a".into() }.discriminant(), 0);
-        assert_eq!(Op::RemoveCgroup { name: "a".into() }.discriminant(), 1);
+        assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 1);
         assert_eq!(
             Op::SpawnHost {
                 workload: Default::default()
@@ -1517,7 +1525,7 @@ mod tests {
         // (cg_0, cg_1 are never removed).
         for step in &steps {
             let remove_ops: Vec<&Op> = step.ops.iter()
-                .filter(|op| matches!(op, Op::RemoveCgroup { name } if name == "cg_0" || name == "cg_1"))
+                .filter(|op| matches!(op, Op::RemoveCgroup { cgroup } if cgroup == "cg_0" || cgroup == "cg_1"))
                 .collect();
             assert!(
                 remove_ops.is_empty(),
@@ -1618,7 +1626,7 @@ mod tests {
         )
         .with_ops(vec![
             Op::AddCgroup { name: "b".into() },
-            Op::RemoveCgroup { name: "c".into() },
+            Op::RemoveCgroup { cgroup: "c".into() },
         ]);
         assert_eq!(step.ops.len(), 2);
     }

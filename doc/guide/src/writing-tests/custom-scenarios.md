@@ -31,6 +31,11 @@ fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 each, starts them. Returns `Result<(Vec<WorkloadHandle>, CgroupGroup)>`. The
 `CgroupGroup` is an RAII guard that removes cgroups on drop.
 
+> **Warning:** `let _ = CgroupGroup::new(...)` drops immediately -- the
+> guard is destroyed at the end of the statement, not the end of the
+> scope. Always bind to a named variable (`let _guard = ...`) to keep
+> cgroups alive for the duration of the test.
+
 **`collect_all(handles, checks)`** -- stops all workers, collects reports,
 runs `checks.assert_cgroup()` when worker-level checks are configured,
 otherwise falls back to `assert_not_starved()`. Merges results: if any
@@ -61,8 +66,20 @@ pub struct Ctx<'a> {
 ```
 
 **`cgroups`** -- create/remove cgroups, set cpusets, move tasks.
+`move_task(name, tid)` moves a single task; `move_tasks(name, &tids)`
+moves all tasks in a slice (calls `move_task` per TID).
 
 **`topo`** -- query CPU topology (LLCs, NUMA nodes, total CPUs).
+Key methods:
+
+- `all_cpus() -> &[usize]` -- all CPU IDs, sorted.
+- `usable_cpus() -> &[usize]` -- all CPUs except the last (reserved
+  for root cgroup) when topology has >2 CPUs.
+- `split_by_llc() -> Vec<BTreeSet<usize>>` -- one BTreeSet per LLC.
+- `num_llcs()`, `total_cpus()`, `num_numa_nodes()` -- counts.
+- `cpus_in_llc(idx) -> &[usize]` -- CPUs in LLC at index.
+- `llc_aligned_cpuset(idx) -> BTreeSet<usize>` -- same as
+  `cpus_in_llc` but returns a set.
 
 **`sched_pid`** -- scheduler process ID for liveness checks.
 

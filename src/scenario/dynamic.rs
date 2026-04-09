@@ -54,7 +54,9 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
         phase2_ops.push(Op::StopCgroup {
             cgroup: name.into(),
         });
-        phase2_ops.push(Op::RemoveCgroup { name: name.into() });
+        phase2_ops.push(Op::RemoveCgroup {
+            cgroup: name.into(),
+        });
     }
 
     let steps = vec![
@@ -118,7 +120,7 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
                     cgroup: "cg_2".into(),
                 },
                 Op::RemoveCgroup {
-                    name: "cg_2".into(),
+                    cgroup: "cg_2".into(),
                 },
             ],
             hold: HoldSpec::Frac(1.0 / 3.0),

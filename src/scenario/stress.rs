@@ -70,7 +70,9 @@ pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
     let mut remove_ops = Vec::new();
     for i in 0..half {
         let name = format!("exhaust_{i}");
-        remove_ops.push(super::ops::Op::RemoveCgroup { name: name.into() });
+        remove_ops.push(super::ops::Op::RemoveCgroup {
+            cgroup: name.into(),
+        });
     }
 
     let steps = vec![

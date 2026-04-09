@@ -146,10 +146,10 @@ pub mod prelude {
     pub use crate::cgroup::CgroupManager;
     pub use crate::scenario::flags::FlagDecl;
     pub use crate::scenario::ops::{
-        CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execute_steps_with,
+        CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_defs, execute_steps, execute_steps_with,
     };
     pub use crate::scenario::scenarios;
-    pub use crate::scenario::{CgroupGroup, Ctx};
+    pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::stt_test;
     pub use crate::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
     pub use crate::workload::{

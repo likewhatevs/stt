@@ -99,6 +99,83 @@ struct and helper functions.
 All scenarios are registered in `all_scenarios()`. The catalog has
 scenarios across 11 categories.
 
+### Canned scenarios (`scenarios::*`)
+
+These thin wrappers in `stt::scenario::scenarios` call `execute_defs`
+or delegate to a `custom_*` function:
+
+| Function | Description |
+|---|---|
+| `steady` | 2 cgroups, no cpusets, equal CPU-spin load |
+| `steady_llc` | 2 cgroups with LLC-aligned cpusets |
+| `oversubscribed` | 2 cgroups, 32 mixed workers each |
+| `cpuset_apply` | Disjoint cpusets applied mid-run |
+| `cpuset_clear` | Cpusets cleared mid-run |
+| `cpuset_resize` | Cpusets shrink then grow |
+| `cgroup_add` | Cgroups added mid-run |
+| `cgroup_remove` | Cgroups removed mid-run |
+| `affinity_change` | Worker affinities randomized mid-run |
+| `affinity_pinned` | Workers pinned to 2-CPU subset |
+| `host_contention` | Host workers vs cgroup workers |
+| `mixed_workloads` | Heavy + bursty + IO cgroups |
+| `nested_steady` | Workers in nested sub-cgroups |
+| `nested_task_move` | Tasks moved between nested cgroups |
+
+### Custom scenario functions
+
+These are in `stt::scenario::{module}` and can be used directly in
+`Action::Custom(...)` or called from custom test functions.
+
+**affinity**: `custom_cgroup_affinity_change`,
+`custom_cgroup_multicpu_pin`, `custom_cgroup_cpuset_multicpu_pin`
+
+**basic**: `custom_host_cgroup_contention`, `custom_sched_mixed`,
+`custom_cgroup_pipe_io`
+
+**cpuset**: `custom_cgroup_cpuset_apply_midrun`,
+`custom_cgroup_cpuset_clear_midrun`, `custom_cgroup_cpuset_resize`,
+`custom_cgroup_cpuset_swap_disjoint`,
+`custom_cgroup_cpuset_workload_imbalance`,
+`custom_cgroup_cpuset_change_imbalance`,
+`custom_cgroup_cpuset_load_shift`
+
+**dynamic**: `custom_cgroup_add_midrun`,
+`custom_cgroup_remove_midrun`, `custom_cgroup_rapid_churn`,
+`custom_cgroup_cpuset_add_remove`,
+`custom_cgroup_add_during_imbalance`
+
+**interaction**: `custom_cgroup_add_load_imbalance`,
+`custom_cgroup_imbalance_mixed_workload`,
+`custom_cgroup_load_oscillation`,
+`custom_cgroup_4way_load_imbalance`,
+`custom_cgroup_cpuset_imbalance_combined`,
+`custom_cgroup_cpuset_overlap_imbalance_combined`,
+`custom_cgroup_noctrl_task_migration`,
+`custom_cgroup_noctrl_imbalance`,
+`custom_cgroup_noctrl_cpuset_change`,
+`custom_cgroup_noctrl_load_imbalance`,
+`custom_cgroup_io_compute_imbalance`
+
+**nested**: `custom_nested_cgroup_steady`,
+`custom_nested_cgroup_task_move`,
+`custom_nested_cgroup_rapid_churn`,
+`custom_nested_cgroup_cpuset`,
+`custom_nested_cgroup_imbalance`,
+`custom_nested_cgroup_noctrl`
+
+**performance**: `custom_cache_pressure_imbalance`,
+`custom_cache_yield_wake_affine`,
+`custom_cache_pipe_io_compute_imbalance`,
+`custom_fanout_wake`
+
+**stress**: `custom_cgroup_per_cpu`,
+`custom_cgroup_exhaust_reuse`,
+`custom_cgroup_dsq_contention`,
+`custom_cgroup_workload_variety`,
+`custom_cgroup_cpuset_workload_variety`,
+`custom_cgroup_dynamic_workload_variety`,
+`custom_cgroup_cpuset_crossllc_race`
+
 ## Flag profiles
 
 Each scenario generates valid flag combinations from its

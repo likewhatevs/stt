@@ -30,7 +30,7 @@ use crate::assert::AssertResult;
 use crate::workload::WorkType;
 
 use super::Ctx;
-use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
+use super::ops::{CgroupDef, CpusetSpec, execute_defs};
 
 // ---------------------------------------------------------------------------
 // Basic
@@ -41,11 +41,10 @@ use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
 /// Simplest possible scenario: tests that the scheduler can handle
 /// two cgroups running simultaneously without starvation.
 pub fn steady(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step::with_defs(
+    execute_defs(
+        ctx,
         vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
-        HoldSpec::Frac(1.0),
-    )];
-    execute_steps(ctx, steps)
+    )
 }
 
 /// Two cgroups with LLC-aligned cpusets.
@@ -57,14 +56,13 @@ pub fn steady_llc(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.num_llcs() < 2 {
         return Ok(AssertResult::skip("skipped: need >=2 LLCs"));
     }
-    let steps = vec![Step::with_defs(
+    execute_defs(
+        ctx,
         vec![
             CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Llc(0)),
             CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Llc(1)),
         ],
-        HoldSpec::Frac(1.0),
-    )];
-    execute_steps(ctx, steps)
+    )
 }
 
 /// Two cgroups with 32 mixed workers each (oversubscribed).
@@ -72,7 +70,8 @@ pub fn steady_llc(ctx: &Ctx) -> Result<AssertResult> {
 /// Worker count far exceeds CPU count, testing dispatch under
 /// heavy oversubscription with mixed workload types.
 pub fn oversubscribed(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step::with_defs(
+    execute_defs(
+        ctx,
         vec![
             CgroupDef::named("cg_0")
                 .workers(32)
@@ -81,9 +80,7 @@ pub fn oversubscribed(ctx: &Ctx) -> Result<AssertResult> {
                 .workers(32)
                 .work_type(WorkType::Mixed),
         ],
-        HoldSpec::Frac(1.0),
-    )];
-    execute_steps(ctx, steps)
+    )
 }
 
 // ---------------------------------------------------------------------------

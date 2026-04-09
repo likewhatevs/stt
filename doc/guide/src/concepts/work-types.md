@@ -106,6 +106,24 @@ futex wait/wake.
 `WorkType::from_name()` uses PascalCase names matching the enum
 variants; `from_preset()` uses the snake_case aliases above.
 
+## WorkloadConfig
+
+`WorkloadConfig` is the low-level struct passed to
+`WorkloadHandle::spawn()`. `CgroupDef` builds one internally; use
+`WorkloadConfig` directly when calling `setup_cgroups()` or
+`WorkloadHandle::spawn()` in custom scenarios.
+
+```rust,ignore
+pub struct WorkloadConfig {
+    pub num_workers: usize,       // Number of worker processes to fork
+    pub affinity: AffinityMode,   // CPU affinity mode (None, Fixed, Random, SingleCpu)
+    pub work_type: WorkType,      // What each worker does
+    pub sched_policy: SchedPolicy, // Linux scheduling policy
+}
+```
+
+`Default`: 1 worker, no affinity, CpuSpin, Normal policy.
+
 ## Scheduling policies
 
 Workers can run under different Linux scheduling policies:
