@@ -410,6 +410,7 @@ impl Scenario {
 /// Prevents cgroup leaks when workload spawning or other operations fail
 /// between cgroup creation and cleanup.
 #[derive(Debug)]
+#[must_use = "dropping a CgroupGroup immediately destroys the cgroups it manages"]
 pub struct CgroupGroup<'a> {
     cgroups: &'a CgroupManager,
     names: Vec<String>,
