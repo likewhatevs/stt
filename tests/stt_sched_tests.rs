@@ -166,7 +166,11 @@ const SCATTER_SCHED: Scheduler =
 static __STT_ENTRY_SCATTER: stt::test_support::SttTestEntry = stt::test_support::SttTestEntry {
     name: "demo_scattershot_migration",
     func: scenario_scattershot,
-    sockets: 2,
+    topology: stt::test_support::Topology {
+        sockets: 2,
+        cores_per_socket: 2,
+        threads_per_core: 1,
+    },
     scheduler: &SCATTER_SCHED,
     extra_sched_args: &["--scattershot"],
     performance_mode: true,

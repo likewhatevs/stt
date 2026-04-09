@@ -312,14 +312,18 @@ static BPF_CRASH: BpfMapWrite = BpfMapWrite {
     value: 1,
 };
 
-use stt::test_support::SttTestEntry;
+use stt::test_support::{SttTestEntry, Topology};
 
 #[linkme::distributed_slice(stt::test_support::STT_TESTS)]
 #[linkme(crate = linkme)]
 static __STT_ENTRY_FORCED_STALL: SttTestEntry = SttTestEntry {
     name: "cover_watchdog_forced_stall",
     func: scenario_sched_mixed,
-    cores: 4,
+    topology: Topology {
+        sockets: 1,
+        cores_per_socket: 4,
+        threads_per_core: 1,
+    },
     scheduler: &STT_SCHED,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout_s: 2,
@@ -333,7 +337,11 @@ static __STT_ENTRY_FORCED_STALL: SttTestEntry = SttTestEntry {
 static __STT_ENTRY_STALL_DETECT: SttTestEntry = SttTestEntry {
     name: "neg_stall_detection_scx_exit",
     func: scenario_sched_mixed,
-    cores: 4,
+    topology: Topology {
+        sockets: 1,
+        cores_per_socket: 4,
+        threads_per_core: 1,
+    },
     scheduler: &STT_SCHED,
     auto_repro: false,
     extra_sched_args: &["--stall-after", "1"],
@@ -347,7 +355,11 @@ static __STT_ENTRY_STALL_DETECT: SttTestEntry = SttTestEntry {
 static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
     name: "neg_sched_death_no_verify_result",
     func: scenario_sched_mixed,
-    cores: 4,
+    topology: Topology {
+        sockets: 1,
+        cores_per_socket: 4,
+        threads_per_core: 1,
+    },
     scheduler: &STT_SCHED,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout_s: 3,
@@ -361,7 +373,11 @@ static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
 static __STT_ENTRY_AUTO_REPRO_VERIFY: SttTestEntry = SttTestEntry {
     name: "neg_auto_repro_on_verify_failure",
     func: scenario_forced_failure,
-    cores: 4,
+    topology: Topology {
+        sockets: 1,
+        cores_per_socket: 4,
+        threads_per_core: 1,
+    },
     scheduler: &STT_SCHED,
     expect_err: true,
     ..SttTestEntry::DEFAULT
@@ -372,7 +388,11 @@ static __STT_ENTRY_AUTO_REPRO_VERIFY: SttTestEntry = SttTestEntry {
 static __STT_ENTRY_CRASH_AFTER: SttTestEntry = SttTestEntry {
     name: "neg_crash_after_auto_repro",
     func: scenario_sched_mixed,
-    cores: 4,
+    topology: Topology {
+        sockets: 1,
+        cores_per_socket: 4,
+        threads_per_core: 1,
+    },
     scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
     expect_err: true,
@@ -384,7 +404,11 @@ static __STT_ENTRY_CRASH_AFTER: SttTestEntry = SttTestEntry {
 static __STT_ENTRY_DEMO_BPF_CRASH: SttTestEntry = SttTestEntry {
     name: "demo_bpf_crash_auto_repro",
     func: scenario_sched_mixed,
-    cores: 4,
+    topology: Topology {
+        sockets: 1,
+        cores_per_socket: 4,
+        threads_per_core: 1,
+    },
     scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
     expect_err: true,
@@ -396,7 +420,11 @@ static __STT_ENTRY_DEMO_BPF_CRASH: SttTestEntry = SttTestEntry {
 static __STT_ENTRY_HOST_CRASH: SttTestEntry = SttTestEntry {
     name: "neg_host_crash_auto_repro",
     func: scenario_yield_heavy,
-    cores: 4,
+    topology: Topology {
+        sockets: 1,
+        cores_per_socket: 4,
+        threads_per_core: 1,
+    },
     scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
     expect_err: true,
@@ -408,7 +436,11 @@ static __STT_ENTRY_HOST_CRASH: SttTestEntry = SttTestEntry {
 static __STT_ENTRY_DEMO_HOST_CRASH: SttTestEntry = SttTestEntry {
     name: "demo_host_crash_auto_repro",
     func: scenario_yield_heavy,
-    cores: 4,
+    topology: Topology {
+        sockets: 1,
+        cores_per_socket: 4,
+        threads_per_core: 1,
+    },
     scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
     expect_err: true,

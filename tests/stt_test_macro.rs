@@ -65,9 +65,9 @@ fn find_registered_tests() {
 #[test]
 fn entry_fields_match_attrs() {
     let entry = stt::test_support::find_test("basic_topology_check").unwrap();
-    assert_eq!(entry.sockets, 1);
-    assert_eq!(entry.cores, 2);
-    assert_eq!(entry.threads, 1);
+    assert_eq!(entry.topology.sockets, 1);
+    assert_eq!(entry.topology.cores_per_socket, 2);
+    assert_eq!(entry.topology.threads_per_core, 1);
     assert_eq!(entry.memory_mb, 2048);
 }
 
@@ -75,16 +75,16 @@ fn entry_fields_match_attrs() {
 #[test]
 fn entry_default_fields() {
     let entry = stt::test_support::find_test("default_attrs_compile").unwrap();
-    assert_eq!(entry.sockets, 1);
-    assert_eq!(entry.cores, 2);
-    assert_eq!(entry.threads, 1);
+    assert_eq!(entry.topology.sockets, 1);
+    assert_eq!(entry.topology.cores_per_socket, 2);
+    assert_eq!(entry.topology.threads_per_core, 1);
     assert_eq!(entry.memory_mb, 2048);
     assert!(entry.required_flags.is_empty());
     assert!(entry.excluded_flags.is_empty());
-    assert_eq!(entry.min_sockets, 1);
-    assert_eq!(entry.min_llcs, 1);
-    assert!(!entry.requires_smt);
-    assert_eq!(entry.min_cpus, 1);
+    assert_eq!(entry.constraints.min_sockets, 1);
+    assert_eq!(entry.constraints.min_llcs, 1);
+    assert!(!entry.constraints.requires_smt);
+    assert_eq!(entry.constraints.min_cpus, 1);
 }
 
 /// Test with required_flags and excluded_flags attributes.
@@ -127,10 +127,10 @@ fn topo_constraints_compile(ctx: &Ctx) -> Result<AssertResult> {
 #[test]
 fn entry_topo_constraints_match_attrs() {
     let entry = stt::test_support::find_test("topo_constraints_compile").unwrap();
-    assert_eq!(entry.min_sockets, 2);
-    assert_eq!(entry.min_llcs, 4);
-    assert!(entry.requires_smt);
-    assert_eq!(entry.min_cpus, 8);
+    assert_eq!(entry.constraints.min_sockets, 2);
+    assert_eq!(entry.constraints.min_llcs, 4);
+    assert!(entry.constraints.requires_smt);
+    assert_eq!(entry.constraints.min_cpus, 8);
 }
 
 /// Test with super_perf_mode — verifies macro forces performance_mode.

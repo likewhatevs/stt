@@ -30,6 +30,7 @@ use super::{CgroupGroup, Ctx, process_alive};
 ///
 /// Names use `Cow<'static, str>` so ops can reference compile-time
 /// literals (zero-cost) or runtime-generated strings (owned).
+#[derive(Clone, Debug)]
 pub enum Op {
     /// Create a new cgroup under the managed cgroup parent.
     AddCgroup { name: Cow<'static, str> },
@@ -77,7 +78,7 @@ pub enum Op {
 }
 
 /// How to compute a cpuset from topology.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum CpusetSpec {
     /// All CPUs in a given LLC index.
     Llc(usize),
@@ -112,7 +113,7 @@ pub enum CpusetSpec {
 /// assert_eq!(def.name, "workers");
 /// assert_eq!(def.num_workers, 4);
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CgroupDef {
     pub name: Cow<'static, str>,
     pub cpuset: Option<CpusetSpec>,
@@ -190,6 +191,27 @@ pub enum Setup {
     Factory(fn(&Ctx) -> Vec<CgroupDef>),
 }
 
+impl Clone for Setup {
+    fn clone(&self) -> Self {
+        match self {
+            Setup::Defs(defs) => Setup::Defs(defs.clone()),
+            Setup::Factory(f) => Setup::Factory(*f),
+        }
+    }
+}
+
+impl std::fmt::Debug for Setup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Setup::Defs(defs) => f.debug_tuple("Defs").field(defs).finish(),
+            Setup::Factory(_) => f
+                .debug_tuple("Factory")
+                .field(&"fn(&Ctx) -> Vec<CgroupDef>")
+                .finish(),
+        }
+    }
+}
+
 impl Setup {
     fn resolve(&self, ctx: &Ctx) -> Vec<CgroupDef> {
         match self {
@@ -216,6 +238,7 @@ impl From<Vec<CgroupDef>> for Setup {
 ///
 /// `setup` cgroups are created, configured, and populated before `ops`
 /// are applied. Use `Step::new` to create a step with only ops (no setup).
+#[derive(Clone, Debug)]
 pub struct Step {
     pub setup: Setup,
     pub ops: Vec<Op>,
@@ -252,6 +275,7 @@ impl Step {
 }
 
 /// How long to hold after a step's ops are applied.
+#[derive(Clone, Debug)]
 pub enum HoldSpec {
     /// Fraction of the total scenario duration.
     Frac(f64),

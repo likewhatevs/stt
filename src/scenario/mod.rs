@@ -200,11 +200,16 @@ fn generate_profiles(required: &[&'static str], excluded: &[&'static str]) -> Ve
 // Scenario definition (data-driven)
 // ---------------------------------------------------------------------------
 
-/// How to partition CPUs across cgroups.
+/// Scenario-level CPU partitioning strategy.
 ///
-/// Each variant produces a different cpuset assignment based on the
-/// VM's [`TestTopology`].
-#[derive(Clone)]
+/// Determines how CPUs are split across all cgroups in a data-driven
+/// [`Scenario`]. Each variant produces a different cpuset assignment
+/// based on the VM's [`TestTopology`] and the scenario's `num_cgroups`.
+///
+/// This is distinct from [`ops::CpusetSpec`], which computes a single
+/// cpuset for one cgroup in the ops/steps system. `CpusetMode`
+/// partitions at the scenario level; `CpusetSpec` specifies per-cgroup.
+#[derive(Clone, Debug)]
 pub enum CpusetMode {
     None,
     LlcAligned,
@@ -228,6 +233,15 @@ pub enum Action {
     Custom(fn(&Ctx) -> Result<AssertResult>),
 }
 
+impl std::fmt::Debug for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Action::Steady => write!(f, "Steady"),
+            Action::Custom(_) => write!(f, "Custom(fn)"),
+        }
+    }
+}
+
 /// Per-cgroup workload definition.
 ///
 /// Specifies the number of workers, their [`WorkType`], scheduling
@@ -235,7 +249,7 @@ pub enum Action {
 ///
 /// When a scenario has fewer `CgroupWork` entries than `num_cgroups`,
 /// the first entry is reused for remaining cgroups.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CgroupWork {
     /// Number of workers. 0 means use `Ctx::workers_per_cgroup`.
     pub num_workers: usize,
@@ -251,7 +265,7 @@ pub struct CgroupWork {
 ///
 /// Resolved to a concrete [`AffinityMode`] at runtime based on the
 /// topology and cpuset assignments.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AffinityKind {
     /// No affinity constraint -- inherit from parent cgroup.
     Inherit,
@@ -300,6 +314,7 @@ impl Default for CgroupWork {
 /// let profiles = first.profiles();
 /// assert!(!profiles.is_empty());
 /// ```
+#[derive(Clone)]
 pub struct Scenario {
     /// Unique identifier (e.g. `"cgroup_steady"`).
     pub name: &'static str,
