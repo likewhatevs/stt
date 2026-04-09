@@ -90,16 +90,25 @@ pub struct SttKvm {
 
 impl SttKvm {
     /// Create a new KVM VM with the given topology and memory size.
-    pub fn new(topo: Topology, memory_mb: u32) -> Result<Self> {
-        Self::new_inner(topo, memory_mb, false)
+    pub fn new(topo: Topology, memory_mb: u32, performance_mode: bool) -> Result<Self> {
+        Self::new_inner(topo, memory_mb, false, performance_mode)
     }
 
     /// Create a new KVM VM with hugepage-backed guest memory.
-    pub fn new_with_hugepages(topo: Topology, memory_mb: u32) -> Result<Self> {
-        Self::new_inner(topo, memory_mb, true)
+    pub fn new_with_hugepages(
+        topo: Topology,
+        memory_mb: u32,
+        performance_mode: bool,
+    ) -> Result<Self> {
+        Self::new_inner(topo, memory_mb, true, performance_mode)
     }
 
-    fn new_inner(topo: Topology, memory_mb: u32, use_hugepages: bool) -> Result<Self> {
+    fn new_inner(
+        topo: Topology,
+        memory_mb: u32,
+        use_hugepages: bool,
+        performance_mode: bool,
+    ) -> Result<Self> {
         let kvm = Kvm::new().context("open /dev/kvm")?;
 
         // Check required capabilities (Firecracker pattern)
@@ -217,7 +226,8 @@ impl SttKvm {
                 .create_vcpu(cpu_id as u64)
                 .with_context(|| format!("create vCPU {cpu_id}"))?;
 
-            let cpuid_entries = generate_cpuid(base_cpuid.as_slice(), &topo, cpu_id);
+            let cpuid_entries =
+                generate_cpuid(base_cpuid.as_slice(), &topo, cpu_id, performance_mode);
             let cpuid = kvm_bindings::CpuId::from_entries(&cpuid_entries).context("build CpuId")?;
             vcpu.set_cpuid2(&cpuid)
                 .with_context(|| format!("set CPUID for vCPU {cpu_id}"))?;
@@ -248,7 +258,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 128);
+        let vm = SttKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
         let vm = vm.unwrap();
         assert_eq!(vm.vcpus.len(), 2);
@@ -261,7 +271,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 2,
         };
-        let vm = SttKvm::new(topo, 256);
+        let vm = SttKvm::new(topo, 256, false);
         assert!(
             vm.is_ok(),
             "multi-socket VM creation failed: {:?}",
@@ -278,7 +288,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64);
+        let vm = SttKvm::new(topo, 64, false);
         assert!(vm.is_ok());
         assert_eq!(vm.unwrap().vcpus.len(), 1);
     }
@@ -290,7 +300,7 @@ mod tests {
             cores_per_socket: 4,
             threads_per_core: 2,
         };
-        let vm = SttKvm::new(topo, 512);
+        let vm = SttKvm::new(topo, 512, false);
         assert!(vm.is_ok(), "large topology failed: {:?}", vm.err());
         assert_eq!(vm.unwrap().vcpus.len(), 32);
     }
@@ -302,7 +312,7 @@ mod tests {
             cores_per_socket: 3,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 128);
+        let vm = SttKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "odd topology failed: {:?}", vm.err());
         assert_eq!(vm.unwrap().vcpus.len(), 9);
     }
@@ -315,7 +325,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 256).unwrap();
+        let vm = SttKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
         assert_eq!(total, 256 << 20);
     }
@@ -346,7 +356,7 @@ mod tests {
         };
         // max APIC ID = apic_id(15) = 1<<3 | 3<<1 | 1 = 15, well under 254
         assert!(max_apic_id(&topo) <= MAX_XAPIC_ID);
-        let vm = SttKvm::new(topo, 256).unwrap();
+        let vm = SttKvm::new(topo, 256, false).unwrap();
         assert!(!vm.split_irqchip, "small topology should use full IRQ chip");
     }
 
@@ -368,7 +378,7 @@ mod tests {
             max_apic_id(&topo),
             MAX_XAPIC_ID,
         );
-        let vm = SttKvm::new(topo, 4096);
+        let vm = SttKvm::new(topo, 4096, false);
         assert!(vm.is_ok(), "split IRQ chip VM failed: {:?}", vm.err());
         let vm = vm.unwrap();
         assert!(vm.split_irqchip, "large topology should use split IRQ chip");
@@ -389,7 +399,7 @@ mod tests {
             "8s/8c/2t max APIC ID {} should be <= 254",
             max_apic_id(&small),
         );
-        let vm = SttKvm::new(small, 2048).unwrap();
+        let vm = SttKvm::new(small, 2048, false).unwrap();
         assert!(!vm.split_irqchip);
 
         // 15 sockets x 8 cores x 2 threads: core_shift = 4, max APIC ID = 14<<4 | 7<<1 | 1 = 239
@@ -403,7 +413,7 @@ mod tests {
             "15s/8c/2t max APIC ID {} should be <= 254",
             max_apic_id(&still_small),
         );
-        let vm = SttKvm::new(still_small, 4096).unwrap();
+        let vm = SttKvm::new(still_small, 4096, false).unwrap();
         assert!(!vm.split_irqchip);
     }
 
@@ -414,7 +424,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64).unwrap();
+        let vm = SttKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT is available since Linux 4.12.
         assert!(vm.has_immediate_exit);
     }

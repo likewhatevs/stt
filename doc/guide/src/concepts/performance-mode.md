@@ -1,13 +1,13 @@
 # Performance Mode
 
-Performance mode reduces host-side noise during VM execution by
-applying host-side isolation: vCPU pinning, hugepages, NUMA mbind,
-and RT scheduling.
+Performance mode reduces noise during VM execution by applying
+host-side isolation (vCPU pinning, hugepages, NUMA mbind, RT
+scheduling) and a guest-visible CPUID hint (KVM_HINTS_REALTIME).
 
 ## What it does
 
-Four host-side optimizations are applied when `performance_mode` is
-enabled:
+Five optimizations are applied when `performance_mode` is enabled
+(four host-side, one guest-visible via CPUID):
 
 **vCPU pinning** -- each virtual socket is mapped to a physical LLC
 group on the host. vCPU threads are pinned to cores within their
@@ -30,6 +30,15 @@ host CPU not assigned to any vCPU, so they can preempt for
 timeout/sampling without competing for vCPU cores. The serial console
 mutex uses `PTHREAD_PRIO_INHERIT` to avoid priority inversion between
 RT vCPU threads and service threads.
+
+**KVM_HINTS_REALTIME CPUID** -- sets bit 0 of CPUID leaf 0x40000001
+EDX, telling the guest kernel that vCPUs are pinned to dedicated host
+cores. The guest disables PV spinlocks, PV TLB flush, and PV
+sched_yield (all add hypercall overhead unnecessary on dedicated
+cores), and enables haltpoll cpuidle (polls briefly before halting,
+reducing wakeup latency). PV spinlocks require
+CONFIG_PARAVIRT_SPINLOCKS, which is not in stt.kconfig, so that
+disable is a no-op for stt guests.
 
 ## Prerequisites
 
@@ -119,8 +128,8 @@ topology matrix.
 
 Performance mode serves two purposes:
 
-**Noise reduction** -- pinning, hugepages, and RT scheduling reduce
-measurement variance. Scheduling gaps, spread, and throughput checks
+**Noise reduction** -- pinning, hugepages, RT scheduling, and the
+KVM_HINTS_REALTIME CPUID hint reduce measurement variance. Scheduling gaps, spread, and throughput checks
 become meaningful because host jitter is controlled. Without
 performance mode, a 50ms gap could be host noise; with it, the same
 gap indicates a scheduler problem.
@@ -151,7 +160,8 @@ sums the actual CPU count of each LLC group and checks the total
 
 `super_perf_mode` validates at build time that sufficient LLC groups
 exist for the test topology. Both modes apply the same runtime
-optimizations (pinning, hugepages, NUMA mbind, RT scheduling).
+optimizations (pinning, hugepages, NUMA mbind, RT scheduling,
+KVM_HINTS_REALTIME CPUID hint).
 
 ```rust,ignore
 #[stt_test(

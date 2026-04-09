@@ -60,7 +60,7 @@ checking.
 ## Performance mode
 
 When `performance_mode` is enabled on the builder, the VMM applies
-host-side optimizations after vCPU threads are spawned:
+optimizations after vCPU threads are spawned:
 
 1. Reads host LLC topology from sysfs.
 2. Maps each virtual socket to a physical LLC group.
@@ -68,6 +68,9 @@ host-side optimizations after vCPU threads are spawned:
    `sched_setaffinity`.
 4. Allocates guest memory with 2MB hugepages (`MAP_HUGETLB`)
    when sufficient free hugepages exist.
+5. Sets KVM_HINTS_REALTIME in CPUID leaf 0x40000001 EDX,
+   disabling PV spinlocks, PV TLB flush, and PV sched_yield
+   in the guest, and enabling haltpoll cpuidle.
 
 Validation runs at build time. Oversubscription and unsatisfiable
 topology mappings are fatal errors. Insufficient hugepages is a

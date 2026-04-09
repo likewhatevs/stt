@@ -74,11 +74,15 @@ pub struct SttKvm {
 }
 
 impl SttKvm {
-    pub fn new(topo: Topology, memory_mb: u32) -> Result<Self> {
+    pub fn new(topo: Topology, memory_mb: u32, _performance_mode: bool) -> Result<Self> {
         Self::new_inner(topo, memory_mb, false)
     }
 
-    pub fn new_with_hugepages(topo: Topology, memory_mb: u32) -> Result<Self> {
+    pub fn new_with_hugepages(
+        topo: Topology,
+        memory_mb: u32,
+        _performance_mode: bool,
+    ) -> Result<Self> {
         Self::new_inner(topo, memory_mb, true)
     }
 
@@ -280,7 +284,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 128);
+        let vm = SttKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
         let vm = vm.unwrap();
         assert_eq!(vm.vcpus.len(), 2);
@@ -293,7 +297,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 2,
         };
-        let vm = SttKvm::new(topo, 256);
+        let vm = SttKvm::new(topo, 256, false);
         assert!(
             vm.is_ok(),
             "multi-socket VM creation failed: {:?}",
@@ -310,7 +314,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64);
+        let vm = SttKvm::new(topo, 64, false);
         assert!(vm.is_ok());
         assert_eq!(vm.unwrap().vcpus.len(), 1);
     }
@@ -323,7 +327,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 256).unwrap();
+        let vm = SttKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
         assert_eq!(total, 256 << 20);
     }
@@ -336,7 +340,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64).unwrap();
+        let vm = SttKvm::new(topo, 64, false).unwrap();
         let region = vm.guest_mem.iter().next().unwrap();
         assert_eq!(
             region.start_addr(),
@@ -352,7 +356,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64).unwrap();
+        let vm = SttKvm::new(topo, 64, false).unwrap();
         assert!(vm.has_immediate_exit);
     }
 

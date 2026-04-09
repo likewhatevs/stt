@@ -69,10 +69,17 @@ pub fn core_shift(topo: &Topology) -> u32 {
 /// Takes a pre-fetched base CPUID (from `get_supported_cpuid`) and patches
 /// topology-related leaves. The base should be fetched once and reused for
 /// all vCPUs — each call clones and patches per-vCPU fields (APIC ID etc).
+///
+/// When `performance_mode` is true, sets KVM_HINTS_REALTIME (CPUID leaf
+/// 0x40000001 EDX bit 0). This disables PV spinlocks, PV TLB flush, and
+/// PV sched_yield in the guest, and enables haltpoll cpuidle. PV spinlocks
+/// require CONFIG_PARAVIRT_SPINLOCKS (not in stt.kconfig, so no-op for
+/// stt guests).
 pub fn generate_cpuid(
     base_cpuid: &[kvm_cpuid_entry2],
     topo: &Topology,
     cpu_id: u32,
+    performance_mode: bool,
 ) -> Vec<kvm_cpuid_entry2> {
     let mut entries: Vec<kvm_cpuid_entry2> = base_cpuid.to_vec();
 
@@ -220,13 +227,30 @@ pub fn generate_cpuid(
             function: 0x4000_0000,
             index: 0,
             flags: 0,
-            eax: 0x4000_0000, // max hypervisor leaf
+            eax: 0x4000_0001, // max hypervisor leaf
             // "KVMKVMKVM\0\0\0" signature
             ebx: 0x4b56_4d4b, // "KVMK"
             ecx: 0x564b_4d56, // "VMKV"
             edx: 0x0000_004d, // "M\0\0\0"
             ..Default::default()
         });
+    }
+
+    // KVM_HINTS_REALTIME: CPUID leaf 0x40000001 EDX bit 0.
+    // Disables PV spinlocks, PV TLB flush, and PV sched_yield in the
+    // guest, and enables haltpoll cpuidle. PV spinlocks require
+    // CONFIG_PARAVIRT_SPINLOCKS (not in stt.kconfig, so no-op for stt
+    // guests). Only set in performance_mode to avoid disabling PV
+    // optimizations in functional tests.
+    if performance_mode {
+        if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0001) {
+            entry.edx |= 1;
+        }
+
+        // Bump max hypervisor leaf so the guest enumerates 0x40000001.
+        if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x4000_0000) {
+            entry.eax = entry.eax.max(0x4000_0001);
+        }
     }
 
     entries
@@ -378,6 +402,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         assert!(!cpuid.is_empty());
 
@@ -406,6 +431,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let cpuid1 = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -413,6 +439,7 @@ mod tests {
                 .as_slice(),
             &topo,
             1,
+            false,
         );
 
         // Different vCPUs should have different APIC IDs in leaf 0xB
@@ -461,6 +488,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf1 = cpuid.iter().find(|e| e.function == 1);
         if let Some(entry) = leaf1 {
@@ -523,6 +551,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf_b_0 = cpuid.iter().find(|e| e.function == 0xb && e.index == 0);
         if let Some(entry) = leaf_b_0 {
@@ -556,6 +585,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf_b_1 = cpuid.iter().find(|e| e.function == 0xb && e.index == 1);
         if let Some(entry) = leaf_b_1 {
@@ -589,6 +619,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         // Subleaf 0: ECX should have level_type=1 (SMT) in bits 15:8 and index=0 in bits 7:0
         if let Some(entry) = cpuid.iter().find(|e| e.function == 0xb && e.index == 0) {
@@ -627,6 +658,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let l3 = cpuid
             .iter()
@@ -658,6 +690,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         // Find any valid leaf 0x4 entry
         let leaf4 = cpuid
@@ -691,6 +724,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf1 = cpuid.iter().find(|e| e.function == 1);
         if let Some(entry) = leaf1 {
@@ -719,6 +753,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf1 = cpuid.iter().find(|e| e.function == 1);
         if let Some(entry) = leaf1 {
@@ -744,6 +779,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf_a = cpuid.iter().find(|e| e.function == 0xa);
         if let Some(entry) = leaf_a {
@@ -771,6 +807,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf_40 = cpuid.iter().find(|e| e.function == 0x4000_0000);
         assert!(leaf_40.is_some(), "hypervisor leaf 0x40000000 should exist");
@@ -830,6 +867,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf = cpuid.iter().find(|e| e.function == 0x8000_0008);
         if let Some(entry) = leaf {
@@ -861,6 +899,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf0 = cpuid0.iter().find(|e| e.function == 0x8000_001e);
         if let Some(entry) = leaf0 {
@@ -882,6 +921,7 @@ mod tests {
                 .as_slice(),
             &topo,
             3,
+            false,
         );
         let leaf3 = cpuid3.iter().find(|e| e.function == 0x8000_001e);
         if let Some(entry) = leaf3 {
@@ -907,6 +947,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf = cpuid.iter().find(|e| e.function == 0x8000_0008);
         if let Some(entry) = leaf {
@@ -933,6 +974,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
 
         // For subleaves 0 and 1, leaf 0x1F should produce the same topology
@@ -966,6 +1008,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf1 = cpuid.iter().find(|e| e.function == 1);
         if let Some(entry) = leaf1 {
@@ -994,6 +1037,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf = cpuid.iter().find(|e| e.function == 0x8000_0001);
         if let Some(entry) = leaf {
@@ -1023,6 +1067,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf = cpuid.iter().find(|e| e.function == 0x8000_0001);
         if let Some(entry) = leaf {
@@ -1084,6 +1129,7 @@ mod tests {
                     .as_slice(),
                 &topo,
                 0,
+                false,
             );
             let leaf = cpuid.iter().find(|e| e.function == 0x8000_0008);
             if let Some(entry) = leaf {
@@ -1203,6 +1249,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         // Brand string leaves 0x80000002-0x80000004 should match host
         for leaf_fn in [0x8000_0002u32, 0x8000_0003, 0x8000_0004] {
@@ -1250,6 +1297,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         // On Intel, leaf 0x4 should have been patched
         let l3 = cpuid
@@ -1289,6 +1337,7 @@ mod tests {
                 .as_slice(),
             &topo,
             0,
+            false,
         );
         let leaf = cpuid.iter().find(|e| e.function == 0x8000_001e);
         if let Some(entry) = leaf {
@@ -1359,5 +1408,153 @@ mod tests {
         assert_eq!(t.total_cpus(), 1);
         assert_eq!(apic_id(&t, 0), 0);
         assert_eq!(max_apic_id(&t), 0);
+    }
+
+    #[test]
+    fn kvm_hints_realtime_set_in_performance_mode() {
+        let kvm = match kvm_ioctls::Kvm::new() {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let topo = Topology {
+            sockets: 1,
+            cores_per_socket: 2,
+            threads_per_core: 1,
+        };
+        let cpuid = generate_cpuid(
+            kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                .unwrap()
+                .as_slice(),
+            &topo,
+            0,
+            true,
+        );
+        let leaf = cpuid.iter().find(|e| e.function == 0x4000_0001);
+        assert!(
+            leaf.is_some(),
+            "leaf 0x40000001 should exist in performance_mode"
+        );
+        let entry = leaf.unwrap();
+        assert_ne!(
+            entry.edx & 1,
+            0,
+            "KVM_HINTS_REALTIME (EDX bit 0) should be set"
+        );
+
+        // Max hypervisor leaf must advertise 0x40000001 so the guest
+        // enumerates the hints leaf.
+        let leaf40 = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0000)
+            .expect("leaf 0x40000000 should exist");
+        assert!(
+            leaf40.eax >= 0x4000_0001,
+            "0x40000000.EAX should be >= 0x40000001, got {:#x}",
+            leaf40.eax,
+        );
+    }
+
+    #[test]
+    fn kvm_hints_realtime_not_set_without_performance_mode() {
+        let kvm = match kvm_ioctls::Kvm::new() {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let topo = Topology {
+            sockets: 1,
+            cores_per_socket: 2,
+            threads_per_core: 1,
+        };
+        let cpuid = generate_cpuid(
+            kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                .unwrap()
+                .as_slice(),
+            &topo,
+            0,
+            false,
+        );
+        // Leaf 0x40000001 may or may not exist from KVM's base CPUID.
+        // If it exists, EDX bit 0 must not be set by our code.
+        // KVM's base leaf has EDX=0, so bit 0 should be clear.
+        if let Some(entry) = cpuid.iter().find(|e| e.function == 0x4000_0001) {
+            assert_eq!(
+                entry.edx & 1,
+                0,
+                "KVM_HINTS_REALTIME should not be set without performance_mode"
+            );
+        }
+    }
+
+    #[test]
+    fn kvm_hints_realtime_preserves_other_edx_bits() {
+        // Synthetic test: if the base CPUID has other EDX bits set in
+        // leaf 0x40000001, performance_mode should OR bit 0, not replace.
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                index: 0,
+                flags: 0,
+                eax: 0,
+                ebx: 0x756e_6547,
+                edx: 0x4965_6e69,
+                ecx: 0x6c65_746e,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0000,
+                index: 0,
+                flags: 0,
+                eax: 0x4000_0000, // max leaf = 0x40000000 initially
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0001,
+                index: 0,
+                flags: 0,
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0xdead_0000, // hypothetical other bits
+                ..Default::default()
+            },
+        ];
+        let topo = Topology {
+            sockets: 1,
+            cores_per_socket: 1,
+            threads_per_core: 1,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, true);
+        let entry = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0001)
+            .expect("leaf 0x40000001 should exist");
+        assert_eq!(
+            entry.edx, 0xdead_0001,
+            "should OR bit 0 into existing EDX, not replace"
+        );
+
+        // Max hypervisor leaf bumped from 0x40000000 to 0x40000001.
+        let leaf40 = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0000)
+            .expect("leaf 0x40000000 should exist");
+        assert_eq!(
+            leaf40.eax, 0x4000_0001,
+            "0x40000000.EAX should be bumped to 0x40000001"
+        );
+
+        // Without performance_mode, EDX should be untouched.
+        let cpuid_no_perf = generate_cpuid(&base, &topo, 0, false);
+        let entry_no_perf = cpuid_no_perf
+            .iter()
+            .find(|e| e.function == 0x4000_0001)
+            .expect("leaf should still exist");
+        assert_eq!(
+            entry_no_perf.edx, 0xdead_0000,
+            "without performance_mode, EDX should be unchanged"
+        );
     }
 }

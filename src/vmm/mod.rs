@@ -880,10 +880,11 @@ impl SttVm {
         let use_hugepages = self.performance_mode
             && host_topology::hugepages_free() >= host_topology::hugepages_needed(self.memory_mb);
         let vm = if use_hugepages {
-            kvm::SttKvm::new_with_hugepages(self.topology, self.memory_mb)
+            kvm::SttKvm::new_with_hugepages(self.topology, self.memory_mb, self.performance_mode)
                 .context("create VM with hugepages")?
         } else {
-            kvm::SttKvm::new(self.topology, self.memory_mb).context("create VM")?
+            kvm::SttKvm::new(self.topology, self.memory_mb, self.performance_mode)
+                .context("create VM")?
         };
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "kvm_create");
 
@@ -2664,8 +2665,10 @@ impl SttVmBuilder {
         self
     }
 
-    /// Enable performance mode: vCPU pinning to host LLCs and
-    /// hugepage-backed guest memory. Validated at build time --
+    /// Enable performance mode: vCPU pinning to host LLCs,
+    /// hugepage-backed guest memory, and KVM_HINTS_REALTIME CPUID
+    /// hint (disables PV spinlocks, PV TLB flush, PV sched_yield;
+    /// enables haltpoll cpuidle). Validated at build time --
     /// oversubscription is a fatal error, insufficient hugepages
     /// is a warning.
     #[allow(dead_code)]
@@ -3095,7 +3098,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = kvm::SttKvm::new(topo, 128).unwrap();
+        let vm = kvm::SttKvm::new(topo, 128, false).unwrap();
         for vcpu in &vm.vcpus[1..] {
             let state = vcpu.get_mp_state().unwrap();
             assert_eq!(
@@ -3214,7 +3217,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = kvm::SttKvm::new(topo, 64).unwrap();
+        let vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT has been available since Linux 4.12.
         assert!(
             vm.has_immediate_exit,
@@ -3230,7 +3233,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let mut vm = kvm::SttKvm::new(topo, 64).unwrap();
+        let mut vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         let handle = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
 
         // Initial state should be 0.
@@ -3265,7 +3268,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let mut vm = kvm::SttKvm::new(topo, 64).unwrap();
+        let mut vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         let h0 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
         let h1 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[1]);
 
@@ -3296,7 +3299,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let mut vm = kvm::SttKvm::new(topo, 64).unwrap();
+        let mut vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
 
         ie.set(1);
@@ -4061,7 +4064,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = kvm::SttKvm::new(topo, 64).unwrap();
+        let vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         assert!(
             vm.has_immediate_exit,
             "KVM_CAP_IMMEDIATE_EXIT should be available on modern kernels"
