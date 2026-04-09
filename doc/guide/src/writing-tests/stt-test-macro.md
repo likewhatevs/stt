@@ -125,6 +125,7 @@ attributes to filter which presets each test runs on. See
 | `duration_s` | 2 | Per-scenario duration in seconds |
 | `workers_per_cgroup` | 2 | Workers per cgroup |
 | `expect_err` | `false` | Test expects `run_stt_test` to return `Err`; disables auto-repro |
+| `bpf_map_write = CONST` | `None` | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
 what `performance_mode` enables, prerequisites, and validation behavior.

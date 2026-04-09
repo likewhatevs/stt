@@ -171,5 +171,44 @@ Use `Assert` for both the merge chain (`#[stt_test]` attributes,
 - `Assert::default_checks()` -- `not_starved` enabled, monitor
   thresholds populated from `MonitorThresholds::DEFAULT`.
 
+## AssertResult
+
+`AssertResult` carries pass/fail status, diagnostic messages, and
+aggregated statistics from a scenario run.
+
+### Construction
+
+- `AssertResult::pass()` -- creates a passing result with empty
+  details and default stats.
+- `AssertResult::skip(reason)` -- creates a passing result with a
+  skip reason in `details`. Used when a scenario cannot run under the
+  current topology or flag combination but is not a failure.
+
+### Fields
+
+- `passed: bool` -- whether all checks passed.
+- `details: Vec<String>` -- human-readable diagnostic messages
+  (failure reasons, warnings, skip reasons).
+- `stats: ScenarioStats` -- aggregated worker telemetry across all
+  cgroups (spread, gaps, migrations, wake latency, iterations).
+
+### Merging
+
+`result.merge(other)` combines two results. If `other.passed` is
+false, the merged result is also false. Details and stats are
+accumulated:
+
+```rust,ignore
+let mut combined = AssertResult::pass();
+combined.merge(cgroup_0_result);
+combined.merge(cgroup_1_result);
+// combined.passed is false if either cgroup failed
+// combined.details contains messages from both
+```
+
+Stats merging takes worst values across cgroups for spread, gap, wake
+latency, and migration ratio. Counters (workers, cpus, migrations,
+iterations) are summed.
+
 For examples of overriding thresholds at the scheduler and per-test
 level, see [Customize Verification](../recipes/custom-verification.md).

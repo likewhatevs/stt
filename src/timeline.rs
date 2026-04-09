@@ -1349,4 +1349,158 @@ mod tests {
     fn detect_change_exactly_at_threshold_returns_none() {
         assert!(detect_change(1.0, 1.5, 0.5, "imbalance", true).is_none());
     }
+
+    // -- iteration_rate computation tests --
+
+    fn stimulus_with_iters(elapsed_ms: u64, label: &str, total_iterations: u64) -> StimulusEvent {
+        StimulusEvent {
+            elapsed_ms,
+            label: label.to_string(),
+            op_kind: None,
+            detail: None,
+            total_iterations: Some(total_iterations),
+        }
+    }
+
+    #[test]
+    fn iteration_rate_computed_from_consecutive_events() {
+        // Two events with total_iterations: phase 0 spans 0..3000ms
+        // (aligned). iterations: 0 -> 3000 over ~3s = 1000 iter/s.
+        let events = vec![
+            stimulus_with_iters(0, "ScenarioStart", 0),
+            stimulus_with_iters(3000, "StepStart[0]", 3000),
+        ];
+        let samples: Vec<MonitorSample> = (5..35)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
+            .collect();
+        let t = Timeline::build(&events, &samples);
+        assert_eq!(t.phases.len(), 2);
+        let rate = t.phases[0].metrics.iteration_rate;
+        assert!(rate.is_some(), "phase 0 should have iteration_rate");
+        let r = rate.unwrap();
+        // Duration is phase boundary difference, not exactly 3s due to
+        // clock alignment offset. Check that the rate is reasonable.
+        assert!(r > 500.0 && r < 2000.0, "rate {r} outside expected range");
+    }
+
+    #[test]
+    fn iteration_rate_none_without_total_iterations() {
+        // Events without total_iterations: iteration_rate should be None.
+        let events = vec![stimulus(0, "ScenarioStart"), stimulus(3000, "StepStart[0]")];
+        let samples: Vec<MonitorSample> = (5..35)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
+            .collect();
+        let t = Timeline::build(&events, &samples);
+        assert!(t.phases[0].metrics.iteration_rate.is_none());
+        assert!(t.phases[1].metrics.iteration_rate.is_none());
+    }
+
+    #[test]
+    fn throughput_degradation_detected() {
+        // Phase 0: high throughput (0 -> 10000 iters over ~2s = ~5000/s)
+        // Phase 1: low throughput (10000 -> 11000 iters over ~2s = ~500/s)
+        // 90% drop exceeds ITERATION_RATE_REL_THRESHOLD (0.3).
+        let events = vec![
+            stimulus_with_iters(0, "ScenarioStart", 0),
+            stimulus_with_iters(2000, "StepStart[0]", 10000),
+            stimulus_with_iters(4000, "StepEnd[0]", 11000),
+        ];
+        let samples: Vec<MonitorSample> = (5..45)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
+            .collect();
+        let t = Timeline::build(&events, &samples);
+        assert_eq!(t.phases.len(), 3);
+        // Phase 0 should have high iteration_rate.
+        assert!(t.phases[0].metrics.iteration_rate.is_some());
+        // Phase 1 should have low iteration_rate.
+        assert!(t.phases[1].metrics.iteration_rate.is_some());
+        let r0 = t.phases[0].metrics.iteration_rate.unwrap();
+        let r1 = t.phases[1].metrics.iteration_rate.unwrap();
+        assert!(
+            r0 > r1,
+            "phase 0 rate ({r0}) should exceed phase 1 rate ({r1})"
+        );
+
+        // Throughput degradation should be detected at phase 1 boundary.
+        let degs: Vec<_> = t
+            .degradations()
+            .into_iter()
+            .filter(|(_, c)| c.metric == "throughput")
+            .collect();
+        assert!(!degs.is_empty(), "throughput degradation must be detected");
+        let (phase, change) = &degs[0];
+        assert_eq!(phase.index, 1);
+        assert_eq!(change.direction, ChangeDirection::Degraded);
+        assert!(change.before > change.after);
+    }
+
+    #[test]
+    fn throughput_improvement_detected() {
+        // Phase 0: low throughput (0 -> 500 iters over ~2s = ~250/s)
+        // Phase 1: high throughput (500 -> 10500 iters over ~2s = ~5000/s)
+        // >30% increase should be flagged as improvement.
+        let events = vec![
+            stimulus_with_iters(0, "ScenarioStart", 0),
+            stimulus_with_iters(2000, "StepStart[0]", 500),
+            stimulus_with_iters(4000, "StepEnd[0]", 10500),
+        ];
+        let samples: Vec<MonitorSample> = (5..45)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
+            .collect();
+        let t = Timeline::build(&events, &samples);
+        let improvements: Vec<_> = t
+            .phases
+            .iter()
+            .flat_map(|p| p.changes.iter())
+            .filter(|c| c.metric == "throughput" && c.direction == ChangeDirection::Improved)
+            .collect();
+        assert!(
+            !improvements.is_empty(),
+            "throughput improvement must be detected"
+        );
+    }
+
+    #[test]
+    fn throughput_stable_below_threshold() {
+        // Phase 0: 1000 iter/s
+        // Phase 1: ~900 iter/s (10% drop, below 30% threshold)
+        // No throughput change should be detected.
+        let events = vec![
+            stimulus_with_iters(0, "ScenarioStart", 0),
+            stimulus_with_iters(2000, "StepStart[0]", 2000),
+            stimulus_with_iters(4000, "StepEnd[0]", 3800),
+        ];
+        let samples: Vec<MonitorSample> = (5..45)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
+            .collect();
+        let t = Timeline::build(&events, &samples);
+        let throughput_changes: Vec<_> = t
+            .phases
+            .iter()
+            .flat_map(|p| p.changes.iter())
+            .filter(|c| c.metric == "throughput")
+            .collect();
+        assert!(
+            throughput_changes.is_empty(),
+            "10% change should not trigger throughput change detection"
+        );
+    }
+
+    #[test]
+    fn iteration_rate_in_formatted_output() {
+        let events = vec![
+            stimulus_with_iters(0, "ScenarioStart", 0),
+            stimulus_with_iters(2000, "StepStart[0]", 5000),
+        ];
+        let samples: Vec<MonitorSample> = (5..25)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
+            .collect();
+        let t = Timeline::build(&events, &samples);
+        let formatted = t.format();
+        assert!(
+            formatted.contains("throughput:"),
+            "format output must contain throughput when iteration_rate is set"
+        );
+        assert!(formatted.contains("iter/s"));
+    }
 }

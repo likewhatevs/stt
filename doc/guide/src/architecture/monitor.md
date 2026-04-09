@@ -182,6 +182,40 @@ let bss = accessor.find_map(".bss").expect(".bss map not found");
 accessor.write_value_u32(&bss, crash_offset, 1);
 ```
 
+### BpfMapWrite
+
+`BpfMapWrite` specifies a host-side write to a BPF map during VM
+execution. The test runner waits for the scheduler to load (map
+becomes discoverable), writes the value, then signals the guest via
+SHM to start the scenario.
+
+```rust,ignore
+pub struct BpfMapWrite {
+    pub map_name_suffix: &'static str,  // e.g. ".bss"
+    pub offset: usize,                  // byte offset in the map value
+    pub value: u32,                     // value to write
+}
+```
+
+Use with `#[stt_test]` via the `bpf_map_write` attribute:
+
+```rust,ignore
+const BPF_CRASH: BpfMapWrite = BpfMapWrite {
+    map_name_suffix: ".bss",
+    offset: 42,
+    value: 1,
+};
+
+#[stt_test(bpf_map_write = BPF_CRASH, expect_err = true)]
+fn crash_test(ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+```
+
+The map is discovered by name suffix via `BpfMapAccessor::find_map`.
+Only `BPF_MAP_TYPE_ARRAY` maps are supported. The write targets a
+u32 at the specified byte offset within the map's value region.
+
 ### Prerequisites
 
 - **vmlinux**: Required for ELF symbols and BTF. Must match the guest
