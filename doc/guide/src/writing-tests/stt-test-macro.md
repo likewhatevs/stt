@@ -15,6 +15,21 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
+When a scheduler with a default topology is specified, the topology
+can be omitted:
+
+```rust,ignore
+const MY_SCHED: Scheduler = Scheduler::new("my_sched")
+    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .topology(2, 4, 1);
+
+#[stt_test(scheduler = MY_SCHED)]
+fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
+    // VM boots with 2 sockets, 4 cores, 1 thread (from MY_SCHED)
+    Ok(AssertResult::pass())
+}
+```
+
 The function must have signature
 `fn(&stt::scenario::Ctx) -> anyhow::Result<stt::assert::AssertResult>`.
 
@@ -35,10 +50,16 @@ All attributes are optional with defaults.
 
 | Attribute | Default | Description |
 |---|---|---|
-| `sockets` | 1 | Number of CPU sockets |
-| `cores` | 2 | Cores per socket |
-| `threads` | 1 | Threads per core |
+| `sockets` | inherited | Number of CPU sockets |
+| `cores` | inherited | Cores per socket |
+| `threads` | inherited | Threads per core |
 | `memory_mb` | 2048 | VM memory in MB |
+
+Each dimension independently inherits from `Scheduler.topology` when
+a `scheduler` is specified and that dimension is not explicitly set.
+Without a scheduler, unset dimensions use macro defaults (sockets=1,
+cores=2, threads=1). See
+[Default topology](scheduler-definitions.md#default-topology).
 
 ### Scheduler
 
@@ -149,18 +170,16 @@ static MY_STEAL: FlagDecl = FlagDecl {
 
 const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
     .binary(SchedulerSpec::Name("scx_my_scheduler"))
-    .flags(&[&MY_LLC, &MY_STEAL]);
+    .flags(&[&MY_LLC, &MY_STEAL])
+    .topology(2, 4, 2);
 
 #[stt_test(
-    sockets = 2,
-    cores = 4,
-    threads = 2,
     scheduler = MY_SCHED,
     not_starved = true,
     max_gap_ms = 5000,
 )]
 fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
-    // Test logic here
+    // Inherits 2s4c2t from MY_SCHED
     Ok(AssertResult::pass())
 }
 ```

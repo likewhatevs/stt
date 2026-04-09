@@ -15,6 +15,7 @@ pub struct Scheduler {
     pub assert: Assert,
     pub cgroup_parent: Option<&'static str>,
     pub sched_args: &'static [&'static str],
+    pub topology: Topology,
 }
 ```
 
@@ -71,6 +72,7 @@ static MY_STEAL: FlagDecl = FlagDecl {
 const MY_SCHEDULER: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
     .flags(&[&MY_LLC, &MY_STEAL])
+    .topology(2, 4, 1)
     .assert(Assert::NONE.max_imbalance_ratio(2.0));
 ```
 
@@ -84,6 +86,7 @@ creates the directory before starting the scheduler, and
 ```rust,ignore
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
+    .topology(2, 4, 1)
     .cgroup_parent("/stt");
 ```
 
@@ -99,12 +102,39 @@ test using this scheduler. They are prepended before per-test
 ```rust,ignore
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
+    .topology(2, 4, 1)
     .cgroup_parent("/stt")
     .sched_args(&["--exit-dump-len", "1048576"]);
 ```
 
 Merge order: `cgroup_parent` injection, then `sched_args`, then
 per-test `extra_sched_args`, then flag-derived args.
+
+## Default topology
+
+`Scheduler.topology` sets the default VM topology for all tests using
+this scheduler. When `#[stt_test]` omits `sockets`, `cores`, and
+`threads`, the scheduler's topology is used. Explicit attributes on
+`#[stt_test]` override the scheduler default.
+
+```rust,ignore
+const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
+    .binary(SchedulerSpec::Name("scx_mitosis"))
+    .cgroup_parent("/stt")
+    .topology(2, 4, 1);
+```
+
+Arguments are `(sockets, cores_per_socket, threads_per_core)`.
+`Scheduler::new()` defaults to `(1, 2, 1)`.
+
+Tests that need a different topology (e.g. SMT) override individual
+dimensions. Unset dimensions still inherit from the scheduler:
+
+```rust,ignore
+// Inherits sockets=2, cores=4 from MITOSIS; overrides threads to 2
+#[stt_test(scheduler = MITOSIS, threads = 2)]
+fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
+```
 
 ## Defining flags
 
@@ -135,7 +165,8 @@ static MITOSIS_STEAL: FlagDecl = FlagDecl {
 
 const MITOSIS: Scheduler = Scheduler::new("mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
-    .flags(&[&MITOSIS_LLC, &MITOSIS_BORROW, &MITOSIS_STEAL]);
+    .flags(&[&MITOSIS_LLC, &MITOSIS_BORROW, &MITOSIS_STEAL])
+    .topology(2, 4, 1);
 ```
 
 The `args` field contains the scheduler CLI arguments passed when the

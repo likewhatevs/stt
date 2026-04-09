@@ -30,13 +30,11 @@ Verify that a scheduler passes performance gates under
 use stt::prelude::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Name("scx_my_sched"));
+    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .topology(1, 2, 1);
 
 #[stt_test(
     scheduler = MY_SCHED,
-    sockets = 1,
-    cores = 2,
-    threads = 1,
     performance_mode = true,
     duration_s = 3,
     workers_per_cgroup = 2,
@@ -80,13 +78,11 @@ disables auto-repro automatically.
 use stt::prelude::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Name("scx_my_sched"));
+    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .topology(1, 2, 1);
 
 #[stt_test(
     scheduler = MY_SCHED,
-    sockets = 1,
-    cores = 2,
-    threads = 1,
     performance_mode = true,
     duration_s = 5,
     workers_per_cgroup = 4,

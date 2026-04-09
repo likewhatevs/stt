@@ -21,17 +21,22 @@ static MY_STEAL: FlagDecl = FlagDecl {
 
 const MY_SCHED: Scheduler = Scheduler::new("my_scheduler")
     .binary(SchedulerSpec::Name("scx_my_scheduler"))
-    .flags(&[&MY_LLC, &MY_STEAL]);
+    .flags(&[&MY_LLC, &MY_STEAL])
+    .topology(2, 4, 2);
 ```
 
 ## 2. Write integration tests
+
+Tests inherit the scheduler's topology. Override with explicit
+`sockets`, `cores`, or `threads` when needed.
 
 ```rust,ignore
 use stt::prelude::*;
 use stt::scenario::*;
 
-#[stt_test(sockets = 2, cores = 4, threads = 2, scheduler = MY_SCHED)]
+#[stt_test(scheduler = MY_SCHED)]
 fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
+    // Inherits 2s4c2t from MY_SCHED
     let wl = dfl_wl(ctx);
     let (handles, _guard) = setup_cgroups(ctx, 2, &wl)?;
     std::thread::sleep(ctx.duration);

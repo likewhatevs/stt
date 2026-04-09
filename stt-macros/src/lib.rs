@@ -19,9 +19,9 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///    inside it.
 ///
 /// Optional attributes (all with defaults):
-///   - `sockets = N` (default: 1)
-///   - `cores = N` (default: 2)
-///   - `threads = N` (default: 1)
+///   - `sockets = N` (default: inherited from scheduler, or 1)
+///   - `cores = N` (default: inherited from scheduler, or 2)
+///   - `threads = N` (default: inherited from scheduler, or 1)
 ///   - `memory_mb = N` (default: 2048)
 ///   - `performance_mode = bool` (default: false) -- vCPU pinning, hugepages
 ///   - `duration_s = N`, `workers_per_cgroup = N` -- workload overrides
@@ -42,6 +42,9 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut sockets = DEFAULT_SOCKETS;
     let mut cores = DEFAULT_CORES;
     let mut threads = DEFAULT_THREADS;
+    let mut sockets_set = false;
+    let mut cores_set = false;
+    let mut threads_set = false;
     let mut memory_mb = DEFAULT_MEMORY_MB;
     let mut scheduler: Option<syn::Path> = None;
     let mut auto_repro = true;
@@ -178,17 +181,20 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "sockets" => {
                                 sockets = lit_int
                                     .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                sockets_set = true;
                             }
                             "cores" => {
                                 cores = lit_int
                                     .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                cores_set = true;
                             }
                             "threads" => {
                                 threads = lit_int
                                     .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                threads_set = true;
                             }
                             "memory_mb" => {
                                 memory_mb = lit_int
@@ -370,18 +376,18 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Reject zero values at compile time.
-    if sockets == 0 {
+    // Reject zero values at compile time (only for explicitly set values).
+    if sockets_set && sockets == 0 {
         return syn::Error::new(proc_macro2::Span::call_site(), "sockets must be > 0")
             .to_compile_error()
             .into();
     }
-    if cores == 0 {
+    if cores_set && cores == 0 {
         return syn::Error::new(proc_macro2::Span::call_site(), "cores must be > 0")
             .to_compile_error()
             .into();
     }
-    if threads == 0 {
+    if threads_set && threads == 0 {
         return syn::Error::new(proc_macro2::Span::call_site(), "threads must be > 0")
             .to_compile_error()
             .into();
@@ -404,6 +410,45 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         None => {
             quote! { &::stt::test_support::Scheduler::EEVDF }
+        }
+    };
+
+    // Build topology tokens. Each dimension independently inherits from
+    // the scheduler's topology when not explicitly set. Scheduler
+    // topology fields are const, so field access is valid in static
+    // initializers.
+    let sockets_tokens = if sockets_set {
+        let s = sockets;
+        quote! { #s }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.topology.sockets }
+    } else {
+        let s = sockets;
+        quote! { #s }
+    };
+    let cores_tokens = if cores_set {
+        let c = cores;
+        quote! { #c }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.topology.cores_per_socket }
+    } else {
+        let c = cores;
+        quote! { #c }
+    };
+    let threads_tokens = if threads_set {
+        let t = threads;
+        quote! { #t }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.topology.threads_per_core }
+    } else {
+        let t = threads;
+        quote! { #t }
+    };
+    let topology_tokens = quote! {
+        ::stt::test_support::Topology {
+            sockets: #sockets_tokens,
+            cores_per_socket: #cores_tokens,
+            threads_per_core: #threads_tokens,
         }
     };
 
@@ -511,11 +556,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         static #entry_name: ::stt::test_support::SttTestEntry = ::stt::test_support::SttTestEntry {
             name: #name_str,
             func: #inner_name,
-            topology: ::stt::test_support::Topology {
-                sockets: #sockets,
-                cores_per_socket: #cores,
-                threads_per_core: #threads,
-            },
+            topology: #topology_tokens,
             constraints: ::stt::test_support::TopologyConstraints {
                 min_sockets: #min_sockets,
                 min_llcs: #min_llcs,

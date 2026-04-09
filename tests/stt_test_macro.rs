@@ -133,6 +133,43 @@ fn entry_topo_constraints_match_attrs() {
     assert_eq!(entry.constraints.min_cpus, 8);
 }
 
+/// Scheduler with a distinctive topology for inheritance tests.
+const TOPO_SCHED: stt::test_support::Scheduler =
+    stt::test_support::Scheduler::new("topo_test").topology(3, 6, 1);
+
+/// Full topology inheritance: all three dimensions from TOPO_SCHED.
+#[stt_test(scheduler = TOPO_SCHED)]
+fn topo_inherit_full(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Partial topology inheritance: threads overridden, sockets and cores
+/// inherited from TOPO_SCHED.
+#[stt_test(scheduler = TOPO_SCHED, threads = 2)]
+fn topo_inherit_partial(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Verify full topology inheritance from scheduler.
+#[test]
+fn entry_topo_inherit_full() {
+    let entry = stt::test_support::find_test("topo_inherit_full").unwrap();
+    assert_eq!(entry.topology.sockets, 3);
+    assert_eq!(entry.topology.cores_per_socket, 6);
+    assert_eq!(entry.topology.threads_per_core, 1);
+}
+
+/// Verify partial topology inheritance: threads overridden, rest inherited.
+#[test]
+fn entry_topo_inherit_partial() {
+    let entry = stt::test_support::find_test("topo_inherit_partial").unwrap();
+    assert_eq!(entry.topology.sockets, 3);
+    assert_eq!(entry.topology.cores_per_socket, 6);
+    assert_eq!(entry.topology.threads_per_core, 2);
+}
+
 /// Test with performance_mode — verifies macro sets the field.
 #[stt_test(sockets = 1, cores = 2, threads = 1, performance_mode = true)]
 fn performance_mode_compile(ctx: &Ctx) -> Result<AssertResult> {

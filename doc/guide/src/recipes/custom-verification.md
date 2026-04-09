@@ -41,9 +41,6 @@ overrides in the merge chain.
 
 ```rust,ignore
 #[stt_test(
-    sockets = 2,
-    cores = 4,
-    threads = 2,
     scheduler = RELAXED,
     not_starved = true,
     max_gap_ms = 5000,
@@ -51,7 +48,7 @@ overrides in the merge chain.
     sustained_samples = 10,
 )]
 fn high_imbalance_test(ctx: &Ctx) -> Result<AssertResult> {
-    // ...
+    // Inherits topology from RELAXED
     Ok(AssertResult::pass())
 }
 ```

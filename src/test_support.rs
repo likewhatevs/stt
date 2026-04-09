@@ -244,6 +244,10 @@ pub struct Scheduler {
     pub cgroup_parent: Option<&'static str>,
     /// Scheduler CLI args, prepended before per-test `extra_sched_args`.
     pub sched_args: &'static [&'static str],
+    /// Default VM topology for tests using this scheduler. Tests inherit
+    /// this topology unless they override `sockets`, `cores`, or
+    /// `threads` explicitly in `#[stt_test]`.
+    pub topology: Topology,
 }
 
 impl Scheduler {
@@ -256,6 +260,11 @@ impl Scheduler {
         assert: crate::assert::Assert::NONE,
         cgroup_parent: None,
         sched_args: &[],
+        topology: Topology {
+            sockets: 1,
+            cores_per_socket: 2,
+            threads_per_core: 1,
+        },
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -269,6 +278,11 @@ impl Scheduler {
             assert: crate::assert::Assert::NONE,
             cgroup_parent: None,
             sched_args: &[],
+            topology: Topology {
+                sockets: 1,
+                cores_per_socket: 2,
+                threads_per_core: 1,
+            },
         }
     }
 
@@ -314,6 +328,18 @@ impl Scheduler {
     /// `extra_sched_args`.
     pub const fn sched_args(mut self, args: &'static [&'static str]) -> Self {
         self.sched_args = args;
+        self
+    }
+
+    /// Set the default VM topology for tests using this scheduler.
+    /// Tests inherit this unless they override `sockets`, `cores`, or
+    /// `threads` explicitly in `#[stt_test]`.
+    pub const fn topology(mut self, sockets: u32, cores: u32, threads: u32) -> Self {
+        self.topology = Topology {
+            sockets,
+            cores_per_socket: cores,
+            threads_per_core: threads,
+        };
         self
     }
 
@@ -4047,6 +4073,11 @@ mod tests {
         assert: crate::assert::Assert::NONE,
         cgroup_parent: None,
         sched_args: &[],
+        topology: crate::vmm::topology::Topology {
+            sockets: 1,
+            cores_per_socket: 2,
+            threads_per_core: 1,
+        },
     };
 
     fn sched_entry(name: &'static str) -> SttTestEntry {
