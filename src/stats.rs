@@ -1756,6 +1756,7 @@ mod tests {
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
+            kvm_stats: None,
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "my_test");
@@ -1786,6 +1787,7 @@ mod tests {
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
+            kvm_stats: None,
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "eevdf_test");
@@ -1819,6 +1821,7 @@ mod tests {
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
+            kvm_stats: None,
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.stall_count, 0);

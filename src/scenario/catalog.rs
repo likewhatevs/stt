@@ -126,7 +126,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             2,
             CpusetMode::None,
             vec![CgroupWork {
-                workers: 32,
+                num_workers: 32,
                 work_type: WorkType::Mixed,
                 ..Default::default()
             }]
@@ -188,7 +188,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             2,
             CpusetMode::None,
             vec![CgroupWork {
-                workers: 1,
+                num_workers: 1,
                 policy: SchedPolicy::Fifo(1),
                 work_type: WorkType::Bursty {
                     burst_ms: 500,
@@ -204,7 +204,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             2,
             CpusetMode::None,
             vec![CgroupWork {
-                workers: 2,
+                num_workers: 2,
                 policy: SchedPolicy::RoundRobin(1),
                 work_type: WorkType::Bursty {
                     burst_ms: 500,
@@ -223,7 +223,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![CgroupWork {
-                workers: 16,
+                num_workers: 16,
                 ..Default::default()
             }],
             action: Action::Steady,
@@ -237,7 +237,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![CgroupWork {
-                workers: 16,
+                num_workers: 16,
                 ..Default::default()
             }],
             action: Action::Steady,
@@ -252,7 +252,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 1,
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![CgroupWork {
-                workers: 8,
+                num_workers: 8,
                 ..Default::default()
             }],
             action: Action::Steady,
@@ -268,11 +268,11 @@ pub fn all_scenarios() -> Vec<Scenario> {
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![
                 CgroupWork {
-                    workers: 16,
+                    num_workers: 16,
                     ..Default::default()
                 },
                 CgroupWork {
-                    workers: 1,
+                    num_workers: 1,
                     work_type: WorkType::YieldHeavy,
                     ..Default::default()
                 },
@@ -289,7 +289,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 1,
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![CgroupWork {
-                workers: 16,
+                num_workers: 16,
                 ..Default::default()
             }],
             action: Action::Steady,
@@ -397,7 +397,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 2,
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![CgroupWork {
-                workers: 16,
+                num_workers: 16,
                 ..Default::default()
             }],
             action: Action::Steady,
@@ -582,11 +582,11 @@ pub fn all_scenarios() -> Vec<Scenario> {
             cpuset_mode: CpusetMode::Overlap(0.5),
             cgroup_works: vec![
                 CgroupWork {
-                    workers: 8,
+                    num_workers: 8,
                     ..Default::default()
                 },
                 CgroupWork {
-                    workers: 1,
+                    num_workers: 1,
                     work_type: WorkType::Bursty {
                         burst_ms: 50,
                         sleep_ms: 100,
@@ -594,7 +594,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
                     ..Default::default()
                 },
                 CgroupWork {
-                    workers: 1,
+                    num_workers: 1,
                     work_type: WorkType::YieldHeavy,
                     ..Default::default()
                 },
@@ -612,16 +612,16 @@ pub fn all_scenarios() -> Vec<Scenario> {
             cpuset_mode: CpusetMode::Overlap(0.5),
             cgroup_works: vec![
                 CgroupWork {
-                    workers: 16,
+                    num_workers: 16,
                     ..Default::default()
                 },
                 CgroupWork {
-                    workers: 1,
+                    num_workers: 1,
                     work_type: WorkType::YieldHeavy,
                     ..Default::default()
                 },
                 CgroupWork {
-                    workers: 4,
+                    num_workers: 4,
                     ..Default::default()
                 },
             ],
@@ -638,11 +638,11 @@ pub fn all_scenarios() -> Vec<Scenario> {
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![
                 CgroupWork {
-                    workers: 8,
+                    num_workers: 8,
                     ..Default::default()
                 },
                 CgroupWork {
-                    workers: 4,
+                    num_workers: 4,
                     work_type: WorkType::Bursty {
                         burst_ms: 50,
                         sleep_ms: 100,
@@ -663,7 +663,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             cpuset_mode: CpusetMode::None,
             cgroup_works: vec![
                 CgroupWork {
-                    workers: 12,
+                    num_workers: 12,
                     work_type: WorkType::Bursty {
                         burst_ms: 200,
                         sleep_ms: 50,
@@ -671,7 +671,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
                     ..Default::default()
                 },
                 CgroupWork {
-                    workers: 4,
+                    num_workers: 4,
                     ..Default::default()
                 },
             ],

@@ -238,7 +238,7 @@ pub enum Action {
 #[derive(Clone)]
 pub struct CgroupWork {
     /// Number of workers. 0 means use `Ctx::workers_per_cgroup`.
-    pub workers: usize,
+    pub num_workers: usize,
     /// What each worker process does.
     pub work_type: WorkType,
     /// Linux scheduling policy for workers.
@@ -268,7 +268,7 @@ pub enum AffinityKind {
 impl Default for CgroupWork {
     fn default() -> Self {
         Self {
-            workers: 0,
+            num_workers: 0,
             work_type: WorkType::CpuSpin,
             policy: SchedPolicy::Normal,
             affinity: AffinityKind::Inherit,
@@ -481,10 +481,10 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
             .or(scenario.cgroup_works.first())
             .cloned()
             .unwrap_or_default();
-        let n = if cw.workers == 0 {
+        let n = if cw.num_workers == 0 {
             ctx.workers_per_cgroup
         } else {
-            cw.workers
+            cw.num_workers
         };
         let affinity = resolve_affinity_kind(&cw.affinity, cpusets.as_deref(), i, ctx.topo);
         let effective_work_type = if let Some(override_wt) = ctx.work_type_override
@@ -995,7 +995,7 @@ mod tests {
     #[test]
     fn cgroup_work_default() {
         let cw = CgroupWork::default();
-        assert_eq!(cw.workers, 0);
+        assert_eq!(cw.num_workers, 0);
         assert!(matches!(cw.work_type, WorkType::CpuSpin));
         assert!(matches!(cw.policy, SchedPolicy::Normal));
         assert!(matches!(cw.affinity, AffinityKind::Inherit));

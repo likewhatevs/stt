@@ -17,6 +17,8 @@ pub use x86_64::boot;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::kvm;
 #[cfg(target_arch = "x86_64")]
+pub use x86_64::kvm_stats;
+#[cfg(target_arch = "x86_64")]
 pub use x86_64::mptable;
 
 #[cfg(target_arch = "aarch64")]
@@ -689,6 +691,57 @@ pub struct VmResult {
     pub stimulus_events: Vec<shm_ring::StimulusEvent>,
     /// BPF verifier stats collected from host-side memory reads.
     pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
+    /// KVM per-vCPU cumulative stats (requires Linux >= 5.15, x86_64 only).
+    pub kvm_stats: Option<KvmStatsTotals>,
+}
+
+/// Per-vCPU KVM stats read after VM exit. Each map holds cumulative
+/// counter values from the VM's lifetime.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct KvmStatsTotals {
+    /// Per-vCPU stat maps. Index is vCPU id.
+    pub per_vcpu: Vec<HashMap<String, u64>>,
+}
+
+/// Trust-relevant stats for scheduler testing.
+pub const KVM_INTERESTING_STATS: &[&str] = &[
+    "exits",
+    "halt_exits",
+    "halt_successful_poll",
+    "halt_attempted_poll",
+    "halt_wait_ns",
+    "preemption_reported",
+    "signal_exits",
+    "hypercalls",
+];
+
+impl KvmStatsTotals {
+    /// Sum a stat across all vCPUs.
+    pub fn sum(&self, name: &str) -> u64 {
+        self.per_vcpu.iter().filter_map(|m| m.get(name)).sum()
+    }
+
+    /// Average a stat across all vCPUs (returns 0 if no vCPUs).
+    pub fn avg(&self, name: &str) -> u64 {
+        if self.per_vcpu.is_empty() {
+            return 0;
+        }
+        self.sum(name) / self.per_vcpu.len() as u64
+    }
+}
+
+/// State returned by [`SttVm::run_vm`] after the BSP exits.
+/// Passed to [`SttVm::collect_results`] to produce [`VmResult`].
+struct VmRunState {
+    exit_code: i32,
+    timed_out: bool,
+    ap_threads: Vec<VcpuThread>,
+    monitor_handle: Option<JoinHandle<(Vec<monitor::MonitorSample>, shm_ring::ShmDrainResult)>>,
+    bpf_write_handle: Option<JoinHandle<()>>,
+    com1: Arc<PiMutex<console::Serial>>,
+    com2: Arc<PiMutex<console::Serial>>,
+    kill: Arc<AtomicBool>,
+    vm: kvm::SttKvm,
 }
 
 // ---------------------------------------------------------------------------
@@ -848,32 +901,29 @@ impl SttVm {
             self.setup_vcpus_aarch64(&vm, kernel_result.entry)?;
         }
 
+        // Open persistent stats fds before vCPUs move to threads.
+        // Stats fds hold kernel references independent of VcpuFd ownership.
+        // Read once after VM exit to capture cumulative totals.
+        #[cfg(target_arch = "x86_64")]
+        let stats_ctx = kvm_stats::open_stats_context(&vm.vcpus);
+        #[cfg(target_arch = "x86_64")]
+        if stats_ctx.is_none() {
+            tracing::debug!("KVM_GET_STATS_FD not supported, skipping stats collection");
+        }
+
         tracing::debug!(elapsed_us = start.elapsed().as_micros(), "total_setup");
 
-        let (
-            exit_code,
-            timed_out,
-            ap_threads,
-            monitor_handle,
-            bpf_write_handle,
-            com1,
-            com2,
-            kill,
-            vm,
-        ) = self.run_vm(start, vm)?;
+        let run = self.run_vm(start, vm)?;
 
-        self.collect_results(
-            start,
-            exit_code,
-            timed_out,
-            ap_threads,
-            monitor_handle,
-            bpf_write_handle,
-            com1,
-            com2,
-            kill,
-            vm,
-        )
+        let mut result = self.collect_results(start, run)?;
+
+        // Read cumulative KVM stats after VM exit.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ctx) = stats_ctx {
+            result.kvm_stats = Some(ctx.read_stats());
+        }
+
+        Ok(result)
     }
 
     /// Create the KVM VM and load the kernel.
@@ -1218,21 +1268,7 @@ impl SttVm {
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
     #[allow(clippy::type_complexity)]
-    fn run_vm(
-        &self,
-        start: Instant,
-        mut vm: kvm::SttKvm,
-    ) -> Result<(
-        i32,
-        bool,
-        Vec<VcpuThread>,
-        Option<JoinHandle<(Vec<monitor::MonitorSample>, shm_ring::ShmDrainResult)>>,
-        Option<JoinHandle<()>>,
-        Arc<PiMutex<console::Serial>>,
-        Arc<PiMutex<console::Serial>>,
-        Arc<AtomicBool>,
-        kvm::SttKvm,
-    )> {
+    fn run_vm(&self, start: Instant, mut vm: kvm::SttKvm) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
@@ -1390,7 +1426,7 @@ impl SttVm {
         // dropped first, the watchdog may write to unmapped memory.
         let _ = watchdog.join();
 
-        Ok((
+        Ok(VmRunState {
             exit_code,
             timed_out,
             ap_threads,
@@ -1400,7 +1436,7 @@ impl SttVm {
             com2,
             kill,
             vm,
-        ))
+        })
     }
 
     /// Spawn AP vCPU threads. Each thread optionally pins itself to a
@@ -1829,54 +1865,41 @@ impl SttVm {
     }
 
     /// Shutdown threads and collect output.
-    #[allow(clippy::too_many_arguments)]
-    fn collect_results(
-        &self,
-        start: Instant,
-        mut exit_code: i32,
-        timed_out: bool,
-        ap_threads: Vec<VcpuThread>,
-        monitor_handle: Option<JoinHandle<(Vec<monitor::MonitorSample>, shm_ring::ShmDrainResult)>>,
-        bpf_write_handle: Option<JoinHandle<()>>,
-        com1: Arc<PiMutex<console::Serial>>,
-        com2: Arc<PiMutex<console::Serial>>,
-        kill: Arc<AtomicBool>,
-        vm: kvm::SttKvm,
-    ) -> Result<VmResult> {
-        kill.store(true, Ordering::Release);
+    fn collect_results(&self, start: Instant, run: VmRunState) -> Result<VmResult> {
+        let mut exit_code = run.exit_code;
+        let timed_out = run.timed_out;
+        run.kill.store(true, Ordering::Release);
 
         // Kick APs still in KVM_RUN, then join. Skip APs that already
         // exited — their VcpuFd (and kvm_run mmap) may be dropped, so
         // writing to ImmediateExitHandle would hit unmapped memory.
-        for vt in &ap_threads {
+        for vt in &run.ap_threads {
             if !vt.exited.load(Ordering::Acquire) {
                 vt.kick();
             }
         }
-        for vt in ap_threads {
+        for vt in run.ap_threads {
             vt.wait_for_exit(Duration::from_secs(5));
-            // join() returns the VcpuFd — it drops HERE, after all kicks
-            // are done. This ensures the kvm_run mmap (used by
-            // ImmediateExitHandle) stays valid throughout wait_for_exit.
             let _ = vt.handle.join();
         }
 
-        let (monitor_report, mid_flight_drain) = match monitor_handle.and_then(|h| h.join().ok()) {
-            Some((samples, drain)) => {
-                let summary = monitor::MonitorSummary::from_samples(&samples);
-                let preemption_threshold_ns =
-                    monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
-                let report = monitor::MonitorReport {
-                    samples,
-                    summary,
-                    preemption_threshold_ns,
-                };
-                (Some(report), drain)
-            }
-            None => (None, shm_ring::ShmDrainResult::default()),
-        };
+        let (monitor_report, mid_flight_drain) =
+            match run.monitor_handle.and_then(|h| h.join().ok()) {
+                Some((samples, drain)) => {
+                    let summary = monitor::MonitorSummary::from_samples(&samples);
+                    let preemption_threshold_ns =
+                        monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
+                    let report = monitor::MonitorReport {
+                        samples,
+                        summary,
+                        preemption_threshold_ns,
+                    };
+                    (Some(report), drain)
+                }
+                None => (None, shm_ring::ShmDrainResult::default()),
+            };
 
-        if let Some(h) = bpf_write_handle {
+        if let Some(h) = run.bpf_write_handle {
             let _ = h.join();
         }
 
@@ -1888,7 +1911,8 @@ impl SttVm {
             let shm_base = DRAM_BASE + mem_size - self.shm_size;
             let shm_size = self.shm_size as usize;
             let mut shm_buf = vec![0u8; shm_size];
-            vm.guest_mem
+            run.vm
+                .guest_mem
                 .read_slice(&mut shm_buf, GuestAddress(shm_base))
                 .context("read SHM region")?;
             let post_mortem = shm_ring::shm_drain(&shm_buf, 0);
@@ -1913,8 +1937,8 @@ impl SttVm {
             (None, Vec::new())
         };
 
-        let app_output = com2.lock().output();
-        let console_output = com1.lock().output();
+        let app_output = run.com2.lock().output();
+        let console_output = run.com1.lock().output();
 
         // Extract exit code: SHM (primary), COM2 sentinel (fallback).
         let shm_exit = shm_data.as_ref().and_then(|d| {
@@ -1936,7 +1960,7 @@ impl SttVm {
         }
 
         // Collect BPF verifier stats from host-side memory reads.
-        let verifier_stats = self.collect_verifier_stats(&vm);
+        let verifier_stats = self.collect_verifier_stats(&run.vm);
 
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
@@ -1949,6 +1973,7 @@ impl SttVm {
             shm_data,
             stimulus_events,
             verifier_stats,
+            kvm_stats: None,
         })
     }
 
@@ -3071,6 +3096,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
+            kvm_stats: None,
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -3093,6 +3119,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
+            kvm_stats: None,
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
@@ -3440,6 +3467,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
+            kvm_stats: None,
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -3475,6 +3503,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
+            kvm_stats: None,
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);

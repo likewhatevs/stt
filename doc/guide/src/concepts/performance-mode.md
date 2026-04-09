@@ -111,6 +111,10 @@ levels of checks:
 - Insufficient free hugepages -- regular page allocation is used.
 - Host load is high -- `procs_running` from `/proc/stat` exceeds
   half the vCPU count, results may be noisy.
+- TSC not stable (checked at VM creation time) --
+  `KVM_CLOCK_TSC_STABLE` not set after `KVM_GET_CLOCK`, kvmclock
+  falls back to per-vCPU timekeeping. Timing measurements may have
+  higher variance. Common in nested virtualization.
 
 ## Usage
 

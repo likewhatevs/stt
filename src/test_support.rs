@@ -42,6 +42,8 @@ pub(crate) struct SidecarResult {
     pub work_type: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verifier_stats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kvm_stats: Option<crate::vmm::KvmStatsTotals>,
 }
 
 /// Scan a directory for stt sidecar JSON files. Recurses one level
@@ -697,6 +699,10 @@ pub fn collect_and_print_sidecar_stats() {
         if !cprofile.is_empty() {
             eprintln!("{cprofile}");
         }
+        let kstats = format_kvm_stats(&sidecars);
+        if !kstats.is_empty() {
+            eprintln!("{kstats}");
+        }
     }
 }
 
@@ -799,6 +805,85 @@ fn format_callback_profile(sidecars: &[SidecarResult]) -> String {
                 d.name, d.cnt, d.nsecs, d.nsecs_per_call,
             ));
         }
+    }
+
+    out
+}
+
+/// Aggregate KVM stats across sidecars into a compact summary.
+///
+/// Averages each stat across all tests that returned `Some(KvmStatsTotals)`.
+/// Tests without KVM stats (non-VM tests, old kernels) are excluded
+/// from the denominator.
+fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
+    let with_stats: Vec<&crate::vmm::KvmStatsTotals> = sidecars
+        .iter()
+        .filter_map(|sc| sc.kvm_stats.as_ref())
+        .collect();
+
+    if with_stats.is_empty() {
+        return String::new();
+    }
+
+    let n_vms = with_stats.len();
+
+    // Compute cross-VM averages for each stat.
+    let vm_avg = |name: &str| -> u64 {
+        let sum: u64 = with_stats.iter().map(|d| d.avg(name)).sum();
+        sum / n_vms as u64
+    };
+
+    let exits = vm_avg("exits");
+    let halt = vm_avg("halt_exits");
+    let halt_wait_ns = vm_avg("halt_wait_ns");
+    let preempted = vm_avg("preemption_reported");
+    let signal = vm_avg("signal_exits");
+    let hypercalls = vm_avg("hypercalls");
+
+    // Halt poll efficiency across all vCPUs and VMs.
+    let total_poll_ok: u64 = with_stats
+        .iter()
+        .map(|d| d.sum("halt_successful_poll"))
+        .sum();
+    let total_poll_try: u64 = with_stats
+        .iter()
+        .map(|d| d.sum("halt_attempted_poll"))
+        .sum();
+
+    if exits == 0 {
+        return String::new();
+    }
+
+    let halt_wait_ms = halt_wait_ns as f64 / 1_000_000.0;
+    let poll_pct = if total_poll_try > 0 {
+        (total_poll_ok as f64 / total_poll_try as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let mut out = format!("\n=== KVM STATS (avg across {n_vms} VMs) ===\n\n");
+    out.push_str(&format!(
+        "  exits/vcpu  {:>7}   halt/vcpu     {:>5}   halt_wait_ms {:>7.1}\n",
+        exits, halt, halt_wait_ms,
+    ));
+    out.push_str(&format!(
+        "  poll_ok%    {:>6.1}%   preempted/vcpu {:>4}   signal/vcpu  {:>7}\n",
+        poll_pct, preempted, signal,
+    ));
+    if hypercalls > 0 {
+        out.push_str(&format!("  hypercalls/vcpu {:>4}\n", hypercalls));
+    }
+
+    // Trust warnings.
+    if preempted > 0 {
+        let total: u64 = with_stats
+            .iter()
+            .map(|d| d.sum("preemption_reported"))
+            .sum();
+        out.push_str(&format!(
+            "\n  WARNING: {total} host preemptions detected \
+             -- timing results may be unreliable\n",
+        ));
     }
 
     out
@@ -2264,6 +2349,7 @@ fn write_sidecar(
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
         verifier_stats: vm_result.verifier_stats.clone(),
+        kvm_stats: vm_result.kvm_stats.clone(),
     };
     let path = dir.join(format!("{}.stt.json", entry.name));
     if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
@@ -3160,6 +3246,7 @@ mod tests {
             }],
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
+            kvm_stats: None,
         };
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -3195,6 +3282,7 @@ mod tests {
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
+            kvm_stats: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -3405,6 +3493,7 @@ mod tests {
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
+            kvm_stats: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(tmp.join("test_x.stt.json"), &json).unwrap();
@@ -3431,6 +3520,7 @@ mod tests {
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
+            kvm_stats: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(sub.join("nested_test.stt.json"), &json).unwrap();
@@ -3474,6 +3564,7 @@ mod tests {
             stimulus_events: vec![],
             work_type: "Bursty".to_string(),
             verifier_stats: vec![],
+            kvm_stats: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -3508,6 +3599,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
+            kvm_stats: None,
         };
         let verify_result = AssertResult::pass();
         // This should be a no-op because STT_SIDECAR_DIR is not set.
@@ -3548,6 +3640,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
+            kvm_stats: None,
         };
         let verify_result = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
@@ -3646,6 +3739,7 @@ mod tests {
             shm_data: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
+            kvm_stats: None,
         }
     }
 
@@ -3983,6 +4077,7 @@ mod tests {
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
             verifier_stats: vstats,
+            kvm_stats: None,
         }
     }
 

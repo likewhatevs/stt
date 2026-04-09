@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_CAP_HALT_POLL, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS,
-    KVM_PIT_SPEAKER_DUMMY, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
-    KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE, kvm_enable_cap, kvm_pit_config,
-    kvm_userspace_memory_region,
+    KVM_CLOCK_TSC_STABLE, KVM_PIT_SPEAKER_DUMMY, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK,
+    KVM_X2APIC_API_USE_32BIT_IDS, KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE,
+    kvm_enable_cap, kvm_pit_config, kvm_userspace_memory_region,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
@@ -306,6 +306,69 @@ impl SttKvm {
             vcpus.push(vcpu);
         }
 
+        // Check TSC stability via KVM_GET_CLOCK. An unstable TSC
+        // (missing KVM_CLOCK_TSC_STABLE) means kvmclock falls back to
+        // host-side timekeeping per-vCPU, adding overhead to
+        // clock_gettime and degrading timer accuracy. Common in nested
+        // virtualization where the L0 hypervisor does not expose
+        // constant TSC to L1.
+        //
+        // Only checked in performance_mode: non-perf tests use binary
+        // pass/fail (cpuset, starvation) where timing precision doesn't
+        // affect results.
+        //
+        // A get→set→get roundtrip is required: use_master_clock
+        // starts false and is only evaluated by
+        // pvclock_update_vm_gtod_copy(). That function is called by
+        // kvm_vm_ioctl_set_clock() but NOT by kvm_vm_ioctl_get_clock()
+        // or vCPU creation. Without the set_clock() call, get_clock()
+        // always returns flags=0 regardless of actual TSC stability.
+        //
+        // Flags must be cleared before set_clock(): get_clock() may
+        // set KVM_CLOCK_REALTIME, and set_clock() applies a realtime
+        // adjustment when that flag is present (x86.c:7209-7215),
+        // double-counting elapsed time. KVM_CLOCK_TSC_STABLE and
+        // KVM_CLOCK_HOST_TSC are output-only and ignored by set_clock().
+        if performance_mode {
+            match vm_fd.get_clock() {
+                Ok(clock) => {
+                    let mut set_data = clock;
+                    set_data.flags = 0;
+                    if let Err(e) = vm_fd.set_clock(&set_data) {
+                        eprintln!(
+                            "performance_mode: WARNING: KVM_SET_CLOCK failed ({e}), \
+                             cannot check TSC stability"
+                        );
+                    } else {
+                        match vm_fd.get_clock() {
+                            Ok(clock2) => {
+                                if clock2.flags & KVM_CLOCK_TSC_STABLE == 0 {
+                                    eprintln!(
+                                        "performance_mode: WARNING: TSC not stable \
+                                         (KVM_CLOCK_TSC_STABLE not set), \
+                                         timing measurements may have higher variance \
+                                         (nested virt?)."
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "performance_mode: WARNING: KVM_GET_CLOCK failed ({e}), \
+                                     cannot check TSC stability"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "performance_mode: WARNING: KVM_GET_CLOCK failed ({e}), \
+                         cannot check TSC stability"
+                    );
+                }
+            }
+        }
+
         Ok(SttKvm {
             kvm,
             vm_fd,
@@ -564,6 +627,28 @@ mod tests {
             0,
             "PAUSE and HLT bits must not overlap"
         );
+    }
+
+    #[test]
+    fn tsc_stability_check_roundtrip() {
+        // Verify the get→set→get roundtrip succeeds with
+        // performance_mode=true (which enables the TSC check).
+        let topo = Topology {
+            sockets: 1,
+            cores_per_socket: 2,
+            threads_per_core: 1,
+        };
+        let vm = SttKvm::new(topo, 64, true).unwrap();
+        let clock = vm.vm_fd.get_clock().unwrap();
+        let mut set_data = clock;
+        set_data.flags = 0;
+        vm.vm_fd.set_clock(&set_data).unwrap();
+        let clock2 = vm.vm_fd.get_clock().unwrap();
+        // On bare-metal with invariant TSC, KVM_CLOCK_TSC_STABLE
+        // should be set after the roundtrip forces
+        // pvclock_update_vm_gtod_copy. In nested virt it may not be.
+        // Either way, the roundtrip must not fail.
+        let _ = clock2.flags & KVM_CLOCK_TSC_STABLE;
     }
 
     #[test]
