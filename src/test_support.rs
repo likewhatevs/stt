@@ -4276,4 +4276,143 @@ mod tests {
         // Deduplicated: total should be 50000, not 100000.
         assert!(result.contains("total verified insns: 50000"));
     }
+
+    // -- diagnostic section tests --
+
+    #[test]
+    fn eval_sched_died_includes_console() {
+        let json = r#"{"passed":false,"details":["scheduler died between step 0 and step 1 (of 2)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = sched_entry("__eval_sched_died_console__");
+        let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--- diagnostics ---"),
+            "scheduler died detail should trigger console_section, got: {msg}",
+        );
+        assert!(
+            msg.contains("kernel panic"),
+            "console_section should include kernel console output, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_died_includes_monitor() {
+        let json = r#"{"passed":false,"details":["scheduler died"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = sched_entry("__eval_sched_died_monitor__");
+        let result = crate::vmm::VmResult {
+            success: false,
+            exit_code: 1,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: output.to_string(),
+            stderr: String::new(),
+            monitor: Some(crate::monitor::MonitorReport {
+                samples: vec![],
+                summary: crate::monitor::MonitorSummary {
+                    total_samples: 5,
+                    max_imbalance_ratio: 3.0,
+                    max_local_dsq_depth: 2,
+                    stall_detected: false,
+                    event_deltas: None,
+                    schedstat_deltas: None,
+                    prog_stats_deltas: None,
+                },
+                preemption_threshold_ns: 0,
+            }),
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+        };
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--- monitor ---"),
+            "assert failure with active scheduler should include monitor section, got: {msg}",
+        );
+        assert!(
+            msg.contains("max_imbalance"),
+            "monitor section should include max_imbalance, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_monitor_fail_includes_sched_log() {
+        let pass_json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let sched_log =
+            format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
+        let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");
+        let entry = sched_entry("__eval_monitor_fail_sched__");
+        // Imbalance ratio 10.0 exceeds default threshold of 4.0,
+        // sustained for 5+ samples past the 20-sample warmup window.
+        let imbalance_samples: Vec<crate::monitor::MonitorSample> = (0..30)
+            .map(|i| {
+                crate::monitor::MonitorSample::new(
+                    (i * 100) as u64,
+                    vec![
+                        crate::monitor::CpuSnapshot {
+                            nr_running: 10,
+                            scx_nr_running: 10,
+                            local_dsq_depth: 0,
+                            rq_clock: 1000 + (i as u64 * 100),
+                            scx_flags: 0,
+                            event_counters: None,
+                            schedstat: None,
+                            vcpu_cpu_time_ns: None,
+                            sched_domains: None,
+                        },
+                        crate::monitor::CpuSnapshot {
+                            nr_running: 1,
+                            scx_nr_running: 1,
+                            local_dsq_depth: 0,
+                            rq_clock: 2000 + (i as u64 * 100),
+                            scx_flags: 0,
+                            event_counters: None,
+                            schedstat: None,
+                            vcpu_cpu_time_ns: None,
+                            sched_domains: None,
+                        },
+                    ],
+                )
+            })
+            .collect();
+        let summary =
+            crate::monitor::MonitorSummary::from_samples_with_threshold(&imbalance_samples, 0);
+        let result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output,
+            stderr: String::new(),
+            monitor: Some(crate::monitor::MonitorReport {
+                samples: imbalance_samples,
+                summary,
+                preemption_threshold_ns: 0,
+            }),
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+        };
+        let assertions = crate::assert::Assert::default_checks();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("passed scenario but monitor failed"),
+            "should indicate scenario passed but monitor failed, got: {msg}",
+        );
+        assert!(
+            msg.contains("--- scheduler log ---"),
+            "monitor failure path should include scheduler log section, got: {msg}",
+        );
+    }
 }
