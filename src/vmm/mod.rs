@@ -1109,6 +1109,15 @@ impl SttVm {
             "sysctl.kernel.sched_schedstats=1",
         )
         .to_string();
+        let verbose = std::env::var("STT_VERBOSE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
+        cmdline.push_str(if verbose {
+            " loglevel=7"
+        } else {
+            " loglevel=4"
+        });
         if self.init_binary.is_some() {
             cmdline.push_str(" rdinit=/init");
         }
@@ -2031,6 +2040,15 @@ impl SttVm {
             "kfence.sample_interval=0",
         )
         .to_string();
+        let verbose = std::env::var("STT_VERBOSE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
+        cmdline.push_str(if verbose {
+            " loglevel=7"
+        } else {
+            " loglevel=4"
+        });
         if self.init_binary.is_some() {
             cmdline.push_str(" rdinit=/init");
         }
