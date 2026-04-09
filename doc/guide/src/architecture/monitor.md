@@ -141,6 +141,12 @@ Value access for `BPF_MAP_TYPE_ARRAY` maps reads/writes the inline
 region is vmalloc'd, so each byte access goes through the page table
 walker to handle page boundaries.
 
+For `BPF_MAP_TYPE_PERCPU_ARRAY` maps, `bpf_array.pptrs[key]` holds
+a `__percpu` pointer (at the same union offset as `value`). Adding
+`__per_cpu_offset[cpu]` yields the per-CPU KVA in the direct mapping.
+`read_percpu_array` returns one `Option<Vec<u8>>` per CPU: `Some`
+when the per-CPU PA falls within guest memory, `None` when it does not.
+
 ### Typed field access
 
 When a map has BTF metadata (`btf_kva != 0`), `resolve_value_layout`

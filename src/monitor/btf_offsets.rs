@@ -356,8 +356,11 @@ pub struct BpfMapOffsets {
     pub key_size: usize,
     /// Offset of `value_size` (u32) within `struct bpf_map`.
     pub value_size: usize,
-    /// Offset of `value` flex array (DECLARE_FLEX_ARRAY) within `struct bpf_array`.
-    /// Value data is inline at this offset, not behind a pointer.
+    /// Offset of `max_entries` (u32) within `struct bpf_map`.
+    pub max_entries: usize,
+    /// Offset of `value`/`ptrs`/`pptrs` union within `struct bpf_array`.
+    /// For `BPF_MAP_TYPE_ARRAY`: inline value data at this offset.
+    /// For `BPF_MAP_TYPE_PERCPU_ARRAY`: `__percpu` pointers at this offset.
     pub array_value: usize,
     /// Offset of `slots` within `struct xa_node`.
     pub xa_node_slots: usize,
@@ -399,6 +402,7 @@ impl BpfMapOffsets {
         let map_flags = member_byte_offset(btf, &bpf_map, "map_flags")?;
         let key_size = member_byte_offset(btf, &bpf_map, "key_size")?;
         let value_size = member_byte_offset(btf, &bpf_map, "value_size")?;
+        let max_entries = member_byte_offset(btf, &bpf_map, "max_entries")?;
 
         let (bpf_array, _) = find_struct(btf, "bpf_array")?;
         let array_value = member_byte_offset(btf, &bpf_array, "value")?;
@@ -434,6 +438,7 @@ impl BpfMapOffsets {
             map_flags,
             key_size,
             value_size,
+            max_entries,
             array_value,
             xa_node_slots,
             xa_node_shift,

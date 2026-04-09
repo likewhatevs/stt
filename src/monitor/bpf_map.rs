@@ -8,8 +8,10 @@
 //! Address translation strategy:
 //! - `map_idr` is a kernel BSS symbol: use `text_kva_to_pa`.
 //! - xa_node structs are SLAB-allocated (direct mapping): use `kva_to_pa`.
-//! - bpf_map/bpf_array for MMAPABLE maps are vmalloc'd: use `translate_kva`.
+//! - bpf_map/bpf_array may be kmalloc'd or vmalloc'd: use `translate_any_kva`.
 //! - .bss value region is vmalloc'd: use `translate_kva`.
+//! - Per-CPU values (`BPF_MAP_TYPE_PERCPU_ARRAY`) are in the direct mapping:
+//!   use `kva_to_pa` with `__per_cpu_offset[cpu]`.
 
 use super::btf_offsets::BpfMapOffsets;
 use super::idr::{translate_any_kva, xa_load};
@@ -21,6 +23,9 @@ pub const BPF_MAP_TYPE_HASH: u32 = 1;
 
 /// BPF_MAP_TYPE_ARRAY from include/uapi/linux/bpf.h.
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
+
+/// BPF_MAP_TYPE_PERCPU_ARRAY from include/uapi/linux/bpf.h.
+pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
 
 /// BPF_OBJ_NAME_LEN from include/linux/bpf.h.
 const BPF_OBJ_NAME_LEN: usize = 16;
@@ -44,6 +49,8 @@ pub struct BpfMapInfo {
     pub key_size: u32,
     /// `value_size` field value.
     pub value_size: u32,
+    /// `max_entries` field value.
+    pub max_entries: u32,
     /// Guest KVA of the value region start (bpf_array.value).
     /// Only set for BPF_MAP_TYPE_ARRAY maps where the value data
     /// is inline at the `bpf_array.value` flex array offset.
@@ -114,6 +121,7 @@ pub(crate) fn find_all_bpf_maps(
         let map_flags = mem.read_u32(map_pa, offsets.map_flags);
         let key_size = mem.read_u32(map_pa, offsets.key_size);
         let value_size = mem.read_u32(map_pa, offsets.value_size);
+        let max_entries = mem.read_u32(map_pa, offsets.max_entries);
 
         // value_kva is only meaningful for ARRAY maps where bpf_array
         // embeds bpf_map at offset 0 and the value flex array is inline.
@@ -134,6 +142,7 @@ pub(crate) fn find_all_bpf_maps(
             map_flags,
             key_size,
             value_size,
+            max_entries,
             value_kva,
             btf_kva,
             btf_value_type_id,
@@ -355,6 +364,67 @@ fn iter_htab_entries(
     }
 
     entries
+}
+
+/// Read the per-CPU values for a single key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
+///
+/// `bpf_array.pptrs[key]` holds a `__percpu` pointer. Adding
+/// `__per_cpu_offset[cpu]` yields the per-CPU KVA, which resides in
+/// the direct mapping.
+///
+/// Returns one entry per CPU, indexed by CPU number. `Some(bytes)`
+/// when the per-CPU PA falls within guest memory; `None` when it
+/// does not. Returns an empty vec if the map is not
+/// `BPF_MAP_TYPE_PERCPU_ARRAY`, `key >= max_entries`, or the percpu
+/// pointer is zero.
+#[allow(clippy::too_many_arguments)]
+fn read_percpu_array_value(
+    mem: &GuestMem,
+    cr3_pa: u64,
+    page_offset: u64,
+    map: &BpfMapInfo,
+    key: u32,
+    offsets: &BpfMapOffsets,
+    per_cpu_offsets: &[u64],
+    l5: bool,
+) -> Vec<Option<Vec<u8>>> {
+    if map.map_type != BPF_MAP_TYPE_PERCPU_ARRAY {
+        return Vec::new();
+    }
+    if key >= map.max_entries {
+        return Vec::new();
+    }
+
+    // pptrs is at the same offset as value (union in bpf_array).
+    let pptrs_kva = map.map_kva + offsets.array_value as u64;
+    // pptrs[key] is a void __percpu * — 8 bytes.
+    let pptr_kva = pptrs_kva + (key as u64) * 8;
+
+    // bpf_array may be kmalloc'd or vmalloc'd — try direct mapping first.
+    let Some(pptr_pa) = translate_any_kva(mem, cr3_pa, page_offset, pptr_kva, l5) else {
+        return Vec::new();
+    };
+    let percpu_base = mem.read_u64(pptr_pa, 0);
+    if percpu_base == 0 {
+        return Vec::new();
+    }
+
+    let value_size = map.value_size as usize;
+    let mut result = Vec::with_capacity(per_cpu_offsets.len());
+
+    for &cpu_off in per_cpu_offsets {
+        let cpu_kva = percpu_base.wrapping_add(cpu_off);
+        let cpu_pa = super::symbols::kva_to_pa(cpu_kva, page_offset);
+        if cpu_pa + value_size as u64 <= mem.size() {
+            let mut buf = vec![0u8; value_size];
+            mem.read_bytes(cpu_pa, &mut buf);
+            result.push(Some(buf));
+        } else {
+            result.push(None);
+        }
+    }
+
+    result
 }
 
 /// Typed value read from or written to a BPF map field.
@@ -726,6 +796,45 @@ impl<'a> BpfMapAccessor<'a> {
         )
     }
 
+    /// Read per-CPU values for a key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
+    ///
+    /// Returns one entry per CPU, indexed by CPU number. `Some(bytes)`
+    /// when the per-CPU PA falls within guest memory; `None` when it
+    /// does not. Resolves `__per_cpu_offset` from the guest kernel.
+    ///
+    /// Returns an empty vec if the map is not `BPF_MAP_TYPE_PERCPU_ARRAY`,
+    /// `key >= max_entries`, or the `__per_cpu_offset` symbol is missing.
+    pub fn read_percpu_array(
+        &self,
+        map: &BpfMapInfo,
+        key: u32,
+        num_cpus: u32,
+    ) -> Vec<Option<Vec<u8>>> {
+        let Some(pco_kva) = self.kernel.symbol_kva("__per_cpu_offset") else {
+            return Vec::new();
+        };
+        let pco_pa = super::symbols::text_kva_to_pa(pco_kva);
+        let end = pco_pa + num_cpus as u64 * 8;
+        if end > self.kernel.mem().size() {
+            return Vec::new();
+        }
+        // SAFETY: bounds checked above; GuestMem outlives this call.
+        let per_cpu_offsets = unsafe {
+            super::symbols::read_per_cpu_offsets(self.kernel.mem().base_ptr(), pco_pa, num_cpus)
+        };
+
+        read_percpu_array_value(
+            self.kernel.mem(),
+            self.kernel.cr3_pa(),
+            self.kernel.page_offset(),
+            map,
+            key,
+            &self.offsets,
+            &per_cpu_offsets,
+            self.kernel.l5(),
+        )
+    }
+
     /// Resolve the value layout from the map's BTF.
     ///
     /// Reads `struct btf` from guest memory (kmalloc'd, direct mapping),
@@ -895,6 +1004,16 @@ impl<'a> BpfMapAccessorOwned<'a> {
     /// Iterate all entries in a `BPF_MAP_TYPE_HASH` map.
     pub fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.as_accessor().iter_hash_map(map)
+    }
+
+    /// Read per-CPU values for a key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
+    pub fn read_percpu_array(
+        &self,
+        map: &BpfMapInfo,
+        key: u32,
+        num_cpus: u32,
+    ) -> Vec<Option<Vec<u8>>> {
+        self.as_accessor().read_percpu_array(map, key, num_cpus)
     }
 
     /// Resolve the value layout from the map's BTF.
@@ -1242,6 +1361,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -1440,6 +1560,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -1592,6 +1713,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -1731,6 +1853,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 16,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -1759,6 +1882,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 16,
+            max_entries: 0,
             value_kva: Some(0xFFFF_FFFF_8000_0000), // Unmapped KVA.
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -1899,6 +2023,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -2099,6 +2224,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2131,6 +2257,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2156,6 +2283,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2292,6 +2420,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -2349,6 +2478,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -2484,6 +2614,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 0x2000,
+            max_entries: 0,
             // value_kva at the start of page 1.
             value_kva: Some(kva),
             btf_kva: 0,
@@ -2521,6 +2652,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 0x2000,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2549,6 +2681,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -2674,6 +2807,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2698,6 +2832,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2721,6 +2856,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2744,6 +2880,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 16,
+            max_entries: 0,
             value_kva: Some(0xFFFF_FFFF_8000_0000), // Unmapped KVA.
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2767,6 +2904,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2817,6 +2955,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 0x2000,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2841,6 +2980,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2908,6 +3048,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -2951,6 +3092,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -2974,6 +3116,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -3050,6 +3193,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -3160,6 +3304,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 8,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -3189,6 +3334,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 8,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -3287,6 +3433,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -3325,6 +3472,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -3525,6 +3673,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 64,
+            max_entries: 0,
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -3608,6 +3757,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 32,
+            max_entries: 0,
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -3626,6 +3776,7 @@ mod tests {
             map_flags: 0,
             key_size: 0,
             value_size: 32,
+            max_entries: 0,
             value_kva: None,
             btf_kva: 0xFFFF_8880_0001_0000,
             btf_value_type_id: 42,
@@ -3693,6 +3844,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -3976,6 +4128,7 @@ mod tests {
             map_flags: 28,
             key_size: 44,
             value_size: 48,
+            max_entries: 52,
             array_value: 256,
             xa_node_slots: 16,
             xa_node_shift: 0,
@@ -4002,6 +4155,7 @@ mod tests {
             map_flags: 0,
             key_size: 4,
             value_size: 8,
+            max_entries: 0,
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -4024,6 +4178,7 @@ mod tests {
             map_flags: 0,
             key_size: 4,
             value_size: 8,
+            max_entries: 0,
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -4145,6 +4300,7 @@ mod tests {
             map_flags: 0,
             key_size,
             value_size,
+            max_entries: 0,
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -4298,6 +4454,7 @@ mod tests {
             map_flags: 0,
             key_size,
             value_size,
+            max_entries: 0,
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
@@ -4308,5 +4465,417 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, key_bytes);
         assert_eq!(entries[0].1, val_bytes);
+    }
+
+    // -- read_percpu_array_value tests --
+
+    /// Build a buffer simulating a percpu array map with `num_cpus` CPUs
+    /// and `max_entries` entries. Each per-CPU value region is `value_size`
+    /// bytes. Uses direct-mapping (page_offset) for per-CPU addresses.
+    ///
+    /// Layout:
+    ///   0x0000..0x1000: page table pages (PGD/PUD/PMD/PTE)
+    ///   0x10000: bpf_array (containing pptrs at array_value offset)
+    ///   0x11000+: per-CPU value regions
+    ///   per_cpu_offsets[cpu] adjusts the percpu base to per-CPU data
+    ///
+    /// Returns (buffer, cr3_pa, page_offset, map_info, offsets, per_cpu_offsets).
+    #[cfg(target_arch = "x86_64")]
+    fn setup_percpu_array(
+        num_cpus: u32,
+        max_entries: u32,
+        value_size: u32,
+    ) -> (Vec<u8>, u64, u64, BpfMapInfo, BpfMapOffsets, Vec<u64>) {
+        let offsets = BpfMapOffsets {
+            map_name: 32,
+            map_type: 24,
+            map_flags: 28,
+            key_size: 44,
+            value_size: 48,
+            max_entries: 52,
+            array_value: 256,
+            xa_node_slots: 16,
+            xa_node_shift: 0,
+            idr_xa_head: 8,
+            idr_next: 20,
+            map_btf: 0,
+            map_btf_value_type_id: 0,
+            btf_data: 0,
+            btf_data_size: 0,
+            htab_offsets: None,
+        };
+
+        let page_offset: u64 = 0xFFFF_8880_0000_0000;
+
+        // Page table for translating the bpf_array KVA (vmalloc'd).
+        let pgd_pa: u64 = 0x10000;
+        let pud_pa: u64 = 0x11000;
+        let pmd_pa: u64 = 0x12000;
+        let pte_pa: u64 = 0x13000;
+        let array_pa: u64 = 0x14000;
+
+        let map_kva: u64 = 0xFFFF_C900_0000_0000;
+        let pgd_idx = (map_kva >> 39) & 0x1FF;
+        let pud_idx = (map_kva >> 30) & 0x1FF;
+        let pmd_idx = (map_kva >> 21) & 0x1FF;
+        let pte_idx = (map_kva >> 12) & 0x1FF;
+
+        // Per-CPU data: each CPU gets value_size bytes per entry, at
+        // fixed PAs separated by 0x1000 per CPU. The percpu base is
+        // a direct-mapped KVA; per_cpu_offsets adjust it per CPU.
+        let percpu_base_pa: u64 = 0x20000;
+        let percpu_stride: u64 = 0x1000;
+        let elem_size = ((value_size as u64 + 7) & !7) * max_entries as u64;
+
+        let total_size = (percpu_base_pa + percpu_stride * num_cpus as u64 + elem_size) as usize;
+        let mut buf = vec![0u8; total_size.max(0x30000)];
+
+        let write_u64 = |buf: &mut Vec<u8>, pa: u64, val: u64| {
+            let off = pa as usize;
+            if off + 8 <= buf.len() {
+                buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+            }
+        };
+
+        // Page table: PGD -> PUD -> PMD -> PTE -> array_pa.
+        write_u64(&mut buf, pgd_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pte_pa + pte_idx * 8, (array_pa + PTE_BASE) | 0x63);
+
+        // percpu base KVA (direct-mapped).
+        let percpu_base_kva = percpu_base_pa + page_offset;
+
+        // per_cpu_offsets: CPU 0 at percpu_base, CPU 1 at +stride, etc.
+        let per_cpu_offsets: Vec<u64> = (0..num_cpus)
+            .map(|cpu| cpu as u64 * percpu_stride)
+            .collect();
+
+        // Write pptrs[0..max_entries] into the bpf_array at array_pa.
+        let pptrs_pa = array_pa + offsets.array_value as u64;
+        for entry in 0..max_entries {
+            let pptr_value = percpu_base_kva + entry as u64 * ((value_size as u64 + 7) & !7);
+            write_u64(&mut buf, pptrs_pa + entry as u64 * 8, pptr_value);
+        }
+
+        let info = BpfMapInfo {
+            map_pa: array_pa,
+            map_kva,
+            name: "test_percpu".into(),
+            map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+            map_flags: 0,
+            key_size: 4,
+            value_size,
+            max_entries,
+            value_kva: None,
+            btf_kva: 0,
+            btf_value_type_id: 0,
+        };
+
+        (buf, pgd_pa, page_offset, info, offsets, per_cpu_offsets)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_basic() {
+        let num_cpus = 4u32;
+        let value_size = 8u32;
+        let (mut buf, cr3_pa, page_offset, info, offsets, per_cpu_offsets) =
+            setup_percpu_array(num_cpus, 1, value_size);
+
+        // Write distinct u64 values for each CPU at key 0.
+        let percpu_base_pa: u64 = 0x20000;
+        let stride: u64 = 0x1000;
+        for cpu in 0..num_cpus {
+            let pa = percpu_base_pa + cpu as u64 * stride;
+            buf[pa as usize..pa as usize + 8]
+                .copy_from_slice(&((cpu as u64 + 1) * 0x1111).to_ne_bytes());
+        }
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let result = read_percpu_array_value(
+            &mem,
+            cr3_pa,
+            page_offset,
+            &info,
+            0,
+            &offsets,
+            &per_cpu_offsets,
+            false,
+        );
+
+        assert_eq!(result.len(), num_cpus as usize);
+        for (cpu, entry) in result.iter().enumerate() {
+            let bytes = entry.as_ref().expect("CPU value should be Some");
+            let val = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+            assert_eq!(val, (cpu as u64 + 1) * 0x1111);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_key_out_of_bounds() {
+        let (buf, cr3_pa, page_offset, info, offsets, per_cpu_offsets) =
+            setup_percpu_array(2, 1, 8);
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+
+        // key=1 is out of bounds for max_entries=1.
+        let result = read_percpu_array_value(
+            &mem,
+            cr3_pa,
+            page_offset,
+            &info,
+            1,
+            &offsets,
+            &per_cpu_offsets,
+            false,
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_wrong_map_type() {
+        let (buf, cr3_pa, page_offset, mut info, offsets, per_cpu_offsets) =
+            setup_percpu_array(2, 1, 8);
+        info.map_type = BPF_MAP_TYPE_ARRAY;
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+
+        let result = read_percpu_array_value(
+            &mem,
+            cr3_pa,
+            page_offset,
+            &info,
+            0,
+            &offsets,
+            &per_cpu_offsets,
+            false,
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_zero_pptr() {
+        let (mut buf, cr3_pa, page_offset, info, offsets, per_cpu_offsets) =
+            setup_percpu_array(2, 1, 8);
+
+        // Zero out pptrs[0] so the percpu base is 0.
+        let pptrs_pa = (0x14000 + offsets.array_value as u64) as usize;
+        buf[pptrs_pa..pptrs_pa + 8].copy_from_slice(&0u64.to_ne_bytes());
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let result = read_percpu_array_value(
+            &mem,
+            cr3_pa,
+            page_offset,
+            &info,
+            0,
+            &offsets,
+            &per_cpu_offsets,
+            false,
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_multiple_entries() {
+        let num_cpus = 2u32;
+        let value_size = 4u32;
+        let max_entries = 3u32;
+        let (mut buf, cr3_pa, page_offset, info, offsets, per_cpu_offsets) =
+            setup_percpu_array(num_cpus, max_entries, value_size);
+
+        // Write distinct u32 values for each CPU at each key.
+        let percpu_base_pa: u64 = 0x20000;
+        let stride: u64 = 0x1000;
+        let elem_size = 8u64; // round_up(4, 8)
+        for key in 0..max_entries {
+            for cpu in 0..num_cpus {
+                let pa = percpu_base_pa + cpu as u64 * stride + key as u64 * elem_size;
+                let val: u32 = key * 100 + cpu;
+                buf[pa as usize..pa as usize + 4].copy_from_slice(&val.to_ne_bytes());
+            }
+        }
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+
+        for key in 0..max_entries {
+            let result = read_percpu_array_value(
+                &mem,
+                cr3_pa,
+                page_offset,
+                &info,
+                key,
+                &offsets,
+                &per_cpu_offsets,
+                false,
+            );
+            assert_eq!(result.len(), num_cpus as usize);
+            for (cpu, entry) in result.iter().enumerate() {
+                let bytes = entry.as_ref().expect("CPU value should be Some");
+                let val = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(val, key * 100 + cpu as u32);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_cpu_out_of_guest_memory() {
+        let (buf, cr3_pa, page_offset, info, offsets, _) = setup_percpu_array(2, 1, 8);
+
+        // Craft per_cpu_offsets so CPU 1's PA exceeds guest memory size.
+        let bad_offset = buf.len() as u64 + 0x10000;
+        let per_cpu_offsets = vec![0u64, bad_offset];
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let result = read_percpu_array_value(
+            &mem,
+            cr3_pa,
+            page_offset,
+            &info,
+            0,
+            &offsets,
+            &per_cpu_offsets,
+            false,
+        );
+
+        assert_eq!(result.len(), 2);
+        assert!(result[0].is_some(), "CPU 0 should be readable");
+        assert!(
+            result[1].is_none(),
+            "CPU 1 should be None (out of guest memory)"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_zero_cpus() {
+        // Use setup_percpu_array with num_cpus=0 so the page table and
+        // pptrs[0] are valid but per_cpu_offsets is empty. This exercises
+        // the per-CPU loop with an empty slice (not the pptr translation
+        // failure path).
+        let (buf, cr3_pa, page_offset, info, offsets, per_cpu_offsets) =
+            setup_percpu_array(0, 1, 8);
+        assert!(per_cpu_offsets.is_empty());
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let result = read_percpu_array_value(
+            &mem,
+            cr3_pa,
+            page_offset,
+            &info,
+            0,
+            &offsets,
+            &per_cpu_offsets,
+            false,
+        );
+        assert!(result.is_empty(), "zero CPUs should produce empty result");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_mixed_translatable() {
+        let num_cpus = 4u32;
+        let value_size = 8u32;
+        let (mut buf, cr3_pa, page_offset, info, offsets, _) =
+            setup_percpu_array(num_cpus, 1, value_size);
+
+        // Write known data at CPU 0 and CPU 2 (valid offsets).
+        let percpu_base_pa: u64 = 0x20000;
+        let stride: u64 = 0x1000;
+        buf[percpu_base_pa as usize..percpu_base_pa as usize + 8]
+            .copy_from_slice(&0xAAAAu64.to_ne_bytes());
+        let cpu2_pa = percpu_base_pa + 2 * stride;
+        buf[cpu2_pa as usize..cpu2_pa as usize + 8].copy_from_slice(&0xCCCCu64.to_ne_bytes());
+
+        // CPU 0 and 2 have valid offsets; CPU 1 and 3 have offsets
+        // that produce PAs beyond the buffer.
+        let bad = buf.len() as u64 + 0x10000;
+        let per_cpu_offsets = vec![0, bad, 2 * stride, bad + stride];
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let result = read_percpu_array_value(
+            &mem,
+            cr3_pa,
+            page_offset,
+            &info,
+            0,
+            &offsets,
+            &per_cpu_offsets,
+            false,
+        );
+
+        assert_eq!(result.len(), 4);
+        // CPU 0: valid.
+        let v0 = result[0].as_ref().expect("CPU 0 should be Some");
+        assert_eq!(u64::from_ne_bytes(v0[..8].try_into().unwrap()), 0xAAAA);
+        // CPU 1: out of bounds.
+        assert!(result[1].is_none(), "CPU 1 should be None");
+        // CPU 2: valid.
+        let v2 = result[2].as_ref().expect("CPU 2 should be Some");
+        assert_eq!(u64::from_ne_bytes(v2[..8].try_into().unwrap()), 0xCCCC);
+        // CPU 3: out of bounds.
+        assert!(result[3].is_none(), "CPU 3 should be None");
+    }
+
+    #[test]
+    fn read_percpu_array_unmapped_bpf_array() {
+        // bpf_array KVA that cannot be translated (no page table,
+        // not in direct mapping) — translate_any_kva returns None.
+        let buf = vec![0u8; 0x20000];
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let offsets = BpfMapOffsets {
+            map_name: 32,
+            map_type: 24,
+            map_flags: 28,
+            key_size: 44,
+            value_size: 48,
+            max_entries: 52,
+            array_value: 256,
+            xa_node_slots: 16,
+            xa_node_shift: 0,
+            idr_xa_head: 8,
+            idr_next: 20,
+            map_btf: 0,
+            map_btf_value_type_id: 0,
+            btf_data: 0,
+            btf_data_size: 0,
+            htab_offsets: None,
+        };
+
+        // map_kva points to an untranslatable address: outside direct
+        // mapping range and page table (cr3=0) is all zeros.
+        let info = BpfMapInfo {
+            map_pa: 0,
+            map_kva: 0xFFFF_C900_DEAD_0000,
+            name: "test_percpu".into(),
+            map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+            map_flags: 0,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+            value_kva: None,
+            btf_kva: 0,
+            btf_value_type_id: 0,
+        };
+
+        let per_cpu_offsets = vec![0u64, 0x1000];
+        let result = read_percpu_array_value(
+            &mem,
+            0,
+            0xFFFF_8880_0000_0000,
+            &info,
+            0,
+            &offsets,
+            &per_cpu_offsets,
+            false,
+        );
+        assert!(
+            result.is_empty(),
+            "unmapped bpf_array should return empty vec"
+        );
     }
 }
