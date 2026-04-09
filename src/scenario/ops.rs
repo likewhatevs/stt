@@ -111,13 +111,14 @@ pub enum CpusetSpec {
 ///     .work_type(WorkType::CpuSpin);
 ///
 /// assert_eq!(def.name, "workers");
-/// assert_eq!(def.num_workers, 4);
+/// assert_eq!(def.num_workers, Some(4));
 /// ```
 #[derive(Clone, Debug)]
 pub struct CgroupDef {
     pub name: Cow<'static, str>,
     pub cpuset: Option<CpusetSpec>,
-    pub num_workers: usize,
+    /// Number of workers. `None` means use `Ctx::workers_per_cgroup`.
+    pub num_workers: Option<usize>,
     pub work_type: WorkType,
     pub sched_policy: crate::workload::SchedPolicy,
     /// When true, the gauntlet work_type override replaces this def's work_type.
@@ -125,8 +126,8 @@ pub struct CgroupDef {
 }
 
 impl CgroupDef {
-    /// Create a CgroupDef with defaults (CpuSpin, Normal, 0 workers).
-    /// 0 workers means use ctx.workers_per_cgroup at execution time.
+    /// Create a CgroupDef with defaults (CpuSpin, Normal, None workers).
+    /// `None` workers means use `ctx.workers_per_cgroup` at execution time.
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),
@@ -141,9 +142,9 @@ impl CgroupDef {
         self
     }
 
-    /// Set the number of workers. 0 means use `ctx.workers_per_cgroup`.
+    /// Set the number of workers.
     pub fn workers(mut self, n: usize) -> Self {
-        self.num_workers = n;
+        self.num_workers = Some(n);
         self
     }
 
@@ -171,7 +172,7 @@ impl Default for CgroupDef {
         Self {
             name: Cow::Borrowed("cg_0"),
             cpuset: None,
-            num_workers: 0,
+            num_workers: None,
             work_type: WorkType::CpuSpin,
             sched_policy: crate::workload::SchedPolicy::Normal,
             swappable: false,
@@ -652,11 +653,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             let resolved = cpuset_spec.resolve(ctx);
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
         }
-        let n = if def.num_workers == 0 {
-            ctx.workers_per_cgroup
-        } else {
-            def.num_workers
-        };
+        let n = def.num_workers.unwrap_or(ctx.workers_per_cgroup);
         let effective_work_type = if def.swappable
             && let Some(override_wt) = ctx.work_type_override
         {
@@ -831,7 +828,8 @@ fn collect_result(state: &mut StepState<'_>, checks: &crate::assert::Assert) -> 
 
 /// Layout strategy for Traverse phases.
 #[derive(Debug)]
-pub enum Layout {
+#[allow(dead_code)]
+pub(crate) enum Layout {
     Disjoint,
     /// Overlapping cpusets. (min_frac, max_frac) — PRNG picks a value in range.
     Overlap(f64, f64),
@@ -850,7 +848,8 @@ pub enum Layout {
 /// `cgroup_workloads` controls the workload for each cgroup index. If the
 /// vec has fewer entries than the cgroup index, the last entry repeats.
 #[derive(Debug)]
-pub struct Traverse {
+#[allow(dead_code)]
+pub(crate) struct Traverse {
     pub seed: Option<u64>,
     pub cgroup_count: RangeInclusive<usize>,
     pub layouts: Vec<Layout>,
@@ -865,6 +864,7 @@ pub struct Traverse {
 
 impl Traverse {
     /// Generate a `Vec<Step>` from the Traverse configuration.
+    #[allow(dead_code)]
     pub fn generate(&self, ctx: &Ctx) -> Vec<Step> {
         use rand::RngExt;
 
@@ -964,6 +964,7 @@ impl Traverse {
 ///
 /// Callers seed with a scenario-specific value so gauntlet runs are
 /// deterministic across reruns.
+#[allow(dead_code)]
 fn seeded_rng(seed: u64) -> rand::rngs::StdRng {
     use rand::SeedableRng;
     rand::rngs::StdRng::seed_from_u64(seed)
@@ -1474,7 +1475,7 @@ mod tests {
             .swappable(true);
         assert_eq!(d.name, "test");
         assert!(d.cpuset.is_some());
-        assert_eq!(d.num_workers, 8);
+        assert_eq!(d.num_workers, Some(8));
         assert!(d.swappable);
     }
 
@@ -1483,7 +1484,7 @@ mod tests {
         let d = CgroupDef::default();
         assert_eq!(d.name, "cg_0");
         assert!(d.cpuset.is_none());
-        assert_eq!(d.num_workers, 0);
+        assert_eq!(d.num_workers, None);
         assert!(!d.swappable);
     }
 
