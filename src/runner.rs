@@ -36,8 +36,6 @@ pub struct RunConfig {
     /// Auto-repro: crash -> extract stack -> rerun with probe-stack.
     pub auto_repro: bool,
     pub kernel_dir: Option<String>,
-    /// Include bootlin URLs in source line output.
-    pub bootlin: bool,
     /// Sleep after cgroup creation to let scheduler apply config (ms).
     pub settle_ms: u64,
     /// Sleep after scheduler process start to let it initialize (ms).
@@ -274,7 +272,6 @@ impl Runner {
                         &events,
                         &func_names,
                         self.config.kernel_dir.as_deref(),
-                        self.config.bootlin,
                         &bpf_locs,
                     )
                 })
@@ -871,7 +868,6 @@ mod tests {
             probe_stack: None,
             auto_repro: false,
             kernel_dir: None,
-            bootlin: false,
             settle_ms: 500,
             scheduler_startup_ms: 2000,
             cleanup_ms: 300,
@@ -908,7 +904,6 @@ mod tests {
             probe_stack: Some("do_enqueue_task,balance_one".into()),
             auto_repro: true,
             kernel_dir: Some("/usr/src/linux".into()),
-            bootlin: true,
             settle_ms: 200,
             scheduler_startup_ms: 1000,
             cleanup_ms: 200,
@@ -916,7 +911,6 @@ mod tests {
         };
         assert!(config.repro);
         assert!(config.auto_repro);
-        assert!(config.bootlin);
         assert_eq!(
             config.probe_stack.as_deref(),
             Some("do_enqueue_task,balance_one")
@@ -959,7 +953,6 @@ mod tests {
             probe_stack: None,
             auto_repro: false,
             kernel_dir: None,
-            bootlin: false,
             settle_ms: 200,
             scheduler_startup_ms: 1000,
             cleanup_ms: 200,
@@ -986,7 +979,6 @@ mod tests {
             probe_stack: Some("func1".into()),
             auto_repro: true,
             kernel_dir: Some("/path".into()),
-            bootlin: true,
             settle_ms: 500,
             scheduler_startup_ms: 2000,
             cleanup_ms: 100,
@@ -1001,7 +993,6 @@ mod tests {
         assert_eq!(c2.verbose, config.verbose);
         assert_eq!(c2.repro, config.repro);
         assert_eq!(c2.auto_repro, config.auto_repro);
-        assert_eq!(c2.bootlin, config.bootlin);
         assert_eq!(c2.probe_stack, config.probe_stack);
         assert_eq!(c2.kernel_dir, config.kernel_dir);
         assert_eq!(c2.settle_ms, config.settle_ms);

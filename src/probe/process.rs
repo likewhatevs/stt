@@ -25,8 +25,7 @@ pub struct ProbeEvent {
 }
 
 /// Resolve a kernel function name to its address via /proc/kallsyms.
-#[cfg_attr(feature = "integration", visibility::make(pub))]
-pub(super) fn resolve_func_ip(name: &str) -> Option<u64> {
+pub fn resolve_func_ip(name: &str) -> Option<u64> {
     let kallsyms = std::fs::read_to_string("/proc/kallsyms").ok()?;
     for line in kallsyms.lines() {
         let mut parts = line.split_whitespace();

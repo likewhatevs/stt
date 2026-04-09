@@ -3884,12 +3884,16 @@ mod tests {
         if host_topo.total_cpus() < 3 {
             return;
         }
-        let vm = SttVmBuilder::default()
+        let vm = match SttVmBuilder::default()
             .kernel(&exe)
             .topology(1, 2, 1)
             .performance_mode(true)
             .build()
-            .unwrap();
+        {
+            Ok(vm) => vm,
+            Err(e) if e.to_string().contains("LLC slots busy") => return,
+            Err(e) => panic!("{e:#}"),
+        };
         assert!(vm.performance_mode);
     }
 

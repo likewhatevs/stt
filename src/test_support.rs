@@ -1564,7 +1564,6 @@ fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Option<String
         &payload.events,
         &payload.func_names,
         kernel_dir,
-        false,
         &payload.bpf_source_locs,
     ))
 }

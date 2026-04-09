@@ -12,35 +12,6 @@ pub(crate) fn extract_section(text: &str, start: &str, end: &str) -> String {
     }
 }
 
-pub(crate) fn kernel_version(kernel_dir: Option<&str>) -> String {
-    if let Some(kd) = kernel_dir
-        && let Ok(repo) = gix::open(kd)
-        && let Ok(head) = repo.head_commit()
-    {
-        let describe = head
-            .describe()
-            .names(gix::commit::describe::SelectRef::AllTags)
-            .try_resolve();
-        if let Ok(Some(resolution)) = describe
-            && let Ok(fmt) = resolution.format()
-        {
-            let v = fmt.to_string();
-            if !v.is_empty() {
-                return v.split("-virtme").next().unwrap_or(&v).to_string();
-            }
-        }
-    }
-    let r = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if !r.is_empty() {
-        let clean = r.split('-').next().unwrap_or(&r);
-        return format!("v{clean}");
-    }
-    "latest".into()
-}
-
 /// Resolve function addresses from a vmlinux ELF's symbol table.
 /// Returns (func_name, virtual_address) for each function found.
 fn resolve_addrs_from_elf(
@@ -126,19 +97,16 @@ pub(crate) fn make_relative(path: &str) -> String {
 ///
 /// When `kernel_dir` is set and contains a vmlinux, resolves source
 /// locations from DWARF via ELF symbol table addresses (not host
-/// kallsyms). When `bootlin` is true, appends Elixir cross-reference
-/// URLs.
+/// kallsyms).
 pub fn format_probe_events(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)], // (func_idx, display_name)
     kernel_dir: Option<&str>,
-    bootlin: bool,
 ) -> String {
     format_probe_events_inner(
         events,
         func_names,
         kernel_dir,
-        bootlin,
         &std::collections::HashMap::new(),
     )
 }
@@ -154,17 +122,15 @@ pub fn format_probe_events_with_bpf_locs(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)],
     kernel_dir: Option<&str>,
-    bootlin: bool,
     bpf_locs: &std::collections::HashMap<String, String>,
 ) -> String {
-    format_probe_events_inner(events, func_names, kernel_dir, bootlin, bpf_locs)
+    format_probe_events_inner(events, func_names, kernel_dir, bpf_locs)
 }
 
 fn format_probe_events_inner(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)],
     kernel_dir: Option<&str>,
-    bootlin: bool,
     bpf_locs: &std::collections::HashMap<String, String>,
 ) -> String {
     use blazesym::symbolize::{self, Symbolizer};
@@ -415,14 +381,9 @@ fn format_probe_events_inner(
 
     if !kstack_addrs.is_empty() {
         out.push('\n');
-        let version = kernel_version(kernel_dir);
         for addr in &kstack_addrs {
             if let Some((_, name, file, line)) = sym_map.iter().find(|(a, _, _, _)| a == addr) {
-                if bootlin && !file.is_empty() {
-                    let url =
-                        format!("https://elixir.bootlin.com/linux/{version}/source/{file}#L{line}");
-                    out.push_str(&format!("    {name:<40} {file}:{line}  {url}\n"));
-                } else if !file.is_empty() {
+                if !file.is_empty() {
                     out.push_str(&format!("    {name:<40} {file}:{line}\n"));
                 } else {
                     out.push_str(&format!("    {name}\n"));
@@ -500,27 +461,11 @@ mod tests {
         assert_eq!(make_relative("ext.c"), "ext.c");
     }
 
-    // -- kernel_version --
-
-    #[test]
-    fn kernel_version_from_proc() {
-        let v = kernel_version(None);
-        // Should return something like "v6.12" or "latest"
-        assert!(!v.is_empty());
-    }
-
-    #[test]
-    fn kernel_version_nonexistent_dir() {
-        let v = kernel_version(Some("/nonexistent/path"));
-        // Should fall back to /proc/sys/kernel/osrelease
-        assert!(!v.is_empty());
-    }
-
     // -- format_probe_events --
 
     #[test]
     fn format_probe_events_empty() {
-        let out = format_probe_events(&[], &[], None, false);
+        let out = format_probe_events(&[], &[], None);
         assert!(out.contains("=== AUTO-PROBE: scx_exit fired ==="));
         assert!(out.contains("no probe data captured"));
     }
@@ -557,7 +502,7 @@ mod tests {
             (1u32, "balance_one".to_string()),
         ];
 
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         assert!(out.contains("=== AUTO-PROBE: scx_exit fired ==="));
         assert!(out.contains("do_enqueue_task"), "missing func name: {out}");
         assert!(out.contains("balance_one"), "missing func name: {out}");
@@ -583,7 +528,7 @@ mod tests {
         }];
         let func_names = vec![(0u32, "known_func".to_string())];
 
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         assert!(
             out.contains("unknown"),
             "unresolved func_idx should show 'unknown': {out}"
@@ -695,7 +640,7 @@ mod tests {
             (1u32, "second_func".to_string()),
         ];
 
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         let pos_second = out.find("second_func").unwrap();
         let pos_first = out.find("first_func").unwrap();
         // Both appear but order depends on input (not sorted by this function)
@@ -716,7 +661,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_func".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         assert!(out.contains("arg0"), "arg0 always shown: {out}");
         assert!(out.contains("arg1"), "nonzero arg1 should be shown: {out}");
     }
@@ -754,7 +699,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "trigger_func".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         assert!(out.contains("trigger_func"), "func name: {out}");
         // kstack is from the last event. Without symbolization each
         // address appears as "    0x{hex}\n".
@@ -786,7 +731,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         // Line format: "      {field:<14}{decoded}\n"
         assert!(out.contains("pid"), "field 'pid' should appear: {out}");
         assert!(
@@ -812,7 +757,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "do_enqueue".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         assert!(out.contains("do_enqueue"), "func name: {out}");
         assert!(out.contains("task_struct *p0"), "type header: {out}");
         assert!(out.contains("pid"), "pid field: {out}");
@@ -863,7 +808,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         // cpumask_0..3 should be merged into one "cpus_ptr" line
         assert!(out.contains("cpus_ptr"), "should show cpus_ptr: {out}");
         // Should decode multi-word: CPUs 0-3 from word 0, CPU 64 from word 1
@@ -906,7 +851,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         // "cpu" as scalar should be suppressed because rq.cpu = 3
         let cpu_lines: Vec<&str> = out
             .lines()
@@ -935,7 +880,7 @@ mod tests {
             str_val: Some("error: task stuck".to_string()),
         }];
         let func_names = vec![(0u32, "scx_exit".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         assert!(out.contains("msg"), "should show msg label: {out}");
         assert!(
             out.contains("\"error: task stuck\""),
@@ -961,7 +906,7 @@ mod tests {
         let func_names = vec![(0u32, "mitosis_enqueue".to_string())];
         let mut locs = std::collections::HashMap::new();
         locs.insert("mitosis_enqueue".to_string(), "main.bpf.c:42".to_string());
-        let out = format_probe_events_with_bpf_locs(&events, &func_names, None, false, &locs);
+        let out = format_probe_events_with_bpf_locs(&events, &func_names, None, &locs);
         assert!(
             out.contains("main.bpf.c:42"),
             "should show BPF source loc: {out}",
@@ -989,7 +934,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         // Multi-word: should have underscore-separated 16-digit hex words.
         assert!(
             out.contains("_"),
@@ -1019,7 +964,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         // Single word: compact hex without leading zeros.
         assert!(out.contains("0xf("), "single-word should be compact: {out}");
         assert!(out.contains("0-3"), "should list CPUs 0-3: {out}");
@@ -1041,7 +986,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "scx_tick".to_string())];
-        let out = format_probe_events(&events, &func_names, None, false);
+        let out = format_probe_events(&events, &func_names, None);
         assert!(
             out.contains("rq *rq"),
             "should show struct type header: {out}"

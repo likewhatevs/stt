@@ -19,7 +19,6 @@ anyhow = "1"
 crc32fast = "1.5"
 flate2 = "1"
 ctor = "0.8"
-gix = "0.81"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "mount", "process", "reboot", "sched", "signal"] }
 blazesym = { version = "0.2", features = ["dwarf"] }
@@ -45,7 +44,6 @@ object = { version = "0.39.0", features = ["read"] }
 libtest-mimic = "0.8"
 linkme = "0.3"
 stt-macros = { path = "stt-macros" }
-visibility = "0.1"
 
 [features]
 integration = []
