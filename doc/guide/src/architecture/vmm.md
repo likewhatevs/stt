@@ -60,7 +60,7 @@ checking.
 ## Performance mode
 
 When `performance_mode` is enabled on the builder, the VMM applies
-optimizations after vCPU threads are spawned:
+optimizations across VM build, creation, and thread spawn:
 
 1. Reads host LLC topology from sysfs.
 2. Maps each virtual socket to a physical LLC group.
@@ -73,6 +73,12 @@ optimizations after vCPU threads are spawned:
    in the guest, and enabling haltpoll cpuidle.
 6. Disables PAUSE VM exits via `KVM_CAP_X86_DISABLE_EXITS`
    (PAUSE bit only; HLT exits remain for BSP shutdown detection).
+7. Skips `KVM_CAP_HALT_POLL` (guest haltpoll cpuidle disables
+   host halt polling via `MSR_KVM_POLL_CONTROL`).
+
+Non-performance-mode VMs set `KVM_CAP_HALT_POLL` to 200µs (matching
+the x86 kernel default) to reduce vCPU wakeup latency. Overcommitted
+topologies (vCPUs > host CPUs) set it to 0.
 
 Validation runs at build time. Oversubscription and unsatisfiable
 topology mappings are fatal errors. Insufficient hugepages is a

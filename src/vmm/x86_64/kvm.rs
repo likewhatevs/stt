@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
-    KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS, KVM_PIT_SPEAKER_DUMMY,
-    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
+    KVM_CAP_HALT_POLL, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS,
+    KVM_PIT_SPEAKER_DUMMY, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
     KVM_X86_DISABLE_EXITS_PAUSE, kvm_enable_cap, kvm_pit_config, kvm_userspace_memory_region,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
@@ -54,6 +54,12 @@ const NUM_IOAPIC_PINS: u64 = 24;
 
 /// APIC IDs above this require x2APIC mode (8-bit xAPIC limit).
 const MAX_XAPIC_ID: u32 = 254;
+
+/// Per-VM halt poll interval (nanoseconds) for non-performance_mode VMs.
+/// Matches the x86 kernel default (KVM_HALT_POLL_NS_DEFAULT in
+/// arch/x86/include/asm/kvm_host.h). Set to 0 for overcommitted
+/// topologies where halt polling wastes host CPU time.
+const HALT_POLL_NS: u64 = 200_000;
 
 /// Required KVM capabilities — Firecracker checks these 14.
 const REQUIRED_CAPS: &[Cap] = &[
@@ -198,6 +204,33 @@ impl SttKvm {
             if let Err(e) = vm_fd.enable_cap(&cap) {
                 eprintln!(
                     "performance_mode: WARNING: KVM_CAP_X86_DISABLE_EXITS not supported: {e}"
+                );
+            }
+        }
+
+        // Set per-VM halt poll interval. Skipped in performance_mode:
+        // KVM_HINTS_REALTIME enables guest haltpoll cpuidle, which writes
+        // MSR_KVM_POLL_CONTROL=0 per-vCPU (arch_haltpoll_enable →
+        // kvm_disable_host_haltpoll), disabling host halt polling via
+        // kvm_arch_no_poll(). KVM_CAP_HALT_POLL is redundant there.
+        //
+        // When vCPUs exceed online host CPUs (overcommit), halt polling
+        // wastes host CPU time — disable it.
+        if !performance_mode {
+            let host_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+            let poll_ns: u64 = if host_cpus > 0 && topo.total_cpus() <= host_cpus as u32 {
+                HALT_POLL_NS
+            } else {
+                0
+            };
+            let mut cap = kvm_enable_cap {
+                cap: KVM_CAP_HALT_POLL,
+                ..Default::default()
+            };
+            cap.args[0] = poll_ns;
+            if let Err(e) = vm_fd.enable_cap(&cap) {
+                eprintln!(
+                    "kvm: WARNING: KVM_CAP_HALT_POLL not supported ({e}), using kernel default"
                 );
             }
         }
@@ -469,5 +502,25 @@ mod tests {
         let vm_normal = SttKvm::new(topo, 256, false).unwrap();
         let vm_perf = SttKvm::new(topo, 256, true).unwrap();
         assert_eq!(vm_normal.vcpus.len(), vm_perf.vcpus.len());
+    }
+
+    #[test]
+    fn halt_poll_ns_constant() {
+        assert_eq!(HALT_POLL_NS, 200_000);
+    }
+
+    #[test]
+    fn non_perf_mode_succeeds_with_halt_poll() {
+        let topo = Topology {
+            sockets: 1,
+            cores_per_socket: 2,
+            threads_per_core: 1,
+        };
+        let vm = SttKvm::new(topo, 128, false);
+        assert!(
+            vm.is_ok(),
+            "non-perf VM with halt poll failed: {:?}",
+            vm.err()
+        );
     }
 }

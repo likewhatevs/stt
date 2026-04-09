@@ -799,6 +799,8 @@ pub struct SttVm {
     /// Performance mode: vCPU pinning to host LLCs, hugepage-backed guest
     /// memory, KVM_HINTS_REALTIME CPUID hint, PAUSE VM exit disabling via
     /// KVM_CAP_X86_DISABLE_EXITS, and oversubscription validation.
+    /// KVM_CAP_HALT_POLL is skipped (guest haltpoll cpuidle disables
+    /// host halt polling via MSR_KVM_POLL_CONTROL).
     performance_mode: bool,
     /// Pinning plan computed during build() when performance_mode is enabled.
     /// Stored so topology is read once and the plan is reused at VM start.
@@ -2669,7 +2671,9 @@ impl SttVmBuilder {
     /// hugepage-backed guest memory, KVM_HINTS_REALTIME CPUID
     /// hint (disables PV spinlocks, PV TLB flush, PV sched_yield;
     /// enables haltpoll cpuidle), and PAUSE VM exit disabling via
-    /// KVM_CAP_X86_DISABLE_EXITS. Validated at build time --
+    /// KVM_CAP_X86_DISABLE_EXITS. KVM_CAP_HALT_POLL is skipped
+    /// (guest haltpoll cpuidle disables host halt polling via
+    /// MSR_KVM_POLL_CONTROL). Validated at build time --
     /// oversubscription is a fatal error, insufficient hugepages
     /// is a warning.
     #[allow(dead_code)]

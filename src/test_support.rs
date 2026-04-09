@@ -384,8 +384,10 @@ pub struct SttTestEntry {
     /// structure, use 2MB hugepages for guest memory, set KVM_HINTS_REALTIME
     /// CPUID hint (disables PV spinlocks, PV TLB flush, PV sched_yield;
     /// enables haltpoll cpuidle), disable PAUSE VM exits via
-    /// KVM_CAP_X86_DISABLE_EXITS, and validate that the host has enough
-    /// CPUs and LLCs to satisfy the request without oversubscription.
+    /// KVM_CAP_X86_DISABLE_EXITS, skip KVM_CAP_HALT_POLL (guest haltpoll
+    /// cpuidle disables host halt polling via MSR_KVM_POLL_CONTROL), and
+    /// validate that the host has enough CPUs and LLCs to satisfy the
+    /// request without oversubscription.
     pub performance_mode: bool,
     /// LLC exclusivity mode. Implies performance_mode. Each virtual socket
     /// reserves an entire physical LLC group.
