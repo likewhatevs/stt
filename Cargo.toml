@@ -45,6 +45,9 @@ libtest-mimic = "0.8"
 linkme = "0.3"
 stt-macros = { path = "stt-macros" }
 
+[profile.release]
+lto = "thin"
+
 [features]
 integration = []
 

@@ -537,12 +537,14 @@ pub fn estimate_min_memory_mb(
     shm_bytes: u64,
 ) -> u32 {
     // Debug binaries are stripped before packing into the initramfs.
-    // Estimate stripped size as 1/3 of debug size (conservative; actual
-    // ratio varies from 4% to 30% depending on crate).
-    let payload_size = std::fs::metadata(payload).map(|m| m.len()).unwrap_or(0) / 3;
+    // Estimate stripped size as 1/2 of debug size. Actual ratios range
+    // from 4% to 30%, but polars-heavy binaries retain more data
+    // sections, so /2 avoids under-allocation at the cost of ~500MB
+    // over-estimate in the common case.
+    let payload_size = std::fs::metadata(payload).map(|m| m.len()).unwrap_or(0) / 2;
     let sched_size = scheduler
         .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len() / 3)
+        .map(|m| m.len() / 2)
         .unwrap_or(0);
     let lib_size: u64 = [Some(payload), scheduler]
         .into_iter()
@@ -1170,7 +1172,7 @@ impl SttVm {
         };
 
         let mut cmdline = concat!(
-            "console=ttyS0 earlyprintk=serial nomodules mitigations=off ",
+            "console=ttyS0 nomodules mitigations=off ",
             "no_timer_check clocksource=kvm-clock ",
             "random.trust_cpu=on swiotlb=noforce ",
             "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
@@ -1183,11 +1185,11 @@ impl SttVm {
             .map(|v| v == "1")
             .unwrap_or(false)
             || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
-        cmdline.push_str(if verbose {
-            " loglevel=7"
+        if verbose {
+            cmdline.push_str(" earlyprintk=serial loglevel=7");
         } else {
-            " loglevel=4"
-        });
+            cmdline.push_str(" loglevel=0");
+        }
         if self.init_binary.is_some() {
             cmdline.push_str(" rdinit=/init");
         }
@@ -2056,7 +2058,7 @@ impl SttVm {
         };
 
         let mut cmdline = concat!(
-            "console=ttyS0 earlycon=uart,mmio,0x09000000 ",
+            "console=ttyS0 ",
             "nomodules mitigations=off ",
             "random.trust_cpu=on swiotlb=noforce ",
             "pci=off reboot=k panic=-1 nokaslr lockdown=none ",
@@ -2069,11 +2071,11 @@ impl SttVm {
             .map(|v| v == "1")
             .unwrap_or(false)
             || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
-        cmdline.push_str(if verbose {
-            " loglevel=7"
+        if verbose {
+            cmdline.push_str(" earlycon=uart,mmio,0x09000000 loglevel=7");
         } else {
-            " loglevel=4"
-        });
+            cmdline.push_str(" loglevel=0");
+        }
         if self.init_binary.is_some() {
             cmdline.push_str(" rdinit=/init");
         }
