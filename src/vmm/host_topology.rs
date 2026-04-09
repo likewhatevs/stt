@@ -56,7 +56,7 @@ pub struct PinningPlan {
 }
 
 impl HostTopology {
-    /// Read host topology from sysfs via [`TestTopology::from_system()`].
+    /// Read host topology from sysfs via [`TestTopology::from_system()`](crate::topology::TestTopology::from_system).
     pub fn from_sysfs() -> Result<Self> {
         let topo = crate::topology::TestTopology::from_system()
             .context("read host topology from sysfs")?;

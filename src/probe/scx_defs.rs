@@ -10,7 +10,7 @@
 //   10 = builtin DSQ    (lower 32 bits = specific builtin)
 //   0x = user DSQ       (full 64-bit user-defined ID)
 
-/// Bits [63:62] for builtin DSQ identification.
+/// Bits \[63:62\] for builtin DSQ identification.
 pub const DSQ_TYPE_SHIFT: u32 = 62;
 /// LOCAL_ON: dispatch to a specific CPU's local DSQ.
 pub const DSQ_TYPE_LOCAL_ON: u64 = 3;

@@ -141,7 +141,7 @@ impl GuestMem {
     /// 4-level page table walk (x86-64).
     ///
     /// CR3 -> PGD -> PUD -> PMD -> PTE. Uses PS bit (bit 7) for
-    /// huge pages, OA in bits [51:12].
+    /// huge pages, OA in bits \[51:12\].
     #[cfg(target_arch = "x86_64")]
     fn walk_4level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
         const PRESENT: u64 = 1;

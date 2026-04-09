@@ -129,8 +129,9 @@ The work type override (configured via gauntlet or
 for all scenarios that use it. Scenarios with non-`CpuSpin` work types
 are not overridden.
 
-Overrides to paired work types (`PipeIo`, `FutexPingPong`,
-`CachePipe`) are skipped when a cgroup has an odd number of workers.
+Overrides to grouped work types (`PipeIo`, `FutexPingPong`,
+`CachePipe`, `FutexFanOut`) are skipped when `num_workers` is not
+divisible by the work type's group size.
 
 Ops-based scenarios have a separate override mechanism via
 `CgroupDef.swappable`. See [Ops and Steps](ops.md#work-type-overrides-and-swappable).

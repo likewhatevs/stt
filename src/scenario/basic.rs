@@ -1,3 +1,5 @@
+//! Basic and mixed-workload scenario implementations.
+
 use super::Ctx;
 use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
 use crate::assert::AssertResult;

@@ -1,3 +1,5 @@
+//! Scenario catalog: registers all scenarios via `all_scenarios()`.
+
 use super::*;
 
 // Static flag slices for Scenario definitions.

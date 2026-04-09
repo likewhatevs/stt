@@ -422,9 +422,9 @@ pub fn format_brief_line(name: &str, insn_cnt: usize, vs: &VerifierStats) -> Str
 /// Parse structured verifier output from a VM run.
 ///
 /// The scheduler binary emits lines when invoked with `--dump-verifier`:
-///   STT_VERIFIER_PROG <name> insn_cnt=<N>
-///   STT_VERIFIER_LOG <name> <log line>
-///   STT_VERIFIER_DONE
+///   `STT_VERIFIER_PROG <name> insn_cnt=<N>`
+///   `STT_VERIFIER_LOG <name> <log line>`
+///   `STT_VERIFIER_DONE`
 pub fn parse_vm_verifier_output(output: &str) -> Vec<ProgStats> {
     let mut stats: Vec<ProgStats> = Vec::new();
     let mut current_name: Option<String> = None;

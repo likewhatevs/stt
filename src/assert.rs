@@ -3,7 +3,6 @@
 //! Key types:
 //! - [`AssertResult`] -- pass/fail status with diagnostics and statistics
 //! - [`Assert`] -- composable assertion config (worker + monitor checks)
-//! - `AssertPlan` -- worker-side check configuration (crate-internal)
 //! - [`ScenarioStats`] / [`CgroupStats`] -- aggregated telemetry
 //!
 //! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->

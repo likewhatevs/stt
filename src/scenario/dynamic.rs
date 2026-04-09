@@ -1,3 +1,5 @@
+//! Dynamic cgroup add/remove scenario implementations.
+
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
 use super::{Ctx, collect_all, dfl_wl, setup_cgroups};
 use crate::assert::AssertResult;

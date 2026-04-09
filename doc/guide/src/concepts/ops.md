@@ -66,7 +66,8 @@ scopes:
 - **Scenario-level**: replaces `CpuSpin` in `CgroupWork.work_type`
 - **CgroupDef-level**: replaces the work type when `swappable = true`
 
-Both skip `PipeIo` overrides when the worker count is odd.
+Both skip overrides to grouped work types when `num_workers` is not
+divisible by the work type's group size.
 
 ## Step
 

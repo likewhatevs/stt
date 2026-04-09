@@ -1,3 +1,5 @@
+//! Stress and edge-case scenario implementations.
+
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Setup, Step, execute_steps};
 use super::{CgroupGroup, Ctx, collect_all, spawn_diverse};
 use crate::assert::{self, AssertResult};

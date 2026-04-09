@@ -1,3 +1,5 @@
+//! Performance and benchmarking scenario implementations.
+
 use super::Ctx;
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps_with};
 use crate::assert::{Assert, AssertResult};

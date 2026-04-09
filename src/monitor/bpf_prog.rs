@@ -240,7 +240,7 @@ pub struct BpfProgAccessor<'a> {
 }
 
 impl<'a> BpfProgAccessor<'a> {
-    /// Create from an existing [`GuestKernel`] and vmlinux path.
+    /// Create from an existing [`GuestKernel`](super::guest::GuestKernel) and vmlinux path.
     pub fn from_guest_kernel(
         kernel: &'a super::guest::GuestKernel<'a>,
         vmlinux: &std::path::Path,

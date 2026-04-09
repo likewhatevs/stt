@@ -2,7 +2,7 @@ use super::scx_defs::*;
 
 /// Decode a sched_ext dispatch queue ID into a human-readable name.
 ///
-/// Inspects bits [63:62] (`DSQ_TYPE_SHIFT`) to classify:
+/// Inspects bits \[63:62\] (`DSQ_TYPE_SHIFT`) to classify:
 /// - `DSQ_TYPE_LOCAL_ON` (0b11): `LOCAL_ON|{cpu}`
 /// - `DSQ_TYPE_BUILTIN` (0b10): `SCX_DSQ_INVALID`, `GLOBAL`, `LOCAL`, `BYPASS`
 /// - Otherwise: `DSQ(0x{id:x})`

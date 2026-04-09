@@ -1,3 +1,5 @@
+//! CPU affinity scenario implementations.
+
 use super::Ctx;
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
 use crate::assert::AssertResult;

@@ -388,8 +388,8 @@ pub struct SchedDomainSnapshot {
 /// CONFIG_SCHEDSTATS load balancing stats for one `struct sched_domain`.
 ///
 /// Array fields have `CPU_MAX_IDLE_TYPES` (3) elements indexed by
-/// `cpu_idle_type`: [0] = CPU_NOT_IDLE, [1] = CPU_IDLE,
-/// [2] = CPU_NEWLY_IDLE. All counters are cumulative — compute
+/// `cpu_idle_type`: \[0\] = CPU_NOT_IDLE, \[1\] = CPU_IDLE,
+/// \[2\] = CPU_NEWLY_IDLE. All counters are cumulative — compute
 /// deltas between samples to get rates.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SchedDomainStats {

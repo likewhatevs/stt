@@ -68,7 +68,7 @@
 //! - [`cgroup`] -- cgroup v2 filesystem operations
 //! - [`scenario`] -- test case definitions, flag system, cgroup helpers
 //! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
-//! - [`assert`] -- pass/fail assertions (starvation, isolation, fairness)
+//! - [`mod@assert`] -- pass/fail assertions (starvation, isolation, fairness)
 //! - [`workload`] -- worker process types and telemetry collection
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
 //! - [`verifier`] -- BPF verifier complexity analysis

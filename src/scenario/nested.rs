@@ -1,3 +1,5 @@
+//! Nested cgroup hierarchy scenario implementations.
+
 use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
 use super::{CgroupGroup, Ctx, collect_all, dfl_wl, setup_cgroups};
 use crate::assert::{self, AssertResult};
