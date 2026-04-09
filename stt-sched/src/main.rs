@@ -36,58 +36,6 @@ fn has_flag(flag: &str) -> bool {
     std::env::args().any(|a| a == flag)
 }
 
-/// Load BPF programs and emit structured results. When --verify-loop
-/// or --fail-verify is set, scx_ops_load! fails and libbpf prints the
-/// verifier's instruction-level traces to stderr automatically.
-fn dump_verifier() -> Result<()> {
-    let mut open_object = MaybeUninit::uninit();
-    let skel_builder = BpfSkelBuilder::default();
-    let mut skel = scx_ops_open!(
-        skel_builder,
-        &mut open_object,
-        stt_ops,
-        None::<libbpf_rs::libbpf_sys::bpf_object_open_opts>
-    )?;
-
-    if has_flag("--degrade")
-        && let Some(rodata) = skel.maps.rodata_data.as_mut()
-    {
-        rodata.degrade = 1;
-    }
-    if has_flag("--verify-loop")
-        && let Some(rodata) = skel.maps.rodata_data.as_mut()
-    {
-        rodata.verify_loop = 1;
-    }
-    if has_flag("--fail-verify")
-        && let Some(rodata) = skel.maps.rodata_data.as_mut()
-    {
-        rodata.fail_verify = 1;
-    }
-
-    // Collect pre-load instruction counts.
-    let insn_counts = [
-        ("stt_enqueue", skel.progs.stt_enqueue.insn_cnt()),
-        ("stt_dispatch", skel.progs.stt_dispatch.insn_cnt()),
-        ("stt_init", skel.progs.stt_init.insn_cnt()),
-        ("stt_exit", skel.progs.stt_exit.insn_cnt()),
-    ];
-
-    // Load normally. On failure, libbpf's default print callback emits
-    // the verifier log (instruction traces) to stderr.
-    let load_ok = scx_ops_load!(skel, stt_ops, uei).is_ok();
-
-    // Emit structured output on stdout.
-    for &(name, cnt) in &insn_counts {
-        println!("STT_VERIFIER_PROG {} insn_cnt={}", name, cnt);
-        if !load_ok {
-            println!("STT_VERIFIER_LOG {} FAIL: verification failed", name);
-        }
-    }
-    println!("STT_VERIFIER_DONE");
-    Ok(())
-}
-
 fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     let stall_after = parse_delay_flag("--stall-after");
     let degrade_after = parse_delay_flag("--degrade-after");
@@ -192,10 +140,6 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
 }
 
 fn main() -> Result<()> {
-    if has_flag("--dump-verifier") {
-        return dump_verifier();
-    }
-
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {

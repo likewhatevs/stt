@@ -18,10 +18,10 @@ console, COM2 for application I/O) and a shared-memory ring buffer.
 **Direct access over tooling layers** -- the host-side monitor reads
 guest memory directly via BTF-resolved struct offsets (`rq.nr_running`,
 `rq.clock`) to observe scheduler state. No BPF instrumentation inside
-the guest, no observer effects on scheduling decisions. Verifier
-statistics come from the real kernel verifier inside the VM --
-stt-sched captures per-program verifier statistics and emits
-structured output; the host has no BPF dependency. Cycle collapse
+the guest, no observer effects on scheduling decisions. Host-side BPF
+program enumeration (`ProgVerifierStats` via `prog_idr`) reads
+`verified_insns` from `bpf_prog_aux` directly from guest memory --
+no guest cooperation or BPF syscalls needed. Cycle collapse
 reduces repetitive loop unrolling instead of truncating.
 
 ## Quick taste
@@ -44,9 +44,7 @@ cargo nextest run --workspace
 ## BPF verifier analysis
 
 The `verifier_pipeline` test boots a scheduler in a VM and captures
-per-program verifier output from the real kernel verifier. The
-stt-sched captures per-program verifier statistics inside the
-VM -- there is no host-side BPF loading.
+per-program verifier output from the real kernel verifier.
 Per-program statistics include instruction counts, states explored,
 verification time, and stack depth. The default output applies
 **cycle collapse** to reduce repetitive loop unrolling. See

@@ -24,11 +24,8 @@ fn main() {
             if !output.contains("stt_dispatch") {
                 return Err("output should list stt_dispatch".into());
             }
-            if !output.contains("insns=") {
-                return Err("output should contain insns=".into());
-            }
-            if !output.contains("processed=") {
-                return Err("output should contain processed=".into());
+            if !output.contains("verified_insns=") {
+                return Err("output should contain verified_insns=".into());
             }
             Ok(())
         })
@@ -65,6 +62,9 @@ fn main() {
     );
 
     // Non-ignored: programmatic check that cycle collapse works.
+    // --verify-loop causes BPF load failure; libbpf prints the
+    // verifier log (with unrolled loop traces) to stderr, captured
+    // in the scheduler log between ===SCHED_OUTPUT_START/END===.
     trials.push(libtest_mimic::Trial::test(
         "verifier_cycle_collapse",
         || {
@@ -74,9 +74,6 @@ fn main() {
                 stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &sched_args)
                     .map_err(|e| format!("{e:#}"))?;
             let output = stt::verifier::format_verifier_output("stt-sched", &result, false);
-            if !output.contains("stt_dispatch") {
-                return Err("output should contain stt_dispatch program".into());
-            }
             if !output.contains("scheduler log") {
                 return Err("output should contain scheduler log section".into());
             }

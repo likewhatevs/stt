@@ -8,19 +8,15 @@ per-program verifier statistics from the real kernel verifier.
 The verifier pipeline follows stt's two core principles.
 
 **Fidelity without overhead.** The scheduler binary runs inside a VM
-on the same kernel the scheduler will run on in production.
-stt-sched's `--dump-verifier` mode uses the same `scx_ops_open!` / `scx_ops_load!`
-macros as the normal startup path. When load fails, libbpf prints
-the verifier's instruction traces to stderr. The verifier that runs
-is the real verifier
-in the real kernel -- no host-side BPF loading, no version skew between
-the host kernel's verifier and the target kernel's verifier.
+on the same kernel the scheduler will run on in production. The
+verifier that runs is the real verifier in the real kernel -- no
+host-side BPF loading, no version skew between the host kernel's
+verifier and the target kernel's verifier.
 
 **Direct access over tooling layers.** No subprocess to bpftool or
-veristat. stt-sched emits structured output directly
-(`STT_VERIFIER_PROG`, `STT_VERIFIER_LOG`, `STT_VERIFIER_DONE`); the
-host parses it. Cycle collapse reduces repetitive loop unrolling
-instead of truncating.
+veristat. The host reads per-program `verified_insns` directly from
+guest memory via `bpf_prog_aux` introspection and applies cycle
+collapse to verifier logs instead of truncating.
 
 ## Quick start
 
@@ -31,29 +27,19 @@ cargo nextest run -E 'test(verifier_)'
 
 ## How it works
 
-1. **Build** -- `cargo build -p <package>` produces the scheduler
-   binary.
+1. **Build** -- the framework builds the scheduler binary.
 
-2. **Boot VM** -- a single-CPU VM boots with stt-sched invoked as
-   `--dump-verifier`. stt-sched opens the BPF object, records
-   pre-load instruction counts, and calls `scx_ops_load!`. On
-   failure, libbpf prints the verifier log to stderr.
+2. **Boot VM** -- the framework boots a single-CPU VM. The scheduler
+   loads its BPF programs via `scx_ops_load!`; the real kernel
+   verifier runs against them.
 
-3. **Capture** -- stt-sched writes structured lines to stdout,
-   which is redirected to COM2 at init startup:
-   - `STT_VERIFIER_PROG <name> insn_cnt=<N>` -- start of a program
-   - `STT_VERIFIER_LOG <name> <line>` -- status line (stt-sched
-     emits "FAIL: verification failed" on load failure)
-   - `STT_VERIFIER_DONE` -- all programs loaded
+3. **Collect** -- the host reads per-program `verified_insns` from
+   `bpf_prog_aux` via guest physical memory introspection. On load
+   failure, libbpf prints the verifier log to stderr, which the VM
+   captures between `===SCHED_OUTPUT_START===` /
+   `===SCHED_OUTPUT_END===` markers.
 
-   The real verifier instruction traces come from libbpf stderr,
-   captured separately in the scheduler log.
-
-4. **Parse** -- the host parses the structured output into per-program
-   stats (name, instruction count) and the scheduler log for verifier
-   traces.
-
-5. **Format** -- per-program summary lines, then verifier logs with
+4. **Format** -- per-program summary lines, then verifier logs with
    cycle collapse applied (pass `raw: true` to skip collapse).
 
 ## Output
@@ -63,16 +49,17 @@ cargo nextest run -E 'test(verifier_)'
 Per-program summary line:
 
 ```text
-  stt_enqueue                              insns=42    processed=500     states=30/100  time=42us  stack=32+0
+  stt_enqueue                              verified_insns=500
 ```
 
-Fields: program size (`insns`), instructions processed during
-verification (`processed`), peak/total verifier states, verification
-time, and stack depth per subprogram.
+Fields: `verified_insns` is the number of instructions the kernel
+verifier processed, read from `bpf_prog_aux` via host-side memory
+introspection.
 
-After the summary, the verifier log is printed with **cycle collapse**
-applied -- repeating loop iterations are reduced to the first iteration,
-an omission marker, and the last iteration:
+On load failure, the scheduler log section shows libbpf's verifier
+output with **cycle collapse** applied -- repeating loop iterations
+are reduced to the first iteration, an omission marker, and the last
+iteration:
 
 ```text
 --- 8x of the following 10 lines ---
@@ -95,7 +82,7 @@ matters.
 ### A/B diff
 
 Boots two VMs -- one for each scheduler binary -- and compares
-processed instruction counts per program:
+`verified_insns` per program:
 
 ```text
   program                                           A          B      delta
@@ -133,19 +120,13 @@ then detects repeating blocks:
 
 ## stt-sched test flags
 
-stt-sched is the example scheduler shipped with stt. It supports
-these flags to produce specific behaviors that exercise the
-framework's verifier pipeline. They are features of the example
-scheduler, not requirements for user schedulers.
-
-**`--dump-verifier`** -- opens the BPF object, records pre-load
-instruction counts, and calls `scx_ops_load!`. On success, emits
-structured verifier output (`STT_VERIFIER_PROG`,
-`STT_VERIFIER_DONE`). On failure, libbpf prints the verifier's
-instruction traces to stderr, which the VM captures as the scheduler
-log.
+stt-sched supports these flags to exercise the verifier pipeline:
 
 **`--fail-verify`** -- sets a `.rodata` variable before
 `scx_ops_load!`, enabling a code path the BPF verifier rejects.
-This produces a real verification failure so the framework can test
-that it correctly detects and reports load rejections.
+On failure, libbpf prints the verifier log to stderr.
+
+**`--verify-loop`** -- sets a `.rodata` variable that enables an
+unrolled loop followed by `while(1)` in `stt_dispatch`. The verifier
+rejects the infinite loop and libbpf prints the full instruction
+trace to stderr, exercising cycle collapse.

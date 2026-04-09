@@ -2629,8 +2629,8 @@ impl SttVmBuilder {
     /// PAUSE-only when mitigate_smt_rsb is active on the host.
     /// KVM_CAP_HALT_POLL is skipped (guest haltpoll cpuidle disables
     /// host halt polling via MSR_KVM_POLL_CONTROL). Validated at
-    /// build time -- oversubscription is a fatal error, insufficient
-    /// hugepages is a warning.
+    /// build time -- oversubscription returns `ResourceContention`,
+    /// insufficient hugepages is a warning.
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {
         self.performance_mode = enabled;
@@ -2715,8 +2715,9 @@ impl SttVmBuilder {
 
     /// Validate host resources for performance_mode and compute the
     /// pinning plan. Returns both the plan and the host topology (needed
-    /// for NUMA node discovery). Errors are fatal (oversubscription,
-    /// unsatisfiable topology). Warnings are printed for degraded conditions.
+    /// for NUMA node discovery). Returns `ResourceContention` when the
+    /// host lacks CPUs or LLC slots. Warnings are printed for degraded
+    /// conditions (hugepages, host load).
     fn validate_performance_mode(
         &mut self,
     ) -> Result<(host_topology::PinningPlan, host_topology::HostTopology)> {
@@ -2737,15 +2738,18 @@ impl SttVmBuilder {
             .map(|g| g.cpus.len())
             .sum();
         let total_reserved = reserved + 1; // +1 for service CPU
-        anyhow::ensure!(
-            total_reserved <= host_topo.total_cpus(),
-            "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
-             but only {} host CPUs available",
-            total_reserved,
-            reserved,
-            llcs_needed,
-            host_topo.total_cpus(),
-        );
+        if total_reserved > host_topo.total_cpus() {
+            return Err(anyhow::Error::new(host_topology::ResourceContention {
+                reason: format!(
+                    "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
+                     but only {} host CPUs available",
+                    total_reserved,
+                    reserved,
+                    llcs_needed,
+                    host_topo.total_cpus(),
+                ),
+            }));
+        }
 
         let plan = acquire_slot_with_locks(
             &host_topo,
@@ -3750,7 +3754,8 @@ mod tests {
     fn builder_performance_mode_valid_succeeds() {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
-        // Need 2 vCPUs + 1 service CPU = 3 host CPUs minimum.
+        // Need 2 vCPUs + 1 service CPU = 3 host CPUs minimum,
+        // plus the LLC must have >= 2 cores.
         if host_topo.total_cpus() < 3 {
             return;
         }
@@ -3759,11 +3764,17 @@ mod tests {
             .topology(1, 2, 1)
             .performance_mode(true)
             .build();
-        assert!(
-            result.is_ok(),
-            "valid topology with performance_mode should build: {:?}",
-            result.err(),
-        );
+        match result {
+            Ok(_) => {}
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                // Host lacks resources (e.g. not enough CPUs across
+                // LLCs) — skip, not fail.
+            }
+            Err(e) => panic!("valid topology with performance_mode should build: {e:#}",),
+        }
     }
 
     #[test]
@@ -3781,7 +3792,12 @@ mod tests {
             .build()
         {
             Ok(vm) => vm,
-            Err(e) if e.to_string().contains("LLC slots busy") => return,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
             Err(e) => panic!("{e:#}"),
         };
         assert!(vm.performance_mode);

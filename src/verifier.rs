@@ -2,8 +2,10 @@
 //!
 //! Provides:
 //! - [`VerifierStats`] / [`ProgStats`] / [`DiffRow`] — data types
+//! - [`collect_verifier_output`] — boot VM, collect stats via host introspection
+//! - [`format_verifier_output`] / [`format_verifier_diff`] — text formatting
+//! - [`extract_verifier_log`] — extract verifier trace from libbpf log blob
 //! - [`parse_verifier_stats`] — extract insn/state counts from verifier log
-//! - [`parse_vm_verifier_output`] — parse structured `STT_VERIFIER_*` lines
 //! - [`normalize_verifier_line`] — strip variable register state annotations
 //! - [`detect_cycle`] / [`collapse_cycles`] — loop iteration compression
 //! - [`format_brief_line`] — single-line program summary
@@ -21,13 +23,12 @@ pub struct VerifierStats {
     pub stack_depth: Option<String>,
 }
 
-/// Per-program verifier statistics parsed from VM output.
+/// Per-program verifier statistics collected from a VM run.
 pub struct ProgStats {
     pub name: String,
-    /// Pre-verification program size (BPF insns).
-    pub insn_cnt: usize,
-    /// Verifier log (stats-only or full, depending on log level).
-    pub log: String,
+    /// Instructions processed by the verifier (from host-side
+    /// `bpf_prog_aux->verified_insns`).
+    pub verified_insns: u32,
 }
 
 /// A single row in the A/B diff output.
@@ -402,84 +403,15 @@ pub fn collapse_cycles(log: &str) -> String {
 }
 
 /// Format a single program's brief output line (without ANSI color).
-pub fn format_brief_line(name: &str, insn_cnt: usize, vs: &VerifierStats) -> String {
-    let mut extra = String::new();
-    if vs.total_states > 0 {
-        extra.push_str(&format!("  states={}/{}", vs.peak_states, vs.total_states));
-    }
-    if let Some(t) = vs.time_usec {
-        extra.push_str(&format!("  time={t}us"));
-    }
-    if let Some(ref s) = vs.stack_depth {
-        extra.push_str(&format!("  stack={s}"));
-    }
-    format!(
-        "  {:<40} insns={:<6} processed={:<6}{}",
-        name, insn_cnt, vs.processed_insns, extra
-    )
-}
-
-/// Parse structured verifier output from a VM run.
-///
-/// The scheduler binary emits lines when invoked with `--dump-verifier`:
-///   `STT_VERIFIER_PROG <name> insn_cnt=<N>`
-///   `STT_VERIFIER_LOG <name> <log line>`
-///   `STT_VERIFIER_DONE`
-pub fn parse_vm_verifier_output(output: &str) -> Vec<ProgStats> {
-    let mut stats: Vec<ProgStats> = Vec::new();
-    let mut current_name: Option<String> = None;
-    let mut current_insn_cnt = 0usize;
-    let mut current_log = String::new();
-
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("STT_VERIFIER_PROG ") {
-            if let Some(name) = current_name.take() {
-                stats.push(ProgStats {
-                    name,
-                    insn_cnt: current_insn_cnt,
-                    log: std::mem::take(&mut current_log),
-                });
-            }
-            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            current_name = Some(parts[0].to_string());
-            current_insn_cnt = parts
-                .get(1)
-                .and_then(|s| s.strip_prefix("insn_cnt="))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            current_log.clear();
-        } else if let Some(rest) = line.strip_prefix("STT_VERIFIER_LOG ") {
-            if let Some((_, log_line)) = rest.split_once(' ') {
-                if !current_log.is_empty() {
-                    current_log.push('\n');
-                }
-                current_log.push_str(log_line);
-            }
-        } else if line.starts_with("STT_VERIFIER_DONE")
-            && let Some(name) = current_name.take()
-        {
-            stats.push(ProgStats {
-                name,
-                insn_cnt: current_insn_cnt,
-                log: std::mem::take(&mut current_log),
-            });
-        }
-    }
-    if let Some(name) = current_name {
-        stats.push(ProgStats {
-            name,
-            insn_cnt: current_insn_cnt,
-            log: current_log,
-        });
-    }
-    stats
+pub fn format_brief_line(name: &str, verified_insns: u32) -> String {
+    format!("  {:<40} verified_insns={}", name, verified_insns)
 }
 
 /// Build diff rows from A stats and B lookup map.
 pub fn build_diff_rows(stats_a: &[ProgStats], b_map: &HashMap<String, u64>) -> Vec<DiffRow> {
     let mut rows = Vec::new();
     for ps in stats_a {
-        let a = parse_verifier_stats(&ps.log).processed_insns;
+        let a = ps.verified_insns as u64;
         let b = b_map.get(&ps.name).copied().unwrap_or(0);
         rows.push(DiffRow {
             name: ps.name.clone(),
@@ -495,10 +427,7 @@ pub fn build_diff_rows(stats_a: &[ProgStats], b_map: &HashMap<String, u64>) -> V
 pub fn build_b_map(stats_b: &[ProgStats]) -> HashMap<String, u64> {
     stats_b
         .iter()
-        .map(|ps| {
-            let vs = parse_verifier_stats(&ps.log);
-            (ps.name.clone(), vs.processed_insns)
-        })
+        .map(|ps| (ps.name.clone(), ps.verified_insns as u64))
         .collect()
 }
 
@@ -508,16 +437,20 @@ pub fn build_b_map(stats_b: &[ProgStats]) -> HashMap<String, u64> {
 
 /// Result of collecting verifier output from a VM run.
 pub struct VerifierVmResult {
-    /// Per-program verifier statistics.
+    /// Per-program verifier statistics from host-side memory
+    /// introspection (`bpf_prog_aux->verified_insns`).
     pub stats: Vec<ProgStats>,
-    /// Scheduler output (stdout+stderr) from the VM, extracted between
-    /// ===SCHED_OUTPUT_START=== and ===SCHED_OUTPUT_END=== markers.
-    /// Contains libbpf's verifier instruction traces when BPF load fails.
+    /// Scheduler log (stdout+stderr) from the VM. Contains libbpf's
+    /// verifier instruction traces when BPF load fails.
     pub scheduler_log: String,
 }
 
-/// Boot a VM with `--dump-verifier` and parse the structured verifier
-/// output. Callers provide pre-built binary paths.
+/// Boot a VM and collect verifier statistics via host-side memory
+/// introspection. Per-program `verified_insns` comes from
+/// `bpf_prog_aux->verified_insns` read through the guest's physical
+/// memory. On load failure, libbpf prints the verifier log to stderr
+/// which the VM captures between `===SCHED_OUTPUT_START===` /
+/// `===SCHED_OUTPUT_END===` markers.
 pub fn collect_verifier_output(
     sched_bin: &std::path::Path,
     stt_bin: &std::path::Path,
@@ -526,8 +459,7 @@ pub fn collect_verifier_output(
 ) -> anyhow::Result<VerifierVmResult> {
     use anyhow::Context;
 
-    let mut sched_args = vec!["--dump-verifier".to_string()];
-    sched_args.extend(extra_sched_args.iter().cloned());
+    let sched_args: Vec<String> = extra_sched_args.to_vec();
 
     let vm = crate::vmm::SttVm::builder()
         .kernel(kernel)
@@ -542,15 +474,6 @@ pub fn collect_verifier_output(
 
     let result = vm.run().context("run verifier VM")?;
 
-    if !result.output.contains("STT_VERIFIER_DONE") {
-        anyhow::bail!(
-            "verifier VM exited with code {} (timed_out={})\n{}",
-            result.exit_code,
-            result.timed_out,
-            result.output,
-        );
-    }
-
     let scheduler_log = result
         .output
         .split("===SCHED_OUTPUT_START===")
@@ -559,10 +482,54 @@ pub fn collect_verifier_output(
         .unwrap_or("")
         .to_string();
 
+    // Build ProgStats from host-side ProgVerifierStats. Each program
+    // that loaded successfully is visible in prog_idr with its
+    // verified_insns count.
+    let stats: Vec<ProgStats> = result
+        .verifier_stats
+        .iter()
+        .map(|pvs| ProgStats {
+            name: pvs.name.clone(),
+            verified_insns: pvs.verified_insns,
+        })
+        .collect();
+
     Ok(VerifierVmResult {
-        stats: parse_vm_verifier_output(&result.output),
+        stats,
         scheduler_log,
     })
+}
+
+/// Extract the verifier instruction trace from a scheduler log blob.
+///
+/// libbpf wraps the kernel verifier log between marker lines:
+///   `-- BEGIN PROG LOAD LOG --`
+///   `-- END PROG LOAD LOG --`
+///
+/// Returns the content between the first pair of markers, or `None` if
+/// no markers are found (backward compat with logs that contain only
+/// raw verifier output).
+pub fn extract_verifier_log(scheduler_log: &str) -> Option<&str> {
+    const BEGIN: &str = "-- BEGIN PROG LOAD LOG --";
+    const END: &str = "-- END PROG LOAD LOG --";
+
+    let begin_pos = scheduler_log.find(BEGIN)?;
+    let content_start = begin_pos + BEGIN.len();
+    // Skip the newline after the BEGIN marker if present.
+    let content_start = if scheduler_log.as_bytes().get(content_start) == Some(&b'\n') {
+        content_start + 1
+    } else {
+        content_start
+    };
+    let end_pos = scheduler_log[content_start..].find(END)?;
+    let content = &scheduler_log[content_start..content_start + end_pos];
+    // The END marker may appear mid-line (e.g. "libbpf: -- END ...").
+    // Trim back to the last newline to drop the partial prefix.
+    let content = content
+        .rfind('\n')
+        .map(|p| &content[..p])
+        .unwrap_or(content);
+    Some(content.trim_end_matches('\n'))
 }
 
 /// Format verifier results as text: brief lines per program, collapsed
@@ -571,30 +538,39 @@ pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool)
     let mut out = String::new();
     out.push_str(&format!("\n{label}\n"));
     for ps in &result.stats {
-        let vs = parse_verifier_stats(&ps.log);
         out.push_str(&format!(
-            "{}\n",
-            format_brief_line(&ps.name, ps.insn_cnt, &vs)
+            "  {:<40} verified_insns={}\n",
+            ps.name, ps.verified_insns
         ));
     }
 
-    for ps in &result.stats {
-        if !ps.log.is_empty() {
-            out.push_str(&format!("\n{label}  {}\n", ps.name));
-            if raw {
-                out.push_str(&ps.log);
-            } else {
-                out.push_str(&collapse_cycles(&ps.log));
-            }
-        }
-    }
-
     if !result.scheduler_log.is_empty() {
+        // Extract the verifier log from between libbpf's markers.
+        // Falls back to the full scheduler_log when no markers exist.
+        let verifier_log =
+            extract_verifier_log(&result.scheduler_log).unwrap_or(&result.scheduler_log);
+
+        let vs = parse_verifier_stats(verifier_log);
+        if vs.processed_insns > 0 {
+            out.push_str(&format!("\n{label} --- verifier stats ---\n"));
+            out.push_str(&format!(
+                "  processed={}  states={}/{}",
+                vs.processed_insns, vs.peak_states, vs.total_states
+            ));
+            if let Some(t) = vs.time_usec {
+                out.push_str(&format!("  time={t}us"));
+            }
+            if let Some(ref s) = vs.stack_depth {
+                out.push_str(&format!("  stack={s}"));
+            }
+            out.push('\n');
+        }
+
         out.push_str(&format!("\n{label} --- scheduler log ---\n"));
         if raw {
             out.push_str(&result.scheduler_log);
         } else {
-            out.push_str(&collapse_cycles(&result.scheduler_log));
+            out.push_str(&collapse_cycles(verifier_log));
         }
     }
 
@@ -879,80 +855,27 @@ verification time 100 usec
     // -----------------------------------------------------------------------
 
     #[test]
-    fn format_brief_line_full_stats() {
-        let vs = VerifierStats {
-            processed_insns: 1234,
-            total_states: 200,
-            peak_states: 50,
-            time_usec: Some(42),
-            stack_depth: Some("32+0".into()),
-        };
-        let line = format_brief_line("dispatch", 100, &vs);
-        assert!(line.contains("insns=100"), "insns: {line}");
-        assert!(line.contains("processed=1234"), "processed: {line}");
-        assert!(line.contains("states=50/200"), "states: {line}");
-        assert!(line.contains("time=42us"), "time: {line}");
-        assert!(line.contains("stack=32+0"), "stack: {line}");
+    fn format_brief_line_basic() {
+        let line = format_brief_line("dispatch", 100);
+        assert!(line.contains("dispatch"), "name: {line}");
+        assert!(
+            line.contains("verified_insns=100"),
+            "verified_insns: {line}"
+        );
     }
 
     #[test]
-    fn format_brief_line_insns_only() {
-        let vs = VerifierStats {
-            processed_insns: 500,
-            total_states: 0,
-            peak_states: 0,
-            time_usec: None,
-            stack_depth: None,
-        };
-        let line = format_brief_line("init", 20, &vs);
-        assert!(line.contains("insns=20"), "insns: {line}");
-        assert!(line.contains("processed=500"), "processed: {line}");
-        assert!(!line.contains("states="), "no states: {line}");
-        assert!(!line.contains("time="), "no time: {line}");
-        assert!(!line.contains("stack="), "no stack: {line}");
+    fn format_brief_line_zero_verified() {
+        let line = format_brief_line("broken", 0);
+        assert!(line.contains("verified_insns=0"), "verified_insns: {line}");
     }
 
     #[test]
-    fn format_brief_line_zero_processed() {
-        let vs = VerifierStats {
-            processed_insns: 0,
-            total_states: 0,
-            peak_states: 0,
-            time_usec: None,
-            stack_depth: None,
-        };
-        let line = format_brief_line("broken", 0, &vs);
-        assert!(line.contains("insns=0"), "insns: {line}");
-        assert!(line.contains("processed=0"), "processed: {line}");
-    }
-
-    #[test]
-    fn format_brief_line_states_without_time() {
-        let vs = VerifierStats {
-            processed_insns: 100,
-            total_states: 10,
-            peak_states: 5,
-            time_usec: None,
-            stack_depth: None,
-        };
-        let line = format_brief_line("prog", 50, &vs);
-        assert!(line.contains("states=5/10"), "states: {line}");
-        assert!(!line.contains("time="), "no time: {line}");
-    }
-
-    #[test]
-    fn format_brief_line_long_name_alignment() {
-        let vs = VerifierStats {
-            processed_insns: 42,
-            total_states: 0,
-            peak_states: 0,
-            time_usec: None,
-            stack_depth: None,
-        };
-        let short = format_brief_line("x", 1, &vs);
-        let long = format_brief_line("a_very_long_program_name_here", 1, &vs);
-        assert!(short.contains("processed=42"));
-        assert!(long.contains("processed=42"));
+    fn format_brief_line_long_name() {
+        let short = format_brief_line("x", 1);
+        let long = format_brief_line("a_very_long_program_name_here", 1);
+        assert!(short.contains("verified_insns=1"));
+        assert!(long.contains("verified_insns=1"));
     }
 
     // -----------------------------------------------------------------------
@@ -1196,80 +1119,19 @@ verification time 100 usec
     }
 
     // -----------------------------------------------------------------------
-    // parse_vm_verifier_output
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_vm_verifier_output_basic() {
-        let output = "\
-some boot noise
-STT_VERIFIER_PROG stt_init insn_cnt=42
-STT_VERIFIER_LOG stt_init processed 100 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0
-STT_VERIFIER_LOG stt_init verification time 10 usec
-STT_VERIFIER_PROG stt_dispatch insn_cnt=200
-STT_VERIFIER_LOG stt_dispatch processed 500 insns (limit 1000000) max_states_per_insn 3 total_states 50 peak_states 20 mark_read 5
-STT_VERIFIER_DONE
-more noise
-";
-        let stats = parse_vm_verifier_output(output);
-        assert_eq!(stats.len(), 2);
-        assert_eq!(stats[0].name, "stt_init");
-        assert_eq!(stats[0].insn_cnt, 42);
-        assert!(stats[0].log.contains("processed 100 insns"));
-        assert_eq!(stats[1].name, "stt_dispatch");
-        assert_eq!(stats[1].insn_cnt, 200);
-        assert!(stats[1].log.contains("processed 500 insns"));
-    }
-
-    #[test]
-    fn parse_vm_verifier_output_empty() {
-        let stats = parse_vm_verifier_output("no markers here\n");
-        assert!(stats.is_empty());
-    }
-
-    #[test]
-    fn parse_vm_verifier_output_no_done_marker() {
-        let output = "\
-STT_VERIFIER_PROG stt_init insn_cnt=10
-STT_VERIFIER_LOG stt_init processed 50 insns (limit 1000000) max_states_per_insn 1 total_states 3 peak_states 1 mark_read 0
-";
-        let stats = parse_vm_verifier_output(output);
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].name, "stt_init");
-    }
-
-    #[test]
-    fn parse_vm_verifier_output_fail_program() {
-        let output = "\
-STT_VERIFIER_PROG broken_prog insn_cnt=0
-STT_VERIFIER_LOG broken_prog FAIL: verification failed
-STT_VERIFIER_DONE
-";
-        let stats = parse_vm_verifier_output(output);
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].name, "broken_prog");
-        assert!(stats[0].log.contains("FAIL"));
-    }
-
-    // -----------------------------------------------------------------------
     // build_b_map / build_diff_rows
     // -----------------------------------------------------------------------
 
-    fn prog(name: &str, insn_cnt: usize, log: &str) -> ProgStats {
+    fn prog(name: &str, verified_insns: u32) -> ProgStats {
         ProgStats {
             name: name.to_string(),
-            insn_cnt,
-            log: log.to_string(),
+            verified_insns,
         }
     }
 
     #[test]
     fn build_b_map_basic() {
-        let stats_b = vec![prog(
-            "dispatch",
-            100,
-            "processed 500 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0\n",
-        )];
+        let stats_b = vec![prog("dispatch", 500)];
         let map = build_b_map(&stats_b);
         assert_eq!(map.get("dispatch"), Some(&500));
     }
@@ -1282,11 +1144,7 @@ STT_VERIFIER_DONE
 
     #[test]
     fn build_diff_rows_matching_programs() {
-        let stats_a = vec![prog(
-            "dispatch",
-            100,
-            "processed 500 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0\n",
-        )];
+        let stats_a = vec![prog("dispatch", 500)];
         let mut b_map = HashMap::new();
         b_map.insert("dispatch".to_string(), 300u64);
         let rows = build_diff_rows(&stats_a, &b_map);
@@ -1299,11 +1157,7 @@ STT_VERIFIER_DONE
 
     #[test]
     fn build_diff_rows_program_missing_from_b() {
-        let stats_a = vec![prog(
-            "new_prog",
-            50,
-            "processed 100 insns (limit 1000000) max_states_per_insn 1 total_states 2 peak_states 1 mark_read 0\n",
-        )];
+        let stats_a = vec![prog("new_prog", 100)];
         let b_map = HashMap::new();
         let rows = build_diff_rows(&stats_a, &b_map);
         assert_eq!(rows.len(), 1);
@@ -1314,11 +1168,7 @@ STT_VERIFIER_DONE
 
     #[test]
     fn build_diff_rows_negative_delta() {
-        let stats_a = vec![prog(
-            "dispatch",
-            100,
-            "processed 200 insns (limit 1000000) max_states_per_insn 1 total_states 3 peak_states 1 mark_read 0\n",
-        )];
+        let stats_a = vec![prog("dispatch", 200)];
         let mut b_map = HashMap::new();
         b_map.insert("dispatch".to_string(), 500u64);
         let rows = build_diff_rows(&stats_a, &b_map);
@@ -1390,5 +1240,133 @@ STT_VERIFIER_DONE
             "should collapse unrolled loop"
         );
         assert!(collapsed.lines().count() < log.lines().count());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_verifier_log
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_verifier_log_basic() {
+        let log = "\
+libbpf: prog 'dispatch': BPF program load failed: -22
+-- BEGIN PROG LOAD LOG --
+func#0 @0
+0: R1=ctx() R10=fp0
+processed 100 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0
+-- END PROG LOAD LOG --
+libbpf: failed to load object 'stt_ops'
+";
+        let extracted = extract_verifier_log(log);
+        assert!(extracted.is_some());
+        let v = extracted.unwrap();
+        assert!(v.starts_with("func#0 @0"));
+        assert!(v.contains("processed 100 insns"));
+        assert!(!v.contains("BEGIN PROG LOAD LOG"));
+        assert!(!v.contains("END PROG LOAD LOG"));
+        assert!(!v.contains("libbpf:"));
+    }
+
+    #[test]
+    fn extract_verifier_log_none_without_markers() {
+        let log = "func#0 @0\n0: R1=ctx()\nprocessed 50 insns\n";
+        assert!(extract_verifier_log(log).is_none());
+    }
+
+    #[test]
+    fn extract_verifier_log_empty() {
+        assert!(extract_verifier_log("").is_none());
+    }
+
+    /// Attack 1: libbpf wraps verifier output with "libbpf: " prefix lines.
+    /// `parse_verifier_stats` looks for `starts_with("processed ")` which
+    /// won't match `libbpf: processed ...`. Without extraction, stats
+    /// parsing fails on blobs where the `processed` line is only inside
+    /// the markers.
+    #[test]
+    fn extract_verifier_log_attack1_stats_parse() {
+        let blob = "\
+libbpf: prog 'stt_ops_dispatch': BPF program load failed: -22
+libbpf: -- BEGIN PROG LOAD LOG --
+func#0 @0
+0: R1=ctx() R10=fp0
+1: (bf) r6 = r1 ; R1=ctx() R6_w=ctx()
+back-edge from insn 42 to 10
+BPF program is too complex
+processed 131071 insns (limit 131072) max_states_per_insn 12 total_states 9999 peak_states 5000 mark_read 800
+verification time 250000 usec
+stack depth 96+32
+libbpf: -- END PROG LOAD LOG --
+libbpf: failed to load BPF skeleton 'stt_ops': -22
+";
+        let extracted = extract_verifier_log(blob);
+        assert!(extracted.is_some(), "should find markers");
+        let v = extracted.unwrap();
+        let vs = parse_verifier_stats(v);
+        assert_eq!(vs.processed_insns, 131071);
+        assert_eq!(vs.total_states, 9999);
+        assert_eq!(vs.peak_states, 5000);
+        assert_eq!(vs.time_usec, Some(250000));
+        assert_eq!(vs.stack_depth.as_deref(), Some("96+32"));
+
+        // Without extraction, parsing the full blob must also work
+        // because the "processed" line doesn't have a "libbpf: " prefix
+        // inside the markers. But verify extraction gives cleaner input.
+        let vs_raw = parse_verifier_stats(blob);
+        assert_eq!(vs_raw.processed_insns, 131071);
+    }
+
+    /// Attack 3: three distinct program load logs in a single blob.
+    /// Each has different instructions. `collapse_cycles` must NOT treat
+    /// them as a repeating cycle.
+    #[test]
+    fn extract_verifier_log_attack3_no_false_collapse() {
+        let blob = "\
+libbpf: prog 'init': BPF program load failed: -22
+libbpf: -- BEGIN PROG LOAD LOG --
+func#0 @0
+0: R1=ctx() R10=fp0
+1: (bf) r6 = r1
+2: (07) r6 += 8
+3: (61) r0 = *(u32 *)(r6 + 0)
+4: (95) exit
+processed 5 insns (limit 1000000) max_states_per_insn 1 total_states 3 peak_states 1 mark_read 0
+libbpf: -- END PROG LOAD LOG --
+libbpf: prog 'dispatch': BPF program load failed: -22
+libbpf: -- BEGIN PROG LOAD LOG --
+func#1 @10
+10: R1=ctx() R10=fp0
+11: (bf) r7 = r1
+12: (85) call bpf_ktime_get_ns#5
+13: (77) r0 >>= 32
+14: (95) exit
+processed 5 insns (limit 1000000) max_states_per_insn 1 total_states 3 peak_states 1 mark_read 0
+libbpf: -- END PROG LOAD LOG --
+libbpf: prog 'enqueue': BPF program load failed: -22
+libbpf: -- BEGIN PROG LOAD LOG --
+func#2 @20
+20: R1=ctx() R10=fp0
+21: (b7) r0 = 0
+22: (63) *(u32 *)(r10 - 4) = r0
+23: (61) r1 = *(u32 *)(r10 - 4)
+24: (95) exit
+processed 5 insns (limit 1000000) max_states_per_insn 1 total_states 3 peak_states 1 mark_read 0
+libbpf: -- END PROG LOAD LOG --
+libbpf: failed to load BPF skeleton 'stt_ops': -22
+";
+        // extract_verifier_log returns the FIRST log section.
+        let extracted = extract_verifier_log(blob);
+        assert!(extracted.is_some());
+        let v = extracted.unwrap();
+        assert!(v.contains("func#0 @0"), "should get first program's log");
+        assert!(!v.contains("func#1"), "should not include second program");
+
+        // collapse_cycles on the extracted first section must not
+        // collapse — it's only 7 lines total.
+        let collapsed = collapse_cycles(v);
+        assert!(
+            !collapsed.contains("identical iterations omitted"),
+            "must not false-collapse distinct program logs"
+        );
     }
 }
