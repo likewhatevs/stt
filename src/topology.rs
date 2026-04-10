@@ -592,6 +592,40 @@ mod tests {
         assert_eq!(splits[0].len(), 4);
     }
 
+    /// Regression test for the split_by_llc bug: topology(2,4,1) must
+    /// produce 2 disjoint LLC sets covering all 8 CPUs. Before the fix,
+    /// from_system() on AMD hosts returned 1 LLC because CPUID leaf
+    /// 0x8000001D was not patched, and the test panicked indexing
+    /// llc_sets[1].
+    #[test]
+    fn split_by_llc_two_socket_regression() {
+        let t = TestTopology::from_spec(2, 4, 1);
+        assert_eq!(t.total_cpus(), 8);
+        assert_eq!(t.num_llcs(), 2);
+
+        let splits = t.split_by_llc();
+        assert_eq!(splits.len(), 2, "2-socket topology must produce 2 LLC sets");
+
+        // Sets must be disjoint
+        let overlap: BTreeSet<usize> = splits[0].intersection(&splits[1]).copied().collect();
+        assert!(
+            overlap.is_empty(),
+            "LLC sets must be disjoint: overlap={overlap:?}"
+        );
+
+        // Union must cover all CPUs
+        let union: BTreeSet<usize> = splits[0].union(&splits[1]).copied().collect();
+        assert_eq!(union, t.all_cpuset(), "LLC sets must cover all CPUs");
+
+        // Each set has 4 CPUs (4 cores per socket, 1 thread)
+        assert_eq!(splits[0].len(), 4);
+        assert_eq!(splits[1].len(), 4);
+
+        // Verify exact contents
+        assert_eq!(splits[0], [0, 1, 2, 3].into_iter().collect());
+        assert_eq!(splits[1], [4, 5, 6, 7].into_iter().collect());
+    }
+
     #[test]
     fn usable_cpus_reserves_last() {
         let t = TestTopology::synthetic(8, 2);
