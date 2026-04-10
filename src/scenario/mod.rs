@@ -306,7 +306,8 @@ pub struct CgroupWork {
 pub enum AffinityKind {
     /// No affinity constraint -- inherit from parent cgroup.
     Inherit,
-    /// Pin to a random subset of the cgroup's cpuset.
+    /// Pin to a random subset of the cgroup's cpuset, or all CPUs if no
+    /// cpuset is configured.
     RandomSubset,
     /// Pin to the CPUs in the worker's LLC.
     LlcAligned,
@@ -669,14 +670,15 @@ fn resolve_affinity_kind(
     cgroup_idx: usize,
     topo: &TestTopology,
 ) -> AffinityMode {
-    match kind {
-        AffinityKind::Inherit => AffinityMode::None,
+    let cgroup_cpuset = cpusets.map(|cs| &cs[cgroup_idx]);
+    let mode = match kind {
+        AffinityKind::Inherit => return AffinityMode::None,
         AffinityKind::RandomSubset => {
             let pool = cpusets
                 .map(|cs| cs[cgroup_idx].clone())
                 .unwrap_or_else(|| topo.all_cpuset());
             let count = (pool.len() / 2).max(1);
-            AffinityMode::Random { from: pool, count }
+            return AffinityMode::Random { from: pool, count };
         }
         AffinityKind::LlcAligned => {
             let idx = cgroup_idx % topo.num_llcs();
@@ -687,7 +689,41 @@ fn resolve_affinity_kind(
             let cpu = topo.all_cpus()[cgroup_idx % topo.total_cpus()];
             AffinityMode::SingleCpu(cpu)
         }
+    };
+
+    // Warn when the resolved affinity extends beyond the cgroup's cpuset.
+    // The kernel silently intersects sched_setaffinity with cpuset, so
+    // effective affinity will differ from what was requested.
+    if let Some(cpuset) = cgroup_cpuset {
+        let affinity_cpus = match &mode {
+            AffinityMode::Fixed(cpus) => cpus,
+            AffinityMode::SingleCpu(cpu) => {
+                if !cpuset.contains(cpu) {
+                    tracing::warn!(
+                        cgroup_idx,
+                        cpu,
+                        ?cpuset,
+                        affinity_kind = ?kind,
+                        "affinity cpu not in cgroup cpuset; kernel will intersect",
+                    );
+                }
+                return mode;
+            }
+            _ => return mode,
+        };
+        if !affinity_cpus.is_subset(cpuset) {
+            let outside: BTreeSet<usize> = affinity_cpus.difference(cpuset).copied().collect();
+            tracing::warn!(
+                cgroup_idx,
+                ?outside,
+                ?cpuset,
+                affinity_kind = ?kind,
+                "affinity set extends beyond cgroup cpuset; kernel will intersect",
+            );
+        }
     }
+
+    mode
 }
 
 // ---------------------------------------------------------------------------

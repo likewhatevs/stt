@@ -17,7 +17,7 @@ An `Op` is an atomic operation on the cgroup topology:
 | `SwapCpusets` | Swap cpusets between two cgroups |
 | `Spawn` | Fork workers into a cgroup |
 | `StopCgroup` | Stop a cgroup's workers |
-| `RandomizeAffinity` | Set random affinity on workers |
+| `RandomizeAffinity` | Set random affinity on workers within the cgroup's cpuset |
 | `SetAffinity` | Set explicit affinity on workers |
 | `SpawnHost` | Spawn workers in the parent cgroup |
 | `MoveAllTasks` | Move all tasks between cgroups |

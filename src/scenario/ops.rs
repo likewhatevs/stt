@@ -55,7 +55,8 @@ pub enum Op {
     },
     /// Stop all workers in a cgroup (does not remove the cgroup).
     StopCgroup { cgroup: Cow<'static, str> },
-    /// Set each worker in a cgroup to a random CPU subset.
+    /// Set each worker in a cgroup to a random CPU subset drawn from the
+    /// cgroup's cpuset (or all CPUs if no cpuset is configured).
     RandomizeAffinity { cgroup: Cow<'static, str> },
     /// Set all workers in a cgroup to the given affinity mask.
     SetAffinity {
@@ -850,9 +851,13 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 state.handles.retain(|(n, _)| n.as_str() != *cgroup);
             }
             Op::RandomizeAffinity { cgroup } => {
+                let pool = state
+                    .cpusets
+                    .get(cgroup.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| ctx.topo.all_cpuset());
                 for (name, handle) in &state.handles {
                     if name.as_str() == *cgroup {
-                        let pool = ctx.topo.all_cpuset();
                         for idx in 0..handle.tids().len() {
                             let count = (pool.len() / 2).max(1);
                             use rand::seq::IndexedRandom;
