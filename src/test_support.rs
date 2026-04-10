@@ -1381,6 +1381,7 @@ fn run_ktstr_test_inner(
             scheduler.as_deref(),
             &ktstr_bin,
             output,
+            &result.stderr,
             topo,
         )
     };
@@ -1733,15 +1734,19 @@ fn trim_settle_samples(report: &crate::monitor::MonitorReport) -> crate::monitor
     }
 }
 
-/// Attempt auto-repro: extract stack functions from the scheduler output,
-/// boot a second VM with BPF probes attached, and return formatted probe
-/// data. Returns `None` if repro cannot be attempted or yields no data.
+/// Attempt auto-repro: extract stack functions from COM2 scheduler output
+/// or COM1 kernel console (fallback), boot a second VM with BPF probes
+/// attached, and return formatted probe data.
+/// `console_output` is COM1 kernel console text, used when COM2 has no
+/// extractable functions (e.g. scheduler died before writing output).
+/// Returns `None` if repro cannot be attempted or yields no data.
 fn attempt_auto_repro(
     entry: &KtstrTestEntry,
     kernel: &Path,
     scheduler: Option<&Path>,
     ktstr_bin: &Path,
     first_vm_output: &str,
+    console_output: &str,
     topo: Option<&TopoOverride>,
 ) -> Option<String> {
     use crate::probe::stack::extract_stack_functions_all;
@@ -1753,12 +1758,25 @@ fn attempt_auto_repro(
         first_vm_output.contains("===SCHED_OUTPUT_START==="),
         first_vm_output.contains("===SCHED_OUTPUT_END==="),
     );
-    let sched_output = parse_sched_output(first_vm_output)?;
+    let sched_output = parse_sched_output(first_vm_output);
 
-    // Extract function names from the scheduler log.
-    let stack_funcs = extract_stack_functions_all(sched_output);
+    // Extract function names from COM2 scheduler log first, then
+    // fall back to COM1 kernel console (which has kernel backtraces
+    // including sched_ext_dump output).
+    let stack_funcs = if let Some(sched) = sched_output {
+        let funcs = extract_stack_functions_all(sched);
+        if funcs.is_empty() {
+            eprintln!("ktstr_test: auto-repro: no functions from COM2, trying COM1");
+            extract_stack_functions_all(console_output)
+        } else {
+            funcs
+        }
+    } else {
+        eprintln!("ktstr_test: auto-repro: no scheduler output on COM2, trying COM1");
+        extract_stack_functions_all(console_output)
+    };
     if stack_funcs.is_empty() {
-        eprintln!("ktstr_test: auto-repro: no functions extracted from scheduler output");
+        eprintln!("ktstr_test: auto-repro: no functions extracted from COM2 or COM1");
         return None;
     }
 

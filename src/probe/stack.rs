@@ -107,7 +107,13 @@ pub fn extract_stack_functions_all(stack: &str) -> Vec<StackFunction> {
     stack
         .lines()
         .filter_map(|line| {
-            let trimmed = line.trim().trim_start_matches("  ");
+            let trimmed = line.trim();
+            // Strip trace_pipe sched_ext_dump prefix so backtrace
+            // frames like "sched_ext_dump:   func+0x..." are parsed.
+            let trimmed = match trimmed.find("sched_ext_dump:") {
+                Some(idx) => trimmed[idx + "sched_ext_dump:".len()..].trim(),
+                None => trimmed,
+            };
             // Handle "func+0xOFFSET/0xSIZE" and "bpf_prog_HASH_name+0x..."
             let func = trimmed.split('+').next()?.trim();
             if func.is_empty()
@@ -270,39 +276,11 @@ pub fn filter_traceable(functions: Vec<StackFunction>) -> Vec<StackFunction> {
 mod tests {
     use super::*;
 
-    /// Extract function names from a crash stack trace.
-    /// Deduplicates and skips generic functions. Test-only simplified
-    /// variant of `extract_stack_functions_all` that returns bare strings
-    /// and filters out BPF programs.
     fn extract_stack_functions(stack: &str) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        stack
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim().trim_start_matches("  ");
-                let func = trimmed.split('+').next()?;
-                let func = func.trim();
-                if func.is_empty()
-                    || func.contains(' ')
-                    || func.starts_with('[')
-                    || func.starts_with('#')
-                    || func.starts_with('=')
-                    || func.starts_with('-')
-                    || func.ends_with(':')
-                    || func.starts_with("bpf_prog_")
-                    || !func
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-                    || should_skip_probe(func)
-                {
-                    return None;
-                }
-                if seen.insert(func.to_string()) {
-                    Some(func.to_string())
-                } else {
-                    None
-                }
-            })
+        extract_stack_functions_all(stack)
+            .into_iter()
+            .filter(|f| !f.is_bpf)
+            .map(|f| f.raw_name)
             .collect()
     }
 
@@ -465,6 +443,22 @@ mod tests {
         let fns = extract_stack_functions_all(stack);
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0].raw_name, "do_exit");
+    }
+
+    #[test]
+    fn extract_stack_functions_all_sched_ext_dump_prefix() {
+        let stack = "  ktstr-0  [001]  0.500: sched_ext_dump:   do_enqueue_task+0x1a0/0x380\n";
+        let fns = extract_stack_functions_all(stack);
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].raw_name, "do_enqueue_task");
+    }
+
+    #[test]
+    fn extract_stack_functions_all_dmesg_sched_ext_dump() {
+        let stack = "[    1.234567] sched_ext_dump:   scx_bpf_error+0x40/0x60\n";
+        let fns = extract_stack_functions_all(stack);
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].raw_name, "scx_bpf_error");
     }
 
     // -- load_probe_stack edge cases --
