@@ -153,7 +153,7 @@ pub mod prelude {
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::stt_test;
     pub use crate::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
-    pub use crate::topology::TestTopology;
+    pub use crate::topology::{LlcInfo, TestTopology};
     pub use crate::workload::{
         AffinityMode, Phase, SchedPolicy, Work, WorkType, WorkerReport, WorkloadConfig,
         WorkloadHandle,
