@@ -12,8 +12,8 @@
 //! - [`Phase`] -- a single phase in a [`WorkType::Sequence`] compound work pattern
 //! - [`SchedPolicy`] -- Linux scheduling policy for a worker process
 //!
-//! See the [Work Types](https://likewhatevs.github.io/stt/guide/concepts/work-types.html)
-//! and [Worker Processes](https://likewhatevs.github.io/stt/guide/architecture/workers.html)
+//! See the [Work Types](https://likewhatevs.github.io/scx-ktstr/guide/concepts/work-types.html)
+//! and [Worker Processes](https://likewhatevs.github.io/scx-ktstr/guide/architecture/workers.html)
 //! chapters of the guide.
 
 use anyhow::{Context, Result};
@@ -94,7 +94,7 @@ pub enum Phase {
 /// CPU-bound, yield-heavy, I/O, bursty, or inter-process communication.
 ///
 /// ```
-/// # use stt::workload::WorkType;
+/// # use scx_ktstr::workload::WorkType;
 /// let wt = WorkType::from_name("CpuSpin").unwrap();
 /// assert!(matches!(wt, WorkType::CpuSpin));
 ///
@@ -113,7 +113,7 @@ pub enum WorkType {
     Mixed,
     /// Simulated I/O-bound workload: writes 64 KB to a temp file then
     /// sleeps 100 us to simulate I/O completion latency. On tmpfs (which
-    /// stt VMs use), the write is a page-cache memcpy and fsync is a
+    /// ktstr VMs use), the write is a page-cache memcpy and fsync is a
     /// no-op (`noop_fsync`), so the sleep provides the blocking behavior
     /// that real disk fsync would cause.
     IoSync,
@@ -384,7 +384,7 @@ impl Default for WorkloadConfig {
 /// set of worker processes.
 ///
 /// ```
-/// # use stt::workload::{Work, WorkType, SchedPolicy};
+/// # use scx_ktstr::workload::{Work, WorkType, SchedPolicy};
 /// let w = Work::default()
 ///     .workers(4)
 ///     .work_type(WorkType::bursty(50, 100))
@@ -920,7 +920,7 @@ impl WorkloadHandle {
                 reports.push(report);
             } else {
                 eprintln!(
-                    "stt: worker pid={pid} returned no report ({} bytes read)",
+                    "ktstr: worker pid={pid} returned no report ({} bytes read)",
                     buf.len()
                 );
                 reports.push(WorkerReport {
@@ -1049,7 +1049,7 @@ fn worker_main(
             WorkType::IoSync => {
                 let (f, _) = io_sync_file.get_or_insert_with(|| {
                     let path = std::env::temp_dir()
-                        .join(format!("stt_io_{tid}"))
+                        .join(format!("ktstr_io_{tid}"))
                         .to_string_lossy()
                         .to_string();
                     let f = std::fs::OpenOptions::new()
@@ -1332,7 +1332,7 @@ fn worker_main(
                             let end = Instant::now() + *dur;
                             let (f, _) = io_seq_file.get_or_insert_with(|| {
                                 let path = std::env::temp_dir()
-                                    .join(format!("stt_seq_{tid}"))
+                                    .join(format!("ktstr_seq_{tid}"))
                                     .to_string_lossy()
                                     .to_string();
                                 let f = std::fs::OpenOptions::new()
@@ -1386,7 +1386,7 @@ fn worker_main(
             }
             // If stuck >2s and not in repro mode, send SIGUSR2 to the
             // scheduler. Default POSIX disposition terminates it, which
-            // stt detects as a scheduler death. In repro mode, keep it
+            // ktstr detects as a scheduler death. In repro mode, keep it
             // alive for BPF probes.
             if gap > 2_000_000_000 && !REPRO_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 let pid = SCHED_PID.load(std::sync::atomic::Ordering::Relaxed);
@@ -2053,7 +2053,7 @@ mod tests {
         assert_eq!(reports.len(), 1);
         let tid = reports[0].tid;
         let path = std::env::temp_dir()
-            .join(format!("stt_io_{tid}"))
+            .join(format!("ktstr_io_{tid}"))
             .to_string_lossy()
             .to_string();
         assert!(

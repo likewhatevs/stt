@@ -1,6 +1,6 @@
-# stt
+# scx-ktstr
 
-stt is a test harness for Linux process schedulers, with a focus on
+scx-ktstr is a test harness for Linux process schedulers, with a focus on
 sched_ext. It boots Linux kernels in KVM virtual machines with
 controlled CPU topologies, runs workloads, and verifies scheduling
 correctness. Also tests under the kernel's default EEVDF scheduler.
@@ -10,9 +10,9 @@ correctness. Also tests under the kernel's default EEVDF scheduler.
 The simplest test calls a canned scenario:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
-#[stt_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     scenarios::steady(ctx)
 }
@@ -27,13 +27,13 @@ Without a `scheduler` attribute, tests run under EEVDF. See
 
 ## Library API
 
-The `stt::prelude` module re-exports the types needed for writing
+The `scx_ktstr::prelude` module re-exports the types needed for writing
 tests. Declare cgroups and workloads as data with `CgroupDef`:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
-#[stt_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("cg_0").workers(2),
@@ -60,7 +60,7 @@ management, `Assert` for composable assertion config, and
 
 ## Design
 
-Two principles drive stt's architecture:
+Two principles drive scx-ktstr's architecture:
 
 **Fidelity without overhead** -- every test boots a real Linux kernel
 in a KVM VM with real cgroups and real BPF programs. No mocking, no
@@ -83,7 +83,7 @@ unrolling. See [BPF Verifier](running-tests/verifier.md) for details.
 
 ## Auto-repro probe pipeline
 
-When a scheduler crashes, stt can automatically rerun the failing
+When a scheduler crashes, scx-ktstr can automatically rerun the failing
 scenario with BPF probes attached to the crash-path functions. See
 [Auto-Repro](running-tests/auto-repro.md) for details.
 
@@ -91,12 +91,12 @@ scenario with BPF probes attached to the crash-path functions. See
 
 | Crate | Purpose |
 |---|---|
-| `stt` | Core library |
-| `stt-macros` | `#[stt_test]` and `#[derive(Scheduler)]` proc macros |
-| `stt-sched` | Minimal BPF scheduler for testing |
+| `scx-ktstr` | Core library |
+| `scx-ktstr-macros` | `#[ktstr_test]` and `#[derive(Scheduler)]` proc macros |
+| `scx-ktstr-sched` | Minimal BPF scheduler for testing |
 
 ## Kernel config
 
-`stt.kconfig` in the repo root contains the kernel config fragment
+`ktstr.kconfig` in the repo root contains the kernel config fragment
 needed for scheduler testing (sched_ext, BPF, kprobes, cgroups).
 Copy it to your kernel source tree and run `make olddefconfig`.

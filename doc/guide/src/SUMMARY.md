@@ -20,7 +20,7 @@
   - [TestTopology](concepts/topology.md)
   - [Performance Mode](concepts/performance-mode.md)
 - [Writing Tests](writing-tests.md)
-  - [The #\[stt_test\] Macro](writing-tests/stt-test-macro.md)
+  - [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md)
   - [Custom Scenarios](writing-tests/custom-scenarios.md)
   - [Scheduler Definitions](writing-tests/scheduler-definitions.md)
 

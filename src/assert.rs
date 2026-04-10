@@ -8,7 +8,7 @@
 //! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->
 //! `Scheduler.assert` -> per-test `assert`.
 //!
-//! See the [Verification](https://likewhatevs.github.io/stt/guide/concepts/verification.html)
+//! See the [Verification](https://likewhatevs.github.io/scx-ktstr/guide/concepts/verification.html)
 //! chapter of the guide.
 
 use crate::workload::WorkerReport;
@@ -32,7 +32,7 @@ fn spread_threshold_pct() -> f64 {
 /// [`merge()`](AssertResult::merge).
 ///
 /// ```
-/// # use stt::assert::AssertResult;
+/// # use scx_ktstr::assert::AssertResult;
 /// let mut a = AssertResult::pass();
 /// assert!(a.passed);
 ///
@@ -357,7 +357,7 @@ impl AssertPlan {
 /// Merge order: `Assert::default_checks()` -> `Scheduler.assert` -> per-test `assert`.
 ///
 /// ```
-/// # use stt::assert::Assert;
+/// # use scx_ktstr::assert::Assert;
 /// // Start from defaults, override imbalance threshold.
 /// let sched_assert = Assert::NONE.max_imbalance_ratio(5.0);
 ///
@@ -667,8 +667,8 @@ impl Assert {
 /// failure with the unexpected CPU IDs listed.
 ///
 /// ```
-/// # use stt::assert::assert_isolation;
-/// # use stt::workload::WorkerReport;
+/// # use scx_ktstr::assert::assert_isolation;
+/// # use scx_ktstr::workload::WorkerReport;
 /// # use std::collections::BTreeSet;
 /// # let report = WorkerReport {
 /// #     tid: 1, cpus_used: [0, 1].into_iter().collect(),
@@ -698,8 +698,8 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// Check one cgroup's workers. Returns per-cgroup stats.
 ///
 /// ```
-/// # use stt::assert::assert_not_starved;
-/// # use stt::workload::WorkerReport;
+/// # use scx_ktstr::assert::assert_not_starved;
+/// # use scx_ktstr::workload::WorkerReport;
 /// # let report = WorkerReport {
 /// #     tid: 1, cpus_used: [0].into_iter().collect(),
 /// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 5_000_000_000,
@@ -874,8 +874,8 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 /// `min_rate`: minimum work_units per CPU-second. `None` skips the floor check.
 ///
 /// ```
-/// # use stt::assert::assert_throughput_parity;
-/// # use stt::workload::WorkerReport;
+/// # use scx_ktstr::assert::assert_throughput_parity;
+/// # use scx_ktstr::workload::WorkerReport;
 /// # let mk = |units, cpu_ns| WorkerReport {
 /// #     tid: 1, cpus_used: [0].into_iter().collect(),
 /// #     work_units: units, cpu_time_ns: cpu_ns, wall_time_ns: cpu_ns,
@@ -948,8 +948,8 @@ pub fn assert_throughput_parity(
 /// and minimum iteration rate.
 ///
 /// ```
-/// # use stt::assert::assert_benchmarks;
-/// # use stt::workload::WorkerReport;
+/// # use scx_ktstr::assert::assert_benchmarks;
+/// # use scx_ktstr::workload::WorkerReport;
 /// # let report = WorkerReport {
 /// #     tid: 1, cpus_used: [0].into_iter().collect(),
 /// #     work_units: 1000, cpu_time_ns: 2_500_000_000,

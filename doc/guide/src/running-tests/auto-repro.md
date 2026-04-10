@@ -7,7 +7,7 @@ each point in the crash path.
 
 ## How it works
 
-1. **First VM** -- the test runs normally. If the scheduler crashes, stt
+1. **First VM** -- the test runs normally. If the scheduler crashes, scx-ktstr
    captures the stack trace from the scenario output.
 
 2. **Stack extraction** -- function names are parsed from the crash
@@ -15,7 +15,7 @@ each point in the crash path.
    short names extracted. Generic functions (scheduler entry points,
    spinlocks, syscall handlers) are filtered out.
 
-3. **BPF discovery** -- for BPF functions, stt discovers loaded
+3. **BPF discovery** -- for BPF functions, scx-ktstr discovers loaded
    struct_ops programs via libbpf-rs and adds their kernel-side callers
    (e.g. `enqueue` -> `do_enqueue_task`) for bridge kprobes.
 
@@ -25,7 +25,7 @@ each point in the crash path.
    resolved to byte offsets. Unknown BPF-local types (e.g. task_ctx)
    have scalar and cpumask pointer fields auto-discovered.
 
-5. **Second VM** -- stt boots a new VM and reruns the scenario with two
+5. **Second VM** -- scx-ktstr boots a new VM and reruns the scenario with two
    BPF skeletons:
    - Kprobe skeleton for kernel functions (uses `bpf_get_func_ip`)
    - Fentry skeleton for BPF callbacks (batched in groups of 4,
@@ -38,18 +38,18 @@ each point in the crash path.
 
 ## Enabling auto-repro
 
-In `#[stt_test]`:
+In `#[ktstr_test]`:
 
 ```rust,ignore
-#[stt_test(auto_repro = true)]
+#[ktstr_test(auto_repro = true)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> { ... }
 ```
 
-`auto_repro` defaults to `true` in `#[stt_test]`.
+`auto_repro` defaults to `true` in `#[ktstr_test]`.
 
 ## Repro mode
 
-During the second VM run, stt sets "repro mode" which disables the
+During the second VM run, scx-ktstr sets "repro mode" which disables the
 work-conservation watchdog. Workers normally send SIGUSR2 to the
 scheduler when stuck > 2 seconds. In repro mode, the scheduler stays
 alive so BPF assertion probes can fire.
@@ -61,7 +61,7 @@ via BPF map write and captures the scheduling path. Probe output shows
 each function with decoded struct fields and source locations:
 
 ```text
-stt_test 'demo_host_crash_auto_repro' [sched=stt-sched] failed:
+ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr-sched] failed:
   scheduler died
 
 --- auto-repro ---
@@ -113,8 +113,8 @@ stt_test 'demo_host_crash_auto_repro' [sched=stt-sched] failed:
 The `demo_host_crash_auto_repro` test:
 
 ```rust,ignore
-use stt::prelude::*;
-use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
+use scx_ktstr::prelude::*;
+use scx_ktstr::test_support::{BpfMapWrite, KtstrTestEntry, run_ktstr_test};
 
 fn scenario(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(

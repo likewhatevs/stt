@@ -199,7 +199,7 @@ pub(crate) fn open_stats_context(vcpus: &[kvm_ioctls::VcpuFd]) -> Option<StatsCo
 mod tests {
     use super::*;
     use crate::vmm::topology::Topology;
-    use crate::vmm::x86_64::kvm::SttKvm;
+    use crate::vmm::x86_64::kvm::KtstrKvm;
 
     #[test]
     fn stats_fd_returns_some_on_modern_kernel() {
@@ -208,7 +208,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vm_fd) {
             assert!(fd.as_raw_fd() >= 0);
         }
@@ -221,7 +221,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
             assert!(fd.as_raw_fd() >= 0);
         }
@@ -234,7 +234,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
             let buf = read_initial(fd.as_raw_fd()).unwrap();
             let meta = parse_meta_from_buf(&buf).unwrap();
@@ -250,7 +250,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
             let buf = read_initial(fd.as_raw_fd()).unwrap();
             let meta = parse_meta_from_buf(&buf).unwrap();
@@ -267,7 +267,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(reader) = VcpuStatsReader::open(&vm.vcpus[0]) {
             let snap = reader.read_snapshot();
             assert!(snap.contains_key("exits"), "should contain 'exits'");
@@ -281,7 +281,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(ctx) = open_stats_context(&vm.vcpus) {
             assert_eq!(ctx.readers.len(), 2);
             let stats = ctx.read_stats();

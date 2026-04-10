@@ -621,14 +621,14 @@ mod tests {
 
     #[test]
     fn setup_sregs_with_kvm() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
         assert_eq!(sregs.cr3, PML4_START);
@@ -639,14 +639,14 @@ mod tests {
 
     #[test]
     fn setup_regs_with_kvm() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
         setup_regs(&vm.vcpus[0], KERNEL_LOAD_ADDR).unwrap();
         let regs = vm.vcpus[0].get_regs().unwrap();
@@ -657,14 +657,14 @@ mod tests {
 
     #[test]
     fn setup_fpu_with_kvm() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_fpu(&vm.vcpus[0]).unwrap();
         let fpu = vm.vcpus[0].get_fpu().unwrap();
         assert_eq!(fpu.fcw, 0x37f);
@@ -672,14 +672,14 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_kvm() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_msrs(&vm.vcpus[0], None).unwrap();
         // Verify MISC_ENABLE was set
         let mut msrs = kvm_bindings::Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
@@ -699,14 +699,14 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_extra_override() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         // Override MISC_ENABLE to disable FAST_STRING
         let extra = [kvm_bindings::kvm_msr_entry {
             index: MSR_IA32_MISC_ENABLE,
@@ -730,14 +730,14 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_extra_append() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         // Append a new MSR (IA32_EFER = 0xC0000080)
         let extra = [kvm_bindings::kvm_msr_entry {
             index: 0xC000_0080,
@@ -756,14 +756,14 @@ mod tests {
 
     #[test]
     fn setup_lapic_bsp() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_lapic(&vm.vcpus[0], true).unwrap();
         let lapic = vm.vcpus[0].get_lapic().unwrap();
         let lvt0 = get_klapic_reg(&lapic, APIC_LVT0);
@@ -782,14 +782,14 @@ mod tests {
 
     #[test]
     fn setup_lapic_ap_masked() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_lapic(&vm.vcpus[1], false).unwrap();
         let lapic = vm.vcpus[1].get_lapic().unwrap();
         let lvt0 = get_klapic_reg(&lapic, APIC_LVT0);
@@ -862,14 +862,14 @@ mod tests {
 
     #[test]
     fn cr0_no_host_bits() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
         // CR0 should be exactly PE|PG — no NW/CD bits from host
@@ -891,14 +891,14 @@ mod tests {
 
     #[test]
     fn setup_sregs_x2apic_disabled() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
         assert_eq!(
@@ -910,14 +910,14 @@ mod tests {
 
     #[test]
     fn setup_sregs_x2apic_enabled() {
-        use crate::vmm::kvm::SttKvm;
+        use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = SttKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], true).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
         assert_ne!(

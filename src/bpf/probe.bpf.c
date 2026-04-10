@@ -36,39 +36,39 @@ struct {
 } events SEC(".maps");
 
 /* Global enable flag. Set by userspace after all probes attached. */
-volatile const bool stt_enabled = false;
+volatile const bool ktstr_enabled = false;
 
 /* Diagnostic counters — readable from userspace after drain. */
-u64 stt_trigger_count = 0;
-u64 stt_probe_count = 0;
-u64 stt_meta_miss = 0;
+u64 ktstr_trigger_count = 0;
+u64 ktstr_probe_count = 0;
+u64 ktstr_meta_miss = 0;
 
 /* Log of IPs that missed func_meta_map lookup, for diagnosis. */
-u64 stt_miss_log[MAX_MISS_LOG] = {};
-u32 stt_miss_log_idx = 0;
+u64 ktstr_miss_log[MAX_MISS_LOG] = {};
+u32 ktstr_miss_log_idx = 0;
 
 /*
  * Generic kprobe handler. Attached at runtime to each target function
  * via attach_kprobe(). Uses bpf_get_func_ip() to identify which
  * function fired, then captures args and BTF-resolved fields.
  */
-SEC("kprobe/stt_probe")
-int stt_probe(struct pt_regs *ctx)
+SEC("kprobe/ktstr_probe")
+int ktstr_probe(struct pt_regs *ctx)
 {
-	if (!stt_enabled)
+	if (!ktstr_enabled)
 		return 0;
 
-	__sync_fetch_and_add(&stt_probe_count, 1);
+	__sync_fetch_and_add(&ktstr_probe_count, 1);
 
 	u64 ip = bpf_get_func_ip(ctx);
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 
 	struct func_meta *meta = bpf_map_lookup_elem(&func_meta_map, &ip);
 	if (!meta) {
-		__sync_fetch_and_add(&stt_meta_miss, 1);
-		u32 idx = __sync_fetch_and_add(&stt_miss_log_idx, 1);
+		__sync_fetch_and_add(&ktstr_meta_miss, 1);
+		u32 idx = __sync_fetch_and_add(&ktstr_miss_log_idx, 1);
 		if (idx < MAX_MISS_LOG)
-			stt_miss_log[idx] = ip;
+			ktstr_miss_log[idx] = ip;
 		return 0;
 	}
 
@@ -141,10 +141,10 @@ int stt_probe(struct pt_regs *ctx)
  * Sends an EVENT_TRIGGER event via ring buffer with the current task
  * pointer and kernel stack.
  */
-SEC("kprobe/stt_trigger")
-int stt_trigger(struct pt_regs *ctx)
+SEC("kprobe/ktstr_trigger")
+int ktstr_trigger(struct pt_regs *ctx)
 {
-	__sync_fetch_and_add(&stt_trigger_count, 1);
+	__sync_fetch_and_add(&ktstr_trigger_count, 1);
 
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 

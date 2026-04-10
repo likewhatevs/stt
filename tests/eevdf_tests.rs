@@ -1,8 +1,8 @@
 use anyhow::Result;
-use stt::assert::AssertResult;
-use stt::scenario::Ctx;
-use stt::stt_test;
-use stt::workload::{WorkType, WorkloadConfig, WorkloadHandle};
+use scx_ktstr::assert::AssertResult;
+use scx_ktstr::ktstr_test;
+use scx_ktstr::scenario::Ctx;
+use scx_ktstr::workload::{WorkType, WorkloadConfig, WorkloadHandle};
 
 /// EEVDF spinlock-holder preemption contention test.
 ///
@@ -15,7 +15,7 @@ use stt::workload::{WorkType, WorkloadConfig, WorkloadHandle};
 /// With good scheduling, workers complete their burst quickly and
 /// scheduling gaps stay small. With aggressive preemption of short-burst
 /// workers, max_gap_ms rises and spread increases.
-#[stt_test(
+#[ktstr_test(
     sockets = 1,
     cores = 4,
     threads = 2,
@@ -29,12 +29,12 @@ fn eevdf_spinlock_contention(ctx: &Ctx) -> Result<AssertResult> {
 
     let config = WorkloadConfig {
         num_workers,
-        affinity: stt::workload::AffinityMode::None,
+        affinity: scx_ktstr::workload::AffinityMode::None,
         work_type: WorkType::Bursty {
             burst_ms: 1,
             sleep_ms: 0,
         },
-        sched_policy: stt::workload::SchedPolicy::Normal,
+        sched_policy: scx_ktstr::workload::SchedPolicy::Normal,
     };
 
     let mut handle = WorkloadHandle::spawn(&config)?;
@@ -47,7 +47,7 @@ fn eevdf_spinlock_contention(ctx: &Ctx) -> Result<AssertResult> {
     // The real signal is max_gap_ms — if preemption during bursts causes
     // cascading contention, gaps spike. Spread check is relaxed via the
     // default threshold; gap check is enforced via Assert::max_gap_ms(2000).
-    let checks = stt::assert::Assert::default_checks()
+    let checks = scx_ktstr::assert::Assert::default_checks()
         .max_gap_ms(2000)
         .max_spread_pct(80.0);
     Ok(checks.assert_cgroup(&reports, None))

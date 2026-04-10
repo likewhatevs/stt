@@ -1,11 +1,11 @@
 [package]
-name = "stt-sched"
+name = "scx-ktstr-sched"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-2.0-only"
-repository = "https://github.com/likewhatevs/stt"
-description = "Minimal BPF scheduler for stt integration tests"
+repository = "https://github.com/likewhatevs/scx-ktstr"
+description = "Minimal BPF scheduler for scx-ktstr integration tests"
 keywords = ["sched_ext", "scheduler", "bpf"]
 categories = ["development-tools::testing"]
 publish = false

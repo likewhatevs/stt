@@ -3,11 +3,11 @@
 ## /dev/kvm not accessible
 
 ```text
-/dev/kvm not accessible — KVM is required for stt_test.
+/dev/kvm not accessible — KVM is required for ktstr_test.
 Check that KVM is enabled and your user is in the kvm group.
 ```
 
-stt boots Linux kernels in KVM virtual machines. The host must have
+scx-ktstr boots Linux kernels in KVM virtual machines. The host must have
 KVM enabled and the user must have read+write access to `/dev/kvm`.
 
 **Fixes:**
@@ -20,32 +20,32 @@ KVM enabled and the user must have read+write access to `/dev/kvm`.
 ## No kernel found
 
 ```text
-no kernel found. Set STT_TEST_KERNEL or build one at ../linux/
+no kernel found. Set KTSTR_TEST_KERNEL or build one at ../linux/
 ```
 
-stt needs a bootable Linux kernel image (bzImage). See
+scx-ktstr needs a bootable Linux kernel image (bzImage). See
 [Kernel discovery](getting-started.md#kernel-discovery) for the
 search order.
 
 **Fixes:**
 
-- Build a kernel using `stt.kconfig` (see
+- Build a kernel using `ktstr.kconfig` (see
   [Getting Started](getting-started.md#build-a-kernel)).
-- Set `STT_TEST_KERNEL` to an explicit path.
+- Set `KTSTR_TEST_KERNEL` to an explicit path.
 - Build a kernel in a sibling `linux/` directory.
 - The host's installed kernel works for basic testing.
 
 ## Scheduler not found
 
 ```text
-scheduler 'scx_mitosis' not found. Set STT_SCHEDULER or
+scheduler 'scx_mitosis' not found. Set KTSTR_SCHEDULER or
 place it next to the test binary or in target/{debug,release}/
 ```
 
-When using `SchedulerSpec::Name`, stt searches for the scheduler
+When using `SchedulerSpec::Name`, scx-ktstr searches for the scheduler
 binary in:
 
-1. `STT_SCHEDULER` environment variable.
+1. `KTSTR_SCHEDULER` environment variable.
 2. Same directory as the test binary.
 3. `target/debug/`.
 4. `target/release/`.
@@ -53,8 +53,8 @@ binary in:
 **Fixes:**
 
 - Build the scheduler first: `cargo build -p scx_mitosis`.
-- Set `STT_SCHEDULER=/path/to/binary`.
-- Use `SchedulerSpec::Path` for an explicit path in `#[stt_test]`.
+- Set `KTSTR_SCHEDULER=/path/to/binary`.
+- Use `SchedulerSpec::Path` for an explicit path in `#[ktstr_test]`.
 
 ## Scheduler died
 
@@ -191,7 +191,7 @@ Common causes:
   `/dev/kvm` access.
 - **Fewer CPUs**: gauntlet topology presets up to 252 CPUs may
   exceed the runner's capacity. Use smaller topologies.
-- **No kernel**: set `STT_TEST_KERNEL` in the CI environment.
+- **No kernel**: set `KTSTR_TEST_KERNEL` in the CI environment.
 - **Debug thresholds**: CI often runs debug builds. Debug builds use
   relaxed thresholds (3000ms gap, 35% spread) but may still hit
   limits on slow runners. See

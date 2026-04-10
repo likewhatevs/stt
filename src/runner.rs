@@ -1,6 +1,6 @@
 //! Scenario execution engine with scheduler lifecycle management.
 //!
-//! See the [Running Tests](https://likewhatevs.github.io/stt/guide/running-tests.html)
+//! See the [Running Tests](https://likewhatevs.github.io/scx-ktstr/guide/running-tests.html)
 //! chapter of the guide.
 
 use anyhow::{Context, Result, bail};
@@ -53,7 +53,7 @@ impl Default for RunConfig {
         Self {
             scheduler_bin: None,
             scheduler_args: Vec::new(),
-            parent_cgroup: "/sys/fs/cgroup/stt".into(),
+            parent_cgroup: "/sys/fs/cgroup/ktstr".into(),
             duration: Duration::from_secs(20),
             workers_per_cgroup: 4,
             json: false,
@@ -361,7 +361,7 @@ impl Runner {
                                     let stack_fns = extract_stack_functions_all(&dump);
                                     if !stack_fns.is_empty() {
                                         let stack_path = std::env::temp_dir().join(format!(
-                                            "stt-crash-stack-{}.txt",
+                                            "ktstr-crash-stack-{}.txt",
                                             std::process::id()
                                         ));
                                         let stack_text: String = stack_fns
@@ -438,7 +438,7 @@ pub struct SchedulerProcess {
 impl SchedulerProcess {
     fn start(bin: &str, args: &[String]) -> Result<Self> {
         let stderr_path =
-            std::env::temp_dir().join(format!("stt-sched-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("ktstr-sched-{}.log", std::process::id()));
         let stderr_file = std::fs::File::create(&stderr_path)?;
         let child = Command::new(bin)
             .args(args)
@@ -594,7 +594,7 @@ mod tests {
         // Spawn a long-running process, wrap in SchedulerProcess, call stop(),
         // verify it terminates within a reasonable time (SIGTERM -> poll -> SIGKILL).
         let stderr_path =
-            std::env::temp_dir().join(format!("stt-test-stop-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("ktstr-test-stop-{}.log", std::process::id()));
         let stderr_file = std::fs::File::create(&stderr_path).unwrap();
         let child = Command::new("sleep")
             .arg("999")
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn scheduler_process_read_stderr_empty() {
         let stderr_path =
-            std::env::temp_dir().join(format!("stt-test-stderr-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("ktstr-test-stderr-{}.log", std::process::id()));
         std::fs::write(&stderr_path, "").unwrap();
         let child = Command::new("true")
             .stdout(Stdio::null())
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn scheduler_process_read_stderr_content() {
         let stderr_path =
-            std::env::temp_dir().join(format!("stt-test-stderr2-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("ktstr-test-stderr2-{}.log", std::process::id()));
         std::fs::write(&stderr_path, "error: scheduler died").unwrap();
         let child = Command::new("true")
             .stdout(Stdio::null())
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn scheduler_process_pid() {
         let stderr_path =
-            std::env::temp_dir().join(format!("stt-test-pid-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("ktstr-test-pid-{}.log", std::process::id()));
         let stderr_file = std::fs::File::create(&stderr_path).unwrap();
         let child = Command::new("sleep")
             .arg("999")
@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn scheduler_process_start_and_immediate_death() {
         let stderr_path =
-            std::env::temp_dir().join(format!("stt-test-death-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("ktstr-test-death-{}.log", std::process::id()));
         let stderr_file = std::fs::File::create(&stderr_path).unwrap();
         let child = Command::new("false") // exits immediately with code 1
             .stdout(Stdio::null())
@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn scheduler_process_drop_stops_child() {
         let stderr_path =
-            std::env::temp_dir().join(format!("stt-test-drop-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("ktstr-test-drop-{}.log", std::process::id()));
         let stderr_file = std::fs::File::create(&stderr_path).unwrap();
         let child = Command::new("sleep")
             .arg("999")
@@ -968,7 +968,7 @@ mod tests {
         let config = RunConfig {
             scheduler_bin: Some("scx_mitosis".into()),
             scheduler_args: vec!["--arg".into()],
-            parent_cgroup: "/sys/fs/cgroup/stt".into(),
+            parent_cgroup: "/sys/fs/cgroup/ktstr".into(),
             duration: Duration::from_secs(10),
             workers_per_cgroup: 4,
             json: true,
@@ -1031,7 +1031,7 @@ mod tests {
         // Exercises the combined stop+read path: after stopping a process
         // that wrote nothing to stderr, read_stderr returns empty.
         let stderr_path =
-            std::env::temp_dir().join(format!("stt-test-stop-read-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("ktstr-test-stop-read-{}.log", std::process::id()));
         let stderr_file = std::fs::File::create(&stderr_path).unwrap();
         let child = Command::new("sleep")
             .arg("999")

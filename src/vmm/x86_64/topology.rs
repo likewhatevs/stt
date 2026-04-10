@@ -73,8 +73,8 @@ pub fn core_shift(topo: &Topology) -> u32 {
 /// When `performance_mode` is true, sets KVM_HINTS_REALTIME (CPUID leaf
 /// 0x40000001 EDX bit 0). This disables PV spinlocks, PV TLB flush, and
 /// PV sched_yield in the guest, and enables haltpoll cpuidle. PV spinlocks
-/// require CONFIG_PARAVIRT_SPINLOCKS (not in stt.kconfig, so no-op for
-/// stt guests).
+/// require CONFIG_PARAVIRT_SPINLOCKS (not in ktstr.kconfig, so no-op for
+/// ktstr guests).
 pub fn generate_cpuid(
     base_cpuid: &[kvm_cpuid_entry2],
     topo: &Topology,
@@ -239,7 +239,7 @@ pub fn generate_cpuid(
     // KVM_HINTS_REALTIME: CPUID leaf 0x40000001 EDX bit 0.
     // Disables PV spinlocks, PV TLB flush, and PV sched_yield in the
     // guest, and enables haltpoll cpuidle. PV spinlocks require
-    // CONFIG_PARAVIRT_SPINLOCKS (not in stt.kconfig, so no-op for stt
+    // CONFIG_PARAVIRT_SPINLOCKS (not in ktstr.kconfig, so no-op for ktstr
     // guests). Only set in performance_mode to avoid disabling PV
     // optimizations in functional tests.
     if performance_mode {

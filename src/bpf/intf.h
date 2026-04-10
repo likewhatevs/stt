@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef __STT_INTF_H
-#define __STT_INTF_H
+#ifndef __KTSTR_INTF_H
+#define __KTSTR_INTF_H
 
 #define MAX_ARGS 6
 #define MAX_FIELDS 16
@@ -62,4 +62,4 @@ struct probe_event {
 	unsigned int kstack_sz;
 };
 
-#endif /* __STT_INTF_H */
+#endif /* __KTSTR_INTF_H */

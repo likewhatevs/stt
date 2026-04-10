@@ -1,4 +1,4 @@
-name: Setup stt build environment
+name: Setup scx-ktstr build environment
 description: Install clang-20, bpftool, Rust toolchain, sccache, and optionally KVM + debug symbols
 
 inputs:

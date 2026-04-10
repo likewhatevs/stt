@@ -1,6 +1,6 @@
 # Core Concepts
 
-stt tests compose from four layers:
+scx-ktstr tests compose from four layers:
 
 1. **Scenarios** -- what to test: cgroup layout, CPU partitioning,
    workloads, custom logic.

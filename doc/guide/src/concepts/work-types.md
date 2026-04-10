@@ -37,7 +37,7 @@ scheduler wake/sleep paths.
 voluntary preemption.
 
 **`IoSync`** -- writes 64 KB to a temp file then sleeps 100 us to
-simulate I/O completion latency. On tmpfs (which stt VMs use), fsync
+simulate I/O completion latency. On tmpfs (which ktstr VMs use), fsync
 is a kernel no-op and writes go to page cache, so the sleep provides
 the blocking that real disk I/O would cause. Exercises scheduler
 dequeue/requeue paths and page allocator pressure.

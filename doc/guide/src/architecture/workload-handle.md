@@ -5,7 +5,7 @@ manages the lifecycle of forked workers: spawning, start signaling,
 stop/collection, and cleanup.
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
 #[must_use = "dropping a WorkloadHandle immediately kills all worker processes"]
 pub struct WorkloadHandle { /* ... */ }

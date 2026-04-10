@@ -56,7 +56,7 @@ Use `#[derive(Scheduler)]` on an enum whose variants are the
 scheduler's flags:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
 #[derive(Scheduler)]
 #[scheduler(
@@ -95,7 +95,7 @@ The const builder pattern still works for cases where the derive
 doesn't fit:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
 static MY_LLC: FlagDecl = FlagDecl {
     name: "llc",
@@ -126,7 +126,7 @@ creates the directory before starting the scheduler, and
 In the derive:
 
 ```rust,ignore
-#[scheduler(cgroup_parent = "/stt")]
+#[scheduler(cgroup_parent = "/ktstr")]
 ```
 
 Or manually:
@@ -135,11 +135,11 @@ Or manually:
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
     .topology(2, 4, 1)
-    .cgroup_parent("/stt");
+    .cgroup_parent("/ktstr");
 ```
 
-This creates `/sys/fs/cgroup/stt` in the guest and passes
-`--cell-parent-cgroup /stt` to the scheduler binary.
+This creates `/sys/fs/cgroup/ktstr` in the guest and passes
+`--cell-parent-cgroup /ktstr` to the scheduler binary.
 
 ## Scheduler args
 
@@ -159,7 +159,7 @@ Or manually:
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
     .topology(2, 4, 1)
-    .cgroup_parent("/stt")
+    .cgroup_parent("/ktstr")
     .sched_args(&["--exit-dump-len", "1048576"]);
 ```
 
@@ -169,9 +169,9 @@ per-test `extra_sched_args`, then flag-derived args.
 ## Default topology
 
 `Scheduler.topology` sets the default VM topology for all tests using
-this scheduler. When `#[stt_test]` omits `sockets`, `cores`, and
+this scheduler. When `#[ktstr_test]` omits `sockets`, `cores`, and
 `threads`, the scheduler's topology is used. Explicit attributes on
-`#[stt_test]` override the scheduler default.
+`#[ktstr_test]` override the scheduler default.
 
 In the derive:
 
@@ -187,7 +187,7 @@ dimensions. Unset dimensions still inherit from the scheduler:
 
 ```rust,ignore
 // Inherits sockets=2, cores=4 from MITOSIS; overrides threads to 2
-#[stt_test(scheduler = MITOSIS, threads = 2)]
+#[ktstr_test(scheduler = MITOSIS, threads = 2)]
 fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
@@ -197,7 +197,7 @@ Each enum variant is a flag. `#[flag(args)]` lists CLI arguments
 passed when the flag is active. `#[flag(requires)]` declares
 dependencies. See [Flags](../concepts/flags.md) for dependency
 semantics, profile generation, and using flags in
-[`#[stt_test]`](stt-test-macro.md#flag-constraints).
+[`#[ktstr_test]`](ktstr-test-macro.md#flag-constraints).
 
 ## Flag scoping
 
@@ -227,7 +227,7 @@ use `SchedulerSpec::KernelBuiltin` with shell commands to
 activate/deactivate the scheduler:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
 static MINLAT_LLC: FlagDecl = FlagDecl {
     name: "llc",

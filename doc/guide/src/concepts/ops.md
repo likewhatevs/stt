@@ -181,7 +181,7 @@ Equivalent to `execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])`.
 `execute_steps` is a convenience wrapper that passes `None`.
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
 fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let assertions = Assert::NONE

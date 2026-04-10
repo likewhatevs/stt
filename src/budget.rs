@@ -1,12 +1,12 @@
 //! Budget-based test selection via greedy coverage maximization.
 //!
-//! When `STT_BUDGET_SECS` is set during `--list`, selects the subset of
+//! When `KTSTR_BUDGET_SECS` is set during `--list`, selects the subset of
 //! tests that maximizes feature coverage within the time budget. Each
 //! test is encoded as a bitset feature vector capturing scheduler, flags,
 //! topology, and workload properties. The greedy algorithm picks tests
 //! with the highest marginal-coverage-per-second ratio.
 
-use crate::test_support::SttTestEntry;
+use crate::test_support::KtstrTestEntry;
 use crate::vmm::topology::Topology;
 
 /// A test candidate for budget selection.
@@ -121,12 +121,12 @@ fn workers_bucket(workers: u32) -> u64 {
     if workers <= 2 { 0 } else { 1 }
 }
 
-/// Extract feature bitset from an SttTestEntry and topology.
+/// Extract feature bitset from an KtstrTestEntry and topology.
 ///
 /// `active_flags` is the flag profile for gauntlet variants (empty for
 /// base tests). `is_gauntlet` distinguishes base from gauntlet variants.
 pub(crate) fn extract_features(
-    entry: &SttTestEntry,
+    entry: &KtstrTestEntry,
     topo: &Topology,
     active_flags: &[&str],
     is_gauntlet: bool,
@@ -188,7 +188,7 @@ pub(crate) fn extract_features(
 /// Derived from the boot overhead in `vm::compute_timeout`.
 ///
 /// Host-only tests run without a VM: `duration + 2`.
-pub(crate) fn estimate_duration(entry: &SttTestEntry, topo: &Topology) -> f64 {
+pub(crate) fn estimate_duration(entry: &KtstrTestEntry, topo: &Topology) -> f64 {
     let duration_secs = entry.duration.as_secs();
     if entry.host_only {
         return (duration_secs + 2) as f64;
@@ -422,9 +422,9 @@ mod tests {
 
     #[test]
     fn extract_features_base_test() {
-        use crate::test_support::SttTestEntry;
+        use crate::test_support::KtstrTestEntry;
 
-        let entry = SttTestEntry::DEFAULT;
+        let entry = KtstrTestEntry::DEFAULT;
         let topo = Topology {
             sockets: 1,
             cores_per_socket: 2,
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn extract_features_smt_set() {
-        let entry = SttTestEntry::DEFAULT;
+        let entry = KtstrTestEntry::DEFAULT;
         let topo = Topology {
             sockets: 2,
             cores_per_socket: 2,
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn extract_features_gauntlet() {
-        let entry = SttTestEntry::DEFAULT;
+        let entry = KtstrTestEntry::DEFAULT;
         let topo = Topology {
             sockets: 4,
             cores_per_socket: 4,
@@ -470,9 +470,9 @@ mod tests {
 
     #[test]
     fn extract_features_required_flags() {
-        let entry = SttTestEntry {
+        let entry = KtstrTestEntry {
             required_flags: &["borrow", "rebal"],
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
         let topo = Topology {
             sockets: 1,
@@ -487,9 +487,9 @@ mod tests {
 
     #[test]
     fn estimate_duration_small_topo() {
-        let entry = SttTestEntry {
+        let entry = KtstrTestEntry {
             duration: std::time::Duration::from_secs(2),
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
         let topo = Topology {
             sockets: 1,
@@ -502,9 +502,9 @@ mod tests {
 
     #[test]
     fn estimate_duration_large_topo() {
-        let entry = SttTestEntry {
+        let entry = KtstrTestEntry {
             duration: std::time::Duration::from_secs(5),
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
         let topo = Topology {
             sockets: 14,
@@ -518,10 +518,10 @@ mod tests {
 
     #[test]
     fn estimate_duration_performance_mode() {
-        let entry = SttTestEntry {
+        let entry = KtstrTestEntry {
             duration: std::time::Duration::from_secs(2),
             performance_mode: true,
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
         let topo = Topology {
             sockets: 1,
@@ -743,10 +743,10 @@ mod tests {
 
     #[test]
     fn estimate_duration_host_only() {
-        let entry = SttTestEntry {
+        let entry = KtstrTestEntry {
             duration: std::time::Duration::from_secs(5),
             host_only: true,
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
         let topo = Topology {
             sockets: 14,

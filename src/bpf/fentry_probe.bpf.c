@@ -7,7 +7,7 @@
 // before load. Loading in batches of FENTRY_BATCH (4) programs per
 // skeleton instance reduces verifier passes.
 //
-// Each stt_fentry_N handler receives the raw fentry context. For
+// Each ktstr_fentry_N handler receives the raw fentry context. For
 // struct_ops BPF programs, ctx[0] is a void *ctx that points to the
 // real callback arguments packed contiguously. The handler dereferences
 // through ctx[0] to read up to 6 args, then applies BTF-resolved field
@@ -52,22 +52,22 @@ struct {
 	__uint(max_entries, MAX_FUNCS * 1024);
 } probe_data SEC(".maps");
 
-volatile const bool stt_enabled = false;
+volatile const bool ktstr_enabled = false;
 
 /* Per-slot func_idx, set via rodata before load. */
-volatile const u32 stt_fentry_func_idx_0 = 0;
-volatile const u32 stt_fentry_func_idx_1 = 0;
-volatile const u32 stt_fentry_func_idx_2 = 0;
-volatile const u32 stt_fentry_func_idx_3 = 0;
+volatile const u32 ktstr_fentry_func_idx_0 = 0;
+volatile const u32 ktstr_fentry_func_idx_1 = 0;
+volatile const u32 ktstr_fentry_func_idx_2 = 0;
+volatile const u32 ktstr_fentry_func_idx_3 = 0;
 
-u64 stt_fentry_probe_count = 0;
+u64 ktstr_fentry_probe_count = 0;
 
-static __always_inline int stt_fentry_common(unsigned long long *ctx, u32 func_idx)
+static __always_inline int ktstr_fentry_common(unsigned long long *ctx, u32 func_idx)
 {
-	if (!stt_enabled)
+	if (!ktstr_enabled)
 		return 0;
 
-	__sync_fetch_and_add(&stt_fentry_probe_count, 1);
+	__sync_fetch_and_add(&ktstr_fentry_probe_count, 1);
 
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 
@@ -151,13 +151,13 @@ static __always_inline int stt_fentry_common(unsigned long long *ctx, u32 func_i
 /* Fentry handlers use unsigned long long * to access the raw fentry
  * context. set_attach_target() retargets each slot at runtime. */
 SEC("fentry")
-int stt_fentry_0(unsigned long long *ctx) { return stt_fentry_common(ctx, stt_fentry_func_idx_0); }
+int ktstr_fentry_0(unsigned long long *ctx) { return ktstr_fentry_common(ctx, ktstr_fentry_func_idx_0); }
 
 SEC("fentry")
-int stt_fentry_1(unsigned long long *ctx) { return stt_fentry_common(ctx, stt_fentry_func_idx_1); }
+int ktstr_fentry_1(unsigned long long *ctx) { return ktstr_fentry_common(ctx, ktstr_fentry_func_idx_1); }
 
 SEC("fentry")
-int stt_fentry_2(unsigned long long *ctx) { return stt_fentry_common(ctx, stt_fentry_func_idx_2); }
+int ktstr_fentry_2(unsigned long long *ctx) { return ktstr_fentry_common(ctx, ktstr_fentry_func_idx_2); }
 
 SEC("fentry")
-int stt_fentry_3(unsigned long long *ctx) { return stt_fentry_common(ctx, stt_fentry_func_idx_3); }
+int ktstr_fentry_3(unsigned long long *ctx) { return ktstr_fentry_common(ctx, ktstr_fentry_func_idx_3); }

@@ -6,7 +6,7 @@ without hand-written `Action::Custom` functions.
 ## Basic: two phases with cpuset resize
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
 fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
@@ -35,11 +35,11 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-## Registering (stt contributors only)
+## Registering (scx-ktstr contributors only)
 
-This section applies to contributing scenarios to stt's internal
+This section applies to contributing scenarios to scx-ktstr's internal
 catalog. External test suites call scenario functions directly from
-`#[stt_test]` -- no registration needed.
+`#[ktstr_test]` -- no registration needed.
 
 Register the scenario in `all_scenarios()`. Set `num_cgroups` to 0 and
 `action` to `Custom` -- the step executor handles all cgroup creation

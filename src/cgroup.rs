@@ -1,7 +1,7 @@
 //! Cgroup v2 filesystem operations for test cgroup management.
 //!
 //! Creates, configures, and removes cgroups under a parent path
-//! (default `/sys/fs/cgroup/stt`). Provides cpuset assignment,
+//! (default `/sys/fs/cgroup/ktstr`). Provides cpuset assignment,
 //! task migration, and cleanup.
 
 use crate::topology::TestTopology;
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn create_cgroup_in_tmpdir() {
-        let dir = std::env::temp_dir().join(format!("stt-cg-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("test_cg").unwrap();
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn create_cgroup_idempotent() {
-        let dir = std::env::temp_dir().join(format!("stt-cg-idem-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-idem-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("cg_0").unwrap();
@@ -295,19 +295,19 @@ mod tests {
 
     #[test]
     fn cleanup_all_on_nonexistent() {
-        let cg = CgroupManager::new("/nonexistent/stt-test-path");
+        let cg = CgroupManager::new("/nonexistent/ktstr-test-path");
         assert!(cg.cleanup_all().is_ok());
     }
 
     #[test]
     fn remove_cgroup_nonexistent() {
-        let cg = CgroupManager::new("/nonexistent/stt-test-path");
+        let cg = CgroupManager::new("/nonexistent/ktstr-test-path");
         assert!(cg.remove_cgroup("no_such_cgroup").is_ok());
     }
 
     #[test]
     fn cleanup_removes_child_dirs() {
-        let dir = std::env::temp_dir().join(format!("stt-cg-clean-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-clean-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("a").unwrap();
@@ -325,14 +325,14 @@ mod tests {
 
     #[test]
     fn drain_tasks_nonexistent_source() {
-        let cg = CgroupManager::new("/nonexistent/stt-drain-test");
+        let cg = CgroupManager::new("/nonexistent/ktstr-drain-test");
         assert!(cg.drain_tasks("missing_cgroup").is_ok());
     }
 
     #[test]
     fn setup_non_cgroup_path() {
         // setup() on a non-cgroup path should still create the dir
-        let dir = std::env::temp_dir().join(format!("stt-setup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-setup-{}", std::process::id()));
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.setup(true).unwrap();
         assert!(dir.exists());
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn write_with_timeout_success() {
-        let dir = std::env::temp_dir().join(format!("stt-wt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-wt-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let f = dir.join("test_write");
         write_with_timeout(&f, "hello", Duration::from_secs(5)).unwrap();
@@ -357,13 +357,13 @@ mod tests {
 
     #[test]
     fn move_task_nonexistent_cgroup() {
-        let cg = CgroupManager::new("/nonexistent/stt-move-test");
+        let cg = CgroupManager::new("/nonexistent/ktstr-move-test");
         assert!(cg.move_task("no_cgroup", 1).is_err());
     }
 
     #[test]
     fn set_cpuset_empty() {
-        let dir = std::env::temp_dir().join(format!("stt-cg-cpuset-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-cpuset-{}", std::process::id()));
         let dir_a = dir.join("cg_a");
         fs::create_dir_all(&dir_a).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn move_tasks_partial_failure() {
         // move_tasks propagates non-ESRCH errors immediately
-        let cg = CgroupManager::new("/nonexistent/stt-partial");
+        let cg = CgroupManager::new("/nonexistent/ktstr-partial");
         let err = cg.move_tasks("cg", &[1, 2, 3]).unwrap_err();
         // The error comes from the first tid (write to nonexistent path)
         let msg = format!("{err:#}");
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn drain_tasks_empty_cgroup() {
-        let dir = std::env::temp_dir().join(format!("stt-cg-drain-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-drain-{}", std::process::id()));
         let dir_d = dir.join("cg_d");
         fs::create_dir_all(&dir_d).unwrap();
         // Create an empty cgroup.procs file
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn write_with_timeout_blocks_on_fifo() {
         use std::ffi::CString;
-        let dir = std::env::temp_dir().join(format!("stt-cg-fifo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-fifo-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let fifo_path = dir.join("blocked_write");
         let c_path = CString::new(fifo_path.to_str().unwrap()).unwrap();

@@ -1,8 +1,8 @@
 [book]
-title = "stt"
+title = "scx-ktstr"
 authors = ["sched-ext contributors"]
 language = "en"
 src = "src"
 
 [output.html]
-git-repository-url = "https://github.com/likewhatevs/stt"
+git-repository-url = "https://github.com/likewhatevs/scx-ktstr"

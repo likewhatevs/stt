@@ -10,7 +10,7 @@ Recipes for writing tests that verify scheduler performance gates
 `None` means "inherit from parent layer."
 
 - In the merge chain: `Assert::default_checks()` -> `Scheduler.assert`
-  -> per-test `#[stt_test]` attributes. Use with `execute_steps_with()`
+  -> per-test `#[ktstr_test]` attributes. Use with `execute_steps_with()`
   for ops-based scenarios. See
   [Verification](../concepts/verification.md#merge-layers).
 
@@ -24,16 +24,16 @@ let result = a.assert_cgroup(&reports, None);
 ## Positive benchmarking test
 
 Verify that a scheduler passes performance gates under
-`performance_mode`. Use `#[stt_test]` with Assert thresholds:
+`performance_mode`. Use `#[ktstr_test]` with Assert thresholds:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
     .topology(1, 2, 1);
 
-#[stt_test(
+#[ktstr_test(
     scheduler = MY_SCHED,
     performance_mode = true,
     duration_s = 3,
@@ -66,18 +66,18 @@ Verify that intentionally degraded scheduling fails the same gates.
 This confirms that the gates actually catch regressions rather than
 passing vacuously.
 
-Use `expect_err = true` on `#[stt_test]` to assert that the test
+Use `expect_err = true` on `#[ktstr_test]` to assert that the test
 fails. The macro wraps the test with `assert!(result.is_err())` and
 disables auto-repro automatically.
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
     .topology(1, 2, 1);
 
-#[stt_test(
+#[ktstr_test(
     scheduler = MY_SCHED,
     performance_mode = true,
     duration_s = 5,

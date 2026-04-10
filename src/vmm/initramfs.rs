@@ -88,7 +88,7 @@ fn write_entry(archive: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) -> Res
 /// process is alive.
 fn strip_debug(path: &Path) -> Result<Vec<u8>> {
     let stripped = std::env::temp_dir().join(format!(
-        "stt-stripped-{}-{:?}-{}",
+        "ktstr-stripped-{}-{:?}-{}",
         std::process::id(),
         std::thread::current().id(),
         path.file_name().unwrap_or_default().to_string_lossy()
@@ -281,7 +281,7 @@ pub fn create_initramfs(
 /// Derive an shm segment name from a content hash. Each distinct
 /// combination of payload + scheduler binaries gets its own segment.
 pub(crate) fn shm_segment_name(content_hash: u64) -> String {
-    format!("/stt-base-{content_hash:016x}")
+    format!("/ktstr-base-{content_hash:016x}")
 }
 
 /// Read-only mmap of a POSIX shared-memory segment. The mapping stays
@@ -439,7 +439,7 @@ pub fn shm_unlink_base(content_hash: u64) {
 
 /// Segment name for the compressed (gzip) version of a base initramfs.
 fn shm_gz_segment_name(content_hash: u64) -> String {
-    format!("/stt-gz-{content_hash:016x}")
+    format!("/ktstr-gz-{content_hash:016x}")
 }
 
 /// Open the compressed SHM segment and return a held fd + size.
@@ -778,7 +778,7 @@ mod tests {
     #[test]
     fn shm_segment_name_format() {
         let name = shm_segment_name(0xDEADBEEF);
-        assert!(name.starts_with("/stt-base-"));
+        assert!(name.starts_with("/ktstr-base-"));
         assert!(name.contains("deadbeef"));
     }
 
@@ -842,8 +842,8 @@ mod tests {
         let n1 = shm_segment_name(0);
         let n2 = shm_segment_name(1);
         assert_ne!(n1, n2);
-        assert!(n1.starts_with("/stt-base-"));
-        assert!(n2.starts_with("/stt-base-"));
+        assert!(n1.starts_with("/ktstr-base-"));
+        assert!(n2.starts_with("/ktstr-base-"));
     }
 
     #[test]
@@ -891,9 +891,9 @@ mod tests {
     #[test]
     fn create_initramfs_base_includes_extra_shared_libs() {
         let exe = crate::resolve_current_exe().unwrap();
-        let sched = std::path::PathBuf::from("target/debug/stt-sched");
+        let sched = std::path::PathBuf::from("target/debug/scx-ktstr-sched");
         if !sched.exists() {
-            eprintln!("skipping: stt-sched not built");
+            eprintln!("skipping: scx-ktstr-sched not built");
             return;
         }
         let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
@@ -901,7 +901,7 @@ mod tests {
         let s = String::from_utf8_lossy(&base);
         assert!(
             s.contains("lib64/libelf"),
-            "initramfs with stt-sched extra should contain libelf; \
+            "initramfs with scx-ktstr-sched extra should contain libelf; \
              resolved libs: {:?}",
             resolve_shared_libs(sched.as_path()).unwrap()
         );

@@ -26,25 +26,25 @@ cargo install cargo-nextest
 
 ## Add the dependency
 
-stt is not on crates.io. Add it as a git dependency:
+scx-ktstr is not on crates.io. Add it as a git dependency:
 
 ```toml
 [dev-dependencies]
-stt = { git = "https://github.com/likewhatevs/stt" }
+scx-ktstr = { git = "https://github.com/likewhatevs/scx-ktstr" }
 ```
 
 ## Write a test
 
-Write an `#[stt_test]` function. The
-[`prelude`](https://likewhatevs.github.io/stt/api/stt/prelude/index.html)
+Write an `#[ktstr_test]` function. The
+[`prelude`](https://likewhatevs.github.io/scx-ktstr/api/scx_ktstr/prelude/index.html)
 module re-exports the types you need.
 
 The simplest test uses a canned scenario:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
-#[stt_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     scenarios::steady(ctx)
 }
@@ -54,9 +54,9 @@ For custom cgroup topology, declare cgroups with `CgroupDef` and run
 them with `execute_defs`. This is the most common custom test pattern:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
-#[stt_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("cg_0").workers(4),
@@ -71,9 +71,9 @@ For multi-phase scenarios with dynamic topology changes, use
 `Step::with_defs` and `execute_steps`:
 
 ```rust,ignore
-use stt::prelude::*;
+use scx_ktstr::prelude::*;
 
-#[stt_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
@@ -88,8 +88,8 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 
 ## Test binary setup
 
-No special setup is needed. `#[stt_test]` functions work with both
-`cargo test` and `cargo nextest run` out of the box. The stt ctor
+No special setup is needed. `#[ktstr_test]` functions work with both
+`cargo test` and `cargo nextest run` out of the box. The scx-ktstr ctor
 automatically intercepts nextest protocol args (`--list`, `--exact`)
 for gauntlet expansion and budget-driven test selection.
 
@@ -99,9 +99,9 @@ for gauntlet expansion and budget-driven test selection.
 
 ## Kernel discovery
 
-Tests require a bootable Linux kernel. stt searches (in order):
+Tests require a bootable Linux kernel. scx-ktstr searches (in order):
 
-1. `STT_TEST_KERNEL` environment variable
+1. `KTSTR_TEST_KERNEL` environment variable
 2. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
 3. `../linux/arch/<arch>/boot/<image>` (sibling directory)
 4. `/lib/modules/$(uname -r)/vmlinuz` (installed kernel)
@@ -112,7 +112,7 @@ On x86_64, the build-tree image is `arch/x86/boot/bzImage`; on
 aarch64, `arch/arm64/boot/Image`.
 
 The host's installed kernel works for basic testing. For sched_ext
-tests, build a kernel with the stt config fragment (below). See
+tests, build a kernel with the ktstr config fragment (below). See
 [Troubleshooting](troubleshooting.md#no-kernel-found) for details.
 
 ## Run
@@ -127,14 +127,14 @@ is unavailable.
 
 ## Build a kernel
 
-`stt.kconfig` in the repo root contains a kernel config fragment
+`ktstr.kconfig` in the repo root contains a kernel config fragment
 tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
 To build a kernel from a Linux source tree:
 
 ```sh
 cd /path/to/linux
 make defconfig
-cat /path/to/stt/stt.kconfig >> .config
+cat /path/to/scx-ktstr/ktstr.kconfig >> .config
 make olddefconfig
 make -j$(nproc)
 ```

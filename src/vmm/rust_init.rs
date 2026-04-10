@@ -1,7 +1,7 @@
 /// Rust init (PID 1) for the VM guest.
 ///
 /// When the test binary is
-/// packed as `/init` in the initramfs, `stt_guest_init()` is called
+/// packed as `/init` in the initramfs, `ktstr_guest_init()` is called
 /// from the ctor or test harness `main()` when PID 1 is detected.
 /// It never returns — it mounts filesystems, starts the scheduler,
 /// dispatches the test, then reboots.
@@ -38,7 +38,7 @@ fn force_reboot() -> ! {
 /// Full guest init lifecycle. Called from the ctor or test harness
 /// `main()` when PID 1 is detected. Mounts filesystems, starts the
 /// scheduler, dispatches the test, then reboots. Never returns.
-pub(crate) fn stt_guest_init() -> ! {
+pub(crate) fn ktstr_guest_init() -> ! {
     // Panic hook: write diagnostic to COM2 then reboot.
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("PANIC: {info}\n");
@@ -62,7 +62,7 @@ pub(crate) fn stt_guest_init() -> ! {
     let _ = fs::write("/proc/sys/kernel/bpf_stats_enabled", "1");
 
     // Phase 2: Sentinel + stdio redirect.
-    write_com2("STT_INIT_STARTED");
+    write_com2("KTSTR_INIT_STARTED");
     redirect_stdio_to_com2();
 
     // Extract RUST_LOG from kernel cmdline before installing the
@@ -117,7 +117,7 @@ pub(crate) fn stt_guest_init() -> ! {
         a.extend(content.lines().map(|s| s.to_string()));
         a
     };
-    write_com2("STT_PAYLOAD_STARTING");
+    write_com2("KTSTR_PAYLOAD_STARTING");
     let code = crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1);
 
     // Flush test output before teardown. Rust's BufWriter on stdout
@@ -157,7 +157,7 @@ pub(crate) fn stt_guest_init() -> ! {
         crate::vmm::shm_ring::MSG_TYPE_EXIT,
         &(code as i32).to_ne_bytes(),
     );
-    write_com2(&format!("STT_EXIT={code}"));
+    write_com2(&format!("KTSTR_EXIT={code}"));
 
     // Drain COM2 UART after writing the exit sentinel.
     if let Ok(com2) = fs::OpenOptions::new().write(true).open(COM2) {
@@ -215,7 +215,7 @@ fn mount_filesystems() {
         if let Err(e) = result
             && required
         {
-            eprintln!("stt-init: mount {fstype} on {target}: {e}");
+            eprintln!("ktstr-init: mount {fstype} on {target}: {e}");
         }
     }
 }
@@ -244,7 +244,7 @@ fn write_com2(msg: &str) {
         // COM2 unavailable (devtmpfs mount failed or device missing).
         // Write to kernel console as fallback so the host sees
         // something on COM1.
-        eprintln!("stt-init [COM1 fallback]: {msg}");
+        eprintln!("ktstr-init [COM1 fallback]: {msg}");
     }
 }
 
@@ -326,7 +326,7 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                     dump_file_to_com2(log_path);
                     write_com2("===SCHED_OUTPUT_END===");
                     write_com2("SCHEDULER_DIED");
-                    write_com2("STT_EXIT=1");
+                    write_com2("KTSTR_EXIT=1");
                     force_reboot();
                 }
                 Ok(None) => {
@@ -334,18 +334,18 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                     (Some(child), Some(log_path.to_string()))
                 }
                 Err(e) => {
-                    eprintln!("stt-init: check scheduler status: {e}");
+                    eprintln!("ktstr-init: check scheduler status: {e}");
                     (Some(child), Some(log_path.to_string()))
                 }
             }
         }
         Err(e) => {
-            eprintln!("stt-init: spawn scheduler: {e}");
+            eprintln!("ktstr-init: spawn scheduler: {e}");
             write_com2("===SCHED_OUTPUT_START===");
             write_com2(&format!("failed to spawn: {e}"));
             write_com2("===SCHED_OUTPUT_END===");
             write_com2("SCHEDULER_DIED");
-            write_com2("STT_EXIT=1");
+            write_com2("KTSTR_EXIT=1");
             force_reboot();
         }
     }
@@ -405,7 +405,7 @@ fn start_trace_pipe() -> Option<Arc<AtomicBool>> {
 }
 
 /// Start the SHM polling loop for dump/stall requests.
-/// Reads STT_SHM_BASE and STT_SHM_SIZE from /proc/cmdline and polls
+/// Reads KTSTR_SHM_BASE and KTSTR_SHM_SIZE from /proc/cmdline and polls
 /// /dev/mem. Also initializes the SHM signal slot pointer for
 /// `shm_ring::wait_for` / `shm_ring::signal`.
 fn start_shm_poll() -> Option<Arc<AtomicBool>> {
@@ -438,7 +438,7 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool) {
     {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("stt-init: /dev/mem open failed: {e}");
+            eprintln!("ktstr-init: /dev/mem open failed: {e}");
             return;
         }
     };
@@ -447,7 +447,7 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool) {
         Some(m) => m,
         None => {
             eprintln!(
-                "stt-init: /dev/mem mmap failed: base={shm_base:#x} size={shm_size:#x} err={}",
+                "ktstr-init: /dev/mem mmap failed: base={shm_base:#x} size={shm_size:#x} err={}",
                 std::io::Error::last_os_error(),
             );
             return;
@@ -473,7 +473,7 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool) {
 
             let stall_byte = *(shm_ptr.add(stall_offset));
             if stall_byte == b'S' {
-                let _ = fs::File::create("/tmp/stt_stall");
+                let _ = fs::File::create("/tmp/ktstr_stall");
                 *(shm_ptr.add(stall_offset)) = 0;
             }
         }
@@ -517,11 +517,11 @@ fn exec_shell_line(line: &str) {
         let value = value.trim();
         let path = path.trim();
         if let Err(e) = fs::write(path, format!("{value}\n")) {
-            eprintln!("stt-init: echo '{value}' > {path}: {e}");
+            eprintln!("ktstr-init: echo '{value}' > {path}: {e}");
         }
         return;
     }
-    eprintln!("stt-init: unsupported command: {line}");
+    eprintln!("ktstr-init: unsupported command: {line}");
 }
 
 #[cfg(test)]
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn mkdir_p_creates_nested() {
-        let base = std::env::temp_dir().join("stt-rust-init-test-mkdir");
+        let base = std::env::temp_dir().join("ktstr-rust-init-test-mkdir");
         let _ = fs::remove_dir_all(&base);
         let nested = base.join("a/b/c");
         mkdir_p(nested.to_str().unwrap());
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn exec_shell_line_echo_redirect() {
-        let tmp = std::env::temp_dir().join("stt-rust-init-echo-test");
+        let tmp = std::env::temp_dir().join("ktstr-rust-init-echo-test");
         let path = tmp.to_str().unwrap();
         exec_shell_line(&format!("echo 42 > {path}"));
         let content = fs::read_to_string(&tmp).unwrap();
