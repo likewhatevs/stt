@@ -654,7 +654,7 @@ fn resolve_cpusets(
 ///
 /// When a cpuset is active, affinity masks are intersected with it so the
 /// effective `sched_setaffinity` mask matches what the kernel will enforce.
-/// Without a cpuset, the full topology is used.
+/// Without a cpuset, usable CPUs are used.
 pub fn resolve_affinity_for_cgroup(
     kind: &AffinityKind,
     cpuset: Option<&BTreeSet<usize>>,
@@ -663,12 +663,12 @@ pub fn resolve_affinity_for_cgroup(
     match kind {
         AffinityKind::Inherit => AffinityMode::None,
         AffinityKind::RandomSubset => {
-            let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
+            let pool = cpuset.cloned().unwrap_or_else(|| topo.usable_cpuset());
             let count = (pool.len() / 2).max(1);
             AffinityMode::Random { from: pool, count }
         }
         AffinityKind::LlcAligned => {
-            let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
+            let pool = cpuset.cloned().unwrap_or_else(|| topo.usable_cpuset());
             // Find the LLC that has the most overlap with the cpuset.
             let mut best_llc = topo.llc_aligned_cpuset(0);
             let mut best_overlap = best_llc.intersection(&pool).count();
@@ -696,7 +696,7 @@ pub fn resolve_affinity_for_cgroup(
             AffinityMode::Fixed(topo.all_cpuset())
         }
         AffinityKind::SingleCpu => {
-            let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
+            let pool = cpuset.cloned().unwrap_or_else(|| topo.usable_cpuset());
             if let Some(&cpu) = pool.iter().next() {
                 AffinityMode::SingleCpu(cpu)
             } else {
@@ -1026,8 +1026,8 @@ mod tests {
     #[test]
     fn resolve_affinity_llc_aligned() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        // No cpuset: both LLCs cover the full pool equally. LLC 0
-        // is found first with max overlap, so result is LLC 0 CPUs.
+        // No cpuset: usable pool = {0..6}. LLC 0 = {0,1,2,3} has 4
+        // overlap, LLC 1 = {4,5,6,7} has 3. LLC 0 wins by count.
         match resolve_affinity_kind(&AffinityKind::LlcAligned, None, 0, &t) {
             AffinityMode::Fixed(cpus) => assert_eq!(cpus, [0, 1, 2, 3].into_iter().collect()),
             other => panic!("expected Fixed, got {:?}", other),
@@ -1214,8 +1214,8 @@ mod tests {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         match resolve_affinity_kind(&AffinityKind::RandomSubset, None, 0, &t) {
             AffinityMode::Random { from, count } => {
-                assert_eq!(from.len(), 8); // all CPUs
-                assert_eq!(count, 4); // half
+                assert_eq!(from.len(), 7); // usable CPUs (last reserved)
+                assert_eq!(count, 3); // half of 7
             }
             other => panic!("expected Random, got {:?}", other),
         }

@@ -33,7 +33,7 @@ pub enum AffinityKind {
     /// No affinity constraint -- inherit from parent cgroup.
     #[default]
     Inherit,
-    /// Pin to a random subset of the cgroup's cpuset, or all CPUs if no
+    /// Pin to a random subset of the cgroup's cpuset, or usable CPUs if no
     /// cpuset is configured.
     RandomSubset,
     /// Pin to the CPUs in the worker's LLC.
