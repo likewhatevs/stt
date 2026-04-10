@@ -15,10 +15,9 @@ pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
             vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )
-        .with_ops(vec![Op::spawn_host(WorkloadConfig {
-            num_workers: ctx.topo.total_cpus(),
-            ..Default::default()
-        })]),
+        .with_ops(vec![Op::spawn_host(
+            Work::default().workers(ctx.topo.total_cpus()),
+        )]),
     ];
 
     execute_steps(ctx, steps)

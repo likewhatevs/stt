@@ -65,7 +65,10 @@ pub enum Op {
         affinity: AffinityKind,
     },
     /// Spawn workers in the parent cgroup (not in a managed cgroup).
-    SpawnHost { workload: WorkloadConfig },
+    ///
+    /// `Work` is resolved to a `WorkloadConfig` at apply time, matching
+    /// the resolution pattern used by `Op::Spawn`.
+    SpawnHost { work: Work },
     /// Move all tasks from one cgroup to another.
     ///
     /// Each task is moved via `cgroup.procs`. If any move fails, the
@@ -410,8 +413,8 @@ impl Op {
     }
 
     /// Spawn workers in the parent cgroup.
-    pub fn spawn_host(workload: WorkloadConfig) -> Self {
-        Op::SpawnHost { workload }
+    pub fn spawn_host(work: Work) -> Self {
+        Op::SpawnHost { work }
     }
 
     /// Move all tasks from one cgroup to another.
@@ -972,8 +975,16 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     }
                 }
             }
-            Op::SpawnHost { workload } => {
-                let mut h = WorkloadHandle::spawn(workload)?;
+            Op::SpawnHost { work } => {
+                let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
+                let affinity = super::resolve_affinity_for_cgroup(&work.affinity, None, ctx.topo);
+                let wl = WorkloadConfig {
+                    num_workers: n,
+                    affinity,
+                    work_type: work.work_type.clone(),
+                    sched_policy: work.sched_policy,
+                };
+                let mut h = WorkloadHandle::spawn(&wl)?;
                 h.start();
                 // Empty string key: workers in parent cgroup, not a managed cgroup.
                 state.handles.push((String::new(), h));
@@ -1197,7 +1208,7 @@ mod tests {
                 affinity: Default::default(),
             },
             Op::SpawnHost {
-                workload: Default::default(),
+                work: Default::default(),
             },
             Op::MoveAllTasks {
                 from: "a".into(),
@@ -1216,7 +1227,7 @@ mod tests {
         assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 1);
         assert_eq!(
             Op::SpawnHost {
-                workload: Default::default()
+                work: Default::default()
             }
             .discriminant(),
             8
