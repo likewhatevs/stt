@@ -4282,7 +4282,7 @@ mod tests {
         let console = "line1\nline2\nKernel panic - not syncing\n";
         let s = format_console_diagnostics(console, -1, "payload started");
         assert!(s.contains("exit_code=-1"));
-        assert!(s.contains("console (last"));
+        assert!(s.contains("console (3 lines)"));
         assert!(s.contains("Kernel panic"));
         assert!(s.contains("stage: payload started"));
         assert!(!s.contains("truncated"));
@@ -4293,7 +4293,7 @@ mod tests {
         let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
         let console = format!("{}\n", lines.join("\n"));
         let s = format_console_diagnostics(&console, 0, "test");
-        assert!(s.contains("last 20 lines"));
+        assert!(s.contains("20 lines"));
         assert!(s.contains("boot line 49"));
         assert!(!s.contains("boot line 29"));
         assert!(!s.contains("truncated"));
@@ -4303,7 +4303,7 @@ mod tests {
     fn format_console_diagnostics_short_console() {
         let console = "Linux version 6.14.0\nbooted ok\n";
         let s = format_console_diagnostics(console, 0, "test");
-        assert!(s.contains("last 2 lines"));
+        assert!(s.contains("2 lines"));
         assert!(s.contains("Linux version 6.14.0"));
         assert!(s.contains("booted ok"));
         assert!(!s.contains("truncated"));
@@ -4313,7 +4313,7 @@ mod tests {
     fn format_console_diagnostics_no_truncation_with_trailing_newline() {
         let console = "line1\nline2\nline3\n";
         let s = format_console_diagnostics(console, 0, "test");
-        assert!(s.contains("last 3 lines)"));
+        assert!(s.contains("3 lines)"));
         assert!(!s.contains("truncated"));
         assert!(!s.contains("[truncated]"));
     }
@@ -4826,9 +4826,9 @@ mod tests {
 
     #[test]
     fn eval_sched_ext_dump_included() {
-        let output = "ktstr-0 [001] 0.5: sched_ext_dump: Debug dump line";
+        let dump_line = "ktstr-0 [001] 0.5: sched_ext_dump: Debug dump line";
         let entry = sched_entry("__eval_dump__");
-        let result = make_vm_result(output, "", -1, false);
+        let result = make_vm_result("", dump_line, -1, false);
         let assertions = crate::assert::Assert::NONE;
         let err =
             evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
