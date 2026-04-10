@@ -67,7 +67,7 @@ cores=2, threads=1). See
 |---|---|---|
 | `scheduler = CONST` | `Scheduler::EEVDF` | Rust const path to a `Scheduler` definition |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler |
-| `watchdog_timeout_s` | 4 | scx watchdog override |
+| `watchdog_timeout_s` | 4 | scx watchdog override (seconds) |
 
 ### Verification
 

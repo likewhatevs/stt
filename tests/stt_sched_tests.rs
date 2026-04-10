@@ -215,7 +215,7 @@ static __STT_ENTRY_AUTO_REPRO: stt::test_support::SttTestEntry = stt::test_suppo
     func: scenario_auto_repro,
     scheduler: &STALL_SCHED,
     extra_sched_args: &["--stall-after=1"],
-    watchdog_timeout_s: 3,
+    watchdog_timeout: std::time::Duration::from_secs(3),
     duration: std::time::Duration::from_secs(10),
     workers_per_cgroup: 2,
     expect_err: true,
@@ -299,7 +299,7 @@ static __STT_ENTRY_MID_DEGRADE: stt::test_support::SttTestEntry = stt::test_supp
     performance_mode: true,
     duration: std::time::Duration::from_secs(10),
     workers_per_cgroup: 4,
-    watchdog_timeout_s: 60,
+    watchdog_timeout: std::time::Duration::from_secs(60),
     expect_err: true,
     ..stt::test_support::SttTestEntry::DEFAULT
 };

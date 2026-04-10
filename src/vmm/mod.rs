@@ -844,9 +844,9 @@ pub struct SttVm {
     /// Thresholds for reactive SysRq-D dump. When set and the monitor
     /// detects a sustained violation, it writes the dump flag to guest SHM.
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
-    /// Override for `scx_watchdog_timeout` in the guest kernel (seconds).
+    /// Override for `scx_watchdog_timeout` in the guest kernel.
     /// Converted to jiffies via CONFIG_HZ at monitor start time.
-    watchdog_timeout_s: Option<u64>,
+    watchdog_timeout: Option<Duration>,
     /// Host-side BPF map write parameters. When set, a thread polls for
     /// BPF map discoverability, waits for scenario start via SHM ring,
     /// then writes a u32 value at the specified offset.
@@ -1533,7 +1533,7 @@ impl SttVm {
                 });
 
         let hz = monitor::guest_kernel_hz(Some(&self.kernel));
-        let watchdog_jiffies = self.watchdog_timeout_s.map(|s| s * hz);
+        let watchdog_jiffies = self.watchdog_timeout.map(|d| d.as_secs() * hz);
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
         let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
@@ -2493,7 +2493,7 @@ pub struct SttVmBuilder {
     timeout: Duration,
     shm_size: u64,
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
-    watchdog_timeout_s: Option<u64>,
+    watchdog_timeout: Option<Duration>,
     bpf_map_write: Option<BpfMapWriteParams>,
     performance_mode: bool,
     sched_enable_cmds: Vec<String>,
@@ -2518,7 +2518,7 @@ impl Default for SttVmBuilder {
             timeout: Duration::from_secs(60),
             shm_size: 0,
             monitor_thresholds: None,
-            watchdog_timeout_s: Some(4),
+            watchdog_timeout: Some(Duration::from_secs(4)),
             bpf_map_write: None,
             performance_mode: false,
             sched_enable_cmds: Vec::new(),
@@ -2606,8 +2606,8 @@ impl SttVmBuilder {
     }
 
     #[allow(dead_code)]
-    pub fn watchdog_timeout_s(mut self, seconds: u64) -> Self {
-        self.watchdog_timeout_s = Some(seconds);
+    pub fn watchdog_timeout(mut self, timeout: Duration) -> Self {
+        self.watchdog_timeout = Some(timeout);
         self
     }
 
@@ -2697,7 +2697,7 @@ impl SttVmBuilder {
             timeout: self.timeout,
             shm_size: self.shm_size,
             monitor_thresholds: self.monitor_thresholds,
-            watchdog_timeout_s: self.watchdog_timeout_s,
+            watchdog_timeout: self.watchdog_timeout,
             bpf_map_write: self.bpf_map_write,
             performance_mode: self.performance_mode,
             pinning_plan,
@@ -3582,18 +3582,18 @@ mod tests {
         assert_eq!(*m.lock(), 1);
     }
 
-    // -- builder watchdog_timeout_s --
+    // -- builder watchdog_timeout --
 
     #[test]
     fn builder_watchdog_timeout_default() {
         let b = SttVmBuilder::default();
-        assert_eq!(b.watchdog_timeout_s, Some(4));
+        assert_eq!(b.watchdog_timeout, Some(Duration::from_secs(4)));
     }
 
     #[test]
     fn builder_watchdog_timeout_override() {
-        let b = SttVmBuilder::default().watchdog_timeout_s(5);
-        assert_eq!(b.watchdog_timeout_s, Some(5));
+        let b = SttVmBuilder::default().watchdog_timeout(Duration::from_secs(5));
+        assert_eq!(b.watchdog_timeout, Some(Duration::from_secs(5)));
     }
 
     #[test]

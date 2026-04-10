@@ -327,7 +327,7 @@ static __STT_ENTRY_FORCED_STALL: SttTestEntry = SttTestEntry {
     },
     scheduler: &STT_SCHED,
     extra_sched_args: &["--stall-after", "1"],
-    watchdog_timeout_s: 2,
+    watchdog_timeout: std::time::Duration::from_secs(2),
     performance_mode: true,
     expect_err: true,
     ..SttTestEntry::DEFAULT
@@ -346,7 +346,7 @@ static __STT_ENTRY_STALL_DETECT: SttTestEntry = SttTestEntry {
     scheduler: &STT_SCHED,
     auto_repro: false,
     extra_sched_args: &["--stall-after", "1"],
-    watchdog_timeout_s: 3,
+    watchdog_timeout: std::time::Duration::from_secs(3),
     expect_err: true,
     ..SttTestEntry::DEFAULT
 };
@@ -363,7 +363,7 @@ static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
     },
     scheduler: &STT_SCHED,
     extra_sched_args: &["--stall-after", "1"],
-    watchdog_timeout_s: 3,
+    watchdog_timeout: std::time::Duration::from_secs(3),
     duration: std::time::Duration::from_secs(10),
     expect_err: true,
     ..SttTestEntry::DEFAULT

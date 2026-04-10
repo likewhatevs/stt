@@ -570,7 +570,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             extra_sched_args: &[#(#extra_sched_args),*],
             required_flags: &[#(#required_flags),*],
             excluded_flags: &[#(#excluded_flags),*],
-            watchdog_timeout_s: #watchdog_timeout_s,
+            watchdog_timeout: ::std::time::Duration::from_secs(#watchdog_timeout_s),
             bpf_map_write: #bpf_map_write_tokens,
             performance_mode: #performance_mode,
             duration: ::std::time::Duration::from_secs(#duration_s),

@@ -457,8 +457,8 @@ pub struct SttTestEntry {
     pub replicas: u32,
     pub assert: crate::assert::Assert,
     pub extra_sched_args: &'static [&'static str],
-    /// scx_watchdog_timeout in the guest kernel (seconds).
-    pub watchdog_timeout_s: u64,
+    /// scx_watchdog_timeout in the guest kernel.
+    pub watchdog_timeout: Duration,
     /// Host-side BPF map write to perform during VM execution.
     pub bpf_map_write: Option<&'static BpfMapWrite>,
     /// Flags that must be present in every flag profile for this test.
@@ -520,7 +520,7 @@ impl SttTestEntry {
         replicas: 1,
         assert: crate::assert::Assert::NONE,
         extra_sched_args: &[],
-        watchdog_timeout_s: 4,
+        watchdog_timeout: Duration::from_secs(4),
         bpf_map_write: None,
         required_flags: &[],
         excluded_flags: &[],
@@ -1299,7 +1299,7 @@ fn run_stt_test_inner(
         builder = builder.sched_args(&sched_args);
     }
 
-    builder = builder.watchdog_timeout_s(entry.watchdog_timeout_s);
+    builder = builder.watchdog_timeout(entry.watchdog_timeout);
 
     if let Some(bpf_write) = entry.bpf_map_write {
         builder =
