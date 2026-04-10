@@ -117,7 +117,10 @@ pub enum WorkType {
     },
     /// Compound work pattern: loop through phases in order, repeat.
     /// Each phase runs for its duration before the next starts.
-    Sequence(Vec<Phase>),
+    Sequence {
+        first: Phase,
+        rest: Vec<Phase>,
+    },
 }
 
 impl WorkType {
@@ -149,7 +152,7 @@ impl WorkType {
             WorkType::CacheYield { .. } => "CacheYield",
             WorkType::CachePipe { .. } => "CachePipe",
             WorkType::FutexFanOut { .. } => "FutexFanOut",
-            WorkType::Sequence(_) => "Sequence",
+            WorkType::Sequence { .. } => "Sequence",
         }
     }
 
@@ -492,11 +495,6 @@ impl WorkloadHandle {
             WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
         );
         let needs_futex = config.work_type.needs_shared_mem();
-        if let WorkType::Sequence(ref phases) = config.work_type
-            && phases.is_empty()
-        {
-            anyhow::bail!("Sequence work type requires at least one phase");
-        }
         if let Some(group_size) = config.work_type.worker_group_size()
             && (config.num_workers == 0 || !config.num_workers.is_multiple_of(group_size))
         {
@@ -1267,8 +1265,11 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
-            WorkType::Sequence(ref phases) => {
-                for phase in phases {
+            WorkType::Sequence {
+                ref first,
+                ref rest,
+            } => {
+                for phase in std::iter::once(first).chain(rest.iter()) {
                     if STOP.load(Ordering::Relaxed) {
                         break;
                     }
