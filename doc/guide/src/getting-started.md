@@ -56,7 +56,7 @@ For custom cgroup topology, use the DSL:
 use stt::prelude::*;
 
 #[stt_test(sockets = 1, cores = 2, threads = 1)]
-fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0").workers(2),

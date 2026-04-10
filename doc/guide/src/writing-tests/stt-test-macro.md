@@ -117,8 +117,8 @@ Values are arrays of string literals or path expressions from
 
 // Path expressions (typed constants from derive)
 #[stt_test(
-    required_flags = [MySchedulerFlag::LLC, MySchedulerFlag::BORROW],
-    excluded_flags = [MySchedulerFlag::NO_CTRL],
+    required_flags = [MySchedFlag::LLC, MySchedFlag::BORROW],
+    excluded_flags = [MySchedFlag::NO_CTRL],
 )]
 ```
 
@@ -170,26 +170,26 @@ use stt::prelude::*;
 
 #[derive(Scheduler)]
 #[scheduler(
-    name = "my_scheduler",
-    binary = "scx_my_scheduler",
-    topology(2, 4, 2),
+    name = "my_sched",
+    binary = "scx_my_sched",
+    topology(2, 4, 1),
 )]
 #[allow(dead_code)]
-enum MySchedulerFlag {
-    #[flag(args = ["--enable-llc-awareness"])]
+enum MySchedFlag {
+    #[flag(args = ["--enable-llc"])]
     Llc,
-    #[flag(args = ["--enable-work-stealing"], requires = [Llc])]
+    #[flag(args = ["--enable-stealing"], requires = [Llc])]
     Steal,
 }
 
 #[stt_test(
-    scheduler = MY_SCHEDULER,
+    scheduler = MY_SCHED,
     not_starved = true,
     max_gap_ms = 5000,
-    required_flags = [MySchedulerFlag::LLC],
+    required_flags = [MySchedFlag::LLC],
 )]
 fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 2s4c2t from MY_SCHEDULER
+    // Inherits 2s4c1t from MY_SCHED
     Ok(AssertResult::pass())
 }
 ```

@@ -23,7 +23,7 @@ static MY_BORROW: FlagDecl = FlagDecl {
     requires: &[],
 };
 
-const RELAXED: Scheduler = Scheduler::new("relaxed_sched")
+const RELAXED: Scheduler = Scheduler::new("relaxed")
     .binary(SchedulerSpec::Name("scx_relaxed"))
     .flags(&[&MY_LLC, &MY_BORROW])
     .assert(

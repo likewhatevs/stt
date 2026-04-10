@@ -11,12 +11,12 @@ use stt::prelude::*;
 
 #[derive(Scheduler)]
 #[scheduler(
-    name = "my_scheduler",
-    binary = "scx_my_scheduler",
-    topology(2, 4, 2),
+    name = "my_sched",
+    binary = "scx_my_sched",
+    topology(2, 4, 1),
 )]
 #[allow(dead_code)]
-enum MySchedulerFlag {
+enum MySchedFlag {
     #[flag(args = ["--enable-llc"])]
     Llc,
     #[flag(args = ["--enable-stealing"], requires = [Llc])]
@@ -24,8 +24,8 @@ enum MySchedulerFlag {
 }
 ```
 
-This generates `const MY_SCHEDULER: Scheduler` and typed flag
-constants (`MySchedulerFlag::LLC`, `MySchedulerFlag::STEAL`).
+This generates `const MY_SCHED: Scheduler` and typed flag
+constants (`MySchedFlag::LLC`, `MySchedFlag::STEAL`).
 
 ## 2. Write integration tests
 
@@ -35,15 +35,15 @@ Tests inherit the scheduler's topology. Override with explicit
 ```rust,ignore
 use stt::prelude::*;
 
-#[stt_test(scheduler = MY_SCHEDULER)]
+#[stt_test(scheduler = MY_SCHED)]
 fn basic_steady(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 2s4c2t from MY_SCHEDULER
+    // Inherits 2s4c1t from MY_SCHED
     scenarios::steady(ctx)
 }
 
 #[stt_test(
-    scheduler = MY_SCHEDULER,
-    required_flags = [MySchedulerFlag::LLC],
+    scheduler = MY_SCHED,
+    required_flags = [MySchedFlag::LLC],
 )]
 fn llc_aware_test(ctx: &Ctx) -> Result<AssertResult> {
     scenarios::steady_llc(ctx)

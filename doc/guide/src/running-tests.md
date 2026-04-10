@@ -62,8 +62,8 @@ Define a `Scheduler` with `SchedulerSpec::Name` or
 `SchedulerSpec::Path` to test a pre-built scheduler binary:
 
 ```rust,ignore
-const MY_SCHED: Scheduler = Scheduler::new("scx_my_scheduler")
-    .binary(SchedulerSpec::Name("scx_my_scheduler"));
+const MY_SCHED: Scheduler = Scheduler::new("my_sched")
+    .binary(SchedulerSpec::Name("scx_my_sched"));
 ```
 
 The binary is injected into the VM's initramfs and started before

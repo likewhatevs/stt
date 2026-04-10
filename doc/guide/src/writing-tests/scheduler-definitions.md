@@ -109,7 +109,7 @@ static MY_STEAL: FlagDecl = FlagDecl {
     requires: &[&MY_LLC],
 };
 
-const MY_SCHEDULER: Scheduler = Scheduler::new("my_sched")
+const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
     .flags(&[&MY_LLC, &MY_STEAL])
     .topology(2, 4, 1)
