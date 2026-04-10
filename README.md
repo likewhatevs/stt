@@ -20,20 +20,58 @@ scheduler.
 
 ## Quick start
 
-### As a library
+### Define a scheduler
 
-Define cgroups declaratively and let the DSL handle lifecycle,
-worker spawning, and assertion:
+Use `#[derive(Scheduler)]` to declare the scheduler binary, default
+topology, and feature flags:
 
 ```rust
 use stt::prelude::*;
 
-#[stt_test(sockets = 1, cores = 2, threads = 1)]
-fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
+#[derive(Scheduler)]
+#[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
+#[allow(dead_code)]
+enum MySchedFlag {
+    #[flag(args = ["--enable-feature-a"])]
+    FeatureA,
+    #[flag(args = ["--enable-feature-b"], requires = [FeatureA])]
+    FeatureB,
+}
+```
+
+This generates a `const MY_SCHED: Scheduler` and per-variant flag
+constants. Tests referencing `MY_SCHED` inherit its topology and
+flags. Without a scheduler, tests run under EEVDF.
+
+### Write a test
+
+Declare cgroups and workloads as data with `CgroupDef` and
+`execute_defs`:
+
+```rust
+use stt::prelude::*;
+
+#[stt_test(scheduler = MY_SCHED)]
+fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("cg_0").workers(2),
+        CgroupDef::named("cg_1").workers(2),
+    ])
+}
+```
+
+For multi-step scenarios with dynamic topology changes, use
+`execute_steps` with `Step` and `HoldSpec`:
+
+```rust
+use stt::prelude::*;
+
+#[stt_test(scheduler = MY_SCHED, sockets = 1, cores = 4, threads = 1)]
+fn cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
-            CgroupDef::named("cg_0").workers(2),
-            CgroupDef::named("cg_1").workers(2),
+            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
         ],
         HoldSpec::FULL,
     )];
@@ -41,7 +79,13 @@ fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Run with `cargo nextest run` (requires `/dev/kvm`).
+### Run
+
+```sh
+cargo nextest run
+```
+
+Requires `/dev/kvm`.
 
 ## Documentation
 
