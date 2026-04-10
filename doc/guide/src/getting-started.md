@@ -102,11 +102,14 @@ for gauntlet expansion and budget-driven test selection.
 Tests require a bootable Linux kernel. stt searches (in order):
 
 1. `STT_TEST_KERNEL` environment variable
-2. `./linux/arch/x86/boot/bzImage` (workspace-local build tree)
-3. `../linux/arch/x86/boot/bzImage` (sibling directory)
+2. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
+3. `../linux/arch/<arch>/boot/<image>` (sibling directory)
 4. `/lib/modules/$(uname -r)/vmlinuz` (installed kernel)
 5. `/boot/vmlinuz-$(uname -r)`
 6. `/boot/vmlinuz` (unversioned symlink)
+
+On x86_64, the build-tree image is `arch/x86/boot/bzImage`; on
+aarch64, `arch/arm64/boot/Image`.
 
 The host's installed kernel works for basic testing. For sched_ext
 tests, build a kernel with the stt config fragment (below). See
