@@ -17,7 +17,7 @@ use anyhow::Result;
 
 use crate::assert::AssertResult;
 use crate::vmm::shm_ring::{self, StimulusPayload};
-use crate::workload::{Work, WorkType, WorkloadConfig, WorkloadHandle};
+use crate::workload::{AffinityKind, Work, WorkType, WorkloadConfig, WorkloadHandle};
 
 use super::{CgroupGroup, Ctx, process_alive};
 
@@ -58,14 +58,11 @@ pub enum Op {
     },
     /// Stop all workers in a cgroup (does not remove the cgroup).
     StopCgroup { cgroup: Cow<'static, str> },
-    /// Set each worker in a cgroup to a random subset of half the
-    /// cgroup's cpuset (or half of all CPUs if no cpuset is configured,
-    /// minimum 1 CPU).
-    RandomizeAffinity { cgroup: Cow<'static, str> },
-    /// Set all workers in a cgroup to the given affinity mask.
+    /// Set worker affinity in a cgroup. Resolved at apply time via
+    /// [`resolve_affinity_for_cgroup()`](super::resolve_affinity_for_cgroup).
     SetAffinity {
         cgroup: Cow<'static, str>,
-        cpus: BTreeSet<usize>,
+        affinity: AffinityKind,
     },
     /// Spawn workers in the parent cgroup (not in a managed cgroup).
     SpawnHost { workload: WorkloadConfig },
@@ -118,7 +115,7 @@ pub enum CpusetSpec {
 /// ```
 /// # use stt::scenario::ops::{CgroupDef, CpusetSpec};
 /// # use stt::workload::{Work, WorkType};
-/// // Old API (backward compatible): single work group.
+/// // Single work group via convenience methods.
 /// let def = CgroupDef::named("workers")
 ///     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
 ///     .workers(4)
@@ -127,7 +124,7 @@ pub enum CpusetSpec {
 /// assert_eq!(def.name, "workers");
 /// assert_eq!(def.works[0].num_workers, Some(4));
 ///
-/// // New API: multiple concurrent work groups.
+/// // Multiple concurrent work groups via .work().
 /// let def = CgroupDef::named("mixed")
 ///     .work(Work::default().workers(4).work_type(WorkType::CpuSpin))
 ///     .work(Work::default().workers(2).work_type(WorkType::YieldHeavy));
@@ -170,35 +167,35 @@ impl CgroupDef {
         self
     }
 
-    /// Ensure works[0] exists for backward-compat builder methods.
+    /// Ensure works[0] exists for single-Work builder methods.
     fn ensure_default_work(&mut self) {
         if self.works.is_empty() {
             self.works.push(Work::default());
         }
     }
 
-    /// Set the number of workers (backward-compat sugar for single Work).
+    /// Set the number of workers (convenience for single Work).
     pub fn workers(mut self, n: usize) -> Self {
         self.ensure_default_work();
         self.works[0].num_workers = Some(n);
         self
     }
 
-    /// Set the work type (backward-compat sugar for single Work).
+    /// Set the work type (convenience for single Work).
     pub fn work_type(mut self, wt: WorkType) -> Self {
         self.ensure_default_work();
         self.works[0].work_type = wt;
         self
     }
 
-    /// Set the scheduling policy (backward-compat sugar for single Work).
+    /// Set the scheduling policy (convenience for single Work).
     pub fn sched_policy(mut self, p: crate::workload::SchedPolicy) -> Self {
         self.ensure_default_work();
         self.works[0].sched_policy = p;
         self
     }
 
-    /// Set the per-worker affinity (backward-compat sugar for single Work).
+    /// Set the per-worker affinity (convenience for single Work).
     pub fn affinity(mut self, a: crate::workload::AffinityKind) -> Self {
         self.ensure_default_work();
         self.works[0].affinity = a;
@@ -348,10 +345,83 @@ impl Op {
             Op::SwapCpusets { .. } => 4,
             Op::Spawn { .. } => 5,
             Op::StopCgroup { .. } => 6,
-            Op::RandomizeAffinity { .. } => 7,
-            Op::SetAffinity { .. } => 8,
-            Op::SpawnHost { .. } => 9,
-            Op::MoveAllTasks { .. } => 10,
+            Op::SetAffinity { .. } => 7,
+            Op::SpawnHost { .. } => 8,
+            Op::MoveAllTasks { .. } => 9,
+        }
+    }
+
+    /// Create a new cgroup.
+    pub fn add_cgroup(name: impl Into<Cow<'static, str>>) -> Self {
+        Op::AddCgroup { name: name.into() }
+    }
+
+    /// Remove a cgroup (stops its workers first).
+    pub fn remove_cgroup(cgroup: impl Into<Cow<'static, str>>) -> Self {
+        Op::RemoveCgroup {
+            cgroup: cgroup.into(),
+        }
+    }
+
+    /// Set a cgroup's cpuset.
+    pub fn set_cpuset(cgroup: impl Into<Cow<'static, str>>, cpus: CpusetSpec) -> Self {
+        Op::SetCpuset {
+            cgroup: cgroup.into(),
+            cpus,
+        }
+    }
+
+    /// Clear a cgroup's cpuset (allow all CPUs).
+    pub fn clear_cpuset(cgroup: impl Into<Cow<'static, str>>) -> Self {
+        Op::ClearCpuset {
+            cgroup: cgroup.into(),
+        }
+    }
+
+    /// Swap cpusets between two cgroups.
+    pub fn swap_cpusets(a: impl Into<Cow<'static, str>>, b: impl Into<Cow<'static, str>>) -> Self {
+        Op::SwapCpusets {
+            a: a.into(),
+            b: b.into(),
+        }
+    }
+
+    /// Spawn workers in a cgroup.
+    pub fn spawn(cgroup: impl Into<Cow<'static, str>>, work: Work) -> Self {
+        Op::Spawn {
+            cgroup: cgroup.into(),
+            work,
+        }
+    }
+
+    /// Stop all workers in a cgroup.
+    pub fn stop_cgroup(cgroup: impl Into<Cow<'static, str>>) -> Self {
+        Op::StopCgroup {
+            cgroup: cgroup.into(),
+        }
+    }
+
+    /// Set worker affinity in a cgroup.
+    pub fn set_affinity(cgroup: impl Into<Cow<'static, str>>, affinity: AffinityKind) -> Self {
+        Op::SetAffinity {
+            cgroup: cgroup.into(),
+            affinity,
+        }
+    }
+
+    /// Spawn workers in the parent cgroup.
+    pub fn spawn_host(workload: WorkloadConfig) -> Self {
+        Op::SpawnHost { workload }
+    }
+
+    /// Move all tasks from one cgroup to another.
+    pub fn move_all_tasks(
+        from: impl Into<Cow<'static, str>>,
+        to: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Op::MoveAllTasks {
+            from: from.into(),
+            to: to.into(),
         }
     }
 }
@@ -870,30 +940,34 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
             Op::StopCgroup { cgroup } => {
                 state.handles.retain(|(n, _)| n.as_str() != *cgroup);
             }
-            Op::RandomizeAffinity { cgroup } => {
-                let pool = state
-                    .cpusets
-                    .get(cgroup.as_ref())
-                    .cloned()
-                    .unwrap_or_else(|| ctx.topo.all_cpuset());
+            Op::SetAffinity { cgroup, affinity } => {
+                let cgroup_cpuset = state.cpusets.get(cgroup.as_ref());
+                let resolved =
+                    super::resolve_affinity_for_cgroup(affinity, cgroup_cpuset, ctx.topo);
                 for (name, handle) in &state.handles {
                     if name.as_str() == *cgroup {
-                        for idx in 0..handle.tids().len() {
-                            let count = (pool.len() / 2).max(1);
-                            use rand::seq::IndexedRandom;
-                            let v: Vec<usize> = pool.iter().copied().collect();
-                            let chosen: BTreeSet<usize> =
-                                v.sample(&mut rand::rng(), count).copied().collect();
-                            let _ = handle.set_affinity(idx, &chosen);
-                        }
-                    }
-                }
-            }
-            Op::SetAffinity { cgroup, cpus } => {
-                for (name, handle) in &state.handles {
-                    if name.as_str() == *cgroup {
-                        for idx in 0..handle.tids().len() {
-                            let _ = handle.set_affinity(idx, cpus);
+                        match &resolved {
+                            crate::workload::AffinityMode::None => {}
+                            crate::workload::AffinityMode::Fixed(cpus) => {
+                                for idx in 0..handle.tids().len() {
+                                    let _ = handle.set_affinity(idx, cpus);
+                                }
+                            }
+                            crate::workload::AffinityMode::Random { from, count } => {
+                                use rand::seq::IndexedRandom;
+                                let v: Vec<usize> = from.iter().copied().collect();
+                                for idx in 0..handle.tids().len() {
+                                    let chosen: BTreeSet<usize> =
+                                        v.sample(&mut rand::rng(), *count).copied().collect();
+                                    let _ = handle.set_affinity(idx, &chosen);
+                                }
+                            }
+                            crate::workload::AffinityMode::SingleCpu(cpu) => {
+                                let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
+                                for idx in 0..handle.tids().len() {
+                                    let _ = handle.set_affinity(idx, &cpus);
+                                }
+                            }
                         }
                     }
                 }
@@ -1118,10 +1192,9 @@ mod tests {
                 work: Default::default(),
             },
             Op::StopCgroup { cgroup: "a".into() },
-            Op::RandomizeAffinity { cgroup: "a".into() },
             Op::SetAffinity {
                 cgroup: "a".into(),
-                cpus: Default::default(),
+                affinity: Default::default(),
             },
             Op::SpawnHost {
                 workload: Default::default(),
@@ -1146,7 +1219,7 @@ mod tests {
                 workload: Default::default()
             }
             .discriminant(),
-            9
+            8
         );
         assert_eq!(
             Op::MoveAllTasks {
@@ -1154,7 +1227,7 @@ mod tests {
                 to: "b".into()
             }
             .discriminant(),
-            10
+            9
         );
     }
 

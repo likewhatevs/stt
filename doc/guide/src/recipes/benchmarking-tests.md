@@ -41,7 +41,6 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     sustained_samples = 15,
 )]
 fn perf_positive(ctx: &Ctx) -> Result<AssertResult> {
-    use stt::scenario::ops::execute_steps_with;
     let checks = Assert::default_checks()
         .min_iteration_rate(5000.0)
         .max_gap_ms(500);

@@ -59,6 +59,8 @@ let def = CgroupDef::named("cg_0")
 - `.work_type(WorkType)` -- set work type (default: `CpuSpin`).
 - `.sched_policy(SchedPolicy)` -- set Linux scheduling policy
   (default: `Normal`). See [Work Types](work-types.md#scheduling-policies).
+- `.work(Work)` -- add a work group (multiple calls for concurrent groups).
+- `.affinity(AffinityKind)` -- set per-worker affinity (default: `Inherit`).
 - `.swappable(bool)` -- opt into gauntlet work type override.
 
 ### Work type overrides and swappable
@@ -161,7 +163,6 @@ Equivalent to `execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])`.
 
 ```rust,ignore
 use stt::prelude::*;
-use stt::scenario::ops::execute_steps_with;
 
 fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let assertions = Assert::NONE

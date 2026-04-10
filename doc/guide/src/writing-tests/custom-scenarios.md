@@ -28,7 +28,7 @@ fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 ## Helper functions
 
 **`setup_cgroups(ctx, n, wl)`** -- creates N cgroups, spawns workers in
-each, starts them. Returns `Result<(Vec<WorkloadHandle>, CgroupGroup)>`. The
+each, starts them. Returns `Result<(Vec<WorkloadHandle>, CgroupGroup<'a>)>`. The
 `CgroupGroup` is an RAII guard that removes cgroups on drop.
 
 > **Warning:** `let _ = CgroupGroup::new(...)` drops immediately -- the

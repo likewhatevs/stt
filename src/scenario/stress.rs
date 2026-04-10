@@ -1,6 +1,6 @@
 //! Stress and edge-case scenario implementations.
 
-use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Setup, Step, execute_steps};
+use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Setup, Step, execute_steps};
 use super::{CgroupGroup, Ctx, collect_all, spawn_diverse};
 use crate::assert::{self, AssertResult};
 use crate::workload::*;
@@ -58,36 +58,20 @@ pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
     for i in 0..n {
         let name = format!("exhaust_{i}");
         let cpus: BTreeSet<usize> = [all[i % all.len()]].into_iter().collect();
-        exhaust_ops.push(super::ops::Op::AddCgroup {
-            name: name.clone().into(),
-        });
-        exhaust_ops.push(super::ops::Op::SetCpuset {
-            cgroup: name.into(),
-            cpus: CpusetSpec::Exact(cpus),
-        });
+        exhaust_ops.push(Op::add_cgroup(name.clone()));
+        exhaust_ops.push(Op::set_cpuset(name, CpusetSpec::Exact(cpus)));
     }
 
     let mut remove_ops = Vec::new();
     for i in 0..half {
-        let name = format!("exhaust_{i}");
-        remove_ops.push(super::ops::Op::RemoveCgroup {
-            cgroup: name.into(),
-        });
+        remove_ops.push(Op::remove_cgroup(format!("exhaust_{i}")));
     }
 
     let steps = vec![
         // Phase 1: create N exhaust cgroups (no workers — they just occupy slots).
-        Step {
-            setup: vec![].into(),
-            ops: exhaust_ops,
-            hold: HoldSpec::Fixed(Duration::from_secs(1)),
-        },
+        Step::new(exhaust_ops, HoldSpec::Fixed(Duration::from_secs(1))),
         // Phase 2: remove first half.
-        Step {
-            setup: vec![].into(),
-            ops: remove_ops,
-            hold: HoldSpec::Fixed(Duration::from_secs(1)),
-        },
+        Step::new(remove_ops, HoldSpec::Fixed(Duration::from_secs(1))),
         // Phase 3: create replacement cgroups with workers.
         Step {
             setup: Setup::Factory(reuse_defs),

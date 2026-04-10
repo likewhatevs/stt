@@ -9,71 +9,50 @@ use std::collections::BTreeSet;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Four nested sub-cgroups up to three levels deep with steady workload.
 pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0/sub_a"),
-            CgroupDef::named("cg_0/sub_b"),
-            CgroupDef::named("cg_1/sub_a"),
-            CgroupDef::named("cg_1/sub_a/deep"),
-        ]
-        .into(),
-        ops: vec![
-            Op::AddCgroup {
-                name: "cg_0".into(),
-            },
-            Op::AddCgroup {
-                name: "cg_1".into(),
-            },
-        ],
-        hold: HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration),
-    }];
+    let steps = vec![
+        Step::with_defs(
+            vec![
+                CgroupDef::named("cg_0/sub_a"),
+                CgroupDef::named("cg_0/sub_b"),
+                CgroupDef::named("cg_1/sub_a"),
+                CgroupDef::named("cg_1/sub_a/deep"),
+            ],
+            HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration),
+        )
+        .with_ops(vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")]),
+    ];
 
     execute_steps(ctx, steps)
 }
 
+/// Move workers through nested hierarchy: sub -> parent ->
+/// cross-hierarchy sub -> sibling.
 pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
-        Step {
-            setup: vec![CgroupDef::named("cg_0/sub")].into(),
-            ops: vec![
-                // Create parents and empty targets for MoveAllTasks.
-                Op::AddCgroup {
-                    name: "cg_0".into(),
-                },
-                Op::AddCgroup {
-                    name: "cg_1".into(),
-                },
-                Op::AddCgroup {
-                    name: "cg_1/sub".into(),
-                },
-            ],
-            hold: HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration / 4),
-        },
-        Step {
-            setup: vec![].into(),
-            ops: vec![Op::MoveAllTasks {
-                from: "cg_0/sub".into(),
-                to: "cg_0".into(),
-            }],
-            hold: HoldSpec::Frac(0.25),
-        },
-        Step {
-            setup: vec![].into(),
-            ops: vec![Op::MoveAllTasks {
-                from: "cg_0".into(),
-                to: "cg_1/sub".into(),
-            }],
-            hold: HoldSpec::Frac(0.25),
-        },
-        Step {
-            setup: vec![].into(),
-            ops: vec![Op::MoveAllTasks {
-                from: "cg_1/sub".into(),
-                to: "cg_1".into(),
-            }],
-            hold: HoldSpec::Frac(0.25),
-        },
+        Step::with_defs(
+            vec![CgroupDef::named("cg_0/sub")],
+            HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration / 4),
+        )
+        .with_ops(vec![
+            // Create parents and empty targets for MoveAllTasks.
+            Op::add_cgroup("cg_0"),
+            Op::add_cgroup("cg_1"),
+            Op::add_cgroup("cg_1/sub"),
+        ]),
+        Step::new(
+            vec![Op::move_all_tasks("cg_0/sub", "cg_0")],
+            HoldSpec::Frac(0.25),
+        ),
+        Step::new(
+            vec![Op::move_all_tasks("cg_0", "cg_1/sub")],
+            HoldSpec::Frac(0.25),
+        ),
+        Step::new(
+            vec![Op::move_all_tasks("cg_1/sub", "cg_1")],
+            HoldSpec::Frac(0.25),
+        ),
     ];
 
     execute_steps(ctx, steps)
@@ -135,52 +114,43 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     Ok(r)
 }
 
+/// Nested sub-cgroups with heavy CpuSpin vs light Bursty load imbalance.
 pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0/sub_a").workers(8),
-            CgroupDef::named("cg_1/sub_b")
-                .workers(2)
-                .work_type(WorkType::Bursty {
-                    burst_ms: 50,
-                    sleep_ms: 100,
-                }),
-        ]
-        .into(),
-        ops: vec![
-            Op::AddCgroup {
-                name: "cg_0".into(),
-            },
-            Op::AddCgroup {
-                name: "cg_1".into(),
-            },
-        ],
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+    let steps = vec![
+        Step::with_defs(
+            vec![
+                CgroupDef::named("cg_0/sub_a").workers(8),
+                CgroupDef::named("cg_1/sub_b")
+                    .workers(2)
+                    .work_type(WorkType::Bursty {
+                        burst_ms: 50,
+                        sleep_ms: 100,
+                    }),
+            ],
+            HoldSpec::Fixed(ctx.settle + ctx.duration),
+        )
+        .with_ops(vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")]),
+    ];
 
     execute_steps(ctx, steps)
 }
 
+/// Three-level nested hierarchy with workers at leaf cgroups.
 pub fn custom_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0/sub_a/deep"),
-            CgroupDef::named("cg_1/sub_b"),
-        ]
-        .into(),
-        ops: vec![
-            Op::AddCgroup {
-                name: "cg_0".into(),
-            },
-            Op::AddCgroup {
-                name: "cg_0/sub_a".into(),
-            },
-            Op::AddCgroup {
-                name: "cg_1".into(),
-            },
-        ],
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+    let steps = vec![
+        Step::with_defs(
+            vec![
+                CgroupDef::named("cg_0/sub_a/deep"),
+                CgroupDef::named("cg_1/sub_b"),
+            ],
+            HoldSpec::Fixed(ctx.settle + ctx.duration),
+        )
+        .with_ops(vec![
+            Op::add_cgroup("cg_0"),
+            Op::add_cgroup("cg_0/sub_a"),
+            Op::add_cgroup("cg_1"),
+        ]),
+    ];
 
     execute_steps(ctx, steps)
 }

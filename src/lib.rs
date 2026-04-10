@@ -26,6 +26,34 @@
 //! }
 //! ```
 //!
+//! # Scheduler definition
+//!
+//! Use `#[derive(Scheduler)]` to declare a scheduler with typed flags
+//! and a default topology. Tests reference the generated const and
+//! inherit its configuration:
+//!
+//! ```rust
+//! use stt::prelude::*;
+//!
+//! #[derive(Scheduler)]
+//! #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
+//! #[allow(dead_code)]
+//! enum MySchedFlag {
+//!     #[flag(args = ["--enable-llc"])]
+//!     Llc,
+//!     #[flag(args = ["--enable-stealing"], requires = [Llc])]
+//!     Steal,
+//! }
+//!
+//! #[stt_test(scheduler = MY_SCHED)]
+//! fn basic(ctx: &Ctx) -> Result<AssertResult> {
+//!     execute_defs(ctx, vec![
+//!         CgroupDef::named("cg_0").workers(2),
+//!         CgroupDef::named("cg_1").workers(2),
+//!     ])
+//! }
+//! ```
+//!
 //! For full control over cgroup setup, worker spawning, and assertion
 //! you can use the low-level API directly:
 //!
@@ -45,9 +73,7 @@
 //!         ..Default::default()
 //!     };
 //!     let mut handle = WorkloadHandle::spawn(&cfg)?;
-//!     for tid in handle.tids() {
-//!         ctx.cgroups.move_task("workers", tid)?;
-//!     }
+//!     ctx.cgroups.move_tasks("workers", &handle.tids())?;
 //!     handle.start();
 //!
 //!     std::thread::sleep(ctx.duration);

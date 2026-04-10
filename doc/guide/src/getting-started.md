@@ -50,7 +50,25 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-For custom cgroup topology, use the DSL:
+For custom cgroup topology, declare cgroups with `CgroupDef` and run
+them with `execute_defs`. This is the most common custom test pattern:
+
+```rust,ignore
+use stt::prelude::*;
+
+#[stt_test(sockets = 1, cores = 2, threads = 1)]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("cg_0").workers(4),
+        CgroupDef::named("cg_1")
+            .workers(2)
+            .work_type(WorkType::Bursty { burst_ms: 50, sleep_ms: 100 }),
+    ])
+}
+```
+
+For multi-phase scenarios with dynamic topology changes, use
+`Step::with_defs` and `execute_steps`:
 
 ```rust,ignore
 use stt::prelude::*;

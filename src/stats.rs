@@ -193,17 +193,16 @@ fn op_kinds_to_name(op_kinds: u32) -> &'static str {
     // Return the name of the highest-priority op present.
     // Priority: the op most likely to cause observable scheduler changes.
     const NAMES: &[&str] = &[
-        "AddCgroup",         // 0
-        "RemoveCgroup",      // 1
-        "SetCpuset",         // 2
-        "ClearCpuset",       // 3
-        "SwapCpusets",       // 4
-        "Spawn",             // 5
-        "StopCgroup",        // 6
-        "RandomizeAffinity", // 7
-        "SetAffinity",       // 8
-        "SpawnHost",         // 9
-        "MoveAllTasks",      // 10
+        "AddCgroup",    // 0
+        "RemoveCgroup", // 1
+        "SetCpuset",    // 2
+        "ClearCpuset",  // 3
+        "SwapCpusets",  // 4
+        "Spawn",        // 5
+        "StopCgroup",   // 6
+        "SetAffinity",  // 7
+        "SpawnHost",    // 8
+        "MoveAllTasks", // 9
     ];
     // Pick the first set bit as the representative op.
     for (i, name) in NAMES.iter().enumerate() {
@@ -1368,8 +1367,8 @@ mod tests {
         assert_eq!(op_kinds_to_name(1 << 4), "SwapCpusets");
         assert_eq!(op_kinds_to_name(1 << 5), "Spawn");
         assert_eq!(op_kinds_to_name(1 << 6), "StopCgroup");
-        assert_eq!(op_kinds_to_name(1 << 7), "RandomizeAffinity");
-        assert_eq!(op_kinds_to_name(1 << 8), "SetAffinity");
+        assert_eq!(op_kinds_to_name(1 << 7), "SetAffinity");
+        assert_eq!(op_kinds_to_name(1 << 8), "SpawnHost");
     }
 
     #[test]

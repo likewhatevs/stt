@@ -14,8 +14,8 @@ use anyhow::Result;
 pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::default_checks().max_throughput_cv(1.0);
 
-    let steps = vec![Step {
-        setup: vec![
+    let steps = vec![Step::with_defs(
+        vec![
             CgroupDef::named("cg_0")
                 .workers(ctx.workers_per_cgroup)
                 .work_type(WorkType::CachePressure {
@@ -23,11 +23,9 @@ pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                     stride: 64,
                 }),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
-        ]
-        .into(),
-        ops: vec![],
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+        ],
+        HoldSpec::Fixed(ctx.settle + ctx.duration),
+    )];
 
     execute_steps_with(ctx, steps, Some(&checks))
 }
@@ -47,8 +45,8 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
         .max_wake_latency_cv(3.0)
         .max_throughput_cv(1.0);
 
-    let steps = vec![Step {
-        setup: vec![
+    let steps = vec![Step::with_defs(
+        vec![
             CgroupDef::named("cg_0")
                 .with_cpuset(CpusetSpec::Llc(0))
                 .workers(ctx.workers_per_cgroup)
@@ -63,11 +61,9 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
                     size_kb: 32,
                     stride: 64,
                 }),
-        ]
-        .into(),
-        ops: vec![],
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+        ],
+        HoldSpec::Fixed(ctx.settle + ctx.duration),
+    )];
 
     execute_steps_with(ctx, steps, Some(&checks))
 }
@@ -89,8 +85,8 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult>
 
     let checks = Assert::default_checks().max_wake_latency_cv(15.0);
 
-    let steps = vec![Step {
-        setup: vec![
+    let steps = vec![Step::with_defs(
+        vec![
             CgroupDef::named("cg_0")
                 .workers(n_pipe)
                 .work_type(WorkType::CachePipe {
@@ -98,11 +94,9 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult>
                     burst_iters: 1024,
                 }),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
-        ]
-        .into(),
-        ops: vec![],
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+        ],
+        HoldSpec::Fixed(ctx.settle + ctx.duration),
+    )];
 
     execute_steps_with(ctx, steps, Some(&checks))
 }
@@ -124,8 +118,8 @@ pub fn custom_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
         .max_wake_latency_cv(10.0)
         .max_spread_pct(50.0);
 
-    let steps = vec![Step {
-        setup: vec![
+    let steps = vec![Step::with_defs(
+        vec![
             CgroupDef::named("cg_0")
                 .workers(n_fanout)
                 .work_type(WorkType::FutexFanOut {
@@ -133,11 +127,9 @@ pub fn custom_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
                     spin_iters: 1024,
                 }),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
-        ]
-        .into(),
-        ops: vec![],
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+        ],
+        HoldSpec::Fixed(ctx.settle + ctx.duration),
+    )];
 
     execute_steps_with(ctx, steps, Some(&checks))
 }

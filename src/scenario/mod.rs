@@ -1,17 +1,23 @@
 //! Scenario definitions, flag system, and test execution.
 //!
-//! Key types:
-//! - [`Scenario`] -- data-driven test case (cgroups, cpusets, workloads)
+//! Most tests use the declarative ops API from the [`ops`] submodule:
+//! - [`ops::CgroupDef`] -- declarative cgroup definition (name + cpuset + workload)
+//! - [`ops::Step`] -- a sequence of ops followed by a hold period
+//! - [`ops::Op`] -- atomic cgroup topology operation
+//! - [`ops::CpusetSpec`] -- how to compute a cpuset from topology
+//! - [`ops::HoldSpec`] -- how long to hold after a step
+//! - [`ops::execute_defs`] -- run cgroup definitions for the full duration
+//! - [`ops::execute_steps`] -- run a multi-step sequence
+//!
+//! Types defined in this module:
 //! - [`Ctx`] -- runtime context passed to scenario functions
-//! - [`CpusetMode`] -- how to partition CPUs across cgroups
-//! - [`Action`] -- steady-state or custom scenario logic
-//! - [`CgroupWork`] -- per-cgroup workload definition
-//! - [`AffinityKind`](crate::workload::AffinityKind) -- per-worker affinity intent (re-exported from workload)
 //! - [`CgroupGroup`] -- RAII guard that removes cgroups on drop
-//! - [`FlagProfile`] -- a set of active flags for a run
 //! - [`flags::FlagDecl`] -- typed flag declaration with dependencies
 //!
-//! The [`ops`] submodule provides composable cgroup topology operations.
+//! The [`scenarios`] submodule provides curated canned scenarios.
+//!
+//! For data-driven test cases (used by the internal catalog), see
+//! [`Scenario`], [`CpusetMode`], [`Action`], and [`CgroupWork`].
 //!
 //! See the [Scenarios](https://likewhatevs.github.io/stt/guide/concepts/scenarios.html)
 //! and [Writing Tests](https://likewhatevs.github.io/stt/guide/writing-tests.html)

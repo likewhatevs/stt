@@ -3,34 +3,34 @@
 use super::Ctx;
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execute_steps_with};
 use crate::assert::{Assert, AssertResult};
+use crate::workload::AffinityKind;
 use anyhow::Result;
 use std::collections::BTreeSet;
 
+/// Two cgroups with worker affinities randomized four times during the
+/// run. Each randomization assigns half the available CPUs to each worker.
 pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
-    let mut steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
-        ops: vec![],
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration / 5),
-    }];
+    let mut steps = vec![Step::with_defs(
+        vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
+        HoldSpec::Fixed(ctx.settle + ctx.duration / 5),
+    )];
 
     for _ in 0..4 {
-        steps.push(Step {
-            setup: vec![].into(),
-            ops: vec![
-                Op::RandomizeAffinity {
-                    cgroup: "cg_0".into(),
-                },
-                Op::RandomizeAffinity {
-                    cgroup: "cg_1".into(),
-                },
+        steps.push(Step::new(
+            vec![
+                Op::set_affinity("cg_0", AffinityKind::RandomSubset),
+                Op::set_affinity("cg_1", AffinityKind::RandomSubset),
             ],
-            hold: HoldSpec::Frac(0.2),
-        });
+            HoldSpec::Frac(0.2),
+        ));
     }
 
     execute_steps(ctx, steps)
 }
 
+/// Two cgroups with all workers pinned to the same 2-CPU subset.
+/// Uses a relaxed 75% spread threshold since concentrated pinning
+/// increases work-unit spread under EEVDF.
 pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let all = ctx.topo.all_cpus();
     let pin_cpus: BTreeSet<usize> = if all.len() >= 2 {
@@ -44,30 +44,25 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
     let steps = vec![
-        Step {
-            setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
-            ops: vec![],
-            hold: HoldSpec::Fixed(ctx.settle),
-        },
-        Step {
-            setup: vec![].into(),
-            ops: vec![
-                Op::SetAffinity {
-                    cgroup: "cg_0".into(),
-                    cpus: pin_cpus.clone(),
-                },
-                Op::SetAffinity {
-                    cgroup: "cg_1".into(),
-                    cpus: pin_cpus,
-                },
+        Step::with_defs(
+            vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
+            HoldSpec::Fixed(ctx.settle),
+        ),
+        Step::new(
+            vec![
+                Op::set_affinity("cg_0", AffinityKind::Exact(pin_cpus.clone())),
+                Op::set_affinity("cg_1", AffinityKind::Exact(pin_cpus)),
             ],
-            hold: HoldSpec::Fixed(ctx.duration),
-        },
+            HoldSpec::Fixed(ctx.duration),
+        ),
     ];
 
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
+/// Two cgroups with disjoint cpusets, workers pinned to 2 CPUs within
+/// each partition. Verifies pinning interacts correctly with cpuset
+/// constraints. Uses a relaxed 75% spread threshold.
 pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let usable = ctx.topo.usable_cpus();
     let mid = usable.len() / 2;
@@ -82,29 +77,20 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
     let steps = vec![
-        Step {
-            setup: vec![
+        Step::with_defs(
+            vec![
                 CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
                 CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
-            ]
-            .into(),
-            ops: vec![],
-            hold: HoldSpec::Fixed(ctx.settle),
-        },
-        Step {
-            setup: vec![].into(),
-            ops: vec![
-                Op::SetAffinity {
-                    cgroup: "cg_0".into(),
-                    cpus: pin_a,
-                },
-                Op::SetAffinity {
-                    cgroup: "cg_1".into(),
-                    cpus: pin_b,
-                },
             ],
-            hold: HoldSpec::Fixed(ctx.duration),
-        },
+            HoldSpec::Fixed(ctx.settle),
+        ),
+        Step::new(
+            vec![
+                Op::set_affinity("cg_0", AffinityKind::Exact(pin_a)),
+                Op::set_affinity("cg_1", AffinityKind::Exact(pin_b)),
+            ],
+            HoldSpec::Fixed(ctx.duration),
+        ),
     ];
 
     execute_steps_with(ctx, steps, Some(&checks))

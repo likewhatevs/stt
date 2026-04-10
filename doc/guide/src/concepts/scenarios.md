@@ -66,10 +66,11 @@ pub struct CgroupWork {
 | Variant | Behavior |
 |---|---|
 | `Inherit` | No constraint (inherit from cgroup) |
-| `RandomSubset` | Random subset of cgroup's cpuset |
+| `RandomSubset` | Random subset of cgroup's cpuset (all CPUs if no cpuset) |
 | `LlcAligned` | CPUs in the worker's LLC |
 | `CrossCgroup` | All CPUs (crosses cgroup boundaries) |
 | `SingleCpu` | Pin to one CPU |
+| `Exact(BTreeSet<usize>)` | Pin to an exact set of CPUs |
 
 **`action`** -- `Steady` (run workers for the duration) or
 `Custom(fn(&Ctx) -> Result<AssertResult>)` for scenarios with custom

@@ -6,21 +6,27 @@ use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 
+/// Two managed cgroups with host-level contention from workers in the
+/// parent cgroup. Spawns `total_cpus` workers outside any managed cgroup
+/// alongside two default cgroups.
 pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")].into(),
-        ops: vec![Op::SpawnHost {
-            workload: WorkloadConfig {
-                num_workers: ctx.topo.total_cpus(),
-                ..Default::default()
-            },
-        }],
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+    let steps = vec![
+        Step::with_defs(
+            vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
+            HoldSpec::Fixed(ctx.settle + ctx.duration),
+        )
+        .with_ops(vec![Op::spawn_host(WorkloadConfig {
+            num_workers: ctx.topo.total_cpus(),
+            ..Default::default()
+        })]),
+    ];
 
     execute_steps(ctx, steps)
 }
 
+/// Two cgroups each running Normal, Batch, Idle, and FIFO(1) workers
+/// concurrently. FIFO workers use bursty workloads to avoid monopolizing
+/// CPUs.
 pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     let configs = [
         (SchedPolicy::Normal, WorkType::CpuSpin),
@@ -35,62 +41,42 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
         ),
     ];
 
-    let mut ops = vec![
-        Op::AddCgroup {
-            name: "cg_0".into(),
-        },
-        Op::AddCgroup {
-            name: "cg_1".into(),
-        },
-    ];
+    let mut ops = vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")];
     for name in ["cg_0", "cg_1"] {
         for &(policy, ref wtype) in &configs {
-            ops.push(Op::Spawn {
-                cgroup: name.into(),
-                work: Work::default()
+            ops.push(Op::spawn(
+                name,
+                Work::default()
                     .workers(2)
                     .sched_policy(policy)
                     .work_type(wtype.clone()),
-            });
+            ));
         }
     }
 
-    let steps = vec![Step {
-        setup: vec![].into(),
-        ops,
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+    let steps = vec![Step::new(ops, HoldSpec::Fixed(ctx.settle + ctx.duration))];
 
     execute_steps(ctx, steps)
 }
 
+/// Two cgroups each with paired PipeIo workers and CpuSpin workers.
+/// Exercises cross-CPU wake placement from pipe I/O under CPU load.
 pub fn custom_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
-    let mut ops = vec![
-        Op::AddCgroup {
-            name: "cg_0".into(),
-        },
-        Op::AddCgroup {
-            name: "cg_1".into(),
-        },
-    ];
+    let mut ops = vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")];
     for name in ["cg_0", "cg_1"] {
-        ops.push(Op::Spawn {
-            cgroup: name.into(),
-            work: Work::default()
+        ops.push(Op::spawn(
+            name,
+            Work::default()
                 .workers(2)
                 .work_type(WorkType::PipeIo { burst_iters: 1024 }),
-        });
-        ops.push(Op::Spawn {
-            cgroup: name.into(),
-            work: Work::default().workers(ctx.workers_per_cgroup),
-        });
+        ));
+        ops.push(Op::spawn(
+            name,
+            Work::default().workers(ctx.workers_per_cgroup),
+        ));
     }
 
-    let steps = vec![Step {
-        setup: vec![].into(),
-        ops,
-        hold: HoldSpec::Fixed(ctx.settle + ctx.duration),
-    }];
+    let steps = vec![Step::new(ops, HoldSpec::Fixed(ctx.settle + ctx.duration))];
 
     execute_steps(ctx, steps)
 }
