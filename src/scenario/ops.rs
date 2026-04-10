@@ -69,9 +69,12 @@ pub enum Op {
     },
     /// Spawn workers in the parent cgroup (not in a managed cgroup).
     SpawnHost { workload: WorkloadConfig },
-    /// Move all tasks from one cgroup to another. Updates handle name
-    /// keys so subsequent ops address moved workers under the new cgroup
-    /// name.
+    /// Move all tasks from one cgroup to another.
+    ///
+    /// Each task is moved via `cgroup.procs`. If any move fails, the
+    /// error propagates and handle name keys are left unchanged (workers
+    /// remain addressed under `from`). On success, handle name keys are
+    /// updated to `to` so subsequent ops address the moved workers.
     MoveAllTasks {
         from: Cow<'static, str>,
         to: Cow<'static, str>,
@@ -902,11 +905,14 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 state.handles.push((String::new(), h));
             }
             Op::MoveAllTasks { from, to } => {
-                for (name, handle) in &mut state.handles {
+                // Move all tasks first; only rename handles if every move succeeds.
+                for (name, handle) in state.handles.iter() {
                     if name.as_str() == *from {
-                        for tid in handle.tids() {
-                            let _ = ctx.cgroups.move_task(to, tid);
-                        }
+                        ctx.cgroups.move_tasks(to, &handle.tids())?;
+                    }
+                }
+                for (name, _) in &mut state.handles {
+                    if name.as_str() == *from {
                         *name = to.to_string();
                     }
                 }
