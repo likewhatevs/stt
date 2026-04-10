@@ -7,38 +7,29 @@ without hand-written `Action::Custom` functions.
 
 ```rust,ignore
 use stt::prelude::*;
-use stt::scenario::ops::*;
 
 fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         // Phase 1: two disjoint cgroups, hold for half the duration
-        Step {
-            setup: vec![
+        Step::with_defs(
+            vec![
                 CgroupDef::named("cg_0")
                     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
                     .workers(4),
                 CgroupDef::named("cg_1")
                     .with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 })
                     .workers(4),
-            ].into(),
-            ops: vec![],
-            hold: HoldSpec::Frac(0.5),
-        },
-        // Phase 2: resize cpusets to overlap
-        Step {
-            setup: vec![].into(),
-            ops: vec![
-                Op::SetCpuset {
-                    cgroup: "cg_0".into(),
-                    cpus: CpusetSpec::Overlap { index: 0, of: 2, frac: 0.5 },
-                },
-                Op::SetCpuset {
-                    cgroup: "cg_1".into(),
-                    cpus: CpusetSpec::Overlap { index: 1, of: 2, frac: 0.5 },
-                },
             ],
-            hold: HoldSpec::Frac(0.5),
-        },
+            HoldSpec::Frac(0.5),
+        ),
+        // Phase 2: resize cpusets to overlap
+        Step::new(
+            vec![
+                Op::set_cpuset("cg_0", CpusetSpec::Overlap { index: 0, of: 2, frac: 0.5 }),
+                Op::set_cpuset("cg_1", CpusetSpec::Overlap { index: 1, of: 2, frac: 0.5 }),
+            ],
+            HoldSpec::Frac(0.5),
+        ),
     ];
     execute_steps(ctx, steps)
 }

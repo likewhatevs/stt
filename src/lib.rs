@@ -7,21 +7,38 @@
 //!
 //! # Quick start
 //!
-//! Define cgroups declaratively, let the DSL handle cgroup lifecycle,
-//! worker spawning, and assertion:
+//! Declare cgroups and workloads as data, let the framework handle
+//! lifecycle and verification:
 //!
 //! ```rust
 //! use stt::prelude::*;
 //!
 //! #[stt_test(sockets = 1, cores = 2, threads = 1)]
 //! fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
-//!     let steps = vec![Step::with_defs(
-//!         vec![
-//!             CgroupDef::named("cg_0").workers(2),
-//!             CgroupDef::named("cg_1").workers(2),
-//!         ],
-//!         HoldSpec::FULL,
-//!     )];
+//!     execute_defs(ctx, vec![
+//!         CgroupDef::named("cg_0").workers(2),
+//!         CgroupDef::named("cg_1").workers(2),
+//!     ])
+//! }
+//! ```
+//!
+//! For multi-phase scenarios with dynamic topology changes:
+//!
+//! ```rust
+//! use stt::prelude::*;
+//!
+//! #[stt_test(sockets = 1, cores = 2, threads = 1)]
+//! fn my_dynamic_test(ctx: &Ctx) -> Result<AssertResult> {
+//!     let steps = vec![
+//!         Step::with_defs(
+//!             vec![CgroupDef::named("cg_0").workers(4)],
+//!             HoldSpec::Frac(0.5),
+//!         ),
+//!         Step::new(
+//!             vec![Op::stop_cgroup("cg_0"), Op::remove_cgroup("cg_0")],
+//!             HoldSpec::Frac(0.5),
+//!         ),
+//!     ];
 //!     execute_steps(ctx, steps)
 //! }
 //! ```

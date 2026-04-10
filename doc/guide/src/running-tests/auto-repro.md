@@ -117,15 +117,14 @@ use stt::prelude::*;
 use stt::test_support::{BpfMapWrite, SttTestEntry, run_stt_test};
 
 fn scenario(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![
+    let steps = vec![Step::with_defs(
+        vec![
             CgroupDef::named("demo_workers")
                 .work_type(WorkType::YieldHeavy)
                 .workers(4),
-        ].into(),
-        ops: vec![],
-        hold: HoldSpec::Fixed(Duration::from_secs(8)),
-    }];
+        ],
+        HoldSpec::Fixed(Duration::from_secs(8)),
+    )];
     execute_steps(ctx, steps)
 }
 ```
