@@ -25,7 +25,8 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
    struct_ops programs via libbpf-rs and adds them to the probe list
    alongside any stack-extracted functions. Their kernel-side callers
    are added (e.g. `enqueue` -> `do_enqueue_task`) for bridge kprobes.
-   This step provides probe targets even when the crash produced no
+   This step ensures probes can capture variable states across the
+   scheduler exit call chain even when the crash produced no
    extractable stack.
 
 4. **BTF resolution** -- function signatures are resolved from vmlinux
@@ -40,10 +41,14 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
    - Fentry skeleton for BPF callbacks (batched in groups of 4,
      shares maps via `reuse_fd`)
 
-6. **Stitching** -- captured events are filtered by task_struct pointer
-   or tid, sorted by timestamp, and formatted with decoded field values
-   (cpumask ranges, DSQ names, enqueue flags, etc.) and source locations
-   (DWARF for kernel, line_info for BPF).
+6. **Stitching** -- the task_struct pointer is found from the last
+   event (closest to trigger time) that has a non-zero task_struct
+   argument. Events with a task_struct parameter are filtered to that
+   pointer; events without a task_struct parameter are kept
+   unconditionally for context. Events are sorted by timestamp and
+   formatted with decoded field values (cpumask ranges, DSQ names,
+   enqueue flags, etc.) and source locations (DWARF for kernel,
+   line_info for BPF).
 
 ## Enabling auto-repro
 

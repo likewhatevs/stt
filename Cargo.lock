@@ -1138,6 +1138,7 @@ dependencies = [
  "anyhow",
  "blazesym",
  "btf-rs",
+ "clap",
  "cpio",
  "crc32fast",
  "ctor",

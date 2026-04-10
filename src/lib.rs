@@ -192,6 +192,9 @@ pub(crate) mod budget;
 pub(crate) mod monitor;
 #[allow(dead_code)]
 pub(crate) mod probe;
+#[cfg(feature = "cli")]
+pub mod runner;
+#[cfg(not(feature = "cli"))]
 #[allow(dead_code)]
 pub(crate) mod runner;
 pub mod scenario;

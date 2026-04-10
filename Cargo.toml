@@ -16,6 +16,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", features = ["derive"], optional = true }
 crc32fast = "1.5"
 flate2 = "1"
 ctor = "0.8"
@@ -50,12 +51,18 @@ lto = "thin"
 
 [features]
 integration = []
+cli = ["dep:clap"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
 
 [build-dependencies]
 libbpf-cargo = "0.26"
+
+[[bin]]
+name = "ktstr-host"
+path = "src/bin/ktstr_host.rs"
+required-features = ["cli"]
 
 [[test]]
 name = "ktstr_sched_tests"
