@@ -39,8 +39,11 @@ other counters indexed by idle type (`CPU_NOT_IDLE`, `CPU_IDLE`,
 The monitor takes periodic snapshots (`MonitorSample`) of all per-CPU
 state. Each sample captures a point-in-time view of every CPU.
 
-`MonitorSummary` aggregates samples into event deltas and overall
-statistics.
+`MonitorSummary` aggregates samples into peak values (max imbalance
+ratio, max DSQ depth, stall detection), per-sample averages
+(imbalance ratio, nr_running per CPU, DSQ depth per CPU), and event
+counter deltas. Averages are computed over valid samples only
+(excluding uninitialized guest memory).
 
 ## Threshold evaluation
 

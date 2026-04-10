@@ -1542,23 +1542,7 @@ fn evaluate_vm_result(
             let monitor_section = if entry.scheduler.binary.has_active_scheduling()
                 && let Some(ref monitor) = result.monitor
             {
-                let s = &monitor.summary;
-                let eval_report = trim_settle_samples(monitor);
-                let thresholds = merged_assert.monitor_thresholds();
-                let verdict = thresholds.evaluate(&eval_report);
-                let verdict_line = if verdict.passed {
-                    verdict.summary.clone()
-                } else {
-                    format!("{}: {}", verdict.summary, verdict.details.join("; "))
-                };
-                format!(
-                    "\n\n--- monitor ---\nsamples={} max_imbalance={:.2} max_dsq_depth={} stall={}\nverdict: {}",
-                    s.total_samples,
-                    s.max_imbalance_ratio,
-                    s.max_local_dsq_depth,
-                    s.stall_detected,
-                    verdict_line,
-                )
+                format_monitor_section(monitor, merged_assert)
             } else {
                 String::new()
             };
@@ -1600,13 +1584,15 @@ fn evaluate_vm_result(
                     .filter(|t| !t.phases.is_empty())
                     .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
                     .unwrap_or_default();
+                let monitor_section = format_monitor_section(monitor, merged_assert);
                 let msg = format!(
-                    "{}ktstr_test '{}'{} passed scenario but monitor failed:\n  {}{}{}{}",
+                    "{}ktstr_test '{}'{} passed scenario but monitor failed:\n  {}{}{}{}{}",
                     fingerprint_line,
                     entry.name,
                     sched_label,
                     details,
                     timeline_section,
+                    monitor_section,
                     sched_log_section,
                     dump_section,
                 );
@@ -1657,23 +1643,7 @@ fn evaluate_vm_result(
     let monitor_section = if entry.scheduler.binary.has_active_scheduling()
         && let Some(ref monitor) = result.monitor
     {
-        let s = &monitor.summary;
-        let eval_report = trim_settle_samples(monitor);
-        let thresholds = merged_assert.monitor_thresholds();
-        let verdict = thresholds.evaluate(&eval_report);
-        let verdict_line = if verdict.passed {
-            verdict.summary.clone()
-        } else {
-            format!("{}: {}", verdict.summary, verdict.details.join("; "))
-        };
-        format!(
-            "\n\n--- monitor ---\nsamples={} max_imbalance={:.2} max_dsq_depth={} stall={}\nverdict: {}",
-            s.total_samples,
-            s.max_imbalance_ratio,
-            s.max_local_dsq_depth,
-            s.stall_detected,
-            verdict_line,
-        )
+        format_monitor_section(monitor, merged_assert)
     } else {
         String::new()
     };
@@ -1713,6 +1683,74 @@ fn evaluate_vm_result(
         repro_section,
     );
     anyhow::bail!("{msg}")
+}
+
+/// Format the `--- monitor ---` section for failure output.
+///
+/// Shows peak values, averaged metrics, event counter rates, schedstat
+/// rates, and the monitor verdict. All values are from the post-warmup
+/// evaluation window (boot-settle samples trimmed).
+fn format_monitor_section(
+    monitor: &crate::monitor::MonitorReport,
+    merged_assert: &crate::assert::Assert,
+) -> String {
+    let eval_report = trim_settle_samples(monitor);
+    let s = &eval_report.summary;
+    let thresholds = merged_assert.monitor_thresholds();
+    let verdict = thresholds.evaluate(&eval_report);
+    let verdict_line = if verdict.passed {
+        verdict.summary.clone()
+    } else {
+        format!("{}: {}", verdict.summary, verdict.details.join("; "))
+    };
+
+    let mut lines = vec![
+        format!(
+            "samples={} max_imbalance={:.2} max_dsq_depth={} stall={}",
+            s.total_samples, s.max_imbalance_ratio, s.max_local_dsq_depth, s.stall_detected,
+        ),
+        format!(
+            "avg: imbalance={:.2} nr_running/cpu={:.1} dsq/cpu={:.1}",
+            s.avg_imbalance_ratio, s.avg_nr_running, s.avg_local_dsq_depth,
+        ),
+    ];
+
+    if let Some(ref ev) = s.event_deltas {
+        lines.push(format!(
+            "events: fallback={} ({:.1}/s) keep_last={} ({:.1}/s) offline={}",
+            ev.total_fallback,
+            ev.fallback_rate,
+            ev.total_dispatch_keep_last,
+            ev.keep_last_rate,
+            ev.total_dispatch_offline,
+        ));
+    }
+
+    if let Some(ref ss) = s.schedstat_deltas {
+        lines.push(format!(
+            "schedstat: csw={} ({:.0}/s) run_delay={:.0}ns/s ttwu={} goidle={}",
+            ss.total_sched_count,
+            ss.sched_count_rate,
+            ss.run_delay_rate,
+            ss.total_ttwu_count,
+            ss.total_sched_goidle,
+        ));
+    }
+
+    if let Some(ref progs) = s.prog_stats_deltas {
+        for p in progs {
+            if p.cnt > 0 {
+                lines.push(format!(
+                    "bpf: {} cnt={} {:.0}ns/call",
+                    p.name, p.cnt, p.nsecs_per_call,
+                ));
+            }
+        }
+    }
+
+    lines.push(format!("verdict: {verdict_line}"));
+
+    format!("\n\n--- monitor ---\n{}", lines.join("\n"))
 }
 
 /// Number of monitor samples to skip at the start of evaluation.
@@ -3779,6 +3817,7 @@ mod tests {
                     total_enq_skip_migration_disabled: 0,
                 }),
                 schedstat_deltas: None,
+                ..Default::default()
             }),
             stimulus_events: vec![crate::timeline::StimulusEvent {
                 elapsed_ms: 500,
@@ -5026,6 +5065,7 @@ mod tests {
                     event_deltas: None,
                     schedstat_deltas: None,
                     prog_stats_deltas: None,
+                    ..Default::default()
                 },
                 preemption_threshold_ns: 0,
             }),

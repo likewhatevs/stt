@@ -3357,6 +3357,7 @@ mod tests {
             stall_detected: true,
             event_deltas: None,
             schedstat_deltas: None,
+            ..Default::default()
         };
         let report = monitor::MonitorReport {
             samples: vec![],

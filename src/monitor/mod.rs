@@ -479,6 +479,15 @@ pub struct MonitorSummary {
     /// Whether any CPU's `rq_clock` failed to advance between consecutive
     /// samples. Idle CPUs (`nr_running == 0` in both samples) are exempt.
     pub stall_detected: bool,
+    /// Average imbalance ratio across valid samples.
+    #[serde(default)]
+    pub avg_imbalance_ratio: f64,
+    /// Average nr_running per CPU across valid samples.
+    #[serde(default)]
+    pub avg_nr_running: f64,
+    /// Average local DSQ depth per CPU across valid samples.
+    #[serde(default)]
+    pub avg_local_dsq_depth: f64,
     /// Aggregate event counter deltas over the monitoring window.
     /// None when event counters are not available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -571,19 +580,45 @@ impl MonitorSummary {
 
         let mut max_imbalance_ratio: f64 = 1.0;
         let mut max_local_dsq_depth: u32 = 0;
+        let mut sum_imbalance_ratio: f64 = 0.0;
+        let mut sum_nr_running: f64 = 0.0;
+        let mut sum_local_dsq_depth: f64 = 0.0;
+        let mut valid_sample_count: usize = 0;
+        let mut total_cpu_readings: usize = 0;
 
         for sample in samples {
             if sample.cpus.is_empty() || !sample_looks_valid(sample) {
                 continue;
             }
+            valid_sample_count += 1;
             for cpu in &sample.cpus {
                 max_local_dsq_depth = max_local_dsq_depth.max(cpu.local_dsq_depth);
+                sum_nr_running += cpu.nr_running as f64;
+                sum_local_dsq_depth += cpu.local_dsq_depth as f64;
+                total_cpu_readings += 1;
             }
             let ratio = sample.imbalance_ratio();
+            sum_imbalance_ratio += ratio;
             if ratio > max_imbalance_ratio {
                 max_imbalance_ratio = ratio;
             }
         }
+
+        let avg_imbalance_ratio = if valid_sample_count > 0 {
+            sum_imbalance_ratio / valid_sample_count as f64
+        } else {
+            0.0
+        };
+        let avg_nr_running = if total_cpu_readings > 0 {
+            sum_nr_running / total_cpu_readings as f64
+        } else {
+            0.0
+        };
+        let avg_local_dsq_depth = if total_cpu_readings > 0 {
+            sum_local_dsq_depth / total_cpu_readings as f64
+        } else {
+            0.0
+        };
 
         // Stall detection: any CPU whose rq_clock did not advance between
         // consecutive samples. Skip invalid samples.
@@ -637,6 +672,9 @@ impl MonitorSummary {
             max_imbalance_ratio,
             max_local_dsq_depth,
             stall_detected,
+            avg_imbalance_ratio,
+            avg_nr_running,
+            avg_local_dsq_depth,
             event_deltas,
             schedstat_deltas,
             prog_stats_deltas,
@@ -1262,6 +1300,9 @@ mod tests {
         assert_eq!(summary.max_imbalance_ratio, 0.0);
         assert_eq!(summary.max_local_dsq_depth, 0);
         assert!(!summary.stall_detected);
+        assert_eq!(summary.avg_imbalance_ratio, 0.0);
+        assert_eq!(summary.avg_nr_running, 0.0);
+        assert_eq!(summary.avg_local_dsq_depth, 0.0);
     }
 
     #[test]
@@ -1289,6 +1330,10 @@ mod tests {
         assert!((summary.max_imbalance_ratio - 4.0).abs() < f64::EPSILON);
         assert_eq!(summary.max_local_dsq_depth, 3);
         assert!(!summary.stall_detected);
+        // avg fields: single sample with cpus [nr_running=1, nr_running=4]
+        assert!((summary.avg_imbalance_ratio - 4.0).abs() < f64::EPSILON);
+        assert!((summary.avg_nr_running - 2.5).abs() < f64::EPSILON);
+        assert!((summary.avg_local_dsq_depth - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1350,6 +1395,9 @@ mod tests {
         let summary = MonitorSummary::from_samples(&[sample]);
         assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
         assert!(!summary.stall_detected);
+        assert!((summary.avg_imbalance_ratio - 1.0).abs() < f64::EPSILON);
+        assert!((summary.avg_nr_running - 3.0).abs() < f64::EPSILON);
+        assert!((summary.avg_local_dsq_depth - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1387,6 +1435,10 @@ mod tests {
         assert_eq!(summary.max_local_dsq_depth, 0);
         // rq_clock=0 is excluded from stall detection
         assert!(!summary.stall_detected);
+        // avg: valid sample with 2 all-zero CPUs
+        assert_eq!(summary.avg_imbalance_ratio, 0.0);
+        assert_eq!(summary.avg_nr_running, 0.0);
+        assert_eq!(summary.avg_local_dsq_depth, 0.0);
     }
 
     #[test]
@@ -1400,6 +1452,10 @@ mod tests {
         assert_eq!(summary.total_samples, 1);
         // Empty cpus slice is skipped via `continue`
         assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
+        // avg: sample skipped (empty cpus), no valid readings
+        assert_eq!(summary.avg_imbalance_ratio, 0.0);
+        assert_eq!(summary.avg_nr_running, 0.0);
+        assert_eq!(summary.avg_local_dsq_depth, 0.0);
     }
 
     #[test]
@@ -2825,6 +2881,22 @@ mod tests {
             deltas.keep_last_rate >= 0.0,
             "keep_last rate must be non-negative"
         );
+        // avg fields: must be positive with non-zero nr_running input
+        assert!(
+            summary.avg_imbalance_ratio >= 1.0,
+            "avg imbalance must be >= 1.0: {}",
+            summary.avg_imbalance_ratio,
+        );
+        assert!(
+            summary.avg_nr_running > 0.0,
+            "avg nr_running must be positive: {}",
+            summary.avg_nr_running,
+        );
+        assert!(
+            summary.avg_local_dsq_depth >= 0.0,
+            "avg dsq_depth must be non-negative: {}",
+            summary.avg_local_dsq_depth,
+        );
     }
 
     #[test]
@@ -2836,6 +2908,9 @@ mod tests {
         assert_eq!(summary.max_imbalance_ratio, 0.0);
         assert_eq!(summary.max_local_dsq_depth, 0);
         assert!(!summary.stall_detected);
+        assert_eq!(summary.avg_imbalance_ratio, 0.0);
+        assert_eq!(summary.avg_nr_running, 0.0);
+        assert_eq!(summary.avg_local_dsq_depth, 0.0);
         assert!(
             summary.event_deltas.is_none(),
             "empty input must not produce event deltas"

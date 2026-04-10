@@ -1758,6 +1758,7 @@ mod tests {
                 }),
                 schedstat_deltas: None,
                 prog_stats_deltas: None,
+                ..Default::default()
             }),
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
@@ -1823,6 +1824,7 @@ mod tests {
                 stall_detected: false,
                 event_deltas: None,
                 schedstat_deltas: None,
+                ..Default::default()
             }),
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
