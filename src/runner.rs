@@ -211,7 +211,7 @@ impl Runner {
                 workers_per_cgroup: self.config.workers_per_cgroup,
                 sched_pid,
                 settle: self.config.settle,
-                work_type_override: self.config.work_type_override,
+                work_type_override: self.config.work_type_override.clone(),
                 assert: crate::assert::Assert::default_checks().merge(&self.config.assert),
                 wait_for_map_write: false,
             };

@@ -536,8 +536,8 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         let n = cw.num_workers.unwrap_or(ctx.workers_per_cgroup);
         let affinity = resolve_affinity_kind(&cw.affinity, cpusets.as_deref(), i, ctx.topo);
         let effective_work_type = crate::workload::resolve_work_type(
-            cw.work_type,
-            ctx.work_type_override,
+            &cw.work_type,
+            ctx.work_type_override.as_ref(),
             matches!(cw.work_type, WorkType::CpuSpin),
             n,
         );
@@ -777,7 +777,7 @@ pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHan
     ];
     let mut handles = Vec::new();
     for (i, name) in cgroup_names.iter().enumerate() {
-        let wt = types[i % types.len()];
+        let wt = types[i % types.len()].clone();
         let n = if matches!(wt, WorkType::IoSync) {
             2
         } else {

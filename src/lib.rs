@@ -155,7 +155,8 @@ pub mod prelude {
     pub use crate::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
     pub use crate::topology::TestTopology;
     pub use crate::workload::{
-        AffinityMode, SchedPolicy, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle,
+        AffinityMode, Phase, SchedPolicy, Work, WorkType, WorkerReport, WorkloadConfig,
+        WorkloadHandle,
     };
 }
 

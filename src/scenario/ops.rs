@@ -18,7 +18,7 @@ use anyhow::Result;
 
 use crate::assert::{self, AssertResult};
 use crate::vmm::shm_ring::{self, StimulusPayload};
-use crate::workload::{WorkType, WorkloadConfig, WorkloadHandle};
+use crate::workload::{Work, WorkType, WorkloadConfig, WorkloadHandle};
 
 use super::{CgroupGroup, Ctx, process_alive};
 
@@ -96,11 +96,15 @@ pub enum CpusetSpec {
 // CgroupDef
 // ---------------------------------------------------------------------------
 
-/// Declarative cgroup definition: name + cpuset + workload.
+/// Declarative cgroup definition: name + cpuset + workload(s).
 ///
-/// Bundles the three ops that always go together (AddCgroup + SetCpuset +
+/// Bundles the ops that always go together (AddCgroup + SetCpuset +
 /// Spawn) into a single value. The executor creates the cgroup, optionally
-/// sets its cpuset, spawns workers, and moves them into the cgroup.
+/// sets its cpuset, spawns workers for each [`Work`] entry, and moves
+/// them into the cgroup.
+///
+/// Multiple [`Work`] entries run in parallel within the cgroup. Each
+/// entry spawns its own set of worker processes.
 ///
 /// Use `CgroupDef` in `Step::with_defs` for scenarios where cgroups are
 /// created once and run for the step duration. Use `Op::AddCgroup` +
@@ -109,30 +113,38 @@ pub enum CpusetSpec {
 ///
 /// ```
 /// # use stt::scenario::ops::{CgroupDef, CpusetSpec};
-/// # use stt::workload::WorkType;
+/// # use stt::workload::{Work, WorkType};
+/// // Old API (backward compatible): single work group.
 /// let def = CgroupDef::named("workers")
 ///     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
 ///     .workers(4)
 ///     .work_type(WorkType::CpuSpin);
 ///
 /// assert_eq!(def.name, "workers");
-/// assert_eq!(def.num_workers, Some(4));
+/// assert_eq!(def.works[0].num_workers, Some(4));
+///
+/// // New API: multiple concurrent work groups.
+/// let def = CgroupDef::named("mixed")
+///     .work(Work::default().workers(4).work_type(WorkType::CpuSpin))
+///     .work(Work::default().workers(2).work_type(WorkType::YieldHeavy));
+///
+/// assert_eq!(def.works.len(), 2);
 /// ```
 #[derive(Clone, Debug)]
 pub struct CgroupDef {
     pub name: Cow<'static, str>,
     pub cpuset: Option<CpusetSpec>,
-    /// Number of workers. `None` means use `Ctx::workers_per_cgroup`.
-    pub num_workers: Option<usize>,
-    pub work_type: WorkType,
-    pub sched_policy: crate::workload::SchedPolicy,
-    /// When true, the gauntlet work_type override replaces this def's work_type.
+    /// Work groups to spawn. Empty means use a single default Work
+    /// (CpuSpin, Normal, ctx.workers_per_cgroup workers).
+    pub works: Vec<Work>,
+    /// When true, the gauntlet work_type override replaces each Work's
+    /// work_type (applied per-Work via resolve_work_type).
     pub swappable: bool,
 }
 
 impl CgroupDef {
-    /// Create a CgroupDef with defaults (CpuSpin, Normal, None workers).
-    /// `None` workers means use `ctx.workers_per_cgroup` at execution time.
+    /// Create a CgroupDef with defaults (empty works, no cpuset).
+    /// Empty works means use a single default Work at execution time.
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),
@@ -147,25 +159,42 @@ impl CgroupDef {
         self
     }
 
-    /// Set the number of workers.
+    /// Add a work group. Can be called multiple times for concurrent
+    /// work groups within this cgroup.
+    pub fn work(mut self, w: Work) -> Self {
+        self.works.push(w);
+        self
+    }
+
+    /// Ensure works[0] exists for backward-compat builder methods.
+    fn ensure_default_work(&mut self) {
+        if self.works.is_empty() {
+            self.works.push(Work::default());
+        }
+    }
+
+    /// Set the number of workers (backward-compat sugar for single Work).
     pub fn workers(mut self, n: usize) -> Self {
-        self.num_workers = Some(n);
+        self.ensure_default_work();
+        self.works[0].num_workers = Some(n);
         self
     }
 
-    /// Set the work type for workers in this cgroup.
+    /// Set the work type (backward-compat sugar for single Work).
     pub fn work_type(mut self, wt: WorkType) -> Self {
-        self.work_type = wt;
+        self.ensure_default_work();
+        self.works[0].work_type = wt;
         self
     }
 
-    /// Set the Linux scheduling policy for workers.
+    /// Set the scheduling policy (backward-compat sugar for single Work).
     pub fn sched_policy(mut self, p: crate::workload::SchedPolicy) -> Self {
-        self.sched_policy = p;
+        self.ensure_default_work();
+        self.works[0].sched_policy = p;
         self
     }
 
-    /// When true, the gauntlet work_type override replaces this def's work type.
+    /// When true, the gauntlet work_type override replaces each Work's work type.
     pub fn swappable(mut self, swappable: bool) -> Self {
         self.swappable = swappable;
         self
@@ -177,9 +206,7 @@ impl Default for CgroupDef {
         Self {
             name: Cow::Borrowed("cg_0"),
             cpuset: None,
-            num_workers: None,
-            work_type: WorkType::CpuSpin,
-            sched_policy: crate::workload::SchedPolicy::Normal,
+            works: vec![],
             swappable: false,
         }
     }
@@ -725,9 +752,18 @@ fn build_stimulus(
 }
 
 /// Create cgroups, set cpusets, and spawn workers from CgroupDefs.
+///
+/// Each CgroupDef's `works` vec is iterated, spawning one WorkloadHandle
+/// per Work entry. Multiple Works for the same cgroup produce multiple
+/// handle entries with the same name key; Ops that filter by cgroup name
+/// (StopCgroup, SetAffinity, etc.) naturally apply to all of them.
+///
+/// When `works` is empty, a single default Work is used (CpuSpin, Normal,
+/// ctx.workers_per_cgroup workers).
 fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Result<()> {
     use crate::workload::AffinityMode;
 
+    let default_work = [Work::default()];
     for def in defs {
         state.cgroups.add_cgroup_no_cpuset(&def.name)?;
         if let Some(ref cpuset_spec) = def.cpuset {
@@ -738,23 +774,30 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
             state.cpusets.insert(def.name.to_string(), resolved);
         }
-        let n = def.num_workers.unwrap_or(ctx.workers_per_cgroup);
-        let effective_work_type = crate::workload::resolve_work_type(
-            def.work_type,
-            ctx.work_type_override,
-            def.swappable,
-            n,
-        );
-        let wl = WorkloadConfig {
-            num_workers: n,
-            affinity: AffinityMode::None,
-            work_type: effective_work_type,
-            sched_policy: def.sched_policy,
+        let effective_works: &[Work] = if def.works.is_empty() {
+            &default_work
+        } else {
+            &def.works
         };
-        let mut h = WorkloadHandle::spawn(&wl)?;
-        ctx.cgroups.move_tasks(&def.name, &h.tids())?;
-        h.start();
-        state.handles.push((def.name.to_string(), h));
+        for work in effective_works {
+            let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
+            let effective_work_type = crate::workload::resolve_work_type(
+                &work.work_type,
+                ctx.work_type_override.as_ref(),
+                def.swappable,
+                n,
+            );
+            let wl = WorkloadConfig {
+                num_workers: n,
+                affinity: AffinityMode::None,
+                work_type: effective_work_type,
+                sched_policy: work.sched_policy,
+            };
+            let mut h = WorkloadHandle::spawn(&wl)?;
+            ctx.cgroups.move_tasks(&def.name, &h.tids())?;
+            h.start();
+            state.handles.push((def.name.to_string(), h));
+        }
     }
     Ok(())
 }
@@ -1553,7 +1596,8 @@ mod tests {
             .swappable(true);
         assert_eq!(d.name, "test");
         assert!(d.cpuset.is_some());
-        assert_eq!(d.num_workers, Some(8));
+        assert_eq!(d.works.len(), 1);
+        assert_eq!(d.works[0].num_workers, Some(8));
         assert!(d.swappable);
     }
 
@@ -1562,8 +1606,35 @@ mod tests {
         let d = CgroupDef::default();
         assert_eq!(d.name, "cg_0");
         assert!(d.cpuset.is_none());
-        assert_eq!(d.num_workers, None);
+        assert!(d.works.is_empty());
         assert!(!d.swappable);
+    }
+
+    #[test]
+    fn cgroup_def_multi_work() {
+        let d = CgroupDef::named("multi")
+            .work(Work::default().workers(4).work_type(WorkType::CpuSpin))
+            .work(Work::default().workers(2).work_type(WorkType::YieldHeavy));
+        assert_eq!(d.works.len(), 2);
+        assert_eq!(d.works[0].num_workers, Some(4));
+        assert_eq!(d.works[1].num_workers, Some(2));
+    }
+
+    #[test]
+    fn cgroup_def_old_api_then_work() {
+        let d = CgroupDef::named("mixed")
+            .workers(4)
+            .work(Work::default().workers(2));
+        assert_eq!(d.works.len(), 2);
+        assert_eq!(d.works[0].num_workers, Some(4));
+        assert_eq!(d.works[1].num_workers, Some(2));
+    }
+
+    #[test]
+    fn cgroup_def_work_only_no_phantom() {
+        let d = CgroupDef::named("explicit").work(Work::default().workers(3));
+        assert_eq!(d.works.len(), 1);
+        assert_eq!(d.works[0].num_workers, Some(3));
     }
 
     // -- Setup --

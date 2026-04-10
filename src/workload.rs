@@ -33,6 +33,22 @@ pub enum AffinityMode {
     SingleCpu(usize),
 }
 
+/// A single phase in a [`WorkType::Sequence`] compound work pattern.
+///
+/// Workers loop through all phases in order, then repeat. Each phase
+/// runs for its specified duration before advancing to the next.
+#[derive(Clone, Debug)]
+pub enum Phase {
+    /// CPU spin for the given duration.
+    Spin(Duration),
+    /// Sleep (thread::sleep) for the given duration.
+    Sleep(Duration),
+    /// Yield (sched_yield) repeatedly for the given duration.
+    Yield(Duration),
+    /// Synchronous I/O (write + fsync) for the given duration.
+    Io(Duration),
+}
+
 /// What each worker process does during a scenario.
 ///
 /// Different work types exercise different scheduler code paths:
@@ -48,7 +64,7 @@ pub enum AffinityMode {
 ///
 /// assert!(WorkType::from_name("nonexistent").is_none());
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum WorkType {
     CpuSpin,
     YieldHeavy,
@@ -99,6 +115,9 @@ pub enum WorkType {
         fan_out: usize,
         spin_iters: u64,
     },
+    /// Compound work pattern: loop through phases in order, repeat.
+    /// Each phase runs for its duration before the next starts.
+    Sequence(Vec<Phase>),
 }
 
 impl WorkType {
@@ -114,6 +133,7 @@ impl WorkType {
         "CacheYield",
         "CachePipe",
         "FutexFanOut",
+        "Sequence",
     ];
 
     pub fn name(&self) -> &'static str {
@@ -129,6 +149,7 @@ impl WorkType {
             WorkType::CacheYield { .. } => "CacheYield",
             WorkType::CachePipe { .. } => "CachePipe",
             WorkType::FutexFanOut { .. } => "FutexFanOut",
+            WorkType::Sequence(_) => "Sequence",
         }
     }
 
@@ -160,6 +181,7 @@ impl WorkType {
                 fan_out: 4,
                 spin_iters: 1024,
             }),
+            // Sequence requires explicit phases; no default from_name.
             _ => None,
         }
     }
@@ -247,27 +269,28 @@ impl WorkType {
 
 /// Resolve a work type with an optional override.
 ///
-/// Returns `override_wt` when `swappable` is true and the override's
-/// group size (if any) divides `num_workers`. Otherwise returns `base`.
+/// Returns a clone of `override_wt` when `swappable` is true and the
+/// override's group size (if any) divides `num_workers`. Otherwise
+/// returns a clone of `base`.
 pub(crate) fn resolve_work_type(
-    base: WorkType,
-    override_wt: Option<WorkType>,
+    base: &WorkType,
+    override_wt: Option<&WorkType>,
     swappable: bool,
     num_workers: usize,
 ) -> WorkType {
     if !swappable {
-        return base;
+        return base.clone();
     }
     match override_wt {
         Some(wt) => {
             if let Some(gs) = wt.worker_group_size()
                 && !num_workers.is_multiple_of(gs)
             {
-                return base;
+                return base.clone();
             }
-            wt
+            wt.clone()
         }
-        None => base,
+        None => base.clone(),
     }
 }
 
@@ -310,6 +333,60 @@ impl Default for WorkloadConfig {
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
         }
+    }
+}
+
+/// Workload definition for a single group of workers within a cgroup.
+///
+/// Extracted from [`CgroupDef`](crate::scenario::ops::CgroupDef) to allow
+/// multiple concurrent work groups per cgroup. Each `Work` spawns its own
+/// set of worker processes.
+///
+/// ```
+/// # use stt::workload::{Work, WorkType, SchedPolicy};
+/// let w = Work::default()
+///     .workers(4)
+///     .work_type(WorkType::Bursty { burst_ms: 50, sleep_ms: 100 })
+///     .sched_policy(SchedPolicy::Batch);
+/// assert_eq!(w.num_workers, Some(4));
+/// ```
+#[derive(Clone, Debug)]
+pub struct Work {
+    /// What each worker does.
+    pub work_type: WorkType,
+    /// Linux scheduling policy.
+    pub sched_policy: SchedPolicy,
+    /// Number of workers. `None` means use `Ctx::workers_per_cgroup`.
+    pub num_workers: Option<usize>,
+}
+
+impl Default for Work {
+    fn default() -> Self {
+        Self {
+            work_type: WorkType::CpuSpin,
+            sched_policy: SchedPolicy::Normal,
+            num_workers: None,
+        }
+    }
+}
+
+impl Work {
+    /// Set the number of workers.
+    pub fn workers(mut self, n: usize) -> Self {
+        self.num_workers = Some(n);
+        self
+    }
+
+    /// Set the work type.
+    pub fn work_type(mut self, wt: WorkType) -> Self {
+        self.work_type = wt;
+        self
+    }
+
+    /// Set the Linux scheduling policy.
+    pub fn sched_policy(mut self, p: SchedPolicy) -> Self {
+        self.sched_policy = p;
+        self
     }
 }
 
@@ -415,6 +492,11 @@ impl WorkloadHandle {
             WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
         );
         let needs_futex = config.work_type.needs_shared_mem();
+        if let WorkType::Sequence(ref phases) = config.work_type
+            && phases.is_empty()
+        {
+            anyhow::bail!("Sequence work type requires at least one phase");
+        }
         if let Some(group_size) = config.work_type.worker_group_size()
             && (config.num_workers == 0 || !config.num_workers.is_multiple_of(group_size))
         {
@@ -612,7 +694,7 @@ impl WorkloadHandle {
                     // Now run
                     let report = worker_main(
                         affinity,
-                        config.work_type,
+                        config.work_type.clone(),
                         config.sched_policy,
                         worker_pipe_fds,
                         worker_futex,
@@ -1185,6 +1267,75 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::Sequence(ref phases) => {
+                for phase in phases {
+                    if STOP.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match phase {
+                        Phase::Spin(dur) => {
+                            let end = Instant::now() + *dur;
+                            while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
+                                for _ in 0..1024 {
+                                    work_units = std::hint::black_box(work_units.wrapping_add(1));
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
+                        Phase::Sleep(dur) => {
+                            let before_sleep = Instant::now();
+                            std::thread::sleep(*dur);
+                            reservoir_push(
+                                &mut wake_latencies_ns,
+                                &mut wake_sample_count,
+                                before_sleep.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                            last_iter_time = Instant::now();
+                        }
+                        Phase::Yield(dur) => {
+                            let end = Instant::now() + *dur;
+                            while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
+                                work_units = work_units.wrapping_add(1);
+                                let before_yield = Instant::now();
+                                std::thread::yield_now();
+                                reservoir_push(
+                                    &mut wake_latencies_ns,
+                                    &mut wake_sample_count,
+                                    before_yield.elapsed().as_nanos() as u64,
+                                    MAX_WAKE_SAMPLES,
+                                );
+                            }
+                            last_iter_time = Instant::now();
+                        }
+                        Phase::Io(dur) => {
+                            let end = Instant::now() + *dur;
+                            let path = std::env::temp_dir()
+                                .join(format!("stt_seq_{tid}"))
+                                .to_string_lossy()
+                                .to_string();
+                            while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .create(true)
+                                    .truncate(true)
+                                    .open(&path)
+                                {
+                                    let buf = [0u8; 4096];
+                                    for _ in 0..16 {
+                                        let _ = f.write_all(&buf);
+                                        work_units = work_units.wrapping_add(1);
+                                    }
+                                    let _ = f.sync_all();
+                                }
+                            }
+                            let _ = std::fs::remove_file(&path);
+                            last_iter_time = Instant::now();
+                        }
+                    }
+                }
+                iterations += 1;
+            }
         }
 
         // Publish iteration count to shared memory for host-side sampling.
@@ -1381,6 +1532,11 @@ mod tests {
     #[test]
     fn work_type_name_roundtrip() {
         for &name in WorkType::ALL_NAMES {
+            // Sequence has no default from_name; tested separately.
+            if name == "Sequence" {
+                assert!(WorkType::from_name(name).is_none());
+                continue;
+            }
             let wt = WorkType::from_name(name).unwrap();
             assert_eq!(wt.name(), name);
         }
@@ -1393,7 +1549,7 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        assert_eq!(WorkType::ALL_NAMES.len(), 11);
+        assert_eq!(WorkType::ALL_NAMES.len(), 12);
     }
 
     #[test]
@@ -2173,13 +2329,12 @@ mod tests {
     }
 
     #[test]
-    fn work_type_copy_preserves_variant() {
+    fn work_type_clone_preserves_variant() {
         let a = WorkType::PipeIo { burst_iters: 512 };
-        let b = a; // Copy
-        // Verify the copied value carries the field value, not just the variant.
+        let b = a.clone();
         match b {
             WorkType::PipeIo { burst_iters } => assert_eq!(burst_iters, 512),
-            _ => panic!("copy must preserve variant and fields"),
+            _ => panic!("clone must preserve variant and fields"),
         }
     }
 
@@ -2722,65 +2877,65 @@ mod tests {
     #[test]
     fn resolve_work_type_not_swappable_returns_base() {
         let base = WorkType::CpuSpin;
-        let override_wt = Some(WorkType::YieldHeavy);
-        let result = resolve_work_type(base, override_wt, false, 4);
+        let override_wt = WorkType::YieldHeavy;
+        let result = resolve_work_type(&base, Some(&override_wt), false, 4);
         assert!(matches!(result, WorkType::CpuSpin));
     }
 
     #[test]
     fn resolve_work_type_swappable_no_override_returns_base() {
         let base = WorkType::CpuSpin;
-        let result = resolve_work_type(base, None, true, 4);
+        let result = resolve_work_type(&base, None, true, 4);
         assert!(matches!(result, WorkType::CpuSpin));
     }
 
     #[test]
     fn resolve_work_type_swappable_ungrouped_override() {
         let base = WorkType::CpuSpin;
-        let override_wt = Some(WorkType::YieldHeavy);
-        let result = resolve_work_type(base, override_wt, true, 4);
+        let override_wt = WorkType::YieldHeavy;
+        let result = resolve_work_type(&base, Some(&override_wt), true, 4);
         assert!(matches!(result, WorkType::YieldHeavy));
     }
 
     #[test]
     fn resolve_work_type_swappable_grouped_override_compatible() {
         let base = WorkType::CpuSpin;
-        let override_wt = Some(WorkType::PipeIo { burst_iters: 1024 });
+        let override_wt = WorkType::PipeIo { burst_iters: 1024 };
         // num_workers=4 is divisible by group_size=2
-        let result = resolve_work_type(base, override_wt, true, 4);
+        let result = resolve_work_type(&base, Some(&override_wt), true, 4);
         assert!(matches!(result, WorkType::PipeIo { .. }));
     }
 
     #[test]
     fn resolve_work_type_swappable_grouped_override_incompatible() {
         let base = WorkType::CpuSpin;
-        let override_wt = Some(WorkType::PipeIo { burst_iters: 1024 });
+        let override_wt = WorkType::PipeIo { burst_iters: 1024 };
         // num_workers=3 is not divisible by group_size=2, falls back to base
-        let result = resolve_work_type(base, override_wt, true, 3);
+        let result = resolve_work_type(&base, Some(&override_wt), true, 3);
         assert!(matches!(result, WorkType::CpuSpin));
     }
 
     #[test]
     fn resolve_work_type_swappable_fanout_compatible() {
         let base = WorkType::CpuSpin;
-        let override_wt = Some(WorkType::FutexFanOut {
+        let override_wt = WorkType::FutexFanOut {
             fan_out: 4,
             spin_iters: 1024,
-        });
+        };
         // num_workers=10 is divisible by group_size=5
-        let result = resolve_work_type(base, override_wt, true, 10);
+        let result = resolve_work_type(&base, Some(&override_wt), true, 10);
         assert!(matches!(result, WorkType::FutexFanOut { .. }));
     }
 
     #[test]
     fn resolve_work_type_swappable_fanout_incompatible() {
         let base = WorkType::CpuSpin;
-        let override_wt = Some(WorkType::FutexFanOut {
+        let override_wt = WorkType::FutexFanOut {
             fan_out: 4,
             spin_iters: 1024,
-        });
+        };
         // num_workers=7 is not divisible by group_size=5, falls back to base
-        let result = resolve_work_type(base, override_wt, true, 7);
+        let result = resolve_work_type(&base, Some(&override_wt), true, 7);
         assert!(matches!(result, WorkType::CpuSpin));
     }
 

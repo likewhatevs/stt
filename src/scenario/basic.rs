@@ -44,13 +44,13 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
         },
     ];
     for name in ["cg_0", "cg_1"] {
-        for &(policy, wtype) in &configs {
+        for &(policy, ref wtype) in &configs {
             ops.push(Op::Spawn {
                 cgroup: name.into(),
                 workload: WorkloadConfig {
                     num_workers: 2,
                     sched_policy: policy,
-                    work_type: wtype,
+                    work_type: wtype.clone(),
                     ..Default::default()
                 },
             });
