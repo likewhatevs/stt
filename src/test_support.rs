@@ -2572,10 +2572,13 @@ fn format_console_diagnostics(console: &str, exit_code: i32, init_stage: &str) -
         let lines: Vec<&str> = trimmed.lines().collect();
         let start = lines.len().saturating_sub(TAIL_LINES);
         let tail = &lines[start..];
+        let truncated = !console.ends_with('\n');
         parts.push(format!(
-            "kernel console (last {} lines):\n{}",
+            "kernel console (last {} lines{}):\n{}{}",
             tail.len(),
+            if truncated { ", truncated" } else { "" },
             tail.join("\n"),
+            if truncated { " [truncated]" } else { "" },
         ));
     }
     format!("\n\n--- diagnostics ---\n{}", parts.join("\n"))
@@ -3889,31 +3892,51 @@ mod tests {
 
     #[test]
     fn format_console_diagnostics_with_console() {
-        let console = "line1\nline2\nKernel panic - not syncing";
+        let console = "line1\nline2\nKernel panic - not syncing\n";
         let s = format_console_diagnostics(console, -1, "payload started");
         assert!(s.contains("exit_code=-1"));
         assert!(s.contains("kernel console"));
         assert!(s.contains("Kernel panic"));
         assert!(s.contains("stage: payload started"));
+        assert!(!s.contains("truncated"));
     }
 
     #[test]
     fn format_console_diagnostics_truncates_long() {
         let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
-        let console = lines.join("\n");
+        let console = format!("{}\n", lines.join("\n"));
         let s = format_console_diagnostics(&console, 0, "test");
         assert!(s.contains("last 20 lines"));
         assert!(s.contains("boot line 49"));
         assert!(!s.contains("boot line 29"));
+        assert!(!s.contains("truncated"));
     }
 
     #[test]
     fn format_console_diagnostics_short_console() {
-        let console = "Linux version 6.14.0\nbooted ok";
+        let console = "Linux version 6.14.0\nbooted ok\n";
         let s = format_console_diagnostics(console, 0, "test");
         assert!(s.contains("last 2 lines"));
         assert!(s.contains("Linux version 6.14.0"));
         assert!(s.contains("booted ok"));
+        assert!(!s.contains("truncated"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_no_truncation_with_trailing_newline() {
+        let console = "line1\nline2\nline3\n";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains("last 3 lines)"));
+        assert!(!s.contains("truncated"));
+        assert!(!s.contains("[truncated]"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_truncation_without_trailing_newline() {
+        let console = "line1\nline2\npartial li";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains(", truncated)"));
+        assert!(s.contains("partial li [truncated]"));
     }
 
     // -- extract_work_type_arg tests --
