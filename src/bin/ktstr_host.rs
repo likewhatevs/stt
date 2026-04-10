@@ -76,9 +76,9 @@ enum Command {
         #[arg(long)]
         work_type: Option<String>,
 
-        /// Parent cgroup path.
-        #[arg(long, default_value = "/sys/fs/cgroup/ktstr")]
-        parent_cgroup: String,
+        /// Parent cgroup path. Auto-generated with PID suffix if omitted.
+        #[arg(long)]
+        parent_cgroup: Option<String>,
     },
     /// List available scenarios.
     List {
@@ -98,6 +98,19 @@ enum Command {
         #[arg(long, default_value = "/sys/fs/cgroup/ktstr")]
         parent_cgroup: String,
     },
+}
+
+/// RAII guard that cleans up an auto-generated cgroup directory on drop.
+struct CgroupGuard {
+    path: String,
+}
+
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        let cgroups = CgroupManager::new(&self.path);
+        let _ = cgroups.cleanup_all();
+        let _ = std::fs::remove_dir(&self.path);
+    }
 }
 
 fn main() -> Result<()> {
@@ -128,6 +141,19 @@ fn main() -> Result<()> {
             work_type,
             parent_cgroup,
         } => {
+            let auto_generated = parent_cgroup.is_none();
+            let parent_cgroup = parent_cgroup
+                .unwrap_or_else(|| format!("/sys/fs/cgroup/ktstr-{}", std::process::id()));
+
+            // Guard cleans up auto-generated cgroups on exit (pass or fail).
+            let _guard = if auto_generated {
+                Some(CgroupGuard {
+                    path: parent_cgroup.clone(),
+                })
+            } else {
+                None
+            };
+
             let active_flags = cli::resolve_flags(flag_arg)?;
             let work_type_override = cli::parse_work_type(work_type.as_deref())?;
 
