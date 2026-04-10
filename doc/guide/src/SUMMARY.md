@@ -47,3 +47,4 @@
 # Reference
 
 - [Troubleshooting](troubleshooting.md)
+- [Environment Variables](reference/environment-variables.md)
