@@ -3,20 +3,32 @@
 stt can save test results as baselines and compare subsequent runs
 against them.
 
-`compare_baselines()` diffs two sets of gauntlet rows. The output
-groups cells into four categories:
+## Workflow
 
-- **Regressions** -- pass rate dropped, spread increased, or gap
-  increased beyond tolerance thresholds.
-- **Improvements** -- pass rate increased or metrics improved beyond
-  tolerance.
-- **Removed** -- cells present in the baseline but missing from the
-  current run.
-- **New** -- cells present in the current run but missing from the
-  baseline.
+1. **Save baseline**: set `STT_SIDECAR_DIR` to a directory. Each test
+   writes a `SidecarResult` JSON file there.
 
-The summary line shows how many cells were unchanged (within
-tolerance).
+   ```sh
+   STT_SIDECAR_DIR=./baseline cargo nextest run --workspace
+   ```
 
-Sidecar results (`SidecarResult` JSON files) are written to
-`STT_SIDECAR_DIR` and collected for analysis.
+2. **Run current**: run the same tests with a different sidecar dir.
+
+   ```sh
+   STT_SIDECAR_DIR=./current cargo nextest run --workspace
+   ```
+
+3. **Compare**: diff the sidecar JSON files between directories.
+   Automated comparison tooling is planned but not yet implemented.
+   For now, compare pass/fail counts and per-test metrics manually
+   or with standard JSON diffing tools.
+
+## Sidecar format
+
+Each test writes a `SidecarResult` JSON file containing the test name,
+topology, scheduler, pass/fail, per-cgroup stats, monitor summary,
+and stimulus events. Files are named with a `.stt.` infix for
+discovery. `collect_sidecars()` reads all sidecar files from a
+directory (recursing one level for gauntlet per-job subdirectories).
+
+See also: [`STT_SIDECAR_DIR`](../reference/environment-variables.md).

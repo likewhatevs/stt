@@ -55,28 +55,15 @@ fn high_imbalance_test(ctx: &Ctx) -> Result<AssertResult> {
 
 ## Understanding not_starved
 
-`not_starved = true` enables three distinct checks:
-
-1. **Starvation**: any worker with zero work units fails.
-2. **Fairness spread**: max - min off-CPU% across workers in a cgroup
-   must be below `max_spread_pct` (default: 15% release, 35% debug).
-3. **Scheduling gaps**: longest gap between work iterations must be
-   below `max_gap_ms` (default: 2000ms release, 3000ms debug).
-
-Each threshold can be overridden independently in `#[stt_test]`
-attributes or in `Scheduler.assert`.
+`not_starved = true` enables starvation, fairness spread, and
+scheduling gap checks. Each threshold can be overridden independently.
+See [Verification: Worker checks](../concepts/verification.md#worker-checks)
+for details and default thresholds.
 
 ## Merge order
 
-```text
-Assert::default_checks()     <- baseline (not_starved, monitor defaults)
-    .merge(&scheduler.assert) <- scheduler overrides
-    .merge(&test.assert)      <- per-test attribute overrides
-```
-
-All fields use last-`Some`-wins -- a higher layer's `Some` replaces
-the lower. A scheduler or test can disable a check by setting
-`Some(false)` even if a lower layer enabled it.
+Three-layer merge with last-`Some`-wins semantics. See
+[Verification: Merge layers](../concepts/verification.md#merge-layers).
 
 ## Using Assert directly in ops scenarios
 

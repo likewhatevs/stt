@@ -31,3 +31,7 @@ Each `#[stt_test]` declares its topology via macro attributes:
 
 The test framework boots a VM with the specified topology
 automatically.
+
+See [Investigate a Crash](../recipes/investigate-crash.md) for
+interpreting failure output and
+[Troubleshooting](../troubleshooting.md) for common error messages.

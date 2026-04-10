@@ -11,7 +11,7 @@ let result = vmm::SttVm::builder()
     .init_binary(&stt_binary)
     .topology(sockets, cores_per_socket, threads_per_core)
     .memory_mb(4096)
-    .run_args(&["run", "--stt-test-fn", "my_test"])
+    .run_args(&["run".into(), "--stt-test-fn".into(), "my_test".into()])
     .build()?
     .run()?;
 ```
@@ -59,36 +59,14 @@ checking.
 
 ## Performance mode
 
-When `performance_mode` is enabled on the builder, the VMM applies
-optimizations across VM build, creation, and thread spawn:
+When `performance_mode` is enabled, the VMM applies host-side
+isolation (vCPU pinning, hugepages, NUMA mbind, RT scheduling),
+guest-visible hints (KVM_HINTS_REALTIME CPUID), and KVM exit
+suppression. Non-performance-mode VMs set `KVM_CAP_HALT_POLL` to
+200us; overcommitted topologies set it to 0.
 
-1. Reads host LLC topology from sysfs.
-2. Maps each virtual socket to a physical LLC group.
-3. Pins each vCPU thread to a dedicated host core via
-   `sched_setaffinity`.
-4. Allocates guest memory with 2MB hugepages (`MAP_HUGETLB`)
-   when sufficient free hugepages exist.
-5. Sets KVM_HINTS_REALTIME in CPUID leaf 0x40000001 EDX,
-   disabling PV spinlocks, PV TLB flush, and PV sched_yield
-   in the guest, and enabling haltpoll cpuidle.
-6. Disables PAUSE and HLT VM exits via `KVM_CAP_X86_DISABLE_EXITS`.
-   HLT is the most frequent exit type during boot/idle. BSP shutdown
-   uses I8042 reset and VcpuExit::Shutdown instead of VcpuExit::Hlt.
-   HLT disable falls back to PAUSE-only when mitigate_smt_rsb is
-   active on the host.
-7. Skips `KVM_CAP_HALT_POLL` (guest haltpoll cpuidle disables
-   host halt polling via `MSR_KVM_POLL_CONTROL`).
-
-Non-performance-mode VMs set `KVM_CAP_HALT_POLL` to 200µs (matching
-the x86 kernel default) to reduce vCPU wakeup latency. Overcommitted
-topologies (vCPUs > host CPUs) set it to 0.
-
-Validation runs at build time. Oversubscription and unsatisfiable
-topology mappings are fatal errors. Insufficient hugepages is a
-warning -- the VM runs with regular pages rather than failing.
-
-See [Performance Mode](../concepts/performance-mode.md) for usage
-and prerequisites.
+See [Performance Mode](../concepts/performance-mode.md) for the
+full optimization list, prerequisites, and validation.
 
 ## Dual-role architecture
 

@@ -193,77 +193,11 @@ fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 
 ## Defining flags
 
-With the derive, each enum variant is a flag. The `#[flag]` attribute
-specifies CLI args and dependencies:
-
-```rust,ignore
-#[derive(stt::Scheduler)]
-#[scheduler(name = "mitosis", binary = "scx_mitosis", topology(2, 4, 1))]
-#[allow(dead_code)]
-enum MitosisFlag {
-    #[flag(args = ["--enable-llc-awareness"])]
-    Llc,
-    #[flag(args = ["--enable-borrowing"])]
-    Borrow,
-    #[flag(args = ["--enable-work-stealing"], requires = [Llc])]
-    Steal,
-}
-```
-
-The `args` field contains the scheduler CLI arguments passed when the
-flag is active. The `requires` field expresses dependencies: `Steal`
-requires `Llc`, so any profile containing `steal` automatically
-includes `llc`. Invalid combinations are rejected by
-`generate_profiles()`.
-
-The derive generates `&'static str` constants on the enum for typed
-flag references in `required_flags` and `excluded_flags`:
-
-```rust,ignore
-#[stt_test(
-    scheduler = MITOSIS,
-    required_flags = [MitosisFlag::LLC],
-    excluded_flags = [MitosisFlag::REJECT_PIN],
-)]
-fn my_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
-```
-
-String literals still work:
-
-```rust,ignore
-#[stt_test(scheduler = MITOSIS, required_flags = ["llc"])]
-```
-
-### Manual flag definition
-
-The manual pattern still works. Each scheduler defines its own
-`FlagDecl` statics:
-
-```rust,ignore
-use stt::prelude::*;
-
-static MITOSIS_LLC: FlagDecl = FlagDecl {
-    name: "llc",
-    args: &["--enable-llc-awareness"],
-    requires: &[],
-};
-
-static MITOSIS_STEAL: FlagDecl = FlagDecl {
-    name: "steal",
-    args: &["--enable-work-stealing"],
-    requires: &[&MITOSIS_LLC],
-};
-
-const MITOSIS: Scheduler = Scheduler::new("mitosis")
-    .binary(SchedulerSpec::Name("scx_mitosis"))
-    .flags(&[&MITOSIS_LLC, &MITOSIS_STEAL])
-    .topology(2, 4, 1);
-```
-
-The built-in `*_DECL` constants in `stt::scenario::flags` (e.g.
-`LLC_DECL`, `BORROW_DECL`) have empty `args` fields. They exist for
-stt's internal scenario catalog. External consumers must define their
-own `FlagDecl` statics with their scheduler's actual CLI arguments.
+Each enum variant is a flag. `#[flag(args)]` lists CLI arguments
+passed when the flag is active. `#[flag(requires)]` declares
+dependencies. See [Flags](../concepts/flags.md) for dependency
+semantics, profile generation, and using flags in
+[`#[stt_test]`](stt-test-macro.md#flag-constraints).
 
 ## Flag scoping
 

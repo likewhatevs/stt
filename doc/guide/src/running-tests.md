@@ -18,16 +18,13 @@ cargo nextest run --run-ignored ignored-only -E 'test(gauntlet/)'
 
 ## Flags
 
-Flags enable scheduler features. Declare them in the `Scheduler`
-definition via `FlagDecl` structs. Use `required_flags` and
-`excluded_flags` in `#[stt_test]` to constrain which flag
-profiles a test runs under.
+Define flags via `#[derive(Scheduler)]` with `#[flag(...)]` attributes.
+Use `required_flags` and `excluded_flags` in `#[stt_test]` to constrain
+which flag profiles a test runs under.
 
-Available flags: `llc`, `borrow`, `steal`, `rebal`, `reject-pin`,
-`no-ctrl`. `steal` requires `llc` -- this is enforced automatically.
-
-See [Flags](concepts/flags.md) for details on flag declarations
-and profile generation.
+stt includes built-in flags (`llc`, `borrow`, `steal`, `rebal`,
+`reject-pin`, `no-ctrl`) for the internal catalog. See
+[Flags](concepts/flags.md) for details.
 
 ## Budget-based test selection
 

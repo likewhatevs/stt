@@ -95,7 +95,11 @@ Call `assert.assert_cgroup(reports, cpuset)` for manual report
 collection, or use `execute_steps_with()` for ops-based scenarios. See
 [Verification](../concepts/verification.md#worker-checks-via-assert).
 
-## Registering a custom scenario
+## Registering a custom scenario (stt contributors only)
+
+This section applies to contributing scenarios to stt's internal
+catalog. External test suites call scenario functions directly from
+`#[stt_test]` -- no registration needed.
 
 Add it to `all_scenarios()` in `src/scenario/catalog.rs`:
 

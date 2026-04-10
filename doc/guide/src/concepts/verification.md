@@ -56,14 +56,10 @@ memory (per-CPU runqueue structs via BTF offsets) and evaluates:
 
 - **Imbalance ratio**: max/min `nr_running` across CPUs.
 - **Local DSQ depth**: per-CPU dispatch queue depth.
-- **Stall detection**: any CPU's `rq_clock` does not advance between
-  consecutive samples. CPUs with `rq_clock == 0` are excluded (not
-  yet initialized). Idle CPUs (`nr_running == 0` in both samples) are
-  also excluded -- the kernel stops the tick (NOHZ) on idle CPUs, so
-  `rq_clock` legitimately does not advance. Preempted vCPUs are also excluded -- when the vCPU thread's
-  CPU time didn't advance past the preemption threshold, the host
-  preempted the vCPU. Stalls use the same
-  `sustained_samples` window as other monitor checks.
+- **Stall detection**: `rq_clock` not advancing on a CPU with
+  runnable tasks. Idle CPUs and preempted vCPUs are exempt. See
+  [Monitor: Stall detection](../architecture/monitor.md#stall-detection)
+  for exemption details.
 - **Event rates**: scx fallback and keep-last event counters.
 
 Monitor thresholds use a sustained sample window (default: 5 samples).

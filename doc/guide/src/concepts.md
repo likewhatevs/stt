@@ -22,10 +22,10 @@ Scenarios are data-driven structs, not test functions. The same scenario
 definition works across different schedulers, flag combinations, and
 topologies without code changes.
 
-Flags use typed static references (`&'static FlagDecl`) with dependency
-constraints (`steal` requires `llc`). Dependencies are declared
-statically and enforced at profile generation time -- invalid
-combinations are rejected automatically.
+Flags are defined via `#[derive(Scheduler)]` on an enum, generating
+typed `FlagDecl` statics with dependency constraints (`steal` requires
+`llc`). Dependencies are declared statically and enforced at profile
+generation time -- invalid combinations are rejected automatically.
 
 Assertion layers merge: `Assert::default_checks()` provides
 baselines, each `Scheduler` can override thresholds, and individual

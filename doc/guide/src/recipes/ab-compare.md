@@ -1,7 +1,7 @@
 # A/B Compare Branches
 
 Compare scheduler behavior between two branches by running the
-same `#[stt_test]` suite against each.
+same `#[stt_test]` suite against each and diffing sidecar results.
 
 ## Setup worktrees
 
@@ -12,21 +12,30 @@ cd ~/opensource/scx
 git worktree add ~/opensource/scx-main upstream/main
 ```
 
-## Run baseline
+## Run baseline with sidecars
 
 ```sh
 cd ~/opensource/scx-main
-cargo nextest run --workspace
+STT_SIDECAR_DIR=./baseline cargo nextest run --workspace
 ```
 
-## Run experimental and compare
+## Run experimental with sidecars
 
 ```sh
 cd ~/opensource/scx
-cargo nextest run --workspace
+STT_SIDECAR_DIR=./current cargo nextest run --workspace
 ```
 
-Compare test output between the two runs.
+## Compare results
+
+Diff the sidecar JSON files between the two directories. See
+[Baselines](../running-tests/baselines.md) for the sidecar format.
+
+Compare test pass/fail counts between runs:
+
+```sh
+diff <(ls baseline/*.stt.*.json | wc -l) <(ls current/*.stt.*.json | wc -l)
+```
 
 ## Cleanup
 

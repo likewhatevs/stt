@@ -1,88 +1,121 @@
 # Flags
 
-Flags represent scheduler capabilities. Each flag is a typed static
-declaration with dependency constraints.
+Flags represent scheduler capabilities that can be independently
+enabled or disabled. The `#[derive(Scheduler)]` macro defines typed
+flags from enum variants, generating compile-time checked constants
+and `FlagDecl` statics.
 
-## Flag declarations
+## Defining flags
+
+Annotate an enum with `#[derive(Scheduler)]`. Each variant becomes a
+flag. `#[flag(args)]` lists CLI arguments passed to the scheduler when
+the flag is active. `#[flag(requires)]` declares dependencies on other
+variants.
 
 ```rust,ignore
-pub struct FlagDecl {
-    pub name: &'static str,
-    pub args: &'static [&'static str],
-    pub requires: &'static [&'static FlagDecl],
+use stt::prelude::*;
+
+#[derive(Scheduler)]
+#[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
+#[allow(dead_code)]
+enum MySchedFlag {
+    #[flag(args = ["--enable-llc-awareness"])]
+    Llc,
+    #[flag(args = ["--enable-borrowing"])]
+    Borrow,
+    #[flag(args = ["--enable-work-stealing"], requires = [Llc])]
+    Steal,
 }
 ```
 
-Six flags are defined:
+The derive macro generates:
 
-| Flag | Requires | Description |
-|---|---|---|
-| `llc` | -- | LLC-aware scheduling |
-| `borrow` | -- | CPU borrowing across domains |
-| `steal` | `llc` | Work stealing (requires LLC awareness) |
-| `rebal` | -- | Rebalancing |
-| `reject-pin` | -- | Reject pinned task overrides |
-| `no-ctrl` | -- | Disable controller |
+- A `static FlagDecl` for each variant with the flag's kebab-case name,
+  CLI args, and dependency references.
+- `impl MySchedFlag { pub const LLC: &'static str = "llc"; pub const BORROW: &'static str = "borrow"; ... }`
+  -- typed string constants for each variant.
+- `const MY_SCHED: Scheduler` -- a `Scheduler` const derived from the
+  enum name (strip `Flag`/`Flags` suffix, convert to
+  `SCREAMING_SNAKE_CASE`).
 
-## Dependency enforcement
+Variant names are converted to kebab-case: `Llc` becomes `"llc"`,
+`RejectPin` becomes `"reject-pin"`.
 
-`steal` requires `llc`. This is encoded in the `FlagDecl`:
+## Using flags in tests
+
+`#[stt_test]` accepts `required_flags` and `excluded_flags` to
+constrain which flag profiles a test runs with. Both path expressions
+and string literals work:
 
 ```rust,ignore
-pub static STEAL_DECL: FlagDecl = FlagDecl {
+// Path expressions -- typos are compile errors
+#[stt_test(
+    scheduler = MY_SCHED,
+    required_flags = [MySchedFlag::LLC],
+    excluded_flags = [MySchedFlag::BORROW],
+)]
+fn needs_llc(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
+
+// String literals -- also work
+#[stt_test(scheduler = MY_SCHED, required_flags = ["llc"])]
+fn also_needs_llc(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
+```
+
+Path expressions are preferred: `MySchedFlag::LLC` is checked by the
+compiler, while `"llc"` is not.
+
+## Flag profiles and gauntlet
+
+A `FlagProfile` is a sorted set of active flag names. Its display name
+is the flags joined with `+` (e.g. `"llc+borrow"`), or `"default"`
+when empty.
+
+The gauntlet generates all valid flag combinations from the scheduler's
+flag declarations and the test's constraints. For a scheduler with 6
+flags and one dependency (`steal` requires `llc`), unconstrained
+generation produces 48 profiles (2^6 = 64 minus 16 combinations where
+`steal` is active without `llc`).
+
+`required_flags` forces flags into every profile. `excluded_flags`
+removes flags from consideration. The remaining flags are combined in
+all valid subsets.
+
+See [Gauntlet flag profiles](../running-tests/gauntlet.md#flag-profiles).
+
+## Dependencies
+
+`requires = [Llc]` on a variant means that variant is only active in
+profiles where `Llc` is also active. Profile generation rejects any
+combination where a flag's dependencies are missing.
+
+```rust,ignore
+#[flag(args = ["--enable-work-stealing"], requires = [Llc])]
+Steal,
+```
+
+Every generated profile containing `steal` also contains `llc`.
+Requiring `steal` in a test (`required_flags = [MySchedFlag::STEAL]`)
+implicitly forces `llc` into all profiles for that test.
+
+## Underlying mechanism (advanced)
+
+The derive macro generates `FlagDecl` statics and a flags array that
+the `Scheduler` const references. Users never need to write `FlagDecl`
+manually -- the macro handles it. The generated code is equivalent to:
+
+```rust,ignore
+static __MY_SCHED_FLAG_DECL_LLC: FlagDecl = FlagDecl {
+    name: "llc",
+    args: &["--enable-llc-awareness"],
+    requires: &[],
+};
+
+static __MY_SCHED_FLAG_DECL_STEAL: FlagDecl = FlagDecl {
     name: "steal",
-    args: &[],
-    requires: &[&LLC_DECL],
+    args: &["--enable-work-stealing"],
+    requires: &[&__MY_SCHED_FLAG_DECL_LLC],
 };
 ```
 
-When generating flag profiles, any combination that includes `steal`
-without `llc` is rejected.
-
-## Using flags
-
-In `#[stt_test]`, use `required_flags` and `excluded_flags` to
-constrain which flag profiles the test runs with. Both string literals
-and path expressions (from `#[derive(Scheduler)]`) work:
-
-```rust,ignore
-// String literals
-#[stt_test(required_flags = ["llc", "borrow"])]
-fn my_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
-
-// Path expressions (from derive)
-#[stt_test(required_flags = [MitosisFlag::LLC, MitosisFlag::BORROW])]
-fn my_test2(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
-```
-
-The gauntlet expands each test across all valid flag profiles.
-
-## Flag profiles
-
-A `FlagProfile` is a sorted set of active flags:
-
-```rust,ignore
-pub struct FlagProfile {
-    pub flags: Vec<&'static str>,
-}
-```
-
-The profile's display name is the flags joined with `+`:
-- Empty profile: `"default"`
-- `[llc, borrow]`: `"llc+borrow"`
-
-## Profile generation
-
-`generate_profiles(required, excluded)` enumerates all valid
-combinations:
-
-- Start with all flags not in `required` or `excluded`.
-- For each subset, add `required` flags.
-- Filter out combinations where a flag's `requires` dependencies are
-  missing.
-- Sort flags in canonical order.
-
-Unconstrained: 48 profiles. With `steal` required: all profiles
-include both `steal` and `llc`.
-
-For gauntlet flag expansion, see [Gauntlet](../running-tests/gauntlet.md#flag-profiles).
+See [`stt-macros/src/lib.rs`](https://github.com/likewhatevs/stt/blob/main/stt-macros/src/lib.rs)
+for the macro source.

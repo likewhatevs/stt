@@ -23,14 +23,9 @@ KVM enabled and the user must have read+write access to `/dev/kvm`.
 no kernel found. Set STT_TEST_KERNEL or build one at ../linux/
 ```
 
-stt needs a bootable Linux kernel image (bzImage). It searches:
-
-1. `STT_TEST_KERNEL` environment variable.
-2. `./linux/arch/x86/boot/bzImage` (workspace-local build).
-3. `../linux/arch/x86/boot/bzImage` (sibling directory).
-4. `/lib/modules/$(uname -r)/vmlinuz` (installed kernel).
-5. `/boot/vmlinuz-$(uname -r)` (installed kernel).
-6. `/boot/vmlinuz` (unversioned symlink).
+stt needs a bootable Linux kernel image (bzImage). See
+[Kernel discovery](getting-started.md#kernel-discovery) for the
+search order.
 
 **Fixes:**
 
@@ -93,6 +88,9 @@ failures, not just scheduler deaths.
   BPF probes. See [Auto-Repro](running-tests/auto-repro.md).
 - Run with a longer duration and specific flags to narrow the
   reproducer.
+
+See [Investigate a Crash](recipes/investigate-crash.md) for the
+complete failure output format and auto-repro walkthrough.
 
 ## Insufficient hugepages
 
