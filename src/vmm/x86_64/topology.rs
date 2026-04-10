@@ -65,6 +65,27 @@ pub fn core_shift(topo: &Topology) -> u32 {
     bits_needed(topo.threads_per_core) + bits_needed(topo.cores_per_socket)
 }
 
+/// Patch cache topology fields in a CPUID EAX register (leaf 0x4 or 0x8000001D).
+/// Sets EAX[25:14] (num_threads_sharing) and EAX[31:26] (num_cores_on_die)
+/// based on the cache level and VM topology.
+fn patch_cache_topology_eax(
+    entry: &mut kvm_cpuid_entry2,
+    smt: u32,
+    core: u32,
+    cores_per_socket: u32,
+) {
+    let cache_level = (entry.eax >> 5) & 0x7;
+    let max_sharing = match cache_level {
+        1 | 2 => (1u32 << smt).saturating_sub(1),
+        3 => (1u32 << core).saturating_sub(1),
+        _ => 0,
+    };
+    entry.eax = (entry.eax & 0xfc003fff) | ((max_sharing & 0xfff) << 14);
+    let core_bits = bits_needed(cores_per_socket);
+    let max_core_ids = (1u32 << core_bits).saturating_sub(1);
+    entry.eax = (entry.eax & 0x03ffffff) | ((max_core_ids & 0x3f) << 26);
+}
+
 /// Generate CPUID entries for a specific vCPU with topology information.
 /// Takes a pre-fetched base CPUID (from `get_supported_cpuid`) and patches
 /// topology-related leaves. The base should be fetched once and reused for
@@ -107,20 +128,7 @@ pub fn generate_cpuid(
 
             // Leaf 0x4: Deterministic Cache Parameters (Intel only)
             0x4 if vendor == CpuVendor::Intel => {
-                let cache_level = (entry.eax >> 5) & 0x7;
-                // EAX[25:14] = max addressable IDs sharing this cache - 1
-                // Uses APIC-ID-space rounding: (1 << shift) - 1
-                let max_sharing = match cache_level {
-                    1 | 2 => (1u32 << smt).saturating_sub(1), // L1/L2: core level
-                    3 => (1u32 << core).saturating_sub(1),    // L3: socket level
-                    _ => 0,
-                };
-                entry.eax = (entry.eax & 0xfc003fff) | ((max_sharing & 0xfff) << 14);
-                // EAX[31:26] = max addressable core IDs in package - 1
-                // APIC-ID-space: (1 << core_bits) - 1
-                let core_bits = bits_needed(topo.cores_per_socket);
-                let max_core_ids = (1u32 << core_bits).saturating_sub(1);
-                entry.eax = (entry.eax & 0x03ffffff) | ((max_core_ids & 0x3f) << 26);
+                patch_cache_topology_eax(entry, smt, core, topo.cores_per_socket);
             }
 
             // Leaf 0xB: Extended Topology Enumeration (Intel + AMD Zen)
@@ -171,6 +179,15 @@ pub fn generate_cpuid(
                     entry.edx = apic;
                 }
             },
+
+            // Leaf 0x8000001D: AMD Cache Topology (AMD equivalent of leaf 0x4)
+            // EAX layout matches leaf 0x4: [4:0]=type, [7:5]=level,
+            // [25:14]=num_threads_sharing, [31:26]=num_cores_on_die.
+            // Without patching, host values pass through and the guest
+            // kernel sees all vCPUs sharing one L3 regardless of socket count.
+            0x8000_001d if vendor == CpuVendor::Amd => {
+                patch_cache_topology_eax(entry, smt, core, topo.cores_per_socket);
+            }
 
             // Leaf 0xA: PMU — zero all registers (disable PMU, vendor-independent)
             0xa => {
@@ -270,6 +287,159 @@ mod tests {
         assert_eq!(bits_needed(8), 3);
         assert_eq!(bits_needed(9), 4);
         assert_eq!(bits_needed(16), 4);
+    }
+
+    /// Build a kvm_cpuid_entry2 with the given cache level in EAX[7:5]
+    /// and arbitrary host values in the sharing/core fields to verify
+    /// patch_cache_topology_eax overwrites them.
+    fn make_cache_entry(level: u32) -> kvm_cpuid_entry2 {
+        kvm_cpuid_entry2 {
+            function: 0x4, // doesn't matter for the helper
+            index: 0,
+            flags: 0,
+            // Set cache level in bits [7:5], type=2 (unified) in [4:0],
+            // and fill sharing/core fields with 0xfff / 0x3f (max host values)
+            // to verify the helper overwrites them.
+            eax: (level << 5) | 2 | (0xfff << 14) | (0x3f << 26),
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn patch_cache_l1_smt_scoped() {
+        // 4 cores, 2 threads: smt=1, core=3
+        let mut entry = make_cache_entry(1);
+        patch_cache_topology_eax(&mut entry, 1, 3, 4);
+        let sharing = (entry.eax >> 14) & 0xfff;
+        // L1: (1 << smt) - 1 = (1 << 1) - 1 = 1
+        assert_eq!(sharing, 1, "L1 sharing should be SMT-scoped");
+    }
+
+    #[test]
+    fn patch_cache_l2_smt_scoped() {
+        let mut entry = make_cache_entry(2);
+        patch_cache_topology_eax(&mut entry, 1, 3, 4);
+        let sharing = (entry.eax >> 14) & 0xfff;
+        assert_eq!(sharing, 1, "L2 sharing should be SMT-scoped");
+    }
+
+    #[test]
+    fn patch_cache_l3_socket_scoped() {
+        let mut entry = make_cache_entry(3);
+        patch_cache_topology_eax(&mut entry, 1, 3, 4);
+        let sharing = (entry.eax >> 14) & 0xfff;
+        // L3: (1 << core) - 1 = (1 << 3) - 1 = 7
+        assert_eq!(sharing, 7, "L3 sharing should be socket-scoped");
+    }
+
+    #[test]
+    fn patch_cache_unknown_level_zero() {
+        // Level 0
+        let mut entry0 = make_cache_entry(0);
+        patch_cache_topology_eax(&mut entry0, 1, 3, 4);
+        assert_eq!((entry0.eax >> 14) & 0xfff, 0, "level 0 sharing should be 0");
+
+        // Level 4
+        let mut entry4 = make_cache_entry(4);
+        patch_cache_topology_eax(&mut entry4, 1, 3, 4);
+        assert_eq!((entry4.eax >> 14) & 0xfff, 0, "level 4 sharing should be 0");
+
+        // Level 7
+        let mut entry7 = make_cache_entry(7);
+        patch_cache_topology_eax(&mut entry7, 1, 3, 4);
+        assert_eq!((entry7.eax >> 14) & 0xfff, 0, "level 7 sharing should be 0");
+    }
+
+    #[test]
+    fn patch_cache_single_core_single_thread() {
+        // smt=0, core=0, cores_per_socket=1
+        let mut entry_l1 = make_cache_entry(1);
+        patch_cache_topology_eax(&mut entry_l1, 0, 0, 1);
+        // (1 << 0) - 1 = 0
+        assert_eq!(
+            (entry_l1.eax >> 14) & 0xfff,
+            0,
+            "1c/1t L1 sharing should be 0"
+        );
+        // core_bits = bits_needed(1) = 0, max_core_ids = 0
+        assert_eq!((entry_l1.eax >> 26) & 0x3f, 0, "1c/1t core IDs should be 0");
+
+        let mut entry_l3 = make_cache_entry(3);
+        patch_cache_topology_eax(&mut entry_l3, 0, 0, 1);
+        assert_eq!(
+            (entry_l3.eax >> 14) & 0xfff,
+            0,
+            "1c/1t L3 sharing should be 0"
+        );
+    }
+
+    #[test]
+    fn patch_cache_large_topology() {
+        // 16 cores, 2 threads: smt=1, core=5, cores_per_socket=16
+        let smt = bits_needed(2); // 1
+        let core = smt + bits_needed(16); // 1 + 4 = 5
+        assert_eq!(smt, 1);
+        assert_eq!(core, 5);
+
+        let mut entry_l3 = make_cache_entry(3);
+        patch_cache_topology_eax(&mut entry_l3, smt, core, 16);
+        let sharing = (entry_l3.eax >> 14) & 0xfff;
+        // (1 << 5) - 1 = 31
+        assert_eq!(sharing, 31, "16c/2t L3 sharing");
+        let core_ids = (entry_l3.eax >> 26) & 0x3f;
+        // bits_needed(16) = 4, (1 << 4) - 1 = 15
+        assert_eq!(core_ids, 15, "16c/2t core IDs");
+        // Verify fields fit: sharing (31) fits in 12 bits, core_ids (15) fits in 6 bits
+        assert!(sharing < (1 << 12));
+        assert!(core_ids < (1 << 6));
+
+        let mut entry_l1 = make_cache_entry(1);
+        patch_cache_topology_eax(&mut entry_l1, smt, core, 16);
+        assert_eq!(
+            (entry_l1.eax >> 14) & 0xfff,
+            1,
+            "16c/2t L1 sharing (SMT-scoped)"
+        );
+    }
+
+    #[test]
+    fn patch_cache_preserves_lower_bits() {
+        // EAX[4:0] (type) and [13:8] should be preserved
+        let mut entry = kvm_cpuid_entry2 {
+            eax: (3 << 5) | 0b10101 | (0x2a << 8), // level=3, type=0b10101, bits[13:8]=0x2a
+            ..Default::default()
+        };
+        patch_cache_topology_eax(&mut entry, 1, 3, 4);
+        assert_eq!(entry.eax & 0x1f, 0b10101, "type bits [4:0] preserved");
+        assert_eq!((entry.eax >> 5) & 0x7, 3, "level bits [7:5] preserved");
+        assert_eq!((entry.eax >> 8) & 0x3f, 0x2a, "bits [13:8] preserved");
+    }
+
+    #[test]
+    fn patch_cache_leaf4_and_8000001d_identical() {
+        // The core invariant: for the same topology, both leaves produce
+        // identical EAX values.
+        let topos = [(1, 1, 1), (2, 4, 1), (2, 4, 2), (4, 8, 2), (8, 16, 2)];
+        for (sockets, cores, threads) in topos {
+            let smt = bits_needed(threads);
+            let core = smt + bits_needed(cores);
+            for level in 1..=3 {
+                let mut leaf4 = make_cache_entry(level);
+                leaf4.function = 0x4;
+                let mut leaf_amd = make_cache_entry(level);
+                leaf_amd.function = 0x8000_001d;
+                patch_cache_topology_eax(&mut leaf4, smt, core, cores);
+                patch_cache_topology_eax(&mut leaf_amd, smt, core, cores);
+                assert_eq!(
+                    leaf4.eax, leaf_amd.eax,
+                    "{sockets}s/{cores}c/{threads}t L{level}: leaf 0x4 and 0x8000001D \
+                     EAX should be identical"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1345,6 +1515,230 @@ mod tests {
                 entry.eax,
                 apic_id(&topo, 0),
                 "AMD leaf 0x8000001E EAX should be patched"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_conditional_leaf8000001d_on_amd() {
+        let kvm = match kvm_ioctls::Kvm::new() {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let host_cpuid = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .expect("get_supported_cpuid");
+        let vendor = detect_vendor(host_cpuid.as_slice());
+        if vendor != CpuVendor::Amd {
+            return;
+        }
+        let topo = Topology {
+            sockets: 2,
+            cores_per_socket: 4,
+            threads_per_core: 2,
+        };
+        let cpuid = generate_cpuid(
+            kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                .unwrap()
+                .as_slice(),
+            &topo,
+            0,
+            false,
+        );
+        let l3 = cpuid
+            .iter()
+            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3);
+        if let Some(entry) = l3 {
+            let max_sharing = (entry.eax >> 14) & 0xfff;
+            assert_eq!(
+                max_sharing,
+                (1u32 << core_shift(&topo)) - 1,
+                "AMD leaf 0x8000001D L3 sharing should be patched to socket scope"
+            );
+            let max_core_ids = (entry.eax >> 26) & 0x3f;
+            let core_bits = bits_needed(topo.cores_per_socket);
+            assert_eq!(
+                max_core_ids,
+                (1u32 << core_bits) - 1,
+                "AMD leaf 0x8000001D core IDs should match topology"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf8000001d_l1_l2_sharing_per_core() {
+        let kvm = match kvm_ioctls::Kvm::new() {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let host_cpuid = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .expect("get_supported_cpuid");
+        let vendor = detect_vendor(host_cpuid.as_slice());
+        if vendor != CpuVendor::Amd {
+            return;
+        }
+        let topo = Topology {
+            sockets: 2,
+            cores_per_socket: 4,
+            threads_per_core: 2,
+        };
+        let cpuid = generate_cpuid(
+            kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                .unwrap()
+                .as_slice(),
+            &topo,
+            0,
+            false,
+        );
+        // L1 and L2 should share at core level (SMT siblings only)
+        for level in [1u32, 2] {
+            let leaf = cpuid
+                .iter()
+                .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == level);
+            if let Some(entry) = leaf {
+                let max_sharing = (entry.eax >> 14) & 0xfff;
+                assert_eq!(
+                    max_sharing,
+                    (1u32 << smt_shift(&topo)) - 1,
+                    "AMD leaf 0x8000001D L{level} sharing should be per-core (SMT level)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leaf8000001d_cache_ids_differ_across_sockets() {
+        let kvm = match kvm_ioctls::Kvm::new() {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let host_cpuid = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .expect("get_supported_cpuid");
+        let vendor = detect_vendor(host_cpuid.as_slice());
+        if vendor != CpuVendor::Amd {
+            return;
+        }
+        let topo = Topology {
+            sockets: 2,
+            cores_per_socket: 4,
+            threads_per_core: 1,
+        };
+        // Generate CPUID for cpu 0 (socket 0) and cpu 4 (socket 1)
+        let cpuid0 = generate_cpuid(
+            kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                .unwrap()
+                .as_slice(),
+            &topo,
+            0,
+            false,
+        );
+        let cpuid4 = generate_cpuid(
+            kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                .unwrap()
+                .as_slice(),
+            &topo,
+            4,
+            false,
+        );
+        let l3_0 = cpuid0
+            .iter()
+            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3);
+        let l3_4 = cpuid4
+            .iter()
+            .find(|e| e.function == 0x8000_001d && ((e.eax >> 5) & 0x7) == 3);
+        if let (Some(e0), Some(e4)) = (l3_0, l3_4) {
+            // Both should have the same sharing field (per-socket scope)
+            let sharing0 = (e0.eax >> 14) & 0xfff;
+            let sharing4 = (e4.eax >> 14) & 0xfff;
+            assert_eq!(sharing0, sharing4, "L3 sharing field should be identical");
+            // Verify that get_cache_id would produce different IDs
+            // by simulating the kernel's apicid >> get_count_order(n)
+            // where get_count_order(n) = fls(n - 1) for n > 1.
+            let num_threads_sharing = sharing0 + 1;
+            let index_msb = 32 - (num_threads_sharing - 1).leading_zeros();
+            let cache_id_0 = apic_id(&topo, 0) >> index_msb;
+            let cache_id_4 = apic_id(&topo, 4) >> index_msb;
+            assert_ne!(
+                cache_id_0,
+                cache_id_4,
+                "CPUs in different sockets should have different L3 cache IDs \
+                 (apic0={}, apic4={}, shift={index_msb})",
+                apic_id(&topo, 0),
+                apic_id(&topo, 4),
+            );
+        }
+    }
+
+    /// Regression test: for every multi-socket gauntlet preset, verify that
+    /// CPUs in different sockets produce different L3 cache IDs via the
+    /// kernel's get_cache_id formula (apicid >> get_count_order(sharing+1)).
+    /// This is the invariant that makes from_system().split_by_llc() return
+    /// the correct number of LLCs inside the guest.
+    #[test]
+    fn cache_ids_distinct_per_socket_all_gauntlet() {
+        let kvm = match kvm_ioctls::Kvm::new() {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let host_cpuid = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .expect("get_supported_cpuid");
+        let vendor = detect_vendor(host_cpuid.as_slice());
+
+        // The cache leaf depends on vendor
+        let cache_leaf: u32 = match vendor {
+            CpuVendor::Intel => 0x4,
+            CpuVendor::Amd => 0x8000_001d,
+            CpuVendor::Unknown => return,
+        };
+
+        let presets = [
+            (2, 2, 1),  // tiny-2llc
+            (3, 3, 1),  // odd-3llc
+            (5, 3, 1),  // odd-5llc
+            (7, 2, 1),  // odd-7llc
+            (2, 2, 2),  // smt-2llc
+            (3, 2, 2),  // smt-3llc
+            (4, 4, 2),  // medium-4llc
+            (8, 4, 2),  // medium-8llc
+            (4, 16, 2), // large-4llc
+            (8, 8, 2),  // large-8llc
+        ];
+        for (sockets, cores, threads) in presets {
+            let topo = Topology {
+                sockets,
+                cores_per_socket: cores,
+                threads_per_core: threads,
+            };
+            let cpus_per_socket = cores * threads;
+
+            // Get L3 sharing from CPU 0's CPUID
+            let cpuid0 = generate_cpuid(host_cpuid.as_slice(), &topo, 0, false);
+            let l3 = cpuid0
+                .iter()
+                .find(|e| e.function == cache_leaf && ((e.eax >> 5) & 0x7) == 3);
+            let Some(l3_entry) = l3 else { continue };
+
+            let sharing = (l3_entry.eax >> 14) & 0xfff;
+            let num_threads_sharing = sharing + 1;
+            let index_msb = 32 - (num_threads_sharing - 1).leading_zeros();
+
+            // Compute cache ID for the first CPU in each socket
+            let mut cache_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for s in 0..sockets {
+                let cpu = s * cpus_per_socket;
+                let apic = apic_id(&topo, cpu);
+                let cache_id = apic >> index_msb;
+                cache_ids.insert(cache_id);
+            }
+            assert_eq!(
+                cache_ids.len(),
+                sockets as usize,
+                "{sockets}s/{cores}c/{threads}t: expected {sockets} distinct L3 cache IDs, \
+                 got {} (shift={index_msb})",
+                cache_ids.len(),
             );
         }
     }
