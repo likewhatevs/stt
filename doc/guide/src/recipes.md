@@ -9,7 +9,7 @@ Standalone examples for common tasks. Each recipe is self-contained.
 - [A/B compare branches](recipes/ab-compare.md) -- worktree setup,
   run and compare
 - [Write a dynamic scenario](recipes/dynamic-scenario.md) -- ops/steps
-  with CgroupDef and Traverse
+  with CgroupDef
 - [Customize verification](recipes/custom-verification.md) -- scheduler
   thresholds, per-test overrides
 - [Benchmarking and negative tests](recipes/benchmarking-tests.md) --

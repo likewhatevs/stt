@@ -10,7 +10,6 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::ops::RangeInclusive;
 use std::thread;
 use std::time::Duration;
 
@@ -948,158 +947,152 @@ fn collect_result(state: &mut StepState<'_>, checks: &crate::assert::Assert) -> 
     )
 }
 
-// ---------------------------------------------------------------------------
-// Traverse combinator
-// ---------------------------------------------------------------------------
-
-/// Layout strategy for Traverse phases.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) enum Layout {
-    Disjoint,
-    /// Overlapping cpusets. (min_frac, max_frac) — PRNG picks a value in range.
-    Overlap(f64, f64),
-}
-
-/// Generates a random walk of cgroup topology changes across phases.
-///
-/// Each phase picks a random (cgroup_count, layout) pair, generates SetCpuset
-/// ops, spawns workers in new cgroups, and holds for phase_duration.
-///
-/// `persistent_cgroups` cgroups are created in phase 0 and never removed.
-/// Only cgroups at index >= `persistent_cgroups` are added/removed by the
-/// random walk. The `cgroup_count` range applies to the total cgroup count
-/// (persistent + ephemeral).
-///
-/// `cgroup_workloads` controls the workload for each cgroup index. If the
-/// vec has fewer entries than the cgroup index, the last entry repeats.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct Traverse {
-    pub seed: Option<u64>,
-    pub cgroup_count: RangeInclusive<usize>,
-    pub layouts: Vec<Layout>,
-    pub phases: usize,
-    pub phase_duration: Duration,
-    pub settle: Duration,
-    /// Cgroups [0..persistent_cgroups) are created once and never removed.
-    pub persistent_cgroups: usize,
-    /// Work definition per cgroup index. Last entry repeats for higher indices.
-    pub cgroup_workloads: Vec<Work>,
-}
-
-impl Traverse {
-    /// Generate a `Vec<Step>` from the Traverse configuration.
-    #[allow(dead_code)]
-    pub fn generate(&self, ctx: &Ctx) -> Vec<Step> {
-        use rand::RngExt;
-
-        let seed = self.seed.unwrap_or_else(|| std::process::id() as u64);
-        let mut rng = seeded_rng(seed);
-
-        let usable_len = ctx.topo.usable_cpus().len();
-        let max_cgroups = (*self.cgroup_count.end()).min(usable_len / 2).max(1);
-        let min_cgroups = (*self.cgroup_count.start()).max(1).min(max_cgroups);
-
-        let mut steps = Vec::with_capacity(self.phases + 1);
-        let mut live_cgroups: Vec<Cow<'static, str>> = Vec::new();
-
-        let names: Vec<Cow<'static, str>> = (0..max_cgroups)
-            .map(|i| Cow::Owned(format!("cg_{i}")))
-            .collect();
-
-        for phase in 0..self.phases {
-            let range = max_cgroups - min_cgroups + 1;
-            let target_count = min_cgroups + rng.random_range(0..range);
-            let layout_idx = rng.random_range(0..self.layouts.len());
-            let layout = &self.layouts[layout_idx];
-
-            let mut ops = Vec::new();
-
-            // Add cgroups if needed.
-            while live_cgroups.len() < target_count {
-                let idx = live_cgroups.len();
-                let name = names[idx].clone();
-                let w = self
-                    .cgroup_workloads
-                    .get(idx)
-                    .or(self.cgroup_workloads.last())
-                    .cloned()
-                    .unwrap_or_default();
-                ops.push(Op::AddCgroup { name: name.clone() });
-                ops.push(Op::Spawn {
-                    cgroup: name.clone(),
-                    work: w,
-                });
-                live_cgroups.push(name);
-            }
-
-            // Remove cgroups if needed (never remove persistent cgroups).
-            while live_cgroups.len() > target_count && live_cgroups.len() > self.persistent_cgroups
-            {
-                if let Some(name) = live_cgroups.pop() {
-                    ops.push(Op::StopCgroup {
-                        cgroup: name.clone(),
-                    });
-                    ops.push(Op::RemoveCgroup { cgroup: name });
-                }
-            }
-
-            // Apply cpuset layout.
-            for (i, name) in live_cgroups.iter().enumerate() {
-                let spec = match layout {
-                    Layout::Disjoint => CpusetSpec::Disjoint {
-                        index: i,
-                        of: live_cgroups.len(),
-                    },
-                    Layout::Overlap(min_frac, max_frac) => {
-                        let frac = min_frac
-                            + rng.random_range(0..100) as f64 / 100.0 * (max_frac - min_frac);
-                        CpusetSpec::Overlap {
-                            index: i,
-                            of: live_cgroups.len(),
-                            frac,
-                        }
-                    }
-                };
-                ops.push(Op::SetCpuset {
-                    cgroup: name.clone(),
-                    cpus: spec,
-                });
-            }
-
-            let hold = if phase == 0 {
-                // First phase includes settle time.
-                HoldSpec::Fixed(self.settle + self.phase_duration)
-            } else {
-                HoldSpec::Fixed(self.phase_duration)
-            };
-
-            steps.push(Step {
-                setup: vec![].into(),
-                ops,
-                hold,
-            });
-        }
-
-        steps
-    }
-}
-
-/// Seeded PRNG for deterministic topology generation.
-///
-/// Callers seed with a scenario-specific value so gauntlet runs are
-/// deterministic across reruns.
-#[allow(dead_code)]
-fn seeded_rng(seed: u64) -> rand::rngs::StdRng {
-    use rand::SeedableRng;
-    rand::rngs::StdRng::seed_from_u64(seed)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::ops::RangeInclusive;
+
     use super::*;
     use crate::vmm::shm_ring::parse_shm_params_from_str;
+
+    // -- Traverse combinator (test-only) --
+
+    /// Layout strategy for Traverse phases.
+    #[derive(Debug)]
+    enum Layout {
+        Disjoint,
+        /// Overlapping cpusets. (min_frac, max_frac) — PRNG picks a value in range.
+        Overlap(f64, f64),
+    }
+
+    /// Generates a random walk of cgroup topology changes across phases.
+    ///
+    /// Each phase picks a random (cgroup_count, layout) pair, generates SetCpuset
+    /// ops, spawns workers in new cgroups, and holds for phase_duration.
+    ///
+    /// `persistent_cgroups` cgroups are created in phase 0 and never removed.
+    /// Only cgroups at index >= `persistent_cgroups` are added/removed by the
+    /// random walk. The `cgroup_count` range applies to the total cgroup count
+    /// (persistent + ephemeral).
+    ///
+    /// `cgroup_workloads` controls the workload for each cgroup index. If the
+    /// vec has fewer entries than the cgroup index, the last entry repeats.
+    #[derive(Debug)]
+    struct Traverse {
+        seed: Option<u64>,
+        cgroup_count: RangeInclusive<usize>,
+        layouts: Vec<Layout>,
+        phases: usize,
+        phase_duration: Duration,
+        settle: Duration,
+        /// Cgroups [0..persistent_cgroups) are created once and never removed.
+        persistent_cgroups: usize,
+        /// Work definition per cgroup index. Last entry repeats for higher indices.
+        cgroup_workloads: Vec<Work>,
+    }
+
+    impl Traverse {
+        /// Generate a `Vec<Step>` from the Traverse configuration.
+        fn generate(&self, ctx: &Ctx) -> Vec<Step> {
+            use rand::RngExt;
+
+            let seed = self.seed.unwrap_or_else(|| std::process::id() as u64);
+            let mut rng = seeded_rng(seed);
+
+            let usable_len = ctx.topo.usable_cpus().len();
+            let max_cgroups = (*self.cgroup_count.end()).min(usable_len / 2).max(1);
+            let min_cgroups = (*self.cgroup_count.start()).max(1).min(max_cgroups);
+
+            let mut steps = Vec::with_capacity(self.phases + 1);
+            let mut live_cgroups: Vec<Cow<'static, str>> = Vec::new();
+
+            let names: Vec<Cow<'static, str>> = (0..max_cgroups)
+                .map(|i| Cow::Owned(format!("cg_{i}")))
+                .collect();
+
+            for phase in 0..self.phases {
+                let range = max_cgroups - min_cgroups + 1;
+                let target_count = min_cgroups + rng.random_range(0..range);
+                let layout_idx = rng.random_range(0..self.layouts.len());
+                let layout = &self.layouts[layout_idx];
+
+                let mut ops = Vec::new();
+
+                // Add cgroups if needed.
+                while live_cgroups.len() < target_count {
+                    let idx = live_cgroups.len();
+                    let name = names[idx].clone();
+                    let w = self
+                        .cgroup_workloads
+                        .get(idx)
+                        .or(self.cgroup_workloads.last())
+                        .cloned()
+                        .unwrap_or_default();
+                    ops.push(Op::AddCgroup { name: name.clone() });
+                    ops.push(Op::Spawn {
+                        cgroup: name.clone(),
+                        work: w,
+                    });
+                    live_cgroups.push(name);
+                }
+
+                // Remove cgroups if needed (never remove persistent cgroups).
+                while live_cgroups.len() > target_count
+                    && live_cgroups.len() > self.persistent_cgroups
+                {
+                    if let Some(name) = live_cgroups.pop() {
+                        ops.push(Op::StopCgroup {
+                            cgroup: name.clone(),
+                        });
+                        ops.push(Op::RemoveCgroup { cgroup: name });
+                    }
+                }
+
+                // Apply cpuset layout.
+                for (i, name) in live_cgroups.iter().enumerate() {
+                    let spec = match layout {
+                        Layout::Disjoint => CpusetSpec::Disjoint {
+                            index: i,
+                            of: live_cgroups.len(),
+                        },
+                        Layout::Overlap(min_frac, max_frac) => {
+                            let frac = min_frac
+                                + rng.random_range(0..100) as f64 / 100.0 * (max_frac - min_frac);
+                            CpusetSpec::Overlap {
+                                index: i,
+                                of: live_cgroups.len(),
+                                frac,
+                            }
+                        }
+                    };
+                    ops.push(Op::SetCpuset {
+                        cgroup: name.clone(),
+                        cpus: spec,
+                    });
+                }
+
+                let hold = if phase == 0 {
+                    // First phase includes settle time.
+                    HoldSpec::Fixed(self.settle + self.phase_duration)
+                } else {
+                    HoldSpec::Fixed(self.phase_duration)
+                };
+
+                steps.push(Step {
+                    setup: vec![].into(),
+                    ops,
+                    hold,
+                });
+            }
+
+            steps
+        }
+    }
+
+    /// Seeded PRNG for deterministic topology generation.
+    fn seeded_rng(seed: u64) -> rand::rngs::StdRng {
+        use rand::SeedableRng;
+        rand::rngs::StdRng::seed_from_u64(seed)
+    }
 
     // -- Op discriminant tests --
 

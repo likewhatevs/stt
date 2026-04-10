@@ -173,41 +173,5 @@ When `assertions` is `Some`, the provided `Assert` overrides `ctx.assert`
 for worker checks. When `None`, uses `ctx.assert` (the merged
 three-layer config: `default_checks` -> scheduler -> per-test).
 
-## Layout
-
-> `Layout` and `Traverse` are `pub(crate)` — available within stt's
-> own scenarios but not exported to external users. External tests
-> use `Step::with_defs` and `execute_steps` directly.
-
-`Layout` controls how `Traverse` assigns cpusets in each phase:
-
-| Variant | Description |
-|---|---|
-| `Disjoint` | Equal, non-overlapping partitions of usable CPUs |
-| `Overlap(min_frac, max_frac)` | Overlapping partitions; overlap fraction randomly chosen in range |
-
-## Traverse
-
-`Traverse` generates a random walk of topology changes:
-
-```rust,ignore
-let traverse = Traverse {
-    seed: Some(42),
-    cgroup_count: 2..=4,
-    layouts: vec![Layout::Disjoint],
-    phases: 5,
-    phase_duration: Duration::from_millis(500),
-    settle: Duration::from_millis(100),
-    persistent_cgroups: 1,
-    cgroup_workloads: vec![WorkloadConfig::default()],
-};
-let steps = traverse.generate(&ctx);
-execute_steps(&ctx, steps)?;
-```
-
-Each phase randomly picks a cgroup count, adds/removes cgroups to reach
-it, applies a layout, and holds. `persistent_cgroups` cgroups are never
-removed.
-
-For a complete example using ops/steps and `Traverse`, see
+For a complete example using ops/steps, see
 [Write a Dynamic Scenario](../recipes/dynamic-scenario.md).

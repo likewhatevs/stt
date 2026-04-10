@@ -44,29 +44,6 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-## Using Traverse for random topology walks
-
-> `Traverse` and `Layout` are `pub(crate)` — available within stt's
-> own scenario modules but not exported to external users.
-
-```rust,ignore
-// Inside stt's own scenario code (pub(crate) access):
-fn my_traverse_scenario(ctx: &Ctx) -> Result<AssertResult> {
-    let traverse = Traverse {
-        seed: Some(42),
-        cgroup_count: 2..=4,
-        layouts: vec![Layout::Disjoint, Layout::Overlap(0.2, 0.5)],
-        phases: 5,
-        phase_duration: std::time::Duration::from_millis(500),
-        settle: std::time::Duration::from_millis(200),
-        persistent_cgroups: 1,
-        cgroup_workloads: vec![WorkloadConfig::default()],
-    };
-    let steps = traverse.generate(ctx);
-    execute_steps(ctx, steps)
-}
-```
-
 ## Registering
 
 Register the scenario in `all_scenarios()`. Set `num_cgroups` to 0 and
@@ -88,5 +65,4 @@ Scenario {
 ```
 
 See [Scenarios](../concepts/scenarios.md) for the full `Scenario` struct
-and [Ops and Steps](../concepts/ops.md) for `CpusetSpec`, `HoldSpec`,
-and `Traverse`.
+and [Ops and Steps](../concepts/ops.md) for `CpusetSpec` and `HoldSpec`.
