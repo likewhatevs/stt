@@ -18,6 +18,27 @@ scheduler.
 - **`#[stt_test]`** -- proc macro for integration tests that boot their own VMs.
 - **Auto-repro** -- reruns failures with BPF kprobes on the crash call chain.
 
+## Setup
+
+**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang, libelf-dev, pkg-config, bpftool, cargo-nextest.
+
+```sh
+# Ubuntu/Debian
+sudo apt install clang libelf-dev pkg-config bpftool
+cargo install cargo-nextest
+```
+
+**Add to your crate** (not on crates.io):
+
+```toml
+[dev-dependencies]
+stt = { git = "https://github.com/likewhatevs/stt" }
+```
+
+**Test files** go in `tests/` as standard Rust integration tests. Use `#[stt_test]` from `stt::prelude::*`.
+
+See the [getting started guide](https://likewhatevs.github.io/stt/guide/getting-started.html) for Fedora packages, kernel discovery, and building a test kernel.
+
 ## Quick start
 
 ### Define a scheduler
