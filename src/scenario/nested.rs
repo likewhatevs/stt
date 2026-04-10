@@ -101,8 +101,9 @@ pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     Ok(collect_all(handles, &ctx.assert))
 }
 
-/// Nested cgroups with cpusets + subtree_control filesystem writes.
-/// Custom filesystem ops not representable via Op, stays custom.
+/// Nested cgroups with cpusets. `create_cgroup` auto-enables
+/// controllers on intermediate cgroup `subtree_control` for
+/// nested paths.
 pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     let all = ctx.topo.all_cpus();
     if all.len() < 4 {
@@ -114,9 +115,6 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     let mut _guard = CgroupGroup::new(ctx.cgroups);
     _guard.add_cgroup("cg_0", &set_a)?;
     thread::sleep(Duration::from_secs(2));
-
-    let sc = std::path::Path::new(&ctx.cgroups.parent_path()).join("cg_0/cgroup.subtree_control");
-    let _ = std::fs::write(&sc, "+cpuset");
 
     let sub_set: BTreeSet<usize> = all[..mid / 2].iter().copied().collect();
     _guard.add_cgroup("cg_0/narrow", &sub_set)?;

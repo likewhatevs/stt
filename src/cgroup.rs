@@ -94,11 +94,19 @@ impl CgroupManager {
     }
 
     /// Create a child cgroup directory.
+    ///
+    /// For nested paths (e.g. `"cg_0/narrow"`), enables controllers on
+    /// each intermediate cgroup's `subtree_control` so the leaf has
+    /// controller files available. The kernel requires each parent to
+    /// have the controller in `subtree_control` for its children to
+    /// have the corresponding files (`cgroup_control()` returns
+    /// `parent->subtree_control`).
     pub fn create_cgroup(&self, name: &str) -> Result<()> {
         let p = self.parent.join(name);
         if !p.exists() {
             fs::create_dir_all(&p).with_context(|| format!("mkdir {}", p.display()))?;
         }
+        self.enable_subtree_cpuset(name);
         Ok(())
     }
 
@@ -117,6 +125,35 @@ impl CgroupManager {
     pub fn set_cpuset(&self, name: &str, cpus: &BTreeSet<usize>) -> Result<()> {
         let p = self.parent.join(name).join("cpuset.cpus");
         write_with_timeout(&p, &TestTopology::cpuset_string(cpus), CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Enable `+cpuset` on `cgroup.subtree_control` for each ancestor
+    /// of the leaf in a nested cgroup path. For `"cg_0/narrow"`, writes
+    /// `+cpuset` to `{parent}/cgroup.subtree_control` and
+    /// `{parent}/cg_0/cgroup.subtree_control`. No-op for
+    /// single-component paths.
+    fn enable_subtree_cpuset(&self, name: &str) {
+        let components: Vec<&str> = name.split('/').collect();
+        if components.len() < 2 {
+            return;
+        }
+        let mut cur = self.parent.clone();
+        for c in &components[..components.len() - 1] {
+            let sc = cur.join("cgroup.subtree_control");
+            if sc.exists()
+                && let Err(e) = write_with_timeout(&sc, "+cpuset", CGROUP_WRITE_TIMEOUT)
+            {
+                tracing::warn!(path = %sc.display(), err = %e, "failed to enable cpuset");
+            }
+            cur = cur.join(c);
+        }
+        // Write at the last intermediate (direct parent of the leaf).
+        let sc = cur.join("cgroup.subtree_control");
+        if sc.exists()
+            && let Err(e) = write_with_timeout(&sc, "+cpuset", CGROUP_WRITE_TIMEOUT)
+        {
+            tracing::warn!(path = %sc.display(), err = %e, "failed to enable cpuset");
+        }
     }
 
     /// Clear `cpuset.cpus` for a child cgroup (empty string = inherit parent).

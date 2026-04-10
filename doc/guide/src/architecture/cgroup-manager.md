@@ -29,7 +29,8 @@ parent by writing to each level's `cgroup.subtree_control`.
 
 **`create_cgroup(name)`** -- creates a child cgroup directory. Idempotent:
 no error if the directory already exists. Supports nested paths
-(e.g. `"nested/deep"`).
+(e.g. `"nested/deep"`). For nested paths, enables `+cpuset` on
+intermediate cgroups' `subtree_control`.
 
 **`remove_cgroup(name)`** -- drains tasks from the child cgroup back to
 the parent, then removes the directory. No error if the cgroup does
