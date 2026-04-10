@@ -359,7 +359,7 @@ pub struct WorkerReport {
     pub tid: u32,
     /// Cumulative work iterations (incremented by `spin_burst` or I/O loops).
     pub work_units: u64,
-    /// Thread CPU time from `CLOCK_PROCESS_CPUTIME_ID` (ns).
+    /// Thread CPU time from `CLOCK_THREAD_CPUTIME_ID` (ns).
     pub cpu_time_ns: u64,
     /// Wall-clock time from fork-start to stop signal (ns).
     pub wall_time_ns: u64,
@@ -1432,7 +1432,7 @@ fn thread_cpu_time_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    let ret = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     if ret != 0 {
         return 0;
     }

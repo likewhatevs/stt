@@ -168,7 +168,7 @@ in `#[stt_test]`:
 ```rust,ignore
 use stt::prelude::*;
 
-#[derive(Scheduler)]
+#[derive(stt::Scheduler)]
 #[scheduler(
     name = "my_scheduler",
     binary = "scx_my_scheduler",
