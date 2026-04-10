@@ -95,7 +95,7 @@ complete failure output format and auto-repro walkthrough.
 ## Insufficient hugepages
 
 ```text
-insufficient free hugepages for N MB guest memory (need M, have K)
+performance_mode: WARNING: not enough hugepages (needed N MB = M pages, available K pages). Using regular pages.
 ```
 
 [Performance mode](concepts/performance-mode.md) requests 2MB
@@ -110,14 +110,14 @@ Allocate hugepages before the run:
 echo 2048 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 ```
 
-## Monitor threshold failures
+## Worker assertion failures
 
 ```text
-worker gap 4500ms exceeds max_gap_ms 3000
-worker spread 0.42 exceeds max_spread 0.35
+stuck 4500ms on cpu2 at +3200ms (threshold 3000ms)
+unfair cgroup: spread=42% (8-50%) 4 workers on 4 cpus (threshold 35%)
 ```
 
-The Assert checks (`max_gap_ms`, `max_spread`, etc.) detected a
+The Assert checks (`max_gap_ms`, `max_spread_pct`, etc.) detected a
 worker metric outside the configured thresholds.
 
 **Fixes:**
@@ -168,7 +168,7 @@ be empty or unexpected).
 ## Worker count mismatches
 
 ```text
-grouped work type PipeIo requires even num_workers, got 3
+PipeIo requires num_workers divisible by 2, got 3
 ```
 
 Grouped work types (`PipeIo`, `FutexPingPong`, `CachePipe`,
