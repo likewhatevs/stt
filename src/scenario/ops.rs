@@ -69,16 +69,12 @@ pub enum Op {
     },
     /// Spawn workers in the parent cgroup (not in a managed cgroup).
     SpawnHost { workload: WorkloadConfig },
-    /// Move all tasks from one cgroup to another via cgroup.procs.
+    /// Move all tasks from one cgroup to another. Updates handle name
+    /// keys so subsequent ops address moved workers under the new cgroup
+    /// name.
     MoveAllTasks {
         from: Cow<'static, str>,
         to: Cow<'static, str>,
-    },
-    /// Move the first `count` tasks from one cgroup to another.
-    MoveTasks {
-        from: Cow<'static, str>,
-        to: Cow<'static, str>,
-        count: usize,
     },
 }
 
@@ -346,7 +342,6 @@ impl Op {
             Op::SetAffinity { .. } => 8,
             Op::SpawnHost { .. } => 9,
             Op::MoveAllTasks { .. } => 10,
-            Op::MoveTasks { .. } => 11,
         }
     }
 }
@@ -905,20 +900,6 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     }
                 }
             }
-            Op::MoveTasks { from, to, count } => {
-                let mut moved = 0usize;
-                for (name, handle) in &mut state.handles {
-                    if name.as_str() != *from || moved >= *count {
-                        continue;
-                    }
-                    let tids = handle.tids();
-                    let n = (*count - moved).min(tids.len());
-                    for &tid in &tids[..n] {
-                        let _ = ctx.cgroups.move_task(to, tid);
-                    }
-                    moved += n;
-                }
-            }
         }
     }
     Ok(())
@@ -1132,11 +1113,6 @@ mod tests {
                 from: "a".into(),
                 to: "b".into(),
             },
-            Op::MoveTasks {
-                from: "a".into(),
-                to: "b".into(),
-                count: 1,
-            },
         ];
         let mut seen = std::collections::BTreeSet::new();
         for op in &ops {
@@ -1162,15 +1138,6 @@ mod tests {
             }
             .discriminant(),
             10
-        );
-        assert_eq!(
-            Op::MoveTasks {
-                from: "a".into(),
-                to: "b".into(),
-                count: 1
-            }
-            .discriminant(),
-            11
         );
     }
 

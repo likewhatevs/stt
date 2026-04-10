@@ -204,7 +204,6 @@ fn op_kinds_to_name(op_kinds: u32) -> &'static str {
         "SetAffinity",       // 8
         "SpawnHost",         // 9
         "MoveAllTasks",      // 10
-        "MoveTasks",         // 11
     ];
     // Pick the first set bit as the representative op.
     for (i, name) in NAMES.iter().enumerate() {

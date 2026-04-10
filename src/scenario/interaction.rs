@@ -180,18 +180,20 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
 }
 
 pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
-    let half = ctx.workers_per_cgroup;
-
+    // cg_0: permanent residents. cg_mobile: workers that ping-pong to cg_1.
+    // Each cgroup has exactly one handle so MoveAllTasks tracks correctly.
     let mut move_steps: Vec<Step> = (0..9)
         .map(|i| {
-            let target = if i % 2 == 0 { "cg_1" } else { "cg_0" };
-            let from = if i % 2 == 0 { "cg_0" } else { "cg_1" };
+            let (from, to) = if i % 2 == 0 {
+                ("cg_mobile", "cg_1")
+            } else {
+                ("cg_1", "cg_mobile")
+            };
             Step {
                 setup: vec![].into(),
-                ops: vec![Op::MoveTasks {
+                ops: vec![Op::MoveAllTasks {
                     from: from.into(),
-                    to: target.into(),
-                    count: half,
+                    to: to.into(),
                 }],
                 hold: HoldSpec::Frac(0.1),
             }
@@ -199,14 +201,17 @@ pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
         .collect();
 
     let mut steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup * 2)].into(),
+        setup: vec![
+            CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup),
+            CgroupDef::named("cg_mobile").workers(ctx.workers_per_cgroup),
+        ]
+        .into(),
         ops: vec![Op::AddCgroup {
             name: "cg_1".into(),
         }],
         hold: HoldSpec::Fixed(Duration::from_secs(2)),
     }];
     steps.append(&mut move_steps);
-    // Final hold for remaining time.
     steps.push(Step {
         setup: vec![].into(),
         ops: vec![],
@@ -217,19 +222,22 @@ pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
+    // cg_heavy: 6 permanent CPU-spin workers.
+    // cg_light: 2 permanent bursty workers.
+    // cg_mobile: 2 workers that ping-pong to cg_overflow.
+    // Each cgroup has at most one handle so MoveAllTasks tracks correctly.
     let mut move_steps: Vec<Step> = (0..5)
         .map(|i| {
             let (from, to) = if i % 2 == 0 {
-                ("cg_0", "cg_1")
+                ("cg_mobile", "cg_overflow")
             } else {
-                ("cg_1", "cg_0")
+                ("cg_overflow", "cg_mobile")
             };
             Step {
                 setup: vec![].into(),
-                ops: vec![Op::MoveTasks {
+                ops: vec![Op::MoveAllTasks {
                     from: from.into(),
                     to: to.into(),
-                    count: 2,
                 }],
                 hold: HoldSpec::Frac(1.0 / 6.0),
             }
@@ -238,8 +246,9 @@ pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 
     let mut steps = vec![Step {
         setup: vec![
-            CgroupDef::named("cg_0").workers(8),
-            CgroupDef::named("cg_1")
+            CgroupDef::named("cg_heavy").workers(6),
+            CgroupDef::named("cg_mobile").workers(2),
+            CgroupDef::named("cg_light")
                 .workers(2)
                 .work_type(WorkType::Bursty {
                     burst_ms: 50,
@@ -247,7 +256,9 @@ pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 }),
         ]
         .into(),
-        ops: vec![],
+        ops: vec![Op::AddCgroup {
+            name: "cg_overflow".into(),
+        }],
         hold: HoldSpec::Fixed(ctx.settle),
     }];
     steps.append(&mut move_steps);
