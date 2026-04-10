@@ -58,7 +58,7 @@ scheduler's flags:
 ```rust,ignore
 use stt::prelude::*;
 
-#[derive(stt::Scheduler)]
+#[derive(Scheduler)]
 #[scheduler(
     name = "my_sched",
     binary = "scx_my_sched",

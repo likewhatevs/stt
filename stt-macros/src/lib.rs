@@ -688,7 +688,9 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// # Example
 ///
 /// ```rust,ignore
-/// #[derive(stt::Scheduler)]
+/// use stt::prelude::*;
+///
+/// #[derive(Scheduler)]
 /// #[scheduler(name = "mitosis", binary = "scx_mitosis", topology(2, 4, 1),
 ///             cgroup_parent = "/stt", sched_args = ["--exit-dump-len", "1048576"])]
 /// #[allow(dead_code)]
