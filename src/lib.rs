@@ -127,6 +127,54 @@ mod bpf_skel;
 
 pub mod cgroup;
 
+/// Map a raw errno value to its C constant name.
+///
+/// Covers the errno values most commonly seen in cgroup, KVM, and
+/// scheduler error paths. Returns `None` for unrecognized values.
+pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
+    match errno {
+        libc::EPERM => Some("EPERM"),
+        libc::ENOENT => Some("ENOENT"),
+        libc::ESRCH => Some("ESRCH"),
+        libc::EINTR => Some("EINTR"),
+        libc::EIO => Some("EIO"),
+        libc::ENXIO => Some("ENXIO"),
+        libc::E2BIG => Some("E2BIG"),
+        libc::ENOEXEC => Some("ENOEXEC"),
+        libc::EBADF => Some("EBADF"),
+        libc::ECHILD => Some("ECHILD"),
+        libc::EAGAIN => Some("EAGAIN"),
+        libc::ENOMEM => Some("ENOMEM"),
+        libc::EACCES => Some("EACCES"),
+        libc::EFAULT => Some("EFAULT"),
+        libc::EBUSY => Some("EBUSY"),
+        libc::EEXIST => Some("EEXIST"),
+        libc::ENODEV => Some("ENODEV"),
+        libc::ENOTDIR => Some("ENOTDIR"),
+        libc::EISDIR => Some("EISDIR"),
+        libc::EINVAL => Some("EINVAL"),
+        libc::ENFILE => Some("ENFILE"),
+        libc::EMFILE => Some("EMFILE"),
+        libc::ENOSPC => Some("ENOSPC"),
+        libc::ESPIPE => Some("ESPIPE"),
+        libc::EROFS => Some("EROFS"),
+        libc::EPIPE => Some("EPIPE"),
+        libc::EDOM => Some("EDOM"),
+        libc::ERANGE => Some("ERANGE"),
+        libc::EDEADLK => Some("EDEADLK"),
+        libc::ENAMETOOLONG => Some("ENAMETOOLONG"),
+        libc::ENOSYS => Some("ENOSYS"),
+        libc::ENOTEMPTY => Some("ENOTEMPTY"),
+        libc::ELOOP => Some("ELOOP"),
+        // EWOULDBLOCK == EAGAIN on Linux, covered above
+        libc::ENOTSUP => Some("ENOTSUP"),
+        libc::EADDRINUSE => Some("EADDRINUSE"),
+        libc::ECONNREFUSED => Some("ECONNREFUSED"),
+        libc::ETIMEDOUT => Some("ETIMEDOUT"),
+        _ => None,
+    }
+}
+
 /// Read the kernel ring buffer (equivalent to `dmesg --notime`).
 pub(crate) fn read_kmsg() -> String {
     match rmesg::log_entries(rmesg::Backend::Default, false) {

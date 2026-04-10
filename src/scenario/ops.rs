@@ -762,9 +762,8 @@ pub fn execute_steps_with(
             let mut r = collect_result(&mut state, effective_checks);
             r.passed = false;
             r.details.push(format!(
-                "scheduler died between step {} and step {} (of {}), {:.1}s into scenario",
+                "scheduler crashed after completing step {} of {} ({:.1}s into test)",
                 step_idx,
-                step_idx + 1,
                 steps.len(),
                 scenario_start.elapsed().as_secs_f64(),
             ));
@@ -829,7 +828,8 @@ pub fn execute_steps_with(
     if sched_dead {
         result.passed = false;
         result.details.push(format!(
-            "scheduler died after scenario completed, {:.1}s elapsed",
+            "scheduler crashed during test (detected after all {} steps completed, {:.1}s elapsed)",
+            steps.len(),
             scenario_start.elapsed().as_secs_f64(),
         ));
     }
@@ -1022,7 +1022,17 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 state.handles.push((String::new(), h));
             }
             Op::MoveAllTasks { from, to } => {
-                // Move all tasks first; rename handles unless a non-ESRCH error aborts.
+                // Clear subtree_control on the destination before moving
+                // tasks. The kernel's no-internal-process constraint
+                // (cgroup_migrate_vet_dst) returns EBUSY when writing to
+                // cgroup.procs of a cgroup with subtree_control set.
+                if let Err(e) = ctx.cgroups.clear_subtree_control(to) {
+                    tracing::warn!(
+                        cgroup = to.as_ref(),
+                        err = %e,
+                        "failed to clear subtree_control before task move"
+                    );
+                }
                 for (name, handle) in state.handles.iter() {
                     if name.as_str() == *from {
                         ctx.cgroups.move_tasks(to, &handle.tids())?;

@@ -75,6 +75,13 @@ pub const MSG_TYPE_EXIT: u32 = 0x4558_4954; // "EXIT"
 /// Message type for test result (payload: JSON-encoded AssertResult).
 pub const MSG_TYPE_TEST_RESULT: u32 = 0x5445_5354; // "TEST"
 
+/// Message type for scheduler process exit (payload: 4-byte i32 exit code).
+/// Written by the guest init when the scheduler child process terminates
+/// during test execution. The host monitor thread can detect this via
+/// mid-flight SHM drain and terminate the VM early instead of waiting
+/// for the full watchdog timeout.
+pub const MSG_TYPE_SCHED_EXIT: u32 = 0x5343_4458; // "SCDX"
+
 /// Current header version.
 pub const SHM_RING_VERSION: u32 = 1;
 
@@ -950,6 +957,12 @@ mod tests {
     fn msg_type_scenario_end_ascii() {
         let bytes = MSG_TYPE_SCENARIO_END.to_be_bytes();
         assert_eq!(&bytes, b"SCEN");
+    }
+
+    #[test]
+    fn msg_type_sched_exit_ascii() {
+        let bytes = MSG_TYPE_SCHED_EXIT.to_be_bytes();
+        assert_eq!(&bytes, b"SCDX");
     }
 
     #[test]

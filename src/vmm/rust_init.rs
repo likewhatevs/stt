@@ -108,6 +108,15 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // are ready for enumeration.
     crate::vmm::shm_ring::signal(1);
 
+    // Phase 4b: Scheduler death monitor.
+    // Spawn a thread that polls /proc/{pid}. If the scheduler exits during
+    // the test, the thread writes MSG_TYPE_SCHED_EXIT to SHM so the host
+    // can detect early death without waiting for the watchdog.
+    let sched_exit_stop = start_sched_exit_monitor(
+        sched_child.as_ref().map(|c| c.id()),
+        sched_log_path.as_deref(),
+    );
+
     // Phase 5: Dispatch.
     // Read test args from /args in the initramfs. As PID 1, the kernel
     // passes cmdline args (console=ttyS0 etc.), not the test args.
@@ -142,6 +151,9 @@ pub(crate) fn ktstr_guest_init() -> ! {
         stop.store(true, Ordering::Release);
     }
     if let Some(ref stop) = shm_stop {
+        stop.store(true, Ordering::Release);
+    }
+    if let Some(ref stop) = sched_exit_stop {
         stop.store(true, Ordering::Release);
     }
 
@@ -303,8 +315,18 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
         None => Stdio::null(),
     };
 
+    // Build RUST_LOG for the scheduler: append libbpf noise suppression
+    // to whatever the guest already has. libbpf emits debug/info messages
+    // through the `log` crate via scx_utils::libbpf_logger; raising its
+    // threshold to warn keeps scheduler output readable.
+    let sched_rust_log = match std::env::var("RUST_LOG") {
+        Ok(existing) => format!("{existing},scx_utils::libbpf_logger=warn"),
+        Err(_) => "info,scx_utils::libbpf_logger=warn".to_string(),
+    };
+
     let child = Command::new("/scheduler")
         .args(&args)
+        .env("RUST_LOG", &sched_rust_log)
         .stdout(stdout)
         .stderr(stderr)
         .spawn();
@@ -483,6 +505,54 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool) {
     unsafe {
         libc::munmap(m.map_base, m.map_size);
     }
+}
+
+/// Monitor the scheduler child process for unexpected exit.
+///
+/// Polls `/proc/{pid}` every 200ms. When the directory disappears, the
+/// scheduler has exited. Writes MSG_TYPE_SCHED_EXIT to SHM with exit
+/// code 1, then dumps the scheduler log to COM2. The host monitor thread
+/// detects this message via mid-flight SHM drain and can terminate the
+/// VM early.
+///
+/// Uses procfs instead of waitpid because SIGCHLD is SIG_IGN (the kernel
+/// auto-reaps children, making waitpid return ECHILD).
+///
+/// Returns None when no scheduler is running.
+fn start_sched_exit_monitor(
+    sched_pid: Option<u32>,
+    log_path: Option<&str>,
+) -> Option<Arc<AtomicBool>> {
+    let pid = sched_pid?;
+    let proc_path = format!("/proc/{pid}");
+    let log_path = log_path.map(|s| s.to_string());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    std::thread::Builder::new()
+        .name("sched-exit-mon".into())
+        .spawn(move || {
+            while !stop_clone.load(Ordering::Acquire) {
+                if !Path::new(&proc_path).exists() {
+                    // Scheduler process is gone. Signal the host.
+                    let exit_code: i32 = 1;
+                    crate::vmm::shm_ring::write_msg(
+                        crate::vmm::shm_ring::MSG_TYPE_SCHED_EXIT,
+                        &exit_code.to_ne_bytes(),
+                    );
+
+                    // Dump scheduler log to COM2 for diagnostics.
+                    if let Some(ref path) = log_path {
+                        dump_sched_output(path);
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        })
+        .ok();
+
+    Some(stop)
 }
 
 /// Execute shell-script-like commands from a file.

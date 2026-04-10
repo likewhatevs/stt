@@ -499,6 +499,8 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         return Ok(AssertResult::skip("skipped: not enough CPUs/LLCs"));
     }
 
+    let scenario_start = std::time::Instant::now();
+
     let names: Vec<String> = (0..scenario.num_cgroups)
         .map(|i| format!("cg_{i}"))
         .collect();
@@ -589,7 +591,10 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
 
     if sched_dead {
         result.passed = false;
-        result.details.push("scheduler died".into());
+        result.details.push(format!(
+            "scheduler crashed during workload ({:.1}s into test)",
+            scenario_start.elapsed().as_secs_f64(),
+        ));
     }
 
     Ok(result)

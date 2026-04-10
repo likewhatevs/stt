@@ -142,9 +142,10 @@ fn entry_topo_constraints_match_attrs() {
 }
 
 /// Scheduler with a distinctive topology for inheritance tests.
-const TOPO_SCHED: ktstr::test_support::Scheduler = ktstr::test_support::Scheduler::new("topo_test")
-    .binary(ktstr::test_support::SchedulerSpec::Name("scx-ktstr"))
-    .topology(3, 6, 1);
+/// Uses EEVDF (no binary) — the test validates topology inheritance,
+/// not scheduler behavior.
+const TOPO_SCHED: ktstr::test_support::Scheduler =
+    ktstr::test_support::Scheduler::new("topo_test").topology(3, 6, 1);
 
 /// Full topology inheritance: all three dimensions from TOPO_SCHED.
 #[ktstr_test(scheduler = TOPO_SCHED)]

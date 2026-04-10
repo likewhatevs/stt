@@ -1519,7 +1519,7 @@ fn evaluate_vm_result(
             let console_section = if verify_result
                 .details
                 .iter()
-                .any(|d| d.contains("scheduler died"))
+                .any(|d| d.contains("scheduler died") || d.contains("scheduler crashed"))
                 || verbose()
             {
                 let init_stage = classify_init_stage(output);
@@ -1610,6 +1610,7 @@ fn evaluate_vm_result(
     let repro_section = if entry.scheduler.binary.has_active_scheduling()
         && (output.contains("SCHEDULER_DIED")
             || output.contains("scheduler died")
+            || output.contains("scheduler crashed")
             || (result.stderr.contains("sched_ext:") && result.stderr.contains("disabled")))
     {
         repro_fn(output)
@@ -1679,9 +1680,9 @@ fn evaluate_vm_result(
     }
 
     let reason = if entry.scheduler.binary.has_active_scheduling() {
-        "scheduler died (no test result in SHM or COM2)"
+        "scheduler crashed before the test could produce results"
     } else {
-        "payload produced no output (no test result in SHM or COM2)"
+        "test function produced no output (no test result found)"
     };
     let msg = format!(
         "ktstr_test '{}'{} {}{}{}{}{}{}{}",
@@ -2540,7 +2541,15 @@ fn format_console_diagnostics(console: &str, exit_code: i32, init_stage: &str) -
     }
     let mut parts = Vec::with_capacity(3);
     parts.push(format!("stage: {init_stage}"));
-    parts.push(format!("exit_code={exit_code}"));
+    let exit_label = if exit_code < 0 {
+        // Negative exit codes are typically negated errno values.
+        crate::errno_name(-exit_code)
+            .map(|name| format!("exit_code={exit_code} ({name})"))
+            .unwrap_or_else(|| format!("exit_code={exit_code}"))
+    } else {
+        format!("exit_code={exit_code}")
+    };
+    parts.push(exit_label);
     if !trimmed.is_empty() {
         let lines: Vec<&str> = trimmed.lines().collect();
         let start = lines.len().saturating_sub(TAIL_LINES);
@@ -4208,12 +4217,12 @@ mod tests {
             evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("payload produced no output"),
-            "EEVDF with no COM2 output should say 'payload produced no output', got: {msg}",
+            msg.contains("test function produced no output"),
+            "EEVDF with no COM2 output should say 'test function produced no output', got: {msg}",
         );
         assert!(
-            !msg.contains("scheduler died"),
-            "EEVDF error should not say 'scheduler died', got: {msg}",
+            !msg.contains("scheduler crashed"),
+            "EEVDF error should not say 'scheduler crashed', got: {msg}",
         );
         assert!(
             msg.contains("exit_code=1"),
@@ -4234,12 +4243,12 @@ mod tests {
             evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("scheduler died"),
-            "scheduler present with no output should say 'scheduler died', got: {msg}",
+            msg.contains("scheduler crashed"),
+            "scheduler present with no output should say 'scheduler crashed', got: {msg}",
         );
         assert!(
-            !msg.contains("payload produced no output"),
-            "should not say 'payload produced no output' when scheduler is set, got: {msg}",
+            !msg.contains("test function produced no output"),
+            "should not say 'test function produced no output' when scheduler is set, got: {msg}",
         );
     }
 
@@ -4257,8 +4266,8 @@ mod tests {
             evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("scheduler died"),
-            "should say scheduler died, got: {msg}",
+            msg.contains("scheduler crashed"),
+            "should say scheduler crashed, got: {msg}",
         );
         assert!(
             msg.contains("--- scheduler log ---"),
@@ -4309,12 +4318,12 @@ mod tests {
             evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("payload produced no output"),
-            "non-parseable COM2 with EEVDF should say 'payload produced no output', got: {msg}",
+            msg.contains("test function produced no output"),
+            "non-parseable COM2 with EEVDF should say 'test function produced no output', got: {msg}",
         );
         assert!(
-            !msg.contains("scheduler died"),
-            "EEVDF should not say scheduler died, got: {msg}",
+            !msg.contains("scheduler crashed"),
+            "EEVDF should not say scheduler crashed, got: {msg}",
         );
     }
 
@@ -4638,7 +4647,7 @@ mod tests {
 
     #[test]
     fn eval_sched_died_includes_console() {
-        let json = r#"{"passed":false,"details":["scheduler died between step 0 and step 1 (of 2)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"details":["scheduler crashed after completing step 1 of 2 (0.5s into test)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
@@ -4658,7 +4667,7 @@ mod tests {
 
     #[test]
     fn eval_sched_died_includes_monitor() {
-        let json = r#"{"passed":false,"details":["scheduler died"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"details":["scheduler crashed during workload (2.0s into test)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_monitor__");
         let result = crate::vmm::VmResult {

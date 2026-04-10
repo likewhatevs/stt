@@ -31,7 +31,14 @@ fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> 
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e).with_context(|| format!("write {display}")),
+        Ok(Err(e)) => {
+            let errno_suffix = e
+                .raw_os_error()
+                .and_then(crate::errno_name)
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default();
+            Err(e).with_context(|| format!("write {display}{errno_suffix}"))
+        }
         Err(_) => bail!(
             "cgroup write to {display} timed out after {}ms",
             timeout.as_millis()
@@ -39,23 +46,7 @@ fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> 
     }
 }
 
-/// Check whether an anyhow error chain contains an `io::Error` with
-/// `raw_os_error() == ESRCH`. The kernel returns ESRCH when writing a
-/// dead PID to `cgroup.procs` (`cgroup_procs_write_start` calls
-/// `find_task_by_vpid`, which returns NULL for reaped tasks).
-fn is_esrch(err: &anyhow::Error) -> bool {
-    is_os_error(err, libc::ESRCH)
-}
-
-/// Check whether an anyhow error chain contains an `io::Error` with
-/// `raw_os_error() == EBUSY`. The kernel returns EBUSY when writing
-/// to `cgroup.procs` of a cgroup that has `subtree_control` set
-/// (cgroup v2 no-internal-process constraint via
-/// `cgroup_migrate_vet_dst`).
-fn is_ebusy(err: &anyhow::Error) -> bool {
-    is_os_error(err, libc::EBUSY)
-}
-
+/// Check whether an anyhow error chain contains a specific OS error.
 fn is_os_error(err: &anyhow::Error, errno: i32) -> bool {
     for cause in err.chain() {
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
@@ -65,6 +56,20 @@ fn is_os_error(err: &anyhow::Error, errno: i32) -> bool {
         }
     }
     false
+}
+
+/// ESRCH: task exited between listing and migration
+/// (`cgroup_procs_write_start` -> `find_task_by_vpid` returns NULL).
+fn is_esrch(err: &anyhow::Error) -> bool {
+    is_os_error(err, libc::ESRCH)
+}
+
+/// EBUSY: either the cgroup v2 no-internal-process constraint
+/// (`cgroup_migrate_vet_dst` when `subtree_control` is set) or a
+/// transient rejection from a sched_ext BPF `cgroup_prep_move`
+/// callback (`scx_cgroup_can_attach`).
+fn is_ebusy(err: &anyhow::Error) -> bool {
+    is_os_error(err, libc::EBUSY)
 }
 
 /// RAII manager for cgroup v2 filesystem operations.
@@ -199,21 +204,15 @@ impl CgroupManager {
     /// Move multiple tasks into a child cgroup by PID.
     ///
     /// Tolerates ESRCH (task exited between listing and migration).
-    /// Retries EBUSY (cgroup v2 no-internal-process constraint from
-    /// `cgroup_migrate_vet_dst` when `subtree_control` is set on the
-    /// destination, or transient contention from concurrent cgroup
-    /// operations). Retries up to 5 times with 50ms backoff, then
-    /// warns and skips the task.
-    /// Propagates all other errors immediately.
+    /// Retries EBUSY up to 3 times with 100ms backoff for transient
+    /// rejections from sched_ext BPF `cgroup_prep_move` callbacks
+    /// (`scx_cgroup_can_attach`). Propagates EBUSY after retries
+    /// exhausted. Propagates all other errors immediately.
     pub fn move_tasks(&self, name: &str, tids: &[u32]) -> Result<()> {
         for &t in tids {
             if let Err(e) = self.move_task_with_retry(name, t) {
                 if is_esrch(&e) {
                     tracing::warn!(tid = t, cgroup = name, "task vanished during migration");
-                    continue;
-                }
-                if is_ebusy(&e) {
-                    tracing::warn!(tid = t, cgroup = name, "EBUSY after retries, skipping task");
                     continue;
                 }
                 return Err(e);
@@ -222,10 +221,10 @@ impl CgroupManager {
         Ok(())
     }
 
-    /// Attempt to move a single task, retrying on EBUSY.
+    /// Move a single task with bounded EBUSY retry.
     fn move_task_with_retry(&self, name: &str, tid: u32) -> Result<()> {
-        const MAX_RETRIES: u32 = 5;
-        const RETRY_DELAY: Duration = Duration::from_millis(50);
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY: Duration = Duration::from_millis(100);
 
         for attempt in 0..MAX_RETRIES {
             match self.move_task(name, tid) {
@@ -243,6 +242,35 @@ impl CgroupManager {
             }
         }
         unreachable!()
+    }
+
+    /// Clear `subtree_control` on a child cgroup by writing an empty
+    /// string. Disables all controllers for the cgroup's children.
+    ///
+    /// Required before moving tasks into a cgroup that has
+    /// `subtree_control` set: the kernel's no-internal-process
+    /// constraint (`cgroup_migrate_vet_dst`) returns EBUSY when
+    /// tasks are written to `cgroup.procs` of a cgroup with
+    /// controllers in `subtree_control`.
+    pub fn clear_subtree_control(&self, name: &str) -> Result<()> {
+        let p = self.parent.join(name).join("cgroup.subtree_control");
+        if !p.exists() {
+            return Ok(());
+        }
+        // Read current controllers and disable each one.
+        let content = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+        let content = content.trim();
+        if content.is_empty() {
+            return Ok(());
+        }
+        // Each controller name needs a "-" prefix to disable.
+        let disable: Vec<String> = content
+            .split_whitespace()
+            .map(|c| format!("-{c}"))
+            .collect();
+        let disable_str = disable.join(" ");
+        write_with_timeout(&p, &disable_str, CGROUP_WRITE_TIMEOUT)
+            .with_context(|| format!("clear subtree_control on {name}"))
     }
 
     /// Move all tasks from a child cgroup back to the parent.
@@ -469,6 +497,25 @@ mod tests {
         let io_err = std::io::Error::from_raw_os_error(libc::ESRCH);
         let anyhow_err = anyhow::Error::new(io_err).context("write cgroup.procs");
         assert!(!is_ebusy(&anyhow_err));
+    }
+
+    #[test]
+    fn clear_subtree_control_nonexistent() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-clear-sc");
+        // No subtree_control file → no-op success.
+        assert!(cg.clear_subtree_control("cg_0").is_ok());
+    }
+
+    #[test]
+    fn clear_subtree_control_empty() {
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-sc-{}", std::process::id()));
+        let dir_a = dir.join("cg_a");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::write(dir_a.join("cgroup.subtree_control"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        // Empty subtree_control → no-op success.
+        assert!(cg.clear_subtree_control("cg_a").is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
