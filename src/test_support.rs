@@ -1316,6 +1316,9 @@ fn run_ktstr_test_inner(
 
     let result = vm.run().context("run ktstr_test VM")?;
 
+    // Drop the VM to release CPU/LLC flock fds before auto-repro.
+    drop(vm);
+
     // Log verifier stats count for visibility.
     if !result.verifier_stats.is_empty() {
         eprintln!(
