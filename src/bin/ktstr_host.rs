@@ -1,11 +1,10 @@
-use std::time::Duration;
-
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use ktstr::cgroup::CgroupManager;
-use ktstr::runner::{RunConfig, Runner};
-use ktstr::scenario::{self, flags};
+use ktstr::cli;
+use ktstr::runner::Runner;
+use ktstr::scenario;
 use ktstr::topology::TestTopology;
 
 #[derive(Parser)]
@@ -110,9 +109,9 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
+    let args = Cli::parse();
 
-    match cli.command {
+    match args.command {
         Command::Run {
             scheduler,
             sched_args,
@@ -129,43 +128,15 @@ fn main() -> Result<()> {
             work_type,
             parent_cgroup,
         } => {
-            let active_flags = match flag_arg {
-                Some(fs) => {
-                    let mut resolved = Vec::new();
-                    for f in &fs {
-                        match flags::from_short_name(f) {
-                            Some(name) => resolved.push(name),
-                            None => bail!(
-                                "unknown flag: '{f}'. valid flags: {}",
-                                flags::ALL.join(", "),
-                            ),
-                        }
-                    }
-                    Some(resolved)
-                }
-                None => None,
-            };
+            let active_flags = cli::resolve_flags(flag_arg)?;
+            let work_type_override = cli::parse_work_type(work_type.as_deref())?;
 
-            let work_type_override = match work_type {
-                Some(ref name) => {
-                    let wt = ktstr::workload::WorkType::from_name(name);
-                    if wt.is_none() {
-                        bail!(
-                            "unknown work type: '{name}'. valid types: {}",
-                            ktstr::workload::WorkType::ALL_NAMES.join(", "),
-                        );
-                    }
-                    wt
-                }
-                None => None,
-            };
-
-            let config = RunConfig {
-                scheduler_bin: scheduler,
-                scheduler_args: sched_args,
+            let config = cli::build_run_config(
+                scheduler,
+                sched_args,
                 parent_cgroup,
-                duration: Duration::from_secs(duration),
-                workers_per_cgroup: workers,
+                duration,
+                workers,
                 json,
                 verbose,
                 active_flags,
@@ -174,27 +145,13 @@ fn main() -> Result<()> {
                 auto_repro,
                 kernel_dir,
                 work_type_override,
-                ..Default::default()
-            };
+            );
 
             let topo = TestTopology::from_system()?;
             let runner = Runner::new(config, topo)?;
 
             let scenarios = scenario::all_scenarios();
-            let refs: Vec<&scenario::Scenario> = scenarios
-                .iter()
-                .filter(|s| {
-                    filter
-                        .as_ref()
-                        .map_or(true, |f| s.name.contains(f.as_str()))
-                })
-                .collect();
-
-            if refs.is_empty() {
-                bail!(
-                    "no scenarios matched filter. run 'ktstr-host list' to see available scenarios"
-                );
-            }
+            let refs = cli::filter_scenarios(&scenarios, filter.as_deref())?;
 
             let results = runner.run_scenarios(&refs)?;
 

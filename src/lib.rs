@@ -188,6 +188,7 @@ pub(crate) fn read_kmsg() -> String {
 }
 pub mod assert;
 pub(crate) mod budget;
+pub mod cli;
 #[allow(dead_code)]
 pub(crate) mod monitor;
 #[allow(dead_code)]
