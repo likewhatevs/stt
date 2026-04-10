@@ -16,7 +16,7 @@ pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
         (0..n)
             .map(|i| {
                 CgroupDef::named(format!("many_{i}"))
-                    .with_cpuset(CpusetSpec::Exact([all[i]].into_iter().collect()))
+                    .with_cpuset(CpusetSpec::exact([all[i]]))
                     .workers(1)
             })
             .collect()
@@ -39,9 +39,7 @@ pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
         (0..half)
             .map(|i| {
                 CgroupDef::named(format!("reuse_{i}"))
-                    .with_cpuset(CpusetSpec::Exact(
-                        [all[i % all.len()]].into_iter().collect(),
-                    ))
+                    .with_cpuset(CpusetSpec::exact([all[i % all.len()]]))
                     .workers(1)
             })
             .collect()
@@ -57,9 +55,11 @@ pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
     let mut exhaust_ops = Vec::new();
     for i in 0..n {
         let name = format!("exhaust_{i}");
-        let cpus: BTreeSet<usize> = [all[i % all.len()]].into_iter().collect();
         exhaust_ops.push(Op::add_cgroup(name.clone()));
-        exhaust_ops.push(Op::set_cpuset(name, CpusetSpec::Exact(cpus)));
+        exhaust_ops.push(Op::set_cpuset(
+            name,
+            CpusetSpec::exact([all[i % all.len()]]),
+        ));
     }
 
     let mut remove_ops = Vec::new();

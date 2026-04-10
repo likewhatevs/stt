@@ -96,6 +96,15 @@ pub enum CpusetSpec {
     Exact(BTreeSet<usize>),
 }
 
+impl CpusetSpec {
+    /// Construct an `Exact` cpuset from any iterator of CPU indices.
+    ///
+    /// Accepts arrays, ranges, `Vec`, `BTreeSet`, or any `IntoIterator<Item = usize>`.
+    pub fn exact(cpus: impl IntoIterator<Item = usize>) -> Self {
+        CpusetSpec::Exact(cpus.into_iter().collect())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CgroupDef
 // ---------------------------------------------------------------------------
@@ -1191,7 +1200,7 @@ mod tests {
             Op::RemoveCgroup { cgroup: "a".into() },
             Op::SetCpuset {
                 cgroup: "a".into(),
-                cpus: CpusetSpec::Exact(Default::default()),
+                cpus: CpusetSpec::exact([]),
             },
             Op::ClearCpuset { cgroup: "a".into() },
             Op::SwapCpusets {
@@ -1848,7 +1857,7 @@ mod tests {
     fn cpusetspec_validate_exact_always_ok() {
         let (cg, topo) = make_ctx(1, 4, 1);
         let ctx = ctx_from(&cg, &topo);
-        let spec = CpusetSpec::Exact([99].into_iter().collect());
+        let spec = CpusetSpec::exact([99]);
         assert!(spec.validate(&ctx).is_ok());
     }
 

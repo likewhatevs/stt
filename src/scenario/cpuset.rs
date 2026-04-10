@@ -5,7 +5,6 @@ use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps};
 use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
-use std::collections::BTreeSet;
 
 /// Apply disjoint cpusets to two initially unconstrained cgroups mid-run.
 pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
@@ -203,7 +202,7 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> 
     let last = all.len() - 1;
     let mid = last / 2;
 
-    let narrow: BTreeSet<usize> = all[mid..mid + 1].iter().copied().collect();
+    let narrow = CpusetSpec::exact([all[mid]]);
 
     let steps = vec![
         Step::with_defs(
@@ -228,7 +227,7 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> 
             HoldSpec::Fixed(ctx.settle + ctx.duration / 3),
         ),
         Step::new(
-            vec![Op::set_cpuset("cg_1", CpusetSpec::Exact(narrow))],
+            vec![Op::set_cpuset("cg_1", narrow)],
             HoldSpec::Frac(1.0 / 3.0),
         ),
         Step::new(

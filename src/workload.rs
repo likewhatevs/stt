@@ -46,6 +46,15 @@ pub enum AffinityKind {
     Exact(BTreeSet<usize>),
 }
 
+impl AffinityKind {
+    /// Construct an `Exact` affinity from any iterator of CPU indices.
+    ///
+    /// Accepts arrays, ranges, `Vec`, `BTreeSet`, or any `IntoIterator<Item = usize>`.
+    pub fn exact(cpus: impl IntoIterator<Item = usize>) -> Self {
+        AffinityKind::Exact(cpus.into_iter().collect())
+    }
+}
+
 /// Resolved CPU affinity for a worker process.
 ///
 /// Created from [`AffinityKind`] at runtime based on topology and
