@@ -942,10 +942,7 @@ fn worker_main(
     while !STOP.load(Ordering::Relaxed) {
         match work_type {
             WorkType::CpuSpin => {
-                for _ in 0..1024 {
-                    work_units = std::hint::black_box(work_units.wrapping_add(1));
-                    std::hint::spin_loop();
-                }
+                spin_burst(&mut work_units, 1024);
                 iterations += 1;
             }
             WorkType::YieldHeavy => {
@@ -954,10 +951,7 @@ fn worker_main(
                 iterations += 1;
             }
             WorkType::Mixed => {
-                for _ in 0..1024 {
-                    work_units = std::hint::black_box(work_units.wrapping_add(1));
-                    std::hint::spin_loop();
-                }
+                spin_burst(&mut work_units, 1024);
                 std::thread::yield_now();
                 iterations += 1;
             }
@@ -988,10 +982,7 @@ fn worker_main(
             WorkType::Bursty { burst_ms, sleep_ms } => {
                 let burst_end = Instant::now() + Duration::from_millis(burst_ms);
                 while Instant::now() < burst_end && !STOP.load(Ordering::Relaxed) {
-                    for _ in 0..1024 {
-                        work_units = std::hint::black_box(work_units.wrapping_add(1));
-                        std::hint::spin_loop();
-                    }
+                    spin_burst(&mut work_units, 1024);
                 }
                 if !STOP.load(Ordering::Relaxed) {
                     let before_sleep = Instant::now();
@@ -1010,40 +1001,15 @@ fn worker_main(
                 if read_fd < 0 || write_fd < 0 {
                     break;
                 }
-                // CPU burst
-                for _ in 0..burst_iters {
-                    work_units = std::hint::black_box(work_units.wrapping_add(1));
-                    std::hint::spin_loop();
-                }
-                // Write 1 byte to partner
-                unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) };
-                let before_block = Instant::now();
-                // Poll for partner's response, checking STOP between polls
-                let mut pfd = libc::pollfd {
-                    fd: read_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                loop {
-                    if STOP.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
-                    if ret > 0 {
-                        let mut byte = [0u8; 1];
-                        unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut _, 1) };
-                        reservoir_push(
-                            &mut wake_latencies_ns,
-                            &mut wake_sample_count,
-                            before_block.elapsed().as_nanos() as u64,
-                            MAX_WAKE_SAMPLES,
-                        );
-                        break;
-                    }
-                    if ret < 0 {
-                        break;
-                    }
-                }
+                spin_burst(&mut work_units, burst_iters);
+                pipe_exchange(
+                    read_fd,
+                    write_fd,
+                    &mut wake_latencies_ns,
+                    &mut wake_sample_count,
+                    MAX_WAKE_SAMPLES,
+                );
+                last_iter_time = Instant::now();
                 iterations += 1;
             }
             WorkType::FutexPingPong { spin_iters } => {
@@ -1051,11 +1017,7 @@ fn worker_main(
                     Some(f) => f,
                     None => break,
                 };
-                // CPU burst
-                for _ in 0..spin_iters {
-                    work_units = std::hint::black_box(work_units.wrapping_add(1));
-                    std::hint::spin_loop();
-                }
+                spin_burst(&mut work_units, spin_iters);
                 // Worker A waits for 0, wakes partner with 1.
                 // Worker B waits for 1, wakes partner with 0.
                 let my_val: u32 = if is_first { 0 } else { 1 };
@@ -1112,30 +1074,18 @@ fn worker_main(
             }
             WorkType::CachePressure { size_kb, stride } => {
                 let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
-                let len = buf.len();
-                if len == 0 || stride == 0 {
+                if buf.is_empty() || stride == 0 {
                     break;
                 }
-                let mut idx = 0;
-                for _ in 0..1024 {
-                    buf[idx] = buf[idx].wrapping_add(1);
-                    idx = (idx + stride) % len;
-                    work_units = std::hint::black_box(work_units.wrapping_add(1));
-                }
+                cache_rmw_loop(buf, stride, 1024, &mut work_units);
                 iterations += 1;
             }
             WorkType::CacheYield { size_kb, stride } => {
                 let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
-                let len = buf.len();
-                if len == 0 || stride == 0 {
+                if buf.is_empty() || stride == 0 {
                     break;
                 }
-                let mut idx = 0;
-                for _ in 0..1024 {
-                    buf[idx] = buf[idx].wrapping_add(1);
-                    idx = (idx + stride) % len;
-                    work_units = std::hint::black_box(work_units.wrapping_add(1));
-                }
+                cache_rmw_loop(buf, stride, 1024, &mut work_units);
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
@@ -1155,45 +1105,16 @@ fn worker_main(
                     break;
                 }
                 let buf = cache_pressure_buf.get_or_insert_with(|| vec![0u8; size_kb * 1024]);
-                let len = buf.len();
-                // Cache pressure burst
-                if len > 0 {
-                    let stride = 64;
-                    let mut idx = 0;
-                    for _ in 0..burst_iters {
-                        buf[idx] = buf[idx].wrapping_add(1);
-                        idx = (idx + stride) % len;
-                        work_units = std::hint::black_box(work_units.wrapping_add(1));
-                    }
+                if !buf.is_empty() {
+                    cache_rmw_loop(buf, 64, burst_iters, &mut work_units);
                 }
-                // Pipe exchange (same as PipeIo)
-                unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) };
-                let before_block = Instant::now();
-                let mut pfd = libc::pollfd {
-                    fd: read_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                loop {
-                    if STOP.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
-                    if ret > 0 {
-                        let mut byte = [0u8; 1];
-                        unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut _, 1) };
-                        reservoir_push(
-                            &mut wake_latencies_ns,
-                            &mut wake_sample_count,
-                            before_block.elapsed().as_nanos() as u64,
-                            MAX_WAKE_SAMPLES,
-                        );
-                        break;
-                    }
-                    if ret < 0 {
-                        break;
-                    }
-                }
+                pipe_exchange(
+                    read_fd,
+                    write_fd,
+                    &mut wake_latencies_ns,
+                    &mut wake_sample_count,
+                    MAX_WAKE_SAMPLES,
+                );
                 // Reset last_iter_time after blocking step
                 last_iter_time = Instant::now();
                 iterations += 1;
@@ -1206,11 +1127,7 @@ fn worker_main(
                     Some(f) => f,
                     None => break,
                 };
-                // CPU burst
-                for _ in 0..spin_iters {
-                    work_units = std::hint::black_box(work_units.wrapping_add(1));
-                    std::hint::spin_loop();
-                }
+                spin_burst(&mut work_units, spin_iters);
                 if is_messenger {
                     // Increment generation counter and wake all receivers.
                     let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
@@ -1280,10 +1197,7 @@ fn worker_main(
                         Phase::Spin(dur) => {
                             let end = Instant::now() + *dur;
                             while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
-                                for _ in 0..1024 {
-                                    work_units = std::hint::black_box(work_units.wrapping_add(1));
-                                    std::hint::spin_loop();
-                                }
+                                spin_burst(&mut work_units, 1024);
                             }
                         }
                         Phase::Sleep(dur) => {
@@ -1418,6 +1332,63 @@ fn worker_main(
         schedstat_run_delay_ns: ss_delay_end.saturating_sub(ss_delay_start),
         schedstat_ctx_switches: ss_ts_end.saturating_sub(ss_ts_start),
         schedstat_cpu_time_ns: ss_cpu_end.saturating_sub(ss_cpu_start),
+    }
+}
+
+/// CPU spin burst: black_box increment + spin_loop hint, repeated `count` times.
+#[inline(always)]
+fn spin_burst(work_units: &mut u64, count: u64) {
+    for _ in 0..count {
+        *work_units = std::hint::black_box(work_units.wrapping_add(1));
+        std::hint::spin_loop();
+    }
+}
+
+/// Strided read-modify-write over a cache buffer.
+fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_units: &mut u64) {
+    let len = buf.len();
+    let mut idx = 0;
+    for _ in 0..iters {
+        buf[idx] = buf[idx].wrapping_add(1);
+        idx = (idx + stride) % len;
+        *work_units = std::hint::black_box(work_units.wrapping_add(1));
+    }
+}
+
+/// Write 1 byte to partner, poll for response, read, record wake latency.
+fn pipe_exchange(
+    read_fd: i32,
+    write_fd: i32,
+    wake_latencies_ns: &mut Vec<u64>,
+    wake_sample_count: &mut u64,
+    max_wake_samples: usize,
+) {
+    unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) };
+    let before_block = Instant::now();
+    let mut pfd = libc::pollfd {
+        fd: read_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        if STOP.load(Ordering::Relaxed) {
+            break;
+        }
+        let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if ret > 0 {
+            let mut byte = [0u8; 1];
+            unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut _, 1) };
+            reservoir_push(
+                wake_latencies_ns,
+                wake_sample_count,
+                before_block.elapsed().as_nanos() as u64,
+                max_wake_samples,
+            );
+            break;
+        }
+        if ret < 0 {
+            break;
+        }
     }
 }
 

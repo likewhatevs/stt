@@ -51,7 +51,7 @@ pub enum Op {
     /// Spawn workers and move them into the target cgroup.
     Spawn {
         cgroup: Cow<'static, str>,
-        workload: WorkloadConfig,
+        work: Work,
     },
     /// Stop all workers in a cgroup (does not remove the cgroup).
     StopCgroup { cgroup: Cow<'static, str> },
@@ -841,8 +841,15 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     state.cpusets.insert(a.to_string(), cb.clone());
                 }
             }
-            Op::Spawn { cgroup, workload } => {
-                let mut h = WorkloadHandle::spawn(workload)?;
+            Op::Spawn { cgroup, work } => {
+                let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
+                let wl = WorkloadConfig {
+                    num_workers: n,
+                    affinity: crate::workload::AffinityMode::None,
+                    work_type: work.work_type.clone(),
+                    sched_policy: work.sched_policy,
+                };
+                let mut h = WorkloadHandle::spawn(&wl)?;
                 ctx.cgroups.move_tasks(cgroup, &h.tids())?;
                 h.start();
                 state.handles.push((cgroup.to_string(), h));
@@ -984,8 +991,8 @@ pub(crate) struct Traverse {
     pub settle: Duration,
     /// Cgroups [0..persistent_cgroups) are created once and never removed.
     pub persistent_cgroups: usize,
-    /// Workload config per cgroup index. Last entry repeats for higher indices.
-    pub cgroup_workloads: Vec<WorkloadConfig>,
+    /// Work definition per cgroup index. Last entry repeats for higher indices.
+    pub cgroup_workloads: Vec<Work>,
 }
 
 impl Traverse {
@@ -1020,7 +1027,7 @@ impl Traverse {
             while live_cgroups.len() < target_count {
                 let idx = live_cgroups.len();
                 let name = names[idx].clone();
-                let wl = self
+                let w = self
                     .cgroup_workloads
                     .get(idx)
                     .or(self.cgroup_workloads.last())
@@ -1029,7 +1036,7 @@ impl Traverse {
                 ops.push(Op::AddCgroup { name: name.clone() });
                 ops.push(Op::Spawn {
                     cgroup: name.clone(),
-                    workload: wl,
+                    work: w,
                 });
                 live_cgroups.push(name);
             }
@@ -1119,7 +1126,7 @@ mod tests {
             },
             Op::Spawn {
                 cgroup: "a".into(),
-                workload: Default::default(),
+                work: Default::default(),
             },
             Op::StopCgroup { cgroup: "a".into() },
             Op::RandomizeAffinity { cgroup: "a".into() },
@@ -1523,7 +1530,7 @@ mod tests {
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
             persistent_cgroups: 0,
-            cgroup_workloads: vec![WorkloadConfig::default()],
+            cgroup_workloads: vec![Work::default()],
         };
         let steps = t.generate(&ctx);
         assert_eq!(steps.len(), 3);
@@ -1544,7 +1551,7 @@ mod tests {
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
             persistent_cgroups: 1,
-            cgroup_workloads: vec![WorkloadConfig::default()],
+            cgroup_workloads: vec![Work::default()],
         };
         let steps1 = t.generate(&ctx);
         let steps2 = t.generate(&ctx);
@@ -1570,7 +1577,7 @@ mod tests {
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
             persistent_cgroups: 2,
-            cgroup_workloads: vec![WorkloadConfig::default()],
+            cgroup_workloads: vec![Work::default()],
         };
         let steps = t.generate(&ctx);
         // Every phase should have at least persistent_cgroups worth of SetCpuset ops

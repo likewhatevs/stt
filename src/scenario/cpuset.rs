@@ -296,10 +296,7 @@ pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
             setup: vec![].into(),
             ops: vec![Op::Spawn {
                 cgroup: "cg_1".into(),
-                workload: WorkloadConfig {
-                    num_workers: 16,
-                    ..Default::default()
-                },
+                work: Work::default().workers(16),
             }],
             hold: HoldSpec::Frac(0.5),
         },

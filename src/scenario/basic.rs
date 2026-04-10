@@ -47,12 +47,10 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
         for &(policy, ref wtype) in &configs {
             ops.push(Op::Spawn {
                 cgroup: name.into(),
-                workload: WorkloadConfig {
-                    num_workers: 2,
-                    sched_policy: policy,
-                    work_type: wtype.clone(),
-                    ..Default::default()
-                },
+                work: Work::default()
+                    .workers(2)
+                    .sched_policy(policy)
+                    .work_type(wtype.clone()),
             });
         }
     }
@@ -78,18 +76,13 @@ pub fn custom_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
     for name in ["cg_0", "cg_1"] {
         ops.push(Op::Spawn {
             cgroup: name.into(),
-            workload: WorkloadConfig {
-                num_workers: 2,
-                work_type: WorkType::PipeIo { burst_iters: 1024 },
-                ..Default::default()
-            },
+            work: Work::default()
+                .workers(2)
+                .work_type(WorkType::PipeIo { burst_iters: 1024 }),
         });
         ops.push(Op::Spawn {
             cgroup: name.into(),
-            workload: WorkloadConfig {
-                num_workers: ctx.workers_per_cgroup,
-                ..Default::default()
-            },
+            work: Work::default().workers(ctx.workers_per_cgroup),
         });
     }
 

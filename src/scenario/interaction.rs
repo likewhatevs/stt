@@ -55,15 +55,8 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
 }
 
 pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
-    let heavy = WorkloadConfig {
-        num_workers: ctx.workers_per_cgroup * 2,
-        ..Default::default()
-    };
-    let light = WorkloadConfig {
-        num_workers: 1,
-        work_type: WorkType::YieldHeavy,
-        ..Default::default()
-    };
+    let heavy = Work::default().workers(ctx.workers_per_cgroup * 2);
+    let light = Work::default().workers(1).work_type(WorkType::YieldHeavy);
 
     let mut steps = vec![Step {
         setup: vec![
@@ -95,11 +88,11 @@ pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
                 },
                 Op::Spawn {
                     cgroup: heavy_cgroup.into(),
-                    workload: heavy.clone(),
+                    work: heavy.clone(),
                 },
                 Op::Spawn {
                     cgroup: light_cgroup.into(),
-                    workload: light.clone(),
+                    work: light.clone(),
                 },
             ],
             hold: HoldSpec::Frac(0.25),
