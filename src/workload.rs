@@ -7,6 +7,9 @@
 //! - [`WorkloadHandle`] -- RAII handle to running workers
 //! - [`WorkerReport`] -- per-worker telemetry collected after stop
 //! - [`AffinityMode`] -- resolved CPU affinity for workers
+//! - [`Work`] -- workload definition for a single group of workers within a cgroup
+//! - [`Phase`] -- a single phase in a [`WorkType::Sequence`] compound work pattern
+//! - [`SchedPolicy`] -- Linux scheduling policy for a worker process
 //!
 //! See the [Work Types](https://likewhatevs.github.io/stt/guide/concepts/work-types.html)
 //! and [Worker Processes](https://likewhatevs.github.io/stt/guide/architecture/workers.html)
