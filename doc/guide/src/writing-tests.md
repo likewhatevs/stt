@@ -19,4 +19,6 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 Run with `cargo nextest run`. See
 [Getting Started](getting-started.md) for setup and
 [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md) for all
-available attributes.
+available attributes. Each test also generates gauntlet variants across
+topology presets and flag profiles. See
+[Gauntlet Tests](writing-tests/gauntlet-tests.md).

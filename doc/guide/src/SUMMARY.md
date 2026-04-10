@@ -23,6 +23,7 @@
   - [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md)
   - [Custom Scenarios](writing-tests/custom-scenarios.md)
   - [Scheduler Definitions](writing-tests/scheduler-definitions.md)
+  - [Gauntlet Tests](writing-tests/gauntlet-tests.md)
 
 # Recipes
 
