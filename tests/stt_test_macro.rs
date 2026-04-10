@@ -87,11 +87,19 @@ fn entry_default_fields() {
     assert_eq!(entry.constraints.min_cpus, 1);
 }
 
+/// Scheduler with the flags referenced by flags_attrs_compile.
+#[derive(stt::Scheduler)]
+#[scheduler(name = "flag_attrs_test", topology(1, 2, 1))]
+#[allow(dead_code)]
+enum FlagAttrsTestFlag {
+    Borrow,
+    Rebal,
+    Steal,
+}
+
 /// Test with required_flags and excluded_flags attributes.
 #[stt_test(
-    sockets = 1,
-    cores = 2,
-    threads = 1,
+    scheduler = FLAG_ATTRS_TEST,
     required_flags = ["borrow", "rebal"],
     excluded_flags = ["steal"]
 )]
