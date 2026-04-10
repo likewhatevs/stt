@@ -31,12 +31,27 @@ fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> 
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(anyhow::anyhow!("{e}")).with_context(|| format!("write {display}")),
+        Ok(Err(e)) => Err(e).with_context(|| format!("write {display}")),
         Err(_) => bail!(
             "cgroup write to {display} timed out after {}ms",
             timeout.as_millis()
         ),
     }
+}
+
+/// Check whether an anyhow error chain contains an `io::Error` with
+/// `raw_os_error() == ESRCH`. The kernel returns ESRCH when writing a
+/// dead PID to `cgroup.procs` (`cgroup_procs_write_start` calls
+/// `find_task_by_vpid`, which returns NULL for reaped tasks).
+fn is_esrch(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && io_err.raw_os_error() == Some(libc::ESRCH)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// RAII manager for cgroup v2 filesystem operations.
@@ -168,10 +183,19 @@ impl CgroupManager {
         write_with_timeout(&p, &tid.to_string(), CGROUP_WRITE_TIMEOUT)
     }
 
-    /// Move all tasks from a workload handle into a cgroup.
+    /// Move multiple tasks into a child cgroup by PID.
+    ///
+    /// Tolerates ESRCH (task exited between listing and migration).
+    /// Propagates all other errors immediately.
     pub fn move_tasks(&self, name: &str, tids: &[u32]) -> Result<()> {
         for &t in tids {
-            self.move_task(name, t)?;
+            if let Err(e) = self.move_task(name, t) {
+                if is_esrch(&e) {
+                    tracing::warn!(tid = t, cgroup = name, "task vanished during migration");
+                    continue;
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -351,7 +375,7 @@ mod tests {
 
     #[test]
     fn move_tasks_partial_failure() {
-        // move_tasks iterates and returns early on first error
+        // move_tasks propagates non-ESRCH errors immediately
         let cg = CgroupManager::new("/nonexistent/stt-partial");
         let err = cg.move_tasks("cg", &[1, 2, 3]).unwrap_err();
         // The error comes from the first tid (write to nonexistent path)
@@ -372,6 +396,20 @@ mod tests {
         // drain_tasks on a cgroup with empty procs file should succeed
         assert!(cg.drain_tasks("cg_d").is_ok());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_esrch_detects_esrch_in_chain() {
+        let io_err = std::io::Error::from_raw_os_error(libc::ESRCH);
+        let anyhow_err = anyhow::Error::new(io_err).context("write cgroup.procs");
+        assert!(is_esrch(&anyhow_err));
+    }
+
+    #[test]
+    fn is_esrch_rejects_enoent() {
+        let io_err = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let anyhow_err = anyhow::Error::new(io_err).context("write cgroup.procs");
+        assert!(!is_esrch(&anyhow_err));
     }
 
     #[test]

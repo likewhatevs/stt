@@ -47,7 +47,8 @@ which inherits the parent's cpuset.
 `cgroup.procs`.
 
 **`move_tasks(name, tids)`** -- moves all PIDs from a slice into the
-child cgroup. Stops on the first error.
+child cgroup. Tolerates ESRCH (task exited between listing and
+migration) with a warning. Propagates all other errors immediately.
 
 **`drain_tasks(name)`** -- moves all tasks from a child cgroup back to
 the parent cgroup by reading `cgroup.procs` and writing each PID to

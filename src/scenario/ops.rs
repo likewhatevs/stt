@@ -905,7 +905,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 state.handles.push((String::new(), h));
             }
             Op::MoveAllTasks { from, to } => {
-                // Move all tasks first; only rename handles if every move succeeds.
+                // Move all tasks first; rename handles unless a non-ESRCH error aborts.
                 for (name, handle) in state.handles.iter() {
                     if name.as_str() == *from {
                         ctx.cgroups.move_tasks(to, &handle.tids())?;
