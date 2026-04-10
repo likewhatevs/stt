@@ -529,7 +529,11 @@ impl ShmWriter {
     }
 
     /// Write a TLV message to the SHM ring.
+    ///
+    /// Acquires `SHM_WRITE_LOCK` to serialize against concurrent writers
+    /// (sched-exit-mon thread via `write_msg`).
     fn write(&self, msg_type: u32, payload: &[u8]) {
+        let _guard = shm_ring::SHM_WRITE_LOCK.lock();
         match self {
             ShmWriter::Mapped { ptr, shm_size, .. } => {
                 let buf = unsafe { std::slice::from_raw_parts_mut(*ptr, *shm_size) };

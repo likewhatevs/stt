@@ -499,7 +499,32 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool) {
                 *(shm_ptr.add(stall_offset)) = 0;
             }
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Check for graceful shutdown request from host.
+        if crate::vmm::shm_ring::read_signal(0) == crate::vmm::shm_ring::SIGNAL_SHUTDOWN_REQ {
+            eprintln!("ktstr-init: shutdown request received, draining");
+            // Stop generating new trace events so pending trace data drains.
+            let _ = fs::write("/sys/kernel/tracing/tracing_on", "0");
+            // Flush stdout/stderr to COM2 before tcdrain.
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            // tcdrain COM1 and COM2.
+            if let Ok(f) = fs::OpenOptions::new().write(true).open(COM1) {
+                unsafe {
+                    libc::tcdrain(std::os::unix::io::AsRawFd::as_raw_fd(&f));
+                }
+            }
+            if let Ok(f) = fs::OpenOptions::new().write(true).open(COM2) {
+                unsafe {
+                    libc::tcdrain(std::os::unix::io::AsRawFd::as_raw_fd(&f));
+                }
+            }
+            // Stop polling -- the guest reboots normally, which the
+            // BSP detects as an I8042 reset (implicit ack).
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     unsafe {

@@ -2,7 +2,8 @@
 ///
 /// The guest writes TLV-framed messages into a fixed region at the top of
 /// guest physical memory. The host drains both mid-flight and after VM exit.
-/// Single producer (guest), single consumer (host), no locking required.
+/// Multiple guest-side producers (step executor, sched-exit-mon) serialize
+/// writes via `SHM_WRITE_LOCK`. Single consumer (host), no read-side locking.
 ///
 /// Memory layout:
 ///   [ShmRingHeader (40 bytes)] [data (capacity bytes)]
@@ -112,6 +113,11 @@ pub const SIGNAL_SLOT_BASE: usize = 14;
 /// Number of available signal slots.
 const SIGNAL_SLOT_COUNT: usize = 2;
 
+/// Value written to signal slot 0 by the host to request graceful shutdown.
+/// Distinct from the BPF map write signal (value 1) so the guest poll loop
+/// can differentiate.
+pub const SIGNAL_SHUTDOWN_REQ: u8 = 0xDD;
+
 /// Guest-side: poll SHM slot until non-zero or timeout.
 /// Reads via AtomicU8 with Acquire ordering. The SHM mmap pointer
 /// is cached in a OnceLock, initialized from /proc/cmdline during
@@ -137,6 +143,44 @@ pub fn wait_for(slot: u8, timeout: std::time::Duration) -> anyhow::Result<()> {
 /// Guest-side: set a slot to non-zero.
 /// Writes via AtomicU8 with Release ordering.
 pub fn signal(slot: u8) {
+    signal_value(slot, 1);
+}
+
+/// Host-side: write 1 to a signal slot in guest memory.
+/// `mem` provides direct access to guest physical memory;
+/// `shm_base` is the guest physical address of the SHM region.
+pub fn signal_guest(mem: &crate::monitor::reader::GuestMem, shm_base: u64, slot: u8) {
+    signal_guest_value(mem, shm_base, slot, 1);
+}
+
+/// Host-side: write an arbitrary value to a signal slot in guest memory.
+pub fn signal_guest_value(
+    mem: &crate::monitor::reader::GuestMem,
+    shm_base: u64,
+    slot: u8,
+    value: u8,
+) {
+    assert!(
+        (slot as usize) < SIGNAL_SLOT_COUNT,
+        "signal slot {slot} out of range"
+    );
+    mem.write_u8(shm_base, SIGNAL_SLOT_BASE + slot as usize, value);
+}
+
+/// Guest-side: read the current value of a signal slot.
+pub fn read_signal(slot: u8) -> u8 {
+    assert!(
+        (slot as usize) < SIGNAL_SLOT_COUNT,
+        "signal slot {slot} out of range"
+    );
+    let Ok((ptr, _)) = shm_ptr() else { return 0 };
+    let offset = SIGNAL_SLOT_BASE + slot as usize;
+    let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
+    atom.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Guest-side: set a slot to a specific value.
+pub fn signal_value(slot: u8, value: u8) {
     assert!(
         (slot as usize) < SIGNAL_SLOT_COUNT,
         "signal slot {slot} out of range"
@@ -144,18 +188,7 @@ pub fn signal(slot: u8) {
     let Ok((ptr, _)) = shm_ptr() else { return };
     let offset = SIGNAL_SLOT_BASE + slot as usize;
     let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
-    atom.store(1, std::sync::atomic::Ordering::Release);
-}
-
-/// Host-side: write 1 to a signal slot in guest memory.
-/// `mem` provides direct access to guest physical memory;
-/// `shm_base` is the guest physical address of the SHM region.
-pub fn signal_guest(mem: &crate::monitor::reader::GuestMem, shm_base: u64, slot: u8) {
-    assert!(
-        (slot as usize) < SIGNAL_SLOT_COUNT,
-        "signal slot {slot} out of range"
-    );
-    mem.write_u8(shm_base, SIGNAL_SLOT_BASE + slot as usize, 1);
+    atom.store(value, std::sync::atomic::Ordering::Release);
 }
 
 /// Set the cached SHM base pointer and region size. Called from
@@ -166,8 +199,12 @@ pub fn init_shm_ptr(base: *mut u8, size: usize) {
 
 /// Guest-side: write a TLV message to the SHM ring using the cached
 /// mmap pointer. No-op if SHM is not initialized.
+///
+/// Acquires `SHM_WRITE_LOCK` to serialize against concurrent writers
+/// (sched-exit-mon thread and step executor).
 pub fn write_msg(msg_type: u32, payload: &[u8]) {
     let Ok((ptr, size)) = shm_ptr() else { return };
+    let _guard = SHM_WRITE_LOCK.lock();
     let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
     shm_write(buf, 0, msg_type, payload);
 }
@@ -184,6 +221,11 @@ unsafe impl Sync for ShmPtr {}
 
 /// Cached SHM mmap pointer for guest-side signal operations.
 static SHM_PTR: std::sync::OnceLock<ShmPtr> = std::sync::OnceLock::new();
+
+/// Mutex serializing guest-side SHM ring writes. Prevents the sched-exit-mon
+/// thread (write_msg) and the step executor (ShmWriter::write) from
+/// concurrently modifying the ring's write_ptr.
+pub static SHM_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Get the cached SHM mmap pointer and size, initializing from
 /// /proc/cmdline if not already set.

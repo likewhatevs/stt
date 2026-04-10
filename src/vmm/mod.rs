@@ -1370,6 +1370,22 @@ impl KtstrVm {
         let kill_for_watchdog = kill.clone();
         let rt_watchdog = self.performance_mode;
         let wd_service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
+
+        // Build GuestMem for the watchdog's graceful shutdown handshake.
+        let wd_shm = if self.shm_size > 0 {
+            vm.guest_mem
+                .get_host_address(GuestAddress(DRAM_BASE))
+                .ok()
+                .map(|host_base| {
+                    let mem_size = (self.memory_mb as u64) << 20;
+                    let mem = monitor::reader::GuestMem::new(host_base, mem_size);
+                    let shm_base = DRAM_BASE + mem_size - self.shm_size;
+                    (mem, shm_base)
+                })
+        } else {
+            None
+        };
+
         let watchdog = std::thread::Builder::new()
             .name("vmm-watchdog".into())
             .spawn(move || {
@@ -1379,15 +1395,24 @@ impl KtstrVm {
                 if rt_watchdog {
                     set_rt_priority(2, "watchdog");
                 }
-                let deadline = Instant::now() + timeout;
+                let hard_deadline = Instant::now() + timeout;
+                // Soft phase needs enough headroom for the guest to
+                // flush serial and reboot. Skip when timeout < 5s.
+                let soft_deadline = if timeout > Duration::from_secs(5) {
+                    Some(hard_deadline - Duration::from_secs(3))
+                } else {
+                    None
+                };
+                let mut soft_fired = false;
                 eprintln!("watchdog: started, timeout={timeout:?}");
                 loop {
                     if bsp_done_for_wd.load(Ordering::Acquire) {
                         eprintln!("watchdog: BSP done, returning");
                         return;
                     }
-                    if kill_for_watchdog.load(Ordering::Acquire) || Instant::now() >= deadline {
-                        // Either an AP set kill or timeout expired.
+                    if kill_for_watchdog.load(Ordering::Acquire) || Instant::now() >= hard_deadline
+                    {
+                        // Either an AP set kill or hard timeout expired.
                         // Re-check bsp_done: if the BSP already exited its
                         // run loop, the VcpuFd (and kvm_run mmap backing
                         // bsp_ie) may be dropped. Writing to ie after drop
@@ -1396,8 +1421,8 @@ impl KtstrVm {
                             eprintln!("watchdog: BSP already done, returning");
                             return;
                         }
-                        let reason = if Instant::now() >= deadline {
-                            "timeout expired"
+                        let reason = if Instant::now() >= hard_deadline {
+                            "hard timeout expired"
                         } else {
                             "kill set by AP"
                         };
@@ -1411,6 +1436,21 @@ impl KtstrVm {
                         }
                         eprintln!("watchdog: BSP kicked");
                         return;
+                    }
+                    // Soft deadline: request graceful shutdown via SHM.
+                    // The BSP keeps running so the guest can flush serial
+                    // and reboot normally.
+                    if !soft_fired && soft_deadline.is_some_and(|d| Instant::now() >= d) {
+                        soft_fired = true;
+                        if let Some((ref mem, shm_base)) = wd_shm {
+                            eprintln!("watchdog: soft deadline, requesting graceful shutdown");
+                            shm_ring::signal_guest_value(
+                                mem,
+                                shm_base,
+                                0,
+                                shm_ring::SIGNAL_SHUTDOWN_REQ,
+                            );
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }

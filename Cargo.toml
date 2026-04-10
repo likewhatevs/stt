@@ -38,6 +38,7 @@ vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
 cpio = "0.4.1"
 vm-superio = "0.8.1"
+parking_lot = "0.12"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 object = { version = "0.39.0", features = ["read"] }

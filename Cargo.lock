@@ -1152,6 +1152,7 @@ dependencies = [
  "linux-loader",
  "nix 0.31.2",
  "object 0.39.0",
+ "parking_lot",
  "polars",
  "rand 0.10.0",
  "rmesg",
