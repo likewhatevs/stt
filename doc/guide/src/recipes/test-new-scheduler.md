@@ -4,12 +4,12 @@ End-to-end workflow: define a scheduler, write tests, run them.
 
 ## 1. Define the scheduler
 
-Use `#[derive(stt::Scheduler)]` on an enum of flags:
+Use `#[derive(Scheduler)]` on an enum of flags:
 
 ```rust,ignore
 use stt::prelude::*;
 
-#[derive(stt::Scheduler)]
+#[derive(Scheduler)]
 #[scheduler(
     name = "my_scheduler",
     binary = "scx_my_scheduler",
