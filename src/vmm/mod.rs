@@ -695,6 +695,9 @@ pub struct VmResult {
     pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
     /// KVM per-vCPU cumulative stats (requires Linux >= 5.15, x86_64 only).
     pub kvm_stats: Option<KvmStatsTotals>,
+    /// Crash message from SHM (MSG_TYPE_CRASH). Reliable delivery via
+    /// memcpy unlike serial which truncates large backtraces.
+    pub crash_message: Option<String>,
 }
 
 /// Per-vCPU KVM stats read after VM exit. Each map holds cumulative
@@ -1997,6 +2000,14 @@ impl KtstrVm {
             exit_code = code;
         }
 
+        // Extract crash message from SHM (reliable, full backtrace).
+        let crash_message = shm_data.as_ref().and_then(|d| {
+            d.entries
+                .iter()
+                .find(|e| e.msg_type == shm_ring::MSG_TYPE_CRASH && e.crc_ok)
+                .and_then(|e| String::from_utf8(e.payload.clone()).ok())
+        });
+
         // Collect BPF verifier stats from host-side memory reads.
         let verifier_stats = self.collect_verifier_stats(&run.vm);
 
@@ -2012,6 +2023,7 @@ impl KtstrVm {
             stimulus_events,
             verifier_stats,
             kvm_stats: None,
+            crash_message,
         })
     }
 
@@ -2971,6 +2983,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -2994,6 +3007,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
@@ -3339,6 +3353,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -3376,6 +3391,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);

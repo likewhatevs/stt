@@ -83,6 +83,12 @@ pub const MSG_TYPE_TEST_RESULT: u32 = 0x5445_5354; // "TEST"
 /// for the full watchdog timeout.
 pub const MSG_TYPE_SCHED_EXIT: u32 = 0x5343_4458; // "SCDX"
 
+/// Message type for guest crash (payload: UTF-8 panic message + backtrace).
+/// Written by the panic hook in rust_init.rs. SHM delivery is reliable
+/// (memcpy to mapped memory) unlike serial which truncates large backtraces
+/// because the UART cannot drain fast enough before reboot.
+pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
+
 /// Current header version.
 pub const SHM_RING_VERSION: u32 = 1;
 
@@ -207,6 +213,24 @@ pub fn write_msg(msg_type: u32, payload: &[u8]) {
     let _guard = SHM_WRITE_LOCK.lock();
     let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
     shm_write(buf, 0, msg_type, payload);
+}
+
+/// Guest-side: try to write a TLV message without blocking.
+///
+/// Uses `try_lock()` on `SHM_WRITE_LOCK`. If the lock is held (e.g.,
+/// the panic occurred on the thread that holds it), silently returns
+/// false so the caller can fall back to serial. No-op if SHM is not
+/// initialized.
+pub fn write_msg_nonblocking(msg_type: u32, payload: &[u8]) -> bool {
+    let Ok((ptr, size)) = shm_ptr() else {
+        return false;
+    };
+    let Some(_guard) = SHM_WRITE_LOCK.try_lock() else {
+        return false;
+    };
+    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+    shm_write(buf, 0, msg_type, payload);
+    true
 }
 
 /// Wrapper for a raw pointer + size that is Send+Sync.
@@ -1005,6 +1029,12 @@ mod tests {
     fn msg_type_sched_exit_ascii() {
         let bytes = MSG_TYPE_SCHED_EXIT.to_be_bytes();
         assert_eq!(&bytes, b"SCDX");
+    }
+
+    #[test]
+    fn msg_type_crash_ascii() {
+        let bytes = MSG_TYPE_CRASH.to_be_bytes();
+        assert_eq!(&bytes, b"CRSH");
     }
 
     #[test]

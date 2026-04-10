@@ -1378,15 +1378,6 @@ fn run_ktstr_test_inner(
         if !effective_auto_repro {
             return None;
         }
-        // Guest init panicked — the repro VM will panic the same way.
-        // Surface the panic message instead of attempting auto-repro.
-        if output.contains("PANIC:") {
-            return Some(
-                "auto-repro: skipped — guest panicked (repro would panic \
-                 identically). See diagnostics section above."
-                    .to_string(),
-            );
-        }
         let repro = attempt_auto_repro(
             entry,
             &kernel,
@@ -1676,8 +1667,10 @@ fn evaluate_vm_result(
         anyhow::bail!("{msg}");
     }
 
-    let reason = if let Some(panic_msg) = extract_panic_message(output) {
-        format!("guest panicked: {panic_msg}")
+    let reason = if let Some(ref shm_crash) = result.crash_message {
+        format!("guest crashed:\n{shm_crash}")
+    } else if let Some(crash_msg) = extract_panic_message(output) {
+        format!("guest crashed: {crash_msg}")
     } else if entry.scheduler.binary.has_active_scheduling() {
         "scheduler crashed before the test could produce results".to_string()
     } else {
@@ -2672,11 +2665,15 @@ fn format_console_diagnostics(console: &str, exit_code: i32, init_stage: &str) -
     parts.push(exit_label);
     if !trimmed.is_empty() {
         let lines: Vec<&str> = trimmed.lines().collect();
-        let start = lines.len().saturating_sub(TAIL_LINES);
+        // Show all lines when a crash is detected (PANIC: in output),
+        // otherwise show only the last TAIL_LINES.
+        let has_crash = lines.iter().any(|l| l.contains("PANIC:"));
+        let limit = if has_crash { lines.len() } else { TAIL_LINES };
+        let start = lines.len().saturating_sub(limit);
         let tail = &lines[start..];
         let truncated = !console.ends_with('\n');
         parts.push(format!(
-            "kernel console (last {} lines{}):\n{}{}",
+            "console ({} lines{}):\n{}{}",
             tail.len(),
             if truncated { ", truncated" } else { "" },
             tail.join("\n"),
@@ -4020,7 +4017,7 @@ mod tests {
         assert!(s.contains("exit_code=1"));
         assert!(s.contains("--- diagnostics ---"));
         assert!(s.contains("stage: test stage"));
-        assert!(!s.contains("kernel console"));
+        assert!(!s.contains("console (last"));
     }
 
     #[test]
@@ -4028,7 +4025,7 @@ mod tests {
         let console = "line1\nline2\nKernel panic - not syncing\n";
         let s = format_console_diagnostics(console, -1, "payload started");
         assert!(s.contains("exit_code=-1"));
-        assert!(s.contains("kernel console"));
+        assert!(s.contains("console (last"));
         assert!(s.contains("Kernel panic"));
         assert!(s.contains("stage: payload started"));
         assert!(!s.contains("truncated"));
@@ -4230,6 +4227,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         let verify_result = AssertResult::pass();
         // This should be a no-op because KTSTR_SIDECAR_DIR is not set.
@@ -4271,6 +4269,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         let verify_result = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
@@ -4377,6 +4376,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         }
     }
 
@@ -4794,6 +4794,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         let assertions = crate::assert::Assert::default_checks();
         let err =
@@ -4934,49 +4935,29 @@ mod tests {
     // -- guest panic detection tests --
 
     #[test]
-    fn eval_panic_in_output_says_guest_panicked() {
-        let entry = sched_entry("__eval_panic_detect__");
+    fn eval_crash_in_output_says_guest_crashed() {
+        let entry = sched_entry("__eval_crash_detect__");
         let output = "KTSTR_INIT_STARTED\nPANIC: panicked at src/foo.rs:42: assertion failed";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
         let err =
             evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("guest panicked:"),
-            "PANIC in output should say 'guest panicked:', got: {msg}",
-        );
-        assert!(
-            msg.contains("panicked at src/foo.rs:42: assertion failed"),
-            "should include the panic message, got: {msg}",
-        );
-        assert!(
-            !msg.contains("scheduler crashed"),
-            "should not say 'scheduler crashed' when guest panicked, got: {msg}",
-        );
+        assert!(msg.contains("guest crashed:"), "got: {msg}");
+        assert!(msg.contains("assertion failed"), "got: {msg}");
     }
 
     #[test]
-    fn eval_panic_eevdf_says_guest_panicked() {
-        let entry = eevdf_entry("__eval_panic_eevdf__");
+    fn eval_crash_eevdf_says_guest_crashed() {
+        let entry = eevdf_entry("__eval_crash_eevdf__");
         let output = "PANIC: panicked at src/bar.rs:10: index out of bounds";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
         let err =
             evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("guest panicked:"),
-            "PANIC with EEVDF should say 'guest panicked:', got: {msg}",
-        );
-        assert!(
-            msg.contains("index out of bounds"),
-            "should include the panic detail, got: {msg}",
-        );
-        assert!(
-            !msg.contains("test function produced no output"),
-            "should not say 'test function produced no output' when guest panicked, got: {msg}",
-        );
+        assert!(msg.contains("guest crashed:"), "got: {msg}");
+        assert!(msg.contains("index out of bounds"), "got: {msg}");
     }
 
     #[test]
@@ -5134,7 +5115,7 @@ mod tests {
         );
         assert!(
             msg.contains("kernel panic"),
-            "console_section should include kernel console output, got: {msg}",
+            "console_section should include console output, got: {msg}",
         );
     }
 
@@ -5168,6 +5149,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         let assertions = crate::assert::Assert::NONE;
         let err =
@@ -5241,6 +5223,7 @@ mod tests {
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
+            crash_message: None,
         };
         let assertions = crate::assert::Assert::default_checks();
         let err =

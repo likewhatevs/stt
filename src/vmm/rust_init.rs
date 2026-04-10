@@ -39,19 +39,25 @@ fn force_reboot() -> ! {
 /// `main()` when PID 1 is detected. Mounts filesystems, starts the
 /// scheduler, dispatches the test, then reboots. Never returns.
 pub(crate) fn ktstr_guest_init() -> ! {
-    // Panic hook: write diagnostic to COM2 then reboot.
+    // Panic hook: write crash diagnostic to COM2 then reboot.
     std::panic::set_hook(Box::new(|info| {
-        let msg = format!("PANIC: {info}\n");
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("PANIC: {info}\n{bt}\n");
+        // SHM write (instant memcpy, no serial bottleneck). Uses
+        // try_lock to avoid deadlock if the panicking thread already
+        // holds SHM_WRITE_LOCK. No-op if SHM is not initialized.
+        crate::vmm::shm_ring::write_msg_nonblocking(
+            crate::vmm::shm_ring::MSG_TYPE_CRASH,
+            msg.as_bytes(),
+        );
+        // Serial fallback for panics before SHM init.
         let _ = fs::write(COM2, &msg);
-        // Also write to kernel console.
         let _ = fs::write(COM1, &msg);
-        // Flush Rust buffered writers and drain the UART transmit buffer
-        // so the panic text is fully transmitted before reboot.
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         unsafe {
-            libc::tcdrain(1); // COM2 (stdout after redirect)
-            libc::tcdrain(2); // COM2 (stderr after redirect)
+            libc::tcdrain(1);
+            libc::tcdrain(2);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
         force_reboot();
