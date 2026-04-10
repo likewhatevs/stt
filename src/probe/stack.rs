@@ -56,7 +56,7 @@ pub fn should_skip_probe(name: &str) -> bool {
 /// Maps sched_ext BPF op name fragments to (kernel_caller, task_arg_idx).
 /// When a BPF function name contains the op fragment, its kernel-side
 /// caller is probed instead. The task_struct pointer is at arg{task_arg_idx}.
-const BPF_OP_CALLERS: &[(&str, &str, u32)] = &[
+pub(super) const BPF_OP_CALLERS: &[(&str, &str, u32)] = &[
     ("select_cpu", "do_enqueue_task", 1),
     ("enqueue", "do_enqueue_task", 1),
     ("dispatch", "balance_one", 0),

@@ -196,9 +196,9 @@ fn detect_str_param(btf_func: &BtfFunc) -> u8 {
 ///
 /// Polls until the trigger kprobe fires (via ring buffer EVENT_TRIGGER)
 /// or `stop` is set. Then iterates `probe_data` entries, matches them
-/// to functions by IP, stitches events by `task_struct` pointer
-/// or time proximity to the trigger,
-/// and returns them sorted by timestamp.
+/// to functions by IP, stitches events by `task_struct` arg value
+/// (using param indices from [`BPF_OP_CALLERS`](super::stack::BPF_OP_CALLERS)
+/// and BTF), and returns them sorted by timestamp.
 /// Pre-open BPF program FDs while the scheduler is alive.
 ///
 /// Returns a map from `bpf_prog_id` to owned fd. Holding these FDs
@@ -679,9 +679,8 @@ pub fn run_probe_skeleton(
 
     // Poll until trigger fires or stop requested.  When stop is
     // signaled, iterate all probe_data entries instead of waiting
-    // for the trigger — the trigger (scx_disable_workfn) runs
-    // asynchronously in a kthread and may not fire before the
-    // payload process exits.
+    // for the trigger — scx_disable_workfn runs asynchronously
+    // in a kthread and may not fire before the payload process exits.
     loop {
         let _ = rb.poll(Duration::from_millis(100));
 
@@ -780,17 +779,55 @@ pub fn run_probe_skeleton(
                 return (None, diag);
             }
 
-            // Keep all events with a valid timestamp. The prototype
-            // (stt-debug-framework) showed all events and it worked;
-            // aggressive tptr+time filtering dropped useful cross-task
-            // events from scheduler crashes.
+            // Stitch by task_struct pointer. Build a map of func_idx ->
+            // task_struct param index from BPF_OP_CALLERS and BTF, then
+            // filter events to those referencing the same task_struct
+            // pointer as the last event with a task_struct arg (the task
+            // that triggered the exit).
+            let task_param_idx: std::collections::HashMap<u32, usize> = func_ips
+                .iter()
+                .filter_map(|(idx, _, name)| {
+                    // BPF_OP_CALLERS: (op_fragment, kernel_caller, task_arg_idx)
+                    if let Some((_, _, tidx)) = super::stack::BPF_OP_CALLERS
+                        .iter()
+                        .find(|(_, caller, _)| *caller == name.as_str())
+                    {
+                        return Some((*idx, *tidx as usize));
+                    }
+                    // Fallback: BTF params with task_struct
+                    let btf = btf_funcs.iter().find(|f| f.name == *name)?;
+                    let pos = btf
+                        .params
+                        .iter()
+                        .position(|p| p.struct_name.as_deref() == Some("task_struct"))?;
+                    Some((*idx, pos))
+                })
+                .collect();
+
+            // The last event with a non-zero task_struct arg value
+            // (closest to trigger time) identifies the target task.
+            let target_tptr: Option<u64> = probe_events.iter().rev().find_map(|e| {
+                let pidx = task_param_idx.get(&e.func_idx)?;
+                let ptr = e.args[*pidx];
+                if ptr != 0 { Some(ptr) } else { None }
+            });
+
             let before = probe_events.len();
-            probe_events.retain(|e| e.ts > 0);
-            tracing::debug!(
-                kept = probe_events.len(),
-                total = before,
-                "filtered by ts > 0",
-            );
+            if let Some(tptr) = target_tptr {
+                probe_events.retain(|e| {
+                    if let Some(&pidx) = task_param_idx.get(&e.func_idx) {
+                        e.args[pidx] == tptr
+                    } else {
+                        true // no task_struct param — keep for context
+                    }
+                });
+                tracing::debug!(
+                    tptr = format_args!("0x{tptr:x}"),
+                    kept = probe_events.len(),
+                    total = before,
+                    "stitched by task_struct arg",
+                );
+            }
 
             diag.events_after_stitch = probe_events.len() as u32;
 
