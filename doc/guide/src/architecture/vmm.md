@@ -48,12 +48,15 @@ memory, sharing physical pages across concurrent VMs.
 
 ## Guest-host communication
 
-**Serial console** -- the guest writes delimited test results to COM2
-(between `===STT_TEST_RESULT_START===` / `===STT_TEST_RESULT_END===`
-sentinels). The host parses results from the serial output after VM exit.
+**Serial console** -- COM2 carries guest stdout/stderr and serves as
+a fallback result transport. Delimited test results (between
+`===STT_TEST_RESULT_START===` / `===STT_TEST_RESULT_END===` sentinels)
+and exit codes (`STT_EXIT=N`) are written to COM2 as fallback when
+SHM is unavailable.
 
-**SHM ring buffer** -- a shared memory ring buffer passes data from
-guest to host. Used for profraw data (`MSG_TYPE_PROFRAW`) and stimulus
+**SHM ring buffer** -- the primary guest-to-host data channel. A shared
+memory ring buffer carries test results (`MSG_TYPE_TEST_RESULT`), exit
+codes (`MSG_TYPE_EXIT`), profraw data (`MSG_TYPE_PROFRAW`), and stimulus
 events (`MSG_TYPE_STIMULUS`). Each entry has a CRC32 for integrity
 checking.
 
@@ -81,9 +84,9 @@ dispatches the test function, then reboots.
 
 The role is determined at runtime:
 
-- **PID 1 detection**: when running as PID 1, the test harness
-  `main()` calls `stt_guest_init()` which handles the full guest
-  lifecycle. The `ctor` early dispatch also checks for PID 1.
+- **PID 1 detection**: when running as PID 1, the `#[ctor]` function
+  `stt_test_early_dispatch()` calls `stt_guest_init()` which handles
+  the full guest lifecycle.
 - **`#[stt_test]` host dispatch**: a `#[ctor::ctor]` function
   (`stt_test_early_dispatch`) runs before `main()` in any binary
   that links against stt. When both `--stt-test-fn` and `--stt-topo`

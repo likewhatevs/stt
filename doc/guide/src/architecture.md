@@ -9,7 +9,7 @@ stt has three execution domains:
 2. **Guest process** -- the same test binary running inside the VM
    as PID 1. Mounts filesystems, starts the scheduler, creates
    cgroups, forks [workers](architecture/workers.md), runs scenarios,
-   writes results to COM2.
+   writes results to SHM (COM2 fallback).
 
 3. **[Monitor](architecture/monitor.md) thread** -- runs on the host
    while the guest executes. Reads guest VM memory directly to observe
@@ -38,9 +38,9 @@ test binary
   |                             +-- poll scheduler liveness
   |                             +-- stop workers, collect reports
   |                             +-- evaluate results
-  |                             +-- write result to COM2
+  |                             +-- write result to SHM (COM2 fallback)
   |                           
-  +-- read result from COM2   
+  +-- read result from SHM (COM2 fallback)
   +-- evaluate monitor data   
   +-- report pass/fail        
 ```

@@ -107,7 +107,7 @@ writes guest BPF maps directly through the physical memory mapping
 
 `GuestMem` wraps a host pointer to guest physical address 0 and
 provides bounds-checked volatile reads and writes for scalar types
-(u8/u16/u32/u64). Byte-slice reads (`read_bytes`) use
+(u8/u32/u64). Byte-slice reads (`read_bytes`) use
 `copy_nonoverlapping`. It also implements x86-64 page table walks
 (`translate_kva`) for both 4-level and 5-level paging, and 3-level
 aarch64 walks (64KB granule).
