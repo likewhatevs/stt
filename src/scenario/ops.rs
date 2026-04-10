@@ -48,6 +48,10 @@ pub enum Op {
         b: Cow<'static, str>,
     },
     /// Spawn workers and move them into the target cgroup.
+    ///
+    /// The work type is used as-is; gauntlet `work_type_override` does
+    /// not apply. Use [`CgroupDef`] with `swappable(true)` when the
+    /// work type should be overridable.
     Spawn {
         cgroup: Cow<'static, str>,
         work: Work,

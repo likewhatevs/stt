@@ -78,6 +78,11 @@ scopes:
 Both skip overrides to grouped work types when `num_workers` is not
 divisible by the work type's group size.
 
+Work type overrides apply only to `CgroupDef` setup, not to raw
+`Op::Spawn`. `Op::Spawn` always uses the work type as given. Use
+`CgroupDef` with `.swappable(true)` when the work type should
+participate in gauntlet overrides.
+
 ## Step
 
 A `Step` is a sequence of ops with a hold period:
