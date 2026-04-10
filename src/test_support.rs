@@ -1455,6 +1455,9 @@ fn evaluate_vm_result(
             format!("\n\n--- scheduler log ---\n{collapsed}")
         })
         .unwrap_or_default();
+    let fingerprint_line = sched_log_fingerprint(output)
+        .map(|fp| format!("\x1b[1;31m{fp}\x1b[0m\n"))
+        .unwrap_or_default();
 
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
@@ -1552,7 +1555,8 @@ fn evaluate_vm_result(
                 String::new()
             };
             let msg = format!(
-                "ktstr_test '{}'{} failed:\n  {}{}{}{}{}{}{}{}",
+                "{}ktstr_test '{}'{} failed:\n  {}{}{}{}{}{}{}{}",
+                fingerprint_line,
                 entry.name,
                 sched_label,
                 details,
@@ -1589,7 +1593,8 @@ fn evaluate_vm_result(
                     .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
                     .unwrap_or_default();
                 let msg = format!(
-                    "ktstr_test '{}'{} passed scenario but monitor failed:\n  {}{}{}{}",
+                    "{}ktstr_test '{}'{} passed scenario but monitor failed:\n  {}{}{}{}",
+                    fingerprint_line,
                     entry.name,
                     sched_label,
                     details,
@@ -1667,7 +1672,8 @@ fn evaluate_vm_result(
 
     if result.timed_out {
         let msg = format!(
-            "ktstr_test '{}'{} timed out (no result in SHM or COM2){}{}{}{}{}{}",
+            "{}ktstr_test '{}'{} timed out (no result in SHM or COM2){}{}{}{}{}{}",
+            fingerprint_line,
             entry.name,
             sched_label,
             console_section,
@@ -1686,7 +1692,8 @@ fn evaluate_vm_result(
         "test function produced no output (no test result found)"
     };
     let msg = format!(
-        "ktstr_test '{}'{} {}{}{}{}{}{}{}",
+        "{}ktstr_test '{}'{} {}{}{}{}{}{}{}",
+        fingerprint_line,
         entry.name,
         sched_label,
         reason,
@@ -2472,6 +2479,16 @@ fn parse_assert_result(output: &str) -> Result<AssertResult> {
 /// Delimiters for the scheduler log in guest output (written by init script).
 const SCHED_OUTPUT_START: &str = "===SCHED_OUTPUT_START===";
 const SCHED_OUTPUT_END: &str = "===SCHED_OUTPUT_END===";
+
+/// Extract the last non-empty line from the scheduler log.
+///
+/// This serves as a failure fingerprint: when many tests fail with the
+/// same scheduler error, the fingerprint makes identical failures
+/// visually obvious in nextest output.
+fn sched_log_fingerprint(output: &str) -> Option<&str> {
+    let log = parse_sched_output(output)?;
+    log.lines().rev().find(|l| !l.trim().is_empty())
+}
 
 /// Extract the scheduler log from guest output between delimiters.
 /// Returns `None` if the delimiters are absent or the content is empty.
@@ -3333,6 +3350,36 @@ mod tests {
         let parsed = parse_sched_output(&output).unwrap();
         assert!(parsed.contains("do_enqueue_task"));
         assert!(parsed.contains("balance_one"));
+    }
+
+    // -- sched_log_fingerprint tests --
+
+    #[test]
+    fn sched_log_fingerprint_last_line() {
+        let output = format!(
+            "{SCHED_OUTPUT_START}\nstarting scheduler\nError: apply_cell_config BPF program returned error -2\n{SCHED_OUTPUT_END}",
+        );
+        assert_eq!(
+            sched_log_fingerprint(&output),
+            Some("Error: apply_cell_config BPF program returned error -2"),
+        );
+    }
+
+    #[test]
+    fn sched_log_fingerprint_skips_trailing_blanks() {
+        let output = format!("{SCHED_OUTPUT_START}\nfatal error here\n\n\n{SCHED_OUTPUT_END}",);
+        assert_eq!(sched_log_fingerprint(&output), Some("fatal error here"));
+    }
+
+    #[test]
+    fn sched_log_fingerprint_none_without_markers() {
+        assert!(sched_log_fingerprint("no markers").is_none());
+    }
+
+    #[test]
+    fn sched_log_fingerprint_none_empty_content() {
+        let output = format!("{SCHED_OUTPUT_START}\n\n{SCHED_OUTPUT_END}");
+        assert!(sched_log_fingerprint(&output).is_none());
     }
 
     // -- extract_probe_stack_arg tests --
@@ -4447,6 +4494,172 @@ mod tests {
         assert!(
             msg.contains("--- scheduler log ---"),
             "assertion failure should include scheduler log header, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_assert_failure_has_fingerprint() {
+        let json = r#"{"passed":false,"details":["stuck 3000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let error_line = "Error: apply_cell_config BPF program returned error -2";
+        let output = format!(
+            "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
+        );
+        let entry = sched_entry("__eval_fingerprint__");
+        let result = make_vm_result(&output, "", 0, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(error_line),
+            "failure should contain fingerprint line, got: {msg}",
+        );
+        // Fingerprint appears before the test name line.
+        let fp_pos = msg.find(error_line).unwrap();
+        let name_pos = msg.find("ktstr_test").unwrap();
+        assert!(
+            fp_pos < name_pos,
+            "fingerprint should appear before ktstr_test line, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_timeout_has_fingerprint() {
+        let error_line = "Error: scheduler panicked";
+        let output = format!("{SCHED_OUTPUT_START}\n{error_line}\n{SCHED_OUTPUT_END}",);
+        let entry = sched_entry("__eval_timeout_fp__");
+        let result = make_vm_result(&output, "", 0, true);
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(error_line),
+            "timeout should contain fingerprint, got: {msg}",
+        );
+        let fp_pos = msg.find(error_line).unwrap();
+        let name_pos = msg.find("ktstr_test").unwrap();
+        assert!(
+            fp_pos < name_pos,
+            "fingerprint should appear before ktstr_test line, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_no_result_has_fingerprint() {
+        let error_line = "Error: fatal scheduler crash";
+        let output =
+            format!("{SCHED_OUTPUT_START}\nstartup log\n{error_line}\n{SCHED_OUTPUT_END}",);
+        let entry = sched_entry("__eval_no_result_fp__");
+        let result = make_vm_result(&output, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(error_line),
+            "no-result failure should contain fingerprint, got: {msg}",
+        );
+        let fp_pos = msg.find(error_line).unwrap();
+        let name_pos = msg.find("ktstr_test").unwrap();
+        assert!(
+            fp_pos < name_pos,
+            "fingerprint should appear before ktstr_test line, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_no_sched_output_no_fingerprint() {
+        let json = r#"{"passed":false,"details":["stuck"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = eevdf_entry("__eval_no_fp__");
+        let result = make_vm_result(&output, "", 0, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        // No scheduler output means no fingerprint; message starts with ktstr_test.
+        assert!(
+            msg.starts_with("ktstr_test"),
+            "without sched output, message should start with ktstr_test, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_monitor_fail_has_fingerprint() {
+        let pass_json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let error_line = "Error: imbalance detected internally";
+        let sched_log =
+            format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
+        let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");
+        let entry = sched_entry("__eval_monitor_fp__");
+        let imbalance_samples: Vec<crate::monitor::MonitorSample> = (0..30)
+            .map(|i| {
+                crate::monitor::MonitorSample::new(
+                    (i * 100) as u64,
+                    vec![
+                        crate::monitor::CpuSnapshot {
+                            nr_running: 10,
+                            scx_nr_running: 10,
+                            local_dsq_depth: 0,
+                            rq_clock: 1000 + (i as u64 * 100),
+                            scx_flags: 0,
+                            event_counters: None,
+                            schedstat: None,
+                            vcpu_cpu_time_ns: None,
+                            sched_domains: None,
+                        },
+                        crate::monitor::CpuSnapshot {
+                            nr_running: 1,
+                            scx_nr_running: 1,
+                            local_dsq_depth: 0,
+                            rq_clock: 2000 + (i as u64 * 100),
+                            scx_flags: 0,
+                            event_counters: None,
+                            schedstat: None,
+                            vcpu_cpu_time_ns: None,
+                            sched_domains: None,
+                        },
+                    ],
+                )
+            })
+            .collect();
+        let summary =
+            crate::monitor::MonitorSummary::from_samples_with_threshold(&imbalance_samples, 0);
+        let result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output,
+            stderr: String::new(),
+            monitor: Some(crate::monitor::MonitorReport {
+                samples: imbalance_samples,
+                summary,
+                preemption_threshold_ns: 0,
+            }),
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+        };
+        let assertions = crate::assert::Assert::default_checks();
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("passed scenario but monitor failed"),
+            "should be a monitor failure, got: {msg}",
+        );
+        assert!(
+            msg.contains(error_line),
+            "monitor failure should contain fingerprint, got: {msg}",
+        );
+        let fp_pos = msg.find(error_line).unwrap();
+        let name_pos = msg.find("ktstr_test").unwrap();
+        assert!(
+            fp_pos < name_pos,
+            "fingerprint should appear before ktstr_test line, got: {msg}",
         );
     }
 
