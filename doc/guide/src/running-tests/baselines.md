@@ -26,8 +26,8 @@ against them.
 ## Sidecar format
 
 Each test writes a `SidecarResult` JSON file containing the test name,
-topology, scheduler, pass/fail, per-cgroup stats, monitor summary,
-and stimulus events. Files are named with a `.stt.` infix for
+topology, scheduler, work type, pass/fail, per-cgroup stats, monitor
+summary, stimulus events, verifier stats, and KVM stats. Files are named with a `.stt.` infix for
 discovery. `collect_sidecars()` reads all sidecar files from a
 directory (recursing one level for gauntlet per-job subdirectories).
 
