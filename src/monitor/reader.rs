@@ -790,6 +790,18 @@ pub(crate) fn monitor_loop(
         if let Some(shm_pa) = shm_base_pa {
             let drain = crate::vmm::shm_ring::shm_drain_live(mem, shm_pa);
             shm_drops = shm_drops.max(drain.drops);
+            // Check for scheduler death signal before accumulating.
+            // The guest init writes MSG_TYPE_SCHED_EXIT when the
+            // scheduler process exits during test execution.
+            if drain
+                .entries
+                .iter()
+                .any(|e| e.msg_type == crate::vmm::shm_ring::MSG_TYPE_SCHED_EXIT && e.crc_ok)
+            {
+                shm_entries.extend(drain.entries);
+                kill.store(true, Ordering::Release);
+                break;
+            }
             shm_entries.extend(drain.entries);
         }
 

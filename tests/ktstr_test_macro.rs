@@ -145,7 +145,7 @@ fn entry_topo_constraints_match_attrs() {
 /// Uses EEVDF (no binary) — the test validates topology inheritance,
 /// not scheduler behavior.
 const TOPO_SCHED: ktstr::test_support::Scheduler =
-    ktstr::test_support::Scheduler::new("topo_test").topology(3, 6, 1);
+    ktstr::test_support::Scheduler::new("topo_test").topology(2, 3, 1);
 
 /// Full topology inheritance: all three dimensions from TOPO_SCHED.
 #[ktstr_test(scheduler = TOPO_SCHED)]
@@ -166,8 +166,8 @@ fn topo_inherit_partial(ctx: &Ctx) -> Result<AssertResult> {
 #[test]
 fn entry_topo_inherit_full() {
     let entry = ktstr::test_support::find_test("topo_inherit_full").unwrap();
-    assert_eq!(entry.topology.sockets, 3);
-    assert_eq!(entry.topology.cores_per_socket, 6);
+    assert_eq!(entry.topology.sockets, 2);
+    assert_eq!(entry.topology.cores_per_socket, 3);
     assert_eq!(entry.topology.threads_per_core, 1);
 }
 
@@ -175,8 +175,8 @@ fn entry_topo_inherit_full() {
 #[test]
 fn entry_topo_inherit_partial() {
     let entry = ktstr::test_support::find_test("topo_inherit_partial").unwrap();
-    assert_eq!(entry.topology.sockets, 3);
-    assert_eq!(entry.topology.cores_per_socket, 6);
+    assert_eq!(entry.topology.sockets, 2);
+    assert_eq!(entry.topology.cores_per_socket, 3);
     assert_eq!(entry.topology.threads_per_core, 2);
 }
 
