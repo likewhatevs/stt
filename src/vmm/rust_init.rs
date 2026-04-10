@@ -65,6 +65,13 @@ pub(crate) fn stt_guest_init() -> ! {
     write_com2("STT_INIT_STARTED");
     redirect_stdio_to_com2();
 
+    // Install tracing subscriber so tracing calls in guest code produce
+    // output on stderr (COM2). Without this, they are silently dropped.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
+
     // Set environment variables.
     // SAFETY: single-threaded context — PID 1 before any threads spawn.
     unsafe {
