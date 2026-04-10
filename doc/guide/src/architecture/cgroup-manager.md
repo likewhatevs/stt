@@ -32,9 +32,9 @@ no error if the directory already exists. Supports nested paths
 (e.g. `"nested/deep"`). For nested paths, enables `+cpuset` on
 intermediate cgroups' `subtree_control`.
 
-**`remove_cgroup(name)`** -- drains tasks from the child cgroup back to
-the parent, then removes the directory. No error if the cgroup does
-not exist.
+**`remove_cgroup(name)`** -- drains tasks from the child cgroup to the
+cgroup filesystem root, then removes the directory. No error if the
+cgroup does not exist.
 
 **`set_cpuset(name, cpus)`** -- writes `cpuset.cpus` for a child cgroup.
 The `BTreeSet<usize>` is formatted as a compact range string via
@@ -50,9 +50,12 @@ which inherits the parent's cpuset.
 child cgroup. Tolerates ESRCH (task exited between listing and
 migration) with a warning. Propagates all other errors immediately.
 
-**`drain_tasks(name)`** -- moves all tasks from a child cgroup back to
-the parent cgroup by reading `cgroup.procs` and writing each PID to
-the parent's `cgroup.procs`.
+**`drain_tasks(name)`** -- moves all tasks from a child cgroup to the
+cgroup filesystem root (`/sys/fs/cgroup`) by reading `cgroup.procs`
+and writing each PID to the root's `cgroup.procs`. Drains to root
+because the parent has `subtree_control` set and the kernel's
+no-internal-process constraint rejects writes to a cgroup with
+active controllers.
 
 **`cleanup_all()`** -- recursively removes all child cgroups under the
 parent (depth-first), draining tasks at each level. Keeps the parent

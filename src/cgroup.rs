@@ -273,20 +273,19 @@ impl CgroupManager {
             .with_context(|| format!("clear subtree_control on {name}"))
     }
 
-    /// Move all tasks from a child cgroup back to the parent.
+    /// Move all tasks from a child cgroup to the cgroup root.
+    ///
+    /// Drains to `/sys/fs/cgroup/cgroup.procs` instead of the parent
+    /// because the parent has `subtree_control` set (enabling cpuset
+    /// for children), and the kernel's no-internal-process constraint
+    /// rejects writes to `cgroup.procs` when `subtree_control` is
+    /// active. The root cgroup is exempt from this constraint.
     pub fn drain_tasks(&self, name: &str) -> Result<()> {
         let src = self.parent.join(name).join("cgroup.procs");
-        let dst = self.parent.join("cgroup.procs");
         if !src.exists() {
             return Ok(());
         }
-        if let Ok(content) = fs::read_to_string(&src) {
-            for line in content.lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    let _ = write_with_timeout(&dst, &pid.to_string(), CGROUP_WRITE_TIMEOUT);
-                }
-            }
-        }
+        drain_pids_to_root(&src, name);
         Ok(())
     }
 
@@ -307,6 +306,26 @@ impl CgroupManager {
     }
 }
 
+/// Drain all tasks from `procs_path` to the cgroup filesystem root.
+///
+/// The root cgroup is exempt from the no-internal-process constraint,
+/// so writes to `/sys/fs/cgroup/cgroup.procs` succeed even when
+/// intermediate cgroups have `subtree_control` set.
+/// ESRCH (task exited) is silently tolerated; other errors are logged.
+fn drain_pids_to_root(procs_path: &Path, context: &str) {
+    let dst = Path::new("/sys/fs/cgroup/cgroup.procs");
+    if let Ok(content) = fs::read_to_string(procs_path) {
+        for line in content.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>()
+                && let Err(e) = write_with_timeout(dst, &pid.to_string(), CGROUP_WRITE_TIMEOUT)
+                && !is_esrch(&e)
+            {
+                tracing::warn!(pid, cgroup = context, err = %e, "failed to drain task");
+            }
+        }
+    }
+}
+
 fn cleanup_recursive(path: &std::path::Path) {
     // Depth-first: clean children before parent
     if let Ok(entries) = fs::read_dir(path) {
@@ -316,16 +335,7 @@ fn cleanup_recursive(path: &std::path::Path) {
             }
         }
     }
-    // Drain tasks to parent
-    let procs = path.join("cgroup.procs");
-    if let (Some(parent), Ok(content)) = (path.parent(), fs::read_to_string(&procs)) {
-        let dst = parent.join("cgroup.procs");
-        for l in content.lines() {
-            if let Ok(pid) = l.trim().parse::<u32>() {
-                let _ = write_with_timeout(&dst, &pid.to_string(), CGROUP_WRITE_TIMEOUT);
-            }
-        }
-    }
+    drain_pids_to_root(&path.join("cgroup.procs"), &path.display().to_string());
     std::thread::sleep(std::time::Duration::from_millis(10));
     let _ = fs::remove_dir(path);
 }
