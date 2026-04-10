@@ -100,8 +100,9 @@ implicitly forces `llc` into all profiles for that test.
 ## Underlying mechanism (advanced)
 
 The derive macro generates `FlagDecl` statics and a flags array that
-the `Scheduler` const references. Users never need to write `FlagDecl`
-manually -- the macro handles it. The generated code is equivalent to:
+the `Scheduler` const references. Most users never need to write
+`FlagDecl` manually -- the macro handles it. The generated code is
+equivalent to:
 
 ```rust,ignore
 static __MY_SCHED_FLAG_DECL_LLC: FlagDecl = FlagDecl {

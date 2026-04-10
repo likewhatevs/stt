@@ -142,3 +142,6 @@ To understand scenarios, flags, and verification:
 [Core Concepts](concepts.md).
 
 To write new tests: [Writing Tests](writing-tests.md).
+
+To test your own scheduler:
+[Test a New Scheduler](recipes/test-new-scheduler.md).
