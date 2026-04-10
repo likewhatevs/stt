@@ -87,12 +87,13 @@ When a scheduler crashes, ktstr can automatically rerun the failing
 scenario with BPF probes attached to the crash-path functions. See
 [Auto-Repro](running-tests/auto-repro.md) for details.
 
-## Crate structure
+## Workspace structure
 
-| Crate | Purpose |
+| Component | Purpose |
 |---|---|
 | `ktstr` | Core library |
 | `ktstr-macros` | `#[ktstr_test]` and `#[derive(Scheduler)]` proc macros |
+| `ktstr-host` | Host-side CLI (binary in `ktstr`, behind the `cli` feature) |
 | `scx-ktstr` | Minimal BPF scheduler for testing |
 
 ## Kernel config

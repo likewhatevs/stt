@@ -108,6 +108,18 @@ cargo nextest run
 
 Requires `/dev/kvm`.
 
+### Host-side CLI
+
+`ktstr-host` runs scenarios directly on the host (outside VMs) against
+a scheduler:
+
+```sh
+cargo run --features cli --bin ktstr-host -- list
+cargo run --features cli --bin ktstr-host -- run --scheduler scx_my_sched
+cargo run --features cli --bin ktstr-host -- topo
+cargo run --features cli --bin ktstr-host -- cleanup
+```
+
 ## Documentation
 
 **[Guide](https://likewhatevs.github.io/ktstr/guide/)** -- getting started, concepts,
