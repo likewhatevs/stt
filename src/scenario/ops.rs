@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::assert::{self, AssertResult};
+use crate::assert::AssertResult;
 use crate::vmm::shm_ring::{self, StimulusPayload};
 use crate::workload::{Work, WorkType, WorkloadConfig, WorkloadHandle};
 
@@ -936,23 +936,16 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
 
 /// Collect all worker results and produce an AssertResult.
 ///
-/// Uses `checks` for worker evaluation, passing each cgroup's
-/// tracked cpuset (if any) for isolation checks. When the Assert
-/// has no worker-level checks configured (all fields None), falls
-/// back to `assert_not_starved`.
+/// Drains handles from state and delegates to [`collect_handles`](super::collect_handles),
+/// passing each cgroup's tracked cpuset for isolation checks.
 fn collect_result(state: &mut StepState<'_>, checks: &crate::assert::Assert) -> AssertResult {
-    let mut result = AssertResult::pass();
     let handles = std::mem::take(&mut state.handles);
-    for (name, h) in handles {
-        let reports = h.stop_and_collect();
-        let cpuset = state.cpusets.get(&name);
-        if checks.has_worker_checks() {
-            result.merge(checks.assert_cgroup(&reports, cpuset));
-        } else {
-            result.merge(assert::assert_not_starved(&reports));
-        }
-    }
-    result
+    super::collect_handles(
+        handles
+            .into_iter()
+            .map(|(name, h)| (h, state.cpusets.get(&name))),
+        checks,
+    )
 }
 
 // ---------------------------------------------------------------------------

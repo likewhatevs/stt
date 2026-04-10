@@ -762,6 +762,29 @@ pub fn setup_cgroups<'a>(
     Ok((handles, guard))
 }
 
+/// Stop workers, collect reports, and merge assertion results.
+///
+/// Each item is a `(WorkloadHandle, Option<&BTreeSet<usize>>)` pair
+/// where the optional cpuset is passed through to
+/// [`Assert::assert_cgroup`](crate::assert::Assert::assert_cgroup)
+/// for isolation checks. When `checks` has no worker-level checks,
+/// falls back to [`assert_not_starved`](assert::assert_not_starved).
+pub(crate) fn collect_handles<'a>(
+    handles: impl IntoIterator<Item = (WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
+    checks: &crate::assert::Assert,
+) -> AssertResult {
+    let mut r = AssertResult::pass();
+    for (h, cpuset) in handles {
+        let reports = h.stop_and_collect();
+        if checks.has_worker_checks() {
+            r.merge(checks.assert_cgroup(&reports, cpuset));
+        } else {
+            r.merge(assert::assert_not_starved(&reports));
+        }
+    }
+    r
+}
+
 /// Stop all workers, collect reports, and run assertion checks.
 ///
 /// Uses `checks` for worker evaluation. When the Assert has no
@@ -769,16 +792,7 @@ pub fn setup_cgroups<'a>(
 /// to `assert_not_starved`. Returns a merged [`AssertResult`]
 /// across all workers.
 pub fn collect_all(handles: Vec<WorkloadHandle>, checks: &crate::assert::Assert) -> AssertResult {
-    let mut r = AssertResult::pass();
-    for h in handles {
-        let reports = h.stop_and_collect();
-        if checks.has_worker_checks() {
-            r.merge(checks.assert_cgroup(&reports, None));
-        } else {
-            r.merge(assert::assert_not_starved(&reports));
-        }
-    }
-    r
+    collect_handles(handles.into_iter().map(|h| (h, None)), checks)
 }
 
 /// Default [`WorkloadConfig`] with `ctx.workers_per_cgroup` workers.
