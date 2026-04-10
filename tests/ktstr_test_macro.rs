@@ -202,7 +202,7 @@ fn entry_performance_mode_set() {
 #[derive(ktstr::Scheduler)]
 #[scheduler(
     name = "test_derive",
-    binary = "test-binary",
+    binary = "scx-ktstr",
     topology(2, 4, 1),
     cgroup_parent = "/test",
     sched_args = ["--arg1", "--arg2"]
@@ -229,7 +229,7 @@ fn derive_scheduler_const_name() {
 fn derive_scheduler_binary() {
     assert!(matches!(
         TEST_DERIVE.binary,
-        ktstr::test_support::SchedulerSpec::Name("test-binary")
+        ktstr::test_support::SchedulerSpec::Name("scx-ktstr")
     ));
 }
 
