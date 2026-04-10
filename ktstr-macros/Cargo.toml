@@ -1,11 +1,11 @@
 [package]
-name = "stt-macros"
+name = "ktstr-macros"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-2.0-only"
-repository = "https://github.com/likewhatevs/stt"
-description = "Proc macro for stt #[stt_test] attribute"
+repository = "https://github.com/likewhatevs/ktstr"
+description = "Proc macro for ktstr #[ktstr_test] attribute"
 keywords = ["scheduler", "testing", "proc-macro"]
 categories = ["development-tools::testing"]
 publish = false

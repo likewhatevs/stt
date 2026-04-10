@@ -453,7 +453,7 @@ pub struct VerifierVmResult {
 /// `===SCHED_OUTPUT_END===` markers.
 pub fn collect_verifier_output(
     sched_bin: &std::path::Path,
-    stt_bin: &std::path::Path,
+    ktstr_bin: &std::path::Path,
     kernel: &std::path::Path,
     extra_sched_args: &[String],
 ) -> anyhow::Result<VerifierVmResult> {
@@ -461,9 +461,9 @@ pub fn collect_verifier_output(
 
     let sched_args: Vec<String> = extra_sched_args.to_vec();
 
-    let vm = crate::vmm::SttVm::builder()
+    let vm = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
-        .init_binary(stt_bin)
+        .init_binary(ktstr_bin)
         .scheduler_binary(sched_bin)
         .sched_args(&sched_args)
         .topology(1, 1, 1)
@@ -1255,7 +1255,7 @@ func#0 @0
 0: R1=ctx() R10=fp0
 processed 100 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0
 -- END PROG LOAD LOG --
-libbpf: failed to load object 'stt_ops'
+libbpf: failed to load object 'ktstr_ops'
 ";
         let extracted = extract_verifier_log(log);
         assert!(extracted.is_some());
@@ -1286,7 +1286,7 @@ libbpf: failed to load object 'stt_ops'
     #[test]
     fn extract_verifier_log_attack1_stats_parse() {
         let blob = "\
-libbpf: prog 'stt_ops_dispatch': BPF program load failed: -22
+libbpf: prog 'ktstr_ops_dispatch': BPF program load failed: -22
 libbpf: -- BEGIN PROG LOAD LOG --
 func#0 @0
 0: R1=ctx() R10=fp0
@@ -1297,7 +1297,7 @@ processed 131071 insns (limit 131072) max_states_per_insn 12 total_states 9999 p
 verification time 250000 usec
 stack depth 96+32
 libbpf: -- END PROG LOAD LOG --
-libbpf: failed to load BPF skeleton 'stt_ops': -22
+libbpf: failed to load BPF skeleton 'ktstr_ops': -22
 ";
         let extracted = extract_verifier_log(blob);
         assert!(extracted.is_some(), "should find markers");
@@ -1352,7 +1352,7 @@ func#2 @20
 24: (95) exit
 processed 5 insns (limit 1000000) max_states_per_insn 1 total_states 3 peak_states 1 mark_read 0
 libbpf: -- END PROG LOAD LOG --
-libbpf: failed to load BPF skeleton 'stt_ops': -22
+libbpf: failed to load BPF skeleton 'ktstr_ops': -22
 ";
         // extract_verifier_log returns the FIRST log section.
         let extracted = extract_verifier_log(blob);

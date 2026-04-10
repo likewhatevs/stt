@@ -1,7 +1,7 @@
 # A/B Compare Branches
 
 Compare scheduler behavior between two branches by running the
-same `#[stt_test]` suite against each and diffing sidecar results.
+same `#[ktstr_test]` suite against each and diffing sidecar results.
 
 ## Setup worktrees
 
@@ -16,14 +16,14 @@ git worktree add ~/opensource/scx-main upstream/main
 
 ```sh
 cd ~/opensource/scx-main
-STT_SIDECAR_DIR=./baseline cargo nextest run --workspace
+KTSTR_SIDECAR_DIR=./baseline cargo nextest run --workspace
 ```
 
 ## Run experimental with sidecars
 
 ```sh
 cd ~/opensource/scx
-STT_SIDECAR_DIR=./current cargo nextest run --workspace
+KTSTR_SIDECAR_DIR=./current cargo nextest run --workspace
 ```
 
 ## Compare results
@@ -34,7 +34,7 @@ Diff the sidecar JSON files between the two directories. See
 Compare test pass/fail counts between runs:
 
 ```sh
-diff <(ls baseline/*.stt.json | wc -l) <(ls current/*.stt.json | wc -l)
+diff <(ls baseline/*.ktstr.json | wc -l) <(ls current/*.ktstr.json | wc -l)
 ```
 
 ## Cleanup

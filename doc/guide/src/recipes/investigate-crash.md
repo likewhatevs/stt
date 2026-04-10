@@ -24,8 +24,8 @@ or when `RUST_BACKTRACE=1` is set.
 
 ## Auto-repro
 
-`auto_repro` defaults to `true` in `#[stt_test]`. When the scheduler
-crashes, stt automatically:
+`auto_repro` defaults to `true` in `#[ktstr_test]`. When the scheduler
+crashes, ktstr automatically:
 
 1. Captures the crash stack trace from the scenario output.
 2. Boots a second VM with BPF kprobes on each function in the crash

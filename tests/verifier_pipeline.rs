@@ -1,30 +1,30 @@
 use anyhow::Result;
-use stt::assert::AssertResult;
-use stt::scenario::Ctx;
-use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
-use stt::test_support::{Scheduler, SchedulerSpec, SttTestEntry};
+use ktstr::assert::AssertResult;
+use ktstr::scenario::Ctx;
+use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
+use ktstr::test_support::{KtstrTestEntry, Scheduler, SchedulerSpec};
 
 /// Build a scheduler package and resolve paths for verifier tests.
 fn resolve_verifier_paths(
     package: &str,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-    let sched_bin = stt::build_and_find_binary(package)?;
-    let stt_bin = std::env::current_exe()?;
-    let kernel = stt::find_kernel().ok_or_else(|| anyhow::anyhow!("no kernel found"))?;
-    Ok((sched_bin, stt_bin, kernel))
+    let sched_bin = ktstr::build_and_find_binary(package)?;
+    let ktstr_bin = std::env::current_exe()?;
+    let kernel = ktstr::find_kernel().ok_or_else(|| anyhow::anyhow!("no kernel found"))?;
+    Ok((sched_bin, ktstr_bin, kernel))
 }
 
-fn __stt_inner_demo_verifier_brief(_ctx: &Ctx) -> Result<AssertResult> {
-    let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
-    let result = stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])?;
-    let output = stt::verifier::format_verifier_output("stt-sched", &result, false);
+fn __ktstr_inner_demo_verifier_brief(_ctx: &Ctx) -> Result<AssertResult> {
+    let (sched_bin, ktstr_bin, kernel) = resolve_verifier_paths("scx-ktstr")?;
+    let result = ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel, &[])?;
+    let output = ktstr::verifier::format_verifier_output("scx-ktstr", &result, false);
     anyhow::ensure!(
-        output.contains("stt_enqueue"),
-        "output should list stt_enqueue"
+        output.contains("ktstr_enqueue"),
+        "output should list ktstr_enqueue"
     );
     anyhow::ensure!(
-        output.contains("stt_dispatch"),
-        "output should list stt_dispatch"
+        output.contains("ktstr_dispatch"),
+        "output should list ktstr_dispatch"
     );
     anyhow::ensure!(
         output.contains("verified_insns="),
@@ -33,24 +33,24 @@ fn __stt_inner_demo_verifier_brief(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = stt::__linkme)]
-static __STT_ENTRY_VERIFIER_BRIEF: SttTestEntry = SttTestEntry {
+#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__linkme)]
+static __KTSTR_ENTRY_VERIFIER_BRIEF: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_brief",
-    func: __stt_inner_demo_verifier_brief,
+    func: __ktstr_inner_demo_verifier_brief,
     auto_repro: false,
     host_only: true,
-    ..SttTestEntry::DEFAULT
+    ..KtstrTestEntry::DEFAULT
 };
 
-fn __stt_inner_demo_verifier_diff(_ctx: &Ctx) -> Result<AssertResult> {
-    let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
-    let result_a = stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])?;
-    let result_b = stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &[])?;
-    let output = stt::verifier::format_verifier_diff(
-        "stt-sched",
+fn __ktstr_inner_demo_verifier_diff(_ctx: &Ctx) -> Result<AssertResult> {
+    let (sched_bin, ktstr_bin, kernel) = resolve_verifier_paths("scx-ktstr")?;
+    let result_a = ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel, &[])?;
+    let result_b = ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel, &[])?;
+    let output = ktstr::verifier::format_verifier_diff(
+        "scx-ktstr",
         &result_a.stats,
-        "stt-sched",
+        "scx-ktstr",
         &result_b.stats,
     );
     anyhow::ensure!(
@@ -65,22 +65,22 @@ fn __stt_inner_demo_verifier_diff(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = stt::__linkme)]
-static __STT_ENTRY_VERIFIER_DIFF: SttTestEntry = SttTestEntry {
+#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__linkme)]
+static __KTSTR_ENTRY_VERIFIER_DIFF: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_diff",
-    func: __stt_inner_demo_verifier_diff,
+    func: __ktstr_inner_demo_verifier_diff,
     auto_repro: false,
     host_only: true,
-    ..SttTestEntry::DEFAULT
+    ..KtstrTestEntry::DEFAULT
 };
 
-fn __stt_inner_verifier_cycle_collapse(_ctx: &Ctx) -> Result<AssertResult> {
-    let (sched_bin, stt_bin, kernel) = resolve_verifier_paths("stt-sched")?;
+fn __ktstr_inner_verifier_cycle_collapse(_ctx: &Ctx) -> Result<AssertResult> {
+    let (sched_bin, ktstr_bin, kernel) = resolve_verifier_paths("scx-ktstr")?;
     let sched_args = vec!["--verify-loop".to_string()];
     let result =
-        stt::verifier::collect_verifier_output(&sched_bin, &stt_bin, &kernel, &sched_args)?;
-    let output = stt::verifier::format_verifier_output("stt-sched", &result, false);
+        ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel, &sched_args)?;
+    let output = ktstr::verifier::format_verifier_output("scx-ktstr", &result, false);
     anyhow::ensure!(
         output.contains("scheduler log"),
         "output should contain scheduler log section"
@@ -92,19 +92,20 @@ fn __stt_inner_verifier_cycle_collapse(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = stt::__linkme)]
-static __STT_ENTRY_CYCLE_COLLAPSE: SttTestEntry = SttTestEntry {
+#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__linkme)]
+static __KTSTR_ENTRY_CYCLE_COLLAPSE: KtstrTestEntry = KtstrTestEntry {
     name: "verifier_cycle_collapse",
-    func: __stt_inner_verifier_cycle_collapse,
+    func: __ktstr_inner_verifier_cycle_collapse,
     auto_repro: false,
     host_only: true,
-    ..SttTestEntry::DEFAULT
+    ..KtstrTestEntry::DEFAULT
 };
 
 // -- demo_verifier_fail_verify: BPF load rejection via --fail-verify --
 
-const FAIL_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
+const FAIL_SCHED: Scheduler =
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
 
 fn scenario_fail_verify(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
@@ -115,9 +116,9 @@ fn scenario_fail_verify(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, None)
 }
 
-#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = stt::__linkme)]
-static __STT_ENTRY_FAIL_VERIFY: SttTestEntry = SttTestEntry {
+#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__linkme)]
+static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_fail_verify",
     func: scenario_fail_verify,
     scheduler: &FAIL_SCHED,
@@ -125,12 +126,12 @@ static __STT_ENTRY_FAIL_VERIFY: SttTestEntry = SttTestEntry {
     expect_err: true,
     duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 2,
-    ..SttTestEntry::DEFAULT
+    ..KtstrTestEntry::DEFAULT
 };
 
-#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-#[linkme(crate = stt::__linkme)]
-static __STT_ENTRY_VERIFY_REJECT: SttTestEntry = SttTestEntry {
+#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__linkme)]
+static __KTSTR_ENTRY_VERIFY_REJECT: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_cycle_collapse",
     func: scenario_fail_verify,
     scheduler: &FAIL_SCHED,
@@ -138,5 +139,5 @@ static __STT_ENTRY_VERIFY_REJECT: SttTestEntry = SttTestEntry {
     duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 2,
     expect_err: true,
-    ..SttTestEntry::DEFAULT
+    ..KtstrTestEntry::DEFAULT
 };

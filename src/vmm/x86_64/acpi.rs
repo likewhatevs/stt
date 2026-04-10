@@ -75,16 +75,16 @@ impl SdtHeader {
             signature: *sig,
             length,
             revision,
-            oem_id: *b"STTVM\0",
+            oem_id: *b"KTSTR\0",
             oem_table_id: {
                 let mut id = [0u8; 8];
-                let prefix = b"STT";
+                let prefix = b"KTSR";
                 id[..prefix.len()].copy_from_slice(prefix);
                 id[prefix.len()..prefix.len() + sig.len()].copy_from_slice(sig);
                 id
             },
             oem_revision: 1,
-            creator_id: *b"STT\0",
+            creator_id: *b"KTSR",
             creator_revision: 1,
             ..Default::default()
         }
@@ -325,7 +325,7 @@ pub fn setup_acpi(
 fn write_rsdp(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
     let mut rsdp = Rsdp {
         signature: *b"RSD PTR ",
-        oem_id: *b"STTVM\0",
+        oem_id: *b"KTSTR\0",
         revision: 2,
         rsdt_address: layout.rsdt_addr as u32,
         length: 36,

@@ -1,7 +1,7 @@
 # Running Tests
 
 Tests run via `cargo nextest run`, which boots KVM virtual machines
-for each `#[stt_test]` entry.
+for each `#[ktstr_test]` entry.
 
 ## Quick reference
 
@@ -19,25 +19,25 @@ cargo nextest run --run-ignored ignored-only -E 'test(gauntlet/)'
 ## Flags
 
 Define flags via `#[derive(Scheduler)]` with `#[flag(...)]` attributes.
-Use `required_flags` and `excluded_flags` in `#[stt_test]` to constrain
+Use `required_flags` and `excluded_flags` in `#[ktstr_test]` to constrain
 which flag profiles a test runs under.
 
-stt includes built-in flags (`llc`, `borrow`, `steal`, `rebal`,
+ktstr includes built-in flags (`llc`, `borrow`, `steal`, `rebal`,
 `reject-pin`, `no-ctrl`) for the internal catalog. See
 [Flags](concepts/flags.md) for details.
 
 ## Budget-based test selection
 
-Set `STT_BUDGET_SECS` to select the subset of tests that maximizes
+Set `KTSTR_BUDGET_SECS` to select the subset of tests that maximizes
 feature coverage within a time budget. Useful for CI pipelines or
 quick smoke tests.
 
 ```sh
 # Run the best 5 minutes of tests
-STT_BUDGET_SECS=300 cargo nextest run --workspace
+KTSTR_BUDGET_SECS=300 cargo nextest run --workspace
 
 # Budget applies to gauntlet variants too
-STT_BUDGET_SECS=600 cargo nextest run --run-ignored all
+KTSTR_BUDGET_SECS=600 cargo nextest run --run-ignored all
 ```
 
 The selector encodes each test as a bitset of properties (scheduler,
@@ -48,10 +48,10 @@ Duration estimates account for VM boot overhead based on vCPU count.
 A summary is printed to stderr during `--list`:
 
 ```
-stt budget: 42/1200 tests, 295/300s used, 38/38 configurations covered
+ktstr budget: 42/1200 tests, 295/300s used, 38/38 configurations covered
 ```
 
-When `STT_BUDGET_SECS` is not set, all tests are listed as usual.
+When `KTSTR_BUDGET_SECS` is not set, all tests are listed as usual.
 
 ## Custom scheduler
 

@@ -19,8 +19,8 @@
 //! For data-driven test cases (used by the internal catalog), see
 //! [`Scenario`], [`CpusetMode`], [`Action`], and [`CgroupWork`].
 //!
-//! See the [Scenarios](https://likewhatevs.github.io/stt/guide/concepts/scenarios.html)
-//! and [Writing Tests](https://likewhatevs.github.io/stt/guide/writing-tests.html)
+//! See the [Scenarios](https://likewhatevs.github.io/ktstr/guide/concepts/scenarios.html)
+//! and [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
 //! chapters of the guide.
 
 pub mod affinity;
@@ -66,7 +66,7 @@ pub(crate) use crate::read_kmsg;
 ///
 /// The built-in `*_DECL` constants (`LLC_DECL`, `BORROW_DECL`, etc.)
 /// have empty `args` fields. They define flag names and dependencies
-/// for stt's internal scenario catalog. External consumers define
+/// for ktstr's internal scenario catalog. External consumers define
 /// their own `FlagDecl` statics with populated `args` fields
 /// containing their scheduler's actual CLI arguments.
 ///
@@ -85,7 +85,7 @@ pub mod flags {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use stt::prelude::*;
+    /// use ktstr::prelude::*;
     ///
     /// static MY_LLC: FlagDecl = FlagDecl {
     ///     name: "llc",
@@ -332,7 +332,7 @@ impl Default for CgroupWork {
 /// flag combinations that satisfy these constraints.
 ///
 /// ```
-/// # use stt::scenario::all_scenarios;
+/// # use ktstr::scenario::all_scenarios;
 /// let scenarios = all_scenarios();
 /// assert!(!scenarios.is_empty());
 ///

@@ -1,7 +1,7 @@
 //! VM launch configuration and gauntlet topology presets.
 //!
-//! See the [Running Tests](https://likewhatevs.github.io/stt/guide/running-tests.html)
-//! and [Gauntlet](https://likewhatevs.github.io/stt/guide/running-tests/gauntlet.html)
+//! See the [Running Tests](https://likewhatevs.github.io/ktstr/guide/running-tests.html)
+//! and [Gauntlet](https://likewhatevs.github.io/ktstr/guide/running-tests/gauntlet.html)
 //! chapters of the guide.
 
 use anyhow::{Context, Result};
@@ -40,12 +40,12 @@ impl Default for VmConfig {
     }
 }
 
-/// Boot a KVM VM with the given config and run stt inside it.
+/// Boot a KVM VM with the given config and run ktstr inside it.
 ///
-/// Resolves the kernel image, builds the initramfs (stt binary +
+/// Resolves the kernel image, builds the initramfs (ktstr binary +
 /// optional scheduler), and boots the VM. Returns the VM's exit
 /// result including serial output.
-pub fn run_in_vm(cfg: &VmConfig, stt_args: &[String]) -> Result<VmResult> {
+pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
     // Resolve kernel
     let kernel = if let Some(ref kd) = cfg.kernel_dir {
         #[cfg(target_arch = "x86_64")]
@@ -59,14 +59,14 @@ pub fn run_in_vm(cfg: &VmConfig, stt_args: &[String]) -> Result<VmResult> {
         crate::find_kernel().unwrap_or_else(|| PathBuf::from("/boot/vmlinuz"))
     };
 
-    // Find stt binary (ourselves)
-    let stt_bin = crate::resolve_current_exe()?;
+    // Find ktstr binary (ourselves)
+    let ktstr_bin = crate::resolve_current_exe()?;
 
     // Build guest args: strip --scheduler-bin (host path) and append
-    // the guest-side path (/scheduler) so the inner stt finds the binary.
+    // the guest-side path (/scheduler) so the inner ktstr finds the binary.
     let mut sched_bin: Option<PathBuf> = None;
-    let mut guest_args = Vec::with_capacity(stt_args.len() + 2);
-    let mut iter = stt_args.iter();
+    let mut guest_args = Vec::with_capacity(ktstr_args.len() + 2);
+    let mut iter = ktstr_args.iter();
     while let Some(a) = iter.next() {
         if a == "--scheduler-bin" {
             if let Some(val) = iter.next() {
@@ -84,9 +84,9 @@ pub fn run_in_vm(cfg: &VmConfig, stt_args: &[String]) -> Result<VmResult> {
     }
 
     let t = &cfg.topology;
-    let mut builder = vmm::SttVm::builder()
+    let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
-        .init_binary(&stt_bin)
+        .init_binary(&ktstr_bin)
         .topology(t.sockets, t.cores_per_socket, t.threads_per_core)
         .memory_mb(u32::try_from(cfg.memory_mb).context("memory_mb exceeds u32::MAX")?)
         .run_args(&guest_args);

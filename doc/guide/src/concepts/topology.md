@@ -5,7 +5,7 @@ configuration. It discovers CPUs, last-level caches (LLCs), and NUMA
 nodes, and generates cpuset partitions for scenarios.
 
 ```rust,ignore
-use stt::prelude::*;
+use ktstr::prelude::*;
 
 pub struct TestTopology {
     cpus: Vec<usize>,

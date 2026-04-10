@@ -12,19 +12,19 @@ fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenStream {
     }
 }
 
-/// Default topology and memory for stt_test-annotated functions.
+/// Default topology and memory for ktstr_test-annotated functions.
 const DEFAULT_SOCKETS: u32 = 1;
 const DEFAULT_CORES: u32 = 2;
 const DEFAULT_THREADS: u32 = 1;
 const DEFAULT_MEMORY_MB: u32 = 2048;
 
-/// Attribute macro that registers a function as an stt integration test.
+/// Attribute macro that registers a function as a ktstr integration test.
 ///
-/// The annotated function must have signature `fn(&stt::scenario::Ctx) ->
-/// anyhow::Result<stt::assert::AssertResult>`. The macro:
+/// The annotated function must have signature `fn(&ktstr::scenario::Ctx) ->
+/// anyhow::Result<ktstr::assert::AssertResult>`. The macro:
 ///
-/// 1. Renames the original function to `__stt_inner_{name}`.
-/// 2. Registers it in the `STT_TESTS` distributed slice via linkme.
+/// 1. Renames the original function to `__ktstr_inner_{name}`.
+/// 2. Registers it in the `KTSTR_TESTS` distributed slice via linkme.
 /// 3. Emits a `#[test]` wrapper that boots a VM and runs the function
 ///    inside it.
 ///
@@ -39,13 +39,13 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `max_gap_ms`, `max_spread_pct`, `max_imbalance_ratio` -- assertion thresholds
 ///   - `max_p99_wake_latency_ns`, `max_wake_latency_cv`, `min_iteration_rate` -- benchmarking
 ///   - `required_flags`, `excluded_flags` -- flag profile filtering
-///   - See SttTestEntry and Assert for the full field list.
+///   - See KtstrTestEntry and Assert for the full field list.
 #[proc_macro_attribute]
-pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
     let orig_name = &input.sig.ident;
-    let inner_name = format_ident!("__stt_inner_{}", orig_name);
-    let entry_name = format_ident!("__STT_ENTRY_{}", orig_name.to_string().to_uppercase());
+    let inner_name = format_ident!("__ktstr_inner_{}", orig_name);
+    let entry_name = format_ident!("__KTSTR_ENTRY_{}", orig_name.to_string().to_uppercase());
     let name_str = orig_name.to_string();
 
     // Parse attributes
@@ -439,7 +439,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { &#p }
         }
         None => {
-            quote! { &::stt::test_support::Scheduler::EEVDF }
+            quote! { &::ktstr::test_support::Scheduler::EEVDF }
         }
     };
 
@@ -475,7 +475,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { #t }
     };
     let topology_tokens = quote! {
-        ::stt::test_support::Topology {
+        ::ktstr::test_support::Topology {
             sockets: #sockets_tokens,
             cores_per_socket: #cores_tokens,
             threads_per_core: #threads_tokens,
@@ -517,7 +517,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let test_body = if expect_err {
         quote! {
-            let result = ::stt::test_support::run_stt_test(&#entry_name);
+            let result = ::ktstr::test_support::run_ktstr_test(&#entry_name);
             assert!(
                 result.is_err(),
                 "expected test to fail but it passed",
@@ -525,7 +525,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
-            let _result = ::stt::test_support::run_stt_test(&#entry_name).unwrap();
+            let _result = ::ktstr::test_support::run_ktstr_test(&#entry_name).unwrap();
         }
     };
 
@@ -533,13 +533,13 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis #inner_sig #block
 
-        #[::stt::__linkme::distributed_slice(::stt::test_support::STT_TESTS)]
-        #[linkme(crate = ::stt::__linkme)]
-        static #entry_name: ::stt::test_support::SttTestEntry = ::stt::test_support::SttTestEntry {
+        #[::ktstr::__linkme::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]
+        #[linkme(crate = ::ktstr::__linkme)]
+        static #entry_name: ::ktstr::test_support::KtstrTestEntry = ::ktstr::test_support::KtstrTestEntry {
             name: #name_str,
             func: #inner_name,
             topology: #topology_tokens,
-            constraints: ::stt::test_support::TopologyConstraints {
+            constraints: ::ktstr::test_support::TopologyConstraints {
                 min_sockets: #min_sockets,
                 min_llcs: #min_llcs,
                 requires_smt: #requires_smt,
@@ -549,7 +549,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             scheduler: #scheduler_tokens,
             auto_repro: #auto_repro,
             replicas: #replicas,
-            assert: ::stt::assert::Assert {
+            assert: ::ktstr::assert::Assert {
                 not_starved: #not_starved_tokens,
                 isolation: #isolation_tokens,
                 max_gap_ms: #gap_tokens,
@@ -668,7 +668,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// - `impl MitosisFlag { pub const LLC: &str = "llc"; pub const STEAL: &str = "steal"; }`
 ///
 /// The associated constants enable typed flag references:
-/// `required_flags = [MitosisFlag::LLC]` in `#[stt_test]`.
+/// `required_flags = [MitosisFlag::LLC]` in `#[ktstr_test]`.
 ///
 /// # Const name derivation
 ///
@@ -688,11 +688,11 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// # Example
 ///
 /// ```rust,ignore
-/// use stt::prelude::*;
+/// use ktstr::prelude::*;
 ///
 /// #[derive(Scheduler)]
 /// #[scheduler(name = "mitosis", binary = "scx_mitosis", topology(2, 4, 1),
-///             cgroup_parent = "/stt", sched_args = ["--exit-dump-len", "1048576"])]
+///             cgroup_parent = "/ktstr", sched_args = ["--exit-dump-len", "1048576"])]
 /// #[allow(dead_code)]
 /// enum MitosisFlag {
 ///     #[flag(args = ["--enable-llc-awareness"])]
@@ -942,7 +942,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
             .collect();
 
         decl_statics.push(quote! {
-            static #decl_ident: ::stt::scenario::flags::FlagDecl = ::stt::scenario::flags::FlagDecl {
+            static #decl_ident: ::ktstr::scenario::flags::FlagDecl = ::ktstr::scenario::flags::FlagDecl {
                 name: #name_str,
                 args: &[#(#args),*],
                 requires: &[#(#requires_tokens),*],
@@ -984,12 +984,12 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     // Build the Scheduler const with builder chain
     let sched_name_str = &sched_name;
     let mut builder_chain = quote! {
-        ::stt::test_support::Scheduler::new(#sched_name_str)
+        ::ktstr::test_support::Scheduler::new(#sched_name_str)
     };
 
     if let Some(ref binary) = sched_binary {
         builder_chain = quote! {
-            #builder_chain.binary(::stt::test_support::SchedulerSpec::Name(#binary))
+            #builder_chain.binary(::ktstr::test_support::SchedulerSpec::Name(#binary))
         };
     }
 
@@ -1018,9 +1018,9 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     let expanded = quote! {
         #(#decl_statics)*
 
-        static #flags_array_ident: &[&::stt::scenario::flags::FlagDecl] = &[#(#decl_refs),*];
+        static #flags_array_ident: &[&::ktstr::scenario::flags::FlagDecl] = &[#(#decl_refs),*];
 
-        const #const_name: ::stt::test_support::Scheduler = #builder_chain;
+        const #const_name: ::ktstr::test_support::Scheduler = #builder_chain;
 
         impl #enum_name {
             #(#name_consts)*

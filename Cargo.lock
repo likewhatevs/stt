@@ -1132,6 +1132,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "ktstr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blazesym",
+ "btf-rs",
+ "cpio",
+ "crc32fast",
+ "ctor",
+ "flate2",
+ "ktstr-macros",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libbpf-cargo",
+ "libbpf-rs",
+ "libc",
+ "linkme",
+ "linux-loader",
+ "nix 0.31.2",
+ "object 0.39.0",
+ "polars",
+ "rand 0.10.0",
+ "rmesg",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "vm-fdt",
+ "vm-memory",
+ "vm-superio",
+ "vmm-sys-util",
+ "zerocopy",
+]
+
+[[package]]
+name = "ktstr-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "kvm-bindings"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2349,6 +2393,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scx-ktstr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "libbpf-rs",
+ "scx_cargo",
+ "scx_utils",
+]
+
+[[package]]
 name = "scx_cargo"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2665,61 +2720,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "stt"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blazesym",
- "btf-rs",
- "cpio",
- "crc32fast",
- "ctor",
- "flate2",
- "kvm-bindings",
- "kvm-ioctls",
- "libbpf-cargo",
- "libbpf-rs",
- "libc",
- "linkme",
- "linux-loader",
- "nix 0.31.2",
- "object 0.39.0",
- "polars",
- "rand 0.10.0",
- "rmesg",
- "serde",
- "serde_json",
- "stt-macros",
- "tracing",
- "tracing-subscriber",
- "vm-fdt",
- "vm-memory",
- "vm-superio",
- "vmm-sys-util",
- "zerocopy",
-]
-
-[[package]]
-name = "stt-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "stt-sched"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ctrlc",
- "libbpf-rs",
- "scx_cargo",
- "scx_utils",
 ]
 
 [[package]]

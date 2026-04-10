@@ -1,17 +1,17 @@
 # VMM
 
-stt includes a purpose-built VMM (virtual machine monitor) that boots
+ktstr includes a purpose-built VMM (virtual machine monitor) that boots
 Linux kernels in KVM for testing.
 
-## SttVm builder
+## KtstrVm builder
 
 ```rust,ignore
-let result = vmm::SttVm::builder()
+let result = vmm::KtstrVm::builder()
     .kernel(&kernel_path)
-    .init_binary(&stt_binary)
+    .init_binary(&ktstr_binary)
     .topology(sockets, cores_per_socket, threads_per_core)
     .memory_mb(4096)
-    .run_args(&["run".into(), "--stt-test-fn".into(), "my_test".into()])
+    .run_args(&["run".into(), "--ktstr-test-fn".into(), "my_test".into()])
     .build()?
     .run()?;
 ```
@@ -50,8 +50,8 @@ memory, sharing physical pages across concurrent VMs.
 
 **Serial console** -- COM2 carries guest stdout/stderr and serves as
 a fallback result transport. Delimited test results (between
-`===STT_TEST_RESULT_START===` / `===STT_TEST_RESULT_END===` sentinels)
-and exit codes (`STT_EXIT=N`) are written to COM2 as fallback when
+`===KTSTR_TEST_RESULT_START===` / `===KTSTR_TEST_RESULT_END===` sentinels)
+and exit codes (`KTSTR_EXIT=N`) are written to COM2 as fallback when
 SHM is unavailable.
 
 **SHM ring buffer** -- the primary guest-to-host data channel. A shared
@@ -85,14 +85,14 @@ dispatches the test function, then reboots.
 The role is determined at runtime:
 
 - **PID 1 detection**: when running as PID 1, the `#[ctor]` function
-  `stt_test_early_dispatch()` calls `stt_guest_init()` which handles
+  `ktstr_test_early_dispatch()` calls `ktstr_guest_init()` which handles
   the full guest lifecycle.
-- **`#[stt_test]` host dispatch**: a `#[ctor::ctor]` function
-  (`stt_test_early_dispatch`) runs before `main()` in any binary
-  that links against stt. When both `--stt-test-fn` and `--stt-topo`
+- **`#[ktstr_test]` host dispatch**: a `#[ctor::ctor]` function
+  (`ktstr_test_early_dispatch`) runs before `main()` in any binary
+  that links against ktstr. When both `--ktstr-test-fn` and `--ktstr-topo`
   are present, it boots a VM and runs the test inside it.
-- **`#[stt_test]` guest dispatch**: when only `--stt-test-fn` is
-  present (no `--stt-topo`), the ctor runs the test function
+- **`#[ktstr_test]` guest dispatch**: when only `--ktstr-test-fn` is
+  present (no `--ktstr-topo`), the ctor runs the test function
   directly -- the binary is already inside a VM.
 
 This design means one `cargo build` produces everything needed for
@@ -107,5 +107,5 @@ that built it.
 4. Set up serial devices (COM1 for console, COM2 for results).
 5. Boot the kernel.
 6. Kernel starts `/init` (the test binary).
-7. PID 1 detected: `stt_guest_init()` mounts filesystems, starts
+7. PID 1 detected: `ktstr_guest_init()` mounts filesystems, starts
    the scheduler, dispatches the test function, and reboots.

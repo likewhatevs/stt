@@ -49,7 +49,7 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     let mut skel = scx_ops_open!(
         skel_builder,
         &mut open_object,
-        stt_ops,
+        ktstr_ops,
         None::<libbpf_rs::libbpf_sys::bpf_object_open_opts>
     )?;
 
@@ -71,22 +71,22 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         rodata.slow = 1;
     }
 
-    let mut skel = scx_ops_load!(skel, stt_ops, uei)?;
-    let _link = scx_ops_attach!(skel, stt_ops)?;
+    let mut skel = scx_ops_load!(skel, ktstr_ops, uei)?;
+    let _link = scx_ops_attach!(skel, ktstr_ops)?;
 
     if degrade {
-        eprintln!("stt-sched: degrade mode enabled");
+        eprintln!("scx-ktstr: degrade mode enabled");
     }
     if scattershot {
-        eprintln!("stt-sched: scattershot mode enabled");
+        eprintln!("scx-ktstr: scattershot mode enabled");
         if slow || degrade {
             eprintln!(
-                "stt-sched: WARNING: --scattershot bypasses SHARED_DSQ; --slow/--degrade have no effect"
+                "scx-ktstr: WARNING: --scattershot bypasses SHARED_DSQ; --slow/--degrade have no effect"
             );
         }
     }
     if slow {
-        eprintln!("stt-sched: slow mode enabled");
+        eprintln!("scx-ktstr: slow mode enabled");
     }
 
     if let Some(delay_s) = stall_after {
@@ -102,7 +102,7 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
                 if let Some(bss) = skel.maps.bss_data.as_mut() {
                     bss.stall = 1;
                 }
-                eprintln!("stt-sched: stall enabled after {delay_s}s");
+                eprintln!("scx-ktstr: stall enabled after {delay_s}s");
             }
         });
     }
@@ -117,7 +117,7 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
                 if let Some(bss) = skel.maps.bss_data.as_mut() {
                     bss.degrade_rt = 1;
                 }
-                eprintln!("stt-sched: degrade enabled after {delay_s}s");
+                eprintln!("scx-ktstr: degrade enabled after {delay_s}s");
             }
         });
     }
@@ -125,13 +125,13 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&skel, uei) {
         thread::sleep(Duration::from_secs(1));
         if let Some(bss) = skel.maps.bss_data.as_mut() {
-            if std::path::Path::new("/tmp/stt_stall").exists() && bss.stall == 0 {
+            if std::path::Path::new("/tmp/ktstr_stall").exists() && bss.stall == 0 {
                 bss.stall = 1;
-                eprintln!("stt-sched: stall enabled via /tmp/stt_stall");
+                eprintln!("scx-ktstr: stall enabled via /tmp/ktstr_stall");
             }
-            if std::path::Path::new("/tmp/stt_degrade").exists() && bss.degrade_rt == 0 {
+            if std::path::Path::new("/tmp/ktstr_degrade").exists() && bss.degrade_rt == 0 {
                 bss.degrade_rt = 1;
-                eprintln!("stt-sched: degrade enabled via /tmp/stt_degrade");
+                eprintln!("scx-ktstr: degrade enabled via /tmp/ktstr_degrade");
             }
         }
     }

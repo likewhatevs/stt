@@ -4,7 +4,7 @@
 configures, and removes cgroups under a parent directory.
 
 ```rust,ignore
-use stt::prelude::*;
+use ktstr::prelude::*;
 
 pub struct CgroupManager {
     parent: PathBuf,
@@ -14,7 +14,7 @@ pub struct CgroupManager {
 ## Construction
 
 ```rust,ignore
-let cgroups = CgroupManager::new("/sys/fs/cgroup/stt");
+let cgroups = CgroupManager::new("/sys/fs/cgroup/ktstr");
 cgroups.setup(true)?; // create parent dir, enable cpuset + cpu controllers
 ```
 

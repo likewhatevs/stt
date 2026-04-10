@@ -1,6 +1,6 @@
 //! Test harness for Linux process schedulers, with a focus on sched_ext.
 //!
-//! stt runs scheduler test scenarios inside lightweight KVM virtual machines
+//! ktstr runs scheduler test scenarios inside lightweight KVM virtual machines
 //! with controlled CPU topologies. Each test creates cgroups, spawns worker
 //! processes, and verifies that the scheduler handled the workload correctly.
 //! Also tests under the kernel's default EEVDF scheduler.
@@ -11,9 +11,9 @@
 //! lifecycle and verification:
 //!
 //! ```rust
-//! use stt::prelude::*;
+//! use ktstr::prelude::*;
 //!
-//! #[stt_test(sockets = 1, cores = 2, threads = 1)]
+//! #[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 //! fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     execute_defs(ctx, vec![
 //!         CgroupDef::named("cg_0").workers(2),
@@ -25,9 +25,9 @@
 //! For multi-phase scenarios with dynamic topology changes:
 //!
 //! ```rust
-//! use stt::prelude::*;
+//! use ktstr::prelude::*;
 //!
-//! #[stt_test(sockets = 1, cores = 2, threads = 1)]
+//! #[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 //! fn my_dynamic_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     let steps = vec![
 //!         Step::with_defs(
@@ -50,7 +50,7 @@
 //! inherit its configuration:
 //!
 //! ```rust
-//! use stt::prelude::*;
+//! use ktstr::prelude::*;
 //!
 //! #[derive(Scheduler)]
 //! #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
@@ -62,7 +62,7 @@
 //!     Steal,
 //! }
 //!
-//! #[stt_test(scheduler = MY_SCHED)]
+//! #[ktstr_test(scheduler = MY_SCHED)]
 //! fn basic(ctx: &Ctx) -> Result<AssertResult> {
 //!     execute_defs(ctx, vec![
 //!         CgroupDef::named("cg_0").workers(2),
@@ -75,9 +75,9 @@
 //! you can use the low-level API directly:
 //!
 //! ```rust
-//! use stt::prelude::*;
+//! use ktstr::prelude::*;
 //!
-//! #[stt_test(sockets = 1, cores = 2, threads = 1)]
+//! #[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 //! fn my_low_level_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     let mut group = CgroupGroup::new(ctx.cgroups);
 //!     group.add_cgroup_no_cpuset("workers")?;
@@ -114,7 +114,7 @@
 //! - [`workload`] -- worker process types and telemetry collection
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
 //! - [`verifier`] -- BPF verifier complexity analysis
-//! - [`test_support`] -- `#[stt_test]` runtime and registration
+//! - [`test_support`] -- `#[ktstr_test]` runtime and registration
 
 #[allow(
     clippy::all,
@@ -164,18 +164,18 @@ pub mod workload;
 #[doc(hidden)]
 pub use linkme as __linkme;
 
-pub use stt_macros::Scheduler;
-pub use stt_macros::stt_test;
+pub use ktstr_macros::Scheduler;
+pub use ktstr_macros::ktstr_test;
 
 #[cfg(feature = "integration")]
 pub use crate::probe::process::resolve_func_ip;
 
-/// Re-exports for writing `#[stt_test]` functions.
+/// Re-exports for writing `#[ktstr_test]` functions.
 ///
 /// ```rust
-/// use stt::prelude::*;
+/// use ktstr::prelude::*;
 ///
-/// #[stt_test(sockets = 1, cores = 2, threads = 1)]
+/// #[ktstr_test(sockets = 1, cores = 2, threads = 1)]
 /// fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 ///     Ok(AssertResult::pass())
 /// }
@@ -188,13 +188,13 @@ pub mod prelude {
     pub use crate::Scheduler;
     pub use crate::assert::{Assert, AssertResult};
     pub use crate::cgroup::CgroupManager;
+    pub use crate::ktstr_test;
     pub use crate::scenario::flags::FlagDecl;
     pub use crate::scenario::ops::{
         CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_defs, execute_steps, execute_steps_with,
     };
     pub use crate::scenario::scenarios;
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
-    pub use crate::stt_test;
     pub use crate::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
     pub use crate::topology::{LlcInfo, TestTopology};
     pub use crate::workload::{

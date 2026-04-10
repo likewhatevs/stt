@@ -5,7 +5,7 @@ per-program verifier statistics from the real kernel verifier.
 
 ## Design
 
-The verifier pipeline follows stt's two core principles.
+The verifier pipeline follows ktstr's two core principles.
 
 **Fidelity without overhead.** The scheduler binary runs inside a VM
 on the same kernel the scheduler will run on in production. The
@@ -49,7 +49,7 @@ cargo nextest run -E 'test(verifier_)'
 Per-program summary line:
 
 ```text
-  stt_enqueue                              verified_insns=500
+  ktstr_enqueue                              verified_insns=500
 ```
 
 Fields: `verified_insns` is the number of instructions the kernel
@@ -87,8 +87,8 @@ Boots two VMs -- one for each scheduler binary -- and compares
 ```text
   program                                           A          B      delta
   ------------------------------------------------------------------------
-  stt_enqueue                                     500        450        +50
-  stt_dispatch                                   1200       1150        +50
+  ktstr_enqueue                                     500        450        +50
+  ktstr_dispatch                                   1200       1150        +50
 ```
 
 ## Cycle collapse algorithm
@@ -118,15 +118,15 @@ then detects repeating blocks:
    omission count, and the last iteration. Run iteratively (up to 5
    passes) to handle nested loops.
 
-## stt-sched test flags
+## scx-ktstr test flags
 
-stt-sched supports these flags to exercise the verifier pipeline:
+scx-ktstr supports these flags to exercise the verifier pipeline:
 
 **`--fail-verify`** -- sets a `.rodata` variable before
 `scx_ops_load!`, enabling a code path the BPF verifier rejects.
 On failure, libbpf prints the verifier log to stderr.
 
 **`--verify-loop`** -- sets a `.rodata` variable that enables an
-unrolled loop followed by `while(1)` in `stt_dispatch`. The verifier
+unrolled loop followed by `while(1)` in `ktstr_dispatch`. The verifier
 rejects the infinite loop and libbpf prints the full instruction
 trace to stderr, exercising cycle collapse.

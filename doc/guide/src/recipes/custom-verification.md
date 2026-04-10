@@ -9,7 +9,7 @@ or relaxed event rates.
 Define a `Scheduler` with custom verification:
 
 ```rust,ignore
-use stt::prelude::*;
+use ktstr::prelude::*;
 
 static MY_LLC: FlagDecl = FlagDecl {
     name: "llc",
@@ -37,10 +37,10 @@ const RELAXED: Scheduler = Scheduler::new("relaxed")
 These overrides sit between `Assert::default_checks()` and per-test
 overrides in the merge chain.
 
-## Per-test overrides via #[stt_test]
+## Per-test overrides via #[ktstr_test]
 
 ```rust,ignore
-#[stt_test(
+#[ktstr_test(
     scheduler = RELAXED,
     not_starved = true,
     max_gap_ms = 5000,

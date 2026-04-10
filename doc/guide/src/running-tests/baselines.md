@@ -1,21 +1,21 @@
 # Baselines
 
-stt can save test results as baselines and compare subsequent runs
+ktstr can save test results as baselines and compare subsequent runs
 against them.
 
 ## Workflow
 
-1. **Save baseline**: set `STT_SIDECAR_DIR` to a directory. Each test
+1. **Save baseline**: set `KTSTR_SIDECAR_DIR` to a directory. Each test
    writes a `SidecarResult` JSON file there.
 
    ```sh
-   STT_SIDECAR_DIR=./baseline cargo nextest run --workspace
+   KTSTR_SIDECAR_DIR=./baseline cargo nextest run --workspace
    ```
 
 2. **Run current**: run the same tests with a different sidecar dir.
 
    ```sh
-   STT_SIDECAR_DIR=./current cargo nextest run --workspace
+   KTSTR_SIDECAR_DIR=./current cargo nextest run --workspace
    ```
 
 3. **Compare**: diff the sidecar JSON files between directories.
@@ -27,8 +27,8 @@ against them.
 
 Each test writes a `SidecarResult` JSON file containing the test name,
 topology, scheduler, work type, pass/fail, per-cgroup stats, monitor
-summary, stimulus events, verifier stats, and KVM stats. Files are named with a `.stt.` infix for
+summary, stimulus events, verifier stats, and KVM stats. Files are named with a `.ktstr.` infix for
 discovery. `collect_sidecars()` reads all sidecar files from a
 directory (recursing one level for gauntlet per-job subdirectories).
 
-See also: [`STT_SIDECAR_DIR`](../reference/environment-variables.md).
+See also: [`KTSTR_SIDECAR_DIR`](../reference/environment-variables.md).

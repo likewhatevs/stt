@@ -16,7 +16,7 @@ CONFIG_DEBUG_INFO_BTF=y
 # CONFIG_DEBUG_INFO_REDUCED is not set
 
 # -- Tracing/probes (required) --
-# Kprobes for stt probe pipeline. ftrace for dynamic attachment
+# Kprobes for ktstr probe pipeline. ftrace for dynamic attachment
 # and scx scheduler tracing (e.g. LAVD futex tracing).
 # PERF_EVENTS: explicit dep of BPF_EVENTS (provided by defconfig's
 # PROFILING=y, but stated here so the tracing section is self-contained).
@@ -88,7 +88,7 @@ CONFIG_SCHEDSTATS=y
 CONFIG_SCHED_MC=y
 # Symbols for monitor kallsyms resolution.
 CONFIG_KALLSYMS_ALL=y
-# Embedded .config for CONFIG_HZ detection by stt monitor.
+# Embedded .config for CONFIG_HZ detection by ktstr monitor.
 CONFIG_IKCONFIG=y
 
 # -- Disabled (would alter scheduler behavior) --

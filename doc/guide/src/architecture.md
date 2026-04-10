@@ -1,6 +1,6 @@
 # Architecture Overview
 
-stt has three execution domains:
+ktstr has three execution domains:
 
 1. **Host process** -- the test binary running on the host. Manages
    [VM lifecycle](architecture/vmm.md), monitors guest memory, evaluates

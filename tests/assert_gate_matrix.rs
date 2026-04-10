@@ -1,10 +1,11 @@
 use anyhow::Result;
-use stt::assert::{Assert, AssertResult};
-use stt::scenario::Ctx;
-use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
-use stt::test_support::{Scheduler, SchedulerSpec, SttTestEntry};
+use ktstr::assert::{Assert, AssertResult};
+use ktstr::scenario::Ctx;
+use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
+use ktstr::test_support::{KtstrTestEntry, Scheduler, SchedulerSpec};
 
-const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
+const KTSTR_SCHED: Scheduler =
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
 
 fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
     let steps = vec![Step {
@@ -17,7 +18,7 @@ fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
 
 // Macros emit module-scope distributed_slice entries. Each test gets a
 // scenario function that captures its Assert checks, and a static
-// SttTestEntry registered in STT_TESTS.
+// KtstrTestEntry registered in KTSTR_TESTS.
 
 macro_rules! perf_positive_test {
     ($name:ident, $checks:expr) => {
@@ -30,17 +31,17 @@ macro_rules! perf_positive_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-        #[linkme(crate = stt::__linkme)]
-        static $name: SttTestEntry = SttTestEntry {
+        #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+        #[linkme(crate = ktstr::__linkme)]
+        static $name: KtstrTestEntry = KtstrTestEntry {
             name: stringify!($name),
             func: $name::scenario,
-            scheduler: &STT_SCHED,
+            scheduler: &KTSTR_SCHED,
             auto_repro: false,
             performance_mode: true,
             duration: std::time::Duration::from_secs(5),
             workers_per_cgroup: 2,
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
     };
 }
@@ -56,19 +57,19 @@ macro_rules! perf_negative_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-        #[linkme(crate = stt::__linkme)]
-        static $name: SttTestEntry = SttTestEntry {
+        #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+        #[linkme(crate = ktstr::__linkme)]
+        static $name: KtstrTestEntry = KtstrTestEntry {
             name: stringify!($name),
             func: $name::scenario,
-            scheduler: &STT_SCHED,
+            scheduler: &KTSTR_SCHED,
             auto_repro: false,
             extra_sched_args: &["--degrade"],
             performance_mode: true,
             duration: std::time::Duration::from_secs(5),
             workers_per_cgroup: 4,
             expect_err: true,
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
     };
 }
@@ -84,16 +85,16 @@ macro_rules! noperf_positive_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-        #[linkme(crate = stt::__linkme)]
-        static $name: SttTestEntry = SttTestEntry {
+        #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+        #[linkme(crate = ktstr::__linkme)]
+        static $name: KtstrTestEntry = KtstrTestEntry {
             name: stringify!($name),
             func: $name::scenario,
-            scheduler: &STT_SCHED,
+            scheduler: &KTSTR_SCHED,
             auto_repro: false,
             duration: std::time::Duration::from_secs(5),
             workers_per_cgroup: 2,
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
     };
 }
@@ -109,18 +110,18 @@ macro_rules! noperf_negative_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
-        #[linkme(crate = stt::__linkme)]
-        static $name: SttTestEntry = SttTestEntry {
+        #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+        #[linkme(crate = ktstr::__linkme)]
+        static $name: KtstrTestEntry = KtstrTestEntry {
             name: stringify!($name),
             func: $name::scenario,
-            scheduler: &STT_SCHED,
+            scheduler: &KTSTR_SCHED,
             auto_repro: false,
             extra_sched_args: &["--degrade"],
             duration: std::time::Duration::from_secs(5),
             workers_per_cgroup: 4,
             expect_err: true,
-            ..SttTestEntry::DEFAULT
+            ..KtstrTestEntry::DEFAULT
         };
     };
 }
