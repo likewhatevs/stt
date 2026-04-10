@@ -306,8 +306,13 @@ impl Runner {
             };
 
             let sched_dead = sched.as_mut().map(|s| s.is_dead()).unwrap_or(false);
+            let elapsed_secs = start.elapsed().as_secs_f64();
             if sched_dead {
-                tracing::warn!(qname, "scheduler died");
+                tracing::warn!(
+                    qname,
+                    elapsed_s = format!("{elapsed_secs:.1}"),
+                    "scheduler crashed"
+                );
             }
 
             let _ = cgroups.cleanup_all();
@@ -325,7 +330,10 @@ impl Runner {
                     }
                     if sched_dead {
                         v.passed = false;
-                        v.details.push("scheduler died".into());
+                        v.details.push(format!(
+                            "scheduler crashed ({:.1}s into test)",
+                            elapsed_secs,
+                        ));
                     }
                     // On failure: kill scheduler so it writes exit dump, then read it
                     if !v.passed {
