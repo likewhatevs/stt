@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::time::{Duration, Instant};
 
 /// Resolved CPU affinity for a worker process.
@@ -891,6 +891,9 @@ fn worker_main(
     let mut max_gap_at_ns: u64 = 0;
     // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe).
     let mut cache_pressure_buf: Option<Vec<u8>> = None;
+    // Persistent temp file for IoSync / Phase::Io (opened on first use, removed on exit).
+    let mut io_sync_file: Option<(std::fs::File, String)> = None;
+    let mut io_seq_file: Option<(std::fs::File, String)> = None;
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
     const MAX_WAKE_SAMPLES: usize = 100_000;
     let mut wake_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
@@ -916,27 +919,27 @@ fn worker_main(
                 iterations += 1;
             }
             WorkType::IoSync => {
-                let path = std::env::temp_dir()
-                    .join(format!("stt_io_{tid}"))
-                    .to_string_lossy()
-                    .to_string();
-                let mut f = match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&path)
-                {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
+                let (f, _) = io_sync_file.get_or_insert_with(|| {
+                    let path = std::env::temp_dir()
+                        .join(format!("stt_io_{tid}"))
+                        .to_string_lossy()
+                        .to_string();
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&path)
+                        .expect("failed to create IoSync temp file");
+                    (f, path)
+                });
+                let _ = f.set_len(0);
+                let _ = f.seek(std::io::SeekFrom::Start(0));
                 let buf = [0u8; 4096];
                 for _ in 0..16 {
                     let _ = f.write_all(&buf);
                     work_units = work_units.wrapping_add(1);
                 }
                 let _ = f.sync_all();
-                drop(f);
-                let _ = std::fs::remove_file(&path);
                 iterations += 1;
             }
             WorkType::Bursty { burst_ms, sleep_ms } => {
@@ -1188,26 +1191,29 @@ fn worker_main(
                         }
                         Phase::Io(dur) => {
                             let end = Instant::now() + *dur;
-                            let path = std::env::temp_dir()
-                                .join(format!("stt_seq_{tid}"))
-                                .to_string_lossy()
-                                .to_string();
-                            while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
-                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                            let (f, _) = io_seq_file.get_or_insert_with(|| {
+                                let path = std::env::temp_dir()
+                                    .join(format!("stt_seq_{tid}"))
+                                    .to_string_lossy()
+                                    .to_string();
+                                let f = std::fs::OpenOptions::new()
                                     .write(true)
                                     .create(true)
                                     .truncate(true)
                                     .open(&path)
-                                {
-                                    let buf = [0u8; 4096];
-                                    for _ in 0..16 {
-                                        let _ = f.write_all(&buf);
-                                        work_units = work_units.wrapping_add(1);
-                                    }
-                                    let _ = f.sync_all();
+                                    .expect("failed to create Phase::Io temp file");
+                                (f, path)
+                            });
+                            while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
+                                let _ = f.set_len(0);
+                                let _ = f.seek(std::io::SeekFrom::Start(0));
+                                let buf = [0u8; 4096];
+                                for _ in 0..16 {
+                                    let _ = f.write_all(&buf);
+                                    work_units = work_units.wrapping_add(1);
                                 }
+                                let _ = f.sync_all();
                             }
-                            let _ = std::fs::remove_file(&path);
                             last_iter_time = Instant::now();
                         }
                     }
@@ -1259,6 +1265,14 @@ fn worker_main(
                 last_cpu = cpu;
             }
         }
+    }
+
+    // Clean up persistent temp files.
+    if let Some((_, path)) = io_sync_file {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Some((_, path)) = io_seq_file {
+        let _ = std::fs::remove_file(&path);
     }
 
     // Final iteration count store for host-side sampling.
