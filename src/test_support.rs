@@ -1446,7 +1446,7 @@ fn evaluate_vm_result(
 
     let sched_label = scheduler_label(&entry.scheduler.binary);
     let output = &result.output;
-    let dump_section = extract_sched_ext_dump(output)
+    let dump_section = extract_sched_ext_dump(&result.stderr)
         .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
         .unwrap_or_default();
     let sched_log_section = parse_sched_output(output)
@@ -2495,7 +2495,7 @@ fn parse_sched_output(output: &str) -> Option<&str> {
 // sched_ext dump extraction
 // ---------------------------------------------------------------------------
 
-/// Extract sched_ext_dump lines from guest output (trace_pipe output on COM2).
+/// Extract sched_ext_dump lines from COM1 kernel console (trace_pipe output).
 ///
 /// The trace_pipe stream contains lines with `sched_ext_dump:` prefixes when
 /// a SysRq-D dump is triggered. Collects all such lines into a single string.
