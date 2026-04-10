@@ -29,7 +29,12 @@ Op::set_cpuset("cg_0", CpusetSpec::Disjoint { index: 0, of: 2 })
 Op::stop_cgroup("cg_0")
 Op::spawn("cg_0", Work::default().workers(4))
 Op::set_affinity("cg_0", AffinityKind::RandomSubset)
+Op::spawn_host(Work::default().workers(4))
 ```
+
+`SpawnHost` creates workers in the parent cgroup, not in a managed
+cgroup. Use this to simulate host-level CPU contention alongside
+managed cgroups.
 
 ## CpusetSpec
 
