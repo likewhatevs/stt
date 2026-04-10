@@ -61,7 +61,7 @@ pub struct WorkerReport {
   (`work_units.is_multiple_of(1024)`). How often this fires depends
   on the work type: every outer iteration for CpuSpin/Mixed (1024
   units each), every 1024th yield for YieldHeavy (1 unit each),
-  every 64th fsync cycle for IoSync (16 units each), after each
+  every 64th write-then-sleep cycle for IoSync (16 units each), after each
   inner spin batch for Bursty (1024 units per batch), and after each
   burst for PipeIo (`burst_iters` units per batch, 1024 by default)
 - Scheduling gaps are the longest intervals between iterations
@@ -74,7 +74,7 @@ Workers collect two categories of timing data:
 recorded around blocking operations. Populated for work types with a
 blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
 (futex wait), FutexFanOut (futex wait, receivers only), CacheYield
-(yield), CachePipe (pipe read). Each sample
+(yield), CachePipe (pipe read), IoSync (sleep). Each sample
 is `Instant::elapsed()` across the blocking call, in nanoseconds.
 
 **schedstat deltas**: read from `/proc/self/schedstat` at work-loop

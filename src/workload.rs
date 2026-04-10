@@ -74,7 +74,8 @@ pub enum Phase {
     Sleep(Duration),
     /// Yield (sched_yield) repeatedly for the given duration.
     Yield(Duration),
-    /// Synchronous I/O (write + fsync) for the given duration.
+    /// Simulated I/O (write 64 KB to tmpfs + 100 us sleep) for the given
+    /// duration. See [`WorkType::IoSync`] for details on tmpfs behavior.
     Io(Duration),
 }
 
@@ -101,7 +102,11 @@ pub enum WorkType {
     YieldHeavy,
     /// CPU spin burst followed by sched_yield.
     Mixed,
-    /// Synchronous file I/O: write 64 KB + fsync per cycle.
+    /// Simulated I/O-bound workload: writes 64 KB to a temp file then
+    /// sleeps 100 us to simulate I/O completion latency. On tmpfs (which
+    /// stt VMs use), the write is a page-cache memcpy and fsync is a
+    /// no-op (`noop_fsync`), so the sleep provides the blocking behavior
+    /// that real disk fsync would cause.
     IoSync,
     /// Work hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
     Bursty { burst_ms: u64, sleep_ms: u64 },
@@ -418,7 +423,7 @@ pub struct WorkerReport {
     pub max_gap_at_ms: u64,
     /// Per-wakeup latency samples (ns). Populated for blocking work types
     /// (FutexPingPong, FutexFanOut, CachePipe, Bursty, CacheYield, PipeIo,
-    /// Sequence with Sleep or Yield phases).
+    /// IoSync, Sequence with Sleep, Yield, or Io phases).
     #[serde(default)]
     pub wake_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
@@ -972,7 +977,18 @@ fn worker_main(
                     let _ = f.write_all(&buf);
                     work_units = work_units.wrapping_add(1);
                 }
-                let _ = f.sync_all();
+                // Sleep 100us to simulate I/O completion latency.
+                // On tmpfs, fsync is noop_fsync (returns 0), so without
+                // this sleep IoSync would be a pure CPU workload.
+                let before_sleep = Instant::now();
+                std::thread::sleep(Duration::from_micros(100));
+                reservoir_push(
+                    &mut wake_latencies_ns,
+                    &mut wake_sample_count,
+                    before_sleep.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
+                last_iter_time = Instant::now();
                 iterations += 1;
             }
             WorkType::Bursty { burst_ms, sleep_ms } => {
@@ -1245,7 +1261,14 @@ fn worker_main(
                                     let _ = f.write_all(&buf);
                                     work_units = work_units.wrapping_add(1);
                                 }
-                                let _ = f.sync_all();
+                                let before_sleep = Instant::now();
+                                std::thread::sleep(Duration::from_micros(100));
+                                reservoir_push(
+                                    &mut wake_latencies_ns,
+                                    &mut wake_sample_count,
+                                    before_sleep.elapsed().as_nanos() as u64,
+                                    MAX_WAKE_SAMPLES,
+                                );
                             }
                             last_iter_time = Instant::now();
                         }

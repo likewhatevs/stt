@@ -30,8 +30,11 @@ scheduler wake/sleep paths.
 **`Mixed`** -- 1024 spin iterations then yield. Combines CPU and
 voluntary preemption.
 
-**`IoSync`** -- writes 64 KB to a temp file and calls `fsync()`.
-Exercises I/O scheduling.
+**`IoSync`** -- writes 64 KB to a temp file then sleeps 100 us to
+simulate I/O completion latency. On tmpfs (which stt VMs use), fsync
+is a kernel no-op and writes go to page cache, so the sleep provides
+the blocking that real disk I/O would cause. Exercises scheduler
+dequeue/requeue paths and page allocator pressure.
 
 **`Bursty`** -- CPU burst for `burst_ms`, then sleep for `sleep_ms`.
 Frees CPUs during sleep, exercising CPU borrowing.
@@ -70,7 +73,7 @@ starts. Phases are defined via the `Phase` enum:
 - `Phase::Spin(Duration)` -- CPU spin for the given duration.
 - `Phase::Sleep(Duration)` -- `thread::sleep` for the given duration.
 - `Phase::Yield(Duration)` -- repeated `sched_yield` for the given duration.
-- `Phase::Io(Duration)` -- synchronous I/O (write + fsync) for the given duration.
+- `Phase::Io(Duration)` -- simulated I/O (write 64 KB + 100 us sleep) for the given duration.
 
 `Sequence` cannot be constructed via `WorkType::from_name()` because
 it requires explicit phase definitions. Build it directly:
