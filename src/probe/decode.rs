@@ -27,17 +27,26 @@ pub(crate) fn decode_dsq_id(id: u64) -> String {
 /// Decode a single 64-bit cpumask word into a CPU range string.
 /// Handles CPUs 0-63 (one u64 word).
 pub(crate) fn decode_cpumask(bits: u64) -> String {
-    decode_cpumask_multi(&[bits])
+    decode_cpumask_multi(&[bits], None)
 }
 
 /// Decode multiple 64-bit cpumask words into a CPU range string.
 /// Word 0 covers CPUs 0-63, word 1 covers CPUs 64-127, etc.
-/// Trailing zero words are ignored.
-pub(crate) fn decode_cpumask_multi(words: &[u64]) -> String {
+///
+/// `nr_cpus` bounds valid bits: only CPUs 0..nr_cpus are considered.
+/// Bits beyond nr_cpus are ignored (they may be uninitialized kernel
+/// memory when the cpumask was read via BPF). Pass `None` to decode
+/// all bits.
+pub(crate) fn decode_cpumask_multi(words: &[u64], nr_cpus: Option<u32>) -> String {
+    let max_cpu = nr_cpus.unwrap_or(words.len() as u32 * 64);
     let mut cpus = Vec::new();
     for (word_idx, &bits) in words.iter().enumerate() {
         let base = word_idx as u32 * 64;
-        for i in 0..64u32 {
+        if base >= max_cpu {
+            break;
+        }
+        let top = (max_cpu - base).min(64);
+        for i in 0..top {
             if bits & (1u64 << i) != 0 {
                 cpus.push(base + i);
             }
@@ -631,30 +640,30 @@ mod tests {
 
     #[test]
     fn decode_cpumask_multi_empty() {
-        assert_eq!(decode_cpumask_multi(&[0, 0, 0, 0]), "none");
+        assert_eq!(decode_cpumask_multi(&[0, 0, 0, 0], None), "none");
     }
 
     #[test]
     fn decode_cpumask_multi_word0_only() {
-        assert_eq!(decode_cpumask_multi(&[0xf, 0, 0, 0]), "0-3");
+        assert_eq!(decode_cpumask_multi(&[0xf, 0, 0, 0], None), "0-3");
     }
 
     #[test]
     fn decode_cpumask_multi_word1() {
         // CPU 64 is bit 0 of word 1.
-        assert_eq!(decode_cpumask_multi(&[0, 1, 0, 0]), "64");
+        assert_eq!(decode_cpumask_multi(&[0, 1, 0, 0], None), "64");
     }
 
     #[test]
     fn decode_cpumask_multi_span_words() {
         // CPUs 63 and 64: last bit of word 0, first bit of word 1.
-        assert_eq!(decode_cpumask_multi(&[1u64 << 63, 1, 0, 0]), "63-64");
+        assert_eq!(decode_cpumask_multi(&[1u64 << 63, 1, 0, 0], None), "63-64");
     }
 
     #[test]
     fn decode_cpumask_multi_all_four_words() {
         // One CPU per word: 0, 64, 128, 192.
-        assert_eq!(decode_cpumask_multi(&[1, 1, 1, 1]), "0,64,128,192");
+        assert_eq!(decode_cpumask_multi(&[1, 1, 1, 1], None), "0,64,128,192");
     }
 
     #[test]
@@ -662,19 +671,52 @@ mod tests {
         // CPUs 62-65: last 2 bits of word 0, first 2 bits of word 1.
         let w0 = (1u64 << 62) | (1u64 << 63);
         let w1 = 0b11u64;
-        assert_eq!(decode_cpumask_multi(&[w0, w1, 0, 0]), "62-65");
+        assert_eq!(decode_cpumask_multi(&[w0, w1, 0, 0], None), "62-65");
     }
 
     #[test]
     fn decode_cpumask_multi_single_word_compat() {
         // Single-word call should match decode_cpumask.
-        assert_eq!(decode_cpumask_multi(&[0x33]), decode_cpumask(0x33));
+        assert_eq!(decode_cpumask_multi(&[0x33], None), decode_cpumask(0x33));
     }
 
     #[test]
     fn decode_cpumask_multi_word3_high() {
         // CPU 255: highest bit of word 3.
-        assert_eq!(decode_cpumask_multi(&[0, 0, 0, 1u64 << 63]), "255");
+        assert_eq!(decode_cpumask_multi(&[0, 0, 0, 1u64 << 63], None), "255");
+    }
+
+    #[test]
+    fn decode_cpumask_multi_nr_cpus_truncates() {
+        // 8-CPU VM: only bits 0-7 are valid.
+        // Word 0 has CPUs 0-7 set, word 1 has garbage.
+        let w0 = 0xff;
+        let w1 = 0xffffffffffffffff; // garbage
+        assert_eq!(decode_cpumask_multi(&[w0, w1, 0, 0], Some(8)), "0-7",);
+    }
+
+    #[test]
+    fn decode_cpumask_multi_nr_cpus_mid_word() {
+        // 10 CPUs: bits 0-9 valid. Word 0 has 0xff (CPUs 0-7),
+        // plus bits 8-9 in positions that should be included.
+        let w0 = 0x3ff; // bits 0-9
+        assert_eq!(decode_cpumask_multi(&[w0], Some(10)), "0-9");
+        // With garbage beyond bit 9:
+        let w0_garbage = 0xffff_ffff_ffff_ffff;
+        assert_eq!(decode_cpumask_multi(&[w0_garbage], Some(10)), "0-9");
+    }
+
+    #[test]
+    fn decode_cpumask_multi_nr_cpus_word_boundary() {
+        // Exactly 64 CPUs: full word 0 is valid, word 1 is garbage.
+        let w0 = 0xff;
+        let w1 = 0xdeadbeef;
+        assert_eq!(decode_cpumask_multi(&[w0, w1], Some(64)), "0-7",);
+    }
+
+    #[test]
+    fn decode_cpumask_multi_nr_cpus_zero() {
+        assert_eq!(decode_cpumask_multi(&[0xff], Some(0)), "none");
     }
 
     // -- decode_kick_flags --

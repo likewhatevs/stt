@@ -1,5 +1,29 @@
 use super::decode::{decode_named_value, format_raw_arg};
 
+/// Read nr_cpu_ids from sysfs. Returns the number of possible CPUs
+/// (upper bound of the "possible" range). Falls back to
+/// `libc::sysconf(_SC_NPROCESSORS_CONF)` if sysfs is unavailable.
+fn get_nr_cpus() -> Option<u32> {
+    // /sys/devices/system/cpu/possible contains "0-N" or "0-N,M-P".
+    // The highest CPU ID + 1 is nr_cpu_ids.
+    if let Ok(content) = std::fs::read_to_string("/sys/devices/system/cpu/possible") {
+        let max_cpu = content
+            .trim()
+            .split(',')
+            .filter_map(|range| {
+                let last = range.split('-').next_back()?;
+                last.parse::<u32>().ok()
+            })
+            .max();
+        if let Some(max) = max_cpu {
+            return Some(max + 1);
+        }
+    }
+    // Fallback: configured processors.
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+    if n > 0 { Some(n as u32) } else { None }
+}
+
 // Used by test_support.rs; #[allow] suppresses false positive from binary crate.
 #[allow(dead_code)]
 pub(crate) fn extract_section(text: &str, start: &str, end: &str) -> String {
@@ -294,9 +318,31 @@ fn format_probe_events_inner(
                     _ => {}
                 }
             }
-            let merged_cpumask = super::decode::decode_cpumask_multi(&cpumask_words);
-            let merged_cpumask_str = if cpumask_words[1..].iter().any(|&w| w != 0) {
-                let hex_parts: Vec<String> = cpumask_words
+            let nr_cpus = get_nr_cpus();
+            let merged_cpumask = super::decode::decode_cpumask_multi(&cpumask_words, nr_cpus);
+
+            // Mask raw words to nr_cpus before hex display so garbage
+            // bits from uninitialized kernel memory are not shown.
+            let display_words = if let Some(nr) = nr_cpus {
+                let mut masked = [0u64; 4];
+                for (i, &w) in cpumask_words.iter().enumerate() {
+                    let base = i as u32 * 64;
+                    if base >= nr {
+                        break;
+                    }
+                    let valid_bits = nr - base;
+                    if valid_bits >= 64 {
+                        masked[i] = w;
+                    } else {
+                        masked[i] = w & ((1u64 << valid_bits) - 1);
+                    }
+                }
+                masked
+            } else {
+                cpumask_words
+            };
+            let merged_cpumask_str = if display_words[1..].iter().any(|&w| w != 0) {
+                let hex_parts: Vec<String> = display_words
                     .iter()
                     .rev()
                     .skip_while(|&&w| w == 0)
@@ -304,7 +350,7 @@ fn format_probe_events_inner(
                     .collect();
                 format!("0x{}({merged_cpumask})", hex_parts.join("_"))
             } else {
-                format!("0x{:x}({merged_cpumask})", cpumask_words[0])
+                format!("0x{:x}({merged_cpumask})", display_words[0])
             };
 
             // Group fields by parameter, emit type headers for struct params.
