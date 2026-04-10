@@ -88,7 +88,7 @@ A `Step` is a sequence of ops with a hold period:
 
 ```rust,ignore
 pub struct Step {
-    pub setup: Setup,   // CgroupDefs to create before ops
+    pub setup: Setup,   // CgroupDefs to create after ops
     pub ops: Vec<Op>,   // Operations to apply
     pub hold: HoldSpec, // How long to wait after
 }

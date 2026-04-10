@@ -122,8 +122,8 @@ pub enum WorkType {
     /// Strided read-modify-write over a buffer, sized to pressure the L1
     /// cache. Each worker allocates its own buffer post-fork.
     CachePressure { size_kb: usize, stride: usize },
-    /// Cache pressure followed by sched_yield(). Tests wake_affine
-    /// placement after voluntary preemption.
+    /// Cache pressure burst followed by sched_yield(). Tests scheduler
+    /// re-placement after voluntary yield with a cache-hot working set.
     CacheYield { size_kb: usize, stride: usize },
     /// Cache pressure burst then 1-byte pipe exchange with a partner
     /// worker. Combines cache-hot working set with cross-CPU wake
