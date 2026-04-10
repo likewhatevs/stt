@@ -785,6 +785,11 @@ impl WorkloadHandle {
     /// Auto-starts workers if [`start()`](Self::start) was not called,
     /// then sleeps 500ms to let them begin before signaling stop.
     /// Consumes `self` -- workers cannot be restarted.
+    ///
+    /// Workers that fail to produce a report (died, timed out, or wrote
+    /// corrupt data) get a zeroed-out sentinel report with `work_units: 0`.
+    /// This ensures `assert_not_starved` catches dead workers as starvation
+    /// failures.
     pub fn stop_and_collect(mut self) -> Vec<WorkerReport> {
         // Auto-start if not explicitly started (workers in parent cgroup)
         let was_started = self.started;
@@ -851,6 +856,29 @@ impl WorkloadHandle {
 
             if let Ok(report) = serde_json::from_slice::<WorkerReport>(&buf) {
                 reports.push(report);
+            } else {
+                eprintln!(
+                    "stt: worker pid={pid} returned no report ({} bytes read)",
+                    buf.len()
+                );
+                reports.push(WorkerReport {
+                    tid: pid,
+                    work_units: 0,
+                    cpu_time_ns: 0,
+                    wall_time_ns: 0,
+                    off_cpu_ns: 0,
+                    migration_count: 0,
+                    cpus_used: BTreeSet::new(),
+                    migrations: Vec::new(),
+                    max_gap_ms: 0,
+                    max_gap_cpu: 0,
+                    max_gap_at_ms: 0,
+                    wake_latencies_ns: Vec::new(),
+                    iterations: 0,
+                    schedstat_run_delay_ns: 0,
+                    schedstat_ctx_switches: 0,
+                    schedstat_cpu_time_ns: 0,
+                });
             }
         }
 
