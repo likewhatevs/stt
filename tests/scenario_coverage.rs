@@ -364,7 +364,7 @@ static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
     scheduler: &STT_SCHED,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout_s: 3,
-    duration_s: 10,
+    duration: std::time::Duration::from_secs(10),
     expect_err: true,
     ..SttTestEntry::DEFAULT
 };

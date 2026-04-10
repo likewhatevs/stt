@@ -573,7 +573,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             watchdog_timeout_s: #watchdog_timeout_s,
             bpf_map_write: #bpf_map_write_tokens,
             performance_mode: #performance_mode,
-            duration_s: #duration_s,
+            duration: ::std::time::Duration::from_secs(#duration_s),
             workers_per_cgroup: #workers_per_cgroup,
             expect_err: #expect_err,
             host_only: false,

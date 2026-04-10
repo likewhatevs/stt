@@ -79,7 +79,7 @@ static __STT_ENTRY_BPF_API: stt::test_support::SttTestEntry = stt::test_support:
     auto_repro: false,
     assert: stt::assert::Assert::NONE.fail_on_stall(false),
     bpf_map_write: Some(&BPF_NOOP),
-    duration_s: 10,
+    duration: std::time::Duration::from_secs(10),
     ..stt::test_support::SttTestEntry::DEFAULT
 };
 
@@ -128,7 +128,7 @@ static __STT_ENTRY_PERF_NEG: stt::test_support::SttTestEntry = stt::test_support
     auto_repro: false,
     extra_sched_args: &["--degrade"],
     performance_mode: true,
-    duration_s: 5,
+    duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 4,
     expect_err: true,
     ..stt::test_support::SttTestEntry::DEFAULT
@@ -163,7 +163,7 @@ static __STT_ENTRY_SCATTER: stt::test_support::SttTestEntry = stt::test_support:
     scheduler: &SCATTER_SCHED,
     extra_sched_args: &["--scattershot"],
     performance_mode: true,
-    duration_s: 5,
+    duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 4,
     ..stt::test_support::SttTestEntry::DEFAULT
 };
@@ -191,7 +191,7 @@ static __STT_ENTRY_SLOW: stt::test_support::SttTestEntry = stt::test_support::St
     scheduler: &SLOW_SCHED,
     extra_sched_args: &["--slow"],
     performance_mode: true,
-    duration_s: 5,
+    duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 4,
     expect_err: true,
     ..stt::test_support::SttTestEntry::DEFAULT
@@ -216,7 +216,7 @@ static __STT_ENTRY_AUTO_REPRO: stt::test_support::SttTestEntry = stt::test_suppo
     scheduler: &STALL_SCHED,
     extra_sched_args: &["--stall-after=1"],
     watchdog_timeout_s: 3,
-    duration_s: 10,
+    duration: std::time::Duration::from_secs(10),
     workers_per_cgroup: 2,
     expect_err: true,
     ..stt::test_support::SttTestEntry::DEFAULT
@@ -238,7 +238,7 @@ static __STT_ENTRY_EEVDF: stt::test_support::SttTestEntry = stt::test_support::S
     func: scenario_baseline,
     auto_repro: false,
     performance_mode: true,
-    duration_s: 3,
+    duration: std::time::Duration::from_secs(3),
     workers_per_cgroup: 4,
     ..stt::test_support::SttTestEntry::DEFAULT
 };
@@ -250,7 +250,7 @@ static __STT_ENTRY_SCX: stt::test_support::SttTestEntry = stt::test_support::Stt
     func: scenario_baseline,
     scheduler: &STT_SCHED,
     performance_mode: true,
-    duration_s: 3,
+    duration: std::time::Duration::from_secs(3),
     workers_per_cgroup: 4,
     ..stt::test_support::SttTestEntry::DEFAULT
 };
@@ -297,7 +297,7 @@ static __STT_ENTRY_MID_DEGRADE: stt::test_support::SttTestEntry = stt::test_supp
     scheduler: &STT_SCHED,
     extra_sched_args: &["--degrade-after=3"],
     performance_mode: true,
-    duration_s: 10,
+    duration: std::time::Duration::from_secs(10),
     workers_per_cgroup: 4,
     watchdog_timeout_s: 60,
     expect_err: true,

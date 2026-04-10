@@ -36,7 +36,7 @@ pub(crate) struct TestCandidate {
 //   Bit  33:     performance_mode
 //   Bit  34:     host_only
 //   Bit  35:     expect_err
-//   Bits 36..38: duration_s bucket (3 one-hot bits)
+//   Bits 36..38: duration bucket (3 one-hot bits)
 //   Bit  39:     workers_per_cgroup bucket (1 bit)
 //   Bit  40:     is gauntlet variant
 //   Bits 41..44: test name hash (4 one-hot bits)
@@ -107,9 +107,9 @@ fn llc_bucket(num_llcs: u32) -> u64 {
     }
 }
 
-/// Classify duration_s into a one-hot bit (3 classes).
-fn duration_bucket(duration_s: u64) -> u64 {
-    match duration_s {
+/// Classify duration (seconds) into a one-hot bit (3 classes).
+fn duration_bucket(duration_secs: u64) -> u64 {
+    match duration_secs {
         0..=2 => 1 << 0,
         3..=10 => 1 << 1,
         _ => 1 << 2,
@@ -165,7 +165,7 @@ pub(crate) fn extract_features(
     }
 
     // Duration bucket
-    bits |= duration_bucket(entry.duration_s) << DURATION_SHIFT;
+    bits |= duration_bucket(entry.duration.as_secs()) << DURATION_SHIFT;
 
     // Workers bucket
     bits |= workers_bucket(entry.workers_per_cgroup) << WORKERS_SHIFT;
@@ -183,19 +183,20 @@ pub(crate) fn extract_features(
 
 /// Estimate wall-clock seconds for a test.
 ///
-/// VM tests: `10 + max(0, (total_cpus - 16) / 10) + duration_s + 2`.
+/// VM tests: `10 + max(0, (total_cpus - 16) / 10) + duration + 2`.
 /// Adds 3s for `performance_mode` (hugepage setup, vCPU pinning).
 /// Derived from the boot overhead in `vm::compute_timeout`.
 ///
-/// Host-only tests run without a VM: `duration_s + 2`.
+/// Host-only tests run without a VM: `duration + 2`.
 pub(crate) fn estimate_duration(entry: &SttTestEntry, topo: &Topology) -> f64 {
+    let duration_secs = entry.duration.as_secs();
     if entry.host_only {
-        return (entry.duration_s + 2) as f64;
+        return (duration_secs + 2) as f64;
     }
     let cpus = topo.total_cpus() as u64;
     let boot_overhead = 10 + cpus.saturating_sub(16) / 10;
     let perf_overhead: u64 = if entry.performance_mode { 3 } else { 0 };
-    (boot_overhead + entry.duration_s + 2 + perf_overhead) as f64
+    (boot_overhead + duration_secs + 2 + perf_overhead) as f64
 }
 
 /// Select tests that maximize feature coverage within a time budget.
@@ -487,7 +488,7 @@ mod tests {
     #[test]
     fn estimate_duration_small_topo() {
         let entry = SttTestEntry {
-            duration_s: 2,
+            duration: std::time::Duration::from_secs(2),
             ..SttTestEntry::DEFAULT
         };
         let topo = Topology {
@@ -502,7 +503,7 @@ mod tests {
     #[test]
     fn estimate_duration_large_topo() {
         let entry = SttTestEntry {
-            duration_s: 5,
+            duration: std::time::Duration::from_secs(5),
             ..SttTestEntry::DEFAULT
         };
         let topo = Topology {
@@ -518,7 +519,7 @@ mod tests {
     #[test]
     fn estimate_duration_performance_mode() {
         let entry = SttTestEntry {
-            duration_s: 2,
+            duration: std::time::Duration::from_secs(2),
             performance_mode: true,
             ..SttTestEntry::DEFAULT
         };
@@ -743,7 +744,7 @@ mod tests {
     #[test]
     fn estimate_duration_host_only() {
         let entry = SttTestEntry {
-            duration_s: 5,
+            duration: std::time::Duration::from_secs(5),
             host_only: true,
             ..SttTestEntry::DEFAULT
         };

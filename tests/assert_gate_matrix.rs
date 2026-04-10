@@ -38,7 +38,7 @@ macro_rules! perf_positive_test {
             scheduler: &STT_SCHED,
             auto_repro: false,
             performance_mode: true,
-            duration_s: 5,
+            duration: std::time::Duration::from_secs(5),
             workers_per_cgroup: 2,
             ..SttTestEntry::DEFAULT
         };
@@ -65,7 +65,7 @@ macro_rules! perf_negative_test {
             auto_repro: false,
             extra_sched_args: &["--degrade"],
             performance_mode: true,
-            duration_s: 5,
+            duration: std::time::Duration::from_secs(5),
             workers_per_cgroup: 4,
             expect_err: true,
             ..SttTestEntry::DEFAULT
@@ -91,7 +91,7 @@ macro_rules! noperf_positive_test {
             func: $name::scenario,
             scheduler: &STT_SCHED,
             auto_repro: false,
-            duration_s: 5,
+            duration: std::time::Duration::from_secs(5),
             workers_per_cgroup: 2,
             ..SttTestEntry::DEFAULT
         };
@@ -117,7 +117,7 @@ macro_rules! noperf_negative_test {
             scheduler: &STT_SCHED,
             auto_repro: false,
             extra_sched_args: &["--degrade"],
-            duration_s: 5,
+            duration: std::time::Duration::from_secs(5),
             workers_per_cgroup: 4,
             expect_err: true,
             ..SttTestEntry::DEFAULT

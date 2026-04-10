@@ -475,8 +475,8 @@ pub struct SttTestEntry {
     /// validate that the host has enough CPUs and LLCs to satisfy the
     /// request without oversubscription.
     pub performance_mode: bool,
-    /// Workload duration in seconds.
-    pub duration_s: u64,
+    /// Workload duration.
+    pub duration: Duration,
     /// Workers per cgroup.
     pub workers_per_cgroup: u32,
     /// When true, the test expects run_stt_test to return Err.
@@ -525,7 +525,7 @@ impl SttTestEntry {
         required_flags: &[],
         excluded_flags: &[],
         performance_mode: false,
-        duration_s: 2,
+        duration: Duration::from_secs(2),
         workers_per_cgroup: 2,
         expect_err: false,
         host_only: false,
@@ -893,7 +893,6 @@ fn run_host_only_test_inner(entry: &SttTestEntry) -> Result<AssertResult> {
         entry.topology.threads_per_core,
     );
     let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/stt");
-    let duration = Duration::from_secs(entry.duration_s);
     let workers_per_cgroup = entry.workers_per_cgroup as usize;
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(&entry.scheduler.assert)
@@ -901,7 +900,7 @@ fn run_host_only_test_inner(entry: &SttTestEntry) -> Result<AssertResult> {
     let ctx = crate::scenario::Ctx {
         cgroups: &cgroups,
         topo: &topo,
-        duration,
+        duration: entry.duration,
         workers_per_cgroup,
         sched_pid: 0,
         settle: Duration::from_millis(500),
@@ -2067,7 +2066,6 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
-    let duration = Duration::from_secs(entry.duration_s);
     let workers_per_cgroup = entry.workers_per_cgroup as usize;
     // Three-layer merge: default_checks -> scheduler.assert -> entry.assert.
     let merged_assert = crate::assert::Assert::default_checks()
@@ -2076,7 +2074,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     let ctx = Ctx {
         cgroups: &cgroups,
         topo: &topo,
-        duration,
+        duration: entry.duration,
         workers_per_cgroup,
         sched_pid,
         settle: Duration::from_millis(500),
