@@ -19,6 +19,12 @@ pub enum WorkType {
 }
 ```
 
+Parameterized variants have convenience constructors:
+`WorkType::bursty(50, 100)`, `WorkType::pipe_io(1024)`,
+`WorkType::futex_ping_pong(1024)`, `WorkType::cache_pressure(32, 64)`,
+`WorkType::cache_yield(32, 64)`, `WorkType::cache_pipe(32, 1024)`,
+`WorkType::futex_fan_out(4, 1024)`.
+
 ## Variants
 
 **`CpuSpin`** -- tight spin loop with `spin_loop()` hints. 1024

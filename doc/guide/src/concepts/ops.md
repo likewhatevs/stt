@@ -25,7 +25,7 @@ Op constructors accept string literals directly (no `.into()` needed):
 
 ```rust,ignore
 Op::add_cgroup("cg_0")
-Op::set_cpuset("cg_0", CpusetSpec::Disjoint { index: 0, of: 2 })
+Op::set_cpuset("cg_0", CpusetSpec::disjoint(0, 2))
 Op::stop_cgroup("cg_0")
 Op::spawn("cg_0", Work::default().workers(4))
 Op::set_affinity("cg_0", AffinityKind::RandomSubset)
@@ -50,6 +50,11 @@ pub enum CpusetSpec {
 }
 ```
 
+Convenience constructors accept parameters directly:
+`CpusetSpec::disjoint(0, 2)`, `CpusetSpec::range(0.0, 0.5)`,
+`CpusetSpec::exact([0, 1, 2])`, `CpusetSpec::llc(0)`,
+`CpusetSpec::overlap(0, 2, 0.5)`.
+
 All fractional specs operate on `usable_cpus()`, which reserves the
 last CPU for the root cgroup when the topology has more than 2 CPUs.
 
@@ -61,7 +66,7 @@ ops-based scenarios.
 
 ```rust,ignore
 let def = CgroupDef::named("cg_0")
-    .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
+    .with_cpuset(CpusetSpec::disjoint(0, 2))
     .workers(4)
     .work_type(WorkType::CpuSpin);
 ```

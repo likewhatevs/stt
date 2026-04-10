@@ -62,7 +62,7 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("cg_0").workers(4),
         CgroupDef::named("cg_1")
             .workers(2)
-            .work_type(WorkType::Bursty { burst_ms: 50, sleep_ms: 100 }),
+            .work_type(WorkType::bursty(50, 100)),
     ])
 }
 ```

@@ -14,10 +14,10 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
         Step::with_defs(
             vec![
                 CgroupDef::named("cg_0")
-                    .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
+                    .with_cpuset(CpusetSpec::disjoint(0, 2))
                     .workers(4),
                 CgroupDef::named("cg_1")
-                    .with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 })
+                    .with_cpuset(CpusetSpec::disjoint(1, 2))
                     .workers(4),
             ],
             HoldSpec::Frac(0.5),
@@ -25,8 +25,8 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
         // Phase 2: resize cpusets to overlap
         Step::new(
             vec![
-                Op::set_cpuset("cg_0", CpusetSpec::Overlap { index: 0, of: 2, frac: 0.5 }),
-                Op::set_cpuset("cg_1", CpusetSpec::Overlap { index: 1, of: 2, frac: 0.5 }),
+                Op::set_cpuset("cg_0", CpusetSpec::overlap(0, 2, 0.5)),
+                Op::set_cpuset("cg_1", CpusetSpec::overlap(1, 2, 0.5)),
             ],
             HoldSpec::Frac(0.5),
         ),

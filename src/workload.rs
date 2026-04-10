@@ -98,7 +98,7 @@ pub enum Phase {
 /// let wt = WorkType::from_name("CpuSpin").unwrap();
 /// assert!(matches!(wt, WorkType::CpuSpin));
 ///
-/// let bursty = WorkType::Bursty { burst_ms: 10, sleep_ms: 5 };
+/// let bursty = WorkType::bursty(10, 5);
 /// assert!(matches!(bursty, WorkType::Bursty { .. }));
 ///
 /// assert!(WorkType::from_name("nonexistent").is_none());
@@ -387,7 +387,7 @@ impl Default for WorkloadConfig {
 /// # use stt::workload::{Work, WorkType, SchedPolicy};
 /// let w = Work::default()
 ///     .workers(4)
-///     .work_type(WorkType::Bursty { burst_ms: 50, sleep_ms: 100 })
+///     .work_type(WorkType::bursty(50, 100))
 ///     .sched_policy(SchedPolicy::Batch);
 /// assert_eq!(w.num_workers, Some(4));
 /// ```
