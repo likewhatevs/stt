@@ -575,9 +575,10 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    unsafe {
-        libc::munmap(m.map_base, m.map_size);
-    }
+    // Do NOT munmap here. SHM_PTR (OnceLock) retains the mmap pointer
+    // and write_msg() in the main thread dereferences it after this
+    // function returns (Phase 7: MSG_TYPE_EXIT). The guest reboots
+    // immediately after — the kernel frees all mappings on exit.
 }
 
 /// Monitor the scheduler child process for unexpected exit.
