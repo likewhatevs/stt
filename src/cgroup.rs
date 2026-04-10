@@ -44,9 +44,22 @@ fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> 
 /// dead PID to `cgroup.procs` (`cgroup_procs_write_start` calls
 /// `find_task_by_vpid`, which returns NULL for reaped tasks).
 fn is_esrch(err: &anyhow::Error) -> bool {
+    is_os_error(err, libc::ESRCH)
+}
+
+/// Check whether an anyhow error chain contains an `io::Error` with
+/// `raw_os_error() == EBUSY`. The kernel returns EBUSY when writing
+/// to `cgroup.procs` of a cgroup that has `subtree_control` set
+/// (cgroup v2 no-internal-process constraint via
+/// `cgroup_migrate_vet_dst`).
+fn is_ebusy(err: &anyhow::Error) -> bool {
+    is_os_error(err, libc::EBUSY)
+}
+
+fn is_os_error(err: &anyhow::Error, errno: i32) -> bool {
     for cause in err.chain() {
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
-            && io_err.raw_os_error() == Some(libc::ESRCH)
+            && io_err.raw_os_error() == Some(errno)
         {
             return true;
         }
@@ -186,18 +199,50 @@ impl CgroupManager {
     /// Move multiple tasks into a child cgroup by PID.
     ///
     /// Tolerates ESRCH (task exited between listing and migration).
+    /// Retries EBUSY (cgroup v2 no-internal-process constraint from
+    /// `cgroup_migrate_vet_dst` when `subtree_control` is set on the
+    /// destination, or transient contention from concurrent cgroup
+    /// operations). Retries up to 5 times with 50ms backoff, then
+    /// warns and skips the task.
     /// Propagates all other errors immediately.
     pub fn move_tasks(&self, name: &str, tids: &[u32]) -> Result<()> {
         for &t in tids {
-            if let Err(e) = self.move_task(name, t) {
+            if let Err(e) = self.move_task_with_retry(name, t) {
                 if is_esrch(&e) {
                     tracing::warn!(tid = t, cgroup = name, "task vanished during migration");
+                    continue;
+                }
+                if is_ebusy(&e) {
+                    tracing::warn!(tid = t, cgroup = name, "EBUSY after retries, skipping task");
                     continue;
                 }
                 return Err(e);
             }
         }
         Ok(())
+    }
+
+    /// Attempt to move a single task, retrying on EBUSY.
+    fn move_task_with_retry(&self, name: &str, tid: u32) -> Result<()> {
+        const MAX_RETRIES: u32 = 5;
+        const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+        for attempt in 0..MAX_RETRIES {
+            match self.move_task(name, tid) {
+                Ok(()) => return Ok(()),
+                Err(e) if is_ebusy(&e) && attempt + 1 < MAX_RETRIES => {
+                    tracing::debug!(
+                        tid,
+                        cgroup = name,
+                        attempt = attempt + 1,
+                        "EBUSY on cgroup.procs write, retrying"
+                    );
+                    std::thread::sleep(RETRY_DELAY);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
     }
 
     /// Move all tasks from a child cgroup back to the parent.
@@ -410,6 +455,20 @@ mod tests {
         let io_err = std::io::Error::from_raw_os_error(libc::ENOENT);
         let anyhow_err = anyhow::Error::new(io_err).context("write cgroup.procs");
         assert!(!is_esrch(&anyhow_err));
+    }
+
+    #[test]
+    fn is_ebusy_detects_ebusy_in_chain() {
+        let io_err = std::io::Error::from_raw_os_error(libc::EBUSY);
+        let anyhow_err = anyhow::Error::new(io_err).context("write cgroup.procs");
+        assert!(is_ebusy(&anyhow_err));
+    }
+
+    #[test]
+    fn is_ebusy_rejects_esrch() {
+        let io_err = std::io::Error::from_raw_os_error(libc::ESRCH);
+        let anyhow_err = anyhow::Error::new(io_err).context("write cgroup.procs");
+        assert!(!is_ebusy(&anyhow_err));
     }
 
     #[test]
