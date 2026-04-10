@@ -11,7 +11,7 @@
 //! in the [`idr`] module) through page table translation. No guest
 //! cooperation is needed.
 //!
-//! See the [Monitor](https://likewhatevs.github.io/scx-ktstr/guide/architecture/monitor.html)
+//! See the [Monitor](https://likewhatevs.github.io/stt/guide/architecture/monitor.html)
 //! chapter of the guide.
 
 pub mod bpf_map;
@@ -1215,7 +1215,7 @@ mod tests {
     #[test]
     fn ikconfig_extracts_hz_1000() {
         let blob = make_ikconfig_blob("CONFIG_HZ=1000\nCONFIG_PREEMPT=y\n");
-        let dir = std::env::temp_dir().join("ktstr-ikconfig-test-1000");
+        let dir = std::env::temp_dir().join("stt-ikconfig-test-1000");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vmlinux");
         std::fs::write(&path, &blob).unwrap();
@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn ikconfig_extracts_hz_250() {
         let blob = make_ikconfig_blob("CONFIG_HZ=250\n");
-        let dir = std::env::temp_dir().join("ktstr-ikconfig-test-250");
+        let dir = std::env::temp_dir().join("stt-ikconfig-test-250");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vmlinux");
         std::fs::write(&path, &blob).unwrap();
@@ -1236,7 +1236,7 @@ mod tests {
 
     #[test]
     fn ikconfig_no_marker_returns_none() {
-        let dir = std::env::temp_dir().join("ktstr-ikconfig-test-none");
+        let dir = std::env::temp_dir().join("stt-ikconfig-test-none");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vmlinux");
         std::fs::write(&path, b"no marker here").unwrap();
@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     fn ikconfig_missing_config_hz_returns_none() {
         let blob = make_ikconfig_blob("CONFIG_PREEMPT=y\n");
-        let dir = std::env::temp_dir().join("ktstr-ikconfig-test-nohz");
+        let dir = std::env::temp_dir().join("stt-ikconfig-test-nohz");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vmlinux");
         std::fs::write(&path, &blob).unwrap();

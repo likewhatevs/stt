@@ -4,7 +4,7 @@
 //! Provides cpuset generation methods used by [`CpusetMode`](crate::scenario::CpusetMode)
 //! and [`CpusetSpec`](crate::scenario::ops::CpusetSpec).
 //!
-//! See the [Scenarios](https://likewhatevs.github.io/scx-ktstr/guide/concepts/scenarios.html)
+//! See the [Scenarios](https://likewhatevs.github.io/stt/guide/concepts/scenarios.html)
 //! chapter for how topology drives cpuset partitioning.
 
 use anyhow::{Context, Result, bail};

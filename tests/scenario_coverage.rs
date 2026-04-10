@@ -1,37 +1,36 @@
 use anyhow::Result;
-use scx_ktstr::assert::AssertResult;
-use scx_ktstr::ktstr_test;
-use scx_ktstr::scenario::Ctx;
-use scx_ktstr::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
+use stt::assert::AssertResult;
+use stt::scenario::Ctx;
+use stt::stt_test;
+use stt::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
-const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr-sched"));
+const STT_SCHED: Scheduler = Scheduler::new("stt_sched").binary(SchedulerSpec::Name("stt-sched"));
 
 // -- basic --
 
-#[ktstr_test(sockets = 1, cores = 2, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 2, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::basic::custom_cgroup_pipe_io(ctx)
+    stt::scenario::basic::custom_cgroup_pipe_io(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::basic::custom_sched_mixed(ctx)
+    stt::scenario::basic::custom_sched_mixed(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::basic::custom_host_cgroup_contention(ctx)
+    stt::scenario::basic::custom_host_cgroup_contention(ctx)
 }
 
 // -- affinity --
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::affinity::custom_cgroup_affinity_change(ctx)
+    stt::scenario::affinity::custom_cgroup_affinity_change(ctx)
 }
 
-#[ktstr_test(
+#[stt_test(
     sockets = 1,
     cores = 4,
     threads = 1,
@@ -39,10 +38,10 @@ fn cover_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     max_spread_pct = 80.0
 )]
 fn cover_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::affinity::custom_cgroup_multicpu_pin(ctx)
+    stt::scenario::affinity::custom_cgroup_multicpu_pin(ctx)
 }
 
-#[ktstr_test(
+#[stt_test(
     sockets = 1,
     cores = 4,
     threads = 1,
@@ -50,251 +49,251 @@ fn cover_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     max_spread_pct = 80.0
 )]
 fn cover_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::affinity::custom_cgroup_cpuset_multicpu_pin(ctx)
+    stt::scenario::affinity::custom_cgroup_cpuset_multicpu_pin(ctx)
 }
 
 // -- cpuset --
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::cpuset::custom_cgroup_cpuset_apply_midrun(ctx)
+    stt::scenario::cpuset::custom_cgroup_cpuset_apply_midrun(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::cpuset::custom_cgroup_cpuset_clear_midrun(ctx)
+    stt::scenario::cpuset::custom_cgroup_cpuset_clear_midrun(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::cpuset::custom_cgroup_cpuset_resize(ctx)
+    stt::scenario::cpuset::custom_cgroup_cpuset_resize(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
 fn cover_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::cpuset::custom_cgroup_cpuset_swap_disjoint(ctx)
+    stt::scenario::cpuset::custom_cgroup_cpuset_swap_disjoint(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::cpuset::custom_cgroup_cpuset_workload_imbalance(ctx)
+    stt::scenario::cpuset::custom_cgroup_cpuset_workload_imbalance(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
+    stt::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15)]
 fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
+    stt::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
 }
 
 // -- dynamic --
 
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::dynamic::custom_cgroup_add_midrun(ctx)
+    stt::scenario::dynamic::custom_cgroup_add_midrun(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::dynamic::custom_cgroup_remove_midrun(ctx)
+    stt::scenario::dynamic::custom_cgroup_remove_midrun(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::dynamic::custom_cgroup_rapid_churn(ctx)
+    stt::scenario::dynamic::custom_cgroup_rapid_churn(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::dynamic::custom_cgroup_cpuset_add_remove(ctx)
+    stt::scenario::dynamic::custom_cgroup_cpuset_add_remove(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::dynamic::custom_cgroup_add_during_imbalance(ctx)
+    stt::scenario::dynamic::custom_cgroup_add_during_imbalance(ctx)
 }
 
 // -- interaction --
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_imbalance_mixed_workload(ctx)
+    stt::scenario::interaction::custom_cgroup_imbalance_mixed_workload(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_add_load_imbalance(ctx)
+    stt::scenario::interaction::custom_cgroup_add_load_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_load_oscillation(ctx)
+    stt::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
 fn cover_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_4way_load_imbalance(ctx)
+    stt::scenario::interaction::custom_cgroup_4way_load_imbalance(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_cpuset_imbalance_combined(ctx)
+    stt::scenario::interaction::custom_cgroup_cpuset_imbalance_combined(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_cpuset_overlap_imbalance_combined(ctx)
+    stt::scenario::interaction::custom_cgroup_cpuset_overlap_imbalance_combined(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_noctrl_task_migration(ctx)
+    stt::scenario::interaction::custom_cgroup_noctrl_task_migration(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_noctrl_imbalance(ctx)
+    stt::scenario::interaction::custom_cgroup_noctrl_imbalance(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_noctrl_cpuset_change(ctx)
+    stt::scenario::interaction::custom_cgroup_noctrl_cpuset_change(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_noctrl_load_imbalance(ctx)
+    stt::scenario::interaction::custom_cgroup_noctrl_load_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[stt_test(scheduler = STT_SCHED, sockets = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::interaction::custom_cgroup_io_compute_imbalance(ctx)
+    stt::scenario::interaction::custom_cgroup_io_compute_imbalance(ctx)
 }
 
 // -- nested --
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::nested::custom_nested_cgroup_steady(ctx)
+    stt::scenario::nested::custom_nested_cgroup_steady(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::nested::custom_nested_cgroup_task_move(ctx)
+    stt::scenario::nested::custom_nested_cgroup_task_move(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::nested::custom_nested_cgroup_rapid_churn(ctx)
+    stt::scenario::nested::custom_nested_cgroup_rapid_churn(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::nested::custom_nested_cgroup_cpuset(ctx)
+    stt::scenario::nested::custom_nested_cgroup_cpuset(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::nested::custom_nested_cgroup_imbalance(ctx)
+    stt::scenario::nested::custom_nested_cgroup_imbalance(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::nested::custom_nested_cgroup_noctrl(ctx)
+    stt::scenario::nested::custom_nested_cgroup_noctrl(ctx)
 }
 
 // -- stress --
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::stress::custom_cgroup_per_cpu(ctx)
+    stt::scenario::stress::custom_cgroup_per_cpu(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::stress::custom_cgroup_exhaust_reuse(ctx)
+    stt::scenario::stress::custom_cgroup_exhaust_reuse(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::stress::custom_cgroup_dsq_contention(ctx)
+    stt::scenario::stress::custom_cgroup_dsq_contention(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
 fn cover_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::stress::custom_cgroup_workload_variety(ctx)
+    stt::scenario::stress::custom_cgroup_workload_variety(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
 fn cover_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::stress::custom_cgroup_cpuset_workload_variety(ctx)
+    stt::scenario::stress::custom_cgroup_cpuset_workload_variety(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 2, memory_mb = 2048)]
 fn cover_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::stress::custom_cgroup_dynamic_workload_variety(ctx)
+    stt::scenario::stress::custom_cgroup_dynamic_workload_variety(ctx)
 }
 
-#[ktstr_test(sockets = 2, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 2, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::stress::custom_cgroup_cpuset_crossllc_race(ctx)
+    stt::scenario::stress::custom_cgroup_cpuset_crossllc_race(ctx)
 }
 
 // -- performance --
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::performance::custom_cache_pressure_imbalance(ctx)
+    stt::scenario::performance::custom_cache_pressure_imbalance(ctx)
 }
 
-#[ktstr_test(sockets = 2, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 2, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::performance::custom_cache_yield_wake_affine(ctx)
+    stt::scenario::performance::custom_cache_yield_wake_affine(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::performance::custom_cache_pipe_io_compute_imbalance(ctx)
+    stt::scenario::performance::custom_cache_pipe_io_compute_imbalance(ctx)
 }
 
-#[ktstr_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
+#[stt_test(sockets = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::performance::custom_fanout_wake(ctx)
+    stt::scenario::performance::custom_fanout_wake(ctx)
 }
 
 // -- watchdog timeout overwrite --
 
-#[ktstr_test(
-    scheduler = KTSTR_SCHED,
+#[stt_test(
+    scheduler = STT_SCHED,
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_s = 60,
     max_imbalance_ratio = 10.0,
     fail_on_stall = false,
 )]
 fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::basic::custom_sched_mixed(ctx)
+    stt::scenario::basic::custom_sched_mixed(ctx)
 }
 
 // -- watchdog forced stall (expects scheduler death) --
 
 fn scenario_sched_mixed(_ctx: &Ctx) -> Result<AssertResult> {
-    scx_ktstr::scenario::basic::custom_sched_mixed(_ctx)
+    stt::scenario::basic::custom_sched_mixed(_ctx)
 }
 
 fn scenario_forced_failure(_ctx: &Ctx) -> Result<AssertResult> {
-    let mut r = scx_ktstr::scenario::basic::custom_sched_mixed(_ctx)?;
+    let mut r = stt::scenario::basic::custom_sched_mixed(_ctx)?;
     r.passed = false;
     r.details.push("forced failure for auto-repro test".into());
     Ok(r)
 }
 
 fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
-    use scx_ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-    use scx_ktstr::workload::WorkType;
     use std::time::Duration;
+    use stt::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+    use stt::workload::WorkType;
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("demo_workers")
@@ -314,11 +313,11 @@ static BPF_CRASH: BpfMapWrite = BpfMapWrite {
     value: 1,
 };
 
-use scx_ktstr::test_support::{KtstrTestEntry, Topology};
+use stt::test_support::{SttTestEntry, Topology};
 
-#[scx_ktstr::__linkme::distributed_slice(scx_ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = scx_ktstr::__linkme)]
-static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_FORCED_STALL: SttTestEntry = SttTestEntry {
     name: "cover_watchdog_forced_stall",
     func: scenario_sched_mixed,
     topology: Topology {
@@ -326,17 +325,17 @@ static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
         cores_per_socket: 4,
         threads_per_core: 1,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &STT_SCHED,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(2),
     performance_mode: true,
     expect_err: true,
-    ..KtstrTestEntry::DEFAULT
+    ..SttTestEntry::DEFAULT
 };
 
-#[scx_ktstr::__linkme::distributed_slice(scx_ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = scx_ktstr::__linkme)]
-static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_STALL_DETECT: SttTestEntry = SttTestEntry {
     name: "neg_stall_detection_scx_exit",
     func: scenario_sched_mixed,
     topology: Topology {
@@ -344,17 +343,17 @@ static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
         cores_per_socket: 4,
         threads_per_core: 1,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &STT_SCHED,
     auto_repro: false,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(3),
     expect_err: true,
-    ..KtstrTestEntry::DEFAULT
+    ..SttTestEntry::DEFAULT
 };
 
-#[scx_ktstr::__linkme::distributed_slice(scx_ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = scx_ktstr::__linkme)]
-static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_SCHED_DEATH: SttTestEntry = SttTestEntry {
     name: "neg_sched_death_no_verify_result",
     func: scenario_sched_mixed,
     topology: Topology {
@@ -362,17 +361,17 @@ static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
         cores_per_socket: 4,
         threads_per_core: 1,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &STT_SCHED,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(3),
     duration: std::time::Duration::from_secs(10),
     expect_err: true,
-    ..KtstrTestEntry::DEFAULT
+    ..SttTestEntry::DEFAULT
 };
 
-#[scx_ktstr::__linkme::distributed_slice(scx_ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = scx_ktstr::__linkme)]
-static __KTSTR_ENTRY_AUTO_REPRO_VERIFY: KtstrTestEntry = KtstrTestEntry {
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_AUTO_REPRO_VERIFY: SttTestEntry = SttTestEntry {
     name: "neg_auto_repro_on_verify_failure",
     func: scenario_forced_failure,
     topology: Topology {
@@ -380,14 +379,14 @@ static __KTSTR_ENTRY_AUTO_REPRO_VERIFY: KtstrTestEntry = KtstrTestEntry {
         cores_per_socket: 4,
         threads_per_core: 1,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &STT_SCHED,
     expect_err: true,
-    ..KtstrTestEntry::DEFAULT
+    ..SttTestEntry::DEFAULT
 };
 
-#[scx_ktstr::__linkme::distributed_slice(scx_ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = scx_ktstr::__linkme)]
-static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_CRASH_AFTER: SttTestEntry = SttTestEntry {
     name: "neg_crash_after_auto_repro",
     func: scenario_sched_mixed,
     topology: Topology {
@@ -395,15 +394,15 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
         cores_per_socket: 4,
         threads_per_core: 1,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
     expect_err: true,
-    ..KtstrTestEntry::DEFAULT
+    ..SttTestEntry::DEFAULT
 };
 
-#[scx_ktstr::__linkme::distributed_slice(scx_ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = scx_ktstr::__linkme)]
-static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_DEMO_BPF_CRASH: SttTestEntry = SttTestEntry {
     name: "demo_bpf_crash_auto_repro",
     func: scenario_sched_mixed,
     topology: Topology {
@@ -411,15 +410,15 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
         cores_per_socket: 4,
         threads_per_core: 1,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
     expect_err: true,
-    ..KtstrTestEntry::DEFAULT
+    ..SttTestEntry::DEFAULT
 };
 
-#[scx_ktstr::__linkme::distributed_slice(scx_ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = scx_ktstr::__linkme)]
-static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_HOST_CRASH: SttTestEntry = SttTestEntry {
     name: "neg_host_crash_auto_repro",
     func: scenario_yield_heavy,
     topology: Topology {
@@ -427,15 +426,15 @@ static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
         cores_per_socket: 4,
         threads_per_core: 1,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
     expect_err: true,
-    ..KtstrTestEntry::DEFAULT
+    ..SttTestEntry::DEFAULT
 };
 
-#[scx_ktstr::__linkme::distributed_slice(scx_ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = scx_ktstr::__linkme)]
-static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
+#[stt::__linkme::distributed_slice(stt::test_support::STT_TESTS)]
+#[linkme(crate = stt::__linkme)]
+static __STT_ENTRY_DEMO_HOST_CRASH: SttTestEntry = SttTestEntry {
     name: "demo_host_crash_auto_repro",
     func: scenario_yield_heavy,
     topology: Topology {
@@ -443,16 +442,16 @@ static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
         cores_per_socket: 4,
         threads_per_core: 1,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &STT_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
     expect_err: true,
-    ..KtstrTestEntry::DEFAULT
+    ..SttTestEntry::DEFAULT
 };
 
 // -- monitor evaluation path with default thresholds --
 
-#[ktstr_test(
-    scheduler = KTSTR_SCHED,
+#[stt_test(
+    scheduler = STT_SCHED,
     sockets = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_s = 60,
     max_imbalance_ratio = 20.0,
@@ -460,7 +459,7 @@ static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
 )]
 fn cover_monitor_evaluation(ctx: &Ctx) -> Result<AssertResult> {
     // Exercises the host-side monitor threshold evaluation path in
-    // run_ktstr_test_inner. The scenario passes, then the host evaluates
+    // run_stt_test_inner. The scenario passes, then the host evaluates
     // monitor samples against merged thresholds.
-    scx_ktstr::scenario::basic::custom_sched_mixed(ctx)
+    stt::scenario::basic::custom_sched_mixed(ctx)
 }

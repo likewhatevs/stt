@@ -1,14 +1,14 @@
-# The #[ktstr_test] Macro
+# The #[stt_test] Macro
 
-`#[ktstr_test]` registers a function as an integration test that runs
+`#[stt_test]` registers a function as an integration test that runs
 inside a VM.
 
 ## Basic usage
 
 ```rust,ignore
-use scx_ktstr::prelude::*;
+use stt::prelude::*;
 
-#[ktstr_test(sockets = 2, cores = 4, threads = 2)]
+#[stt_test(sockets = 2, cores = 4, threads = 2)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     // ctx provides cgroup manager, topology, duration, etc.
     Ok(AssertResult::pass())
@@ -23,7 +23,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
     .topology(2, 4, 1);
 
-#[ktstr_test(scheduler = MY_SCHED)]
+#[stt_test(scheduler = MY_SCHED)]
 fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
     // VM boots with 2 sockets, 4 cores, 1 thread (from MY_SCHED)
     Ok(AssertResult::pass())
@@ -31,13 +31,13 @@ fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 The function must have signature
-`fn(&scx_ktstr::scenario::Ctx) -> anyhow::Result<scx_ktstr::assert::AssertResult>`.
+`fn(&stt::scenario::Ctx) -> anyhow::Result<stt::assert::AssertResult>`.
 
 ## What the macro generates
 
 1. Renames the function to `__stt_inner_{name}`.
 2. Registers it in the `STT_TESTS` distributed slice via linkme.
-3. Emits a `#[test]` wrapper that calls `run_ktstr_test()`.
+3. Emits a `#[test]` wrapper that calls `run_stt_test()`.
 
 The `#[test]` wrapper boots a VM with the specified topology and runs
 the function inside it.
@@ -110,13 +110,13 @@ Values are arrays of string literals or path expressions from
 
 ```rust,ignore
 // String literals
-#[ktstr_test(
+#[stt_test(
     required_flags = ["llc", "borrow"],
     excluded_flags = ["no-ctrl"],
 )]
 
 // Path expressions (typed constants from derive)
-#[ktstr_test(
+#[stt_test(
     required_flags = [MySchedFlag::LLC, MySchedFlag::BORROW],
     excluded_flags = [MySchedFlag::NO_CTRL],
 )]
@@ -153,7 +153,7 @@ attributes to filter which presets each test runs on. See
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
 | `duration_s` | 2 | Per-scenario duration in seconds |
 | `workers_per_cgroup` | 2 | Workers per cgroup |
-| `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
+| `expect_err` | `false` | Test expects `run_stt_test` to return `Err`; disables auto-repro |
 | `bpf_map_write = CONST` | `None` | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
@@ -163,10 +163,10 @@ what `performance_mode` enables, prerequisites, and validation behavior.
 
 Define the scheduler with `#[derive(Scheduler)]` (see
 [Scheduler Definitions](scheduler-definitions.md)), then reference it
-in `#[ktstr_test]`:
+in `#[stt_test]`:
 
 ```rust,ignore
-use scx_ktstr::prelude::*;
+use stt::prelude::*;
 
 #[derive(Scheduler)]
 #[scheduler(
@@ -182,7 +182,7 @@ enum MySchedFlag {
     Steal,
 }
 
-#[ktstr_test(
+#[stt_test(
     scheduler = MY_SCHED,
     not_starved = true,
     max_gap_ms = 5000,

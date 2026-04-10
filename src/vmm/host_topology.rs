@@ -50,7 +50,7 @@ pub struct PinningPlan {
     /// `reserve_service_cpu` is true in `compute_pinning`.
     pub service_cpu: Option<usize>,
     /// Held flock fds for resource reservation. Dropped when the plan
-    /// (and the KtstrVm holding it) is dropped, releasing all locks.
+    /// (and the SttVm holding it) is dropped, releasing all locks.
     #[allow(dead_code)]
     pub(crate) locks: Vec<std::os::fd::OwnedFd>,
 }
@@ -253,11 +253,11 @@ fn try_flock(path: &str, mode: i32) -> Result<Option<std::os::fd::OwnedFd>> {
 
 /// Acquire resource locks for a pinning plan (non-blocking).
 ///
-/// **LLC locks** (`/tmp/ktstr-llc-{N}.lock`):
+/// **LLC locks** (`/tmp/stt-llc-{N}.lock`):
 /// - `Exclusive`: `flock(LOCK_EX | LOCK_NB)` — sole access to the LLC.
 /// - `Shared`: `flock(LOCK_SH | LOCK_NB)` — multiple holders coexist.
 ///
-/// **CPU locks** (`/tmp/ktstr-cpu-{C}.lock`):
+/// **CPU locks** (`/tmp/stt-cpu-{C}.lock`):
 /// - Always `flock(LOCK_EX | LOCK_NB)` — exclusive per CPU.
 /// - Skipped for `Exclusive` LLC mode (the LLC lock already provides
 ///   exclusivity over all CPUs in the group).
@@ -295,7 +295,7 @@ fn try_acquire_all(
 
     // Lock LLC files.
     for &llc_idx in llc_indices {
-        let path = format!("/tmp/ktstr-llc-{llc_idx}.lock");
+        let path = format!("/tmp/stt-llc-{llc_idx}.lock");
         match try_flock(&path, flock_mode) {
             Ok(Some(fd)) => locks.push(fd),
             Ok(None) => return Err(format!("LLC {llc_idx} busy")),
@@ -307,7 +307,7 @@ fn try_acquire_all(
     // all CPUs in the group).
     if llc_mode != LlcLockMode::Exclusive {
         for &(_vcpu, host_cpu) in &plan.assignments {
-            let path = format!("/tmp/ktstr-cpu-{host_cpu}.lock");
+            let path = format!("/tmp/stt-cpu-{host_cpu}.lock");
             match try_flock(&path, libc::LOCK_EX) {
                 Ok(Some(fd)) => locks.push(fd),
                 Ok(None) => return Err(format!("CPU {host_cpu} busy")),
@@ -315,7 +315,7 @@ fn try_acquire_all(
             }
         }
         if let Some(cpu) = plan.service_cpu {
-            let path = format!("/tmp/ktstr-cpu-{cpu}.lock");
+            let path = format!("/tmp/stt-cpu-{cpu}.lock");
             match try_flock(&path, libc::LOCK_EX) {
                 Ok(Some(fd)) => locks.push(fd),
                 Ok(None) => return Err(format!("service CPU {cpu} busy")),
@@ -394,7 +394,7 @@ fn acquire_llc_shared_locks(
     }
     let mut locks = Vec::new();
     for &llc_idx in &llc_indices {
-        let path = format!("/tmp/ktstr-llc-{llc_idx}.lock");
+        let path = format!("/tmp/stt-llc-{llc_idx}.lock");
         match try_flock(&path, libc::LOCK_SH) {
             Ok(Some(fd)) => locks.push(fd),
             Ok(None) => return Err(format!("LLC {llc_idx} exclusively held")),
@@ -412,7 +412,7 @@ fn try_acquire_cpu_window(
 ) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
     let mut locks = Vec::with_capacity(count);
     for cpu in offset..offset + count {
-        let path = format!("/tmp/ktstr-cpu-{cpu}.lock");
+        let path = format!("/tmp/stt-cpu-{cpu}.lock");
         match try_flock(&path, libc::LOCK_EX) {
             Ok(Some(fd)) => locks.push(fd),
             Ok(None) => return Err(format!("CPU {cpu} busy")),

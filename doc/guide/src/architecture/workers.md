@@ -89,7 +89,7 @@ start and end. Three fields:
 ## Work-conservation watchdog
 
 Workers send SIGUSR2 to the scheduler when stuck > 2 seconds. The
-default POSIX disposition terminates the scheduler process, which scx-ktstr
+default POSIX disposition terminates the scheduler process, which stt
 detects as a scheduler death and captures the sched_ext dump from
 dmesg.
 

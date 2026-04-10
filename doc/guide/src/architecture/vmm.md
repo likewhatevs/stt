@@ -1,17 +1,17 @@
 # VMM
 
-scx-ktstr includes a purpose-built VMM (virtual machine monitor) that boots
+stt includes a purpose-built VMM (virtual machine monitor) that boots
 Linux kernels in KVM for testing.
 
-## KtstrVm builder
+## SttVm builder
 
 ```rust,ignore
-let result = vmm::KtstrVm::builder()
+let result = vmm::SttVm::builder()
     .kernel(&kernel_path)
     .init_binary(&stt_binary)
     .topology(sockets, cores_per_socket, threads_per_core)
     .memory_mb(4096)
-    .run_args(&["run".into(), "--ktstr-test-fn".into(), "my_test".into()])
+    .run_args(&["run".into(), "--stt-test-fn".into(), "my_test".into()])
     .build()?
     .run()?;
 ```
@@ -85,14 +85,14 @@ dispatches the test function, then reboots.
 The role is determined at runtime:
 
 - **PID 1 detection**: when running as PID 1, the `#[ctor]` function
-  `ktstr_test_early_dispatch()` calls `stt_guest_init()` which handles
+  `stt_test_early_dispatch()` calls `stt_guest_init()` which handles
   the full guest lifecycle.
-- **`#[ktstr_test]` host dispatch**: a `#[ctor::ctor]` function
-  (`ktstr_test_early_dispatch`) runs before `main()` in any binary
-  that links against scx-ktstr. When both `--ktstr-test-fn` and `--ktstr-topo`
+- **`#[stt_test]` host dispatch**: a `#[ctor::ctor]` function
+  (`stt_test_early_dispatch`) runs before `main()` in any binary
+  that links against stt. When both `--stt-test-fn` and `--stt-topo`
   are present, it boots a VM and runs the test inside it.
-- **`#[ktstr_test]` guest dispatch**: when only `--ktstr-test-fn` is
-  present (no `--ktstr-topo`), the ctor runs the test function
+- **`#[stt_test]` guest dispatch**: when only `--stt-test-fn` is
+  present (no `--stt-topo`), the ctor runs the test function
   directly -- the binary is already inside a VM.
 
 This design means one `cargo build` produces everything needed for

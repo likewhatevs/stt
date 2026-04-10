@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn from_vmlinux_empty_file() {
-        let dir = std::env::temp_dir().join(format!("ktstr-btf-empty-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("stt-btf-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("vmlinux");
         std::fs::write(&f, b"").unwrap();

@@ -869,7 +869,7 @@ fn infer_scalar_param_name(func_name: &str, param_pos: usize) -> String {
 
 /// Resolve callback signature from vmlinux BTF's `sched_ext_ops` struct.
 ///
-/// Maps scheduler function names (e.g. `ktstr_enqueue`) to ops members
+/// Maps scheduler function names (e.g. `stt_enqueue`) to ops members
 /// (e.g. `enqueue`) by suffix matching, then follows the member's type
 /// through Ptr to reach the FuncProto with typed parameters.
 pub(super) fn resolve_ops_callback_proto<'a>(

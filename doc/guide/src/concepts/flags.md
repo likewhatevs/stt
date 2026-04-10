@@ -13,7 +13,7 @@ the flag is active. `#[flag(requires)]` declares dependencies on other
 variants.
 
 ```rust,ignore
-use scx_ktstr::prelude::*;
+use stt::prelude::*;
 
 #[derive(Scheduler)]
 #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
@@ -43,13 +43,13 @@ Variant names are converted to kebab-case: `Llc` becomes `"llc"`,
 
 ## Using flags in tests
 
-`#[ktstr_test]` accepts `required_flags` and `excluded_flags` to
+`#[stt_test]` accepts `required_flags` and `excluded_flags` to
 constrain which flag profiles a test runs with. Both path expressions
 and string literals work:
 
 ```rust,ignore
 // Path expressions -- typos are compile errors
-#[ktstr_test(
+#[stt_test(
     scheduler = MY_SCHED,
     required_flags = [MySchedFlag::LLC],
     excluded_flags = [MySchedFlag::BORROW],
@@ -57,7 +57,7 @@ and string literals work:
 fn needs_llc(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 
 // String literals -- also work
-#[ktstr_test(scheduler = MY_SCHED, required_flags = ["llc"])]
+#[stt_test(scheduler = MY_SCHED, required_flags = ["llc"])]
 fn also_needs_llc(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
@@ -118,5 +118,5 @@ static __MY_SCHED_FLAG_DECL_STEAL: FlagDecl = FlagDecl {
 };
 ```
 
-See [`scx-ktstr-macros/src/lib.rs`](https://github.com/likewhatevs/scx-ktstr/blob/main/scx-ktstr-macros/src/lib.rs)
+See [`stt-macros/src/lib.rs`](https://github.com/likewhatevs/stt/blob/main/stt-macros/src/lib.rs)
 for the macro source.

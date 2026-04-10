@@ -1,13 +1,13 @@
 [workspace]
-members = [".", "scx-ktstr-macros", "scx-ktstr-sched"]
+members = [".", "stt-macros", "stt-sched"]
 
 [package]
-name = "scx-ktstr"
+name = "stt"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-2.0-only"
-repository = "https://github.com/likewhatevs/scx-ktstr"
+repository = "https://github.com/likewhatevs/stt"
 description = "Test harness for Linux process schedulers"
 readme = "README.md"
 keywords = ["sched_ext", "scheduler", "testing", "bpf", "linux"]
@@ -42,7 +42,7 @@ zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 object = { version = "0.39.0", features = ["read"] }
 linkme = "0.3"
-scx-ktstr-macros = { path = "scx-ktstr-macros" }
+stt-macros = { path = "stt-macros" }
 
 [profile.release]
 lto = "thin"
@@ -57,7 +57,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_
 libbpf-cargo = "0.26"
 
 [[test]]
-name = "ktstr_sched_tests"
+name = "stt_sched_tests"
 
 [[test]]
 name = "scenario_coverage"

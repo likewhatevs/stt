@@ -11,8 +11,8 @@ cannot express.
 ## Writing a custom scenario
 
 ```rust,ignore
-use scx_ktstr::prelude::*;
-use scx_ktstr::scenario::*;
+use stt::prelude::*;
+use stt::scenario::*;
 
 fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let wl = dfl_wl(ctx);
@@ -95,11 +95,11 @@ Call `assert.assert_cgroup(reports, cpuset)` for manual report
 collection, or use `execute_steps_with()` for ops-based scenarios. See
 [Verification](../concepts/verification.md#worker-checks-via-assert).
 
-## Registering a custom scenario (scx-ktstr contributors only)
+## Registering a custom scenario (stt contributors only)
 
-This section applies to contributing scenarios to scx-ktstr's internal
+This section applies to contributing scenarios to stt's internal
 catalog. External test suites call scenario functions directly from
-`#[ktstr_test]` -- no registration needed.
+`#[stt_test]` -- no registration needed.
 
 Add it to `all_scenarios()` in `src/scenario/catalog.rs`:
 

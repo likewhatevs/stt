@@ -392,7 +392,7 @@ pub(crate) fn get_or_build_base(
 }
 
 /// Remove stale SHM segments from `/dev/shm` that don't match `current`.
-/// Scans for `ktstr-base-*` and `ktstr-gz-*` entries and unlinks any whose
+/// Scans for `stt-base-*` and `stt-gz-*` entries and unlinks any whose
 /// hash suffix differs from the current key.
 fn cleanup_stale_shm(current: &BaseKey) {
     let current_suffix = format!("{:016x}", current.0);
@@ -405,9 +405,9 @@ fn cleanup_stale_shm(current: &BaseKey) {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        let hash_suffix = if let Some(s) = name_str.strip_prefix("ktstr-base-") {
+        let hash_suffix = if let Some(s) = name_str.strip_prefix("stt-base-") {
             s
-        } else if let Some(s) = name_str.strip_prefix("ktstr-gz-") {
+        } else if let Some(s) = name_str.strip_prefix("stt-gz-") {
             s
         } else {
             continue;
@@ -732,8 +732,8 @@ impl KvmStatsTotals {
     }
 }
 
-/// State returned by [`KtstrVm::run_vm`] after the BSP exits.
-/// Passed to [`KtstrVm::collect_results`] to produce [`VmResult`].
+/// State returned by [`SttVm::run_vm`] after the BSP exits.
+/// Passed to [`SttVm::collect_results`] to produce [`VmResult`].
 struct VmRunState {
     exit_code: i32,
     timed_out: bool,
@@ -743,7 +743,7 @@ struct VmRunState {
     com1: Arc<PiMutex<console::Serial>>,
     com2: Arc<PiMutex<console::Serial>>,
     kill: Arc<AtomicBool>,
-    vm: kvm::KtstrKvm,
+    vm: kvm::SttKvm,
 }
 
 // ---------------------------------------------------------------------------
@@ -825,11 +825,11 @@ impl VcpuThread {
 }
 
 // ---------------------------------------------------------------------------
-// KtstrVm — builder + run
+// SttVm — builder + run
 // ---------------------------------------------------------------------------
 
 /// Builder for creating and running VMs with custom topologies.
-pub struct KtstrVm {
+pub struct SttVm {
     kernel: PathBuf,
     init_binary: Option<PathBuf>,
     scheduler_binary: Option<PathBuf>,
@@ -880,9 +880,9 @@ struct BpfMapWriteParams {
     value: u32,
 }
 
-impl KtstrVm {
-    pub fn builder() -> KtstrVmBuilder {
-        KtstrVmBuilder::default()
+impl SttVm {
+    pub fn builder() -> SttVmBuilder {
+        SttVmBuilder::default()
     }
 
     /// Boot the VM, run until shutdown/timeout, return captured output.
@@ -929,15 +929,15 @@ impl KtstrVm {
     }
 
     /// Create the KVM VM and load the kernel.
-    fn create_vm_and_load_kernel(&self) -> Result<(kvm::KtstrKvm, boot::KernelLoadResult)> {
+    fn create_vm_and_load_kernel(&self) -> Result<(kvm::SttKvm, boot::KernelLoadResult)> {
         let t0 = Instant::now();
         let use_hugepages = self.performance_mode
             && host_topology::hugepages_free() >= host_topology::hugepages_needed(self.memory_mb);
         let vm = if use_hugepages {
-            kvm::KtstrKvm::new_with_hugepages(self.topology, self.memory_mb, self.performance_mode)
+            kvm::SttKvm::new_with_hugepages(self.topology, self.memory_mb, self.performance_mode)
                 .context("create VM with hugepages")?
         } else {
-            kvm::KtstrKvm::new(self.topology, self.memory_mb, self.performance_mode)
+            kvm::SttKvm::new(self.topology, self.memory_mb, self.performance_mode)
                 .context("create VM")?
         };
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "kvm_create");
@@ -990,7 +990,7 @@ impl KtstrVm {
     #[cfg(target_arch = "x86_64")]
     fn join_and_load_initramfs(
         &self,
-        vm: &kvm::KtstrKvm,
+        vm: &kvm::SttKvm,
         handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
         load_addr: u64,
     ) -> Result<(Option<u64>, Option<u32>)> {
@@ -1117,7 +1117,7 @@ impl KtstrVm {
     #[cfg(target_arch = "x86_64")]
     fn try_cow_overlay(
         &self,
-        vm: &kvm::KtstrKvm,
+        vm: &kvm::SttKvm,
         key: &BaseKey,
         expected_len: usize,
         load_addr: u64,
@@ -1162,7 +1162,7 @@ impl KtstrVm {
     #[cfg(target_arch = "x86_64")]
     fn setup_memory(
         &self,
-        vm: &kvm::KtstrKvm,
+        vm: &kvm::SttKvm,
         kernel_result: &boot::KernelLoadResult,
         initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
     ) -> Result<()> {
@@ -1181,7 +1181,7 @@ impl KtstrVm {
             "sysctl.kernel.sched_schedstats=1",
         )
         .to_string();
-        let verbose = std::env::var("KTSTR_VERBOSE")
+        let verbose = std::env::var("STT_VERBOSE")
             .map(|v| v == "1")
             .unwrap_or(false)
             || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
@@ -1197,7 +1197,7 @@ impl KtstrVm {
             let mem_size = (self.memory_mb as u64) << 20;
             let shm_base = mem_size - self.shm_size;
             cmdline.push_str(&format!(
-                " KTSTR_SHM_BASE={:#x} KTSTR_SHM_SIZE={:#x}",
+                " STT_SHM_BASE={:#x} STT_SHM_SIZE={:#x}",
                 shm_base, self.shm_size
             ));
         }
@@ -1240,7 +1240,7 @@ impl KtstrVm {
 
     /// Configure BSP and AP vCPUs.
     #[cfg(target_arch = "x86_64")]
-    fn setup_vcpus(&self, vm: &kvm::KtstrKvm, kernel_entry: u64) -> Result<()> {
+    fn setup_vcpus(&self, vm: &kvm::SttKvm, kernel_entry: u64) -> Result<()> {
         let t0 = Instant::now();
         boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], vm.split_irqchip)?;
         boot::setup_regs(&vm.vcpus[0], kernel_entry)?;
@@ -1275,7 +1275,7 @@ impl KtstrVm {
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
     #[allow(clippy::type_complexity)]
-    fn run_vm(&self, start: Instant, mut vm: kvm::KtstrKvm) -> Result<VmRunState> {
+    fn run_vm(&self, start: Instant, mut vm: kvm::SttKvm) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
@@ -1498,7 +1498,7 @@ impl KtstrVm {
     #[allow(clippy::type_complexity)]
     fn start_monitor(
         &self,
-        vm: &kvm::KtstrKvm,
+        vm: &kvm::SttKvm,
         kill: &Arc<AtomicBool>,
         start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
@@ -1672,7 +1672,7 @@ impl KtstrVm {
     /// 3. Write the crash value and signal guest via SHM slot 0
     fn start_bpf_map_write(
         &self,
-        vm: &kvm::KtstrKvm,
+        vm: &kvm::SttKvm,
         kill: &Arc<AtomicBool>,
     ) -> Result<Option<JoinHandle<()>>> {
         let Some(ref params) = self.bpf_map_write else {
@@ -1951,8 +1951,8 @@ impl KtstrVm {
         } else if let Some(line) = app_output
             .lines()
             .rev()
-            .find(|l| l.starts_with("KTSTR_EXIT="))
-            && let Ok(code) = line.trim_start_matches("KTSTR_EXIT=").trim().parse::<i32>()
+            .find(|l| l.starts_with("STT_EXIT="))
+            && let Ok(code) = line.trim_start_matches("STT_EXIT=").trim().parse::<i32>()
         {
             exit_code = code;
         }
@@ -1981,7 +1981,7 @@ impl KtstrVm {
     /// reads `bpf_prog_aux->verified_insns` for each.
     fn collect_verifier_stats(
         &self,
-        vm: &kvm::KtstrKvm,
+        vm: &kvm::SttKvm,
     ) -> Vec<monitor::bpf_prog::ProgVerifierStats> {
         let vmlinux = match find_vmlinux(&self.kernel) {
             Some(v) => v,
@@ -2011,10 +2011,10 @@ impl KtstrVm {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
-impl KtstrVm {
+impl SttVm {
     fn setup_memory_aarch64(
         &self,
-        vm: &kvm::KtstrKvm,
+        vm: &kvm::SttKvm,
         _kernel_result: &boot::KernelLoadResult,
         initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
     ) -> Result<()> {
@@ -2067,7 +2067,7 @@ impl KtstrVm {
             "kfence.sample_interval=0",
         )
         .to_string();
-        let verbose = std::env::var("KTSTR_VERBOSE")
+        let verbose = std::env::var("STT_VERBOSE")
             .map(|v| v == "1")
             .unwrap_or(false)
             || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
@@ -2083,7 +2083,7 @@ impl KtstrVm {
             let mem_size = (self.memory_mb as u64) << 20;
             let shm_base = kvm::DRAM_START + mem_size - self.shm_size;
             cmdline.push_str(&format!(
-                " KTSTR_SHM_BASE={:#x} KTSTR_SHM_SIZE={:#x}",
+                " STT_SHM_BASE={:#x} STT_SHM_SIZE={:#x}",
                 shm_base, self.shm_size
             ));
         }
@@ -2132,7 +2132,7 @@ impl KtstrVm {
         Ok(())
     }
 
-    fn setup_vcpus_aarch64(&self, vm: &kvm::KtstrKvm, kernel_entry: u64) -> Result<()> {
+    fn setup_vcpus_aarch64(&self, vm: &kvm::SttKvm, kernel_entry: u64) -> Result<()> {
         let t0 = Instant::now();
         let fdt_addr = aarch64::fdt::fdt_address(self.memory_mb, self.shm_size);
         boot::setup_regs(&vm.vcpus[0], kernel_entry, fdt_addr)?;
@@ -2481,7 +2481,7 @@ pub(crate) fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
 // Builder
 // ---------------------------------------------------------------------------
 
-pub struct KtstrVmBuilder {
+pub struct SttVmBuilder {
     kernel: Option<PathBuf>,
     init_binary: Option<PathBuf>,
     scheduler_binary: Option<PathBuf>,
@@ -2500,9 +2500,9 @@ pub struct KtstrVmBuilder {
     sched_disable_cmds: Vec<String>,
 }
 
-impl Default for KtstrVmBuilder {
+impl Default for SttVmBuilder {
     fn default() -> Self {
-        KtstrVmBuilder {
+        SttVmBuilder {
             kernel: None,
             init_binary: None,
             scheduler_binary: None,
@@ -2527,7 +2527,7 @@ impl Default for KtstrVmBuilder {
     }
 }
 
-impl KtstrVmBuilder {
+impl SttVmBuilder {
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
         self.kernel = Some(path.into());
         self
@@ -2647,7 +2647,7 @@ impl KtstrVmBuilder {
         self
     }
 
-    pub fn build(mut self) -> Result<KtstrVm> {
+    pub fn build(mut self) -> Result<SttVm> {
         let (pinning_plan, mbind_nodes, cpu_locks) = if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
             let pinned_cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
@@ -2685,7 +2685,7 @@ impl KtstrVmBuilder {
             );
         }
 
-        Ok(KtstrVm {
+        Ok(SttVm {
             kernel,
             init_binary: self.init_binary,
             scheduler_binary: self.scheduler_binary,
@@ -2836,27 +2836,27 @@ mod tests {
 
     #[test]
     fn builder_default() {
-        let b = KtstrVmBuilder::default();
+        let b = SttVmBuilder::default();
         assert_eq!(b.memory_mb, 256);
         assert_eq!(b.topology.total_cpus(), 1);
     }
 
     #[test]
     fn builder_topology() {
-        let b = KtstrVmBuilder::default().topology(2, 4, 2);
+        let b = SttVmBuilder::default().topology(2, 4, 2);
         assert_eq!(b.topology.total_cpus(), 16);
         assert_eq!(b.topology.sockets, 2);
     }
 
     #[test]
     fn builder_requires_kernel() {
-        let result = KtstrVmBuilder::default().build();
+        let result = SttVmBuilder::default().build();
         assert!(result.is_err());
     }
 
     #[test]
     fn builder_rejects_missing_kernel() {
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel("/nonexistent/vmlinuz")
             .build();
         assert!(result.is_err());
@@ -2864,7 +2864,7 @@ mod tests {
 
     #[test]
     fn builder_chain() {
-        let b = KtstrVmBuilder::default()
+        let b = SttVmBuilder::default()
             .topology(2, 2, 2)
             .memory_mb(4096)
             .cmdline("root=/dev/sda")
@@ -2878,13 +2878,13 @@ mod tests {
     #[test]
     fn builder_with_init_binary() {
         let exe = crate::resolve_current_exe().unwrap();
-        let b = KtstrVmBuilder::default().init_binary(&exe);
+        let b = SttVmBuilder::default().init_binary(&exe);
         assert_eq!(b.init_binary.as_deref(), Some(exe.as_path()));
     }
 
     #[test]
     fn builder_rejects_missing_init_binary() {
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel("/nonexistent/vmlinuz")
             .init_binary("/nonexistent/binary")
             .build();
@@ -2894,7 +2894,7 @@ mod tests {
     #[test]
     fn builder_rejects_missing_scheduler_binary() {
         let exe = crate::resolve_current_exe().unwrap();
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel(&exe)
             .scheduler_binary("/nonexistent/scheduler")
             .build();
@@ -2903,14 +2903,14 @@ mod tests {
 
     #[test]
     fn builder_run_args() {
-        let b = KtstrVmBuilder::default().run_args(&["run".into(), "--json".into()]);
+        let b = SttVmBuilder::default().run_args(&["run".into(), "--json".into()]);
         assert_eq!(b.run_args, vec!["run", "--json"]);
     }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn builder_kernel_dir_resolves_bzimage() {
-        let b = KtstrVmBuilder::default().kernel_dir("/some/linux");
+        let b = SttVmBuilder::default().kernel_dir("/some/linux");
         assert_eq!(
             b.kernel.as_deref(),
             Some(std::path::Path::new("/some/linux/arch/x86/boot/bzImage"))
@@ -2990,7 +2990,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = kvm::KtstrKvm::new(topo, 128, false).unwrap();
+        let vm = kvm::SttKvm::new(topo, 128, false).unwrap();
         for vcpu in &vm.vcpus[1..] {
             let state = vcpu.get_mp_state().unwrap();
             assert_eq!(
@@ -3018,7 +3018,7 @@ mod tests {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = SttVm::builder()
             .kernel(&kernel)
             .topology(1, 1, 1)
             .memory_mb(256)
@@ -3040,7 +3040,7 @@ mod tests {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = SttVm::builder()
             .kernel(&kernel)
             .topology(2, 2, 1) // 4 CPUs
             .memory_mb(256)
@@ -3067,7 +3067,7 @@ mod tests {
             [("1cpu", 1, 1, 1, 256), ("4cpu", 2, 2, 1, 512)]
         {
             let start = Instant::now();
-            let vm = KtstrVm::builder()
+            let vm = SttVm::builder()
                 .kernel(&kernel)
                 .topology(sockets, cores, threads)
                 .memory_mb(mem)
@@ -3107,7 +3107,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT has been available since Linux 4.12.
         assert!(
             vm.has_immediate_exit,
@@ -3123,7 +3123,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let mut vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         let handle = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
 
         // Initial state should be 0.
@@ -3158,7 +3158,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let mut vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         let h0 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
         let h1 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[1]);
 
@@ -3189,7 +3189,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let mut vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
 
         ie.set(1);
@@ -3208,7 +3208,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn find_vmlinux_from_bzimage_path() {
         // Create a temp dir simulating <root>/arch/x86/boot/bzImage with vmlinux at <root>.
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-test");
+        let tmp = std::env::temp_dir().join("stt-find-vmlinux-test");
         let boot_dir = tmp.join("arch/x86/boot");
         std::fs::create_dir_all(&boot_dir).unwrap();
         let vmlinux = tmp.join("vmlinux");
@@ -3225,7 +3225,7 @@ mod tests {
     #[test]
     fn find_vmlinux_sibling() {
         // vmlinux in the same directory as the kernel image.
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-sibling");
+        let tmp = std::env::temp_dir().join("stt-find-vmlinux-sibling");
         std::fs::create_dir_all(&tmp).unwrap();
         let vmlinux = tmp.join("vmlinux");
         std::fs::write(&vmlinux, b"ELF").unwrap();
@@ -3258,7 +3258,7 @@ mod tests {
     #[test]
     fn builder_rejects_zero_sockets() {
         let exe = crate::resolve_current_exe().unwrap();
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel(&exe)
             .topology(0, 2, 2)
             .build();
@@ -3268,7 +3268,7 @@ mod tests {
     #[test]
     fn builder_rejects_zero_cores() {
         let exe = crate::resolve_current_exe().unwrap();
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel(&exe)
             .topology(2, 0, 2)
             .build();
@@ -3278,7 +3278,7 @@ mod tests {
     #[test]
     fn builder_rejects_zero_threads() {
         let exe = crate::resolve_current_exe().unwrap();
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel(&exe)
             .topology(2, 2, 0)
             .build();
@@ -3348,7 +3348,7 @@ mod tests {
 
     #[test]
     fn find_vmlinux_missing_returns_none() {
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-none");
+        let tmp = std::env::temp_dir().join("stt-find-vmlinux-none");
         std::fs::create_dir_all(&tmp).unwrap();
         let kernel = tmp.join("bzImage");
         std::fs::write(&kernel, b"kernel").unwrap();
@@ -3370,7 +3370,7 @@ mod tests {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = SttVm::builder()
             .kernel(&kernel)
             .topology(1, 2, 1)
             .memory_mb(256)
@@ -3406,7 +3406,7 @@ mod tests {
     #[test]
     fn base_key_different_content_differs() {
         let tmp =
-            std::env::temp_dir().join(format!("ktstr-cache-content-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("stt-cache-content-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let bin = tmp.join("payload");
 
@@ -3433,8 +3433,7 @@ mod tests {
 
     #[test]
     fn hash_file_large_file() {
-        let tmp =
-            std::env::temp_dir().join(format!("ktstr-hash-sample-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("stt-hash-sample-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("big");
         // 16KB file — exercises both head and tail sampling.
@@ -3587,13 +3586,13 @@ mod tests {
 
     #[test]
     fn builder_watchdog_timeout_default() {
-        let b = KtstrVmBuilder::default();
+        let b = SttVmBuilder::default();
         assert_eq!(b.watchdog_timeout, Some(Duration::from_secs(4)));
     }
 
     #[test]
     fn builder_watchdog_timeout_override() {
-        let b = KtstrVmBuilder::default().watchdog_timeout(Duration::from_secs(5));
+        let b = SttVmBuilder::default().watchdog_timeout(Duration::from_secs(5));
         assert_eq!(b.watchdog_timeout, Some(Duration::from_secs(5)));
     }
 
@@ -3603,19 +3602,19 @@ mod tests {
             max_imbalance_ratio: 2.0,
             ..Default::default()
         };
-        let b = KtstrVmBuilder::default().monitor_thresholds(t);
+        let b = SttVmBuilder::default().monitor_thresholds(t);
         assert!(b.monitor_thresholds.is_some());
     }
 
     #[test]
     fn builder_shm_size() {
-        let b = KtstrVmBuilder::default().shm_size(65536);
+        let b = SttVmBuilder::default().shm_size(65536);
         assert_eq!(b.shm_size, 65536);
     }
 
     #[test]
     fn builder_sched_args() {
-        let b = KtstrVmBuilder::default().sched_args(&["--enable-borrow".into()]);
+        let b = SttVmBuilder::default().sched_args(&["--enable-borrow".into()]);
         assert_eq!(b.sched_args, vec!["--enable-borrow"]);
     }
 
@@ -3623,13 +3622,13 @@ mod tests {
 
     #[test]
     fn builder_performance_mode_default_false() {
-        let b = KtstrVmBuilder::default();
+        let b = SttVmBuilder::default();
         assert!(!b.performance_mode);
     }
 
     #[test]
     fn builder_performance_mode_set() {
-        let b = KtstrVmBuilder::default().performance_mode(true);
+        let b = SttVmBuilder::default().performance_mode(true);
         assert!(b.performance_mode);
     }
 
@@ -3638,7 +3637,7 @@ mod tests {
         // performance_mode=false should not trigger validation, even with
         // a topology that exceeds host capacity.
         let exe = crate::resolve_current_exe().unwrap();
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel(&exe)
             .topology(1, 1, 1)
             .performance_mode(false)
@@ -3654,7 +3653,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
         let too_many = host_topo.total_cpus() as u32 + 1;
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel(&exe)
             .topology(1, too_many, 1)
             .performance_mode(true)
@@ -3678,7 +3677,7 @@ mod tests {
         let too_many_sockets = host_topo.llc_groups.len() as u32 + 1;
         // Need total vCPUs + 1 service CPU to fit without oversubscription.
         if (too_many_sockets as usize + 1) <= host_topo.total_cpus() {
-            let result = KtstrVmBuilder::default()
+            let result = SttVmBuilder::default()
                 .kernel(&exe)
                 .topology(too_many_sockets, 1, 1)
                 .performance_mode(true)
@@ -3696,7 +3695,7 @@ mod tests {
         if host_topo.total_cpus() < 3 {
             return;
         }
-        let result = KtstrVmBuilder::default()
+        let result = SttVmBuilder::default()
             .kernel(&exe)
             .topology(1, 2, 1)
             .performance_mode(true)
@@ -3722,7 +3721,7 @@ mod tests {
         if host_topo.total_cpus() < 3 {
             return;
         }
-        let vm = match KtstrVmBuilder::default()
+        let vm = match SttVmBuilder::default()
             .kernel(&exe)
             .topology(1, 2, 1)
             .performance_mode(true)
@@ -3743,7 +3742,7 @@ mod tests {
     #[test]
     fn builder_performance_mode_false_preserves_in_vm() {
         let exe = crate::resolve_current_exe().unwrap();
-        let vm = KtstrVmBuilder::default()
+        let vm = SttVmBuilder::default()
             .kernel(&exe)
             .topology(1, 1, 1)
             .performance_mode(false)
@@ -3759,7 +3758,7 @@ mod tests {
         if host_topo.total_cpus() < 3 {
             return;
         }
-        let vm = KtstrVmBuilder::default()
+        let vm = SttVmBuilder::default()
             .kernel(&exe)
             .topology(1, 2, 1)
             .performance_mode(true)
@@ -3873,7 +3872,7 @@ mod tests {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = SttVm::builder()
             .kernel(&kernel)
             .topology(1, 1, 1)
             .memory_mb(256)
@@ -3896,7 +3895,7 @@ mod tests {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = SttVm::builder()
             .kernel(&kernel)
             .topology(2, 2, 1) // 4 CPUs
             .memory_mb(256)
@@ -3915,7 +3914,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = kvm::SttKvm::new(topo, 64, false).unwrap();
         assert!(
             vm.has_immediate_exit,
             "KVM_CAP_IMMEDIATE_EXIT should be available on modern kernels"
@@ -3925,7 +3924,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn builder_kernel_dir_resolves_image() {
-        let b = KtstrVmBuilder::default().kernel_dir("/some/linux");
+        let b = SttVmBuilder::default().kernel_dir("/some/linux");
         assert_eq!(
             b.kernel.as_deref(),
             Some(std::path::Path::new("/some/linux/arch/arm64/boot/Image"))

@@ -2,18 +2,18 @@
 
 Most tests define cgroups with `CgroupDef` and run them via
 `execute_defs` or `execute_steps` (see [Ops and Steps](ops.md)).
-The `Scenario` struct described below is scx-ktstr's internal catalog
+The `Scenario` struct described below is stt's internal catalog
 format -- external test suites do not need it.
 
 ## Canned scenarios (`scenarios::*`)
 
-`scx_ktstr::scenario::scenarios` provides curated scenario functions that
-can be called directly from `#[ktstr_test]`:
+`stt::scenario::scenarios` provides curated scenario functions that
+can be called directly from `#[stt_test]`:
 
 ```rust,ignore
-use scx_ktstr::prelude::*;
+use stt::prelude::*;
 
-#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+#[stt_test(sockets = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     scenarios::steady(ctx)
 }
@@ -37,14 +37,14 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 | `nested_task_move` | Tasks moved between nested cgroups |
 
 Additional `custom_*` functions are available in
-`scx_ktstr::scenario::{affinity, basic, cpuset, dynamic, interaction,
+`stt::scenario::{affinity, basic, cpuset, dynamic, interaction,
 nested, performance, stress}`. See the
-[API docs](https://likewhatevs.github.io/scx-ktstr/api/scx_ktstr/scenario/index.html)
+[API docs](https://likewhatevs.github.io/stt/api/stt/scenario/index.html)
 for the full list.
 
 ## The Scenario struct (internal catalog)
 
-`Scenario` is scx-ktstr's internal catalog format. All catalog entries are
+`Scenario` is stt's internal catalog format. All catalog entries are
 registered in `all_scenarios()` across 11 categories.
 
 ```rust,ignore

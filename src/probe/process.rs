@@ -183,7 +183,7 @@ pub fn run_probe_skeleton(
 
     // Enable probes (must set before load — rodata is immutable after)
     if let Some(rodata) = open_skel.maps.rodata_data.as_mut() {
-        rodata.ktstr_enabled = true;
+        rodata.stt_enabled = true;
     }
 
     // Load skeleton
@@ -255,7 +255,7 @@ pub fn run_probe_skeleton(
     let mut links: Vec<(Link, String)> = Vec::new();
     for (idx, _ip, _name) in &func_ips {
         let raw = &functions[*idx as usize].raw_name;
-        match skel.progs.ktstr_probe.attach_kprobe(false, raw) {
+        match skel.progs.stt_probe.attach_kprobe(false, raw) {
             Ok(link) => {
                 links.push((link, raw.clone()));
             }
@@ -322,13 +322,13 @@ pub fn run_probe_skeleton(
 
         // Set rodata and attach targets for each slot.
         if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
-            rodata.ktstr_enabled = true;
+            rodata.stt_enabled = true;
             for t in &targets {
                 match t.slot {
-                    0 => rodata.ktstr_fentry_func_idx_0 = t.idx,
-                    1 => rodata.ktstr_fentry_func_idx_1 = t.idx,
-                    2 => rodata.ktstr_fentry_func_idx_2 = t.idx,
-                    3 => rodata.ktstr_fentry_func_idx_3 = t.idx,
+                    0 => rodata.stt_fentry_func_idx_0 = t.idx,
+                    1 => rodata.stt_fentry_func_idx_1 = t.idx,
+                    2 => rodata.stt_fentry_func_idx_2 = t.idx,
+                    3 => rodata.stt_fentry_func_idx_3 = t.idx,
                     _ => {}
                 }
             }
@@ -336,10 +336,10 @@ pub fn run_probe_skeleton(
 
         for t in targets.iter_mut() {
             let prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fentry_0,
-                1 => &mut fentry_open.progs.ktstr_fentry_1,
-                2 => &mut fentry_open.progs.ktstr_fentry_2,
-                3 => &mut fentry_open.progs.ktstr_fentry_3,
+                0 => &mut fentry_open.progs.stt_fentry_0,
+                1 => &mut fentry_open.progs.stt_fentry_1,
+                2 => &mut fentry_open.progs.stt_fentry_2,
+                3 => &mut fentry_open.progs.stt_fentry_3,
                 _ => continue,
             };
             // Attach to the struct_ops wrapper. The fentry BPF handler
@@ -369,10 +369,10 @@ pub fn run_probe_skeleton(
         for slot in 0..FENTRY_BATCH {
             if !used_slots.contains(&slot) {
                 let prog = match slot {
-                    0 => &mut fentry_open.progs.ktstr_fentry_0,
-                    1 => &mut fentry_open.progs.ktstr_fentry_1,
-                    2 => &mut fentry_open.progs.ktstr_fentry_2,
-                    3 => &mut fentry_open.progs.ktstr_fentry_3,
+                    0 => &mut fentry_open.progs.stt_fentry_0,
+                    1 => &mut fentry_open.progs.stt_fentry_1,
+                    2 => &mut fentry_open.progs.stt_fentry_2,
+                    3 => &mut fentry_open.progs.stt_fentry_3,
                     _ => continue,
                 };
                 prog.set_autoload(false);
@@ -455,10 +455,10 @@ pub fn run_probe_skeleton(
             func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
 
             let result = match t.slot {
-                0 => fentry_skel.progs.ktstr_fentry_0.attach_trace(),
-                1 => fentry_skel.progs.ktstr_fentry_1.attach_trace(),
-                2 => fentry_skel.progs.ktstr_fentry_2.attach_trace(),
-                3 => fentry_skel.progs.ktstr_fentry_3.attach_trace(),
+                0 => fentry_skel.progs.stt_fentry_0.attach_trace(),
+                1 => fentry_skel.progs.stt_fentry_1.attach_trace(),
+                2 => fentry_skel.progs.stt_fentry_2.attach_trace(),
+                3 => fentry_skel.progs.stt_fentry_3.attach_trace(),
                 _ => continue,
             };
             match result {
@@ -483,7 +483,7 @@ pub fn run_probe_skeleton(
     }
 
     // Attach trigger
-    match skel.progs.ktstr_trigger.attach_kprobe(false, trigger) {
+    match skel.progs.stt_trigger.attach_kprobe(false, trigger) {
         Ok(link) => {
             links.push((link, trigger.to_string()));
         }
@@ -553,7 +553,7 @@ pub fn run_probe_skeleton(
 
     // Enable is handled by the BPF program reading the volatile const.
     // Since we can't mutate rodata after load, the program starts enabled.
-    // (ktstr_enabled defaults to false in BPF, but we always want probes
+    // (stt_enabled defaults to false in BPF, but we always want probes
     // active once attached — remove the gate or set it before load.)
 
     tracing::debug!(

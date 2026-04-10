@@ -1,11 +1,11 @@
 # Verification
 
-scx-ktstr verifies scheduler behavior through two channels: worker-side
+stt verifies scheduler behavior through two channels: worker-side
 telemetry and host-side monitoring.
 
 ## Worker checks
 
-After each scenario, scx-ktstr collects
+After each scenario, stt collects
 [`WorkerReport`](../architecture/workers.md#telemetry) from every worker
 process. Several checks run against these reports:
 
@@ -34,7 +34,7 @@ thresholds:
   absolute throughput is too low).
 
 Neither threshold is set by default; enable via `Assert` setters or
-`#[ktstr_test]` attributes.
+`#[stt_test]` attributes.
 
 **Benchmarking** -- `assert_benchmarks()` checks per-wakeup latency
 and iteration throughput. Three thresholds:
@@ -47,7 +47,7 @@ and iteration throughput. Three thresholds:
 - `min_iteration_rate`: minimum outer-loop iterations per wall-clock
   second per worker.
 
-None are set by default. Set via `Assert` setters or `#[ktstr_test]`
+None are set by default. Set via `Assert` setters or `#[stt_test]`
 attributes.
 
 ## Monitor checks
@@ -108,7 +108,7 @@ Verification uses a three-layer merge:
 1. `Assert::default_checks()` -- baseline: `not_starved` enabled,
    monitor thresholds from `MonitorThresholds::DEFAULT`.
 2. `Scheduler.assert` -- scheduler-level overrides.
-3. Per-test `assert` -- test-specific overrides via `#[ktstr_test]`
+3. Per-test `assert` -- test-specific overrides via `#[stt_test]`
    attributes.
 
 All fields use last-`Some`-wins semantics. A `Some(false)` in a
@@ -159,7 +159,7 @@ let a = Assert::default_checks().max_gap_ms(5000);
 let result = a.assert_cgroup(&reports, Some(&cpuset));
 ```
 
-Use `Assert` for both the merge chain (`#[ktstr_test]` attributes,
+Use `Assert` for both the merge chain (`#[stt_test]` attributes,
 `Scheduler.assert`, `execute_steps_with`) and direct report checking.
 
 ## Constants

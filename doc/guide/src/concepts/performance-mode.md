@@ -56,8 +56,8 @@ cores. The guest disables PV spinlocks, PV TLB flush, and PV
 sched_yield (all add hypercall overhead unnecessary on dedicated
 cores), and enables haltpoll cpuidle (polls briefly before halting,
 reducing wakeup latency). PV spinlocks require
-CONFIG_PARAVIRT_SPINLOCKS, which is not in ktstr.kconfig, so that
-disable is a no-op for ktstr guests.
+CONFIG_PARAVIRT_SPINLOCKS, which is not in stt.kconfig, so that
+disable is a no-op for stt guests.
 
 **Skip host-side halt poll** -- when a guest vCPU halts (executes
 HLT with nothing to do), KVM can busy-wait briefly on the host
@@ -118,10 +118,10 @@ levels of checks:
 
 ## Usage
 
-In `#[ktstr_test]`:
+In `#[stt_test]`:
 
 ```rust,ignore
-#[ktstr_test(
+#[stt_test(
     sockets = 2,
     cores = 4,
     threads = 2,
@@ -136,7 +136,7 @@ fn my_perf_test(ctx: &Ctx) -> Result<AssertResult> {
 Via the builder API:
 
 ```rust,ignore
-let vm = vmm::KtstrVm::builder()
+let vm = vmm::SttVm::builder()
     .kernel(&kernel_path)
     .init_binary(&stt_binary)
     .topology(2, 4, 2)

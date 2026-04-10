@@ -9,7 +9,7 @@
 ///
 /// The SHM region is an E820 gap — no E820 entry covers it, so the kernel
 /// never touches it. The guest init binary discovers the region via
-/// KTSTR_SHM_BASE and KTSTR_SHM_SIZE environment variables on the kernel
+/// STT_SHM_BASE and STT_SHM_SIZE environment variables on the kernel
 /// command line.
 use zerocopy::IntoBytes;
 
@@ -90,7 +90,7 @@ pub const DUMP_REQ_SYSRQ_D: u8 = b'D';
 /// Byte offset within the SHM region for the host-to-guest stall request flag.
 /// Occupies the second byte of the `_pad` field in ShmRingHeader (offset 13).
 /// Host writes `STALL_REQ_ACTIVATE` to request a scheduler stall; guest polls
-/// this byte, creates /tmp/ktstr_stall, and clears it back to 0.
+/// this byte, creates /tmp/stt_stall, and clears it back to 0.
 pub const STALL_REQ_OFFSET: usize = 13;
 
 /// Value written to STALL_REQ_OFFSET to request a scheduler stall.
@@ -208,16 +208,16 @@ fn shm_ptr() -> anyhow::Result<(*mut u8, usize)> {
     Ok((m.ptr, size))
 }
 
-/// Parse KTSTR_SHM_BASE and KTSTR_SHM_SIZE from a kernel command line string.
+/// Parse STT_SHM_BASE and STT_SHM_SIZE from a kernel command line string.
 pub(crate) fn parse_shm_params_from_str(cmdline: &str) -> Option<(u64, u64)> {
     let base = cmdline
         .split_whitespace()
-        .find(|s| s.starts_with("KTSTR_SHM_BASE="))?
-        .strip_prefix("KTSTR_SHM_BASE=")?;
+        .find(|s| s.starts_with("STT_SHM_BASE="))?
+        .strip_prefix("STT_SHM_BASE=")?;
     let size = cmdline
         .split_whitespace()
-        .find(|s| s.starts_with("KTSTR_SHM_SIZE="))?
-        .strip_prefix("KTSTR_SHM_SIZE=")?;
+        .find(|s| s.starts_with("STT_SHM_SIZE="))?
+        .strip_prefix("STT_SHM_SIZE=")?;
     let base =
         u64::from_str_radix(base.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
     let size =

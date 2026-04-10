@@ -14,7 +14,7 @@ cargo nextest run --run-ignored ignored-only -E 'test(gauntlet/)'
 cargo nextest run --run-ignored all
 ```
 
-`#[ktstr_test]` functions declare topology constraints that filter which
+`#[stt_test]` functions declare topology constraints that filter which
 presets they run on. Each test's attributes -- `required_flags`,
 `excluded_flags`, `min_sockets`, `min_llcs`, `requires_smt`,
 `min_cpus`, and its scheduler's flag declarations -- fully determine
@@ -41,11 +41,11 @@ The test definition is the spec.
 
 Presets are defined in `gauntlet_presets()`.
 
-`#[ktstr_test]` functions can declare topology constraints that filter
+`#[stt_test]` functions can declare topology constraints that filter
 which presets they run on. For example:
 
 ```rust,ignore
-#[ktstr_test(
+#[stt_test(
     sockets = 2, cores = 4, threads = 2,
     scheduler = MY_SCHED,
     min_llcs = 2,
@@ -59,13 +59,13 @@ This test skips `tiny-1llc` (1 LLC), `odd-3llc` (no SMT), and all
 non-SMT presets. Every generated flag profile includes `llc`. The
 test definition controls exactly which gauntlet cells it runs in.
 
-See [Topology Constraints](../writing-tests/ktstr-test-macro.md#topology-constraints)
-and [Flag Constraints](../writing-tests/ktstr-test-macro.md#flag-constraints)
+See [Topology Constraints](../writing-tests/stt-test-macro.md#topology-constraints)
+and [Flag Constraints](../writing-tests/stt-test-macro.md#flag-constraints)
 for the full attribute lists.
 
 ## Budget interaction
 
-When `KTSTR_BUDGET_SECS` is set, the budget selector considers gauntlet
+When `STT_BUDGET_SECS` is set, the budget selector considers gauntlet
 variants alongside base tests. Gauntlet variants contribute topology
 and flag profile diversity to the feature coverage model, so a
 budget-constrained run may select a mix of base tests (cheap, default

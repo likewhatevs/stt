@@ -5,7 +5,7 @@
 //! single declaration. [`execute_steps()`] runs a step sequence with
 //! scheduler liveness checks and stimulus event recording.
 //!
-//! See the [Ops and Steps](https://likewhatevs.github.io/scx-ktstr/guide/concepts/ops.html)
+//! See the [Ops and Steps](https://likewhatevs.github.io/stt/guide/concepts/ops.html)
 //! chapter for a guide.
 
 use std::borrow::Cow;
@@ -148,8 +148,8 @@ impl CpusetSpec {
 /// or other dynamic operations between spawn and collect.
 ///
 /// ```
-/// # use scx_ktstr::scenario::ops::{CgroupDef, CpusetSpec};
-/// # use scx_ktstr::workload::{Work, WorkType};
+/// # use stt::scenario::ops::{CgroupDef, CpusetSpec};
+/// # use stt::workload::{Work, WorkType};
 /// // Single work group via convenience methods.
 /// let def = CgroupDef::named("workers")
 ///     .with_cpuset(CpusetSpec::disjoint(0, 2))
@@ -516,7 +516,7 @@ impl ShmWriter {
             }),
             None => {
                 eprintln!(
-                    "ktstr: SHM mmap failed ({}), using pread/pwrite fallback",
+                    "stt: SHM mmap failed ({}), using pread/pwrite fallback",
                     std::io::Error::last_os_error(),
                 );
                 Some(ShmWriter::Fd {
@@ -751,7 +751,7 @@ pub fn execute_steps_with(
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
             Err(e) => {
-                eprintln!("ktstr: signal slot 0 wait failed: {e} — proceeding without sync");
+                eprintln!("stt: signal slot 0 wait failed: {e} — proceeding without sync");
             }
         }
     }
@@ -1356,7 +1356,7 @@ mod tests {
 
     #[test]
     fn ops_parse_shm_params_valid() {
-        let cmdline = "console=ttyS0 KTSTR_SHM_BASE=0xfc000000 KTSTR_SHM_SIZE=0x10000 quiet";
+        let cmdline = "console=ttyS0 STT_SHM_BASE=0xfc000000 STT_SHM_SIZE=0x10000 quiet";
         let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
         assert_eq!(base, 0xfc000000);
         assert_eq!(size, 0x10000);

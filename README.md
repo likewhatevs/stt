@@ -1,9 +1,9 @@
-# scx-ktstr
+# stt
 
-[![CI](https://github.com/likewhatevs/scx-ktstr/actions/workflows/ci.yml/badge.svg)](https://github.com/likewhatevs/scx-ktstr/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/likewhatevs/scx-ktstr/graph/badge.svg)](https://codecov.io/gh/likewhatevs/scx-ktstr)
-[![guide](https://img.shields.io/badge/docs-guide-blue)](https://likewhatevs.github.io/scx-ktstr/guide/)
-[![api](https://img.shields.io/badge/docs-api-blue)](https://likewhatevs.github.io/scx-ktstr/api/scx_ktstr/)
+[![CI](https://github.com/likewhatevs/stt/actions/workflows/ci.yml/badge.svg)](https://github.com/likewhatevs/stt/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/likewhatevs/stt/graph/badge.svg)](https://codecov.io/gh/likewhatevs/stt)
+[![guide](https://img.shields.io/badge/docs-guide-blue)](https://likewhatevs.github.io/stt/guide/)
+[![api](https://img.shields.io/badge/docs-api-blue)](https://likewhatevs.github.io/stt/api/stt/)
 
 Test harness for Linux process schedulers, with a focus on
 [sched_ext](https://github.com/sched-ext/scx). Boots kernels in KVM
@@ -15,7 +15,7 @@ scheduler.
 - **Any topology** -- 1 to 252 CPUs with arbitrary LLC structure via synthetic ACPI tables.
 - **Data-driven** -- scenarios declare cgroups, cpusets, workloads, and verification as data.
 - **Gauntlet** -- all scenarios across 13 topology presets in parallel VMs. Baseline save/compare for A/B testing.
-- **`#[ktstr_test]`** -- proc macro for integration tests that boot their own VMs.
+- **`#[stt_test]`** -- proc macro for integration tests that boot their own VMs.
 - **Auto-repro** -- reruns failures with BPF kprobes on the crash call chain.
 
 ## Setup
@@ -32,12 +32,12 @@ cargo install cargo-nextest
 
 ```toml
 [dev-dependencies]
-scx-ktstr = { git = "https://github.com/likewhatevs/scx-ktstr" }
+stt = { git = "https://github.com/likewhatevs/stt" }
 ```
 
-**Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `scx_ktstr::prelude::*`.
+**Test files** go in `tests/` as standard Rust integration tests. Use `#[stt_test]` from `stt::prelude::*`.
 
-See the [getting started guide](https://likewhatevs.github.io/scx-ktstr/guide/getting-started.html) for Fedora packages, kernel discovery, and building a test kernel.
+See the [getting started guide](https://likewhatevs.github.io/stt/guide/getting-started.html) for Fedora packages, kernel discovery, and building a test kernel.
 
 ## Quick start
 
@@ -47,7 +47,7 @@ Use `#[derive(Scheduler)]` to declare the scheduler binary, default
 topology, and feature flags:
 
 ```rust
-use scx_ktstr::prelude::*;
+use stt::prelude::*;
 
 #[derive(Scheduler)]
 #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
@@ -70,9 +70,9 @@ Declare cgroups and workloads as data with `CgroupDef` and
 `execute_defs`:
 
 ```rust
-use scx_ktstr::prelude::*;
+use stt::prelude::*;
 
-#[ktstr_test(scheduler = MY_SCHED)]
+#[stt_test(scheduler = MY_SCHED)]
 fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("cg_0").workers(2),
@@ -85,9 +85,9 @@ For multi-step scenarios with dynamic topology changes, use
 `execute_steps` with `Step` and `HoldSpec`:
 
 ```rust
-use scx_ktstr::prelude::*;
+use stt::prelude::*;
 
-#[ktstr_test(scheduler = MY_SCHED, sockets = 1, cores = 4, threads = 1)]
+#[stt_test(scheduler = MY_SCHED, sockets = 1, cores = 4, threads = 1)]
 fn cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
@@ -110,10 +110,10 @@ Requires `/dev/kvm`.
 
 ## Documentation
 
-**[Guide](https://likewhatevs.github.io/scx-ktstr/guide/)** -- getting started, concepts,
+**[Guide](https://likewhatevs.github.io/stt/guide/)** -- getting started, concepts,
 writing tests, recipes, architecture.
 
-**[API docs](https://likewhatevs.github.io/scx-ktstr/api/scx_ktstr/)** -- rustdoc for all workspace crates.
+**[API docs](https://likewhatevs.github.io/stt/api/stt/)** -- rustdoc for all workspace crates.
 
 ## License
 

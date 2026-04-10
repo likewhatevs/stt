@@ -197,7 +197,7 @@ pub struct BpfMapWrite {
 }
 ```
 
-Use with `#[ktstr_test]` via the `bpf_map_write` attribute:
+Use with `#[stt_test]` via the `bpf_map_write` attribute:
 
 ```rust,ignore
 const BPF_CRASH: BpfMapWrite = BpfMapWrite {
@@ -206,7 +206,7 @@ const BPF_CRASH: BpfMapWrite = BpfMapWrite {
     value: 1,
 };
 
-#[ktstr_test(bpf_map_write = BPF_CRASH, expect_err = true)]
+#[stt_test(bpf_map_write = BPF_CRASH, expect_err = true)]
 fn crash_test(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }

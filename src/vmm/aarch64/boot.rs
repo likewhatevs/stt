@@ -192,7 +192,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = crate::vmm::kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = crate::vmm::kvm::SttKvm::new(topo, 64, false).unwrap();
         let result = setup_regs(&vm.vcpus[0], 0x28_0000, 0x4000_0000);
         assert!(result.is_ok(), "setup_regs failed: {:?}", result.err());
 

@@ -62,7 +62,7 @@ const GIC_NR_IRQS: u32 = 128;
 
 /// A KVM virtual machine with configured topology (aarch64).
 #[allow(dead_code)]
-pub struct KtstrKvm {
+pub struct SttKvm {
     pub kvm: Kvm,
     pub vm_fd: VmFd,
     pub vcpus: Vec<VcpuFd>,
@@ -73,7 +73,7 @@ pub struct KtstrKvm {
     gic_fd: DeviceFd,
 }
 
-impl KtstrKvm {
+impl SttKvm {
     pub fn new(topo: Topology, memory_mb: u32, _performance_mode: bool) -> Result<Self> {
         Self::new_inner(topo, memory_mb, false)
     }
@@ -164,7 +164,7 @@ impl KtstrKvm {
         // Map GSI N -> irqchip 0, pin N for the serial SPI IRQs.
         Self::setup_gsi_routing(&vm_fd)?;
 
-        Ok(KtstrKvm {
+        Ok(SttKvm {
             kvm,
             vm_fd,
             vcpus,
@@ -284,7 +284,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 128, false);
+        let vm = SttKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
         let vm = vm.unwrap();
         assert_eq!(vm.vcpus.len(), 2);
@@ -297,7 +297,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 2,
         };
-        let vm = KtstrKvm::new(topo, 256, false);
+        let vm = SttKvm::new(topo, 256, false);
         assert!(
             vm.is_ok(),
             "multi-socket VM creation failed: {:?}",
@@ -314,7 +314,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 64, false);
+        let vm = SttKvm::new(topo, 64, false);
         assert!(vm.is_ok());
         assert_eq!(vm.unwrap().vcpus.len(), 1);
     }
@@ -327,7 +327,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 256, false).unwrap();
+        let vm = SttKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
         assert_eq!(total, 256 << 20);
     }
@@ -340,7 +340,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = SttKvm::new(topo, 64, false).unwrap();
         let region = vm.guest_mem.iter().next().unwrap();
         assert_eq!(
             region.start_addr(),
@@ -356,7 +356,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = SttKvm::new(topo, 64, false).unwrap();
         assert!(vm.has_immediate_exit);
     }
 

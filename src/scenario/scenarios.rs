@@ -16,9 +16,9 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use scx_ktstr::prelude::*;
+//! use stt::prelude::*;
 //!
-//! #[ktstr_test(sockets = 2, cores = 4, threads = 1)]
+//! #[stt_test(sockets = 2, cores = 4, threads = 1)]
 //! fn test_steady(ctx: &Ctx) -> Result<AssertResult> {
 //!     scenarios::steady(ctx)
 //! }

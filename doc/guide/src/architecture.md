@@ -1,6 +1,6 @@
 # Architecture Overview
 
-scx-ktstr has three execution domains:
+stt has three execution domains:
 
 1. **Host process** -- the test binary running on the host. Manages
    [VM lifecycle](architecture/vmm.md), monitors guest memory, evaluates

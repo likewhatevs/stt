@@ -5,7 +5,7 @@ per-program verifier statistics from the real kernel verifier.
 
 ## Design
 
-The verifier pipeline follows scx-ktstr's two core principles.
+The verifier pipeline follows stt's two core principles.
 
 **Fidelity without overhead.** The scheduler binary runs inside a VM
 on the same kernel the scheduler will run on in production. The
@@ -118,9 +118,9 @@ then detects repeating blocks:
    omission count, and the last iteration. Run iteratively (up to 5
    passes) to handle nested loops.
 
-## scx-ktstr-sched test flags
+## stt-sched test flags
 
-scx-ktstr-sched supports these flags to exercise the verifier pipeline:
+stt-sched supports these flags to exercise the verifier pipeline:
 
 **`--fail-verify`** -- sets a `.rodata` variable before
 `scx_ops_load!`, enabling a code path the BPF verifier rejects.

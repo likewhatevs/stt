@@ -82,7 +82,7 @@ const REQUIRED_CAPS: &[Cap] = &[
 
 /// A KVM virtual machine with configured topology.
 #[allow(dead_code)] // kvm/vm_fd/topology fields are held for Drop (fd lifetime)
-pub struct KtstrKvm {
+pub struct SttKvm {
     pub kvm: Kvm,
     pub vm_fd: VmFd,
     pub vcpus: Vec<VcpuFd>,
@@ -95,7 +95,7 @@ pub struct KtstrKvm {
     pub(crate) split_irqchip: bool,
 }
 
-impl KtstrKvm {
+impl SttKvm {
     /// Create a new KVM VM with the given topology and memory size.
     pub fn new(topo: Topology, memory_mb: u32, performance_mode: bool) -> Result<Self> {
         Self::new_inner(topo, memory_mb, false, performance_mode)
@@ -369,7 +369,7 @@ impl KtstrKvm {
             }
         }
 
-        Ok(KtstrKvm {
+        Ok(SttKvm {
             kvm,
             vm_fd,
             vcpus,
@@ -392,7 +392,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 128, false);
+        let vm = SttKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
         let vm = vm.unwrap();
         assert_eq!(vm.vcpus.len(), 2);
@@ -405,7 +405,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 2,
         };
-        let vm = KtstrKvm::new(topo, 256, false);
+        let vm = SttKvm::new(topo, 256, false);
         assert!(
             vm.is_ok(),
             "multi-socket VM creation failed: {:?}",
@@ -422,7 +422,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 64, false);
+        let vm = SttKvm::new(topo, 64, false);
         assert!(vm.is_ok());
         assert_eq!(vm.unwrap().vcpus.len(), 1);
     }
@@ -434,7 +434,7 @@ mod tests {
             cores_per_socket: 4,
             threads_per_core: 2,
         };
-        let vm = KtstrKvm::new(topo, 512, false);
+        let vm = SttKvm::new(topo, 512, false);
         assert!(vm.is_ok(), "large topology failed: {:?}", vm.err());
         assert_eq!(vm.unwrap().vcpus.len(), 32);
     }
@@ -446,7 +446,7 @@ mod tests {
             cores_per_socket: 3,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 128, false);
+        let vm = SttKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "odd topology failed: {:?}", vm.err());
         assert_eq!(vm.unwrap().vcpus.len(), 9);
     }
@@ -459,7 +459,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 256, false).unwrap();
+        let vm = SttKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
         assert_eq!(total, 256 << 20);
     }
@@ -490,7 +490,7 @@ mod tests {
         };
         // max APIC ID = apic_id(15) = 1<<3 | 3<<1 | 1 = 15, well under 254
         assert!(max_apic_id(&topo) <= MAX_XAPIC_ID);
-        let vm = KtstrKvm::new(topo, 256, false).unwrap();
+        let vm = SttKvm::new(topo, 256, false).unwrap();
         assert!(!vm.split_irqchip, "small topology should use full IRQ chip");
     }
 
@@ -512,7 +512,7 @@ mod tests {
             max_apic_id(&topo),
             MAX_XAPIC_ID,
         );
-        let vm = KtstrKvm::new(topo, 4096, false);
+        let vm = SttKvm::new(topo, 4096, false);
         assert!(vm.is_ok(), "split IRQ chip VM failed: {:?}", vm.err());
         let vm = vm.unwrap();
         assert!(vm.split_irqchip, "large topology should use split IRQ chip");
@@ -533,7 +533,7 @@ mod tests {
             "8s/8c/2t max APIC ID {} should be <= 254",
             max_apic_id(&small),
         );
-        let vm = KtstrKvm::new(small, 2048, false).unwrap();
+        let vm = SttKvm::new(small, 2048, false).unwrap();
         assert!(!vm.split_irqchip);
 
         // 15 sockets x 8 cores x 2 threads: core_shift = 4, max APIC ID = 14<<4 | 7<<1 | 1 = 239
@@ -547,7 +547,7 @@ mod tests {
             "15s/8c/2t max APIC ID {} should be <= 254",
             max_apic_id(&still_small),
         );
-        let vm = KtstrKvm::new(still_small, 4096, false).unwrap();
+        let vm = SttKvm::new(still_small, 4096, false).unwrap();
         assert!(!vm.split_irqchip);
     }
 
@@ -558,7 +558,7 @@ mod tests {
             cores_per_socket: 1,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = SttKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT is available since Linux 4.12.
         assert!(vm.has_immediate_exit);
     }
@@ -570,7 +570,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 128, true);
+        let vm = SttKvm::new(topo, 128, true);
         assert!(
             vm.is_ok(),
             "performance_mode VM creation failed: {:?}",
@@ -585,8 +585,8 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 2,
         };
-        let vm_normal = KtstrKvm::new(topo, 256, false).unwrap();
-        let vm_perf = KtstrKvm::new(topo, 256, true).unwrap();
+        let vm_normal = SttKvm::new(topo, 256, false).unwrap();
+        let vm_perf = SttKvm::new(topo, 256, true).unwrap();
         assert_eq!(vm_normal.vcpus.len(), vm_perf.vcpus.len());
     }
 
@@ -602,7 +602,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 128, false);
+        let vm = SttKvm::new(topo, 128, false);
         assert!(
             vm.is_ok(),
             "non-perf VM with halt poll failed: {:?}",
@@ -638,7 +638,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 64, true).unwrap();
+        let vm = SttKvm::new(topo, 64, true).unwrap();
         let clock = vm.vm_fd.get_clock().unwrap();
         let mut set_data = clock;
         set_data.flags = 0;
@@ -661,7 +661,7 @@ mod tests {
             cores_per_socket: 2,
             threads_per_core: 1,
         };
-        let vm = KtstrKvm::new(topo, 128, true);
+        let vm = SttKvm::new(topo, 128, true);
         assert!(
             vm.is_ok(),
             "performance_mode with HLT disable failed: {:?}",
