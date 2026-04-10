@@ -16,18 +16,10 @@ stt tests compose from four layers:
 These compose orthogonally. A scenario runs with every valid flag
 combination, and verification checks apply uniformly across all runs.
 
-## Why this design
-
-Scenarios are data-driven structs, not test functions. The same scenario
-definition works across different schedulers, flag combinations, and
-topologies without code changes.
-
-Flags are defined via `#[derive(Scheduler)]` on an enum, generating
-typed `FlagDecl` statics with dependency constraints (`steal` requires
-`llc`). Dependencies are declared statically and enforced at profile
-generation time -- invalid combinations are rejected automatically.
-
-Assertion layers merge: `Assert::default_checks()` provides
-baselines, each `Scheduler` can override thresholds, and individual
-`#[stt_test]` attributes can override further. This eliminates
-per-test boilerplate while allowing scheduler-specific tuning.
+Three supporting concepts complete the picture:
+[Ops and Steps](concepts/ops.md) is the primary API for defining
+scenarios -- most tests use `CgroupDef` and `execute_defs` from
+this module. [TestTopology](concepts/topology.md) provides CPU and
+LLC layout for cpuset partitioning.
+[Performance Mode](concepts/performance-mode.md) applies host-side
+isolation for noise-sensitive measurements.
