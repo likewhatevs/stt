@@ -59,7 +59,7 @@ pub enum Op {
     /// Stop all workers in a cgroup (does not remove the cgroup).
     StopCgroup { cgroup: Cow<'static, str> },
     /// Set each worker in a cgroup to a random subset of half the
-    /// cgroup's cpuset (or half of usable CPUs if no cpuset is configured,
+    /// cgroup's cpuset (or half of all CPUs if no cpuset is configured,
     /// minimum 1 CPU).
     RandomizeAffinity { cgroup: Cow<'static, str> },
     /// Set all workers in a cgroup to the given affinity mask.
@@ -872,7 +872,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     .cpusets
                     .get(cgroup.as_ref())
                     .cloned()
-                    .unwrap_or_else(|| ctx.topo.usable_cpuset());
+                    .unwrap_or_else(|| ctx.topo.all_cpuset());
                 for (name, handle) in &state.handles {
                     if name.as_str() == *cgroup {
                         for idx in 0..handle.tids().len() {

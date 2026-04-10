@@ -36,7 +36,7 @@
 //! fn my_low_level_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     let mut group = CgroupGroup::new(ctx.cgroups);
 //!     group.add_cgroup_no_cpuset("workers")?;
-//!     let cpus = ctx.topo.usable_cpuset();
+//!     let cpus = ctx.topo.all_cpuset();
 //!     ctx.cgroups.set_cpuset("workers", &cpus)?;
 //!
 //!     let cfg = WorkloadConfig {
