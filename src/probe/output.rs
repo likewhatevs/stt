@@ -477,7 +477,7 @@ mod tests {
         let events = vec![
             ProbeEvent {
                 func_idx: 0,
-                tid: 42,
+                task_ptr: 42,
                 ts: 100,
                 args: [0xDEAD, 0xBEEF, 0, 0, 0, 0],
                 fields: vec![
@@ -489,7 +489,7 @@ mod tests {
             },
             ProbeEvent {
                 func_idx: 1,
-                tid: 42,
+                task_ptr: 42,
                 ts: 200,
                 args: [7, 0, 0, 0, 0, 0],
                 fields: vec![],
@@ -519,7 +519,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 99, // not in func_names
-            tid: 1,
+            task_ptr: 1,
             ts: 50,
             args: [1, 0, 0, 0, 0, 0],
             fields: vec![],
@@ -618,7 +618,7 @@ mod tests {
         let events = vec![
             ProbeEvent {
                 func_idx: 1,
-                tid: 1,
+                task_ptr: 1,
                 ts: 200,
                 args: [0; 6],
                 fields: vec![],
@@ -627,7 +627,7 @@ mod tests {
             },
             ProbeEvent {
                 func_idx: 0,
-                tid: 1,
+                task_ptr: 1,
                 ts: 100,
                 args: [0; 6],
                 fields: vec![],
@@ -653,7 +653,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0, 0x42, 0, 0, 0, 0],
             fields: vec![],
@@ -691,7 +691,7 @@ mod tests {
         // symbolize them, so they appear as raw "0x{addr:x}" lines.
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![],
@@ -723,7 +723,7 @@ mod tests {
         // Value 123 -> decode_named_value("pid", "123") -> "123" (passthrough).
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![("p0:task_struct.pid".to_string(), 123)],
@@ -746,7 +746,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 42,
+            task_ptr: 42,
             ts: 100,
             args: [0xDEAD, 0, 0, 0, 0, 0],
             fields: vec![
@@ -794,7 +794,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![
@@ -839,7 +839,7 @@ mod tests {
         // the scalar line is suppressed.
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![
@@ -872,7 +872,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![],
@@ -896,7 +896,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![],
@@ -921,7 +921,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![
@@ -951,7 +951,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![
@@ -978,7 +978,7 @@ mod tests {
 
         let events = vec![ProbeEvent {
             func_idx: 0,
-            tid: 1,
+            task_ptr: 1,
             ts: 100,
             args: [0; 6],
             fields: vec![("rq:rq.cpu".to_string(), 2)],

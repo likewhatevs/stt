@@ -227,7 +227,12 @@ impl Runner {
                 && let Some(ref stack_input) = self.config.probe_stack
             {
                 let mut functions = filter_traceable(load_probe_stack(stack_input));
-                let bpf_syms = discover_bpf_symbols();
+                let stack_display_names: Vec<&str> = functions
+                    .iter()
+                    .filter(|f| f.is_bpf)
+                    .map(|f| f.display_name.as_str())
+                    .collect();
+                let bpf_syms = discover_bpf_symbols(&stack_display_names);
                 if !bpf_syms.is_empty() {
                     tracing::debug!(n = bpf_syms.len(), "auto-probe: BPF symbols discovered");
                     functions.extend(bpf_syms);

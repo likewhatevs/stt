@@ -15,11 +15,10 @@ struct {
 	__uint(max_entries, MAX_FUNCS);
 } func_meta_map SEC(".maps");
 
-/* Per-probe-hit data: (func_ip, tid) -> probe_entry. */
+/* Per-probe-hit data: (func_ip, task_ptr) -> probe_entry. */
 struct probe_key {
 	u64 func_ip;
-	u32 tid;
-	u32 _pad;
+	u64 task_ptr;
 };
 
 struct {
@@ -61,7 +60,7 @@ int ktstr_probe(struct pt_regs *ctx)
 	__sync_fetch_and_add(&ktstr_probe_count, 1);
 
 	u64 ip = bpf_get_func_ip(ctx);
-	u32 tid = (u32)bpf_get_current_pid_tgid();
+	u64 task_ptr = (u64)bpf_get_current_task();
 
 	struct func_meta *meta = bpf_map_lookup_elem(&func_meta_map, &ip);
 	if (!meta) {
@@ -130,7 +129,7 @@ int ktstr_probe(struct pt_regs *ctx)
 		}
 	}
 
-	struct probe_key key = { .func_ip = ip, .tid = tid };
+	struct probe_key key = { .func_ip = ip, .task_ptr = task_ptr };
 	bpf_map_update_elem(&probe_data, &key, &entry, BPF_ANY);
 
 	return 0;

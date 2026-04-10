@@ -12,14 +12,14 @@ const EVENT_TRIGGER: u32 = 2;
 
 /// Structured probe event captured by the BPF skeleton.
 ///
-/// One per (function, tid) combination. `fields` contains BTF-resolved
+/// One per (function, task_ptr) combination. `fields` contains BTF-resolved
 /// struct field values keyed as `"param:struct.field"` (from
 /// [`build_field_keys`]). Events are sorted by `ts` and stitched by
-/// `task_struct` pointer or tid before output.
+/// `task_struct` pointer before output.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProbeEvent {
     pub func_idx: u32,
-    pub tid: u32,
+    pub task_ptr: u64,
     pub ts: u64,
     pub args: [u64; 6],
     pub fields: Vec<(String, u64)>, // (field_key, value) — decoded by caller
@@ -156,7 +156,8 @@ fn detect_str_param(btf_func: &BtfFunc) -> u8 {
 ///
 /// Polls until the trigger kprobe fires (via ring buffer EVENT_TRIGGER)
 /// or `stop` is set. Then iterates `probe_data` entries, matches them
-/// to functions by IP, stitches events by `task_struct` pointer or tid,
+/// to functions by IP, stitches events by `task_struct` pointer
+/// or time proximity to the trigger,
 /// and returns them sorted by timestamp.
 pub fn run_probe_skeleton(
     functions: &[StackFunction],
@@ -528,7 +529,7 @@ pub fn run_probe_skeleton(
                 let kstack_sz = (raw.kstack_sz as usize).min(32);
                 let event = ProbeEvent {
                     func_idx: 0,
-                    tid: raw.tid,
+                    task_ptr: raw.args[0],
                     ts: raw.ts,
                     args: raw.args,
                     fields: vec![],
@@ -628,7 +629,7 @@ pub fn run_probe_skeleton(
 
                     probe_events.push(ProbeEvent {
                         func_idx,
-                        tid: key.tid,
+                        task_ptr: key.task_ptr,
                         ts: entry.ts,
                         args: entry.args,
                         fields,
@@ -651,56 +652,48 @@ pub fn run_probe_skeleton(
                 return None;
             }
 
-            // Stitch by task_struct pointer. Build a map of func_idx →
-            // task_struct param index from BTF, then filter events to
-            // those referencing the same task_struct pointer as the most
-            // recent event (the task that triggered the exit).
-            let task_param_idx: std::collections::HashMap<u32, usize> = func_ips
-                .iter()
-                .filter_map(|(idx, _, name)| {
-                    let btf = btf_funcs.iter().find(|f| f.name == *name)?;
-                    let pos = btf
-                        .params
-                        .iter()
-                        .position(|p| p.struct_name.as_deref() == Some("task_struct"))?;
-                    Some((*idx, pos))
-                })
-                .collect();
-
-            // Get tptr and tid from the trigger event.
+            // Stitch by task_struct pointer OR time proximity.
+            // Events from the same task (matching task_ptr) are always
+            // kept. Events from different tasks (scheduler thread, IRQ
+            // context) are kept if they fired within a time window
+            // around the trigger — these cross-task events are critical
+            // for debugging scheduler crashes.
             let trigger_event = events.lock().unwrap().last().cloned();
-            let trigger_tptr: Option<u64> = trigger_event.as_ref().and_then(|e| {
-                let ptr = e.args[0];
-                if ptr != 0 { Some(ptr) } else { None }
-            });
-            let trigger_tid: Option<u32> = trigger_event.as_ref().map(|e| e.tid);
+            let target_tptr: Option<u64> = trigger_event
+                .as_ref()
+                .map(|e| e.task_ptr)
+                .filter(|&ptr| ptr != 0)
+                .or_else(|| {
+                    probe_events
+                        .iter()
+                        .rev()
+                        .map(|e| e.task_ptr)
+                        .find(|&ptr| ptr != 0)
+                });
+            let trigger_ts: u64 = trigger_event
+                .as_ref()
+                .map(|e| e.ts)
+                .or_else(|| probe_events.last().map(|e| e.ts))
+                .unwrap_or(0);
 
-            let target_tptr: Option<u64> = trigger_tptr.or_else(|| {
-                probe_events.iter().rev().find_map(|e| {
-                    let pidx = task_param_idx.get(&e.func_idx)?;
-                    let ptr = e.args[*pidx];
-                    if ptr != 0 { Some(ptr) } else { None }
-                })
-            });
+            // 100ms window: captures cross-task events from the crash
+            // path (IRQ work, scheduler thread) while filtering noise
+            // from unrelated earlier probe hits.
+            const TIME_WINDOW_NS: u64 = 100_000_000;
 
-            // Stitch: tptr for task-param functions, tid for non-task functions.
-            // Same filter for both kernel and BPF fentry events.
             if let Some(tptr) = target_tptr {
-                let ttid = trigger_tid.unwrap_or(0);
                 let before = probe_events.len();
                 probe_events.retain(|e| {
-                    if let Some(&pidx) = task_param_idx.get(&e.func_idx) {
-                        e.args[pidx] == tptr
-                    } else {
-                        e.tid == ttid
-                    }
+                    e.task_ptr == tptr
+                        || (trigger_ts > 0 && e.ts.abs_diff(trigger_ts) <= TIME_WINDOW_NS)
                 });
                 tracing::debug!(
                     tptr = format_args!("0x{tptr:x}"),
-                    tid = ttid,
+                    trigger_ts,
+                    window_ns = TIME_WINDOW_NS,
                     kept = probe_events.len(),
                     total = before,
-                    "stitched by tptr/tid",
+                    "stitched by task_ptr + time window",
                 );
             }
 

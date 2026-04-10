@@ -476,40 +476,144 @@ pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> V
 
 /// Discover loaded sched_ext BPF programs via libbpf-rs `ProgInfoIter`.
 ///
-/// Each struct_ops callback is its own BPF program. Returns a
-/// [`StackFunction`] per callback with `is_bpf = true` and the
-/// program's ID in `bpf_prog_id`. The `raw_name` is
+/// Discovers programs in two passes:
+/// 1. All `StructOps` programs (scheduler callbacks).
+/// 2. Any other loaded BPF program whose name matches a display name
+///    in `stack_names` (e.g. `SEC("syscall")` programs like
+///    `apply_cell_config` that appear in crash backtraces).
+///
+/// For non-StructOps matching, `bpf_prog_info.name` is truncated to
+/// 15 characters (`BPF_OBJ_NAME_LEN - 1`). When a stack name is
+/// longer than 15 chars, the truncated `info.name` is used as a
+/// candidate prefix match, then the full name is confirmed via the
+/// program's BTF.
+///
+/// Returns a [`StackFunction`] per discovered program with `is_bpf = true`
+/// and the program's ID in `bpf_prog_id`. The `raw_name` is
 /// `bpf_prog_{id}_{name}` to match kallsyms format.
-pub fn discover_bpf_symbols() -> Vec<StackFunction> {
+pub fn discover_bpf_symbols(stack_names: &[&str]) -> Vec<StackFunction> {
     use libbpf_rs::query::ProgInfoIter;
 
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
 
-    // Each struct_ops program IS one callback function. Use the
-    // program's name as the function name and its id as the prog_id.
-    // This ensures set_attach_target gets the correct FD for each function.
     for info in ProgInfoIter::default() {
-        if info.ty != libbpf_rs::ProgramType::StructOps {
-            continue;
-        }
-        let func_name = match info.name.to_str() {
+        let info_name = match info.name.to_str() {
             Ok(n) if !n.is_empty() => n.to_string(),
             _ => continue,
         };
-        if !seen.insert(func_name.clone()) {
-            continue;
+        if info.ty == libbpf_rs::ProgramType::StructOps {
+            if !seen.insert(info_name.clone()) {
+                continue;
+            }
+            results.push(StackFunction {
+                raw_name: format!("bpf_prog_{}_{info_name}", info.id),
+                display_name: info_name,
+                is_bpf: true,
+                bpf_prog_id: Some(info.id),
+            });
+        } else if !stack_names.is_empty() {
+            // bpf_prog_info.name is truncated to 15 chars. For short
+            // names, exact match works. For long names, check if any
+            // stack name starts with the truncated info.name, then
+            // confirm the full name via BTF.
+            let matched_name = if stack_names.contains(&info_name.as_str()) {
+                Some(info_name.clone())
+            } else {
+                // Candidate: a stack name whose prefix matches the
+                // truncated info.name (only relevant when info.name
+                // is at the 15-char limit).
+                let candidate = stack_names
+                    .iter()
+                    .find(|sn| sn.len() > info_name.len() && sn.starts_with(&info_name));
+                if let Some(target) = candidate {
+                    resolve_bpf_prog_full_name(info.id).filter(|full| full == *target)
+                } else {
+                    None
+                }
+            };
+            if let Some(func_name) = matched_name {
+                if !seen.insert(func_name.clone()) {
+                    continue;
+                }
+                tracing::debug!(
+                    name = %func_name, id = info.id, ty = ?info.ty,
+                    "discover_bpf_symbols: matched non-struct_ops program from stack",
+                );
+                results.push(StackFunction {
+                    raw_name: format!("bpf_prog_{}_{func_name}", info.id),
+                    display_name: func_name,
+                    is_bpf: true,
+                    bpf_prog_id: Some(info.id),
+                });
+            }
         }
-        results.push(StackFunction {
-            raw_name: format!("bpf_prog_{}_{func_name}", info.id),
-            display_name: func_name,
-            is_bpf: true,
-            bpf_prog_id: Some(info.id),
-        });
     }
 
     tracing::debug!(n = results.len(), "discover_bpf_symbols");
     results
+}
+
+/// Resolve the full function name for a BPF program from its BTF.
+///
+/// `bpf_prog_info.name` is truncated to 15 characters. The full name
+/// is resolved from `func_info[0].type_id` in the program's BTF,
+/// which the kernel guarantees is the entry point (`insn_off == 0`).
+fn resolve_bpf_prog_full_name(prog_id: u32) -> Option<String> {
+    use libbpf_rs::AsRawLibbpf;
+    use libbpf_rs::libbpf_sys;
+
+    let prog_btf = libbpf_rs::btf::Btf::from_prog_id(prog_id).ok()?;
+    let btf_ptr = prog_btf.as_libbpf_object().as_ptr();
+
+    let fd = unsafe { libbpf_sys::bpf_prog_get_fd_by_id(prog_id) };
+    if fd < 0 {
+        return None;
+    }
+
+    let mut info = libbpf_sys::bpf_prog_info::default();
+    let mut info_len = std::mem::size_of::<libbpf_sys::bpf_prog_info>() as u32;
+    let ret = unsafe {
+        libbpf_sys::bpf_obj_get_info_by_fd(fd, &mut info as *mut _ as *mut _, &mut info_len)
+    };
+    if ret != 0 || info.nr_func_info == 0 {
+        unsafe { libc::close(fd) };
+        return None;
+    }
+
+    let fi_rec = info.func_info_rec_size as usize;
+    let mut fi_buf = vec![0u8; info.nr_func_info as usize * fi_rec];
+
+    let mut info2 = libbpf_sys::bpf_prog_info {
+        nr_func_info: info.nr_func_info,
+        func_info_rec_size: info.func_info_rec_size,
+        func_info: fi_buf.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    let mut info2_len = std::mem::size_of::<libbpf_sys::bpf_prog_info>() as u32;
+    let ret = unsafe {
+        libbpf_sys::bpf_obj_get_info_by_fd(fd, &mut info2 as *mut _ as *mut _, &mut info2_len)
+    };
+    unsafe { libc::close(fd) };
+    if ret != 0 {
+        return None;
+    }
+
+    // func_info[0] is the entry point (insn_off == 0).
+    let fi = unsafe { &*(fi_buf.as_ptr() as *const libbpf_sys::bpf_func_info) };
+    let t = unsafe { libbpf_sys::btf__type_by_id(btf_ptr, fi.type_id) };
+    if t.is_null() {
+        return None;
+    }
+    let name_ptr = unsafe { libbpf_sys::btf__name_by_offset(btf_ptr, (*t).name_off) };
+    if name_ptr.is_null() {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) }
+        .to_str()
+        .ok()?
+        .to_string();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Resolve source locations for BPF functions from program BTF line_info.
@@ -1241,7 +1345,7 @@ mod tests {
 
     #[test]
     fn discover_bpf_symbols_no_scheduler() {
-        let _ = discover_bpf_symbols();
+        let _ = discover_bpf_symbols(&[]);
     }
 
     // -- resolve_btf_path --

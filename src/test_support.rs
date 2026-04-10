@@ -2120,7 +2120,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         // Discover BPF scheduler functions from the running scheduler.
         // Stack-extracted BPF names have stale prog IDs from the first VM;
         // discover_bpf_symbols finds the current scheduler's programs.
-        let bpf_syms = crate::probe::btf::discover_bpf_symbols();
+        let stack_display_names: Vec<&str> = functions
+            .iter()
+            .filter(|f| f.is_bpf)
+            .map(|f| f.display_name.as_str())
+            .collect();
+        let bpf_syms = crate::probe::btf::discover_bpf_symbols(&stack_display_names);
         if !bpf_syms.is_empty() {
             eprintln!(
                 "ktstr_test: probe: {} BPF symbols discovered",
@@ -2278,7 +2283,8 @@ fn collect_and_print_probe_data(
 
     // Resolve BPF source locations inside the guest where the BPF
     // programs are loaded. The host doesn't have the prog FDs.
-    let bpf_syms = crate::probe::btf::discover_bpf_symbols();
+    let source_loc_names: Vec<&str> = func_names.iter().map(|(_, name)| name.as_str()).collect();
+    let bpf_syms = crate::probe::btf::discover_bpf_symbols(&source_loc_names);
     let bpf_prog_ids: Vec<u32> = func_names
         .iter()
         .filter_map(|(_, name)| {
@@ -3522,7 +3528,7 @@ mod tests {
         let payload = ProbePayload {
             events: vec![ProbeEvent {
                 func_idx: 0,
-                tid: 1,
+                task_ptr: 1,
                 ts: 100,
                 args: [0; 6],
                 fields: vec![("p:task_struct.pid".to_string(), 42)],
@@ -3571,7 +3577,7 @@ mod tests {
             events: vec![
                 ProbeEvent {
                     func_idx: 0,
-                    tid: 1,
+                    task_ptr: 1,
                     ts: 100,
                     args: [0xDEAD, 0, 0, 0, 0, 0],
                     fields: vec![
@@ -3583,7 +3589,7 @@ mod tests {
                 },
                 ProbeEvent {
                     func_idx: 1,
-                    tid: 1,
+                    task_ptr: 1,
                     ts: 200,
                     args: [0; 6],
                     fields: vec![("rq:rq.cpu".to_string(), 3)],

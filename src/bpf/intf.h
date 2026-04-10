@@ -10,7 +10,7 @@
 #define FENTRY_BATCH 4
 #define MAX_STR_LEN 64
 
-/* Per-probe-hit captured data, stored in hash map keyed by (func_ip, tid). */
+/* Per-probe-hit captured data, stored in hash map keyed by (func_ip, task_ptr). */
 struct probe_entry {
 	unsigned long long ts;
 	unsigned long long args[MAX_ARGS];

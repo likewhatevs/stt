@@ -34,8 +34,7 @@ char _license[] SEC("license") = "GPL";
 
 struct probe_key {
 	u64 func_ip;
-	u32 tid;
-	u32 _pad;
+	u64 task_ptr;
 };
 
 struct {
@@ -69,7 +68,7 @@ static __always_inline int ktstr_fentry_common(unsigned long long *ctx, u32 func
 
 	__sync_fetch_and_add(&ktstr_fentry_probe_count, 1);
 
-	u32 tid = (u32)bpf_get_current_pid_tgid();
+	u64 task_ptr = (u64)bpf_get_current_task();
 
 	struct probe_entry entry = {};
 	entry.ts = bpf_ktime_get_ns();
@@ -142,7 +141,7 @@ static __always_inline int ktstr_fentry_common(unsigned long long *ctx, u32 func
 		}
 	}
 
-	struct probe_key key = { .func_ip = fake_ip, .tid = tid };
+	struct probe_key key = { .func_ip = fake_ip, .task_ptr = task_ptr };
 	bpf_map_update_elem(&probe_data, &key, &entry, BPF_ANY);
 
 	return 0;

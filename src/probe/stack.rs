@@ -1,28 +1,31 @@
 /// Return true if a function should not be probed.
 ///
-/// Skips the trigger function (`scx_disable_workfn`), generic scheduler
+/// Skips generic scheduler
 /// entry points (`schedule`, `__schedule`), syscall handlers,
 /// low-level infrastructure (`_raw_spin_*`, `asm_*`, `entry_*`,
 /// `sysvec_*`), sched_ext exit/error machinery (`scx_vexit`,
-/// `scx_exit`, `scx_bpf_error_bstr`, `scx_error_irq*`, etc.),
+/// `scx_exit`, `scx_error_irq*`, etc.),
 /// BPF trampoline functions (`__bpf_prog_enter*`, `__bpf_prog_exit*`),
+/// BPF syscall infrastructure (`__sys_bpf`, `__x64_sys_bpf`,
+/// `bpf_prog_test_run*`),
 /// and stack dump helpers (`dump_stack`,
 /// `stack_trace_save`, etc.) that appear in every sched_ext crash
 /// backtrace but carry no scheduler-specific decision data.
 pub fn should_skip_probe(name: &str) -> bool {
     matches!(
         name,
-        "scx_disable_workfn"
-            | "schedule"
+        "schedule"
             | "__schedule"
             | "do_syscall_64"
             | "__do_sys_sched_yield"
             | "do_sched_yield"
+            // BPF syscall infrastructure (raw fd/attr/size args)
+            | "__sys_bpf"
+            | "__x64_sys_bpf"
             | "preempt_schedule_common"
             | "preempt_schedule_irq"
             // sched_ext exit/error infrastructure (ext.c)
             | "scx_vexit"
-            | "scx_bpf_error_bstr"
             | "scx_bpf_exit_bstr"
             | "scx_dump_state"
             | "scx_dump_task"
@@ -46,6 +49,8 @@ pub fn should_skip_probe(name: &str) -> bool {
         || name.starts_with("__bpf_prog_exit")
         // sched_ext error irq work
         || name.starts_with("scx_error_irq")
+        // BPF prog_test_run variants (syscall infrastructure)
+        || name.starts_with("bpf_prog_test_run")
 }
 
 /// Maps sched_ext BPF op name fragments to (kernel_caller, task_arg_idx).
@@ -158,7 +163,7 @@ pub fn extract_stack_functions_all(stack: &str) -> Vec<StackFunction> {
             if !seen.insert(func.to_string()) {
                 return None;
             }
-            let is_bpf = func.starts_with("bpf_prog_");
+            let is_bpf = is_bpf_prog_symbol(func);
             let display_name = if is_bpf {
                 bpf_short_name(func).unwrap_or(func).to_string()
             } else {
@@ -172,6 +177,24 @@ pub fn extract_stack_functions_all(stack: &str) -> Vec<StackFunction> {
             })
         })
         .collect()
+}
+
+/// Return true if `name` is a BPF program symbol (not a kernel function).
+///
+/// BPF program symbols in kallsyms follow `bpf_prog_<hex_hash>_<name>`.
+/// Kernel functions like `bpf_prog_test_run_syscall` or `bpf_prog_get`
+/// share the `bpf_prog_` prefix but the segment after it is not hex.
+pub fn is_bpf_prog_symbol(name: &str) -> bool {
+    let rest = match name.strip_prefix("bpf_prog_") {
+        Some(r) => r,
+        None => return false,
+    };
+    let hash_end = match rest.find('_') {
+        Some(idx) => idx,
+        None => return false,
+    };
+    let hash = &rest[..hash_end];
+    !hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Extract the short function name from a BPF program symbol.
@@ -200,7 +223,7 @@ pub fn load_probe_stack(input: &str) -> Vec<StackFunction> {
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
             let s = s.trim();
-            let is_bpf = s.starts_with("bpf_prog_");
+            let is_bpf = is_bpf_prog_symbol(s);
             StackFunction {
                 raw_name: s.to_string(),
                 display_name: if is_bpf {
@@ -313,7 +336,6 @@ mod tests {
 
     #[test]
     fn should_skip_probe_skips() {
-        assert!(should_skip_probe("scx_disable_workfn"));
         assert!(should_skip_probe("_raw_spin_lock"));
         assert!(should_skip_probe("asm_exc_page_fault"));
         assert!(should_skip_probe("entry_SYSCALL_64"));
@@ -348,6 +370,28 @@ mod tests {
     #[test]
     fn bpf_short_name_no_underscore() {
         assert_eq!(bpf_short_name("bpf_prog_"), None);
+    }
+
+    // -- is_bpf_prog_symbol --
+
+    #[test]
+    fn is_bpf_prog_symbol_real_bpf() {
+        assert!(is_bpf_prog_symbol(
+            "bpf_prog_d62ea951ad3da50b_apply_cell_config"
+        ));
+        assert!(is_bpf_prog_symbol("bpf_prog_abc_mitosis_enqueue"));
+    }
+
+    #[test]
+    fn is_bpf_prog_symbol_kernel_functions() {
+        assert!(!is_bpf_prog_symbol("bpf_prog_test_run_syscall"));
+        assert!(!is_bpf_prog_symbol("bpf_prog_get"));
+    }
+
+    #[test]
+    fn is_bpf_prog_symbol_not_bpf_prefix() {
+        assert!(!is_bpf_prog_symbol("do_enqueue_task"));
+        assert!(!is_bpf_prog_symbol("__sys_bpf"));
     }
 
     // -- extract_stack_functions --
@@ -508,11 +552,11 @@ mod tests {
         // Infrastructure frames should be filtered
         assert!(!names.contains(&"scx_vexit"));
         assert!(!names.contains(&"scx_exit"));
-        assert!(!names.contains(&"scx_bpf_error_bstr"));
         assert!(!names.contains(&"__bpf_prog_enter"));
         assert!(!names.contains(&"dump_stack"));
         assert!(!names.contains(&"stack_trace_save"));
         // Scheduler-specific frames should be kept
+        assert!(names.contains(&"scx_bpf_error_bstr"));
         assert!(names.contains(&"bpf_prog_abc_mitosis_enqueue"));
         assert!(names.contains(&"do_enqueue_task"));
         assert!(names.contains(&"scx_exit_task"));
@@ -532,12 +576,11 @@ mod tests {
             do_enqueue_task+0x1a0/0x380\n";
         let fns = extract_stack_functions_all(stack);
         let names: Vec<&str> = fns.iter().map(|f| f.raw_name.as_str()).collect();
+        // BPF syscall infrastructure filtered
         assert!(!names.contains(&"do_syscall_64"));
-        // __sys_bpf, __x64_sys_bpf, bpf_prog_test_run_syscall are kept —
-        // probe deduplication by tid/timestamp makes them useful context
-        assert!(names.contains(&"__sys_bpf"));
-        assert!(names.contains(&"__x64_sys_bpf"));
-        assert!(names.contains(&"bpf_prog_test_run_syscall"));
+        assert!(!names.contains(&"__sys_bpf"));
+        assert!(!names.contains(&"__x64_sys_bpf"));
+        assert!(!names.contains(&"bpf_prog_test_run_syscall"));
         // Scheduler-specific frames kept
         assert!(names.contains(&"bpf_prog_abc_mitosis_apply_cell_config"));
         assert!(names.contains(&"do_enqueue_task"));
@@ -696,7 +739,6 @@ mod tests {
         assert!(should_skip_probe("scx_vexit"));
         assert!(should_skip_probe("scx_exit"));
         assert!(should_skip_probe("scx_exit_reason"));
-        assert!(should_skip_probe("scx_bpf_error_bstr"));
         assert!(should_skip_probe("scx_bpf_exit_bstr"));
         assert!(should_skip_probe("scx_dump_state"));
         assert!(should_skip_probe("scx_dump_task"));
@@ -721,12 +763,12 @@ mod tests {
     }
 
     #[test]
-    fn should_not_skip_bpf_syscall_infrastructure() {
-        // BPF syscall functions are kept — probe tid/timestamp
-        // deduplication makes them useful context for crash analysis.
-        assert!(!should_skip_probe("__sys_bpf"));
-        assert!(!should_skip_probe("__x64_sys_bpf"));
-        assert!(!should_skip_probe("bpf_prog_test_run_syscall"));
+    fn should_skip_probe_bpf_syscall_infrastructure() {
+        assert!(should_skip_probe("__sys_bpf"));
+        assert!(should_skip_probe("__x64_sys_bpf"));
+        assert!(should_skip_probe("bpf_prog_test_run_syscall"));
+        assert!(should_skip_probe("bpf_prog_test_run_xdp"));
+        assert!(should_skip_probe("bpf_prog_test_run_skb"));
     }
 
     // -- BPF_OP_CALLERS table --
