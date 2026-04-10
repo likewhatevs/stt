@@ -40,7 +40,8 @@ Neither threshold is set by default; enable via `Assert` setters or
 and iteration throughput. Three thresholds:
 - `max_p99_wake_latency_ns`: p99 of all `wake_latencies_ns` samples
   across workers in a cgroup. Populated only for blocking work types
-  (FutexPingPong, FutexFanOut, CachePipe, Bursty, CacheYield, PipeIo, IoSync).
+  (FutexPingPong, FutexFanOut, CachePipe, Bursty, CacheYield, PipeIo,
+  IoSync, Sequence with Sleep/Yield/Io phases).
 - `max_wake_latency_cv`: coefficient of variation of wake latency
   samples. High CV means inconsistent scheduling latency.
 - `min_iteration_rate`: minimum outer-loop iterations per wall-clock
