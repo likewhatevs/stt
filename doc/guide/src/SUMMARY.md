@@ -17,6 +17,7 @@
   - [Work Types](concepts/work-types.md)
   - [Verification](concepts/verification.md)
   - [Ops and Steps](concepts/ops.md)
+  - [TestTopology](concepts/topology.md)
   - [Performance Mode](concepts/performance-mode.md)
 - [Writing Tests](writing-tests.md)
   - [The #\[stt_test\] Macro](writing-tests/stt-test-macro.md)
@@ -39,6 +40,9 @@
   - [VMM](architecture/vmm.md)
   - [Monitor](architecture/monitor.md)
   - [Worker Processes](architecture/workers.md)
+  - [WorkloadHandle](architecture/workload-handle.md)
+  - [CgroupManager](architecture/cgroup-manager.md)
+  - [CgroupGroup](architecture/cgroup-group.md)
 
 # Reference
 
