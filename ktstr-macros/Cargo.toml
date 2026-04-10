@@ -8,7 +8,6 @@ repository.workspace = true
 description = "Proc macro for ktstr #[ktstr_test] attribute"
 keywords = ["scheduler", "testing", "proc-macro"]
 categories = ["development-tools::testing"]
-publish = false
 
 [lib]
 proc-macro = true

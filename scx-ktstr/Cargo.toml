@@ -8,7 +8,6 @@ repository.workspace = true
 description = "Minimal BPF scheduler for ktstr integration tests"
 keywords = ["sched_ext", "scheduler", "bpf"]
 categories = ["development-tools::testing"]
-publish = false
 
 [dependencies]
 anyhow = "1"

@@ -26,11 +26,11 @@ cargo install cargo-nextest
 
 ## Add the dependency
 
-ktstr is not on crates.io. Add it as a git dependency:
+Add ktstr as a dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { git = "https://github.com/likewhatevs/ktstr" }
+ktstr = "0.1"
 ```
 
 ## Write a test

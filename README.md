@@ -28,11 +28,11 @@ sudo apt install clang libelf-dev pkg-config bpftool
 cargo install cargo-nextest
 ```
 
-**Add to your crate** (not on crates.io):
+**Add to your crate**:
 
 ```toml
 [dev-dependencies]
-ktstr = { git = "https://github.com/likewhatevs/ktstr" }
+ktstr = "0.1"
 ```
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
