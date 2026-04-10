@@ -385,6 +385,7 @@ pub(crate) fn set_repro_mode(v: bool) {
 
 /// Handle to running worker processes (forked, not threads).
 /// Each worker is a separate process so it can be in its own cgroup.
+#[must_use = "dropping a WorkloadHandle immediately kills all worker processes"]
 pub struct WorkloadHandle {
     children: Vec<(u32, std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
     started: bool,

@@ -525,7 +525,7 @@ pub fn stt_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
-            ::stt::test_support::run_stt_test(&#entry_name).unwrap();
+            let _result = ::stt::test_support::run_stt_test(&#entry_name).unwrap();
         }
     };
 

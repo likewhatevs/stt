@@ -44,6 +44,7 @@ fn spread_threshold_pct() -> f64 {
 /// assert!(!a.passed);
 /// assert!(a.details.iter().any(|d| d.contains("starved")));
 /// ```
+#[must_use = "test verdict is lost if not checked"]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssertResult {
     /// Whether all checks passed.
@@ -369,6 +370,7 @@ impl AssertPlan {
 /// assert_eq!(merged.max_imbalance_ratio, Some(5.0)); // from sched
 /// assert_eq!(merged.max_gap_ms, Some(5000));    // from test
 /// ```
+#[must_use = "builder methods return a new Assert; discard means config is lost"]
 #[derive(Clone, Copy, Debug)]
 pub struct Assert {
     // Worker checks
