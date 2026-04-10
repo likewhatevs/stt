@@ -441,11 +441,9 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
                     return;
                 };
                 let mut buf = [0u8; 4096];
-                let mut draining = false;
                 let mut drain_deadline = None;
                 loop {
-                    if !draining && stop_clone.load(Ordering::Acquire) {
-                        draining = true;
+                    if drain_deadline.is_none() && stop_clone.load(Ordering::Acquire) {
                         drain_deadline =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                     }
