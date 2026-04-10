@@ -4961,6 +4961,36 @@ mod tests {
     }
 
     #[test]
+    fn eval_crash_message_from_shm() {
+        let entry = sched_entry("__eval_crash_shm__");
+        let shm_crash = "PANIC: panicked at src/test.rs:42: assertion failed\n   \
+                          0: ktstr::vmm::rust_init::ktstr_guest_init\n";
+        // COM2 also has a PANIC: line (serial fallback). SHM must take priority.
+        let output = "PANIC: panicked at src/test.rs:42: assertion failed";
+        let mut result = make_vm_result(output, "", 1, false);
+        result.crash_message = Some(shm_crash.to_string());
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("guest crashed:"),
+            "should say 'guest crashed:', got: {msg}",
+        );
+        assert!(
+            msg.contains("ktstr_guest_init"),
+            "SHM backtrace content should be present, got: {msg}",
+        );
+        // SHM path uses "guest crashed:\n{shm_crash}" (multiline),
+        // COM2 path uses "guest crashed: {msg}" (single line).
+        // The backtrace frame proves SHM was used, not COM2.
+        assert!(
+            msg.contains("0: ktstr::vmm::rust_init::ktstr_guest_init"),
+            "full backtrace from SHM should appear, got: {msg}",
+        );
+    }
+
+    #[test]
     fn extract_panic_message_found() {
         let output = "noise\nPANIC: panicked at src/main.rs:5: oh no\nmore";
         assert_eq!(
