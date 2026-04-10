@@ -503,12 +503,20 @@ pub fn discover_bpf_symbols(stack_names: &[&str]) -> Vec<StackFunction> {
             _ => continue,
         };
         if info.ty == libbpf_rs::ProgramType::StructOps {
-            if !seen.insert(info_name.clone()) {
+            // bpf_prog_info.name is truncated to 15 chars. Resolve
+            // the full name from program BTF when truncated so that
+            // set_attach_target can find the function.
+            let full_name = if info_name.len() >= 15 {
+                resolve_bpf_prog_full_name(info.id).unwrap_or(info_name.clone())
+            } else {
+                info_name.clone()
+            };
+            if !seen.insert(full_name.clone()) {
                 continue;
             }
             results.push(StackFunction {
-                raw_name: format!("bpf_prog_{}_{info_name}", info.id),
-                display_name: info_name,
+                raw_name: format!("bpf_prog_{}_{full_name}", info.id),
+                display_name: full_name,
                 is_bpf: true,
                 bpf_prog_id: Some(info.id),
             });

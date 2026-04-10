@@ -219,7 +219,10 @@ impl Runner {
             // Start BPF skeleton probes for auto-probe.
             let probe_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             type SkeletonHandle = (
-                std::thread::JoinHandle<Option<Vec<crate::probe::process::ProbeEvent>>>,
+                std::thread::JoinHandle<(
+                    Option<Vec<crate::probe::process::ProbeEvent>>,
+                    crate::probe::process::ProbeDiagnostics,
+                )>,
                 Vec<(u32, String)>,
                 std::collections::HashMap<String, String>,
             );
@@ -274,16 +277,24 @@ impl Runner {
                     let bpf_prog_ids: Vec<u32> =
                         functions.iter().filter_map(|f| f.bpf_prog_id).collect();
                     let bpf_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
+                    let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
                     let stop_clone = probe_stop.clone();
+                    let probes_ready =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let probes_ready_thread = probes_ready.clone();
                     let handle = std::thread::spawn(move || {
                         crate::probe::process::run_probe_skeleton(
                             &functions,
                             &btf_funcs,
                             "scx_disable_workfn",
                             &stop_clone,
+                            &bpf_fds,
+                            &probes_ready_thread,
                         )
                     });
-                    std::thread::sleep(Duration::from_secs(2));
+                    while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     Some((handle, func_names, bpf_locs))
                 }
             } else {
@@ -298,13 +309,22 @@ impl Runner {
             let probe_output = if let Some((handle, func_names, bpf_locs)) = skeleton_handle.take()
             {
                 probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                handle.join().ok().flatten().map(|events| {
-                    crate::probe::output::format_probe_events_with_bpf_locs(
-                        &events,
-                        &func_names,
-                        self.config.kernel_dir.as_deref(),
-                        &bpf_locs,
-                    )
+                handle.join().ok().and_then(|(events, diag)| {
+                    let mut out = String::new();
+                    // Format diagnostics summary.
+                    let pipeline = crate::test_support::PipelineDiagnostics::default();
+                    out.push_str(&crate::test_support::format_probe_diagnostics(
+                        &pipeline, &diag,
+                    ));
+                    if let Some(events) = events {
+                        out.push_str(&crate::probe::output::format_probe_events_with_bpf_locs(
+                            &events,
+                            &func_names,
+                            self.config.kernel_dir.as_deref(),
+                            &bpf_locs,
+                        ));
+                    }
+                    if out.is_empty() { None } else { Some(out) }
                 })
             } else {
                 None

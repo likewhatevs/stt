@@ -10,6 +10,46 @@ use crate::bpf_skel::types;
 /// in `intf.h`).
 const EVENT_TRIGGER: u32 = 2;
 
+/// Pipeline diagnostics from a probe run.
+///
+/// Tracks how many functions/events survived each stage so users can
+/// see WHERE data is being lost (filter, attach, capture, stitch).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProbeDiagnostics {
+    /// Kernel functions resolved to IPs.
+    pub kprobe_resolved: u32,
+    /// Kernel functions that failed IP resolution.
+    pub kprobe_resolve_failed: Vec<String>,
+    /// Kprobes successfully attached.
+    pub kprobe_attached: u32,
+    /// Kprobes that failed to attach (name, error).
+    pub kprobe_attach_failed: Vec<(String, String)>,
+    /// BPF functions with valid prog IDs for fentry.
+    pub fentry_candidates: u32,
+    /// Fentry probes successfully attached.
+    pub fentry_attached: u32,
+    /// Fentry probes that failed (name, error).
+    pub fentry_attach_failed: Vec<(String, String)>,
+    /// Total keys in probe_data map at readout.
+    pub probe_data_keys: u32,
+    /// Keys with unmatched IPs (no func_meta entry).
+    pub probe_data_unmatched_ips: u32,
+    /// Events read from probe_data before stitching.
+    pub events_before_stitch: u32,
+    /// Events surviving tptr+time stitching.
+    pub events_after_stitch: u32,
+    /// Whether the trigger kprobe fired.
+    pub trigger_fired: bool,
+    /// BPF-side kprobe fire count (from BSS ktstr_probe_count).
+    pub bpf_kprobe_fires: u64,
+    /// BPF-side trigger fire count (from BSS ktstr_trigger_count).
+    pub bpf_trigger_fires: u64,
+    /// BPF-side func_meta_map misses (IP not found in map).
+    pub bpf_meta_misses: u64,
+    /// IPs that missed func_meta_map lookup (from BSS ktstr_miss_log).
+    pub bpf_miss_ips: Vec<u64>,
+}
+
 /// Structured probe event captured by the BPF skeleton.
 ///
 /// One per (function, task_ptr) combination. `fields` contains BTF-resolved
@@ -159,17 +199,40 @@ fn detect_str_param(btf_func: &BtfFunc) -> u8 {
 /// to functions by IP, stitches events by `task_struct` pointer
 /// or time proximity to the trigger,
 /// and returns them sorted by timestamp.
+/// Pre-open BPF program FDs while the scheduler is alive.
+///
+/// Returns a map from `bpf_prog_id` to owned fd. Holding these FDs
+/// keeps the BPF programs alive via kernel refcounting even after the
+/// scheduler exits. Must be called before the test function runs
+/// (which may crash the scheduler).
+pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashMap<u32, i32> {
+    let mut fds = std::collections::HashMap::new();
+    for f in functions {
+        if let Some(prog_id) = f.bpf_prog_id {
+            let fd = unsafe { libbpf_rs::libbpf_sys::bpf_prog_get_fd_by_id(prog_id) };
+            if fd >= 0 {
+                fds.insert(prog_id, fd);
+            }
+        }
+    }
+    fds
+}
+
 pub fn run_probe_skeleton(
     functions: &[StackFunction],
     btf_funcs: &[BtfFunc],
     trigger: &str,
     stop: &AtomicBool,
-) -> Option<Vec<ProbeEvent>> {
+    bpf_prog_fds: &std::collections::HashMap<u32, i32>,
+    ready: &AtomicBool,
+) -> (Option<Vec<ProbeEvent>>, ProbeDiagnostics) {
     use crate::bpf_skel::*;
     use libbpf_rs::skel::{OpenSkel, SkelBuilder};
     use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder};
 
     tracing::debug!(n = functions.len(), trigger, "run_probe_skeleton",);
+
+    let mut diag = ProbeDiagnostics::default();
 
     // Open skeleton
     let mut open_object = std::mem::MaybeUninit::uninit();
@@ -178,7 +241,7 @@ pub fn run_probe_skeleton(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "probe skeleton open failed");
-            return None;
+            return (None, diag);
         }
     };
 
@@ -192,7 +255,7 @@ pub fn run_probe_skeleton(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "probe skeleton load failed");
-            return None;
+            return (None, diag);
         }
     };
 
@@ -209,6 +272,7 @@ pub fn run_probe_skeleton(
             Some(ip) => ip,
             None => {
                 tracing::warn!(func = %func.raw_name, "could not resolve function IP");
+                diag.kprobe_resolve_failed.push(func.raw_name.clone());
                 continue;
             }
         };
@@ -244,12 +308,16 @@ pub fn run_probe_skeleton(
         }
 
         tracing::debug!(func = %func.raw_name, ip, nr = meta.nr_field_specs, "kprobe meta");
+        diag.kprobe_resolved += 1;
         func_ips.push((idx as u32, ip, func.display_name.clone()));
     }
 
+    if func_ips.is_empty() && bpf_funcs.is_empty() {
+        tracing::warn!("no kprobe IPs resolved and no BPF functions for fentry");
+        return (None, diag);
+    }
     if func_ips.is_empty() {
-        tracing::warn!("no functions resolved to IPs");
-        return None;
+        tracing::debug!("no kernel functions resolved to IPs, proceeding with fentry only");
     }
 
     // Attach kprobes to each function using the raw kernel symbol name.
@@ -262,9 +330,11 @@ pub fn run_probe_skeleton(
             }
             Err(e) => {
                 tracing::warn!(%e, func = raw, "kprobe attach failed");
+                diag.kprobe_attach_failed.push((raw.clone(), e.to_string()));
             }
         }
     }
+    diag.kprobe_attached = links.len() as u32;
     tracing::debug!(attached = links.len(), total = func_ips.len(), "kprobes");
 
     // Attach fentry probes for BPF functions in batches of 4.
@@ -277,6 +347,7 @@ pub fn run_probe_skeleton(
         .iter()
         .filter(|(_, f)| f.bpf_prog_id.is_some())
         .collect();
+    diag.fentry_candidates = valid_bpf.len() as u32;
 
     struct FentryTarget<'a> {
         slot: usize,
@@ -290,11 +361,33 @@ pub fn run_probe_skeleton(
         let mut targets: Vec<FentryTarget<'_>> = Vec::new();
         for (slot, (idx, func)) in chunk.iter().enumerate() {
             let prog_id = func.bpf_prog_id.unwrap();
-            let fd = unsafe { libbpf_rs::libbpf_sys::bpf_prog_get_fd_by_id(prog_id) };
-            if fd < 0 {
-                tracing::warn!(prog_id, func = %func.display_name, "fentry: failed to get fd");
-                continue;
-            }
+            // Use pre-opened FD if available (keeps program alive after
+            // scheduler exit), otherwise try to open now.
+            let fd = if let Some(&pre_fd) = bpf_prog_fds.get(&prog_id) {
+                // Dup the pre-opened fd so each fentry batch owns its
+                // own copy (closed after load).
+                let dup_fd = unsafe { libc::dup(pre_fd) };
+                if dup_fd < 0 {
+                    tracing::warn!(prog_id, func = %func.display_name, "fentry: dup failed");
+                    diag.fentry_attach_failed.push((
+                        func.display_name.clone(),
+                        format!("dup(pre_fd={pre_fd}) failed"),
+                    ));
+                    continue;
+                }
+                dup_fd
+            } else {
+                let fd = unsafe { libbpf_rs::libbpf_sys::bpf_prog_get_fd_by_id(prog_id) };
+                if fd < 0 {
+                    tracing::warn!(prog_id, func = %func.display_name, "fentry: failed to get fd");
+                    diag.fentry_attach_failed.push((
+                        func.display_name.clone(),
+                        format!("bpf_prog_get_fd_by_id({prog_id}) returned {fd}"),
+                    ));
+                    continue;
+                }
+                fd
+            };
             targets.push(FentryTarget {
                 slot,
                 fd,
@@ -352,6 +445,8 @@ pub fn run_probe_skeleton(
                 }
                 Err(e) => {
                     tracing::warn!(slot = t.slot, func = t.name, %e, "fentry: set_attach_target failed");
+                    diag.fentry_attach_failed
+                        .push((t.name.to_string(), format!("set_attach_target: {e}")));
                 }
             }
         }
@@ -387,14 +482,20 @@ pub fn run_probe_skeleton(
         // Reuse the main skeleton's maps so fentry events land in the
         // same probe_data map that the Rust side reads.
         use std::os::unix::io::AsFd;
-        let _ = fentry_open
+        if let Err(e) = fentry_open
             .maps
             .probe_data
-            .reuse_fd(skel.maps.probe_data.as_fd());
-        let _ = fentry_open
+            .reuse_fd(skel.maps.probe_data.as_fd())
+        {
+            tracing::warn!(%e, "fentry: probe_data reuse_fd failed");
+        }
+        if let Err(e) = fentry_open
             .maps
             .func_meta_map
-            .reuse_fd(skel.maps.func_meta_map.as_fd());
+            .reuse_fd(skel.maps.func_meta_map.as_fd())
+        {
+            tracing::warn!(%e, "fentry: func_meta_map reuse_fd failed");
+        }
 
         let fentry_skel = match fentry_open.load() {
             Ok(s) => {
@@ -407,6 +508,10 @@ pub fn run_probe_skeleton(
             Err(e) => {
                 tracing::warn!(%e, "fentry: batch load failed");
                 for t in &targets {
+                    if t.ok {
+                        diag.fentry_attach_failed
+                            .push((t.name.to_string(), format!("batch load: {e}")));
+                    }
                     unsafe { libc::close(t.fd) };
                 }
                 continue;
@@ -469,12 +574,15 @@ pub fn run_probe_skeleton(
                 }
                 Err(e) => {
                     tracing::warn!(%e, func = t.name, "fentry attach failed");
+                    diag.fentry_attach_failed
+                        .push((t.name.to_string(), e.to_string()));
                 }
             }
         }
 
         drop(fentry_skel);
     }
+    diag.fentry_attached = fentry_links.len() as u32;
     if !valid_bpf.is_empty() {
         tracing::debug!(
             attached = fentry_links.len(),
@@ -490,7 +598,7 @@ pub fn run_probe_skeleton(
         }
         Err(e) => {
             tracing::error!(%e, trigger, "trigger attach failed");
-            return None;
+            return (None, diag);
         }
     }
 
@@ -548,7 +656,7 @@ pub fn run_probe_skeleton(
         Ok(rb) => rb,
         Err(e) => {
             tracing::error!(%e, "failed to build ring buffer");
-            return None;
+            return (None, diag);
         }
     };
 
@@ -564,6 +672,11 @@ pub fn run_probe_skeleton(
         "polling for probe data",
     );
 
+    // Signal that all probes are attached. The caller should wait
+    // for this before starting the test function to avoid racing
+    // with probe attachment.
+    ready.store(true, Ordering::Release);
+
     // Poll until trigger fires or stop requested.  When stop is
     // signaled, iterate all probe_data entries instead of waiting
     // for the trigger — the trigger (scx_disable_workfn) runs
@@ -573,6 +686,17 @@ pub fn run_probe_skeleton(
         let _ = rb.poll(Duration::from_millis(100));
 
         if triggered.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+            diag.trigger_fired = triggered.load(Ordering::Relaxed);
+
+            // Read BPF-side diagnostic counters from BSS.
+            if let Some(bss) = skel.maps.bss_data.as_ref() {
+                diag.bpf_kprobe_fires = bss.ktstr_probe_count;
+                diag.bpf_trigger_fires = bss.ktstr_trigger_count;
+                diag.bpf_meta_misses = bss.ktstr_meta_miss;
+                let n = (bss.ktstr_miss_log_idx as usize).min(bss.ktstr_miss_log.len());
+                diag.bpf_miss_ips = bss.ktstr_miss_log[..n].to_vec();
+            }
+
             let key_size = std::mem::size_of::<types::probe_key>();
             let mut probe_events = Vec::new();
             let mut total_keys = 0u32;
@@ -641,6 +765,10 @@ pub fn run_probe_skeleton(
 
             probe_events.sort_by_key(|e| e.ts);
 
+            diag.probe_data_keys = total_keys;
+            diag.probe_data_unmatched_ips = unmatched_ips;
+            diag.events_before_stitch = probe_events.len() as u32;
+
             tracing::debug!(
                 events = probe_events.len(),
                 total_keys,
@@ -649,53 +777,22 @@ pub fn run_probe_skeleton(
             );
 
             if probe_events.is_empty() {
-                return None;
+                return (None, diag);
             }
 
-            // Stitch by task_struct pointer OR time proximity.
-            // Events from the same task (matching task_ptr) are always
-            // kept. Events from different tasks (scheduler thread, IRQ
-            // context) are kept if they fired within a time window
-            // around the trigger — these cross-task events are critical
-            // for debugging scheduler crashes.
-            let trigger_event = events.lock().unwrap().last().cloned();
-            let target_tptr: Option<u64> = trigger_event
-                .as_ref()
-                .map(|e| e.task_ptr)
-                .filter(|&ptr| ptr != 0)
-                .or_else(|| {
-                    probe_events
-                        .iter()
-                        .rev()
-                        .map(|e| e.task_ptr)
-                        .find(|&ptr| ptr != 0)
-                });
-            let trigger_ts: u64 = trigger_event
-                .as_ref()
-                .map(|e| e.ts)
-                .or_else(|| probe_events.last().map(|e| e.ts))
-                .unwrap_or(0);
+            // Keep all events with a valid timestamp. The prototype
+            // (stt-debug-framework) showed all events and it worked;
+            // aggressive tptr+time filtering dropped useful cross-task
+            // events from scheduler crashes.
+            let before = probe_events.len();
+            probe_events.retain(|e| e.ts > 0);
+            tracing::debug!(
+                kept = probe_events.len(),
+                total = before,
+                "filtered by ts > 0",
+            );
 
-            // 100ms window: captures cross-task events from the crash
-            // path (IRQ work, scheduler thread) while filtering noise
-            // from unrelated earlier probe hits.
-            const TIME_WINDOW_NS: u64 = 100_000_000;
-
-            if let Some(tptr) = target_tptr {
-                let before = probe_events.len();
-                probe_events.retain(|e| {
-                    e.task_ptr == tptr
-                        || (trigger_ts > 0 && e.ts.abs_diff(trigger_ts) <= TIME_WINDOW_NS)
-                });
-                tracing::debug!(
-                    tptr = format_args!("0x{tptr:x}"),
-                    trigger_ts,
-                    window_ns = TIME_WINDOW_NS,
-                    kept = probe_events.len(),
-                    total = before,
-                    "stitched by task_ptr + time window",
-                );
-            }
+            diag.events_after_stitch = probe_events.len() as u32;
 
             // Attach trigger kstack if available.
             let trigger_kstack = events
@@ -708,7 +805,7 @@ pub fn run_probe_skeleton(
                 last.kstack = trigger_kstack;
             }
 
-            return Some(probe_events);
+            return (Some(probe_events), diag);
         }
     }
 }

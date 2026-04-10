@@ -2019,15 +2019,157 @@ fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Option<String
             return None;
         }
     };
-    if payload.events.is_empty() {
-        return None;
+    let mut out = String::new();
+
+    // Append pipeline diagnostics if present.
+    if let Some(ref diag) = payload.diagnostics {
+        out.push_str(&format_probe_diagnostics(&diag.pipeline, &diag.skeleton));
     }
-    Some(crate::probe::output::format_probe_events_with_bpf_locs(
+
+    if payload.events.is_empty() {
+        if out.is_empty() {
+            return None;
+        }
+        return Some(out);
+    }
+    out.push_str(&crate::probe::output::format_probe_events_with_bpf_locs(
         &payload.events,
         &payload.func_names,
         kernel_dir,
         &payload.bpf_source_locs,
-    ))
+    ));
+    Some(out)
+}
+
+/// Format probe pipeline diagnostics into a human-readable summary.
+pub(crate) fn format_probe_diagnostics(
+    pipeline: &PipelineDiagnostics,
+    skeleton: &crate::probe::process::ProbeDiagnostics,
+) -> String {
+    let mut out = String::new();
+    out.push_str("--- probe pipeline ---\n");
+
+    // Stage 1: extraction
+    out.push_str(&format!(
+        "  extracted:   {} functions from crash backtrace\n",
+        pipeline.stack_extracted,
+    ));
+
+    // Stage 2: filter
+    let passed = pipeline.stack_extracted as usize - pipeline.filter_dropped.len();
+    if pipeline.filter_dropped.is_empty() {
+        out.push_str(&format!("  traceable:   {passed} passed filter\n"));
+    } else {
+        out.push_str(&format!(
+            "  traceable:   {passed} passed, {} dropped: {}\n",
+            pipeline.filter_dropped.len(),
+            pipeline.filter_dropped.join(", "),
+        ));
+    }
+
+    // Stage 3: BPF discovery
+    out.push_str(&format!(
+        "  bpf_discover: {} programs found\n",
+        pipeline.bpf_discovered,
+    ));
+
+    // Stage 4: expansion
+    out.push_str(&format!(
+        "  after_expand: {} total probe targets\n",
+        pipeline.total_after_expand,
+    ));
+
+    // Stage 5: kprobe attach
+    if skeleton.kprobe_attach_failed.is_empty() {
+        out.push_str(&format!(
+            "  kprobes:     {} attached\n",
+            skeleton.kprobe_attached,
+        ));
+    } else {
+        out.push_str(&format!(
+            "  kprobes:     {} attached, {} failed: {}\n",
+            skeleton.kprobe_attached,
+            skeleton.kprobe_attach_failed.len(),
+            skeleton
+                .kprobe_attach_failed
+                .iter()
+                .map(|(n, e)| format!("{n} ({e})"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if !skeleton.kprobe_resolve_failed.is_empty() {
+        out.push_str(&format!(
+            "  kprobe_miss: {} unresolved: {}\n",
+            skeleton.kprobe_resolve_failed.len(),
+            skeleton.kprobe_resolve_failed.join(", "),
+        ));
+    }
+
+    // Stage 6: fentry attach
+    if skeleton.fentry_candidates > 0 {
+        if skeleton.fentry_attach_failed.is_empty() {
+            out.push_str(&format!(
+                "  fentry:      {} attached\n",
+                skeleton.fentry_attached,
+            ));
+        } else {
+            out.push_str(&format!(
+                "  fentry:      {} attached, {} failed: {}\n",
+                skeleton.fentry_attached,
+                skeleton.fentry_attach_failed.len(),
+                skeleton
+                    .fentry_attach_failed
+                    .iter()
+                    .map(|(n, e)| format!("{n} ({e})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
+
+    // Stage 7: trigger
+    out.push_str(&format!(
+        "  trigger:     {}\n",
+        if skeleton.trigger_fired {
+            "fired"
+        } else {
+            "not fired"
+        },
+    ));
+
+    // Stage 8: capture
+    out.push_str(&format!(
+        "  probe_data:  {} keys, {} unmatched IPs\n",
+        skeleton.probe_data_keys, skeleton.probe_data_unmatched_ips,
+    ));
+
+    // Stage 9: events + stitching
+    out.push_str(&format!(
+        "  events:      {} captured, {} after stitch\n",
+        skeleton.events_before_stitch, skeleton.events_after_stitch,
+    ));
+
+    // Stage 10: BPF-side counters
+    if skeleton.bpf_kprobe_fires > 0
+        || skeleton.bpf_trigger_fires > 0
+        || skeleton.bpf_meta_misses > 0
+    {
+        out.push_str(&format!(
+            "  bpf_counts:  {} kprobe fires, {} trigger fires, {} meta misses\n",
+            skeleton.bpf_kprobe_fires, skeleton.bpf_trigger_fires, skeleton.bpf_meta_misses,
+        ));
+        if !skeleton.bpf_miss_ips.is_empty() {
+            let ips: Vec<String> = skeleton
+                .bpf_miss_ips
+                .iter()
+                .map(|ip| format!("0x{ip:x}"))
+                .collect();
+            out.push_str(&format!("  miss_ips:    {}\n", ips.join(", ")));
+        }
+    }
+
+    out
 }
 
 /// Setup function for nextest `setup-script` integration.
@@ -2116,7 +2258,17 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         use crate::probe::stack::load_probe_stack;
 
         eprintln!("ktstr_test: probe: loading probe stack from --ktstr-probe-stack");
-        let mut functions = crate::probe::stack::filter_traceable(load_probe_stack(stack_input));
+        let mut pipe_diag = PipelineDiagnostics::default();
+        let raw_functions = load_probe_stack(stack_input);
+        pipe_diag.stack_extracted = raw_functions.len() as u32;
+        let pre_filter: Vec<String> = raw_functions.iter().map(|f| f.raw_name.clone()).collect();
+        let mut functions = crate::probe::stack::filter_traceable(raw_functions);
+        // Record which functions were dropped by filter_traceable.
+        for name in &pre_filter {
+            if !functions.iter().any(|f| f.raw_name == *name) {
+                pipe_diag.filter_dropped.push(name.clone());
+            }
+        }
         // Discover BPF scheduler functions from the running scheduler.
         // Stack-extracted BPF names have stale prog IDs from the first VM;
         // discover_bpf_symbols finds the current scheduler's programs.
@@ -2126,6 +2278,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             .map(|f| f.display_name.as_str())
             .collect();
         let bpf_syms = crate::probe::btf::discover_bpf_symbols(&stack_display_names);
+        pipe_diag.bpf_discovered = bpf_syms.len() as u32;
         if !bpf_syms.is_empty() {
             eprintln!(
                 "ktstr_test: probe: {} BPF symbols discovered",
@@ -2136,6 +2289,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         // Expand BPF functions to kernel-side callers for bridge kprobes,
         // keeping BPF functions for fentry attachment.
         let functions = crate::probe::stack::expand_bpf_to_kernel_callers(functions);
+        pipe_diag.total_after_expand = functions.len() as u32;
         if functions.is_empty() {
             eprintln!("ktstr_test: no traceable functions from --ktstr-probe-stack");
             return None;
@@ -2172,13 +2326,44 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             .map(|(i, f)| (i as u32, f.display_name.clone()))
             .collect();
 
+        // Pre-open BPF program FDs while the scheduler is alive.
+        // Holding these FDs keeps programs alive via kernel refcounting
+        // even after the scheduler crashes.
+        let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
         let stop = probe_stop.clone();
         let funcs = functions.clone();
+        let fn_names = func_names.clone();
+        let pd = pipe_diag.clone();
+        let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output_done_thread = output_done.clone();
+        let probes_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probes_ready_thread = probes_ready.clone();
         let handle = std::thread::spawn(move || {
             use crate::probe::process::run_probe_skeleton;
-            run_probe_skeleton(&funcs, &btf_funcs, "scx_disable_workfn", &stop)
+            let (events, diag) = run_probe_skeleton(
+                &funcs,
+                &btf_funcs,
+                "scx_disable_workfn",
+                &stop,
+                &bpf_fds,
+                &probes_ready_thread,
+            );
+            // Serialize probe output immediately so it reaches COM2
+            // even if the test function hangs and never calls
+            // collect_and_print_probe_data.
+            emit_probe_payload(events.as_deref().unwrap_or(&[]), &fn_names, &pd, &diag);
+            output_done_thread.store(true, std::sync::atomic::Ordering::Release);
+            (events, diag)
         });
-        Some((handle, func_names))
+
+        // Wait for probes to attach before starting the test function.
+        // Without this, the test may crash the scheduler before probes
+        // are active, resulting in 0 captured events.
+        while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        Some((handle, func_names, pipe_diag, output_done))
     });
 
     // Build a minimal Ctx for the test function.
@@ -2251,9 +2436,27 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
 }
 
 type ProbeHandle = (
-    std::thread::JoinHandle<Option<Vec<crate::probe::process::ProbeEvent>>>,
+    std::thread::JoinHandle<(
+        Option<Vec<crate::probe::process::ProbeEvent>>,
+        crate::probe::process::ProbeDiagnostics,
+    )>,
     Vec<(u32, String)>,
+    PipelineDiagnostics,
+    std::sync::Arc<std::sync::atomic::AtomicBool>, // output_done
 );
+
+/// Pre-skeleton pipeline diagnostics captured during guest probe setup.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PipelineDiagnostics {
+    /// Functions from --ktstr-probe-stack before filter.
+    pub stack_extracted: u32,
+    /// Functions dropped by filter_traceable.
+    pub filter_dropped: Vec<String>,
+    /// BPF symbols discovered from running scheduler.
+    pub bpf_discovered: u32,
+    /// Functions after expand_bpf_to_kernel_callers.
+    pub total_after_expand: u32,
+}
 
 /// Serialized probe data sent from guest to host via COM2.
 /// The host deserializes and formats with kernel_dir for source locations.
@@ -2263,26 +2466,27 @@ pub(crate) struct ProbePayload {
     pub func_names: Vec<(u32, String)>,
     #[serde(default)]
     pub bpf_source_locs: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub diagnostics: Option<ProbePayloadDiagnostics>,
 }
 
-/// Stop probes, join the probe thread, and print captured probe data to
-/// stdout (COM2) between delimiters so the host can extract it.
-fn collect_and_print_probe_data(
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<ProbeHandle>,
+/// Combined diagnostics for the probe payload.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProbePayloadDiagnostics {
+    #[serde(default)]
+    pub pipeline: PipelineDiagnostics,
+    #[serde(default)]
+    pub skeleton: crate::probe::process::ProbeDiagnostics,
+}
+
+/// Serialize probe payload to stdout (COM2) between delimiters.
+/// Resolves BPF source locations from loaded programs before serializing.
+fn emit_probe_payload(
+    events: &[crate::probe::process::ProbeEvent],
+    func_names: &[(u32, String)],
+    pipeline_diag: &PipelineDiagnostics,
+    skeleton_diag: &crate::probe::process::ProbeDiagnostics,
 ) {
-    let Some((handle, func_names)) = handle else {
-        return;
-    };
-
-    stop.store(true, std::sync::atomic::Ordering::Release);
-    let events = match handle.join() {
-        Ok(Some(events)) if !events.is_empty() => events,
-        _ => return,
-    };
-
-    // Resolve BPF source locations inside the guest where the BPF
-    // programs are loaded. The host doesn't have the prog FDs.
     let source_loc_names: Vec<&str> = func_names.iter().map(|(_, name)| name.as_str()).collect();
     let bpf_syms = crate::probe::btf::discover_bpf_symbols(&source_loc_names);
     let bpf_prog_ids: Vec<u32> = func_names
@@ -2297,15 +2501,49 @@ fn collect_and_print_probe_data(
     let bpf_source_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
 
     let payload = ProbePayload {
-        events,
-        func_names,
+        events: events.to_vec(),
+        func_names: func_names.to_vec(),
         bpf_source_locs,
+        diagnostics: Some(ProbePayloadDiagnostics {
+            pipeline: pipeline_diag.clone(),
+            skeleton: skeleton_diag.clone(),
+        }),
     };
-    println!("===PROBE_OUTPUT_START===");
+    println!("{PROBE_OUTPUT_START}");
     if let Ok(json) = serde_json::to_string(&payload) {
         println!("{json}");
     }
-    println!("===PROBE_OUTPUT_END===");
+    println!("{PROBE_OUTPUT_END}");
+}
+
+/// Stop probes, join the probe thread. The probe thread emits output
+/// directly when the trigger fires; this function only needs to set
+/// `stop` and join. If the probe thread already emitted output, this
+/// is a no-op.
+fn collect_and_print_probe_data(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<ProbeHandle>,
+) {
+    let Some((handle, func_names, pipeline_diag, output_done)) = handle else {
+        return;
+    };
+
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (events, skeleton_diag) = match handle.join() {
+        Ok((Some(events), diag)) => (events, diag),
+        Ok((None, diag)) => (Vec::new(), diag),
+        Err(_) => (
+            Vec::new(),
+            crate::probe::process::ProbeDiagnostics::default(),
+        ),
+    };
+
+    // The probe thread already emitted output on trigger/stop.
+    // Only emit here if it somehow didn't (e.g. thread panicked
+    // before reaching emit_probe_payload).
+    if !output_done.load(std::sync::atomic::Ordering::Acquire) {
+        emit_probe_payload(&events, &func_names, &pipeline_diag, &skeleton_diag);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3537,6 +3775,7 @@ mod tests {
             }],
             func_names: vec![(0, "schedule".to_string())],
             bpf_source_locs: Default::default(),
+            diagnostics: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let output = format!("noise\n{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}\nmore");
@@ -3602,6 +3841,7 @@ mod tests {
                 (1, "pick_task_scx".to_string()),
             ],
             bpf_source_locs: Default::default(),
+            diagnostics: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");
