@@ -543,7 +543,8 @@ pub fn find_test(name: &str) -> Option<&'static SttTestEntry> {
 
 /// Validate that `required_flags` and `excluded_flags` on an entry
 /// reference flags the scheduler actually declares. Panics on unknown
-/// flag names so typos are caught at test discovery time.
+/// flag names so typos are caught at test discovery time. Also panics
+/// if a flag appears in both `required_flags` and `excluded_flags`.
 fn validate_entry_flags(entry: &SttTestEntry) {
     if entry.scheduler.flags.is_empty() {
         if !entry.required_flags.is_empty() || !entry.excluded_flags.is_empty() {
@@ -574,6 +575,14 @@ fn validate_entry_flags(entry: &SttTestEntry) {
                 flag,
                 entry.scheduler.name,
                 valid.join(", "),
+            );
+        }
+    }
+    for &flag in entry.required_flags {
+        if entry.excluded_flags.contains(&flag) {
+            panic!(
+                "stt_test: '{}' has flag '{}' in both required_flags and excluded_flags",
+                entry.name, flag,
             );
         }
     }
