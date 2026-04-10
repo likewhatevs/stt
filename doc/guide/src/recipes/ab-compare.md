@@ -34,7 +34,7 @@ Diff the sidecar JSON files between the two directories. See
 Compare test pass/fail counts between runs:
 
 ```sh
-diff <(ls baseline/*.stt.*.json | wc -l) <(ls current/*.stt.*.json | wc -l)
+diff <(ls baseline/*.stt.json | wc -l) <(ls current/*.stt.json | wc -l)
 ```
 
 ## Cleanup
