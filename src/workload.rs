@@ -127,6 +127,10 @@ pub enum WorkType {
 }
 
 impl WorkType {
+    /// PascalCase names for all variants, matching the enum arm names.
+    ///
+    /// Includes `"Sequence"` even though [`from_name`](Self::from_name)
+    /// cannot construct it (sequences require explicit phases).
     pub const ALL_NAMES: &[&'static str] = &[
         "CpuSpin",
         "YieldHeavy",
@@ -142,6 +146,7 @@ impl WorkType {
         "Sequence",
     ];
 
+    /// PascalCase name of this variant, matching [`ALL_NAMES`](Self::ALL_NAMES).
     pub fn name(&self) -> &'static str {
         match self {
             WorkType::CpuSpin => "CpuSpin",
@@ -159,6 +164,9 @@ impl WorkType {
         }
     }
 
+    /// Look up a variant by PascalCase name and return it with default
+    /// parameters. Returns `None` for unknown names and for `"Sequence"`
+    /// (which requires explicit phases).
     pub fn from_name(s: &str) -> Option<WorkType> {
         match s {
             "CpuSpin" => Some(WorkType::CpuSpin),
@@ -222,54 +230,6 @@ impl WorkType {
                 | WorkType::CacheYield { .. }
                 | WorkType::CachePipe { .. }
         )
-    }
-
-    /// Snake_case preset names for human-friendly work type selection.
-    pub const PRESET_NAMES: &[&'static str] = &[
-        "cpu_spin",
-        "mixed",
-        "bursty",
-        "yield",
-        "io",
-        "pipe",
-        "cache_l1",
-        "cache_yield",
-        "cache_pipe",
-        "futex",
-        "fanout",
-    ];
-
-    /// Resolve a snake_case preset name to a `WorkType` with default parameters.
-    pub fn from_preset(s: &str) -> Option<WorkType> {
-        match s {
-            "cpu_spin" => Some(WorkType::CpuSpin),
-            "mixed" => Some(WorkType::Mixed),
-            "bursty" => Some(WorkType::Bursty {
-                burst_ms: 50,
-                sleep_ms: 100,
-            }),
-            "yield" => Some(WorkType::YieldHeavy),
-            "io" => Some(WorkType::IoSync),
-            "pipe" => Some(WorkType::PipeIo { burst_iters: 1024 }),
-            "cache_l1" => Some(WorkType::CachePressure {
-                size_kb: 32,
-                stride: 64,
-            }),
-            "cache_yield" => Some(WorkType::CacheYield {
-                size_kb: 32,
-                stride: 64,
-            }),
-            "cache_pipe" => Some(WorkType::CachePipe {
-                size_kb: 32,
-                burst_iters: 1024,
-            }),
-            "futex" => Some(WorkType::FutexPingPong { spin_iters: 1024 }),
-            "fanout" => Some(WorkType::FutexFanOut {
-                fan_out: 4,
-                spin_iters: 1024,
-            }),
-            _ => None,
-        }
     }
 }
 
@@ -2732,68 +2692,6 @@ mod tests {
             .worker_group_size(),
             None
         );
-    }
-
-    // -- WorkType::from_preset tests --
-
-    #[test]
-    fn work_type_from_preset_all_names() {
-        for &name in WorkType::PRESET_NAMES {
-            assert!(
-                WorkType::from_preset(name).is_some(),
-                "preset {name} should resolve"
-            );
-        }
-    }
-
-    #[test]
-    fn work_type_from_preset_unknown() {
-        assert!(WorkType::from_preset("nonexistent").is_none());
-    }
-
-    #[test]
-    fn work_type_from_preset_cpu_spin() {
-        let wt = WorkType::from_preset("cpu_spin").unwrap();
-        assert!(matches!(wt, WorkType::CpuSpin));
-    }
-
-    #[test]
-    fn work_type_from_preset_bursty_defaults() {
-        let wt = WorkType::from_preset("bursty").unwrap();
-        match wt {
-            WorkType::Bursty { burst_ms, sleep_ms } => {
-                assert_eq!(burst_ms, 50);
-                assert_eq!(sleep_ms, 100);
-            }
-            _ => panic!("expected Bursty"),
-        }
-    }
-
-    #[test]
-    fn work_type_from_preset_fanout() {
-        let wt = WorkType::from_preset("fanout").unwrap();
-        match wt {
-            WorkType::FutexFanOut {
-                fan_out,
-                spin_iters,
-            } => {
-                assert_eq!(fan_out, 4);
-                assert_eq!(spin_iters, 1024);
-            }
-            _ => panic!("expected FutexFanOut"),
-        }
-    }
-
-    #[test]
-    fn work_type_from_preset_cache_l1() {
-        let wt = WorkType::from_preset("cache_l1").unwrap();
-        match wt {
-            WorkType::CachePressure { size_kb, stride } => {
-                assert_eq!(size_kb, 32);
-                assert_eq!(stride, 64);
-            }
-            _ => panic!("expected CachePressure"),
-        }
     }
 
     // -- WorkType::needs_cache_buf tests --

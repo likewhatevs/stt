@@ -83,28 +83,12 @@ futex wait/wake.
 - `CachePipe`: `size_kb=32`, `burst_iters=1024`
 - `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
 
-## Preset names
+## String lookup
 
-`WorkType::from_preset()` resolves snake_case preset names to
-`WorkType` values with default parameters:
-
-| Preset | Resolves to |
-|---|---|
-| `cpu_spin` | `CpuSpin` |
-| `mixed` | `Mixed` |
-| `bursty` | `Bursty { burst_ms: 50, sleep_ms: 100 }` |
-| `yield` | `YieldHeavy` |
-| `io` | `IoSync` |
-| `pipe` | `PipeIo { burst_iters: 1024 }` |
-| `cache_l1` | `CachePressure { size_kb: 32, stride: 64 }` |
-| `cache_yield` | `CacheYield { size_kb: 32, stride: 64 }` |
-| `cache_pipe` | `CachePipe { size_kb: 32, burst_iters: 1024 }` |
-| `futex` | `FutexPingPong { spin_iters: 1024 }` |
-| `fanout` | `FutexFanOut { fan_out: 4, spin_iters: 1024 }` |
-
-`WorkType::PRESET_NAMES` lists all available preset names.
-`WorkType::from_name()` uses PascalCase names matching the enum
-variants; `from_preset()` uses the snake_case aliases above.
+`WorkType::from_name()` accepts PascalCase names matching the enum
+variants (e.g. `"CpuSpin"`, `"FutexPingPong"`).
+`WorkType::ALL_NAMES` lists every variant name. `WorkType::name()`
+returns the PascalCase name for a given value.
 
 ## WorkloadConfig
 
