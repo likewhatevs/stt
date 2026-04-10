@@ -27,7 +27,7 @@ fn verbose() -> bool {
         .unwrap_or(false)
 }
 
-/// Test result sidecar written to KTSTR_SIDECAR_DIR for `ktstr test` collection.
+/// Test result sidecar written to KTSTR_SIDECAR_DIR for post-run analysis.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SidecarResult {
     pub test_name: String,
@@ -1375,7 +1375,7 @@ fn run_ktstr_test_inner(
         if !effective_auto_repro {
             return None;
         }
-        attempt_auto_repro(
+        let repro = attempt_auto_repro(
             entry,
             &kernel,
             scheduler.as_deref(),
@@ -1383,7 +1383,15 @@ fn run_ktstr_test_inner(
             output,
             &result.stderr,
             topo,
-        )
+        );
+        // When auto-repro was attempted but produced no data, return a
+        // diagnostic so the user knows it was tried.
+        Some(repro.unwrap_or_else(|| {
+            "auto-repro: no probe data — scheduler may have exited before \
+             probes could attach. Check the sched_ext dump and scheduler \
+             log sections above for crash details."
+                .to_string()
+        }))
     };
 
     evaluate_vm_result(
@@ -1613,12 +1621,12 @@ fn evaluate_vm_result(
     // When a scheduler is running this typically means the scheduler died;
     // without a scheduler (EEVDF) it means the payload itself failed.
     // Attempt auto-repro if enabled and a scheduler was running.
-    let repro_section = if entry.scheduler.binary.has_active_scheduling()
-        && (output.contains("SCHEDULER_DIED")
-            || output.contains("scheduler died")
-            || output.contains("scheduler crashed")
-            || (result.stderr.contains("sched_ext:") && result.stderr.contains("disabled")))
-    {
+    // Any scheduler failure that prevents producing a test result warrants
+    // repro — BPF verifier failures, scx_bpf_error() exits, crashes, and
+    // stalls all land here. Previous code required specific string patterns
+    // ("SCHEDULER_DIED", "sched_ext:" + "disabled") which missed mid-test
+    // deaths where the sched_exit_monitor writes to SHM but not COM2.
+    let repro_section = if entry.scheduler.binary.has_active_scheduling() {
         repro_fn(output)
             .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
             .unwrap_or_default()
@@ -1741,9 +1749,17 @@ fn trim_settle_samples(report: &crate::monitor::MonitorReport) -> crate::monitor
     }
 }
 
+/// Sentinel value for `--ktstr-probe-stack` when no crash stack functions
+/// were extracted. Triggers the guest-side probe path so
+/// `discover_bpf_symbols()` can dynamically find the scheduler's BPF
+/// programs. `filter_traceable` drops it (not in kallsyms).
+const DISCOVER_SENTINEL: &str = "__discover__";
+
 /// Attempt auto-repro: extract stack functions from COM2 scheduler output
 /// or COM1 kernel console (fallback), boot a second VM with BPF probes
-/// attached, and return formatted probe data.
+/// attached, and return formatted probe data. When no stack functions are
+/// available (e.g. BPF text error without backtrace), falls back to
+/// dynamic BPF program discovery in the repro VM.
 /// `console_output` is COM1 kernel console text, used when COM2 has no
 /// extractable functions (e.g. scheduler died before writing output).
 /// Returns `None` if repro cannot be attempted or yields no data.
@@ -1782,18 +1798,22 @@ fn attempt_auto_repro(
         eprintln!("ktstr_test: auto-repro: no scheduler output on COM2, trying COM1");
         extract_stack_functions_all(console_output)
     };
-    if stack_funcs.is_empty() {
-        eprintln!("ktstr_test: auto-repro: no functions extracted from COM2 or COM1");
-        return None;
-    }
-
     let func_names: Vec<String> = stack_funcs.iter().map(|f| f.raw_name.clone()).collect();
-    let probe_arg = format!("--ktstr-probe-stack={}", func_names.join(","));
 
-    eprintln!(
-        "ktstr_test: auto-repro: probing {} functions in second VM",
-        func_names.len()
-    );
+    // When no stack functions were extracted (e.g. BPF text error with no
+    // backtrace), still boot the repro VM. The guest-side discover_bpf_symbols()
+    // dynamically finds the scheduler's BPF programs. Pass a sentinel value
+    // so extract_probe_stack_arg returns Some and the guest probe path activates.
+    let probe_arg = if func_names.is_empty() {
+        eprintln!("ktstr_test: auto-repro: no stack functions, using BPF discovery in repro VM");
+        format!("--ktstr-probe-stack={DISCOVER_SENTINEL}")
+    } else {
+        eprintln!(
+            "ktstr_test: auto-repro: probing {} functions in second VM",
+            func_names.len()
+        );
+        format!("--ktstr-probe-stack={}", func_names.join(","))
+    };
 
     // Build guest args for the repro VM.
     let guest_args = vec![
@@ -2190,13 +2210,12 @@ fn collect_and_print_probe_data(
 
     // Resolve BPF source locations inside the guest where the BPF
     // programs are loaded. The host doesn't have the prog FDs.
+    let bpf_syms = crate::probe::btf::discover_bpf_symbols();
     let bpf_prog_ids: Vec<u32> = func_names
         .iter()
         .filter_map(|(_, name)| {
-            // BPF functions have sentinel IPs — find their prog_ids
-            // from discover_bpf_symbols cache.
-            crate::probe::btf::discover_bpf_symbols()
-                .into_iter()
+            bpf_syms
+                .iter()
                 .find(|s| s.display_name == *name)
                 .and_then(|s| s.bpf_prog_id)
         })
@@ -4364,6 +4383,72 @@ mod tests {
         assert!(
             msg.contains("do_enqueue_task"),
             "should include scheduler log content, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_mid_test_death_triggers_repro() {
+        // Scheduler dies mid-test: sched_exit_monitor dumps log to COM2
+        // but does NOT write "SCHEDULER_DIED". Auto-repro should still
+        // trigger because has_active_scheduling() is true and no
+        // AssertResult was produced.
+        let sched_log =
+            format!("{SCHED_OUTPUT_START}\nError: BPF program error\n{SCHED_OUTPUT_END}",);
+        let entry = sched_entry("__eval_mid_death_repro__");
+        let result = make_vm_result(&sched_log, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let repro_called = std::sync::atomic::AtomicBool::new(false);
+        let repro_fn = |_output: &str| -> Option<String> {
+            repro_called.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some("repro data".to_string())
+        };
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &repro_fn).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            repro_called.load(std::sync::atomic::Ordering::Relaxed),
+            "repro_fn should be called for mid-test scheduler death without SCHEDULER_DIED marker",
+        );
+        assert!(
+            msg.contains("--- auto-repro ---"),
+            "error should include auto-repro section, got: {msg}",
+        );
+        assert!(
+            msg.contains("repro data"),
+            "error should include repro output, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_repro_no_data_shows_diagnostic() {
+        // When repro_fn returns the fallback diagnostic, the error
+        // output should include it so the user knows auto-repro was
+        // tried and why it produced nothing.
+        let entry = sched_entry("__eval_repro_no_data__");
+        let result = make_vm_result("", "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let repro_fn = |_output: &str| -> Option<String> {
+            Some(
+                "auto-repro: no probe data — scheduler may have exited before \
+                 probes could attach. Check the sched_ext dump and scheduler \
+                 log sections above for crash details."
+                    .to_string(),
+            )
+        };
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &repro_fn).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--- auto-repro ---"),
+            "should include auto-repro section, got: {msg}",
+        );
+        assert!(
+            msg.contains("no probe data"),
+            "should include diagnostic message, got: {msg}",
+        );
+        assert!(
+            msg.contains("sched_ext dump"),
+            "should direct user to dump section, got: {msg}",
         );
     }
 

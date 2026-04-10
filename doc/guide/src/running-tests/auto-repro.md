@@ -1,23 +1,32 @@
 # Auto-Repro
 
-When a test crashes, auto-repro extracts function names from the crash
-stack and reruns in a second VM with BPF probes attached to those
-functions. The probes capture function arguments and struct fields at
-each point in the crash path.
+When a test fails because the scheduler crashes or exits, auto-repro
+boots a second VM with BPF probes attached to capture function arguments
+and struct fields along the scheduling path. Stack functions extracted
+from the crash output seed the probe list; when no crash stack is
+available (e.g. a BPF text error or verifier failure with no backtrace),
+auto-repro falls back to dynamic BPF program discovery in the repro VM.
 
 ## How it works
 
-1. **First VM** -- the test runs normally. If the scheduler crashes, ktstr
-   captures the stack trace from the scenario output.
+1. **First VM** -- the test runs normally. If the scheduler crashes or
+   exits (BPF error, verifier failure, stall), ktstr captures any stack
+   trace from the scheduler log (COM2) or kernel console (COM1).
 
 2. **Stack extraction** -- function names are parsed from the crash
-   trace. BPF program symbols (`bpf_prog_*`) are recognized and their
-   short names extracted. Generic functions (scheduler entry points,
-   spinlocks, syscall handlers) are filtered out.
+   trace when available. BPF program symbols (`bpf_prog_*`) are
+   recognized and their short names extracted. Generic functions
+   (scheduler entry points, spinlocks, syscall handlers, sched_ext
+   exit machinery, BPF trampolines, stack dump helpers) are filtered
+   out. When no stack functions are found, the pipeline continues with
+   an empty probe list.
 
-3. **BPF discovery** -- for BPF functions, ktstr discovers loaded
-   struct_ops programs via libbpf-rs and adds their kernel-side callers
-   (e.g. `enqueue` -> `do_enqueue_task`) for bridge kprobes.
+3. **BPF discovery** -- in the repro VM, ktstr discovers loaded
+   struct_ops programs via libbpf-rs and adds them to the probe list
+   alongside any stack-extracted functions. Their kernel-side callers
+   are added (e.g. `enqueue` -> `do_enqueue_task`) for bridge kprobes.
+   This step provides probe targets even when the crash produced no
+   extractable stack.
 
 4. **BTF resolution** -- function signatures are resolved from vmlinux
    BTF (kernel functions) and program BTF (BPF callbacks). Known struct

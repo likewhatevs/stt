@@ -1,10 +1,14 @@
 /// Return true if a function should not be probed.
 ///
 /// Skips the trigger function (`scx_disable_workfn`), generic scheduler
-/// entry points (`schedule`, `__schedule`), syscall handlers, and
+/// entry points (`schedule`, `__schedule`), syscall handlers,
 /// low-level infrastructure (`_raw_spin_*`, `asm_*`, `entry_*`,
-/// `sysvec_*`) that generate massive probe_data maps with no useful
-/// scheduler decision data.
+/// `sysvec_*`), sched_ext exit/error machinery (`scx_vexit`,
+/// `scx_exit`, `scx_bpf_error_bstr`, `scx_error_irq*`, etc.),
+/// BPF trampoline functions (`__bpf_prog_enter*`, `__bpf_prog_exit*`),
+/// and stack dump helpers (`dump_stack`, `stack_trace_save`, etc.)
+/// that appear in every sched_ext crash backtrace but carry no
+/// scheduler-specific decision data.
 pub fn should_skip_probe(name: &str) -> bool {
     matches!(
         name,
@@ -16,11 +20,32 @@ pub fn should_skip_probe(name: &str) -> bool {
             | "do_sched_yield"
             | "preempt_schedule_common"
             | "preempt_schedule_irq"
+            // sched_ext exit/error infrastructure (ext.c)
+            | "scx_vexit"
+            | "scx_bpf_error_bstr"
+            | "scx_bpf_exit_bstr"
+            | "scx_dump_state"
+            | "scx_dump_task"
+            // sched_ext exit path (scx_exit_task is useful — it
+            // calls the BPF exit_task callback)
+            | "scx_exit"
+            | "scx_exit_reason"
+            // stack dump helpers
+            | "dump_stack"
+            | "dump_stack_lvl"
+            | "stack_trace_save"
+            | "stack_trace_print"
+            | "show_stack"
     ) || name.starts_with("_raw_spin_")
         || name.starts_with("asm_")
         || name.starts_with("entry_")
         || name.starts_with("__sysvec_")
         || name.starts_with("sysvec_")
+        // BPF trampoline enter/exit functions
+        || name.starts_with("__bpf_prog_enter")
+        || name.starts_with("__bpf_prog_exit")
+        // sched_ext error irq work
+        || name.starts_with("scx_error_irq")
 }
 
 /// Maps sched_ext BPF op name fragments to (kernel_caller, task_arg_idx).
@@ -298,10 +323,11 @@ mod tests {
 
     #[test]
     fn should_skip_probe_keeps() {
-        assert!(!should_skip_probe("scx_exit"));
         assert!(!should_skip_probe("do_enqueue_task"));
         assert!(!should_skip_probe("mitosis_enqueue"));
         assert!(!should_skip_probe("balance_one"));
+        // scx_exit_task calls the BPF exit_task callback — useful
+        assert!(!should_skip_probe("scx_exit_task"));
     }
 
     // -- bpf_short_name --
@@ -455,10 +481,42 @@ mod tests {
 
     #[test]
     fn extract_stack_functions_all_dmesg_sched_ext_dump() {
-        let stack = "[    1.234567] sched_ext_dump:   scx_bpf_error+0x40/0x60\n";
+        // dmesg-style sched_ext_dump line with timestamp prefix.
+        let stack = "[    1.234567] sched_ext_dump:   do_enqueue_task+0x1a0/0x380\n";
         let fns = extract_stack_functions_all(stack);
         assert_eq!(fns.len(), 1);
-        assert_eq!(fns[0].raw_name, "scx_bpf_error");
+        assert_eq!(fns[0].raw_name, "do_enqueue_task");
+    }
+
+    #[test]
+    fn extract_stack_functions_all_filters_scx_exit_infrastructure() {
+        // Realistic sched_ext crash backtrace: scx_bpf_error() call chain
+        // plus scheduler-specific frames.
+        let stack = "\
+            scx_vexit+0x80/0x100\n\
+            scx_exit+0x40/0x60\n\
+            scx_bpf_error_bstr+0x30/0x50\n\
+            __bpf_prog_enter+0x10/0x20\n\
+            bpf_prog_abc_mitosis_enqueue+0x50/0x80\n\
+            do_enqueue_task+0x1a0/0x380\n\
+            scx_exit_task+0x30/0x60\n\
+            dump_stack+0x10/0x20\n\
+            stack_trace_save+0x20/0x40\n\
+            balance_one+0x50/0x100\n";
+        let fns = extract_stack_functions_all(stack);
+        let names: Vec<&str> = fns.iter().map(|f| f.raw_name.as_str()).collect();
+        // Infrastructure frames should be filtered
+        assert!(!names.contains(&"scx_vexit"));
+        assert!(!names.contains(&"scx_exit"));
+        assert!(!names.contains(&"scx_bpf_error_bstr"));
+        assert!(!names.contains(&"__bpf_prog_enter"));
+        assert!(!names.contains(&"dump_stack"));
+        assert!(!names.contains(&"stack_trace_save"));
+        // Scheduler-specific frames should be kept
+        assert!(names.contains(&"bpf_prog_abc_mitosis_enqueue"));
+        assert!(names.contains(&"do_enqueue_task"));
+        assert!(names.contains(&"scx_exit_task"));
+        assert!(names.contains(&"balance_one"));
     }
 
     // -- load_probe_stack edge cases --
@@ -606,6 +664,36 @@ mod tests {
         assert!(!should_skip_probe("task_tick_scx"));
         assert!(!should_skip_probe("set_next_task_scx"));
         assert!(!should_skip_probe("put_prev_task_scx"));
+        assert!(!should_skip_probe("scx_exit_task"));
+    }
+
+    #[test]
+    fn should_skip_probe_scx_exit_infrastructure() {
+        assert!(should_skip_probe("scx_vexit"));
+        assert!(should_skip_probe("scx_exit"));
+        assert!(should_skip_probe("scx_exit_reason"));
+        assert!(should_skip_probe("scx_bpf_error_bstr"));
+        assert!(should_skip_probe("scx_bpf_exit_bstr"));
+        assert!(should_skip_probe("scx_dump_state"));
+        assert!(should_skip_probe("scx_dump_task"));
+        assert!(should_skip_probe("scx_error_irq_workfn"));
+    }
+
+    #[test]
+    fn should_skip_probe_bpf_trampoline() {
+        assert!(should_skip_probe("__bpf_prog_enter"));
+        assert!(should_skip_probe("__bpf_prog_enter_sleepable"));
+        assert!(should_skip_probe("__bpf_prog_exit"));
+        assert!(should_skip_probe("__bpf_prog_exit_sleepable"));
+    }
+
+    #[test]
+    fn should_skip_probe_stack_dump_helpers() {
+        assert!(should_skip_probe("dump_stack"));
+        assert!(should_skip_probe("dump_stack_lvl"));
+        assert!(should_skip_probe("stack_trace_save"));
+        assert!(should_skip_probe("stack_trace_print"));
+        assert!(should_skip_probe("show_stack"));
     }
 
     // -- BPF_OP_CALLERS table --
