@@ -58,7 +58,7 @@ fn high_imbalance_test(ctx: &Ctx) -> Result<AssertResult> {
 `not_starved = true` enables three distinct checks:
 
 1. **Starvation**: any worker with zero work units fails.
-2. **Fairness spread**: max - min runnable% across workers in a cgroup
+2. **Fairness spread**: max - min off-CPU% across workers in a cgroup
    must be below `max_spread_pct` (default: 15% release, 35% debug).
 3. **Scheduling gaps**: longest gap between work iterations must be
    below `max_gap_ms` (default: 2000ms release, 3000ms debug).

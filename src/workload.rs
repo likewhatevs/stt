@@ -363,8 +363,11 @@ pub struct WorkerReport {
     pub cpu_time_ns: u64,
     /// Wall-clock time from fork-start to stop signal (ns).
     pub wall_time_ns: u64,
-    /// `wall_time_ns - cpu_time_ns`: time spent runnable but not on-CPU (ns).
-    pub runnable_ns: u64,
+    /// `wall_time_ns - cpu_time_ns`: total off-CPU time (ns).
+    ///
+    /// Includes all time the worker was not executing on a CPU: runnable
+    /// queue wait, voluntary sleep, I/O wait, futex wait, etc.
+    pub off_cpu_ns: u64,
     /// Number of observed CPU migrations (checked every 1024 work units).
     pub migration_count: u64,
     /// Set of all CPUs this worker ran on.
@@ -1288,7 +1291,7 @@ fn worker_main(
         work_units,
         cpu_time_ns,
         wall_time_ns,
-        runnable_ns: wall_time_ns.saturating_sub(cpu_time_ns),
+        off_cpu_ns: wall_time_ns.saturating_sub(cpu_time_ns),
         migration_count,
         cpus_used,
         migrations,
@@ -1546,7 +1549,7 @@ mod tests {
             work_units: 1000,
             cpu_time_ns: 5_000_000_000,
             wall_time_ns: 10_000_000_000,
-            runnable_ns: 5_000_000_000,
+            off_cpu_ns: 5_000_000_000,
             migration_count: 3,
             cpus_used: [0, 1, 2].into_iter().collect(),
             migrations: vec![Migration {
@@ -1842,7 +1845,7 @@ mod tests {
             work_units: 0,
             cpu_time_ns: 0,
             wall_time_ns: 0,
-            runnable_ns: 0,
+            off_cpu_ns: 0,
             migration_count: 0,
             cpus_used: BTreeSet::new(),
             migrations: vec![],
@@ -1867,7 +1870,7 @@ mod tests {
             work_units: u64::MAX,
             cpu_time_ns: u64::MAX,
             wall_time_ns: u64::MAX,
-            runnable_ns: u64::MAX,
+            off_cpu_ns: u64::MAX,
             migration_count: u64::MAX,
             cpus_used: [0, usize::MAX].into_iter().collect(),
             migrations: vec![],
@@ -2251,7 +2254,7 @@ mod tests {
             work_units: 12345,
             cpu_time_ns: 1000,
             wall_time_ns: 2000,
-            runnable_ns: 1000,
+            off_cpu_ns: 1000,
             migration_count: 3,
             cpus_used: [0, 5].into_iter().collect(),
             migrations: vec![],
@@ -2294,14 +2297,14 @@ mod tests {
     // -- WorkerReport edge cases --
 
     #[test]
-    fn worker_report_runnable_ns_calculation() {
-        // runnable_ns = wall_time_ns - cpu_time_ns
+    fn worker_report_off_cpu_ns_calculation() {
+        // off_cpu_ns = wall_time_ns - cpu_time_ns
         let r = WorkerReport {
             tid: 1,
             work_units: 100,
             cpu_time_ns: 3_000_000_000,
             wall_time_ns: 5_000_000_000,
-            runnable_ns: 2_000_000_000,
+            off_cpu_ns: 2_000_000_000,
             migration_count: 0,
             cpus_used: [0].into_iter().collect(),
             migrations: vec![],
@@ -2314,7 +2317,7 @@ mod tests {
             schedstat_ctx_switches: 0,
             schedstat_cpu_time_ns: 0,
         };
-        assert_eq!(r.runnable_ns, r.wall_time_ns - r.cpu_time_ns);
+        assert_eq!(r.off_cpu_ns, r.wall_time_ns - r.cpu_time_ns);
     }
 
     #[test]

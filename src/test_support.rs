@@ -3619,9 +3619,9 @@ mod tests {
                 cgroups: vec![crate::assert::CgroupStats {
                     num_workers: 4,
                     num_cpus: 2,
-                    avg_runnable_pct: 50.0,
-                    min_runnable_pct: 40.0,
-                    max_runnable_pct: 60.0,
+                    avg_off_cpu_pct: 50.0,
+                    min_off_cpu_pct: 40.0,
+                    max_off_cpu_pct: 60.0,
                     spread: 20.0,
                     max_gap_ms: 100,
                     max_gap_cpu: 1,

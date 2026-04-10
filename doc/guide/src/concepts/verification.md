@@ -12,7 +12,7 @@ process. Several checks run against these reports:
 **Starvation** -- any worker with `work_units == 0` fails the test.
 
 **Fairness** -- workers in the same cgroup should get similar CPU time.
-The "spread" (max runnable% - min runnable%) must be below a threshold
+The "spread" (max off-CPU% - min off-CPU%) must be below a threshold
 (15% in release builds, 35% in debug). Violations report the spread
 and per-cgroup statistics.
 

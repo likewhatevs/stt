@@ -41,7 +41,7 @@ pub struct WorkerReport {
     pub work_units: u64,
     pub cpu_time_ns: u64,
     pub wall_time_ns: u64,
-    pub runnable_ns: u64,
+    pub off_cpu_ns: u64,
     pub migration_count: u64,
     pub cpus_used: BTreeSet<usize>,
     pub migrations: Vec<Migration>,
@@ -56,7 +56,7 @@ pub struct WorkerReport {
 }
 ```
 
-- `runnable_ns = wall_time_ns - cpu_time_ns`
+- `off_cpu_ns = wall_time_ns - cpu_time_ns`
 - Migrations are tracked every 1024 work units
   (`work_units.is_multiple_of(1024)`). How often this fires depends
   on the work type: every outer iteration for CpuSpin/Mixed (1024

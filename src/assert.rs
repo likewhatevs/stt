@@ -61,9 +61,9 @@ pub struct AssertResult {
 pub struct CgroupStats {
     pub num_workers: usize,
     pub num_cpus: usize,
-    pub avg_runnable_pct: f64,
-    pub min_runnable_pct: f64,
-    pub max_runnable_pct: f64,
+    pub avg_off_cpu_pct: f64,
+    pub min_off_cpu_pct: f64,
+    pub max_off_cpu_pct: f64,
     pub spread: f64,
     pub max_gap_ms: u64,
     pub max_gap_cpu: usize,
@@ -243,7 +243,7 @@ impl AssertPlan {
                         cgroup_result.passed = false;
                         cgroup_result.details.push(format!(
                             "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
-                            cg.spread, cg.min_runnable_pct, cg.max_runnable_pct,
+                            cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
                             cg.num_workers, cg.num_cpus, spread_limit
                         ));
                     } else {
@@ -673,7 +673,7 @@ impl Assert {
 /// # let report = WorkerReport {
 /// #     tid: 1, cpus_used: [0, 1].into_iter().collect(),
 /// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 2_000_000,
-/// #     runnable_ns: 1_000_000, migration_count: 0, migrations: vec![],
+/// #     off_cpu_ns: 1_000_000, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 0, max_gap_cpu: 0, max_gap_at_ms: 0,
 /// #     wake_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
@@ -703,7 +703,7 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// # let report = WorkerReport {
 /// #     tid: 1, cpus_used: [0].into_iter().collect(),
 /// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 5_000_000_000,
-/// #     runnable_ns: 500_000_000, migration_count: 0, migrations: vec![],
+/// #     off_cpu_ns: 500_000_000, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
 /// #     wake_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
@@ -732,7 +732,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
                 .push(format!("tid {} starved (0 work units)", w.tid));
         }
         if w.wall_time_ns > 0 {
-            pcts.push(w.runnable_ns as f64 / w.wall_time_ns as f64 * 100.0);
+            pcts.push(w.off_cpu_ns as f64 / w.wall_time_ns as f64 * 100.0);
         }
     }
 
@@ -800,9 +800,9 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     let cg = CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
-        avg_runnable_pct: avg,
-        min_runnable_pct: min,
-        max_runnable_pct: max,
+        avg_off_cpu_pct: avg,
+        min_off_cpu_pct: min,
+        max_off_cpu_pct: max,
         spread,
         max_gap_ms: gap_ms,
         max_gap_cpu: gap_cpu,
@@ -879,7 +879,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 /// # let mk = |units, cpu_ns| WorkerReport {
 /// #     tid: 1, cpus_used: [0].into_iter().collect(),
 /// #     work_units: units, cpu_time_ns: cpu_ns, wall_time_ns: cpu_ns,
-/// #     runnable_ns: cpu_ns, migration_count: 0, migrations: vec![],
+/// #     off_cpu_ns: cpu_ns, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 0, max_gap_cpu: 0, max_gap_at_ms: 0,
 /// #     wake_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
@@ -953,7 +953,7 @@ pub fn assert_throughput_parity(
 /// # let report = WorkerReport {
 /// #     tid: 1, cpus_used: [0].into_iter().collect(),
 /// #     work_units: 1000, cpu_time_ns: 2_500_000_000,
-/// #     wall_time_ns: 5_000_000_000, runnable_ns: 2_500_000_000,
+/// #     wall_time_ns: 5_000_000_000, off_cpu_ns: 2_500_000_000,
 /// #     migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
 /// #     wake_latencies_ns: vec![100, 200, 300, 400, 500],
@@ -1046,16 +1046,16 @@ mod tests {
         tid: u32,
         work: u64,
         wall_ns: u64,
-        run_ns: u64,
+        off_cpu_ns: u64,
         cpus: &[usize],
         gap_ms: u64,
     ) -> WorkerReport {
         WorkerReport {
             tid,
             work_units: work,
-            cpu_time_ns: wall_ns.saturating_sub(run_ns),
+            cpu_time_ns: wall_ns.saturating_sub(off_cpu_ns),
             wall_time_ns: wall_ns,
-            runnable_ns: run_ns,
+            off_cpu_ns,
             migration_count: 0,
             cpus_used: cpus.iter().copied().collect(),
             migrations: vec![],
@@ -1161,14 +1161,14 @@ mod tests {
         m.merge(r2);
         assert_eq!(m.stats.cgroups.len(), 2);
         assert_eq!(m.stats.total_workers, 4);
-        assert!(m.passed, "diff cgroups diff runnable should pass");
+        assert!(m.passed, "diff cgroups diff off_cpu should pass");
     }
 
     #[test]
     fn spread_boundary() {
         let threshold = spread_threshold_pct();
         // At threshold exactly - pass
-        // Worker 1: 10% runnable, Worker 2: 10%+threshold runnable
+        // Worker 1: 10% off-CPU, Worker 2: 10%+threshold off-CPU
         let at_threshold_ns = ((10.0 + threshold) / 100.0 * 5e9) as u64;
         let r = assert_not_starved(&[
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50), // 10%
@@ -1221,10 +1221,10 @@ mod tests {
         let c = &r.stats.cgroups[0];
         assert_eq!(c.num_workers, 2);
         assert_eq!(c.num_cpus, 2);
-        assert!((c.min_runnable_pct - 20.0).abs() < 0.1);
-        assert!((c.max_runnable_pct - 30.0).abs() < 0.1);
+        assert!((c.min_off_cpu_pct - 20.0).abs() < 0.1);
+        assert!((c.max_off_cpu_pct - 30.0).abs() < 0.1);
         assert!((c.spread - 10.0).abs() < 0.1);
-        assert!((c.avg_runnable_pct - 25.0).abs() < 0.1);
+        assert!((c.avg_off_cpu_pct - 25.0).abs() < 0.1);
     }
 
     #[test]
@@ -1289,9 +1289,9 @@ mod tests {
             cgroups: vec![CgroupStats {
                 num_workers: 4,
                 num_cpus: 2,
-                avg_runnable_pct: 50.0,
-                min_runnable_pct: 40.0,
-                max_runnable_pct: 60.0,
+                avg_off_cpu_pct: 50.0,
+                min_off_cpu_pct: 40.0,
+                max_off_cpu_pct: 60.0,
                 spread: 20.0,
                 max_gap_ms: 150,
                 max_gap_cpu: 3,
@@ -1464,7 +1464,7 @@ mod tests {
     fn zero_wall_time_nonzero_work() {
         // wall_time=0 but work_units>0: the worker did work but the timer
         // didn't advance. Should not produce a starved failure since work was done.
-        // The runnable_pct computation skips this worker (no pcts entry).
+        // The off_cpu_pct computation skips this worker (no pcts entry).
         let r = assert_not_starved(&[rpt(1, 100, 0, 0, &[0], 0)]);
         assert!(
             r.passed,
@@ -1892,14 +1892,14 @@ mod tests {
         assert_eq!(c.num_workers, 2);
         assert_eq!(c.num_cpus, 2);
         assert!(
-            c.min_runnable_pct < 10.0,
+            c.min_off_cpu_pct < 10.0,
             "min pct should be ~5%: {:.1}",
-            c.min_runnable_pct
+            c.min_off_cpu_pct
         );
         assert!(
-            c.max_runnable_pct > 90.0,
+            c.max_off_cpu_pct > 90.0,
             "max pct should be ~95%: {:.1}",
-            c.max_runnable_pct
+            c.max_off_cpu_pct
         );
     }
 
@@ -2151,7 +2151,7 @@ mod tests {
             work_units: 1000,
             cpu_time_ns: wall_ns / 2,
             wall_time_ns: wall_ns,
-            runnable_ns: wall_ns / 2,
+            off_cpu_ns: wall_ns / 2,
             migration_count: 0,
             cpus_used: [0].into_iter().collect(),
             migrations: vec![],

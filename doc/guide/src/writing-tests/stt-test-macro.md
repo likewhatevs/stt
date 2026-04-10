@@ -91,7 +91,7 @@ cores=2, threads=1). See
 | `max_migration_ratio` | inherited | Max migration ratio (migrations/iterations) per cgroup |
 
 `not_starved = true` enables three distinct checks: starvation (any
-worker with zero work units), fairness spread (max-min runnable% below
+worker with zero work units), fairness spread (max-min off-CPU% below
 `max_spread_pct`), and scheduling gaps (longest gap below `max_gap_ms`).
 Each threshold can be overridden independently. See
 [Customize Verification](../recipes/custom-verification.md) for
