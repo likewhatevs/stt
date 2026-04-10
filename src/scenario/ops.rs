@@ -58,8 +58,9 @@ pub enum Op {
     },
     /// Stop all workers in a cgroup (does not remove the cgroup).
     StopCgroup { cgroup: Cow<'static, str> },
-    /// Set each worker in a cgroup to a random CPU subset drawn from the
-    /// cgroup's cpuset (or all CPUs if no cpuset is configured).
+    /// Set each worker in a cgroup to a random subset of half the
+    /// cgroup's cpuset (or half of all CPUs if no cpuset is configured,
+    /// minimum 1 CPU).
     RandomizeAffinity { cgroup: Cow<'static, str> },
     /// Set all workers in a cgroup to the given affinity mask.
     SetAffinity {

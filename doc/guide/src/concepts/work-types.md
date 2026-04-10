@@ -15,6 +15,7 @@ pub enum WorkType {
     CacheYield { size_kb: usize, stride: usize },
     CachePipe { size_kb: usize, burst_iters: u64 },
     FutexFanOut { fan_out: usize, spin_iters: u64 },
+    Sequence { first: Phase, rest: Vec<Phase> },
 }
 ```
 
@@ -61,6 +62,28 @@ placement. Requires even `num_workers`.
 messenger per group does `spin_iters` of CPU work then wakes `fan_out`
 receivers via `FUTEX_WAKE`. Receivers measure wake-to-run latency.
 Requires `num_workers` divisible by `fan_out + 1`.
+
+**`Sequence`** -- compound work pattern: loop through phases in order,
+repeat. Each phase runs for its specified duration before the next
+starts. Phases are defined via the `Phase` enum:
+
+- `Phase::Spin(Duration)` -- CPU spin for the given duration.
+- `Phase::Sleep(Duration)` -- `thread::sleep` for the given duration.
+- `Phase::Yield(Duration)` -- repeated `sched_yield` for the given duration.
+- `Phase::Io(Duration)` -- synchronous I/O (write + fsync) for the given duration.
+
+`Sequence` cannot be constructed via `WorkType::from_name()` because
+it requires explicit phase definitions. Build it directly:
+
+```rust,ignore
+WorkType::Sequence {
+    first: Phase::Spin(Duration::from_millis(100)),
+    rest: vec![
+        Phase::Sleep(Duration::from_millis(50)),
+        Phase::Yield(Duration::from_millis(20)),
+    ],
+}
+```
 
 ## Grouped work types
 

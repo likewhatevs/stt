@@ -4,7 +4,7 @@
 //! in its own cgroup. Key types:
 //! - [`WorkType`] -- what each worker does (CPU spin, yield, I/O, bursty, pipe)
 //! - [`WorkloadConfig`] -- spawn configuration (count, affinity, work type, policy)
-//! - [`WorkloadHandle`] -- RAII handle to running workers
+//! - [`WorkloadHandle`] -- RAII handle to spawned workers
 //! - [`WorkerReport`] -- per-worker telemetry collected after stop
 //! - [`AffinityMode`] -- resolved CPU affinity for workers
 //! - [`Work`] -- workload definition for a single group of workers within a cgroup
@@ -69,61 +69,43 @@ pub enum Phase {
 /// ```
 #[derive(Debug, Clone)]
 pub enum WorkType {
+    /// Tight CPU spin loop (1024 iterations per cycle).
     CpuSpin,
+    /// Repeated sched_yield with minimal CPU work.
     YieldHeavy,
+    /// CPU spin burst followed by sched_yield.
     Mixed,
+    /// Synchronous file I/O: write 64 KB + fsync per cycle.
     IoSync,
     /// Work hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
-    Bursty {
-        burst_ms: u64,
-        sleep_ms: u64,
-    },
+    Bursty { burst_ms: u64, sleep_ms: u64 },
     /// CPU burst then 1-byte pipe exchange with a partner worker. Sleep
     /// duration depends on partner scheduling, exercising cross-CPU wake
     /// placement. Requires even num_workers; workers are paired (0,1), (2,3), etc.
-    PipeIo {
-        burst_iters: u64,
-    },
+    PipeIo { burst_iters: u64 },
     /// Paired futex wait/wake between partner workers. Each iteration does
     /// `spin_iters` of CPU work then wakes the partner and waits on the
     /// shared futex word. Exercises the non-WF_SYNC wake path.
     /// Requires even num_workers.
-    FutexPingPong {
-        spin_iters: u64,
-    },
+    FutexPingPong { spin_iters: u64 },
     /// Strided read-modify-write over a buffer, sized to pressure the L1
     /// cache. Each worker allocates its own buffer post-fork.
-    CachePressure {
-        size_kb: usize,
-        stride: usize,
-    },
+    CachePressure { size_kb: usize, stride: usize },
     /// Cache pressure followed by sched_yield(). Tests wake_affine
     /// placement after voluntary preemption.
-    CacheYield {
-        size_kb: usize,
-        stride: usize,
-    },
+    CacheYield { size_kb: usize, stride: usize },
     /// Cache pressure burst then 1-byte pipe exchange with a partner
     /// worker. Combines cache-hot working set with cross-CPU wake
     /// placement. Requires even num_workers.
-    CachePipe {
-        size_kb: usize,
-        burst_iters: u64,
-    },
+    CachePipe { size_kb: usize, burst_iters: u64 },
     /// 1:N fan-out wake pattern (schbench-style). One messenger per group
     /// does CPU work then wakes N receivers via FUTEX_WAKE. Receivers
     /// measure wake-to-run latency. Requires num_workers divisible by
     /// (fan_out + 1).
-    FutexFanOut {
-        fan_out: usize,
-        spin_iters: u64,
-    },
+    FutexFanOut { fan_out: usize, spin_iters: u64 },
     /// Compound work pattern: loop through phases in order, repeat.
     /// Each phase runs for its duration before the next starts.
-    Sequence {
-        first: Phase,
-        rest: Vec<Phase>,
-    },
+    Sequence { first: Phase, rest: Vec<Phase> },
 }
 
 impl WorkType {
@@ -373,13 +355,21 @@ pub struct Migration {
 /// serialized via a pipe to the parent process.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerReport {
+    /// Worker process ID (from `getpid()` in the forked child).
     pub tid: u32,
+    /// Cumulative work iterations (incremented by `spin_burst` or I/O loops).
     pub work_units: u64,
+    /// Thread CPU time from `CLOCK_PROCESS_CPUTIME_ID` (ns).
     pub cpu_time_ns: u64,
+    /// Wall-clock time from fork-start to stop signal (ns).
     pub wall_time_ns: u64,
+    /// `wall_time_ns - cpu_time_ns`: time spent runnable but not on-CPU (ns).
     pub runnable_ns: u64,
+    /// Number of observed CPU migrations (checked every 1024 work units).
     pub migration_count: u64,
+    /// Set of all CPUs this worker ran on.
     pub cpus_used: BTreeSet<usize>,
+    /// Ordered list of CPU migration events with timestamps.
     pub migrations: Vec<Migration>,
     /// Longest gap between work iterations (ms). High = task was stuck waiting for CPU.
     pub max_gap_ms: u64,
@@ -388,7 +378,8 @@ pub struct WorkerReport {
     /// When the longest gap happened (ms from start).
     pub max_gap_at_ms: u64,
     /// Per-wakeup latency samples (ns). Populated for blocking work types
-    /// (FutexPingPong, FutexFanOut, CachePipe, Bursty, CacheYield, PipeIo).
+    /// (FutexPingPong, FutexFanOut, CachePipe, Bursty, CacheYield, PipeIo,
+    /// Sequence with Sleep or Yield phases).
     #[serde(default)]
     pub wake_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
@@ -413,7 +404,8 @@ static REPRO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 /// Set the scheduler PID for the work-conservation watchdog.
 ///
-/// Workers send SIGUSR2 to this PID when stuck > 2 seconds.
+/// Workers send SIGUSR2 to this PID when stuck > 2 seconds,
+/// unless repro mode is active (see [`set_repro_mode`]).
 #[doc(hidden)]
 pub(crate) fn set_sched_pid(pid: i32) {
     SCHED_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
@@ -426,7 +418,8 @@ pub(crate) fn set_repro_mode(v: bool) {
     REPRO_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Handle to running worker processes (forked, not threads).
+/// Handle to spawned worker processes (forked, not threads).
+/// Workers block until [`start()`](Self::start) is called.
 /// Each worker is a separate process so it can be in its own cgroup.
 #[must_use = "dropping a WorkloadHandle immediately kills all worker processes"]
 pub struct WorkloadHandle {
@@ -745,7 +738,8 @@ impl WorkloadHandle {
 
     /// Send SIGUSR1 to all workers, collect their reports, and wait for exit.
     ///
-    /// Auto-starts workers if [`start()`](Self::start) was not called.
+    /// Auto-starts workers if [`start()`](Self::start) was not called,
+    /// then sleeps 500ms to let them begin before signaling stop.
     /// Consumes `self` -- workers cannot be restarted.
     pub fn stop_and_collect(mut self) -> Vec<WorkerReport> {
         // Auto-start if not explicitly started (workers in parent cgroup)
