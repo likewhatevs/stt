@@ -154,12 +154,9 @@ pub(crate) fn ktstr_guest_init() -> ! {
         stop.store(true, Ordering::Release);
     }
 
-    // Flush COM1 trace data before reboot. The stop flag must be set
-    // before the sentinel so the reader exits after processing it
-    // instead of looping back into a blocking read (deadlock). The
-    // sentinel must be written while tracing is on (trace_marker writes
-    // fail after tracing_on=0). tracing_on=0 wakes the blocked reader
-    // via ring_buffer_wake_waiters.
+    // Flush COM1 trace data before reboot. tracing_on=0 wakes the
+    // blocked reader via ring_buffer_wake_waiters and causes EOF after
+    // all buffered events are drained.
     let _ = fs::write(
         "/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable",
         "0",
@@ -167,7 +164,6 @@ pub(crate) fn ktstr_guest_init() -> ! {
     if let Some(ref stop) = trace_stop {
         stop.store(true, Ordering::Release);
     }
-    let _ = fs::write("/sys/kernel/tracing/trace_marker", "ktstr_flush\n");
     let _ = fs::write("/sys/kernel/tracing/tracing_on", "0");
     if let Some(handle) = trace_handle {
         let _ = handle.join();
@@ -444,26 +440,7 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
                     match trace.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let chunk = &buf[..n];
-                            let mut saw_sentinel = false;
-                            // Filter the flush sentinel so it doesn't
-                            // appear in user-visible COM1 output.
-                            if let Ok(s) = std::str::from_utf8(chunk) {
-                                for line in s.split_inclusive('\n') {
-                                    if line.contains("ktstr_flush") {
-                                        saw_sentinel = true;
-                                    } else {
-                                        let _ = com1.write_all(line.as_bytes());
-                                    }
-                                }
-                            } else {
-                                let _ = com1.write_all(chunk);
-                            }
-                            // In drain mode, the sentinel marks the end
-                            // of real trace data — exit once it's seen.
-                            if draining && saw_sentinel {
-                                break;
-                            }
+                            let _ = com1.write_all(&buf[..n]);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -483,8 +460,7 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
 /// `shm_ring::wait_for` / `shm_ring::signal`.
 ///
 /// `trace_stop` is the trace_pipe reader's stop flag. The graceful
-/// shutdown handler sets it before writing the flush sentinel so the
-/// reader enters drain mode.
+/// shutdown handler sets it so the reader enters drain mode.
 fn start_shm_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc<AtomicBool>> {
     let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
     let (shm_base, shm_size) = crate::vmm::shm_ring::parse_shm_params_from_str(&cmdline)?;
@@ -506,9 +482,9 @@ fn start_shm_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc<AtomicBool>
 /// Maps the full SHM region so signal slots are accessible via
 /// `shm_ring::init_shm_ptr`.
 ///
-/// On graceful shutdown (SIGNAL_SHUTDOWN_REQ), sets `trace_stop` before
-/// writing the flush sentinel so the trace_pipe reader drains all
-/// buffered data before exiting.
+/// On graceful shutdown (SIGNAL_SHUTDOWN_REQ), sets `trace_stop` and
+/// disables tracing so the trace_pipe reader drains all buffered data
+/// before exiting.
 fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
     use std::os::unix::io::AsRawFd;
 
@@ -562,20 +538,12 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
         // Check for graceful shutdown request from host.
         if crate::vmm::shm_ring::read_signal(0) == crate::vmm::shm_ring::SIGNAL_SHUTDOWN_REQ {
             eprintln!("ktstr-init: shutdown request received, draining");
-            // Set trace_stop before sentinel so the reader enters drain
-            // mode and exits after processing the sentinel, matching
-            // the Phase 6 ordering in ktstr_guest_init.
             if let Some(ts) = trace_stop {
                 ts.store(true, Ordering::Release);
             }
-            // Sentinel unblocks trace_pipe reader; must come before
-            // tracing_on=0 (trace_marker writes fail when tracing off).
-            let _ = fs::write("/sys/kernel/tracing/trace_marker", "ktstr_flush\n");
             let _ = fs::write("/sys/kernel/tracing/tracing_on", "0");
-            // Flush stdout/stderr to COM2 before tcdrain.
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
-            // tcdrain COM1 and COM2.
             if let Ok(f) = fs::OpenOptions::new().write(true).open(COM1) {
                 unsafe {
                     libc::tcdrain(std::os::unix::io::AsRawFd::as_raw_fd(&f));
@@ -586,8 +554,6 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
                     libc::tcdrain(std::os::unix::io::AsRawFd::as_raw_fd(&f));
                 }
             }
-            // Stop polling -- the guest reboots normally, which the
-            // BSP detects as an I8042 reset (implicit ack).
             break;
         }
 
