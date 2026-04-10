@@ -65,11 +65,25 @@ pub(crate) fn stt_guest_init() -> ! {
     write_com2("STT_INIT_STARTED");
     redirect_stdio_to_com2();
 
+    // Extract RUST_LOG from kernel cmdline before installing the
+    // tracing subscriber so EnvFilter picks it up.
+    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline")
+        && let Some(val) = cmdline
+            .split_whitespace()
+            .find(|s| s.starts_with("RUST_LOG="))
+            .and_then(|s| s.strip_prefix("RUST_LOG="))
+    {
+        // SAFETY: single-threaded PID 1 context.
+        unsafe { std::env::set_var("RUST_LOG", val) };
+    }
+
     // Install tracing subscriber so tracing calls in guest code produce
     // output on stderr (COM2). Without this, they are silently dropped.
+    // EnvFilter respects RUST_LOG when set.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     // Set environment variables.

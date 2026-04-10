@@ -1228,10 +1228,13 @@ fn run_stt_test_inner(
     for &karg in entry.scheduler.kargs {
         cmdline_parts.push(karg.to_string());
     }
-    // Propagate RUST_BACKTRACE to the guest so guest-side code
-    // can gate verbose output.
+    // Propagate RUST_BACKTRACE and RUST_LOG to the guest so
+    // guest-side code can gate verbose output and tracing.
     if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
         cmdline_parts.push(format!("RUST_BACKTRACE={bt}"));
+    }
+    if let Ok(log) = std::env::var("RUST_LOG") {
+        cmdline_parts.push(format!("RUST_LOG={log}"));
     }
     let cmdline_extra = cmdline_parts.join(" ");
 
@@ -1775,6 +1778,9 @@ fn attempt_auto_repro(
     if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
         cmdline_parts.push(format!("RUST_BACKTRACE={bt}"));
     }
+    if let Ok(log) = std::env::var("RUST_LOG") {
+        cmdline_parts.push(format!("RUST_LOG={log}"));
+    }
     let cmdline_extra = cmdline_parts.join(" ");
 
     let (sockets, cores, threads, memory_mb) = match topo {
@@ -1954,16 +1960,25 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
 pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     let name = extract_test_fn_arg(args)?;
 
-    // Propagate RUST_BACKTRACE from kernel cmdline to env.
-    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline")
-        && let Some(val) = cmdline
-            .split_whitespace()
+    // Propagate RUST_BACKTRACE and RUST_LOG from kernel cmdline to env.
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        let parts: Vec<&str> = cmdline.split_whitespace().collect();
+        if let Some(val) = parts
+            .iter()
             .find(|s| s.starts_with("RUST_BACKTRACE="))
             .and_then(|s| s.strip_prefix("RUST_BACKTRACE="))
-    {
-        // SAFETY: guest-side dispatch runs single-threaded before
-        // any test threads are spawned.
-        unsafe { std::env::set_var("RUST_BACKTRACE", val) };
+        {
+            // SAFETY: guest-side dispatch runs single-threaded before
+            // any test threads are spawned.
+            unsafe { std::env::set_var("RUST_BACKTRACE", val) };
+        }
+        if let Some(val) = parts
+            .iter()
+            .find(|s| s.starts_with("RUST_LOG="))
+            .and_then(|s| s.strip_prefix("RUST_LOG="))
+        {
+            unsafe { std::env::set_var("RUST_LOG", val) };
+        }
     }
 
     let entry = match find_test(name) {
