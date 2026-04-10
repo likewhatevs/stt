@@ -101,7 +101,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let (mut sched_child, sched_log_path) = start_scheduler();
 
     // Phase 4: SHM polling + trace pipe (background threads).
-    let trace_stop = start_trace_pipe();
+    let (trace_stop, trace_handle) = start_trace_pipe();
     let shm_stop = start_shm_poll();
 
     // Signal the host that the scheduler is loaded and BPF programs
@@ -147,9 +147,6 @@ pub(crate) fn ktstr_guest_init() -> ! {
     exec_shell_script("/sched_disable");
 
     // Stop background threads.
-    if let Some(ref stop) = trace_stop {
-        stop.store(true, Ordering::Release);
-    }
     if let Some(ref stop) = shm_stop {
         stop.store(true, Ordering::Release);
     }
@@ -157,9 +154,34 @@ pub(crate) fn ktstr_guest_init() -> ! {
         stop.store(true, Ordering::Release);
     }
 
+    // Flush COM1 trace data before reboot. The stop flag must be set
+    // before the sentinel so the reader exits after processing it
+    // instead of looping back into a blocking read (deadlock). The
+    // sentinel must be written while tracing is on (trace_marker writes
+    // fail after tracing_on=0). tracing_on=0 wakes the blocked reader
+    // via ring_buffer_wake_waiters.
+    let _ = fs::write(
+        "/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable",
+        "0",
+    );
+    if let Some(ref stop) = trace_stop {
+        stop.store(true, Ordering::Release);
+    }
+    let _ = fs::write("/sys/kernel/tracing/trace_marker", "ktstr_flush\n");
+    let _ = fs::write("/sys/kernel/tracing/tracing_on", "0");
+    if let Some(handle) = trace_handle {
+        let _ = handle.join();
+    }
+    if let Ok(com1) = fs::OpenOptions::new().write(true).open(COM1) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::tcdrain(com1.as_raw_fd());
+        }
+    }
+
     // Phase 7: Exit.
-    // tcdrain stdout to wait for the UART to finish transmitting all
-    // queued bytes. Without this, reboot(2) can cut short serial output.
+    // tcdrain stdout (COM2 after redirect) to wait for the UART to
+    // finish transmitting all queued bytes.
     unsafe {
         libc::tcdrain(1);
     }
@@ -390,15 +412,15 @@ fn dump_file_to_com2(path: &str) {
 }
 
 /// Enable sched_ext_dump trace event and pipe trace_pipe to COM1 in a
-/// background thread. Returns a stop flag to signal the thread to exit.
-fn start_trace_pipe() -> Option<Arc<AtomicBool>> {
+/// background thread. Returns the stop flag and thread join handle.
+fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandle<()>>) {
     let trace_enable = "/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable";
     if Path::new(trace_enable).exists() {
         let _ = fs::write(trace_enable, "1");
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("trace-pipe".into())
             .spawn(move || {
                 let Ok(mut trace) = fs::File::open("/sys/kernel/tracing/trace_pipe") else {
@@ -412,7 +434,18 @@ fn start_trace_pipe() -> Option<Arc<AtomicBool>> {
                     match trace.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let _ = com1.write_all(&buf[..n]);
+                            let chunk = &buf[..n];
+                            // Filter the flush sentinel so it doesn't
+                            // appear in user-visible COM1 output.
+                            if let Ok(s) = std::str::from_utf8(chunk) {
+                                for line in s.split_inclusive('\n') {
+                                    if !line.contains("ktstr_flush") {
+                                        let _ = com1.write_all(line.as_bytes());
+                                    }
+                                }
+                            } else {
+                                let _ = com1.write_all(chunk);
+                            }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -420,9 +453,9 @@ fn start_trace_pipe() -> Option<Arc<AtomicBool>> {
                 }
             })
             .ok();
-        Some(stop)
+        (Some(stop), handle)
     } else {
-        None
+        (None, None)
     }
 }
 
@@ -503,7 +536,9 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool) {
         // Check for graceful shutdown request from host.
         if crate::vmm::shm_ring::read_signal(0) == crate::vmm::shm_ring::SIGNAL_SHUTDOWN_REQ {
             eprintln!("ktstr-init: shutdown request received, draining");
-            // Stop generating new trace events so pending trace data drains.
+            // Sentinel unblocks trace_pipe reader; must come before
+            // tracing_on=0 (trace_marker writes fail when tracing off).
+            let _ = fs::write("/sys/kernel/tracing/trace_marker", "ktstr_flush\n");
             let _ = fs::write("/sys/kernel/tracing/tracing_on", "0");
             // Flush stdout/stderr to COM2 before tcdrain.
             let _ = std::io::stdout().flush();
