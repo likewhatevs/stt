@@ -103,6 +103,29 @@ impl CpusetSpec {
     pub fn exact(cpus: impl IntoIterator<Item = usize>) -> Self {
         CpusetSpec::Exact(cpus.into_iter().collect())
     }
+
+    /// Partition usable CPUs into `of` equal disjoint sets; take the `index`-th.
+    pub fn disjoint(index: usize, of: usize) -> Self {
+        CpusetSpec::Disjoint { index, of }
+    }
+
+    /// Like [`disjoint`](Self::disjoint) but each set overlaps neighbors by `frac` of its size.
+    pub fn overlap(index: usize, of: usize, frac: f64) -> Self {
+        CpusetSpec::Overlap { index, of, frac }
+    }
+
+    /// Fractional range of usable CPUs `[start_frac..end_frac)`.
+    pub fn range(start_frac: f64, end_frac: f64) -> Self {
+        CpusetSpec::Range {
+            start_frac,
+            end_frac,
+        }
+    }
+
+    /// All CPUs in a given LLC index.
+    pub fn llc(index: usize) -> Self {
+        CpusetSpec::Llc(index)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +152,7 @@ impl CpusetSpec {
 /// # use stt::workload::{Work, WorkType};
 /// // Single work group via convenience methods.
 /// let def = CgroupDef::named("workers")
-///     .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
+///     .with_cpuset(CpusetSpec::disjoint(0, 2))
 ///     .workers(4)
 ///     .work_type(WorkType::CpuSpin);
 ///
@@ -1666,12 +1689,9 @@ mod tests {
     #[test]
     fn cgroup_def_builder_chain() {
         let d = CgroupDef::named("test")
-            .with_cpuset(CpusetSpec::Llc(0))
+            .with_cpuset(CpusetSpec::llc(0))
             .workers(8)
-            .work_type(WorkType::Bursty {
-                burst_ms: 50,
-                sleep_ms: 100,
-            })
+            .work_type(WorkType::bursty(50, 100))
             .sched_policy(crate::workload::SchedPolicy::Batch)
             .swappable(true);
         assert_eq!(d.name, "test");

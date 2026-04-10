@@ -828,10 +828,7 @@ pub fn split_half(ctx: &Ctx) -> (BTreeSet<usize>, BTreeSet<usize>) {
 pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHandle>> {
     let types = [
         WorkType::CpuSpin,
-        WorkType::Bursty {
-            burst_ms: 50,
-            sleep_ms: 100,
-        },
+        WorkType::bursty(50, 100),
         WorkType::IoSync,
         WorkType::Mixed,
         WorkType::YieldHeavy,

@@ -59,8 +59,8 @@ pub fn steady_llc(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(
         ctx,
         vec![
-            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Llc(0)),
-            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Llc(1)),
+            CgroupDef::named("cg_0").with_cpuset(CpusetSpec::llc(0)),
+            CgroupDef::named("cg_1").with_cpuset(CpusetSpec::llc(1)),
         ],
     )
 }

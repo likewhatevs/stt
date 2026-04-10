@@ -79,8 +79,8 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step::with_defs(
             vec![
-                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)),
+                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
             ],
             HoldSpec::Fixed(ctx.settle),
         ),

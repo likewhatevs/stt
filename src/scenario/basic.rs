@@ -31,13 +31,7 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
         (SchedPolicy::Normal, WorkType::CpuSpin),
         (SchedPolicy::Batch, WorkType::CpuSpin),
         (SchedPolicy::Idle, WorkType::CpuSpin),
-        (
-            SchedPolicy::Fifo(1),
-            WorkType::Bursty {
-                burst_ms: 500,
-                sleep_ms: 250,
-            },
-        ),
+        (SchedPolicy::Fifo(1), WorkType::bursty(500, 250)),
     ];
 
     let mut ops = vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")];
@@ -67,7 +61,7 @@ pub fn custom_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
             name,
             Work::default()
                 .workers(2)
-                .work_type(WorkType::PipeIo { burst_iters: 1024 }),
+                .work_type(WorkType::pipe_io(1024)),
         ));
         ops.push(Op::spawn(
             name,

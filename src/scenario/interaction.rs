@@ -38,10 +38,7 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
             CgroupDef::named("cg_0").workers(8),
             CgroupDef::named("cg_1")
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::Bursty {
-                    burst_ms: 100,
-                    sleep_ms: 50,
-                }),
+                .work_type(WorkType::bursty(100, 50)),
             CgroupDef::named("cg_2")
                 .workers(ctx.workers_per_cgroup)
                 .work_type(WorkType::IoSync),
@@ -116,15 +113,12 @@ pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0")
-                .with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })
+                .with_cpuset(CpusetSpec::disjoint(0, 2))
                 .workers(mid * 2),
             CgroupDef::named("cg_1")
-                .with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 })
+                .with_cpuset(CpusetSpec::disjoint(1, 2))
                 .workers(2)
-                .work_type(WorkType::Bursty {
-                    burst_ms: 50,
-                    sleep_ms: 150,
-                }),
+                .work_type(WorkType::bursty(50, 150)),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
     )];
@@ -147,10 +141,7 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
             CgroupDef::named("cg_1")
                 .with_cpuset(CpusetSpec::Exact(sets[1].clone()))
                 .workers(2)
-                .work_type(WorkType::Bursty {
-                    burst_ms: 50,
-                    sleep_ms: 100,
-                }),
+                .work_type(WorkType::bursty(50, 100)),
             CgroupDef::named("cg_2")
                 .with_cpuset(CpusetSpec::Exact(sets[2].clone()))
                 .workers(1)
@@ -222,10 +213,7 @@ pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_mobile").workers(2),
                 CgroupDef::named("cg_light")
                     .workers(2)
-                    .work_type(WorkType::Bursty {
-                        burst_ms: 50,
-                        sleep_ms: 100,
-                    }),
+                    .work_type(WorkType::bursty(50, 100)),
             ],
             HoldSpec::Fixed(ctx.settle),
         )
@@ -242,8 +230,8 @@ pub fn custom_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step::with_defs(
             vec![
-                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)),
+                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
             ],
             HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         ),

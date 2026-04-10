@@ -103,10 +103,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     let n_unpinned = (last * 3).max(8);
     let mut h_cgroup = WorkloadHandle::spawn(&WorkloadConfig {
         num_workers: n_unpinned,
-        work_type: WorkType::Bursty {
-            burst_ms: 10,
-            sleep_ms: 5,
-        },
+        work_type: WorkType::bursty(10, 5),
         ..Default::default()
     })?;
     ctx.cgroups.move_tasks("cg_0", &h_cgroup.tids())?;
@@ -117,10 +114,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
         let h = WorkloadHandle::spawn(&WorkloadConfig {
             num_workers: 1,
             affinity: AffinityMode::SingleCpu(cpu),
-            work_type: WorkType::Bursty {
-                burst_ms: 10,
-                sleep_ms: 5,
-            },
+            work_type: WorkType::bursty(10, 5),
             ..Default::default()
         })?;
         ctx.cgroups.move_tasks("cg_0", &h.tids())?;
@@ -215,10 +209,7 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
     _guard.add_cgroup_no_cpuset("cg_3")?;
     let mut h = WorkloadHandle::spawn(&WorkloadConfig {
         num_workers: 4,
-        work_type: WorkType::Bursty {
-            burst_ms: 100,
-            sleep_ms: 50,
-        },
+        work_type: WorkType::bursty(100, 50),
         ..Default::default()
     })?;
     ctx.cgroups.move_tasks("cg_3", &h.tids())?;

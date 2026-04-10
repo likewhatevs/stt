@@ -253,6 +253,47 @@ impl WorkType {
                 | WorkType::CachePipe { .. }
         )
     }
+
+    /// Bursty work: CPU burst for `burst_ms`, sleep for `sleep_ms`, repeat.
+    pub fn bursty(burst_ms: u64, sleep_ms: u64) -> Self {
+        WorkType::Bursty { burst_ms, sleep_ms }
+    }
+
+    /// Paired pipe I/O with CPU burst between exchanges.
+    pub fn pipe_io(burst_iters: u64) -> Self {
+        WorkType::PipeIo { burst_iters }
+    }
+
+    /// Paired futex ping-pong with CPU spin between wakes.
+    pub fn futex_ping_pong(spin_iters: u64) -> Self {
+        WorkType::FutexPingPong { spin_iters }
+    }
+
+    /// Strided read-modify-write over a `size_kb` KB buffer.
+    pub fn cache_pressure(size_kb: usize, stride: usize) -> Self {
+        WorkType::CachePressure { size_kb, stride }
+    }
+
+    /// Cache pressure burst followed by sched_yield().
+    pub fn cache_yield(size_kb: usize, stride: usize) -> Self {
+        WorkType::CacheYield { size_kb, stride }
+    }
+
+    /// Cache pressure burst then pipe exchange with a partner worker.
+    pub fn cache_pipe(size_kb: usize, burst_iters: u64) -> Self {
+        WorkType::CachePipe {
+            size_kb,
+            burst_iters,
+        }
+    }
+
+    /// 1:N fan-out wake pattern with CPU spin between wakes.
+    pub fn futex_fan_out(fan_out: usize, spin_iters: u64) -> Self {
+        WorkType::FutexFanOut {
+            fan_out,
+            spin_iters,
+        }
+    }
 }
 
 /// Resolve a work type with an optional override.
@@ -298,6 +339,18 @@ pub enum SchedPolicy {
     Fifo(u32),
     /// `SCHED_RR` with the given priority (1-99).
     RoundRobin(u32),
+}
+
+impl SchedPolicy {
+    /// `SCHED_FIFO` with the given priority (1-99).
+    pub fn fifo(priority: u32) -> Self {
+        SchedPolicy::Fifo(priority)
+    }
+
+    /// `SCHED_RR` with the given priority (1-99).
+    pub fn round_robin(priority: u32) -> Self {
+        SchedPolicy::RoundRobin(priority)
+    }
 }
 
 /// Configuration for spawning a group of worker processes.

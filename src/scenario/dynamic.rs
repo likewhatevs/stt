@@ -84,13 +84,13 @@ pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step::with_defs(
             vec![
-                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::Disjoint { index: 0, of: 3 }),
-                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::Disjoint { index: 1, of: 3 }),
+                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 3)),
+                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 3)),
             ],
             HoldSpec::Fixed(ctx.settle + ctx.duration / 3),
         ),
         Step::with_defs(
-            vec![CgroupDef::named("cg_2").with_cpuset(CpusetSpec::Disjoint { index: 2, of: 3 })],
+            vec![CgroupDef::named("cg_2").with_cpuset(CpusetSpec::disjoint(2, 3))],
             HoldSpec::Frac(1.0 / 3.0),
         ),
         Step::new(
@@ -110,10 +110,7 @@ pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_0").workers(8),
                 CgroupDef::named("cg_1")
                     .workers(2)
-                    .work_type(WorkType::Bursty {
-                        burst_ms: 50,
-                        sleep_ms: 100,
-                    }),
+                    .work_type(WorkType::bursty(50, 100)),
             ],
             HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
         ),

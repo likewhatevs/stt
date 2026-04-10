@@ -18,10 +18,7 @@ pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         vec![
             CgroupDef::named("cg_0")
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::CachePressure {
-                    size_kb: 32,
-                    stride: 64,
-                }),
+                .work_type(WorkType::cache_pressure(32, 64)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
@@ -48,19 +45,13 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0")
-                .with_cpuset(CpusetSpec::Llc(0))
+                .with_cpuset(CpusetSpec::llc(0))
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::CacheYield {
-                    size_kb: 32,
-                    stride: 64,
-                }),
+                .work_type(WorkType::cache_yield(32, 64)),
             CgroupDef::named("cg_1")
-                .with_cpuset(CpusetSpec::Llc(1))
+                .with_cpuset(CpusetSpec::llc(1))
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::CacheYield {
-                    size_kb: 32,
-                    stride: 64,
-                }),
+                .work_type(WorkType::cache_yield(32, 64)),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
     )];
@@ -89,10 +80,7 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult>
         vec![
             CgroupDef::named("cg_0")
                 .workers(n_pipe)
-                .work_type(WorkType::CachePipe {
-                    size_kb: 32,
-                    burst_iters: 1024,
-                }),
+                .work_type(WorkType::cache_pipe(32, 1024)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
@@ -122,10 +110,7 @@ pub fn custom_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
         vec![
             CgroupDef::named("cg_0")
                 .workers(n_fanout)
-                .work_type(WorkType::FutexFanOut {
-                    fan_out,
-                    spin_iters: 1024,
-                }),
+                .work_type(WorkType::futex_fan_out(fan_out, 1024)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
