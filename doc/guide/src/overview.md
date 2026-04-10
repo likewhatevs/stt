@@ -22,6 +22,9 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 cargo nextest run --workspace
 ```
 
+Without a `scheduler` attribute, tests run under EEVDF. See
+[Getting Started](getting-started.md) for testing a sched_ext scheduler.
+
 ## Library API
 
 The `stt::prelude` module re-exports the types needed for writing
@@ -73,7 +76,7 @@ for details on BTF resolution and guest memory introspection.
 
 ## BPF verifier analysis
 
-The `verifier_pipeline` test boots a scheduler in a VM and captures
+The `verifier_pipeline` tests boot a scheduler in a VM and capture
 per-program verifier output from the real kernel verifier. The
 default output applies **cycle collapse** to reduce repetitive loop
 unrolling. See [BPF Verifier](running-tests/verifier.md) for details.
