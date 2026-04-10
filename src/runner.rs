@@ -25,7 +25,7 @@ pub struct RunConfig {
     pub scheduler_bin: Option<String>,
     pub scheduler_args: Vec<String>,
     pub parent_cgroup: String,
-    pub duration_s: u64,
+    pub duration: Duration,
     pub workers_per_cgroup: usize,
     pub json: bool,
     pub verbose: bool,
@@ -54,7 +54,7 @@ impl Default for RunConfig {
             scheduler_bin: None,
             scheduler_args: Vec::new(),
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
-            duration_s: 20,
+            duration: Duration::from_secs(20),
             workers_per_cgroup: 4,
             json: false,
             verbose: false,
@@ -207,7 +207,7 @@ impl Runner {
             let ctx = Ctx {
                 cgroups: &cgroups,
                 topo: &self.topo,
-                duration: Duration::from_secs(self.config.duration_s),
+                duration: self.config.duration,
                 workers_per_cgroup: self.config.workers_per_cgroup,
                 sched_pid,
                 settle: self.config.settle,
@@ -884,7 +884,7 @@ mod tests {
         let config = RunConfig {
             scheduler_bin: Some("scx_mitosis".into()),
             scheduler_args: vec!["--verbose".into()],
-            duration_s: 30,
+            duration: Duration::from_secs(30),
             workers_per_cgroup: 8,
             json: true,
             verbose: true,
@@ -898,7 +898,7 @@ mod tests {
         // Verify config fields survived construction.
         assert_eq!(runner.config.scheduler_bin.as_deref(), Some("scx_mitosis"));
         assert_eq!(runner.config.scheduler_args, vec!["--verbose"]);
-        assert_eq!(runner.config.duration_s, 30);
+        assert_eq!(runner.config.duration, Duration::from_secs(30));
         assert_eq!(runner.config.workers_per_cgroup, 8);
         assert!(runner.config.json);
         assert!(runner.config.verbose);
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn run_config_fields_carry_probe_and_repro() {
         let config = RunConfig {
-            duration_s: 5,
+            duration: Duration::from_secs(5),
             workers_per_cgroup: 2,
             repro: true,
             probe_stack: Some("do_enqueue_task,balance_one".into()),
@@ -953,13 +953,13 @@ mod tests {
     fn run_config_debug_shows_field_values() {
         let config = RunConfig {
             scheduler_bin: Some("scx_mitosis".into()),
-            duration_s: 30,
+            duration: Duration::from_secs(30),
             verbose: true,
             ..Default::default()
         };
         let s = format!("{:?}", config);
         assert!(s.contains("scx_mitosis"), "must show scheduler_bin value");
-        assert!(s.contains("30"), "must show duration_s value");
+        assert!(s.contains("30"), "must show duration value");
         assert!(s.contains("4"), "must show workers_per_cgroup value");
     }
 
@@ -969,7 +969,7 @@ mod tests {
             scheduler_bin: Some("scx_mitosis".into()),
             scheduler_args: vec!["--arg".into()],
             parent_cgroup: "/sys/fs/cgroup/stt".into(),
-            duration_s: 10,
+            duration: Duration::from_secs(10),
             workers_per_cgroup: 4,
             json: true,
             verbose: true,
@@ -987,7 +987,7 @@ mod tests {
         let c2 = config.clone();
         assert_eq!(c2.scheduler_bin, config.scheduler_bin);
         assert_eq!(c2.scheduler_args, config.scheduler_args);
-        assert_eq!(c2.duration_s, config.duration_s);
+        assert_eq!(c2.duration, config.duration);
         assert_eq!(c2.workers_per_cgroup, config.workers_per_cgroup);
         assert_eq!(c2.json, config.json);
         assert_eq!(c2.verbose, config.verbose);
