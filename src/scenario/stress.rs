@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// One cgroup per CPU, each with a single pinned worker. Stresses
+/// the scheduler with up to 64 cgroups on disjoint single-CPU cpusets.
 pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
     fn per_cpu_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
         let all = ctx.topo.all_cpus();
@@ -31,6 +33,8 @@ pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
+/// Exhaust cgroup slots with empty cpuset-pinned cgroups, remove half,
+/// then create replacement cgroups with workers to test slot reuse.
 pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
     fn reuse_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
         let all = ctx.topo.all_cpus();

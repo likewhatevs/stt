@@ -59,28 +59,43 @@ pub struct AssertResult {
 /// Per-cgroup statistics from worker telemetry.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CgroupStats {
+    /// Number of workers in this cgroup.
     pub num_workers: usize,
+    /// Distinct CPUs used across all workers in this cgroup.
     pub num_cpus: usize,
+    /// Mean off-CPU percentage across workers (off_cpu_ns / wall_time_ns * 100).
     pub avg_off_cpu_pct: f64,
+    /// Minimum off-CPU percentage across workers.
     pub min_off_cpu_pct: f64,
+    /// Maximum off-CPU percentage across workers.
     pub max_off_cpu_pct: f64,
+    /// max_off_cpu_pct - min_off_cpu_pct. Measures scheduling fairness within the cgroup.
     pub spread: f64,
+    /// Longest scheduling gap across all workers (ms).
     pub max_gap_ms: u64,
+    /// CPU where the longest scheduling gap occurred.
     pub max_gap_cpu: usize,
+    /// Sum of CPU migration counts across all workers.
     pub total_migrations: u64,
     /// Migrations per iteration (total_migrations / total_iterations).
     #[serde(default)]
     pub migration_ratio: f64,
+    /// 99th percentile wake latency across all workers (microseconds).
     #[serde(default)]
     pub p99_wake_latency_us: f64,
+    /// Median wake latency across all workers (microseconds).
     #[serde(default)]
     pub median_wake_latency_us: f64,
+    /// Coefficient of variation (stddev / mean) of wake latencies.
     #[serde(default)]
     pub wake_latency_cv: f64,
+    /// Sum of iteration counts across all workers.
     #[serde(default)]
     pub total_iterations: u64,
+    /// Mean schedstat run delay across workers (microseconds).
     #[serde(default)]
     pub mean_run_delay_us: f64,
+    /// Worst schedstat run delay across workers (microseconds).
     #[serde(default)]
     pub worst_run_delay_us: f64,
     /// Extensible metrics for the generic comparison pipeline.
@@ -91,28 +106,39 @@ pub struct CgroupStats {
 /// Aggregated statistics across all cgroups in a scenario.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScenarioStats {
+    /// Per-cgroup stats, one entry per cgroup.
     pub cgroups: Vec<CgroupStats>,
+    /// Sum of workers across all cgroups.
     pub total_workers: usize,
+    /// Sum of per-cgroup distinct CPU counts (not deduplicated across cgroups).
     pub total_cpus: usize,
+    /// Sum of migration counts across all cgroups.
     pub total_migrations: u64,
     /// Worst spread across any cgroup.
     pub worst_spread: f64,
     /// Worst gap across any cgroup (ms).
     pub worst_gap_ms: u64,
+    /// CPU where the worst gap occurred across all cgroups.
     pub worst_gap_cpu: usize,
     /// Worst migration ratio across any cgroup.
     #[serde(default)]
     pub worst_migration_ratio: f64,
+    /// Worst p99 wake latency across all cgroups (microseconds).
     #[serde(default)]
     pub p99_wake_latency_us: f64,
+    /// Worst median wake latency across all cgroups (microseconds).
     #[serde(default)]
     pub median_wake_latency_us: f64,
+    /// Worst wake latency coefficient of variation across all cgroups.
     #[serde(default)]
     pub wake_latency_cv: f64,
+    /// Sum of iteration counts across all cgroups.
     #[serde(default)]
     pub total_iterations: u64,
+    /// Worst mean schedstat run delay across all cgroups (microseconds).
     #[serde(default)]
     pub mean_run_delay_us: f64,
+    /// Worst schedstat run delay across all cgroups (microseconds).
     #[serde(default)]
     pub worst_run_delay_us: f64,
     /// Extensible metrics for the generic comparison pipeline.

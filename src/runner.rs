@@ -463,7 +463,7 @@ impl Runner {
 }
 
 /// RAII handle to a running scheduler process.
-pub struct SchedulerProcess {
+pub(crate) struct SchedulerProcess {
     child: Child,
     stderr_path: std::path::PathBuf,
 }

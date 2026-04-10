@@ -176,6 +176,7 @@ pub mod flags {
 
     pub const ALL: &[&str] = &[LLC, BORROW, STEAL, REBAL, REJECT_PIN, NO_CTRL];
 
+    /// Look up a canonical flag name by its short name string.
     pub fn from_short_name(s: &str) -> Option<&'static str> {
         ALL.iter().find(|&&f| f == s).copied()
     }

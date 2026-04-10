@@ -5,3 +5,4 @@ doc/guide/book/
 *.swp
 *.swo
 *~
+.envrc

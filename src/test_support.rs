@@ -146,15 +146,10 @@ pub fn ktstr_test_early_dispatch() {
     }
 }
 
-/// Returns true when running as PID 1 (the binary is `/init` in a VM).
-pub fn is_pid1() -> bool {
-    vmm::rust_init::is_pid1()
-}
-
 /// Guest init entry point. Called when running as PID 1 (the binary is
 /// `/init` in the VM). Handles the full init lifecycle: mounts,
 /// scheduler start, test dispatch, cleanup, and reboot. Never returns.
-pub fn ktstr_guest_init() -> ! {
+pub(crate) fn ktstr_guest_init() -> ! {
     vmm::rust_init::ktstr_guest_init()
 }
 
@@ -598,7 +593,7 @@ fn validate_entry_flags(entry: &KtstrTestEntry) {
 }
 
 /// Optional topology override for `run_ktstr_test`.
-pub struct TopoOverride {
+pub(crate) struct TopoOverride {
     pub sockets: u32,
     pub cores: u32,
     pub threads: u32,
@@ -607,7 +602,7 @@ pub struct TopoOverride {
 
 /// Parse a topology string in "NsNcNt" format (e.g. "2s4c2t").
 /// Returns None if the string doesn't match the expected format.
-pub fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
+pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
     let s_pos = s.find('s')?;
     let c_pos = s.find('c')?;
     let t_pos = s.find('t')?;
@@ -652,17 +647,10 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     run_ktstr_test_inner(entry, None, &[])
 }
 
-/// Like `run_ktstr_test` but with an explicit topology override.
-pub fn run_ktstr_test_with_topo(
-    entry: &KtstrTestEntry,
-    topo: &TopoOverride,
-) -> Result<AssertResult> {
-    run_ktstr_test_inner(entry, Some(topo), &[])
-}
-
-/// Like `run_ktstr_test_with_topo` but with active flags that map to
+/// Like `run_ktstr_test` but with an explicit topology override and
+/// active flags that map to
 /// scheduler CLI args via `Scheduler::flag_args()`.
-pub fn run_ktstr_test_with_topo_and_flags(
+pub(crate) fn run_ktstr_test_with_topo_and_flags(
     entry: &KtstrTestEntry,
     topo: &TopoOverride,
     active_flags: &[String],
@@ -977,7 +965,7 @@ fn run_gauntlet_test(rest: &str) -> i32 {
 
 /// Run sidecar collection and stats summary. Called after test
 /// execution completes.
-pub fn collect_and_print_sidecar_stats() {
+pub(crate) fn collect_and_print_sidecar_stats() {
     if let Ok(dir) = std::env::var("KTSTR_SIDECAR_DIR") {
         let sidecars = collect_sidecars(std::path::Path::new(&dir));
         let rows: Vec<_> = sidecars.iter().map(crate::stats::sidecar_to_row).collect();

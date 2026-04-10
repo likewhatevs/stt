@@ -1,18 +1,26 @@
 [workspace]
 members = [".", "ktstr-macros", "scx-ktstr"]
 
-[package]
-name = "ktstr"
-version = "0.1.0"
+[workspace.package]
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-2.0-only"
 repository = "https://github.com/likewhatevs/ktstr"
+
+[package]
+name = "ktstr"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Test harness for Linux process schedulers"
 readme = "README.md"
 keywords = ["sched_ext", "scheduler", "testing", "bpf", "linux"]
 categories = ["development-tools::testing"]
 publish = false
+documentation = "https://likewhatevs.github.io/ktstr/api/ktstr/"
+exclude = [".build-cache/", "doc/guide/book/", ".github/", ".githooks/", ".config/"]
 
 [dependencies]
 anyhow = "1"

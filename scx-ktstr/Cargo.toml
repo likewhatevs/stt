@@ -1,10 +1,10 @@
 [package]
 name = "scx-ktstr"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.88"
-license = "GPL-2.0-only"
-repository = "https://github.com/likewhatevs/ktstr"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Minimal BPF scheduler for ktstr integration tests"
 keywords = ["sched_ext", "scheduler", "bpf"]
 categories = ["development-tools::testing"]
@@ -13,7 +13,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 ctrlc = "3"
-libbpf-rs = "=0.26.1"
+libbpf-rs = "0.26"
 scx_utils = "1.1.0"
 
 [build-dependencies]

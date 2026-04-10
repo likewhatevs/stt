@@ -1,10 +1,10 @@
 [package]
 name = "ktstr-macros"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.88"
-license = "GPL-2.0-only"
-repository = "https://github.com/likewhatevs/ktstr"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Proc macro for ktstr #[ktstr_test] attribute"
 keywords = ["scheduler", "testing", "proc-macro"]
 categories = ["development-tools::testing"]

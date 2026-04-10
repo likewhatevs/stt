@@ -46,6 +46,7 @@ macro_rules! custom {
     };
 }
 
+/// Returns all registered scenarios: data-driven and custom.
 pub fn all_scenarios() -> Vec<Scenario> {
     use super::affinity::*;
     use super::basic::*;

@@ -188,7 +188,11 @@ pub(crate) fn read_kmsg() -> String {
 }
 pub mod assert;
 pub(crate) mod budget;
+#[cfg(feature = "cli")]
 pub mod cli;
+#[cfg(not(feature = "cli"))]
+#[allow(dead_code)]
+pub(crate) mod cli;
 #[allow(dead_code)]
 pub(crate) mod monitor;
 #[allow(dead_code)]
@@ -243,7 +247,8 @@ pub mod prelude {
     pub use crate::ktstr_test;
     pub use crate::scenario::flags::FlagDecl;
     pub use crate::scenario::ops::{
-        CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_defs, execute_steps, execute_steps_with,
+        CgroupDef, CpusetSpec, HoldSpec, Op, Setup, Step, execute_defs, execute_steps,
+        execute_steps_with,
     };
     pub use crate::scenario::scenarios;
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
