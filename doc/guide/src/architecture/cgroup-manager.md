@@ -48,7 +48,10 @@ which inherits the parent's cpuset.
 
 **`move_tasks(name, tids)`** -- moves all PIDs from a slice into the
 child cgroup. Tolerates ESRCH (task exited between listing and
-migration) with a warning. Propagates all other errors immediately.
+migration) with a warning. Retries EBUSY up to 3 times with 100ms
+backoff for transient rejections from sched_ext BPF
+`cgroup_prep_move` callbacks. Propagates EBUSY after retries
+exhausted. Propagates all other errors immediately.
 
 **`drain_tasks(name)`** -- moves all tasks from a child cgroup to the
 cgroup filesystem root (`/sys/fs/cgroup`) by reading `cgroup.procs`
