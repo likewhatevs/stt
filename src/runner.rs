@@ -38,10 +38,10 @@ pub struct RunConfig {
     pub kernel_dir: Option<String>,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
-    /// Sleep after scheduler process start to let it initialize (ms).
-    pub scheduler_startup_ms: u64,
-    /// Sleep after cgroup cleanup before next scenario (ms).
-    pub cleanup_ms: u64,
+    /// Sleep after scheduler process start to let it initialize.
+    pub scheduler_startup: Duration,
+    /// Sleep after cgroup cleanup before next scenario.
+    pub cleanup: Duration,
     /// Override work_type for all swappable CgroupDefs and steady-state cgroups.
     pub work_type_override: Option<crate::workload::WorkType>,
     /// Caller-level assertion overrides merged onto `Assert::default_checks()`.
@@ -64,8 +64,8 @@ impl Default for RunConfig {
             auto_repro: false,
             kernel_dir: None,
             settle: Duration::from_millis(500),
-            scheduler_startup_ms: 2000,
-            cleanup_ms: 200,
+            scheduler_startup: Duration::from_millis(2000),
+            cleanup: Duration::from_millis(200),
             work_type_override: None,
             assert: crate::assert::Assert::NONE,
         }
@@ -191,7 +191,7 @@ impl Runner {
                     let args = self.config.scheduler_args.clone();
                     tracing::info!(bin = %bin, ?args, "starting scheduler");
                     let mut p = SchedulerProcess::start(bin, &args)?;
-                    std::thread::sleep(Duration::from_millis(self.config.scheduler_startup_ms));
+                    std::thread::sleep(self.config.scheduler_startup);
                     if p.is_dead() {
                         let _ = cgroups.cleanup_all();
                         bail!("scheduler exited immediately");
@@ -311,7 +311,7 @@ impl Runner {
             }
 
             let _ = cgroups.cleanup_all();
-            std::thread::sleep(Duration::from_millis(self.config.cleanup_ms));
+            std::thread::sleep(self.config.cleanup);
 
             let r = match res {
                 Ok(mut v) => {
@@ -889,7 +889,7 @@ mod tests {
             json: true,
             verbose: true,
             active_flags: Some(vec![flags::BORROW, flags::LLC]),
-            cleanup_ms: 300,
+            cleanup: Duration::from_millis(300),
             ..Default::default()
         };
         let runner = Runner::new(config, topo).unwrap();
@@ -903,8 +903,8 @@ mod tests {
         assert!(runner.config.json);
         assert!(runner.config.verbose);
         assert_eq!(runner.config.settle, Duration::from_millis(500));
-        assert_eq!(runner.config.scheduler_startup_ms, 2000);
-        assert_eq!(runner.config.cleanup_ms, 300);
+        assert_eq!(runner.config.scheduler_startup, Duration::from_millis(2000));
+        assert_eq!(runner.config.cleanup, Duration::from_millis(300));
         assert_eq!(runner.config.active_flags.as_ref().unwrap().len(), 2);
     }
 
@@ -979,8 +979,8 @@ mod tests {
             auto_repro: true,
             kernel_dir: Some("/path".into()),
             settle: Duration::from_millis(500),
-            scheduler_startup_ms: 2000,
-            cleanup_ms: 100,
+            scheduler_startup: Duration::from_millis(2000),
+            cleanup: Duration::from_millis(100),
             work_type_override: Some(crate::workload::WorkType::CpuSpin),
             assert: crate::assert::Assert::NONE.max_gap_ms(5000),
         };
