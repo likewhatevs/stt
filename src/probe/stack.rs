@@ -6,9 +6,10 @@
 /// `sysvec_*`), sched_ext exit/error machinery (`scx_vexit`,
 /// `scx_exit`, `scx_bpf_error_bstr`, `scx_error_irq*`, etc.),
 /// BPF trampoline functions (`__bpf_prog_enter*`, `__bpf_prog_exit*`),
-/// and stack dump helpers (`dump_stack`, `stack_trace_save`, etc.)
-/// that appear in every sched_ext crash backtrace but carry no
-/// scheduler-specific decision data.
+/// BPF syscall infrastructure (`__sys_bpf`, `__x64_sys_bpf`,
+/// `bpf_prog_test_run_syscall`), and stack dump helpers (`dump_stack`,
+/// `stack_trace_save`, etc.) that appear in every sched_ext crash
+/// backtrace but carry no scheduler-specific decision data.
 pub fn should_skip_probe(name: &str) -> bool {
     matches!(
         name,
@@ -30,6 +31,12 @@ pub fn should_skip_probe(name: &str) -> bool {
             // calls the BPF exit_task callback)
             | "scx_exit"
             | "scx_exit_reason"
+            // BPF syscall infrastructure — appears in every
+            // apply_cell_config crash stack but captures only
+            // generic bpf() syscall args, not scheduler state
+            | "__sys_bpf"
+            | "__x64_sys_bpf"
+            | "bpf_prog_test_run_syscall"
             // stack dump helpers
             | "dump_stack"
             | "dump_stack_lvl"
@@ -519,6 +526,28 @@ mod tests {
         assert!(names.contains(&"balance_one"));
     }
 
+    #[test]
+    fn extract_stack_functions_all_filters_bpf_syscall_infra() {
+        // apply_cell_config crash stack where the entire chain above
+        // the BPF callback is BPF syscall infrastructure.
+        let stack = "\
+            __sys_bpf+0x200/0x2a0\n\
+            __x64_sys_bpf+0x20/0x30\n\
+            do_syscall_64+0x80/0xf0\n\
+            bpf_prog_test_run_syscall+0x100/0x180\n\
+            bpf_prog_abc_mitosis_apply_cell_config+0x50/0x80\n\
+            do_enqueue_task+0x1a0/0x380\n";
+        let fns = extract_stack_functions_all(stack);
+        let names: Vec<&str> = fns.iter().map(|f| f.raw_name.as_str()).collect();
+        assert!(!names.contains(&"__sys_bpf"));
+        assert!(!names.contains(&"__x64_sys_bpf"));
+        assert!(!names.contains(&"do_syscall_64"));
+        assert!(!names.contains(&"bpf_prog_test_run_syscall"));
+        // Scheduler-specific frames kept
+        assert!(names.contains(&"bpf_prog_abc_mitosis_apply_cell_config"));
+        assert!(names.contains(&"do_enqueue_task"));
+    }
+
     // -- load_probe_stack edge cases --
 
     #[test]
@@ -694,6 +723,13 @@ mod tests {
         assert!(should_skip_probe("stack_trace_save"));
         assert!(should_skip_probe("stack_trace_print"));
         assert!(should_skip_probe("show_stack"));
+    }
+
+    #[test]
+    fn should_skip_probe_bpf_syscall_infrastructure() {
+        assert!(should_skip_probe("__sys_bpf"));
+        assert!(should_skip_probe("__x64_sys_bpf"));
+        assert!(should_skip_probe("bpf_prog_test_run_syscall"));
     }
 
     // -- BPF_OP_CALLERS table --

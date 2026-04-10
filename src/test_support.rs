@@ -1378,6 +1378,15 @@ fn run_ktstr_test_inner(
         if !effective_auto_repro {
             return None;
         }
+        // Guest init panicked — the repro VM will panic the same way.
+        // Surface the panic message instead of attempting auto-repro.
+        if output.contains("PANIC:") {
+            return Some(
+                "auto-repro: skipped — guest panicked (repro would panic \
+                 identically). See diagnostics section above."
+                    .to_string(),
+            );
+        }
         let repro = attempt_auto_repro(
             entry,
             &kernel,
@@ -1667,10 +1676,12 @@ fn evaluate_vm_result(
         anyhow::bail!("{msg}");
     }
 
-    let reason = if entry.scheduler.binary.has_active_scheduling() {
-        "scheduler crashed before the test could produce results"
+    let reason = if let Some(panic_msg) = extract_panic_message(output) {
+        format!("guest panicked: {panic_msg}")
+    } else if entry.scheduler.binary.has_active_scheduling() {
+        "scheduler crashed before the test could produce results".to_string()
     } else {
-        "test function produced no output (no test result found)"
+        "test function produced no output (no test result found)".to_string()
     };
     let msg = format!(
         "{}ktstr_test '{}'{} {}{}{}{}{}{}{}",
@@ -2598,6 +2609,20 @@ fn extract_kernel_version(console: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the panic message from guest COM2 output.
+///
+/// Looks for a line containing "PANIC:" (written by the guest panic hook
+/// in `rust_init.rs`). Returns the trimmed text after the "PANIC:" prefix,
+/// or `None` if no panic line is present.
+fn extract_panic_message(output: &str) -> Option<&str> {
+    output.lines().find(|l| l.contains("PANIC:")).map(|l| {
+        l.trim()
+            .strip_prefix("PANIC:")
+            .map(|s| s.trim_start())
+            .unwrap_or(l.trim())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4904,6 +4929,73 @@ mod tests {
             msg.contains("payload started but produced no test result"),
             "both sentinels should indicate payload ran but failed, got: {msg}",
         );
+    }
+
+    // -- guest panic detection tests --
+
+    #[test]
+    fn eval_panic_in_output_says_guest_panicked() {
+        let entry = sched_entry("__eval_panic_detect__");
+        let output = "KTSTR_INIT_STARTED\nPANIC: panicked at src/foo.rs:42: assertion failed";
+        let result = make_vm_result(output, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("guest panicked:"),
+            "PANIC in output should say 'guest panicked:', got: {msg}",
+        );
+        assert!(
+            msg.contains("panicked at src/foo.rs:42: assertion failed"),
+            "should include the panic message, got: {msg}",
+        );
+        assert!(
+            !msg.contains("scheduler crashed"),
+            "should not say 'scheduler crashed' when guest panicked, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_panic_eevdf_says_guest_panicked() {
+        let entry = eevdf_entry("__eval_panic_eevdf__");
+        let output = "PANIC: panicked at src/bar.rs:10: index out of bounds";
+        let result = make_vm_result(output, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err =
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("guest panicked:"),
+            "PANIC with EEVDF should say 'guest panicked:', got: {msg}",
+        );
+        assert!(
+            msg.contains("index out of bounds"),
+            "should include the panic detail, got: {msg}",
+        );
+        assert!(
+            !msg.contains("test function produced no output"),
+            "should not say 'test function produced no output' when guest panicked, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn extract_panic_message_found() {
+        let output = "noise\nPANIC: panicked at src/main.rs:5: oh no\nmore";
+        assert_eq!(
+            extract_panic_message(output),
+            Some("panicked at src/main.rs:5: oh no"),
+        );
+    }
+
+    #[test]
+    fn extract_panic_message_absent() {
+        assert!(extract_panic_message("no panic here").is_none());
+    }
+
+    #[test]
+    fn extract_panic_message_empty() {
+        assert!(extract_panic_message("").is_none());
     }
 
     // -- format_verifier_stats tests --

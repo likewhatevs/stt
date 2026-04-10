@@ -43,8 +43,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("PANIC: {info}\n");
         let _ = fs::write(COM2, &msg);
-        // Fallback to kernel console if COM2 write failed.
+        // Also write to kernel console.
         let _ = fs::write(COM1, &msg);
+        // Flush Rust buffered writers and drain the UART transmit buffer
+        // so the panic text is fully transmitted before reboot.
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe {
+            libc::tcdrain(1); // COM2 (stdout after redirect)
+            libc::tcdrain(2); // COM2 (stderr after redirect)
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
         force_reboot();
     }));
 
