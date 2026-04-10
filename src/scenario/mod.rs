@@ -6,7 +6,7 @@
 //! - [`CpusetMode`] -- how to partition CPUs across cgroups
 //! - [`Action`] -- steady-state or custom scenario logic
 //! - [`CgroupWork`] -- per-cgroup workload definition
-//! - [`AffinityKind`] -- scenario-level affinity intent
+//! - [`AffinityKind`](crate::workload::AffinityKind) -- per-worker affinity intent (re-exported from workload)
 //! - [`CgroupGroup`] -- RAII guard that removes cgroups on drop
 //! - [`FlagProfile`] -- a set of active flags for a run
 //! - [`flags::FlagDecl`] -- typed flag declaration with dependencies
@@ -201,6 +201,10 @@ impl FlagProfile {
     }
 }
 
+// Re-export AffinityKind from workload so existing `use super::*` in
+// submodules (catalog.rs, affinity.rs, etc.) can find it.
+pub use crate::workload::AffinityKind;
+
 /// Look up flag dependencies via FlagDecl.requires.
 fn flag_requires(flag: &str) -> Vec<&'static str> {
     flags::decl_by_name(flag)
@@ -296,25 +300,6 @@ pub struct CgroupWork {
     pub policy: SchedPolicy,
     /// How to set worker CPU affinity.
     pub affinity: AffinityKind,
-}
-
-/// Scenario-level affinity intent.
-///
-/// Resolved to a concrete [`AffinityMode`] at runtime based on the
-/// topology and cpuset assignments.
-#[derive(Clone, Debug)]
-pub enum AffinityKind {
-    /// No affinity constraint -- inherit from parent cgroup.
-    Inherit,
-    /// Pin to a random subset of the cgroup's cpuset, or all CPUs if no
-    /// cpuset is configured.
-    RandomSubset,
-    /// Pin to the CPUs in the worker's LLC.
-    LlcAligned,
-    /// Pin to all CPUs (crosses cgroup boundaries).
-    CrossCgroup,
-    /// Pin to a single CPU.
-    SingleCpu,
 }
 
 impl Default for CgroupWork {
@@ -664,66 +649,86 @@ fn resolve_cpusets(
     }
 }
 
+/// Resolve an [`AffinityKind`] to a concrete [`AffinityMode`] for workers
+/// in a cgroup with the given effective cpuset.
+///
+/// When a cpuset is active, affinity masks are intersected with it so the
+/// effective `sched_setaffinity` mask matches what the kernel will enforce.
+/// Without a cpuset, the full topology is used.
+pub fn resolve_affinity_for_cgroup(
+    kind: &AffinityKind,
+    cpuset: Option<&BTreeSet<usize>>,
+    topo: &TestTopology,
+) -> AffinityMode {
+    match kind {
+        AffinityKind::Inherit => AffinityMode::None,
+        AffinityKind::RandomSubset => {
+            let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
+            let count = (pool.len() / 2).max(1);
+            AffinityMode::Random { from: pool, count }
+        }
+        AffinityKind::LlcAligned => {
+            let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
+            // Find the LLC that has the most overlap with the cpuset.
+            let mut best_llc = topo.llc_aligned_cpuset(0);
+            let mut best_overlap = best_llc.intersection(&pool).count();
+            for idx in 1..topo.num_llcs() {
+                let llc = topo.llc_aligned_cpuset(idx);
+                let overlap = llc.intersection(&pool).count();
+                if overlap > best_overlap {
+                    best_llc = llc;
+                    best_overlap = overlap;
+                }
+            }
+            // Intersect with cpuset so effective affinity matches kernel behavior.
+            let effective: BTreeSet<usize> = best_llc.intersection(&pool).copied().collect();
+            if effective.is_empty() {
+                // All LLC CPUs outside cpuset -- fall back to inheriting cpuset.
+                AffinityMode::None
+            } else {
+                AffinityMode::Fixed(effective)
+            }
+        }
+        AffinityKind::CrossCgroup => {
+            // When a cpuset is active, crossing cgroup boundaries is the intent,
+            // but the kernel will intersect. Use all CPUs -- the kernel enforces
+            // the cpuset constraint.
+            AffinityMode::Fixed(topo.all_cpuset())
+        }
+        AffinityKind::SingleCpu => {
+            let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
+            if let Some(&cpu) = pool.iter().next() {
+                AffinityMode::SingleCpu(cpu)
+            } else {
+                AffinityMode::None
+            }
+        }
+        AffinityKind::Exact(cpus) => {
+            if let Some(cs) = cpuset {
+                let effective: BTreeSet<usize> = cpus.intersection(cs).copied().collect();
+                if effective.is_empty() {
+                    AffinityMode::None
+                } else {
+                    AffinityMode::Fixed(effective)
+                }
+            } else {
+                AffinityMode::Fixed(cpus.clone())
+            }
+        }
+    }
+}
+
+/// Backward-compatible wrapper: resolves AffinityKind using a cgroup index
+/// into an array of cpusets. Used by [`run_scenario`] for data-driven
+/// [`Scenario`] definitions.
 fn resolve_affinity_kind(
     kind: &AffinityKind,
     cpusets: Option<&[BTreeSet<usize>]>,
     cgroup_idx: usize,
     topo: &TestTopology,
 ) -> AffinityMode {
-    let cgroup_cpuset = cpusets.map(|cs| &cs[cgroup_idx]);
-    let mode = match kind {
-        AffinityKind::Inherit => return AffinityMode::None,
-        AffinityKind::RandomSubset => {
-            let pool = cpusets
-                .map(|cs| cs[cgroup_idx].clone())
-                .unwrap_or_else(|| topo.all_cpuset());
-            let count = (pool.len() / 2).max(1);
-            return AffinityMode::Random { from: pool, count };
-        }
-        AffinityKind::LlcAligned => {
-            let idx = cgroup_idx % topo.num_llcs();
-            AffinityMode::Fixed(topo.llc_aligned_cpuset(idx))
-        }
-        AffinityKind::CrossCgroup => AffinityMode::Fixed(topo.all_cpuset()),
-        AffinityKind::SingleCpu => {
-            let cpu = topo.all_cpus()[cgroup_idx % topo.total_cpus()];
-            AffinityMode::SingleCpu(cpu)
-        }
-    };
-
-    // Warn when the resolved affinity extends beyond the cgroup's cpuset.
-    // The kernel silently intersects sched_setaffinity with cpuset, so
-    // effective affinity will differ from what was requested.
-    if let Some(cpuset) = cgroup_cpuset {
-        let affinity_cpus = match &mode {
-            AffinityMode::Fixed(cpus) => cpus,
-            AffinityMode::SingleCpu(cpu) => {
-                if !cpuset.contains(cpu) {
-                    tracing::warn!(
-                        cgroup_idx,
-                        cpu,
-                        ?cpuset,
-                        affinity_kind = ?kind,
-                        "affinity cpu not in cgroup cpuset; kernel will intersect",
-                    );
-                }
-                return mode;
-            }
-            _ => return mode,
-        };
-        if !affinity_cpus.is_subset(cpuset) {
-            let outside: BTreeSet<usize> = affinity_cpus.difference(cpuset).copied().collect();
-            tracing::warn!(
-                cgroup_idx,
-                ?outside,
-                ?cpuset,
-                affinity_kind = ?kind,
-                "affinity set extends beyond cgroup cpuset; kernel will intersect",
-            );
-        }
-    }
-
-    mode
+    let cpuset = cpusets.map(|cs| &cs[cgroup_idx]);
+    resolve_affinity_for_cgroup(kind, cpuset, topo)
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,7 +1026,23 @@ mod tests {
     #[test]
     fn resolve_affinity_llc_aligned() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_kind(&AffinityKind::LlcAligned, None, 1, &t) {
+        // No cpuset: both LLCs cover the full pool equally. LLC 0
+        // is found first with max overlap, so result is LLC 0 CPUs.
+        match resolve_affinity_kind(&AffinityKind::LlcAligned, None, 0, &t) {
+            AffinityMode::Fixed(cpus) => assert_eq!(cpus, [0, 1, 2, 3].into_iter().collect()),
+            other => panic!("expected Fixed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_affinity_llc_aligned_with_cpuset() {
+        let t = crate::topology::TestTopology::synthetic(8, 2);
+        // Cpuset restricted to LLC 1 CPUs: LlcAligned picks LLC 1.
+        let cpusets: Vec<BTreeSet<usize>> = vec![
+            [0, 1, 2, 3].into_iter().collect(),
+            [4, 5, 6, 7].into_iter().collect(),
+        ];
+        match resolve_affinity_kind(&AffinityKind::LlcAligned, Some(&cpusets), 1, &t) {
             AffinityMode::Fixed(cpus) => assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect()),
             other => panic!("expected Fixed, got {:?}", other),
         }
@@ -1391,22 +1412,26 @@ mod tests {
     // -- resolve_affinity_kind edge cases --
 
     #[test]
-    fn resolve_affinity_single_cpu_wraps() {
+    fn resolve_affinity_single_cpu_with_cpuset() {
         let t = crate::topology::TestTopology::synthetic(4, 1);
-        // cgroup_idx=5 with 4 CPUs should wrap via modulo
-        match resolve_affinity_kind(&AffinityKind::SingleCpu, None, 5, &t) {
-            AffinityMode::SingleCpu(c) => assert_eq!(c, 1), // 5 % 4 = 1
+        // Cpuset restricts to CPUs {2,3}: SingleCpu picks first in cpuset.
+        let cpusets: Vec<BTreeSet<usize>> = vec![[2, 3].into_iter().collect()];
+        match resolve_affinity_kind(&AffinityKind::SingleCpu, Some(&cpusets), 0, &t) {
+            AffinityMode::SingleCpu(c) => assert_eq!(c, 2),
             other => panic!("expected SingleCpu, got {:?}", other),
         }
     }
 
     #[test]
-    fn resolve_affinity_llc_aligned_wraps() {
+    fn resolve_affinity_llc_aligned_picks_best_overlap() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        // cgroup_idx=3 with 2 LLCs should wrap via modulo
-        match resolve_affinity_kind(&AffinityKind::LlcAligned, None, 3, &t) {
+        // Cpuset spans both LLCs but has more CPUs in LLC 1.
+        // LLC 0 = {0,1,2,3}, LLC 1 = {4,5,6,7}.
+        // Cpuset = {3, 4, 5, 6, 7}: LLC 1 has 4 CPUs in cpuset, LLC 0 has 1.
+        let cpusets: Vec<BTreeSet<usize>> = vec![[3, 4, 5, 6, 7].into_iter().collect()];
+        match resolve_affinity_kind(&AffinityKind::LlcAligned, Some(&cpusets), 0, &t) {
             AffinityMode::Fixed(cpus) => {
-                // 3 % 2 = 1 -> LLC 1
+                // LLC 1 has best overlap; result is intersection {4,5,6,7}.
                 assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect());
             }
             other => panic!("expected Fixed, got {:?}", other),

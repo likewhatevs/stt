@@ -195,6 +195,13 @@ impl CgroupDef {
         self
     }
 
+    /// Set the per-worker affinity (backward-compat sugar for single Work).
+    pub fn affinity(mut self, a: crate::workload::AffinityKind) -> Self {
+        self.ensure_default_work();
+        self.works[0].affinity = a;
+        self
+    }
+
     /// When true, the gauntlet work_type override replaces each Work's work type.
     pub fn swappable(mut self, swappable: bool) -> Self {
         self.swappable = swappable;
@@ -761,8 +768,6 @@ fn build_stimulus(
 /// When `works` is empty, a single default Work is used (CpuSpin, Normal,
 /// ctx.workers_per_cgroup workers).
 fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Result<()> {
-    use crate::workload::AffinityMode;
-
     let default_work = [Work::default()];
     for def in defs {
         state.cgroups.add_cgroup_no_cpuset(&def.name)?;
@@ -779,6 +784,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
         } else {
             &def.works
         };
+        let cgroup_cpuset = state.cpusets.get(def.name.as_ref());
         for work in effective_works {
             let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
             let effective_work_type = crate::workload::resolve_work_type(
@@ -787,9 +793,11 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
                 def.swappable,
                 n,
             );
+            let affinity =
+                super::resolve_affinity_for_cgroup(&work.affinity, cgroup_cpuset, ctx.topo);
             let wl = WorkloadConfig {
                 num_workers: n,
-                affinity: AffinityMode::None,
+                affinity,
                 work_type: effective_work_type,
                 sched_policy: work.sched_policy,
             };
@@ -842,9 +850,12 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
             }
             Op::Spawn { cgroup, work } => {
                 let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
+                let cgroup_cpuset = state.cpusets.get(cgroup.as_ref());
+                let affinity =
+                    super::resolve_affinity_for_cgroup(&work.affinity, cgroup_cpuset, ctx.topo);
                 let wl = WorkloadConfig {
                     num_workers: n,
-                    affinity: crate::workload::AffinityMode::None,
+                    affinity,
                     work_type: work.work_type.clone(),
                     sched_policy: work.sched_policy,
                 };

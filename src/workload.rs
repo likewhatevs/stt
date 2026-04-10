@@ -6,6 +6,7 @@
 //! - [`WorkloadConfig`] -- spawn configuration (count, affinity, work type, policy)
 //! - [`WorkloadHandle`] -- RAII handle to spawned workers
 //! - [`WorkerReport`] -- per-worker telemetry collected after stop
+//! - [`AffinityKind`] -- per-worker affinity intent (Inherit, LlcAligned, Exact, etc.)
 //! - [`AffinityMode`] -- resolved CPU affinity for workers
 //! - [`Work`] -- workload definition for a single group of workers within a cgroup
 //! - [`Phase`] -- a single phase in a [`WorkType::Sequence`] compound work pattern
@@ -20,10 +21,35 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek, Write};
 use std::time::{Duration, Instant};
 
+/// Scenario-level affinity intent for a group of workers.
+///
+/// Resolved to a concrete [`AffinityMode`] at runtime based on the
+/// cgroup's effective cpuset and the VM's topology. When attached to
+/// a [`Work`], determines per-worker `sched_setaffinity` masks.
+///
+/// Resolution uses [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
+#[derive(Clone, Debug, Default)]
+pub enum AffinityKind {
+    /// No affinity constraint -- inherit from parent cgroup.
+    #[default]
+    Inherit,
+    /// Pin to a random subset of the cgroup's cpuset, or all CPUs if no
+    /// cpuset is configured.
+    RandomSubset,
+    /// Pin to the CPUs in the worker's LLC.
+    LlcAligned,
+    /// Pin to all CPUs (crosses cgroup boundaries).
+    CrossCgroup,
+    /// Pin to a single CPU.
+    SingleCpu,
+    /// Pin to an exact set of CPUs.
+    Exact(BTreeSet<usize>),
+}
+
 /// Resolved CPU affinity for a worker process.
 ///
-/// Created from [`AffinityKind`](crate::scenario::AffinityKind) at
-/// runtime based on topology and cpuset assignments.
+/// Created from [`AffinityKind`] at runtime based on topology and
+/// cpuset assignments.
 #[derive(Debug, Clone)]
 pub enum AffinityMode {
     /// No affinity constraint.
@@ -306,6 +332,9 @@ pub struct Work {
     pub sched_policy: SchedPolicy,
     /// Number of workers. `None` means use `Ctx::workers_per_cgroup`.
     pub num_workers: Option<usize>,
+    /// Per-worker affinity intent. Resolved to [`AffinityMode`] at
+    /// runtime via [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
+    pub affinity: AffinityKind,
 }
 
 impl Default for Work {
@@ -314,6 +343,7 @@ impl Default for Work {
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             num_workers: None,
+            affinity: AffinityKind::Inherit,
         }
     }
 }
@@ -334,6 +364,12 @@ impl Work {
     /// Set the Linux scheduling policy.
     pub fn sched_policy(mut self, p: SchedPolicy) -> Self {
         self.sched_policy = p;
+        self
+    }
+
+    /// Set the per-worker affinity intent.
+    pub fn affinity(mut self, a: AffinityKind) -> Self {
+        self.affinity = a;
         self
     }
 }
@@ -537,7 +573,7 @@ impl WorkloadHandle {
         let mut children = Vec::with_capacity(config.num_workers);
 
         for i in 0..config.num_workers {
-            let affinity = resolve_affinity(&config.affinity, i)?;
+            let affinity = resolve_affinity(&config.affinity)?;
 
             // Determine pipe fds for this worker (PipeIo/CachePipe).
             let worker_pipe_fds: Option<(i32, i32)> = if needs_pipes {
@@ -1367,7 +1403,7 @@ extern "C" fn sigusr1_handler(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-fn resolve_affinity(mode: &AffinityMode, _idx: usize) -> Result<Option<BTreeSet<usize>>> {
+fn resolve_affinity(mode: &AffinityMode) -> Result<Option<BTreeSet<usize>>> {
     match mode {
         AffinityMode::None => Ok(None),
         AffinityMode::Fixed(cpus) => Ok(Some(cpus.clone())),
@@ -1500,27 +1536,27 @@ mod tests {
 
     #[test]
     fn resolve_affinity_none() {
-        let r = resolve_affinity(&AffinityMode::None, 0).unwrap();
+        let r = resolve_affinity(&AffinityMode::None).unwrap();
         assert!(r.is_none());
     }
 
     #[test]
     fn resolve_affinity_fixed() {
         let cpus: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
-        let r = resolve_affinity(&AffinityMode::Fixed(cpus.clone()), 0).unwrap();
+        let r = resolve_affinity(&AffinityMode::Fixed(cpus.clone())).unwrap();
         assert_eq!(r, Some(cpus));
     }
 
     #[test]
     fn resolve_affinity_single_cpu() {
-        let r = resolve_affinity(&AffinityMode::SingleCpu(5), 0).unwrap();
+        let r = resolve_affinity(&AffinityMode::SingleCpu(5)).unwrap();
         assert_eq!(r, Some([5].into_iter().collect()));
     }
 
     #[test]
     fn resolve_affinity_random() {
         let from: BTreeSet<usize> = (0..8).collect();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 3 }, 0).unwrap();
+        let r = resolve_affinity(&AffinityMode::Random { from, count: 3 }).unwrap();
         let cpus = r.unwrap();
         assert_eq!(cpus.len(), 3);
         assert!(cpus.iter().all(|c| *c < 8));
@@ -1529,7 +1565,7 @@ mod tests {
     #[test]
     fn resolve_affinity_random_clamps_count() {
         let from: BTreeSet<usize> = [0, 1].into_iter().collect();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 10 }, 0).unwrap();
+        let r = resolve_affinity(&AffinityMode::Random { from, count: 10 }).unwrap();
         assert_eq!(r.unwrap().len(), 2);
     }
 
@@ -2038,7 +2074,7 @@ mod tests {
     #[test]
     fn resolve_affinity_random_single_cpu_pool() {
         let from: BTreeSet<usize> = [7].into_iter().collect();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 1 }, 0).unwrap();
+        let r = resolve_affinity(&AffinityMode::Random { from, count: 1 }).unwrap();
         assert_eq!(r.unwrap(), [7].into_iter().collect());
     }
 
@@ -2351,7 +2387,7 @@ mod tests {
     #[test]
     fn resolve_affinity_random_zero_count() {
         let from: BTreeSet<usize> = (0..4).collect();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 0 }, 0).unwrap();
+        let r = resolve_affinity(&AffinityMode::Random { from, count: 0 }).unwrap();
         // count is clamped to max(1), so should get 1 CPU
         assert_eq!(r.unwrap().len(), 1);
     }
