@@ -207,7 +207,7 @@ pub struct MonitorReport {
 
 /// Tracks consecutive threshold violations and records the worst run.
 ///
-/// Used by `MonitorChecks::evaluate` for imbalance, DSQ depth, fallback
+/// Used by `MonitorThresholds::evaluate` for imbalance, DSQ depth, fallback
 /// rate, keep-last rate, and stall checks. Call `record(true)` on
 /// violation, `record(false)` on pass.
 #[derive(Debug, Clone, Default)]
@@ -3602,8 +3602,9 @@ mod tests {
 
     #[test]
     fn evaluate_suppresses_stall_when_vcpu_preempted() {
-        // vcpu_cpu_time_ns shows < 10ms advancement -> vCPU was
-        // preempted, stall should be suppressed.
+        // vcpu_cpu_time_ns shows < threshold advancement -> vCPU was
+        // preempted, stall should be suppressed. Use explicit threshold
+        // (10ms) to avoid host CONFIG_HZ dependency.
         let t = MonitorThresholds {
             fail_on_stall: true,
             sustained_samples: 1,
@@ -3647,7 +3648,7 @@ mod tests {
                 ],
             },
         ];
-        let summary = MonitorSummary::from_samples(&samples);
+        let summary = MonitorSummary::from_samples_with_threshold(&samples, 10_000_000);
         assert!(
             !summary.stall_detected,
             "preempted vCPU should not flag stall in summary"
@@ -3655,7 +3656,7 @@ mod tests {
         let report = MonitorReport {
             samples,
             summary,
-            ..Default::default()
+            preemption_threshold_ns: 10_000_000,
         };
         let v = t.evaluate(&report);
         assert!(
@@ -3667,8 +3668,10 @@ mod tests {
 
     #[test]
     fn evaluate_catches_stall_when_vcpu_running() {
-        // vcpu_cpu_time_ns shows advancement >= 10ms -> vCPU was running,
-        // stall is real.
+        // vcpu_cpu_time_ns shows advancement >= threshold -> vCPU was
+        // running, stall is real. Use explicit threshold (10ms) to avoid
+        // host CONFIG_HZ dependency (DEFAULT_HZ=250 gives 40ms threshold,
+        // which would mask the 10ms advance).
         let t = MonitorThresholds {
             fail_on_stall: true,
             sustained_samples: 1,
@@ -3712,7 +3715,7 @@ mod tests {
                 ],
             },
         ];
-        let summary = MonitorSummary::from_samples(&samples);
+        let summary = MonitorSummary::from_samples_with_threshold(&samples, 10_000_000);
         assert!(
             summary.stall_detected,
             "running vCPU with stuck clock is a stall"
@@ -3720,7 +3723,7 @@ mod tests {
         let report = MonitorReport {
             samples,
             summary,
-            ..Default::default()
+            preemption_threshold_ns: 10_000_000,
         };
         let v = t.evaluate(&report);
         assert!(!v.passed, "running vCPU stall must fail: {:?}", v.details);
@@ -3789,7 +3792,8 @@ mod tests {
 
     #[test]
     fn from_samples_suppresses_stall_when_vcpu_preempted() {
-        // from_samples should also respect vcpu_cpu_time_ns gating.
+        // from_samples_with_threshold should respect vcpu_cpu_time_ns
+        // gating. Use explicit threshold to avoid host CONFIG_HZ dependency.
         let s1 = MonitorSample {
             prog_stats: None,
             elapsed_ms: 100,
@@ -3826,7 +3830,7 @@ mod tests {
                 },
             ],
         };
-        let summary = MonitorSummary::from_samples(&[s1, s2]);
+        let summary = MonitorSummary::from_samples_with_threshold(&[s1, s2], 10_000_000);
         assert!(
             !summary.stall_detected,
             "preempted vCPU should not flag stall"

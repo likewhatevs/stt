@@ -122,8 +122,8 @@ impl GuestMem {
     /// x86-64: supports 4-level (PGD -> PUD -> PMD -> PTE) and 5-level
     /// (PML5 -> P4D -> PUD -> PMD -> PTE) paging.
     ///
-    /// aarch64: 4-level walk with AArch64 translation table descriptors
-    /// (4KB granule, 48-bit VA). `l5` is ignored.
+    /// aarch64: 3-level walk with AArch64 translation table descriptors
+    /// (64KB granule, 48-bit VA). `l5` is ignored.
     ///
     /// `cr3_pa` is the physical address of the top-level page table.
     /// `l5` selects 5-level paging (x86 LA57); use `resolve_pgtable_l5`
@@ -1587,7 +1587,8 @@ mod tests {
     fn monitor_loop_vcpu_timing_preempted_no_stall() {
         // Sleeping thread: CPU time stays near zero between samples.
         // rq_clock stuck + CPU time not advancing = preempted, suppress stall.
-        // 30ms interval gives margin on loaded hosts.
+        // 30ms interval gives margin on loaded hosts. Explicit threshold
+        // (10ms) avoids host CONFIG_HZ dependency.
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
         let shm_pa = buf.len() as u64;
@@ -1633,6 +1634,7 @@ mod tests {
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
             vcpu_timing: Some(&vcpu_timing),
+            preemption_threshold_ns: 10_000_000,
             ..test_config()
         };
         let (samples, _) = monitor_loop(
@@ -1660,9 +1662,11 @@ mod tests {
     #[test]
     fn monitor_loop_vcpu_timing_running_stall_fires() {
         // Busy-spinning thread: accumulates CPU time every interval.
-        // 30ms interval ensures spinner clears the preemption threshold
-        // (10-40ms depending on CONFIG_HZ) with margin.
-        // rq_clock stuck + CPU time advancing = real stall.
+        // 30ms interval ensures spinner clears the 10ms preemption
+        // threshold with margin.
+        // rq_clock stuck + CPU time advancing = real stall. Explicit
+        // threshold (10ms) avoids host CONFIG_HZ dependency (CONFIG_HZ=250
+        // gives 40ms threshold, which would mask 30ms of spin time).
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
         let shm_pa = buf.len() as u64;
@@ -1708,6 +1712,7 @@ mod tests {
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
             vcpu_timing: Some(&vcpu_timing),
+            preemption_threshold_ns: 10_000_000,
             ..test_config()
         };
         let (samples, _) = monitor_loop(
