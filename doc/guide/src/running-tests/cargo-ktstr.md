@@ -3,18 +3,18 @@
 `cargo ktstr test` automates kernel configuration, building, and test
 execution. It is a cargo plugin that wraps `cargo nextest run`.
 
-## KTSTR_KERNEL
+## --kernel
 
-The `KTSTR_KERNEL` environment variable is **required**. Set it to
-the path of a Linux kernel source tree:
+The `--kernel` flag is **required**. Pass the path to a Linux kernel
+source tree:
 
 ```sh
-export KTSTR_KERNEL=~/linux
+cargo ktstr test --kernel ~/linux
 ```
 
 ## What it does
 
-1. **Config check** -- reads `$KTSTR_KERNEL/.config` for
+1. **Config check** -- reads `<kernel>/.config` for
    `CONFIG_SCHED_CLASS_EXT=y`.
 2. **Auto-configure** -- if the config sentinel is missing, runs
    `make defconfig` (when no `.config` exists), merges `ktstr.kconfig`
@@ -23,17 +23,17 @@ export KTSTR_KERNEL=~/linux
    This always runs; `make` handles the no-op case when the kernel
    is already built.
 4. **Test execution** -- execs `cargo nextest run` with `KTSTR_KERNEL`
-   in the environment.
+   set in the environment for test kernel discovery.
 
 ## Passing nextest arguments
 
 Arguments after `test` are passed through to `cargo nextest run`:
 
 ```sh
-cargo ktstr test                              # run all tests
-cargo ktstr test -- -E 'test(my_test)'        # nextest filter
-cargo ktstr test --workspace                  # all workspace tests
-cargo ktstr test -- --retries 2               # nextest retries
+cargo ktstr test --kernel ~/linux                              # run all tests
+cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'        # nextest filter
+cargo ktstr test --kernel ~/linux --workspace                  # all workspace tests
+cargo ktstr test --kernel ~/linux -- --retries 2               # nextest retries
 ```
 
 ## Install

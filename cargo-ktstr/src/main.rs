@@ -1,4 +1,3 @@
-use std::env;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,12 +31,18 @@ struct Ktstr {
 enum KtstrCommand {
     /// Build the kernel with sched_ext support.
     BuildKernel {
+        /// Path to the kernel source directory.
+        #[arg(long)]
+        kernel: PathBuf,
         /// Run `make mrproper` first for a full reconfigure + rebuild.
         #[arg(long)]
         clean: bool,
     },
     /// Build the kernel (if needed) and run tests via cargo nextest.
     Test {
+        /// Path to the kernel source directory.
+        #[arg(long)]
+        kernel: PathBuf,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -110,43 +115,34 @@ fn make_kernel(kernel_dir: &Path) -> Result<(), String> {
     run_make(kernel_dir, &arg_refs)
 }
 
-/// Resolve KTSTR_KERNEL, configure if needed, and build.
-fn build_kernel(clean: bool) -> Result<PathBuf, String> {
-    let kernel_dir = env::var("KTSTR_KERNEL").map_err(|_| {
-        "KTSTR_KERNEL is not set. Set it to your kernel source directory:\n  \
-         export KTSTR_KERNEL=/path/to/linux"
-            .to_string()
-    })?;
-    let kernel_dir = PathBuf::from(&kernel_dir);
+/// Configure if needed and build the kernel.
+fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     if !kernel_dir.is_dir() {
-        return Err(format!(
-            "KTSTR_KERNEL={}: not a directory",
-            kernel_dir.display()
-        ));
+        return Err(format!("{}: not a directory", kernel_dir.display()));
     }
 
     if clean {
         eprintln!("cargo-ktstr: make mrproper");
-        run_make(&kernel_dir, &["mrproper"])?;
+        run_make(kernel_dir, &["mrproper"])?;
     }
 
-    if !has_sched_ext(&kernel_dir) {
+    if !has_sched_ext(kernel_dir) {
         let (_tmpdir, kconfig) = write_embedded_kconfig()?;
-        configure_kernel(&kernel_dir, &kconfig)?;
+        configure_kernel(kernel_dir, &kconfig)?;
     }
 
-    make_kernel(&kernel_dir)?;
-    Ok(kernel_dir)
+    make_kernel(kernel_dir)?;
+    Ok(())
 }
 
-fn run_test(args: Vec<String>) -> Result<(), String> {
-    let kernel_dir = build_kernel(false)?;
+fn run_test(kernel_dir: &Path, args: Vec<String>) -> Result<(), String> {
+    build_kernel(kernel_dir, false)?;
 
     eprintln!("cargo-ktstr: running tests");
     let err = Command::new("cargo")
         .args(["nextest", "run"])
         .args(&args)
-        .env("KTSTR_KERNEL", &kernel_dir)
+        .env("KTSTR_KERNEL", kernel_dir)
         .exec();
     Err(format!("exec cargo nextest run: {err}"))
 }
@@ -157,8 +153,8 @@ fn main() {
     } = Cargo::parse();
 
     let result = match ktstr.command {
-        KtstrCommand::BuildKernel { clean } => build_kernel(clean).map(|_| ()),
-        KtstrCommand::Test { args } => run_test(args),
+        KtstrCommand::BuildKernel { kernel, clean } => build_kernel(&kernel, clean),
+        KtstrCommand::Test { kernel, args } => run_test(&kernel, args),
     };
 
     if let Err(e) = result {

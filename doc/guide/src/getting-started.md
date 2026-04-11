@@ -137,12 +137,11 @@ is unavailable.
 ### Using cargo-ktstr
 
 `cargo ktstr test` handles kernel configuration, building, and test
-execution in one command. Point `KTSTR_KERNEL` at a Linux source tree:
+execution in one command:
 
 ```sh
-export KTSTR_KERNEL=~/linux
-cargo ktstr test
-cargo ktstr test -- -E 'test(my_test)'   # pass nextest args
+cargo ktstr test --kernel ~/linux
+cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'   # pass nextest args
 ```
 
 See [cargo-ktstr](running-tests/cargo-ktstr.md) for details.
@@ -164,8 +163,8 @@ make -j$(nproc)
 
 ### Automated
 
-`cargo ktstr test` does this automatically when `KTSTR_KERNEL` is set
-and the kernel `.config` is missing or lacks sched_ext support.
+`cargo ktstr test --kernel /path/to/linux` does this automatically
+when the kernel `.config` is missing or lacks sched_ext support.
 
 ## Next steps
 

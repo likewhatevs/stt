@@ -126,13 +126,11 @@ Requires `/dev/kvm`.
 
 ### Dev workflow
 
-Point `KTSTR_KERNEL` at a Linux source tree and let `cargo ktstr`
-handle kernel config, build, and test execution:
+`cargo ktstr` handles kernel config, build, and test execution:
 
 ```sh
-export KTSTR_KERNEL=~/linux
-cargo ktstr test                          # build kernel + run all tests
-cargo ktstr test -- -E 'test(my_test)'    # pass nextest filter
+cargo ktstr test --kernel ~/linux                          # build kernel + run all tests
+cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # pass nextest filter
 ```
 
 ### Host-side CLI
