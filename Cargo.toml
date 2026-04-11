@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ktstr-macros", "scx-ktstr"]
+members = [".", "ktstr-macros", "scx-ktstr", "cargo-ktstr"]
 
 [workspace.package]
 edition = "2024"
