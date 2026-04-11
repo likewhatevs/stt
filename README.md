@@ -5,6 +5,9 @@
 [![guide](https://img.shields.io/badge/docs-guide-blue)](https://likewhatevs.github.io/ktstr/guide/)
 [![api](https://img.shields.io/badge/docs-api-blue)](https://likewhatevs.github.io/ktstr/api/ktstr/)
 
+> **Early stage.** APIs, CLI, and internals are actively evolving.
+> Expect breaking changes between releases.
+
 Test harness for Linux process schedulers, with a focus on
 [sched_ext](https://github.com/sched-ext/scx). Boots kernels in KVM
 VMs with synthetic CPU topologies, runs workloads, and verifies
