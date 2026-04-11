@@ -18,14 +18,27 @@ scheduler.
 - **`#[ktstr_test]`** -- proc macro for integration tests that boot their own VMs.
 - **Auto-repro** -- reruns failures with BPF kprobes on the crash call chain.
 
+## Installation
+
+```sh
+cargo install ktstr --features cli    # host-side test runner
+cargo install cargo-ktstr             # dev workflow plugin (kernel build + nextest)
+cargo install cargo-nextest           # required test runner
+```
+
+`ktstr` is the host-side CLI for running scenarios directly against a
+scheduler (outside VMs). `cargo-ktstr` automates kernel configuration,
+building, and test execution in one command. `scx-ktstr` (the test
+fixture scheduler) is built automatically by the workspace and does
+not need a separate install.
+
 ## Setup
 
-**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang, libelf-dev, pkg-config, bpftool, cargo-nextest.
+**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang, libelf-dev, pkg-config, bpftool.
 
 ```sh
 # Ubuntu/Debian
 sudo apt install clang libelf-dev pkg-config bpftool
-cargo install cargo-nextest
 ```
 
 **Add to your crate**:
@@ -107,6 +120,17 @@ cargo nextest run
 ```
 
 Requires `/dev/kvm`.
+
+### Dev workflow
+
+Point `KTSTR_KERNEL` at a Linux source tree and let `cargo ktstr`
+handle kernel config, build, and test execution:
+
+```sh
+export KTSTR_KERNEL=~/linux
+cargo ktstr test                          # build kernel + run all tests
+cargo ktstr test -- -E 'test(my_test)'    # pass nextest filter
+```
 
 ### Host-side CLI
 

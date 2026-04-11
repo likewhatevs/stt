@@ -8,21 +8,30 @@
 - libelf development headers
 - pkg-config
 - bpftool (generates vmlinux.h from the running kernel's BTF)
-- cargo-nextest (`cargo install cargo-nextest`)
 
 **Ubuntu/Debian:**
 
 ```sh
 sudo apt install clang libelf-dev pkg-config bpftool
-cargo install cargo-nextest
 ```
 
 **Fedora:**
 
 ```sh
 sudo dnf install clang elfutils-libelf-devel pkgconf bpftool
-cargo install cargo-nextest
 ```
+
+## Install tools
+
+```sh
+cargo install cargo-nextest           # required test runner
+cargo install ktstr --features cli    # host-side test runner (optional)
+cargo install cargo-ktstr             # dev workflow plugin (optional)
+```
+
+`cargo-nextest` is the test runner. `ktstr` is the host-side CLI for
+running scenarios outside VMs. `cargo-ktstr` automates kernel
+configuration, building, and test execution.
 
 ## Add the dependency
 
@@ -125,11 +134,25 @@ Requires `/dev/kvm`. See
 [Troubleshooting](troubleshooting.md#devkvm-not-accessible) if KVM
 is unavailable.
 
+### Using cargo-ktstr
+
+`cargo ktstr test` handles kernel configuration, building, and test
+execution in one command. Point `KTSTR_KERNEL` at a Linux source tree:
+
+```sh
+export KTSTR_KERNEL=~/linux
+cargo ktstr test
+cargo ktstr test -- -E 'test(my_test)'   # pass nextest args
+```
+
+See [cargo-ktstr](running-tests/cargo-ktstr.md) for details.
+
 ## Build a kernel
 
 `ktstr.kconfig` in the repo root contains a kernel config fragment
 tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
-To build a kernel from a Linux source tree:
+
+### Manual
 
 ```sh
 cd /path/to/linux
@@ -138,6 +161,11 @@ cat /path/to/ktstr/ktstr.kconfig >> .config
 make olddefconfig
 make -j$(nproc)
 ```
+
+### Automated
+
+`cargo ktstr test` does this automatically when `KTSTR_KERNEL` is set
+and the kernel `.config` is missing or lacks sched_ext support.
 
 ## Next steps
 

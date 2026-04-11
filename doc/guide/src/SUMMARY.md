@@ -10,6 +10,7 @@
   - [Gauntlet](running-tests/gauntlet.md)
   - [Baselines](running-tests/baselines.md)
   - [ktstr](running-tests/ktstr.md)
+  - [cargo-ktstr](running-tests/cargo-ktstr.md)
   - [Auto-Repro](running-tests/auto-repro.md)
   - [BPF Verifier](running-tests/verifier.md)
 - [Core Concepts](concepts.md)
