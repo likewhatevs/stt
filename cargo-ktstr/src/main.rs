@@ -132,7 +132,18 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     }
 
     make_kernel(kernel_dir)?;
+    gen_compile_commands(kernel_dir)?;
     Ok(())
+}
+
+/// Generate compile_commands.json for LSP support.
+///
+/// Runs `make compile_commands.json` which invokes
+/// `scripts/clang-tools/gen_compile_commands.py` over the build
+/// artifacts. Requires a completed kernel build (depends on vmlinux.a).
+fn gen_compile_commands(kernel_dir: &Path) -> Result<(), String> {
+    eprintln!("cargo-ktstr: generating compile_commands.json");
+    run_make(kernel_dir, &["compile_commands.json"])
 }
 
 fn run_test(kernel_dir: &Path, args: Vec<String>) -> Result<(), String> {

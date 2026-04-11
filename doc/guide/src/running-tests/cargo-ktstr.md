@@ -22,7 +22,9 @@ cargo ktstr test --kernel ~/linux
 3. **Kernel build** -- runs `make -j$(nproc) KCFLAGS=-Wno-error`.
    This always runs; `make` handles the no-op case when the kernel
    is already built.
-4. **Test execution** -- execs `cargo nextest run` with `KTSTR_KERNEL`
+4. **compile_commands.json** -- runs `make compile_commands.json` to
+   generate the compilation database for clangd / LSP.
+5. **Test execution** -- execs `cargo nextest run` with `KTSTR_KERNEL`
    set in the environment for test kernel discovery.
 
 ## Passing nextest arguments

@@ -165,6 +165,8 @@ make -j$(nproc)
 
 `cargo ktstr test --kernel /path/to/linux` does this automatically
 when the kernel `.config` is missing or lacks sched_ext support.
+Both `build-kernel` and `test` generate `compile_commands.json` after
+building, so clangd / LSP works out of the box.
 
 ## Next steps
 
