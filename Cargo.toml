@@ -51,7 +51,7 @@ zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 object = { version = "0.39.0", features = ["read"] }
 linkme = "0.3"
-ktstr-macros = { path = "ktstr-macros" }
+ktstr-macros = { version = "0.1.0", path = "ktstr-macros" }
 
 [profile.release]
 lto = "thin"

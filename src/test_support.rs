@@ -4289,7 +4289,7 @@ mod tests {
         assert!(s.contains("exit_code=1"));
         assert!(s.contains("--- diagnostics ---"));
         assert!(s.contains("stage: test stage"));
-        assert!(!s.contains("console (last"));
+        assert!(!s.contains("console ("));
     }
 
     #[test]
@@ -4308,7 +4308,7 @@ mod tests {
         let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
         let console = format!("{}\n", lines.join("\n"));
         let s = format_console_diagnostics(&console, 0, "test");
-        assert!(s.contains("20 lines"));
+        assert!(s.contains("console (20 lines)"));
         assert!(s.contains("boot line 49"));
         assert!(!s.contains("boot line 29"));
         assert!(!s.contains("truncated"));
@@ -4318,7 +4318,7 @@ mod tests {
     fn format_console_diagnostics_short_console() {
         let console = "Linux version 6.14.0\nbooted ok\n";
         let s = format_console_diagnostics(console, 0, "test");
-        assert!(s.contains("2 lines"));
+        assert!(s.contains("console (2 lines)"));
         assert!(s.contains("Linux version 6.14.0"));
         assert!(s.contains("booted ok"));
         assert!(!s.contains("truncated"));
@@ -4328,7 +4328,7 @@ mod tests {
     fn format_console_diagnostics_no_truncation_with_trailing_newline() {
         let console = "line1\nline2\nline3\n";
         let s = format_console_diagnostics(console, 0, "test");
-        assert!(s.contains("3 lines)"));
+        assert!(s.contains("console (3 lines)"));
         assert!(!s.contains("truncated"));
         assert!(!s.contains("[truncated]"));
     }

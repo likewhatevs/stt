@@ -38,6 +38,21 @@ cargo ktstr test --kernel ~/linux --workspace                  # all workspace t
 cargo ktstr test --kernel ~/linux -- --retries 2               # nextest retries
 ```
 
+## build-kernel
+
+`cargo ktstr build-kernel` configures and builds the kernel without
+running tests:
+
+```sh
+cargo ktstr build-kernel --kernel ~/linux
+cargo ktstr build-kernel --kernel ~/linux --clean   # make mrproper first
+```
+
+Steps 1-4 from the `test` subcommand above apply. The `--clean` flag
+runs `make mrproper` before configuring, forcing a full reconfigure
+and rebuild. Both `build-kernel` and `test` generate
+`compile_commands.json` after building.
+
 ## Install
 
 ```sh

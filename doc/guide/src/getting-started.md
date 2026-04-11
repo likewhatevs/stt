@@ -110,12 +110,14 @@ for gauntlet expansion and budget-driven test selection.
 
 Tests require a bootable Linux kernel. ktstr searches (in order):
 
-1. `KTSTR_TEST_KERNEL` environment variable
-2. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
-3. `../linux/arch/<arch>/boot/<image>` (sibling directory)
-4. `/lib/modules/$(uname -r)/vmlinuz` (installed kernel)
-5. `/boot/vmlinuz-$(uname -r)`
-6. `/boot/vmlinuz` (unversioned symlink)
+1. `KTSTR_TEST_KERNEL` environment variable (direct image path)
+2. `KTSTR_KERNEL` directory / `arch/<arch>/boot/<image>`
+3. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
+4. `../linux/arch/<arch>/boot/<image>` (sibling directory)
+5. `/lib/modules/$(uname -r)/build/arch/<arch>/boot/<image>` (installed kernel build tree)
+6. `/lib/modules/$(uname -r)/vmlinuz` (installed kernel)
+7. `/boot/vmlinuz-$(uname -r)`
+8. `/boot/vmlinuz` (unversioned symlink)
 
 On x86_64, the build-tree image is `arch/x86/boot/bzImage`; on
 aarch64, `arch/arm64/boot/Image`.

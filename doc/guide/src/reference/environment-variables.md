@@ -6,10 +6,11 @@ Environment variables that control ktstr behavior.
 
 | Variable | Description | Default |
 |---|---|---|
+| `KTSTR_KERNEL` | Path to a kernel source/build directory. Used at build time for BTF resolution (vmlinux.h generation) and at runtime for kernel image discovery. Set automatically by `cargo ktstr test --kernel`. | `./linux`, `../linux`, or `/lib/modules/$(uname -r)/build` |
 | `KTSTR_TEST_KERNEL` | Path to a bootable kernel image (bzImage). See [Getting Started](../getting-started.md#build-a-kernel) and [Troubleshooting](../troubleshooting.md#no-kernel-found) for search order. | Auto-discovered |
 | `KTSTR_SCHEDULER` | Path to a scheduler binary for `SchedulerSpec::Name`. See [Troubleshooting](../troubleshooting.md#scheduler-not-found) for search order. | Auto-discovered |
 | `KTSTR_BUDGET_SECS` | Time budget in seconds for greedy test selection during `--list`. Must be positive. See [Running Tests](../running-tests.md). | None (all tests listed) |
-| `KTSTR_SIDECAR_DIR` | Directory for per-test result sidecar JSON files. See [Baselines](../running-tests/baselines.md). | None (sidecars disabled) |
+| `KTSTR_SIDECAR_DIR` | Directory for per-test result sidecar JSON files. See [Baselines](../running-tests/baselines.md). | `target/ktstr/{branch}-{hash}/` |
 | `KTSTR_VERBOSE` | Set to `"1"` for verbose VM console output (`earlyprintk`, `loglevel=7`). | None |
 | `RUST_BACKTRACE` | Gates verbose diagnostic output on failure. Also enables verbose VM console output (same as `KTSTR_VERBOSE=1`) when set to `"1"` or `"full"`. Propagated to the guest. | None |
 | `RUST_LOG` | Controls tracing filter for guest-side logging. Propagated to the VM kernel command line and parsed by the guest tracing subscriber. | None |

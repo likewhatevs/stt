@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Cargo plugin for ktstr: kernel build + nextest in one command"
+keywords = ["sched_ext", "scheduler", "testing", "cargo-plugin", "linux"]
+categories = ["development-tools::testing", "development-tools::cargo-plugins"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
