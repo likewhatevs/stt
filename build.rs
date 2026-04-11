@@ -1,7 +1,6 @@
-// NOTE: This build script invokes `sudo bpftool btf dump` to generate
-// vmlinux.h from the running kernel's BTF. Requires CAP_SYS_ADMIN.
-// You will be prompted for your password on first build (results are
-// cached in OUT_DIR for subsequent builds).
+// Generates vmlinux.h via bpftool from the kernel's BTF.
+// Uses $KTSTR_KERNEL/vmlinux if KTSTR_KERNEL is set, otherwise
+// falls back to /sys/kernel/btf/vmlinux (world-readable).
 
 use std::env;
 use std::path::PathBuf;
@@ -12,32 +11,40 @@ use libbpf_cargo::SkeletonBuilder;
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // Generate vmlinux.h from the running kernel's BTF.
+    // Resolve BTF source: $KTSTR_KERNEL/vmlinux or /sys/kernel/btf/vmlinux.
     let vmlinux_h = out_dir.join("vmlinux.h");
     if !vmlinux_h.exists() {
-        println!(
-            "cargo::warning=generating vmlinux.h — sudo bpftool requires CAP_SYS_ADMIN (you may be prompted for your password)"
-        );
-        let output = Command::new("sudo")
-            .args([
-                "bpftool",
-                "btf",
-                "dump",
-                "file",
-                "/sys/kernel/btf/vmlinux",
-                "format",
-                "c",
-            ])
+        let btf_source = if let Ok(kernel_dir) = env::var("KTSTR_KERNEL") {
+            let p = PathBuf::from(&kernel_dir).join("vmlinux");
+            if p.exists() {
+                println!("cargo::warning=generating vmlinux.h from $KTSTR_KERNEL/vmlinux");
+                p.to_string_lossy().into_owned()
+            } else {
+                panic!(
+                    "KTSTR_KERNEL={kernel_dir} but {}/vmlinux not found. \
+                     Build the kernel first.",
+                    kernel_dir,
+                );
+            }
+        } else {
+            println!(
+                "cargo::warning=KTSTR_KERNEL not set, generating vmlinux.h \
+                 from /sys/kernel/btf/vmlinux"
+            );
+            "/sys/kernel/btf/vmlinux".to_string()
+        };
+        let output = Command::new("bpftool")
+            .args(["btf", "dump", "file", &btf_source, "format", "c"])
             .output()
-            .expect("sudo bpftool required to generate vmlinux.h");
+            .expect("bpftool required to generate vmlinux.h");
         assert!(
             output.status.success(),
             "bpftool btf dump failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        // Written by the build process (not sudo), so ownership is correct.
         std::fs::write(&vmlinux_h, &output.stdout).expect("write vmlinux.h");
     }
+    println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
 
     let clang_args = [
         format!("-I{}", out_dir.display()),
