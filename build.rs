@@ -149,21 +149,15 @@ int main(void) {{
     println!("cargo::rerun-if-changed=src/bpf/intf.h");
 
     // Git info for output directory keying.
-    if let Ok(output) = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        && output.status.success()
-    {
-        let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("cargo:rustc-env=KTSTR_GIT_HASH={hash}");
-    }
-    if let Ok(output) = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        && output.status.success()
-    {
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("cargo:rustc-env=KTSTR_GIT_BRANCH={branch}");
+    if let Ok(repo) = gix::discover(".") {
+        if let Ok(id) = repo.head_id() {
+            let full = id.to_string();
+            let short = &full[..full.len().min(7)];
+            println!("cargo:rustc-env=KTSTR_GIT_HASH={short}");
+        }
+        if let Ok(Some(name)) = repo.head_name() {
+            println!("cargo:rustc-env=KTSTR_GIT_BRANCH={}", name.shorten());
+        }
     }
     println!("cargo:rerun-if-changed=.git/HEAD");
 }

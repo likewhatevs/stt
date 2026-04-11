@@ -68,6 +68,7 @@ tempfile = "3"
 
 [build-dependencies]
 cc = "1"
+gix = { version = "0.81", default-features = false, features = ["sha1"] }
 libbpf-cargo = "0.26"
 
 [[bin]]
