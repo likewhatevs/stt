@@ -3,8 +3,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cargo_ktstr::{build_make_args, find_kconfig_from, has_sched_ext};
+use cargo_ktstr::{build_make_args, has_sched_ext};
 use clap::{Parser, Subcommand};
+
+/// ktstr.kconfig embedded at compile time so `cargo install` works.
+const EMBEDDED_KCONFIG: &str = include_str!("../../ktstr.kconfig");
 
 #[derive(Parser)]
 #[command(name = "cargo-ktstr", bin_name = "cargo")]
@@ -35,25 +38,15 @@ enum KtstrCommand {
     },
 }
 
-/// Locate ktstr.kconfig relative to the cargo-ktstr binary.
+/// Write the embedded ktstr.kconfig to a temporary file.
 ///
-/// Walks up from the binary's directory looking for ktstr.kconfig.
-/// Falls back to the current directory.
-fn find_kconfig() -> Option<PathBuf> {
-    // Try relative to the binary location (../../ktstr.kconfig from
-    // target/debug/cargo-ktstr or target/release/cargo-ktstr).
-    if let Ok(exe) = env::current_exe()
-        && let Some(start) = exe.parent()
-        && let Some(found) = find_kconfig_from(start)
-    {
-        return Some(found);
-    }
-    // Fallback: current working directory.
-    let cwd = Path::new("ktstr.kconfig");
-    if cwd.exists() {
-        return Some(cwd.to_path_buf());
-    }
-    None
+/// Returns the path to the temp file. The caller must keep the
+/// `TempDir` alive until merge_config.sh finishes.
+fn write_embedded_kconfig() -> Result<(tempfile::TempDir, PathBuf), String> {
+    let dir = tempfile::TempDir::new().map_err(|e| format!("create temp dir: {e}"))?;
+    let path = dir.path().join("ktstr.kconfig");
+    std::fs::write(&path, EMBEDDED_KCONFIG).map_err(|e| format!("write embedded kconfig: {e}"))?;
+    Ok((dir, path))
 }
 
 /// Configure the kernel with sched_ext support.
@@ -127,11 +120,7 @@ fn run_test(args: Vec<String>) -> Result<(), String> {
 
     // Configure kernel if sched_ext is not enabled.
     if !has_sched_ext(&kernel_dir) {
-        let kconfig = find_kconfig().ok_or(
-            "ktstr.kconfig not found. Run from the ktstr workspace root \
-             or install cargo-ktstr from the workspace."
-                .to_string(),
-        )?;
+        let (_tmpdir, kconfig) = write_embedded_kconfig()?;
         configure_kernel(&kernel_dir, &kconfig)?;
     }
 
