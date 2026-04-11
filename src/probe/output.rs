@@ -24,6 +24,43 @@ fn get_nr_cpus() -> Option<u32> {
     if n > 0 { Some(n as u32) } else { None }
 }
 
+/// Format cpumask words into a display string like `0xf(0-3)` or
+/// `0x0000000000000001_00000000000000ff(0-7,64)`. Masks raw words to
+/// `nr_cpus` to avoid showing garbage bits from uninitialized memory.
+fn format_cpumask_display(cpumask_words: &[u64; 4], nr_cpus: Option<u32>) -> String {
+    let merged_cpumask = super::decode::decode_cpumask_multi(cpumask_words, nr_cpus);
+
+    let display_words = if let Some(nr) = nr_cpus {
+        let mut masked = [0u64; 4];
+        for (i, &w) in cpumask_words.iter().enumerate() {
+            let base = i as u32 * 64;
+            if base >= nr {
+                break;
+            }
+            let valid_bits = nr - base;
+            if valid_bits >= 64 {
+                masked[i] = w;
+            } else {
+                masked[i] = w & ((1u64 << valid_bits) - 1);
+            }
+        }
+        masked
+    } else {
+        *cpumask_words
+    };
+    if display_words[1..].iter().any(|&w| w != 0) {
+        let hex_parts: Vec<String> = display_words
+            .iter()
+            .rev()
+            .skip_while(|&&w| w == 0)
+            .map(|w| format!("{w:016x}"))
+            .collect();
+        format!("0x{}({merged_cpumask})", hex_parts.join("_"))
+    } else {
+        format!("0x{:x}({merged_cpumask})", display_words[0])
+    }
+}
+
 // Used by test_support.rs; #[allow] suppresses false positive from binary crate.
 #[allow(dead_code)]
 pub(crate) fn extract_section(text: &str, start: &str, end: &str) -> String {
@@ -319,39 +356,7 @@ fn format_probe_events_inner(
                 }
             }
             let nr_cpus = get_nr_cpus();
-            let merged_cpumask = super::decode::decode_cpumask_multi(&cpumask_words, nr_cpus);
-
-            // Mask raw words to nr_cpus before hex display so garbage
-            // bits from uninitialized kernel memory are not shown.
-            let display_words = if let Some(nr) = nr_cpus {
-                let mut masked = [0u64; 4];
-                for (i, &w) in cpumask_words.iter().enumerate() {
-                    let base = i as u32 * 64;
-                    if base >= nr {
-                        break;
-                    }
-                    let valid_bits = nr - base;
-                    if valid_bits >= 64 {
-                        masked[i] = w;
-                    } else {
-                        masked[i] = w & ((1u64 << valid_bits) - 1);
-                    }
-                }
-                masked
-            } else {
-                cpumask_words
-            };
-            let merged_cpumask_str = if display_words[1..].iter().any(|&w| w != 0) {
-                let hex_parts: Vec<String> = display_words
-                    .iter()
-                    .rev()
-                    .skip_while(|&&w| w == 0)
-                    .map(|w| format!("{w:016x}"))
-                    .collect();
-                format!("0x{}({merged_cpumask})", hex_parts.join("_"))
-            } else {
-                format!("0x{:x}({merged_cpumask})", display_words[0])
-            };
+            let merged_cpumask_str = format_cpumask_display(&cpumask_words, nr_cpus);
 
             // Group fields by parameter, emit type headers for struct params.
             let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
@@ -838,6 +843,8 @@ mod tests {
     fn format_probe_events_cpumask_coalesced() {
         use crate::probe::process::ProbeEvent;
 
+        // Use only word 0 bits so the test is host-CPU-count independent.
+        // Multi-word display is tested separately in cpumask_multi_word_hex_format.
         let events = vec![ProbeEvent {
             func_idx: 0,
             task_ptr: 1,
@@ -845,8 +852,8 @@ mod tests {
             args: [0; 6],
             fields: vec![
                 ("p:task_struct.pid".to_string(), 42),
-                ("p:task_struct.cpumask_0".to_string(), 0xf),
-                ("p:task_struct.cpumask_1".to_string(), 1),
+                ("p:task_struct.cpumask_0".to_string(), 0x7),
+                ("p:task_struct.cpumask_1".to_string(), 0),
                 ("p:task_struct.cpumask_2".to_string(), 0),
                 ("p:task_struct.cpumask_3".to_string(), 0),
             ],
@@ -857,9 +864,8 @@ mod tests {
         let out = format_probe_events(&events, &func_names, None);
         // cpumask_0..3 should be merged into one "cpus_ptr" line
         assert!(out.contains("cpus_ptr"), "should show cpus_ptr: {out}");
-        // Should decode multi-word: CPUs 0-3 from word 0, CPU 64 from word 1
-        assert!(out.contains("0-3"), "should contain 0-3: {out}");
-        assert!(out.contains("64"), "should contain 64: {out}");
+        // CPUs 0-2 from word 0
+        assert!(out.contains("0-2"), "should contain 0-2: {out}");
         // Individual cpumask_1/2/3 should NOT appear
         assert!(
             !out.contains("cpumask_1"),
@@ -963,55 +969,25 @@ mod tests {
 
     #[test]
     fn cpumask_multi_word_hex_format() {
-        use crate::probe::process::ProbeEvent;
-
-        let events = vec![ProbeEvent {
-            func_idx: 0,
-            task_ptr: 1,
-            ts: 100,
-            args: [0; 6],
-            fields: vec![
-                ("p:cpumask.cpumask_0".to_string(), 0xff),
-                ("p:cpumask.cpumask_1".to_string(), 0x1),
-                ("p:cpumask.cpumask_2".to_string(), 0),
-                ("p:cpumask.cpumask_3".to_string(), 0),
-            ],
-            kstack: vec![],
-            str_val: None,
-        }];
-        let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
-        // Multi-word: should have underscore-separated 16-digit hex words.
+        // Test multi-word display with a controlled nr_cpus to avoid
+        // host-dependent masking (CI runners may have <65 CPUs).
+        let words = [0xffu64, 0x1, 0, 0];
+        let out = format_cpumask_display(&words, Some(128));
+        // Multi-word: underscore-separated 16-digit hex words.
         assert!(
             out.contains("_"),
             "multi-word should use _ separator: {out}"
         );
-        // Should list CPUs 0-7 (word 0 = 0xff) and CPU 64 (word 1 = 0x1).
+        // CPUs 0-7 from word 0, CPU 64 from word 1.
         assert!(out.contains("0-7"), "should list CPUs 0-7: {out}");
         assert!(out.contains("64"), "should list CPU 64: {out}");
     }
 
     #[test]
     fn cpumask_single_word_compact() {
-        use crate::probe::process::ProbeEvent;
-
-        let events = vec![ProbeEvent {
-            func_idx: 0,
-            task_ptr: 1,
-            ts: 100,
-            args: [0; 6],
-            fields: vec![
-                ("p:cpumask.cpumask_0".to_string(), 0xf),
-                ("p:cpumask.cpumask_1".to_string(), 0),
-                ("p:cpumask.cpumask_2".to_string(), 0),
-                ("p:cpumask.cpumask_3".to_string(), 0),
-            ],
-            kstack: vec![],
-            str_val: None,
-        }];
-        let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
-        // Single word: compact hex without leading zeros.
+        // Single-word display: compact hex without leading zeros.
+        let words = [0xfu64, 0, 0, 0];
+        let out = format_cpumask_display(&words, Some(64));
         assert!(out.contains("0xf("), "single-word should be compact: {out}");
         assert!(out.contains("0-3"), "should list CPUs 0-3: {out}");
     }

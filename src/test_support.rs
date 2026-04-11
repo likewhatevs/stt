@@ -4660,6 +4660,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_eevdf_no_com2_output() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -4688,6 +4689,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_dies_no_com2_output() {
         let entry = sched_entry("__eval_sched_dies__");
@@ -4706,6 +4708,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_dies_with_sched_log() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -4733,6 +4736,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_mid_test_death_triggers_repro() {
         // Scheduler dies mid-test: sched_exit_monitor dumps log to COM2
@@ -4766,6 +4770,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_repro_no_data_shows_diagnostic() {
         // When repro_fn returns the fallback diagnostic, the error
@@ -4799,6 +4804,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_timeout_no_result() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -4823,6 +4829,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_payload_exits_no_verify_result() {
         // Payload wrote something to COM2 but not a valid AssertResult.
@@ -4847,6 +4854,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_ext_dump_included() {
         let dump_line = "ktstr-0 [001] 0.5: sched_ext_dump: Debug dump line";
@@ -4879,6 +4887,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_verify_result_failed_includes_details() {
         let json = r#"{"passed":false,"details":["stuck 3000ms","spread 45%"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -4903,6 +4912,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_assert_failure_includes_sched_log() {
         let json = r#"{"passed":false,"details":["worker 0 stuck 5000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -4929,6 +4939,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_assert_failure_has_fingerprint() {
         let json = r#"{"passed":false,"details":["stuck 3000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -4955,6 +4966,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_timeout_has_fingerprint() {
         let error_line = "Error: scheduler panicked";
@@ -4977,6 +4989,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_no_result_has_fingerprint() {
         let error_line = "Error: fatal scheduler crash";
@@ -5000,6 +5013,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_no_sched_output_no_fingerprint() {
         let json = r#"{"passed":false,"details":["stuck"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5017,6 +5031,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_monitor_fail_has_fingerprint() {
         let pass_json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5096,6 +5111,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_timeout_with_sched_includes_diagnostics() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5163,6 +5179,7 @@ mod tests {
 
     // -- sentinel integration in evaluate_vm_result --
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_no_sentinels_shows_initramfs_failure() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5179,6 +5196,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_init_started_but_no_payload() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5195,6 +5213,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_payload_started_no_result() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5214,6 +5233,7 @@ mod tests {
 
     // -- guest panic detection tests --
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_crash_in_output_says_guest_crashed() {
         let entry = sched_entry("__eval_crash_detect__");
@@ -5227,6 +5247,7 @@ mod tests {
         assert!(msg.contains("assertion failed"), "got: {msg}");
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_crash_eevdf_says_guest_crashed() {
         let entry = eevdf_entry("__eval_crash_eevdf__");
@@ -5240,6 +5261,7 @@ mod tests {
         assert!(msg.contains("index out of bounds"), "got: {msg}");
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_crash_message_from_shm() {
         let entry = sched_entry("__eval_crash_shm__");
@@ -5409,6 +5431,7 @@ mod tests {
 
     // -- diagnostic section tests --
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_died_includes_console() {
         let json = r#"{"passed":false,"details":["scheduler crashed after completing step 1 of 2 (0.5s into test)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5429,6 +5452,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_died_includes_monitor() {
         let json = r#"{"passed":false,"details":["scheduler crashed during workload (2.0s into test)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5475,6 +5499,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn eval_monitor_fail_includes_sched_log() {
         let pass_json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
