@@ -67,8 +67,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_
 libbpf-cargo = "0.26"
 
 [[bin]]
-name = "ktstr-host"
-path = "src/bin/ktstr_host.rs"
+name = "ktstr"
+path = "src/bin/ktstr.rs"
 required-features = ["cli"]
 
 [[test]]

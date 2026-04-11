@@ -1,13 +1,13 @@
-# ktstr-host
+# ktstr
 
-`ktstr-host` runs ktstr scenarios directly on the host against a
+`ktstr` runs ktstr scenarios directly on the host against a
 scheduler. Unlike `#[ktstr_test]` (which boots KVM VMs),
-`ktstr-host` operates on the host's real topology and cgroups.
+`ktstr` operates on the host's real topology and cgroups.
 
 Build with the `cli` feature:
 
 ```sh
-cargo build --features cli --bin ktstr-host
+cargo build --features cli --bin ktstr
 ```
 
 ## Subcommands
@@ -17,10 +17,10 @@ cargo build --features cli --bin ktstr-host
 Run scenarios against a scheduler binary:
 
 ```sh
-ktstr-host run --scheduler scx_my_sched
-ktstr-host run --scheduler scx_my_sched --flags llc,borrow --duration 30
-ktstr-host run --scheduler scx_my_sched --filter cpuset --json
-ktstr-host run --scheduler scx_my_sched --work-type YieldHeavy
+ktstr run --scheduler scx_my_sched
+ktstr run --scheduler scx_my_sched --flags llc,borrow --duration 30
+ktstr run --scheduler scx_my_sched --filter cpuset --json
+ktstr run --scheduler scx_my_sched --work-type YieldHeavy
 ```
 
 Without `--scheduler`, scenarios run under the kernel's default
@@ -41,9 +41,9 @@ FutexPingPong, CachePressure, CacheYield, CachePipe, FutexFanOut.
 List available scenarios:
 
 ```sh
-ktstr-host list
-ktstr-host list --filter dynamic
-ktstr-host list --json
+ktstr list
+ktstr list --filter dynamic
+ktstr list --json
 ```
 
 ### topo
@@ -51,7 +51,7 @@ ktstr-host list --json
 Show the host CPU topology (CPUs, LLCs, NUMA nodes):
 
 ```sh
-ktstr-host topo
+ktstr topo
 ```
 
 ### cleanup
@@ -59,6 +59,6 @@ ktstr-host topo
 Remove leftover cgroups from a previous run:
 
 ```sh
-ktstr-host cleanup
-ktstr-host cleanup --parent-cgroup /sys/fs/cgroup/ktstr
+ktstr cleanup
+ktstr cleanup --parent-cgroup /sys/fs/cgroup/ktstr
 ```

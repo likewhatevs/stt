@@ -1,4 +1,4 @@
-//! CLI support functions for `ktstr-host`.
+//! CLI support functions for `ktstr`.
 //!
 //! Pure validation and configuration logic extracted from the binary
 //! so tests are nextest-discoverable.
@@ -55,7 +55,7 @@ pub fn filter_scenarios<'a>(
         .filter(|s| filter.is_none_or(|f| s.name.contains(f)))
         .collect();
     if refs.is_empty() {
-        bail!("no scenarios matched filter. run 'ktstr-host list' to see available scenarios");
+        bail!("no scenarios matched filter. run 'ktstr list' to see available scenarios");
     }
     Ok(refs)
 }
@@ -220,7 +220,7 @@ mod tests {
         let err = filter_scenarios(&scenarios, Some("__nonexistent_scenario_xyz__")).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no scenarios matched"), "{msg}");
-        assert!(msg.contains("ktstr-host list"), "{msg}");
+        assert!(msg.contains("ktstr list"), "{msg}");
     }
 
     #[test]

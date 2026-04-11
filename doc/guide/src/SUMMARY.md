@@ -9,7 +9,7 @@
   - [Single Scenario](running-tests/single-scenario.md)
   - [Gauntlet](running-tests/gauntlet.md)
   - [Baselines](running-tests/baselines.md)
-  - [ktstr-host](running-tests/ktstr-host.md)
+  - [ktstr](running-tests/ktstr.md)
   - [Auto-Repro](running-tests/auto-repro.md)
   - [BPF Verifier](running-tests/verifier.md)
 - [Core Concepts](concepts.md)

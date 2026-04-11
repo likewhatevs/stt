@@ -217,6 +217,11 @@ pub(crate) mod vm;
 pub(crate) mod vmm;
 pub mod workload;
 
+/// Short git commit hash at build time.
+pub const GIT_HASH: &str = env!("KTSTR_GIT_HASH");
+/// Git branch name at build time.
+pub const GIT_BRANCH: &str = env!("KTSTR_GIT_BRANCH");
+
 #[doc(hidden)]
 pub use linkme as __linkme;
 

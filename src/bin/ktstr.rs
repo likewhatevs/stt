@@ -9,7 +9,7 @@ use ktstr::topology::TestTopology;
 
 #[derive(Parser)]
 #[command(
-    name = "ktstr-host",
+    name = "ktstr",
     about = "Run ktstr scheduler test scenarios on the host"
 )]
 struct Cli {

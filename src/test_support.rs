@@ -966,24 +966,23 @@ fn run_gauntlet_test(rest: &str) -> i32 {
 /// Run sidecar collection and stats summary. Called after test
 /// execution completes.
 pub(crate) fn collect_and_print_sidecar_stats() {
-    if let Ok(dir) = std::env::var("KTSTR_SIDECAR_DIR") {
-        let sidecars = collect_sidecars(std::path::Path::new(&dir));
-        let rows: Vec<_> = sidecars.iter().map(crate::stats::sidecar_to_row).collect();
-        if !rows.is_empty() {
-            eprintln!("{}", crate::stats::analyze_rows(&rows));
-        }
-        let vstats = format_verifier_stats(&sidecars);
-        if !vstats.is_empty() {
-            eprintln!("{vstats}");
-        }
-        let cprofile = format_callback_profile(&sidecars);
-        if !cprofile.is_empty() {
-            eprintln!("{cprofile}");
-        }
-        let kstats = format_kvm_stats(&sidecars);
-        if !kstats.is_empty() {
-            eprintln!("{kstats}");
-        }
+    let dir = sidecar_dir();
+    let sidecars = collect_sidecars(&dir);
+    let rows: Vec<_> = sidecars.iter().map(crate::stats::sidecar_to_row).collect();
+    if !rows.is_empty() {
+        eprintln!("{}", crate::stats::analyze_rows(&rows));
+    }
+    let vstats = format_verifier_stats(&sidecars);
+    if !vstats.is_empty() {
+        eprintln!("{vstats}");
+    }
+    let cprofile = format_callback_profile(&sidecars);
+    if !cprofile.is_empty() {
+        eprintln!("{cprofile}");
+    }
+    let kstats = format_kvm_stats(&sidecars);
+    if !kstats.is_empty() {
+        eprintln!("{kstats}");
     }
 }
 
@@ -3151,8 +3150,27 @@ fn resolve_cgroup_root(args: &[String]) -> String {
     "/sys/fs/cgroup/ktstr".to_string()
 }
 
-/// Write a sidecar JSON file to KTSTR_SIDECAR_DIR if the env var is set.
-/// No-op when the var is absent, so tests remain runnable with plain cargo test.
+/// Resolve the sidecar output directory.
+///
+/// Uses `KTSTR_SIDECAR_DIR` if set, otherwise defaults to
+/// `target/ktstr/{branch}-{hash}/`.
+fn sidecar_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("KTSTR_SIDECAR_DIR")
+        && !d.is_empty()
+    {
+        return PathBuf::from(d);
+    }
+    PathBuf::from(format!(
+        "target/ktstr/{}-{}",
+        crate::GIT_BRANCH,
+        crate::GIT_HASH,
+    ))
+}
+
+/// Write a sidecar JSON file for post-run analysis.
+///
+/// Output goes to `KTSTR_SIDECAR_DIR` if set, otherwise to
+/// `target/ktstr/{branch}-{hash}/`.
 fn write_sidecar(
     entry: &KtstrTestEntry,
     vm_result: &vmm::VmResult,
@@ -3160,10 +3178,7 @@ fn write_sidecar(
     verify_result: &AssertResult,
     work_type: &str,
 ) {
-    let dir = match std::env::var("KTSTR_SIDECAR_DIR") {
-        Ok(d) if !d.is_empty() => PathBuf::from(d),
-        _ => return,
-    };
+    let dir = sidecar_dir();
     let topo = format!(
         "{}s{}c{}t",
         entry.topology.sockets, entry.topology.cores_per_socket, entry.topology.threads_per_core,
@@ -4456,18 +4471,22 @@ mod tests {
     }
 
     #[test]
-    fn write_sidecar_noop_without_env() {
+    fn write_sidecar_defaults_to_target_dir_without_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         let key = "KTSTR_SIDECAR_DIR";
         let prev = std::env::var(key).ok();
         // SAFETY: test-only, single-threaded env mutation with save/restore.
         unsafe { std::env::remove_var(key) };
 
+        let dir = sidecar_dir();
+        let expected = format!("target/ktstr/{}-{}", crate::GIT_BRANCH, crate::GIT_HASH);
+        assert_eq!(dir, PathBuf::from(&expected));
+
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
         }
         let entry = KtstrTestEntry {
-            name: "__sidecar_noop__",
+            name: "__sidecar_default_dir__",
             func: dummy,
             auto_repro: false,
             ..KtstrTestEntry::DEFAULT
@@ -4487,8 +4506,12 @@ mod tests {
             crash_message: None,
         };
         let verify_result = AssertResult::pass();
-        // This should be a no-op because KTSTR_SIDECAR_DIR is not set.
         write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
+
+        // Clean up written file.
+        let path = dir.join("__sidecar_default_dir__.ktstr.json");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
 
         match prev {
             Some(v) => unsafe { std::env::set_var(key, v) },
