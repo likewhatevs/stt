@@ -11,41 +11,6 @@ use libbpf_cargo::SkeletonBuilder;
 
 include!("src/kernel_path.rs");
 
-/// Find the libbpf-sys source directory in the cargo registry.
-///
-/// libbpf-sys vendors libbpf headers at `libbpf/include/bpf/`. We
-/// locate the crate directory by scanning the cargo registry.
-fn find_libbpf_include() -> PathBuf {
-    let home = env::var("CARGO_HOME")
-        .or_else(|_| env::var("HOME").map(|h| format!("{h}/.cargo")))
-        .expect("CARGO_HOME or HOME must be set");
-    let registry = PathBuf::from(&home).join("registry/src");
-    if registry.is_dir() {
-        for entry in std::fs::read_dir(&registry).expect("read cargo registry") {
-            let index_dir = entry.expect("read index dir").path();
-            if !index_dir.is_dir() {
-                continue;
-            }
-            // Find the libbpf-sys directory matching our version range.
-            for pkg in std::fs::read_dir(&index_dir).expect("read packages") {
-                let pkg_dir = pkg.expect("read pkg dir").path();
-                if let Some(name) = pkg_dir.file_name().and_then(|n| n.to_str())
-                    && name.starts_with("libbpf-sys-1.")
-                {
-                    let include = pkg_dir.join("libbpf/include");
-                    if include.is_dir() {
-                        return include;
-                    }
-                }
-            }
-        }
-    }
-    panic!(
-        "libbpf-sys headers not found in cargo registry. \
-         Ensure libbpf-sys is a dependency."
-    );
-}
-
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -73,7 +38,10 @@ fn main() {
             btf_source.display()
         );
 
-        let libbpf_include = find_libbpf_include();
+        // libbpf-sys (links = "bpf") emits installed headers at
+        // DEP_BPF_INCLUDE with bpf/ prefix (bpf/btf.h, bpf/libbpf.h).
+        let libbpf_include =
+            PathBuf::from(env::var("DEP_BPF_INCLUDE").expect("DEP_BPF_INCLUDE not set"));
 
         // Compile the C vmlinux generator + driver into a standalone binary.
         let vmlinux_gen_bin = out_dir.join("vmlinux_gen");

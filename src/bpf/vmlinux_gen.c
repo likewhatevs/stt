@@ -2,7 +2,7 @@
  * Generate vmlinux.h from a BTF source file.
  *
  * Replaces the bpftool dependency by using libbpf's btf_dump API
- * directly. Called from build.rs via FFI.
+ * directly. Compiled and run as a standalone binary by build.rs.
  *
  * Usage: generate_vmlinux_h(btf_path, output_path)
  *   btf_path:    path to vmlinux ELF or /sys/kernel/btf/vmlinux

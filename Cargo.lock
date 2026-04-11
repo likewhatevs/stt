@@ -2191,6 +2191,7 @@ dependencies = [
  "kvm-ioctls",
  "libbpf-cargo",
  "libbpf-rs",
+ "libbpf-sys",
  "libc",
  "linkme",
  "linux-loader",
