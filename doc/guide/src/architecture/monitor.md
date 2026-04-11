@@ -260,7 +260,7 @@ Attaches to kernel functions via `attach_kprobe`. The BPF handler:
 3. Captures 6 raw args from `pt_regs`
 4. Dereferences struct fields via BTF-resolved offsets
 5. Reads char * string params if configured
-6. Stores result in `probe_data` (keyed by `(func_ip, tid)`)
+6. Stores result in `probe_data` (keyed by `(func_ip, task_ptr)`)
 
 A separate trigger kprobe fires on `scx_disable_workfn` and sends
 an `EVENT_TRIGGER` via ring buffer with the current task pointer
