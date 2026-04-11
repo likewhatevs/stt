@@ -45,8 +45,9 @@ runs:
           libtool \
           gettext \
           autopoint \
-          libelf-dev \
+          libbpf-dev \
           libcap-dev \
+          libelf-dev \
           binutils-dev \
           zlib1g-dev
         sudo apt-get install -y linux-headers-$(uname -r) || true
