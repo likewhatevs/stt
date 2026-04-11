@@ -321,6 +321,7 @@ name = "cargo-ktstr"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "tempfile",
 ]
 
 [[package]]
@@ -1167,6 +1168,7 @@ dependencies = [
  "rmesg",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "vm-fdt",

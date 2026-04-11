@@ -63,6 +63,9 @@ cli = ["dep:clap"]
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 cc = "1"
 libbpf-cargo = "0.26"

@@ -1,9 +1,9 @@
 use std::env;
-use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cargo_ktstr::{build_make_args, find_kconfig_from, has_sched_ext};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -42,15 +42,11 @@ enum KtstrCommand {
 fn find_kconfig() -> Option<PathBuf> {
     // Try relative to the binary location (../../ktstr.kconfig from
     // target/debug/cargo-ktstr or target/release/cargo-ktstr).
-    if let Ok(exe) = env::current_exe() {
-        let mut dir = exe.parent().map(Path::to_path_buf);
-        while let Some(d) = dir {
-            let candidate = d.join("ktstr.kconfig");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            dir = d.parent().map(Path::to_path_buf);
-        }
+    if let Ok(exe) = env::current_exe()
+        && let Some(start) = exe.parent()
+        && let Some(found) = find_kconfig_from(start)
+    {
+        return Some(found);
     }
     // Fallback: current working directory.
     let cwd = Path::new("ktstr.kconfig");
@@ -58,14 +54,6 @@ fn find_kconfig() -> Option<PathBuf> {
         return Some(cwd.to_path_buf());
     }
     None
-}
-
-/// Check if .config contains CONFIG_SCHED_CLASS_EXT=y.
-fn has_sched_ext(kernel_dir: &Path) -> bool {
-    let config = kernel_dir.join(".config");
-    fs::read_to_string(config)
-        .map(|s| s.lines().any(|l| l == "CONFIG_SCHED_CLASS_EXT=y"))
-        .unwrap_or(false)
 }
 
 /// Configure the kernel with sched_ext support.
@@ -116,10 +104,11 @@ fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<(), String> {
 fn build_kernel(kernel_dir: &Path) -> Result<(), String> {
     eprintln!("cargo-ktstr: building kernel in {}", kernel_dir.display());
     let nproc = std::thread::available_parallelism()
-        .map(|n| n.get().to_string())
-        .unwrap_or_else(|_| "1".into());
-    let j_flag = format!("-j{nproc}");
-    run_make(kernel_dir, &[&j_flag, "KCFLAGS=-Wno-error"])
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let args = build_make_args(nproc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_make(kernel_dir, &arg_refs)
 }
 
 fn run_test(args: Vec<String>) -> Result<(), String> {
