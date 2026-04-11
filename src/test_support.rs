@@ -1,7 +1,8 @@
 //! Runtime support for `#[ktstr_test]` integration tests.
 //!
-//! Provides the registration type, distributed slice, VM launcher, and
-//! guest-side profraw flush for coverage-instrumented test functions.
+//! Provides the registration type, distributed slice, VM launcher,
+//! and result evaluation. Includes guest-side profraw flush for
+//! coverage-instrumented builds.
 //!
 //! See the [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
 //! and [`#[ktstr_test]` Macro](https://likewhatevs.github.io/ktstr/guide/writing-tests/ktstr-test-macro.html)
@@ -1411,13 +1412,7 @@ fn run_ktstr_test_inner(
 /// `run_ktstr_test_inner` so that error message formatting can be tested
 /// without booting a VM. The `repro_fn` callback handles auto-repro
 /// (which requires a second VM boot) when provided.
-///
-/// In coverage mode (`#[cfg(coverage)]`), all assertions are skipped.
-/// Coverage answers "what code was exercised" — scheduling correctness
-/// under instrumented code is not meaningful because instrumentation
-/// changes the workload. Profraw is still collected (before this
-/// function is called).
-#[allow(clippy::too_many_arguments, unreachable_code)]
+#[allow(clippy::too_many_arguments)]
 fn evaluate_vm_result(
     entry: &KtstrTestEntry,
     result: &vmm::VmResult,
@@ -1428,23 +1423,6 @@ fn evaluate_vm_result(
     threads: u32,
     repro_fn: &dyn Fn(&str) -> Option<String>,
 ) -> Result<AssertResult> {
-    // Coverage gate: skip all assertions. The instrumented binary
-    // already ran the scenario and flushed profraw via SHM. Parse
-    // the result for sidecar stats but never fail on assertions.
-    #[cfg(coverage)]
-    {
-        let _ = (merged_assert, sockets, cores, threads, repro_fn);
-        eprintln!(
-            "ktstr_test: coverage mode: assertions skipped for '{}' (instrumentation changes workload)",
-            entry.name,
-        );
-        let verify_result = parse_assert_result_shm(result.shm_data.as_ref())
-            .or_else(|_| parse_assert_result(&result.output))
-            .unwrap_or_else(|_| AssertResult::pass());
-        write_sidecar(entry, result, stimulus_events, &verify_result, "CpuSpin");
-        return Ok(verify_result);
-    }
-
     // Build timeline from stimulus events + monitor samples.
     let timeline = result
         .monitor
@@ -3046,7 +3024,7 @@ pub fn resolve_kernel() -> Result<PathBuf> {
     }
 
     // Standard locations.
-    if let Some(p) = crate::find_kernel() {
+    if let Some(p) = crate::find_kernel()? {
         return Ok(p);
     }
 
@@ -4660,7 +4638,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_eevdf_no_com2_output() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -4689,7 +4666,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_dies_no_com2_output() {
         let entry = sched_entry("__eval_sched_dies__");
@@ -4708,7 +4684,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_dies_with_sched_log() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -4736,7 +4711,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_mid_test_death_triggers_repro() {
         // Scheduler dies mid-test: sched_exit_monitor dumps log to COM2
@@ -4770,7 +4744,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_repro_no_data_shows_diagnostic() {
         // When repro_fn returns the fallback diagnostic, the error
@@ -4804,7 +4777,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_timeout_no_result() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -4829,7 +4801,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_payload_exits_no_verify_result() {
         // Payload wrote something to COM2 but not a valid AssertResult.
@@ -4854,7 +4825,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_ext_dump_included() {
         let dump_line = "ktstr-0 [001] 0.5: sched_ext_dump: Debug dump line";
@@ -4887,7 +4857,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_verify_result_failed_includes_details() {
         let json = r#"{"passed":false,"details":["stuck 3000ms","spread 45%"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -4895,24 +4864,15 @@ mod tests {
         let entry = eevdf_entry("__eval_fail_details__");
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
-        let err =
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("failed:"),
-            "failed AssertResult should say 'failed:', got: {msg}",
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err()
         );
-        assert!(
-            msg.contains("stuck 3000ms"),
-            "should include failure details, got: {msg}",
-        );
-        assert!(
-            msg.contains("spread 45%"),
-            "should include all failure details, got: {msg}",
-        );
+        assert!(msg.contains("failed:"), "got: {msg}");
+        assert!(msg.contains("stuck 3000ms"), "got: {msg}");
+        assert!(msg.contains("spread 45%"), "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_assert_failure_includes_sched_log() {
         let json = r#"{"passed":false,"details":["worker 0 stuck 5000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -4922,24 +4882,15 @@ mod tests {
         let entry = sched_entry("__eval_fail_sched_log__");
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
-        let err =
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("worker 0 stuck 5000ms"),
-            "should include assertion details, got: {msg}",
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err()
         );
-        assert!(
-            msg.contains("scheduler noise"),
-            "assertion failure should include scheduler log, got: {msg}",
-        );
-        assert!(
-            msg.contains("--- scheduler log ---"),
-            "assertion failure should include scheduler log header, got: {msg}",
-        );
+        assert!(msg.contains("worker 0 stuck 5000ms"), "got: {msg}");
+        assert!(msg.contains("scheduler noise"), "got: {msg}");
+        assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_assert_failure_has_fingerprint() {
         let json = r#"{"passed":false,"details":["stuck 3000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -4950,23 +4901,16 @@ mod tests {
         let entry = sched_entry("__eval_fingerprint__");
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
-        let err =
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains(error_line),
-            "failure should contain fingerprint line, got: {msg}",
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err()
         );
-        // Fingerprint appears before the test name line.
+        assert!(msg.contains(error_line), "got: {msg}");
         let fp_pos = msg.find(error_line).unwrap();
         let name_pos = msg.find("ktstr_test").unwrap();
-        assert!(
-            fp_pos < name_pos,
-            "fingerprint should appear before ktstr_test line, got: {msg}",
-        );
+        assert!(fp_pos < name_pos, "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_timeout_has_fingerprint() {
         let error_line = "Error: scheduler panicked";
@@ -4989,7 +4933,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_no_result_has_fingerprint() {
         let error_line = "Error: fatal scheduler crash";
@@ -5013,7 +4956,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_no_sched_output_no_fingerprint() {
         let json = r#"{"passed":false,"details":["stuck"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5021,17 +4963,13 @@ mod tests {
         let entry = eevdf_entry("__eval_no_fp__");
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
-        let err =
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
-        let msg = format!("{err}");
-        // No scheduler output means no fingerprint; message starts with ktstr_test.
-        assert!(
-            msg.starts_with("ktstr_test"),
-            "without sched output, message should start with ktstr_test, got: {msg}",
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err()
         );
+        assert!(msg.starts_with("ktstr_test"), "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_monitor_fail_has_fingerprint() {
         let pass_json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5092,26 +5030,20 @@ mod tests {
             crash_message: None,
         };
         let assertions = crate::assert::Assert::default_checks();
-        let err =
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
-        let msg = format!("{err}");
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err()
+        );
         assert!(
             msg.contains("passed scenario but monitor failed"),
-            "should be a monitor failure, got: {msg}",
+            "got: {msg}"
         );
-        assert!(
-            msg.contains(error_line),
-            "monitor failure should contain fingerprint, got: {msg}",
-        );
+        assert!(msg.contains(error_line), "got: {msg}");
         let fp_pos = msg.find(error_line).unwrap();
         let name_pos = msg.find("ktstr_test").unwrap();
-        assert!(
-            fp_pos < name_pos,
-            "fingerprint should appear before ktstr_test line, got: {msg}",
-        );
+        assert!(fp_pos < name_pos, "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_timeout_with_sched_includes_diagnostics() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5179,7 +5111,6 @@ mod tests {
 
     // -- sentinel integration in evaluate_vm_result --
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_no_sentinels_shows_initramfs_failure() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5196,7 +5127,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_init_started_but_no_payload() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5213,7 +5143,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_payload_started_no_result() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5233,7 +5162,6 @@ mod tests {
 
     // -- guest panic detection tests --
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_crash_in_output_says_guest_crashed() {
         let entry = sched_entry("__eval_crash_detect__");
@@ -5247,7 +5175,6 @@ mod tests {
         assert!(msg.contains("assertion failed"), "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_crash_eevdf_says_guest_crashed() {
         let entry = eevdf_entry("__eval_crash_eevdf__");
@@ -5261,7 +5188,6 @@ mod tests {
         assert!(msg.contains("index out of bounds"), "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_crash_message_from_shm() {
         let entry = sched_entry("__eval_crash_shm__");
@@ -5431,7 +5357,6 @@ mod tests {
 
     // -- diagnostic section tests --
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_died_includes_console() {
         let json = r#"{"passed":false,"details":["scheduler crashed after completing step 1 of 2 (0.5s into test)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5439,20 +5364,14 @@ mod tests {
         let entry = sched_entry("__eval_sched_died_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err =
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("--- diagnostics ---"),
-            "scheduler died detail should trigger console_section, got: {msg}",
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err()
         );
-        assert!(
-            msg.contains("kernel panic"),
-            "console_section should include console output, got: {msg}",
-        );
+        assert!(msg.contains("--- diagnostics ---"), "got: {msg}");
+        assert!(msg.contains("kernel panic"), "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_sched_died_includes_monitor() {
         let json = r#"{"passed":false,"details":["scheduler crashed during workload (2.0s into test)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5486,20 +5405,14 @@ mod tests {
             crash_message: None,
         };
         let assertions = crate::assert::Assert::NONE;
-        let err =
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("--- monitor ---"),
-            "assert failure with active scheduler should include monitor section, got: {msg}",
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err()
         );
-        assert!(
-            msg.contains("max_imbalance"),
-            "monitor section should include max_imbalance, got: {msg}",
-        );
+        assert!(msg.contains("--- monitor ---"), "got: {msg}");
+        assert!(msg.contains("max_imbalance"), "got: {msg}");
     }
 
-    #[cfg(not(coverage))]
     #[test]
     fn eval_monitor_fail_includes_sched_log() {
         let pass_json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
@@ -5561,16 +5474,14 @@ mod tests {
             crash_message: None,
         };
         let assertions = crate::assert::Assert::default_checks();
-        let err =
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err();
-        let msg = format!("{err}");
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 2, 1, &no_repro).unwrap_err()
+        );
         assert!(
             msg.contains("passed scenario but monitor failed"),
-            "should indicate scenario passed but monitor failed, got: {msg}",
+            "got: {msg}"
         );
-        assert!(
-            msg.contains("--- scheduler log ---"),
-            "monitor failure path should include scheduler log section, got: {msg}",
-        );
+        assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
     }
 }

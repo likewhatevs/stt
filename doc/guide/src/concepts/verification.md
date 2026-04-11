@@ -130,10 +130,9 @@ let final_assert = Assert::default_checks()
 | Fairness spread | 15% | 35% |
 
 Debug builds run in small VMs with higher scheduling overhead, so
-thresholds are relaxed. In coverage-instrumented builds
-(`#[cfg(coverage)]`), all assertions are skipped entirely --
-coverage measures what code paths tests exercise, not scheduling
-correctness under instrumented workloads.
+thresholds are relaxed. Coverage-instrumented builds collect profraw
+data for code coverage analysis; all assertion and monitor threshold
+checks run normally.
 
 ### Monitor checks
 

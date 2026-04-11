@@ -56,7 +56,7 @@ pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
     } else if let Some(ref k) = cfg.kernel {
         PathBuf::from(k)
     } else {
-        crate::find_kernel().unwrap_or_else(|| PathBuf::from("/boot/vmlinuz"))
+        crate::find_kernel()?.unwrap_or_else(|| PathBuf::from("/boot/vmlinuz"))
     };
 
     // Find ktstr binary (ourselves)

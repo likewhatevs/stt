@@ -268,10 +268,28 @@ pub mod prelude {
 
 /// Find a bootable kernel image on the host.
 ///
-/// Delegates to [`kernel_path::find_image`] with `KTSTR_KERNEL` if set.
-pub fn find_kernel() -> Option<std::path::PathBuf> {
-    let ktstr_kernel = std::env::var("KTSTR_KERNEL").ok();
-    kernel_path::find_image(ktstr_kernel.as_deref())
+/// Returns `Err` when `KTSTR_KERNEL` is set but the path does not
+/// exist or contains no kernel image. Returns `Ok(None)` when
+/// `KTSTR_KERNEL` is not set and no fallback location has a kernel.
+///
+/// Without `KTSTR_KERNEL`, searches build trees (`./linux`,
+/// `../linux`, `/lib/modules/{release}/build`) for arch-specific
+/// images, then `/lib/modules/{release}/vmlinuz`,
+/// `/boot/vmlinuz-{release}`, and `/boot/vmlinuz`.
+pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
+    let release = nix::sys::utsname::uname()
+        .ok()
+        .map(|u| u.release().to_string_lossy().into_owned());
+    let release_ref = release.as_deref();
+    if let Ok(val) = std::env::var("KTSTR_KERNEL") {
+        // Explicit path: find_image with Some(dir) checks only that
+        // directory, no fallthrough to build trees or host paths.
+        match kernel_path::find_image(Some(&val), release_ref) {
+            Some(p) => return Ok(Some(p)),
+            None => anyhow::bail!("KTSTR_KERNEL={val} does not contain a kernel image"),
+        }
+    }
+    Ok(kernel_path::find_image(None, release_ref))
 }
 
 /// Build a cargo binary package and return its output path.

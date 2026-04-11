@@ -3068,17 +3068,26 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_produces_output() {
-        let Some(kernel) = crate::find_kernel() else {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = match KtstrVm::builder()
             .kernel(&kernel)
             .topology(1, 1, 1)
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap();
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
         let result = vm.run().unwrap();
         assert!(
             result.stderr.contains("Linux") || result.stderr.contains("Booting"),
@@ -3090,17 +3099,26 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_smp_topology() {
-        let Some(kernel) = crate::find_kernel() else {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = match KtstrVm::builder()
             .kernel(&kernel)
             .topology(2, 2, 1) // 4 CPUs
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap();
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
         let result = vm.run().unwrap();
         assert!(!result.stderr.is_empty(), "no console output from SMP boot");
     }
@@ -3113,7 +3131,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn bench_boot_time() {
-        let Some(kernel) = crate::find_kernel() else {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
             return;
         };
 
@@ -3121,13 +3139,22 @@ mod tests {
             [("1cpu", 1, 1, 1, 256), ("4cpu", 2, 2, 1, 512)]
         {
             let start = Instant::now();
-            let vm = KtstrVm::builder()
+            let vm = match KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(sockets, cores, threads)
                 .memory_mb(mem)
                 .timeout(Duration::from_secs(10))
                 .build()
-                .unwrap();
+            {
+                Ok(vm) => vm,
+                Err(e)
+                    if e.downcast_ref::<host_topology::ResourceContention>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("{e:#}"),
+            };
             let setup = start.elapsed();
             let result = vm.run().unwrap();
             // Extract kernel timestamp from last line (e.g. "[    0.189300] Kernel panic")
@@ -3419,7 +3446,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
-        let Some(kernel) = crate::find_kernel() else {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
             return;
         };
         // Monitor needs vmlinux — skip if not present.
@@ -3427,13 +3454,22 @@ mod tests {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = match KtstrVm::builder()
             .kernel(&kernel)
             .topology(1, 2, 1)
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap();
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
         let result = vm.run().unwrap();
         if let Some(ref report) = result.monitor {
             assert!(
@@ -3934,7 +3970,7 @@ mod tests {
     /// decompresses transparently.
     #[cfg(target_arch = "aarch64")]
     fn find_aarch64_image() -> Option<std::path::PathBuf> {
-        crate::find_kernel()
+        crate::find_kernel().unwrap()
     }
 
     #[test]
@@ -3945,13 +3981,22 @@ mod tests {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = match KtstrVm::builder()
             .kernel(&kernel)
             .topology(1, 1, 1)
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap();
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
         let result = vm.run().unwrap();
         assert!(
             result.stderr.contains("Linux") || result.stderr.contains("Booting"),
@@ -3968,13 +4013,22 @@ mod tests {
             return;
         };
 
-        let vm = KtstrVm::builder()
+        let vm = match KtstrVm::builder()
             .kernel(&kernel)
             .topology(2, 2, 1) // 4 CPUs
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap();
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
         let result = vm.run().unwrap();
         assert!(!result.stderr.is_empty(), "no console output from SMP boot");
     }

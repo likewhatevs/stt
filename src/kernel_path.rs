@@ -46,7 +46,7 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
 
 /// Find a bootable kernel image within a directory.
 #[allow(dead_code)]
-fn _find_image_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+pub fn find_image_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     #[cfg(target_arch = "x86_64")]
     {
         let p = dir.join("arch/x86/boot/bzImage");
@@ -67,19 +67,45 @@ fn _find_image_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 /// Find a bootable kernel image on the host.
 ///
 /// `kernel_dir`: explicit kernel directory (e.g. from `KTSTR_KERNEL`).
+/// When set, only that directory is searched — no fallback to local
+/// build trees or host paths.
 ///
-/// Checks the resolved kernel directory for arch-specific boot images,
-/// then versioned paths (`/lib/modules/$(uname -r)/vmlinuz`,
-/// `/boot/vmlinuz-$(uname -r)`), then `/boot/vmlinuz`.
+/// `release`: kernel release string (e.g. from `uname -r`). When
+/// `None`, falls back to running `uname -r` via `Command`.
+///
+/// Without `kernel_dir`, searches local build trees (`./linux`,
+/// `../linux`), `/lib/modules/{release}/build`, then host paths
+/// (`/lib/modules/{release}/vmlinuz`, `/boot/vmlinuz-{release}`,
+/// `/boot/vmlinuz`).
 #[allow(dead_code)]
-pub fn find_image(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
-    if let Some(dir) = resolve_kernel(kernel_dir)
-        && let Some(img) = _find_image_in_dir(&dir)
+pub fn find_image(kernel_dir: Option<&str>, release: Option<&str>) -> Option<std::path::PathBuf> {
+    // When kernel_dir is explicit, only check that directory.
+    if let Some(dir_str) = kernel_dir {
+        let dir = std::path::PathBuf::from(dir_str);
+        if !dir.is_dir() {
+            return None;
+        }
+        return find_image_in_dir(&dir);
+    }
+
+    // No explicit dir: search local build trees via resolve_kernel.
+    if let Some(dir) = resolve_kernel(None)
+        && let Some(img) = find_image_in_dir(&dir)
     {
         return Some(img);
     }
 
-    if let Some(rel) = _kernel_release() {
+    // Host fallback paths.
+    let owned_release;
+    let rel = match release {
+        Some(r) => Some(r),
+        None => {
+            owned_release = _kernel_release();
+            owned_release.as_deref()
+        }
+    };
+
+    if let Some(rel) = rel {
         let p = std::path::PathBuf::from(format!("/lib/modules/{rel}/vmlinuz"));
         if std::fs::File::open(&p).is_ok() {
             return Some(p);
@@ -216,7 +242,7 @@ mod tests {
         assert!(!_has_kernel_artifacts(tmp.path()));
     }
 
-    // -- _find_image_in_dir --
+    // -- find_image_in_dir --
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -225,14 +251,14 @@ mod tests {
         let boot = tmp.path().join("arch/x86/boot");
         std::fs::create_dir_all(&boot).unwrap();
         std::fs::write(boot.join("bzImage"), b"fake").unwrap();
-        let result = _find_image_in_dir(tmp.path());
+        let result = find_image_in_dir(tmp.path());
         assert_eq!(result, Some(boot.join("bzImage")));
     }
 
     #[test]
     fn kernel_path_find_image_in_dir_empty() {
         let tmp = TempDir::new().unwrap();
-        assert!(_find_image_in_dir(tmp.path()).is_none());
+        assert!(find_image_in_dir(tmp.path()).is_none());
     }
 
     // -- resolve_btf --
@@ -274,15 +300,15 @@ mod tests {
         let boot = tmp.path().join("arch/x86/boot");
         std::fs::create_dir_all(&boot).unwrap();
         std::fs::write(boot.join("bzImage"), b"fake").unwrap();
-        let result = find_image(Some(tmp.path().to_str().unwrap()));
+        let result = find_image(Some(tmp.path().to_str().unwrap()), None);
         assert_eq!(result, Some(boot.join("bzImage")));
     }
 
     #[test]
     fn kernel_path_find_image_nonexistent_dir() {
-        // Nonexistent explicit dir: falls through to kernel_release paths.
-        // Must not panic regardless of host state.
-        let _ = find_image(Some("/nonexistent/image/dir/xyz"));
+        // Nonexistent explicit dir: is_dir() is false, returns None
+        // immediately with no fallthrough.
+        let _ = find_image(Some("/nonexistent/image/dir/xyz"), None);
     }
 
     // -- _kernel_release --

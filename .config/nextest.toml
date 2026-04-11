@@ -71,6 +71,19 @@ retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max
 filter = "test(sched_) | test(cover_)"
 retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
 
+# Verifier tests: boot a VM and collect BPF verifier output.
+# The test sets a 120s internal timeout, so nextest must allow at least
+# that plus overhead.
+[[profile.default.overrides]]
+filter = "test(verifier_)"
+slow-timeout = { period = "180s", terminate-after = 2 }
+retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
+
+[[profile.ci.overrides]]
+filter = "test(verifier_)"
+slow-timeout = { period = "180s", terminate-after = 2 }
+retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
+
 # Demo tests: demo_ tests from the custom harness are ignored by default.
 # Auto-repro demos boot two VMs sequentially; verifier demos load BPF.
 [[profile.default.overrides]]
