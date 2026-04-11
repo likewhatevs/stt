@@ -193,6 +193,7 @@ pub mod cli;
 #[cfg(not(feature = "cli"))]
 #[allow(dead_code)]
 pub(crate) mod cli;
+pub mod kernel_path;
 #[allow(dead_code)]
 pub(crate) mod monitor;
 #[allow(dead_code)]
@@ -267,46 +268,10 @@ pub mod prelude {
 
 /// Find a bootable kernel image on the host.
 ///
-/// Checks build-tree paths first, then versioned paths
-/// (`/lib/modules/$(uname -r)/vmlinuz`, `/boot/vmlinuz-$(uname -r)`),
-/// then falls back to the unversioned `/boot/vmlinuz` symlink.
+/// Delegates to [`kernel_path::find_image`] with `KTSTR_KERNEL` if set.
 pub fn find_kernel() -> Option<std::path::PathBuf> {
-    let rel = {
-        let mut buf: libc::utsname = unsafe { std::mem::zeroed() };
-        if unsafe { libc::uname(&mut buf) } == 0 {
-            let cstr = unsafe { std::ffi::CStr::from_ptr(buf.release.as_ptr()) };
-            Some(cstr.to_string_lossy().into_owned())
-        } else {
-            None
-        }
-    };
-
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-
-    // Build-tree kernels (for development)
-    #[cfg(target_arch = "x86_64")]
-    {
-        candidates.push("./linux/arch/x86/boot/bzImage".into());
-        candidates.push("../linux/arch/x86/boot/bzImage".into());
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        candidates.push("./linux/arch/arm64/boot/Image".into());
-        candidates.push("../linux/arch/arm64/boot/Image".into());
-    }
-
-    // Versioned paths (usually world-readable)
-    if let Some(ref r) = rel {
-        candidates.push(format!("/lib/modules/{r}/vmlinuz").into());
-        candidates.push(format!("/boot/vmlinuz-{r}").into());
-    }
-
-    // Unversioned fallback
-    candidates.push("/boot/vmlinuz".into());
-
-    candidates
-        .into_iter()
-        .find(|p| std::fs::File::open(p).is_ok())
+    let ktstr_kernel = std::env::var("KTSTR_KERNEL").ok();
+    kernel_path::find_image(ktstr_kernel.as_deref())
 }
 
 /// Build a cargo binary package and return its output path.

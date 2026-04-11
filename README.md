@@ -34,11 +34,11 @@ not need a separate install.
 
 ## Setup
 
-**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang, libelf-dev, pkg-config, bpftool.
+**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang, libelf-dev, libbpf-dev, pkg-config.
 
 ```sh
 # Ubuntu/Debian
-sudo apt install clang libelf-dev pkg-config bpftool
+sudo apt install clang libelf-dev libbpf-dev pkg-config
 ```
 
 **Add to your crate**:

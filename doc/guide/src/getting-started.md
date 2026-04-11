@@ -6,19 +6,19 @@
 - Rust toolchain (stable, >= 1.88)
 - clang and BPF toolchain (builds BPF skeletons via libbpf-cargo)
 - libelf development headers
+- libbpf development headers (vmlinux.h generation)
 - pkg-config
-- bpftool (generates vmlinux.h from the running kernel's BTF)
 
 **Ubuntu/Debian:**
 
 ```sh
-sudo apt install clang libelf-dev pkg-config bpftool
+sudo apt install clang libelf-dev libbpf-dev pkg-config
 ```
 
 **Fedora:**
 
 ```sh
-sudo dnf install clang elfutils-libelf-devel pkgconf bpftool
+sudo dnf install clang elfutils-libelf-devel libbpf-devel pkgconf
 ```
 
 ## Install tools

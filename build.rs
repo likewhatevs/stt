@@ -1,6 +1,7 @@
-// Generates vmlinux.h via bpftool from the kernel's BTF.
-// Uses $KTSTR_KERNEL/vmlinux if KTSTR_KERNEL is set, otherwise
-// falls back to /sys/kernel/btf/vmlinux (world-readable).
+// Generates vmlinux.h from kernel BTF using libbpf's btf_dump API.
+// Uses the shared kernel resolver (src/kernel_path.rs) to find the
+// BTF source: $KTSTR_KERNEL/vmlinux, ./linux/vmlinux, ../linux/vmlinux,
+// or /sys/kernel/btf/vmlinux as fallback.
 
 use std::env;
 use std::path::PathBuf;
@@ -8,43 +9,115 @@ use std::process::Command;
 
 use libbpf_cargo::SkeletonBuilder;
 
+include!("src/kernel_path.rs");
+
+/// Find the libbpf-sys source directory in the cargo registry.
+///
+/// libbpf-sys vendors libbpf headers at `libbpf/include/bpf/`. We
+/// locate the crate directory by scanning the cargo registry.
+fn find_libbpf_include() -> PathBuf {
+    let home = env::var("CARGO_HOME")
+        .or_else(|_| env::var("HOME").map(|h| format!("{h}/.cargo")))
+        .expect("CARGO_HOME or HOME must be set");
+    let registry = PathBuf::from(&home).join("registry/src");
+    if registry.is_dir() {
+        for entry in std::fs::read_dir(&registry).expect("read cargo registry") {
+            let index_dir = entry.expect("read index dir").path();
+            if !index_dir.is_dir() {
+                continue;
+            }
+            // Find the libbpf-sys directory matching our version range.
+            for pkg in std::fs::read_dir(&index_dir).expect("read packages") {
+                let pkg_dir = pkg.expect("read pkg dir").path();
+                if let Some(name) = pkg_dir.file_name().and_then(|n| n.to_str())
+                    && name.starts_with("libbpf-sys-1.")
+                {
+                    let include = pkg_dir.join("libbpf/include");
+                    if include.is_dir() {
+                        return include;
+                    }
+                }
+            }
+        }
+    }
+    panic!(
+        "libbpf-sys headers not found in cargo registry. \
+         Ensure libbpf-sys is a dependency."
+    );
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // Resolve BTF source: $KTSTR_KERNEL/vmlinux or /sys/kernel/btf/vmlinux.
+    // Cache invalidation: always track env var and resolved kernel.
+    println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
+    println!("cargo:rerun-if-changed=src/kernel_path.rs");
+    println!("cargo:rerun-if-changed=src/bpf/vmlinux_gen.c");
+    let ktstr_kernel = env::var("KTSTR_KERNEL").ok();
+    let kernel = resolve_kernel(ktstr_kernel.as_deref());
+    if let Some(ref path) = kernel {
+        println!("cargo:rerun-if-changed={}", path.join("vmlinux").display());
+    }
+
+    // Generate vmlinux.h from kernel BTF.
     let vmlinux_h = out_dir.join("vmlinux.h");
     if !vmlinux_h.exists() {
-        let btf_source = if let Ok(kernel_dir) = env::var("KTSTR_KERNEL") {
-            let p = PathBuf::from(&kernel_dir).join("vmlinux");
-            if p.exists() {
-                println!("cargo::warning=generating vmlinux.h from $KTSTR_KERNEL/vmlinux");
-                p.to_string_lossy().into_owned()
-            } else {
-                panic!(
-                    "KTSTR_KERNEL={kernel_dir} but {}/vmlinux not found. \
-                     Build the kernel first.",
-                    kernel_dir,
-                );
-            }
-        } else {
-            println!(
-                "cargo::warning=KTSTR_KERNEL not set, generating vmlinux.h \
-                 from /sys/kernel/btf/vmlinux"
+        let btf_source = resolve_btf(ktstr_kernel.as_deref()).unwrap_or_else(|| {
+            panic!(
+                "no BTF source found. Set KTSTR_KERNEL to a kernel build \
+                 directory, or ensure /sys/kernel/btf/vmlinux exists."
             );
-            "/sys/kernel/btf/vmlinux".to_string()
-        };
-        let output = Command::new("bpftool")
-            .args(["btf", "dump", "file", &btf_source, "format", "c"])
-            .output()
-            .expect("bpftool required to generate vmlinux.h");
-        assert!(
-            output.status.success(),
-            "bpftool btf dump failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+        });
+        println!(
+            "cargo::warning=generating vmlinux.h from {}",
+            btf_source.display()
         );
-        std::fs::write(&vmlinux_h, &output.stdout).expect("write vmlinux.h");
+
+        let libbpf_include = find_libbpf_include();
+
+        // Compile the C vmlinux generator + driver into a standalone binary.
+        let vmlinux_gen_bin = out_dir.join("vmlinux_gen");
+        let driver_src = out_dir.join("vmlinux_gen_main.c");
+        std::fs::write(
+            &driver_src,
+            format!(
+                r#"
+extern int generate_vmlinux_h(const char *, const char *);
+int main(void) {{
+    return generate_vmlinux_h("{btf}", "{out}") == 0 ? 0 : 1;
+}}
+"#,
+                btf = btf_source.display(),
+                out = vmlinux_h.display(),
+            ),
+        )
+        .expect("write driver source");
+
+        let compiler = cc::Build::new().get_compiler();
+        let status = Command::new(compiler.path())
+            .args([
+                "src/bpf/vmlinux_gen.c",
+                driver_src.to_str().unwrap(),
+                "-o",
+                vmlinux_gen_bin.to_str().unwrap(),
+                &format!("-I{}", libbpf_include.display()),
+                "-lbpf",
+                "-lelf",
+                "-lz",
+            ])
+            .status()
+            .expect("compile vmlinux_gen");
+        assert!(status.success(), "failed to compile vmlinux_gen");
+
+        let status = Command::new(&vmlinux_gen_bin)
+            .status()
+            .expect("run vmlinux_gen");
+        assert!(
+            status.success(),
+            "vmlinux_gen failed — check BTF source: {}",
+            btf_source.display()
+        );
     }
-    println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
 
     let clang_args = [
         format!("-I{}", out_dir.display()),
