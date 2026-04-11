@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <string.h>
 #include <bpf/btf.h>
+#include <bpf/libbpf.h>
 
 static void btf_dump_printf(void *ctx, const char *fmt, va_list args)
 {
