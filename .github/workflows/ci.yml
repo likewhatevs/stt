@@ -29,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -48,7 +50,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: llvm-tools-preview
+          components: rustfmt,llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
