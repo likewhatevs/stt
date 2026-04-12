@@ -121,29 +121,21 @@ mod tests {
     }
 
     #[test]
-    fn mpidr_unique_all_gauntlet_presets() {
-        let presets = [
-            (1, 4, 1),
-            (2, 2, 1),
-            (3, 3, 1),
-            (5, 3, 1),
-            (7, 2, 1),
-            (2, 2, 2),
-            (3, 2, 2),
-            (4, 4, 2),
-            (8, 4, 2),
-            (4, 16, 2),
-            (8, 8, 2),
-            (15, 8, 2),
-            (14, 9, 2),
-            (4, 8, 1),
-            (8, 8, 1),
-            (4, 32, 1),
-            (8, 16, 1),
-            (15, 16, 1),
-            (14, 18, 1),
+    fn mpidr_unique_representative_topologies() {
+        let topos = [
+            (1, 1, 1),   // degenerate single CPU
+            (2, 1, 1),   // minimal multi-socket
+            (3, 3, 1),   // odd non-power-of-2
+            (1, 1, 2),   // minimal SMT
+            (2, 4, 2),   // standard multi-socket with SMT
+            (7, 5, 3),   // all dimensions non-power-of-2
+            (15, 16, 1), // large scale no SMT
+            (14, 9, 2),  // large with SMT
+            (255, 1, 1), // max sockets before Aff2 overflow
+            (1, 255, 1), // max cores before Aff1 overflow
+            (4, 32, 1),  // many cores, multi-socket
         ];
-        for (sockets, cores, threads) in presets {
+        for (sockets, cores, threads) in topos {
             let t = Topology {
                 sockets,
                 cores_per_socket: cores,

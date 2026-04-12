@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn mptable_max_gauntlet_preset() {
+    fn mptable_large_topology() {
         let mem = test_mem(4096);
         let topo = Topology {
             sockets: 14,

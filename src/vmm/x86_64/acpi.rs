@@ -961,29 +961,20 @@ mod tests {
     }
 
     #[test]
-    fn madt_checksum_all_gauntlet_presets() {
-        let presets = [
-            (1, 4, 1),
-            (2, 2, 1),
-            (3, 3, 1),
-            (5, 3, 1),
-            (7, 2, 1),
-            (2, 2, 2),
-            (3, 2, 2),
-            (4, 4, 2),
-            (8, 4, 2),
-            (4, 16, 2),
-            (8, 8, 2),
-            (15, 8, 2),
-            (14, 9, 2),
-            (4, 8, 1),
-            (8, 8, 1),
-            (4, 32, 1),
-            (8, 16, 1),
-            (15, 16, 1),
-            (14, 18, 1),
+    fn madt_checksum_representative_topologies() {
+        let topos = [
+            (1, 1, 1),   // degenerate single CPU
+            (2, 1, 1),   // minimal multi-socket
+            (3, 3, 1),   // odd non-power-of-2
+            (1, 1, 2),   // minimal SMT
+            (2, 4, 2),   // standard multi-socket with SMT
+            (7, 5, 3),   // all dimensions non-power-of-2
+            (15, 16, 1), // large scale no SMT
+            (14, 9, 2),  // large with SMT, mixed LAPIC/x2APIC
+            (2, 128, 1), // x2APIC boundary (max APIC ID = 255)
+            (14, 18, 1), // large no SMT, mixed LAPIC/x2APIC
         ];
-        for (sockets, cores, threads) in presets {
+        for (sockets, cores, threads) in topos {
             let mem = test_mem(16);
             let topo = Topology {
                 sockets,

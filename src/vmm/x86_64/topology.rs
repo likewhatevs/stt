@@ -672,29 +672,19 @@ mod tests {
     }
 
     #[test]
-    fn apic_ids_unique_for_all_gauntlet_presets() {
-        let presets = [
-            (1, 4, 1),   // tiny-1llc
-            (2, 2, 1),   // tiny-2llc
-            (3, 3, 1),   // odd-3llc
-            (5, 3, 1),   // odd-5llc
-            (7, 2, 1),   // odd-7llc
-            (2, 2, 2),   // smt-2llc
-            (3, 2, 2),   // smt-3llc
-            (4, 4, 2),   // medium-4llc
-            (8, 4, 2),   // medium-8llc
-            (4, 16, 2),  // large-4llc
-            (8, 8, 2),   // large-8llc
-            (15, 8, 2),  // near-max-llc
-            (14, 9, 2),  // max-cpu
-            (4, 8, 1),   // medium-4llc-nosmt
-            (8, 8, 1),   // medium-8llc-nosmt
-            (4, 32, 1),  // large-4llc-nosmt
-            (8, 16, 1),  // large-8llc-nosmt
-            (15, 16, 1), // near-max-llc-nosmt
-            (14, 18, 1), // max-cpu-nosmt
+    fn apic_ids_unique_representative_topologies() {
+        let topos = [
+            (1, 1, 1),   // degenerate single CPU
+            (2, 1, 1),   // minimal multi-socket
+            (3, 3, 1),   // odd non-power-of-2
+            (1, 1, 2),   // minimal SMT
+            (2, 4, 2),   // standard multi-socket with SMT
+            (7, 5, 3),   // all dimensions non-power-of-2
+            (15, 16, 1), // large scale no SMT
+            (14, 9, 2),  // large with SMT, max APIC > 255
+            (2, 128, 1), // x2APIC boundary (max APIC ID = 255)
         ];
-        for (sockets, cores, threads) in presets {
+        for (sockets, cores, threads) in topos {
             let t = Topology {
                 sockets,
                 cores_per_socket: cores,
@@ -990,29 +980,18 @@ mod tests {
     }
 
     #[test]
-    fn decompose_roundtrip_all_gauntlet() {
-        let presets = [
-            (1, 4, 1),
-            (2, 2, 1),
-            (3, 3, 1),
-            (5, 3, 1),
-            (7, 2, 1),
-            (2, 2, 2),
-            (3, 2, 2),
-            (4, 4, 2),
-            (8, 4, 2),
-            (4, 16, 2),
-            (8, 8, 2),
-            (15, 8, 2),
-            (14, 9, 2),
-            (4, 8, 1),
-            (8, 8, 1),
-            (4, 32, 1),
-            (8, 16, 1),
-            (15, 16, 1),
-            (14, 18, 1),
+    fn decompose_roundtrip_representative_topologies() {
+        let topos = [
+            (1, 1, 1),   // degenerate single CPU
+            (2, 1, 1),   // minimal multi-socket
+            (3, 3, 1),   // odd non-power-of-2
+            (1, 1, 2),   // minimal SMT
+            (2, 4, 2),   // standard multi-socket with SMT
+            (7, 5, 3),   // all dimensions non-power-of-2
+            (15, 16, 1), // large scale no SMT
+            (14, 9, 2),  // large with SMT, max APIC > 255
         ];
-        for (sockets, cores, threads) in presets {
+        for (sockets, cores, threads) in topos {
             let t = Topology {
                 sockets,
                 cores_per_socket: cores,
@@ -1279,33 +1258,24 @@ mod tests {
     }
 
     #[test]
-    fn leaf_80000008_apic_id_size_all_gauntlet() {
+    fn leaf_80000008_apic_id_size_representative() {
         let kvm = match kvm_ioctls::Kvm::new() {
             Ok(k) => k,
             Err(_) => return,
         };
-        let presets = [
-            (1, 4, 1),
-            (2, 2, 1),
-            (3, 3, 1),
-            (5, 3, 1),
-            (7, 2, 1),
-            (2, 2, 2),
-            (3, 2, 2),
-            (4, 4, 2),
-            (8, 4, 2),
-            (4, 16, 2),
-            (8, 8, 2),
-            (15, 8, 2),
-            (14, 9, 2),
-            (4, 8, 1),
-            (8, 8, 1),
-            (4, 32, 1),
-            (8, 16, 1),
-            (15, 16, 1),
-            (14, 18, 1),
+        let topos = [
+            (1, 1, 1),   // degenerate single CPU (ECX=0 path)
+            (2, 1, 1),   // minimal multi-socket
+            (3, 3, 1),   // odd non-power-of-2
+            (1, 1, 2),   // minimal SMT
+            (2, 4, 2),   // standard multi-socket with SMT
+            (7, 5, 3),   // all dimensions non-power-of-2
+            (15, 16, 1), // large scale no SMT
+            (14, 9, 2),  // large with SMT, max APIC > 255
+            (1, 64, 1),  // EAX[31:26] boundary (bits_needed(64)=6)
+            (1, 18, 1),  // non-power-of-2 large threads_per_pkg
         ];
-        for (sockets, cores, threads) in presets {
+        for (sockets, cores, threads) in topos {
             let topo = Topology {
                 sockets,
                 cores_per_socket: cores,
@@ -1688,13 +1658,12 @@ mod tests {
         }
     }
 
-    /// Regression test: for every multi-socket gauntlet preset, verify that
-    /// CPUs in different sockets produce different L3 cache IDs via the
-    /// kernel's get_cache_id formula (apicid >> get_count_order(sharing+1)).
-    /// This is the invariant that makes from_system().split_by_llc() return
-    /// the correct number of LLCs inside the guest.
+    /// For multi-socket topologies, verify that CPUs in different sockets
+    /// produce different L3 cache IDs via the kernel's get_cache_id formula
+    /// (apicid >> get_count_order(sharing+1)). This invariant makes
+    /// from_system().split_by_llc() return the correct LLC count in guests.
     #[test]
-    fn cache_ids_distinct_per_socket_all_gauntlet() {
+    fn cache_ids_distinct_per_socket_representative() {
         let kvm = match kvm_ioctls::Kvm::new() {
             Ok(k) => k,
             Err(_) => return,
@@ -1711,25 +1680,17 @@ mod tests {
             CpuVendor::Unknown => return,
         };
 
-        let presets = [
-            (2, 2, 1),   // tiny-2llc
-            (3, 3, 1),   // odd-3llc
-            (5, 3, 1),   // odd-5llc
-            (7, 2, 1),   // odd-7llc
-            (2, 2, 2),   // smt-2llc
-            (3, 2, 2),   // smt-3llc
-            (4, 4, 2),   // medium-4llc
-            (8, 4, 2),   // medium-8llc
-            (4, 16, 2),  // large-4llc
-            (8, 8, 2),   // large-8llc
-            (4, 8, 1),   // medium-4llc-nosmt
-            (8, 8, 1),   // medium-8llc-nosmt
-            (4, 32, 1),  // large-4llc-nosmt
-            (8, 16, 1),  // large-8llc-nosmt
-            (15, 16, 1), // near-max-llc-nosmt
-            (14, 18, 1), // max-cpu-nosmt
+        // Multi-socket only — single-socket has no cross-socket invariant.
+        let topos = [
+            (2, 1, 1),   // minimal multi-socket
+            (3, 3, 1),   // odd non-power-of-2
+            (2, 4, 2),   // standard multi-socket with SMT
+            (7, 5, 3),   // all dimensions non-power-of-2
+            (5, 3, 2),   // prime sockets, odd cores, SMT
+            (15, 16, 1), // large scale no SMT
+            (14, 9, 2),  // large with SMT, max APIC > 255
         ];
-        for (sockets, cores, threads) in presets {
+        for (sockets, cores, threads) in topos {
             let topo = Topology {
                 sockets,
                 cores_per_socket: cores,
@@ -1788,7 +1749,7 @@ mod tests {
 
     #[test]
     fn max_apic_id_large_topology() {
-        // 14 sockets x 9 cores x 2 threads: the gauntlet max-cpu preset
+        // 14 sockets x 9 cores x 2 threads = 252 CPUs (near KVM vCPU limit)
         let t = Topology {
             sockets: 14,
             cores_per_socket: 9,
