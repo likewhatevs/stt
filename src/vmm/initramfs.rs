@@ -19,6 +19,8 @@ pub struct SharedLibs {
     /// Each entry includes whether it is a direct (DT_NEEDED) dependency
     /// of the root binary or a transitive dependency.
     pub missing: Vec<MissingLib>,
+    /// The binary's PT_INTERP path, if present (e.g. `/lib64/ld-linux-x86-64.so.2`).
+    pub interpreter: Option<String>,
 }
 
 /// A shared library dependency that could not be resolved.
@@ -126,15 +128,19 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
             return Ok(SharedLibs {
                 found: vec![],
                 missing: vec![],
+                interpreter: None,
             });
         }
     };
+
+    let interpreter = elf.interpreter.map(|s| s.to_string());
 
     if elf.libraries.is_empty() && elf.dynamic.is_none() {
         // No dynamic section — static binary.
         return Ok(SharedLibs {
             found: vec![],
             missing: vec![],
+            interpreter,
         });
     }
 
@@ -196,7 +202,11 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
         }
     }
 
-    Ok(SharedLibs { found, missing })
+    Ok(SharedLibs {
+        found,
+        missing,
+        interpreter,
+    })
 }
 
 /// Extract search paths from DT_RUNPATH (preferred) or DT_RPATH, with
@@ -236,6 +246,38 @@ fn elf_search_paths(elf: &goblin::elf::Elf, binary: &Path) -> Vec<PathBuf> {
             PathBuf::from(expanded)
         })
         .collect()
+}
+
+/// Well-known system dynamic linker paths. If a binary's PT_INTERP
+/// canonicalizes to the same file as one of these, it uses the standard
+/// linker and does not need the interpreter packed separately.
+const STANDARD_INTERPRETERS: &[&str] = &[
+    "/lib/ld-linux.so.2",
+    "/lib/ld-linux-aarch64.so.1",
+    "/lib/ld-linux-armhf.so.3",
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/ld-musl-x86_64.so.1",
+    "/lib/ld-musl-aarch64.so.1",
+    "/libexec/ld-elf.so.1",
+];
+
+/// Check if `interp` is a standard system linker. Compares the
+/// canonicalized path against canonicalized well-known linker paths
+/// to catch symlinks (e.g. `/opt/toolchain/lib/ld-linux-x86-64.so.2`
+/// symlinking to `/lib64/ld-linux-x86-64.so.2`).
+fn is_standard_interpreter(interp: &str) -> bool {
+    let interp_path = Path::new(interp);
+    // Direct match first (avoids syscalls for common case).
+    if STANDARD_INTERPRETERS.contains(&interp) {
+        return true;
+    }
+    // Canonicalize and compare against canonical standard paths.
+    let Ok(canon) = std::fs::canonicalize(interp_path) else {
+        return false;
+    };
+    STANDARD_INTERPRETERS.iter().any(|std_interp| {
+        std::fs::canonicalize(std_interp).is_ok_and(|std_canon| std_canon == canon)
+    })
 }
 
 /// Default library search paths used by the dynamic linker.
@@ -469,32 +511,48 @@ pub fn create_initramfs_base(
         let result = resolve_shared_libs(path)
             .with_context(|| format!("resolve libs for {}", path.display()))?;
 
-        if !result.missing.is_empty() && include_elf_paths.contains(path) {
-            let direct: Vec<&str> = result
-                .missing
-                .iter()
-                .filter(|m| m.direct)
-                .map(|m| m.soname.as_str())
-                .collect();
-            if !direct.is_empty() {
-                anyhow::bail!(
-                    "include file '{}' requires shared libraries not found in \
-                     LD_LIBRARY_PATH, RPATH, ld.so.conf, or default paths: {}",
-                    path.display(),
-                    direct.join(", ")
-                );
-            }
-            for m in result.missing.iter().filter(|m| !m.direct) {
-                eprintln!(
-                    "warning: include file '{}': transitive dependency {} \
-                     not found — the binary may not load in the guest VM",
-                    path.display(),
-                    m.soname
-                );
-            }
-        } else {
-            for m in &result.missing {
-                eprintln!("warning: {}: {} => not found", path.display(), m.soname);
+        for m in &result.missing {
+            eprintln!("warning: {}: {} => not found", path.display(), m.soname);
+        }
+
+        // Pack non-standard PT_INTERP (custom dynamic linker) into the
+        // initramfs so the guest kernel uses the same linker as the host.
+        if include_elf_paths.contains(path)
+            && let Some(ref interp) = result.interpreter
+            && !is_standard_interpreter(interp)
+        {
+            let interp_path = Path::new(interp);
+            if interp_path.is_file() {
+                let guest = interp.strip_prefix('/').unwrap_or(interp).to_string();
+                if let Some(parent) = Path::new(&guest).parent() {
+                    let mut dir = PathBuf::new();
+                    for component in parent.components() {
+                        dir.push(component);
+                        dirs.insert(dir.to_string_lossy().to_string());
+                    }
+                }
+                shared_libs.push((guest, interp_path.to_path_buf()));
+
+                // Resolve the interpreter's own shared lib deps.
+                if let Ok(interp_result) = resolve_shared_libs(interp_path) {
+                    for m in &interp_result.missing {
+                        eprintln!(
+                            "warning: {}: {} => not found",
+                            interp_path.display(),
+                            m.soname
+                        );
+                    }
+                    for (g, h) in interp_result.found {
+                        if let Some(parent) = Path::new(&g).parent() {
+                            let mut dir = PathBuf::new();
+                            for component in parent.components() {
+                                dir.push(component);
+                                dirs.insert(dir.to_string_lossy().to_string());
+                            }
+                        }
+                        shared_libs.push((g, h));
+                    }
+                }
             }
         }
 
