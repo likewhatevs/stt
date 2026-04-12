@@ -8,6 +8,8 @@ use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
 
 mod fetch;
+#[cfg(feature = "gha-cache")]
+mod remote_cache;
 
 /// ktstr.kconfig embedded at compile time so `cargo install` works.
 const EMBEDDED_KCONFIG: &str = include_str!("../../ktstr.kconfig");
@@ -492,7 +494,7 @@ fn kernel_build(
         // Check cache before downloading.
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}");
-        if !force && let Some(entry) = cache.lookup(&cache_key) {
+        if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
             eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
             eprintln!("cargo-ktstr: use --force to rebuild");
             return Ok(());
@@ -505,7 +507,7 @@ fn kernel_build(
     if !force
         && (source.is_some() || git.is_some())
         && !acquired.is_dirty
-        && let Some(entry) = cache.lookup(&acquired.cache_key)
+        && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
         eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
         eprintln!("cargo-ktstr: use --force to rebuild");
@@ -583,6 +585,12 @@ fn kernel_build(
         .store(&acquired.cache_key, &image_path, &metadata)
         .map_err(|e| format!("cache store: {e}"))?;
 
+    // Store to remote cache when enabled.
+    #[cfg(feature = "gha-cache")]
+    if remote_cache::is_enabled() {
+        remote_cache::remote_store(&entry);
+    }
+
     eprintln!("cargo-ktstr: kernel cached as {}", acquired.cache_key);
     eprintln!(
         "cargo-ktstr: image: {}",
@@ -627,6 +635,22 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+/// Look up a cache key, checking local first, then remote (if enabled).
+fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
+    // Local first.
+    if let Some(entry) = cache.lookup(cache_key) {
+        return Some(entry);
+    }
+
+    // Remote fallback.
+    #[cfg(feature = "gha-cache")]
+    if remote_cache::is_enabled() {
+        return remote_cache::remote_lookup(cache, cache_key);
+    }
+
+    None
+}
+
 /// Resolve a kernel image path from a Version or CacheKey identifier.
 fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, String> {
     use ktstr::kernel_path::KernelId;
@@ -635,7 +659,7 @@ fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, S
             let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
             let (arch, _) = fetch::arch_info();
             let cache_key = format!("{ver}-tarball-{arch}");
-            match cache.lookup(&cache_key) {
+            match cache_lookup(&cache, &cache_key) {
                 Some(entry) => entry
                     .metadata
                     .as_ref()
@@ -649,7 +673,7 @@ fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, S
         }
         KernelId::CacheKey(key) => {
             let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
-            match cache.lookup(key) {
+            match cache_lookup(&cache, key) {
                 Some(entry) => entry
                     .metadata
                     .as_ref()
@@ -1118,6 +1142,17 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
 }
 
 fn main() {
+    #[cfg(not(feature = "gha-cache"))]
+    if std::env::var("KTSTR_GHA_CACHE")
+        .ok()
+        .is_some_and(|v| v == "1")
+    {
+        eprintln!(
+            "cargo-ktstr: warning: KTSTR_GHA_CACHE=1 but binary compiled without gha-cache feature. \
+             Rebuild with: cargo install cargo-ktstr --features gha-cache"
+        );
+    }
+
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
     } = Cargo::parse();
