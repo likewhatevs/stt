@@ -5,7 +5,9 @@ use std::process::Command;
 
 use cargo_ktstr::{build_make_args, has_sched_ext, run_test_stats};
 use clap::{Parser, Subcommand};
-use ktstr::cache::{CacheDir, CacheEntry};
+use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
+
+mod fetch;
 
 /// ktstr.kconfig embedded at compile time so `cargo install` works.
 const EMBEDDED_KCONFIG: &str = include_str!("../../ktstr.kconfig");
@@ -70,6 +72,27 @@ enum KernelCommand {
         /// Output in JSON format for CI scripting.
         #[arg(long)]
         json: bool,
+    },
+    /// Download, build, and cache a kernel image.
+    Build {
+        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3).
+        #[arg(conflicts_with_all = ["source", "git"])]
+        version: Option<String>,
+        /// Path to existing kernel source directory.
+        #[arg(long, conflicts_with_all = ["version", "git"])]
+        source: Option<PathBuf>,
+        /// Git URL to clone kernel source from.
+        #[arg(long, requires = "git_ref", conflicts_with_all = ["version", "source"])]
+        git: Option<String>,
+        /// Git ref to checkout (branch, tag, commit).
+        #[arg(long = "ref", requires = "git")]
+        git_ref: Option<String>,
+        /// Rebuild even if a cached image exists.
+        #[arg(long)]
+        force: bool,
+        /// Run make mrproper before configuring (local source only).
+        #[arg(long)]
+        clean: bool,
     },
     /// Remove cached kernel images.
     Clean {
@@ -359,6 +382,171 @@ fn kernel_clean(keep: Option<usize>, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Acquire source, configure, build, and cache a kernel image.
+fn kernel_build(
+    version: Option<String>,
+    source: Option<PathBuf>,
+    git: Option<String>,
+    git_ref: Option<String>,
+    force: bool,
+    clean: bool,
+) -> Result<(), String> {
+    let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+
+    // Temporary directory for tarball/git source extraction.
+    // Lives until end of function so the source tree persists through build.
+    let tmp_dir = tempfile::TempDir::new().map_err(|e| format!("create temp dir: {e}"))?;
+
+    // Acquire source.
+    let acquired = if let Some(ref src_path) = source {
+        fetch::local_source(src_path)?
+    } else if let Some(ref url) = git {
+        let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
+        fetch::git_clone(url, ref_name, tmp_dir.path())?
+    } else {
+        // Tarball download: explicit version or latest stable.
+        let ver = match version {
+            Some(v) => v,
+            None => fetch::fetch_latest_stable_version()?,
+        };
+        // Check cache before downloading.
+        let (arch, _) = fetch::arch_info();
+        let cache_key = format!("{ver}-tarball-{arch}");
+        if !force && let Some(entry) = cache.lookup(&cache_key) {
+            eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
+            eprintln!("cargo-ktstr: use --force to rebuild");
+            return Ok(());
+        }
+        fetch::download_tarball(&ver, tmp_dir.path())?
+    };
+
+    // Check cache for --source and --git (tarball already checked
+    // pre-download above).
+    if !force
+        && (source.is_some() || git.is_some())
+        && !acquired.is_dirty
+        && let Some(entry) = cache.lookup(&acquired.cache_key)
+    {
+        eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
+        eprintln!("cargo-ktstr: use --force to rebuild");
+        return Ok(());
+    }
+
+    let source_dir = &acquired.source_dir;
+
+    // Clean step (local source only).
+    if clean {
+        if source.is_none() {
+            eprintln!(
+                "cargo-ktstr: --clean is only meaningful with --source (downloaded sources start clean)"
+            );
+        } else {
+            eprintln!("cargo-ktstr: make mrproper");
+            run_make(source_dir, &["mrproper"])?;
+        }
+    }
+
+    // Configure.
+    if !has_sched_ext(source_dir) {
+        configure_kernel(source_dir, EMBEDDED_KCONFIG)?;
+    }
+
+    // Build.
+    make_kernel(source_dir)?;
+
+    // Generate compile_commands.json for local trees (LSP support).
+    if !acquired.is_temp {
+        gen_compile_commands(source_dir)?;
+    }
+
+    // Find the built kernel image.
+    let image_path = ktstr::kernel_path::find_image_in_dir(source_dir)
+        .ok_or_else(|| format!("no kernel image found in {}", source_dir.display()))?;
+
+    // Cache (skip for dirty local trees).
+    if acquired.is_dirty {
+        eprintln!("cargo-ktstr: kernel built at {}", image_path.display());
+        eprintln!("cargo-ktstr: skipping cache (dirty tree)");
+        return Ok(());
+    }
+
+    // Compute config hash.
+    let config_path = source_dir.join(".config");
+    let config_hash = if config_path.exists() {
+        let data = std::fs::read(&config_path).map_err(|e| format!("read .config: {e}"))?;
+        Some(format!("{:08x}", crc32fast::hash(&data)))
+    } else {
+        None
+    };
+
+    let (arch, image_name) = fetch::arch_info();
+    let kconfig_hash = embedded_kconfig_hash();
+
+    let metadata = KernelMetadata::new(
+        acquired.source_type.clone(),
+        arch.to_string(),
+        image_name.to_string(),
+        now_iso8601(),
+    )
+    .with_version(acquired.version.clone())
+    .with_config_hash(config_hash)
+    .with_ktstr_kconfig_hash(Some(kconfig_hash))
+    .with_git_hash(acquired.git_hash.clone())
+    .with_git_ref(acquired.git_ref.clone())
+    .with_source_tree_path(if source.is_some() {
+        Some(acquired.source_dir.clone())
+    } else {
+        None
+    });
+
+    let entry = cache
+        .store(&acquired.cache_key, &image_path, &metadata)
+        .map_err(|e| format!("cache store: {e}"))?;
+
+    eprintln!("cargo-ktstr: kernel cached as {}", acquired.cache_key);
+    eprintln!(
+        "cargo-ktstr: image: {}",
+        entry.path.join(image_name).display()
+    );
+
+    Ok(())
+}
+
+/// Current time as ISO 8601 string (UTC, second precision).
+fn now_iso8601() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    // Manual UTC formatting to avoid adding chrono as a dependency.
+    // Good enough for cache metadata timestamps.
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Days since Unix epoch to Y-M-D (simplified Gregorian).
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 fn main() {
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
@@ -370,6 +558,14 @@ fn main() {
         KtstrCommand::TestStats { ref dir } => test_stats(dir),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => kernel_list(json),
+            KernelCommand::Build {
+                version,
+                source,
+                git,
+                git_ref,
+                force,
+                clean,
+            } => kernel_build(version, source, git, git_ref, force, clean),
             KernelCommand::Clean { keep, force } => kernel_clean(keep, force),
         },
     };
@@ -377,5 +573,36 @@ fn main() {
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- days_to_ymd --
+
+    #[test]
+    fn days_to_ymd_epoch() {
+        // Day 0 = 1970-01-01.
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_known_date() {
+        // 2026-04-12 = 20555 days since epoch.
+        assert_eq!(days_to_ymd(20555), (2026, 4, 12));
+    }
+
+    #[test]
+    fn days_to_ymd_leap_year_feb29() {
+        // 2024-02-29 = 19782 days since epoch.
+        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_end_of_year() {
+        // 2023-12-31 = 19722 days since epoch.
+        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
     }
 }

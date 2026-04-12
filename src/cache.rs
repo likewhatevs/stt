@@ -87,6 +87,63 @@ pub struct KernelMetadata {
     pub source_tree_path: Option<PathBuf>,
 }
 
+impl KernelMetadata {
+    /// Create a new KernelMetadata with required fields.
+    ///
+    /// Optional fields default to `None`. Use struct update syntax
+    /// within the crate or setter methods to populate them.
+    pub fn new(source: SourceType, arch: String, image_name: String, built_at: String) -> Self {
+        KernelMetadata {
+            version: None,
+            source,
+            arch,
+            image_name,
+            config_hash: None,
+            built_at,
+            ktstr_kconfig_hash: None,
+            git_hash: None,
+            git_ref: None,
+            source_tree_path: None,
+        }
+    }
+
+    /// Set the kernel version.
+    pub fn with_version(mut self, version: Option<String>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Set the .config CRC32 hash.
+    pub fn with_config_hash(mut self, hash: Option<String>) -> Self {
+        self.config_hash = hash;
+        self
+    }
+
+    /// Set the ktstr.kconfig CRC32 hash.
+    pub fn with_ktstr_kconfig_hash(mut self, hash: Option<String>) -> Self {
+        self.ktstr_kconfig_hash = hash;
+        self
+    }
+
+    /// Set the git commit hash (short form).
+    pub fn with_git_hash(mut self, hash: Option<String>) -> Self {
+        self.git_hash = hash;
+        self
+    }
+
+    /// Set the git ref used for checkout.
+    pub fn with_git_ref(mut self, git_ref: Option<String>) -> Self {
+        self.git_ref = git_ref;
+        self
+    }
+
+    /// Set the source tree path (local builds only).
+    pub fn with_source_tree_path(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.source_tree_path = path;
+        self
+    }
+}
+
 // Re-export KernelId from kernel_path (canonical definition, std-only).
 pub use crate::kernel_path::KernelId;
 
