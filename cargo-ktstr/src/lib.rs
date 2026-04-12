@@ -1,7 +1,8 @@
+use std::io::IsTerminal;
 use std::path::Path;
 
 use comfy_table::presets::ASCII_FULL_CONDENSED;
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use serde::Deserialize;
 
 /// Check if a kernel .config contains CONFIG_SCHED_CLASS_EXT=y.
@@ -282,20 +283,49 @@ fn fmt_duration(seconds: f64) -> String {
     }
 }
 
+/// Whether colored output should be used.
+///
+/// Returns `true` when stdout is a terminal and `NO_COLOR` is not set.
+fn use_color() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
+/// Wrap `text` in ANSI SGR codes if `color` is true.
+fn ansi(text: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Format test stats into a pretty report string.
 pub fn format_stats(stats: &TestStats) -> String {
     let mut out = String::new();
+    let color = use_color();
 
     // Summary line.
     out.push_str(&format!(
-        "\n  {} tests | {} passed | {} failed | {} flaky | {} skipped | {} retries | {}\n",
+        "\n  {} tests | {} | {} | {} | {} skipped | {} retries | {}\n",
         stats.total,
-        stats.passed,
-        stats.failed,
-        stats.flaky,
+        ansi(
+            &format!("{} passed", stats.passed),
+            "32",
+            color && stats.passed > 0,
+        ),
+        ansi(
+            &format!("{} failed", stats.failed),
+            "31",
+            color && stats.failed > 0,
+        ),
+        ansi(
+            &format!("{} flaky", stats.flaky),
+            "33",
+            color && stats.flaky > 0,
+        ),
         stats.skipped,
         stats.total_retries,
-        fmt_duration(stats.wall_clock_s),
+        ansi(&fmt_duration(stats.wall_clock_s), "2", color),
     ));
 
     // Per-suite table.
@@ -306,14 +336,43 @@ pub fn format_stats(stats: &TestStats) -> String {
             .load_preset(ASCII_FULL_CONDENSED)
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_header(vec!["Suite", "Tests", "Pass", "Fail", "Flaky", "Test Time"]);
+        if color {
+            table.enforce_styling();
+        } else {
+            table.force_no_tty();
+        }
         for s in &stats.suites {
+            let pass_cell = Cell::new(s.passed.to_string());
+            let pass_cell = if color && s.passed > 0 {
+                pass_cell.fg(Color::Green)
+            } else {
+                pass_cell
+            };
+            let fail_cell = Cell::new(s.failed.to_string());
+            let fail_cell = if color && s.failed > 0 {
+                fail_cell.fg(Color::Red).add_attribute(Attribute::Bold)
+            } else {
+                fail_cell
+            };
+            let flaky_cell = Cell::new(s.flaky.to_string());
+            let flaky_cell = if color && s.flaky > 0 {
+                flaky_cell.fg(Color::Yellow)
+            } else {
+                flaky_cell
+            };
+            let duration_cell = Cell::new(fmt_duration(s.duration_s));
+            let duration_cell = if color {
+                duration_cell.add_attribute(Attribute::Dim)
+            } else {
+                duration_cell
+            };
             table.add_row(vec![
-                s.name.clone(),
-                s.tests.to_string(),
-                s.passed.to_string(),
-                s.failed.to_string(),
-                s.flaky.to_string(),
-                fmt_duration(s.duration_s),
+                Cell::new(&s.name),
+                Cell::new(s.tests.to_string()),
+                pass_cell,
+                fail_cell,
+                flaky_cell,
+                duration_cell,
             ]);
         }
         out.push_str(&table.to_string());
@@ -322,14 +381,19 @@ pub fn format_stats(stats: &TestStats) -> String {
 
     // Failed tests.
     if !stats.failed_tests.is_empty() {
-        out.push_str("\n  FAILED:\n");
+        out.push_str(&format!("\n  {}:\n", ansi("FAILED", "31;1", color)));
         for ft in &stats.failed_tests {
             let retry_info = if ft.retries > 0 {
                 format!(" ({} retries)", ft.retries)
             } else {
                 String::new()
             };
-            out.push_str(&format!("    {} [{}]{}\n", ft.name, ft.suite, retry_info));
+            out.push_str(&format!(
+                "    {} [{}]{}\n",
+                ansi(&ft.name, "31", color),
+                ansi(&ft.suite, "2", color),
+                retry_info,
+            ));
             if let Some(ref msg) = ft.message {
                 out.push_str(&format!("      {}\n", msg));
             }
@@ -338,11 +402,16 @@ pub fn format_stats(stats: &TestStats) -> String {
 
     // Flaky tests.
     if !stats.flaky_tests.is_empty() {
-        out.push_str("\n  FLAKY (passed after retries):\n");
+        out.push_str(&format!(
+            "\n  {} (passed after retries):\n",
+            ansi("FLAKY", "33;1", color),
+        ));
         for ft in &stats.flaky_tests {
             out.push_str(&format!(
                 "    {} [{}] ({} retries)\n",
-                ft.name, ft.suite, ft.retries
+                ansi(&ft.name, "33", color),
+                ansi(&ft.suite, "2", color),
+                ft.retries,
             ));
         }
     }
@@ -352,10 +421,10 @@ pub fn format_stats(stats: &TestStats) -> String {
         out.push_str("\n  SLOWEST:\n");
         for st in &stats.slowest {
             out.push_str(&format!(
-                "    {:>7}  {} [{}]\n",
-                fmt_duration(st.duration_s),
+                "    {}  {} [{}]\n",
+                ansi(&format!("{:>7}", fmt_duration(st.duration_s)), "2", color),
                 st.name,
-                st.suite,
+                ansi(&st.suite, "2", color),
             ));
         }
     }

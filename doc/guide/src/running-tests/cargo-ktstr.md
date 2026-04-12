@@ -75,6 +75,9 @@ The output includes:
 - **Flaky tests** -- tests that passed after one or more retries.
 - **Slowest tests** -- top 10 by duration.
 
+Output is colorized when writing to a terminal. Set `NO_COLOR` to
+disable color (see [Environment Variables](../reference/environment-variables.md)).
+
 ### Prerequisites
 
 The nextest profile must have JUnit output enabled. The default
