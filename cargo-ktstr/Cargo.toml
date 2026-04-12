@@ -11,6 +11,7 @@ categories = ["development-tools::testing", "development-tools::cargo-plugins"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crc32fast = "1.5"
 flate2 = "1"
 gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status"] }

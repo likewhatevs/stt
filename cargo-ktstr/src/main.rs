@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cargo_ktstr::{build_make_args, has_sched_ext, run_test_stats};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
 
 mod fetch;
@@ -86,6 +86,14 @@ enum KtstrCommand {
         /// Print raw verifier output without formatting.
         #[arg(long)]
         raw: bool,
+    },
+    /// Generate shell completions for cargo-ktstr.
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+        /// Binary name for completions (default: "cargo").
+        #[arg(long, default_value = "cargo")]
+        binary: String,
     },
     /// Boot an interactive shell in a KVM virtual machine.
     ///
@@ -845,6 +853,11 @@ fn run_verifier(
     Ok(())
 }
 
+fn run_completions(shell: clap_complete::Shell, binary: &str) {
+    let mut cmd = Cargo::command();
+    clap_complete::generate(shell, &mut cmd, binary, &mut std::io::stdout());
+}
+
 fn main() {
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
@@ -857,6 +870,10 @@ fn main() {
                 kernel.display()
             );
             build_kernel(&kernel, clean)
+        }
+        KtstrCommand::Completions { shell, binary } => {
+            run_completions(shell, &binary);
+            Ok(())
         }
         KtstrCommand::Test { kernel, args } => run_test(kernel, args),
         KtstrCommand::Verifier {
@@ -919,5 +936,29 @@ mod tests {
     fn days_to_ymd_end_of_year() {
         // 2023-12-31 = 19722 days since epoch.
         assert_eq!(days_to_ymd(19722), (2023, 12, 31));
+    }
+
+    // -- completions --
+
+    #[test]
+    fn completions_bash_non_empty() {
+        let mut buf = Vec::new();
+        let mut cmd = Cargo::command();
+        clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, "cargo", &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn completions_zsh_contains_subcommands() {
+        let mut buf = Vec::new();
+        let mut cmd = Cargo::command();
+        clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, "cargo", &mut buf);
+        let output = String::from_utf8(buf).expect("completions should be valid UTF-8");
+        assert!(output.contains("test"), "zsh completions missing 'test'");
+        assert!(output.contains("shell"), "zsh completions missing 'shell'");
+        assert!(
+            output.contains("kernel"),
+            "zsh completions missing 'kernel'"
+        );
     }
 }
