@@ -279,8 +279,8 @@ impl BaseKey {
     /// Hash shared library paths and content samples for a binary so
     /// the cache key changes when any shared lib is updated on the host.
     fn hash_shared_libs(binary: &Path, hasher: &mut std::hash::DefaultHasher) {
-        if let Ok(libs) = initramfs::resolve_shared_libs(binary) {
-            let mut entries: Vec<_> = libs.iter().map(|(_, p)| p.clone()).collect();
+        if let Ok(result) = initramfs::resolve_shared_libs(binary) {
+            let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
             entries.sort();
             for p in &entries {
                 p.to_str().unwrap_or("").hash(hasher);
@@ -569,7 +569,7 @@ pub fn estimate_min_memory_mb(
         .into_iter()
         .flatten()
         .filter_map(|p| initramfs::resolve_shared_libs(p).ok())
-        .flat_map(|libs| libs.into_iter().map(|(_, p)| p))
+        .flat_map(|result| result.found.into_iter().map(|(_, p)| p))
         .filter_map(|p| std::fs::metadata(&p).ok())
         .map(|m| m.len())
         .sum();

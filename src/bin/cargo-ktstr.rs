@@ -120,8 +120,7 @@ enum KtstrCommand {
     /// Launches a VM with busybox and drops into a shell. Files passed
     /// via -i are available at /include-files/<name> inside the guest.
     /// Dynamically-linked ELF binaries get automatic shared library
-    /// resolution via ldd. Note: ldd executes the binary's ELF
-    /// interpreter, so only include trusted binaries.
+    /// resolution via ELF DT_NEEDED parsing.
     Shell {
         /// Kernel identifier: path (`../linux`), version (`6.14.2`),
         /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).

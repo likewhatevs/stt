@@ -502,16 +502,10 @@ pub fn run_shell(
             .filter_map(|(_, p)| std::fs::metadata(p).ok())
             .map(|m| m.len())
             .sum();
-        let include_lib_size: u64 = include_files
-            .iter()
-            .filter_map(|(_, p)| vmm::initramfs::resolve_shared_libs(p).ok())
-            .flat_map(|libs| libs.into_iter().map(|(_, p)| p))
-            .filter_map(|p| std::fs::metadata(&p).ok())
-            .map(|m| m.len())
-            .sum();
-        let include_mb = ((include_size + include_lib_size + (1 << 20) - 1) >> 20) as u32;
-        // Include files are not stripped, so count their full size
-        // in the initramfs memory floor (2x for compressed+uncompressed).
+        // 3x for shared lib overhead (typical ELF deps are ~1-2x the
+        // binary size plus cpio metadata), then 2x for
+        // compressed+uncompressed coexistence during initramfs extraction.
+        let include_mb = ((include_size * 3 + (1 << 20) - 1) >> 20) as u32;
         (base + 2 * include_mb).max(256)
     });
 

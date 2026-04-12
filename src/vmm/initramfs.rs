@@ -9,69 +9,225 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-/// Resolve shared library dependencies for a dynamically-linked binary.
-/// Runs `ldd`, parses output, returns `(guest_path, host_path)` pairs.
-/// Skips linux-vdso (kernel-provided). Returns empty vec for static binaries.
-/// Warns to stderr for any dependency ldd reports as "not found".
-pub fn resolve_shared_libs(binary: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let output = std::process::Command::new("ldd")
-        .arg(binary)
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .with_context(|| format!("ldd {}", binary.display()))?;
+/// Result of shared library resolution for a binary.
+#[derive(Debug)]
+pub struct SharedLibs {
+    /// Resolved `(guest_path, host_path)` pairs.
+    pub found: Vec<(String, PathBuf)>,
+    /// Library sonames that could not be resolved to a host path.
+    /// Each entry includes whether it is a direct (DT_NEEDED) dependency
+    /// of the root binary or a transitive dependency.
+    pub missing: Vec<MissingLib>,
+}
 
-    if !output.status.success() {
-        // ldd exits non-zero for static binaries ("not a dynamic executable")
-        return Ok(vec![]);
+/// A shared library dependency that could not be resolved.
+#[derive(Debug)]
+pub struct MissingLib {
+    /// The soname (e.g. `libssl.so.1.1`).
+    pub soname: String,
+    /// True if this soname appears in the root binary's DT_NEEDED.
+    /// False if it is a transitive dependency of one of the root's deps.
+    pub direct: bool,
+}
+
+/// Resolve shared library dependencies for a dynamically-linked ELF binary.
+/// Parses the ELF dynamic section to read DT_NEEDED entries, then resolves
+/// each soname to a host path using DT_RUNPATH/DT_RPATH and default library
+/// paths. Recurses into resolved libraries to build the full transitive
+/// closure. Returns empty result for static binaries or non-ELF files.
+pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
+    let data =
+        std::fs::read(binary).with_context(|| format!("read binary: {}", binary.display()))?;
+    let elf = match object::read::elf::ElfFile64::<object::Endianness>::parse(&*data) {
+        Ok(e) => e,
+        Err(_) => {
+            // Not a valid ELF (or 32-bit) — treat as static/non-dynamic.
+            return Ok(SharedLibs {
+                found: vec![],
+                missing: vec![],
+            });
+        }
+    };
+
+    let dynamic = match elf.elf_dynamic_table() {
+        Ok(d) => d,
+        Err(_) => {
+            // No dynamic section — static binary.
+            return Ok(SharedLibs {
+                found: vec![],
+                missing: vec![],
+            });
+        }
+    };
+
+    // Extract DT_NEEDED, DT_RUNPATH, and DT_RPATH from the root binary.
+    let root_needed = elf_dynamic_needed(&dynamic);
+    let root_search = elf_search_paths(&dynamic, binary);
+
+    // Resolve the full transitive closure. Each queued entry carries the
+    // search paths from the library that declared the DT_NEEDED, since
+    // each ELF has its own DT_RUNPATH/DT_RPATH.
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    let mut missing: Vec<MissingLib> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    // Queue: (soname, is_direct_dep_of_root, search_paths_from_parent)
+    let mut queue: std::collections::VecDeque<(String, bool, Vec<PathBuf>)> = root_needed
+        .iter()
+        .map(|s| (s.clone(), true, root_search.clone()))
+        .collect();
+
+    while let Some((soname, is_direct, search_paths)) = queue.pop_front() {
+        if !visited.insert(soname.clone()) {
+            continue;
+        }
+        if let Some(host_path) = resolve_soname(&soname, &search_paths) {
+            let canonical = std::fs::canonicalize(&host_path).unwrap_or_else(|_| host_path.clone());
+            let canon_str = canonical.to_string_lossy();
+            let canon_guest = canon_str
+                .strip_prefix('/')
+                .unwrap_or(&canon_str)
+                .to_string();
+            found.push((canon_guest.clone(), canonical.clone()));
+
+            // Also add the non-canonical path if it differs, so the
+            // guest dynamic linker can find the lib via either path.
+            let host_str = host_path.to_string_lossy();
+            let host_guest = host_str.strip_prefix('/').unwrap_or(&host_str).to_string();
+            if host_guest != canon_guest {
+                found.push((host_guest, canonical.clone()));
+            }
+
+            // Recurse: parse the resolved lib's own DT_NEEDED and use
+            // its own DT_RUNPATH/DT_RPATH for resolving those deps.
+            if let Ok(lib_data) = std::fs::read(&canonical)
+                && let Ok(lib_elf) =
+                    object::read::elf::ElfFile64::<object::Endianness>::parse(&*lib_data)
+                && let Ok(lib_dynamic) = lib_elf.elf_dynamic_table()
+            {
+                let lib_search = elf_search_paths(&lib_dynamic, &canonical);
+                for transitive in elf_dynamic_needed(&lib_dynamic) {
+                    if !visited.contains(&transitive) {
+                        queue.push_back((transitive, false, lib_search.clone()));
+                    }
+                }
+            }
+        } else {
+            missing.push(MissingLib {
+                soname,
+                direct: is_direct,
+            });
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut libs = Vec::new();
+    Ok(SharedLibs { found, missing })
+}
 
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.contains("linux-vdso") || line.contains("linux-gate") {
-            continue;
+/// Extract DT_NEEDED sonames from a parsed dynamic table.
+fn elf_dynamic_needed(
+    dynamic: &object::read::elf::DynamicTable<'_, object::elf::FileHeader64<object::Endianness>>,
+) -> Vec<String> {
+    let mut needed = Vec::new();
+    for entry in dynamic {
+        if entry.tag == object::elf::DT_NEEDED
+            && let Ok(name) = dynamic.string(entry)
+        {
+            needed.push(String::from_utf8_lossy(name).into_owned());
         }
-        if line.contains("not found") {
-            eprintln!("warning: ldd {}: {line}", binary.display());
-            continue;
-        }
-        if let Some(path) = parse_ldd_line(line) {
-            // Canonicalize the host path to resolve symlinks (e.g.,
-            // /lib64/libelf.so.1 → /usr/lib64/libelf.so.1 when /lib64
-            // is a symlink to usr/lib64). Include both the canonical
-            // and ldd-reported paths so the dynamic linker finds libs
-            // regardless of whether the guest has matching symlinks.
-            let host = PathBuf::from(&path);
-            let canonical = std::fs::canonicalize(&host).unwrap_or(host.clone());
-            let canon_str = canonical.to_str().unwrap_or(&path);
-            let canon_guest = canon_str.strip_prefix('/').unwrap_or(canon_str);
-            libs.push((canon_guest.to_string(), canonical.clone()));
+    }
+    needed
+}
 
-            let ldd_guest = path.strip_prefix('/').unwrap_or(&path);
-            if ldd_guest != canon_guest {
-                libs.push((ldd_guest.to_string(), canonical));
+/// Extract search paths from DT_RUNPATH (preferred) or DT_RPATH, with
+/// dynamic string tokens expanded:
+/// - `$ORIGIN` / `${ORIGIN}`: binary's parent directory
+/// - `$LIB` / `${LIB}`: `lib` or `lib64` based on ELF class
+/// - `$PLATFORM` / `${PLATFORM}`: `x86_64` or `aarch64`
+fn elf_search_paths(
+    dynamic: &object::read::elf::DynamicTable<'_, object::elf::FileHeader64<object::Endianness>>,
+    binary: &Path,
+) -> Vec<PathBuf> {
+    let origin = binary
+        .parent()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .unwrap_or_default();
+
+    // DT_RUNPATH takes precedence over DT_RPATH when both are present.
+    let mut raw_paths: Option<String> = None;
+    for entry in dynamic {
+        if entry.tag == object::elf::DT_RUNPATH
+            && let Ok(val) = dynamic.string(entry)
+        {
+            raw_paths = Some(String::from_utf8_lossy(val).into_owned());
+            break;
+        }
+    }
+    if raw_paths.is_none() {
+        for entry in dynamic {
+            if entry.tag == object::elf::DT_RPATH
+                && let Ok(val) = dynamic.string(entry)
+            {
+                raw_paths = Some(String::from_utf8_lossy(val).into_owned());
+                break;
             }
         }
     }
 
-    Ok(libs)
+    let Some(raw) = raw_paths else {
+        return vec![];
+    };
+
+    let origin_str = origin.to_string_lossy();
+    // ElfFile64 implies 64-bit ELF class → lib64. 32-bit would be lib.
+    let lib_str = "lib64";
+    let platform_str = std::env::consts::ARCH;
+
+    raw.split(':')
+        .map(|p| {
+            let expanded = p
+                .replace("$ORIGIN", &origin_str)
+                .replace("${ORIGIN}", &origin_str)
+                .replace("$LIB", lib_str)
+                .replace("${LIB}", lib_str)
+                .replace("$PLATFORM", platform_str)
+                .replace("${PLATFORM}", platform_str);
+            PathBuf::from(expanded)
+        })
+        .collect()
 }
 
-/// Parse a single ldd output line into a host path.
-fn parse_ldd_line(line: &str) -> Option<String> {
-    let line = line.trim();
-    if let Some(pos) = line.find("=>") {
-        let after = line[pos + 2..].trim();
-        let path = after.split_whitespace().next()?;
-        if path.starts_with('/') {
-            return Some(path.to_string());
+/// Default library search paths used by the dynamic linker.
+const DEFAULT_LIB_PATHS: &[&str] = &[
+    "/lib",
+    "/usr/lib",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/x86_64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+];
+
+/// Resolve a soname to a host path.
+/// Search order: RUNPATH/RPATH dirs, then default library paths.
+fn resolve_soname(soname: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
+    // 1. RUNPATH / RPATH directories.
+    for dir in search_paths {
+        let candidate = dir.join(soname);
+        if candidate.is_file() {
+            return Some(candidate);
         }
-    } else if line.starts_with('/') {
-        let path = line.split_whitespace().next()?;
-        return Some(path.to_string());
     }
+
+    // 2. Default paths.
+    for dir in DEFAULT_LIB_PATHS {
+        let candidate = Path::new(dir).join(soname);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
     None
 }
 
@@ -227,18 +383,49 @@ pub fn create_initramfs_base(
         .collect();
 
     // ELF files from include_files join the shared lib resolution chain.
-    // "not found" warnings are emitted by resolve_shared_libs during the
-    // ldd parse loop below.
+    let mut include_elf_paths: Vec<&Path> = Vec::new();
     for (_, host_path) in include_files {
         if is_elf(host_path) {
+            include_elf_paths.push(host_path);
             all_binaries.push(host_path);
         }
     }
 
     for path in &all_binaries {
-        let libs = resolve_shared_libs(path)
+        let result = resolve_shared_libs(path)
             .with_context(|| format!("resolve libs for {}", path.display()))?;
-        for (guest_path, host_path) in libs {
+
+        if !result.missing.is_empty() && include_elf_paths.contains(path) {
+            let direct: Vec<&str> = result
+                .missing
+                .iter()
+                .filter(|m| m.direct)
+                .map(|m| m.soname.as_str())
+                .collect();
+            if !direct.is_empty() {
+                anyhow::bail!(
+                    "include file '{}' directly requires missing shared libraries: {}. \
+                     The binary will not load inside the guest VM. \
+                     Use a statically-linked binary or install the missing libraries.",
+                    path.display(),
+                    direct.join(", ")
+                );
+            }
+            for m in result.missing.iter().filter(|m| !m.direct) {
+                eprintln!(
+                    "warning: include file '{}': transitive dependency {} \
+                     is not found — the binary may not load in the guest VM",
+                    path.display(),
+                    m.soname
+                );
+            }
+        } else {
+            for m in &result.missing {
+                eprintln!("warning: {}: {} => not found", path.display(), m.soname);
+            }
+        }
+
+        for (guest_path, host_path) in result.found {
             if let Some(parent) = Path::new(&guest_path).parent() {
                 let mut dir = PathBuf::new();
                 for component in parent.components() {
@@ -813,65 +1000,69 @@ mod tests {
         assert_eq!(&buf[4096..], &part2[..]);
     }
 
-    // -- ldd / shared lib resolution tests --
-
-    #[test]
-    fn parse_ldd_line_arrow_format() {
-        let line = "  libelf.so.1 => /lib64/libelf.so.1 (0x00007f...)";
-        assert_eq!(parse_ldd_line(line), Some("/lib64/libelf.so.1".into()));
-    }
-
-    #[test]
-    fn parse_ldd_line_linker() {
-        let line = "  /lib64/ld-linux-x86-64.so.2 (0x00007f...)";
-        assert_eq!(
-            parse_ldd_line(line),
-            Some("/lib64/ld-linux-x86-64.so.2".into())
-        );
-    }
-
-    #[test]
-    fn parse_ldd_line_vdso() {
-        let line = "  linux-vdso.so.1 (0x00007ffc...)";
-        assert_eq!(parse_ldd_line(line), None);
-    }
-
-    #[test]
-    fn parse_ldd_line_not_found() {
-        let line = "  libfoo.so.1 => not found";
-        assert_eq!(parse_ldd_line(line), None);
-    }
+    // -- shared lib resolution tests --
 
     #[test]
     fn resolve_shared_libs_nonexistent_returns_error() {
         let result = resolve_shared_libs(Path::new("/nonexistent/binary"));
-        // ldd on a nonexistent binary fails, returning empty or error.
-        if let Ok(libs) = result {
-            assert!(libs.is_empty());
-        }
+        // Nonexistent file cannot be read.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_shared_libs_non_elf_returns_empty() {
+        let tmp = std::env::temp_dir().join("ktstr-test-resolve-nonelf");
+        std::fs::write(&tmp, b"not an elf").unwrap();
+        let result = resolve_shared_libs(&tmp).unwrap();
+        assert!(result.found.is_empty());
+        assert!(result.missing.is_empty());
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn resolve_shared_libs_dynamic_binary() {
         let sh = Path::new("/bin/sh");
         if sh.exists() {
-            let libs = resolve_shared_libs(sh).unwrap();
-            if !libs.is_empty() {
+            let shared = resolve_shared_libs(sh).unwrap();
+            if !shared.found.is_empty() {
                 assert!(
-                    libs.iter().any(|(g, _)| g.contains("libc")),
+                    shared.found.iter().any(|(g, _)| g.contains("libc")),
                     "dynamic binary should depend on libc: {:?}",
-                    libs
+                    shared.found
                 );
-                assert!(
-                    !libs.iter().any(|(g, _)| g.contains("vdso")),
-                    "vdso should be filtered: {:?}",
-                    libs
-                );
-                for (g, _) in &libs {
+                for (g, _) in &shared.found {
                     assert!(!g.starts_with('/'), "guest path should be relative: {g}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn elf_dynamic_needed_extracts_sonames() {
+        let sh = Path::new("/bin/sh");
+        if !sh.exists() || !is_elf(sh) {
+            eprintln!("skipping: /bin/sh not ELF");
+            return;
+        }
+        let data = std::fs::read(sh).unwrap();
+        let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*data).unwrap();
+        let dynamic = elf.elf_dynamic_table().unwrap();
+        let needed = elf_dynamic_needed(&dynamic);
+        assert!(
+            needed.iter().any(|n| n.contains("libc")),
+            "/bin/sh should need libc: {:?}",
+            needed
+        );
+    }
+
+    #[test]
+    fn resolve_soname_finds_libc() {
+        let result = resolve_soname("libc.so.6", &[]);
+        assert!(
+            result.is_some(),
+            "should resolve libc.so.6 via default paths"
+        );
+        assert!(result.unwrap().is_file());
     }
 
     #[test]
@@ -918,16 +1109,6 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         // Current binary is not deleted.
         assert!(!is_deleted_self(&exe));
-    }
-
-    #[test]
-    fn parse_ldd_line_empty() {
-        assert!(parse_ldd_line("").is_none());
-    }
-
-    #[test]
-    fn parse_ldd_line_whitespace_only() {
-        assert!(parse_ldd_line("   ").is_none());
     }
 
     #[test]
@@ -1000,13 +1181,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_ldd_line_arrow_no_path() {
-        // Arrow but no path after it
-        let line = "  libfoo.so => ";
-        assert!(parse_ldd_line(line).is_none());
-    }
-
-    #[test]
     fn create_initramfs_base_contains_init() {
         let exe = crate::resolve_current_exe().unwrap();
         let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
@@ -1029,7 +1203,7 @@ mod tests {
             s.contains("lib64/libelf"),
             "initramfs with scx-ktstr extra should contain libelf; \
              resolved libs: {:?}",
-            resolve_shared_libs(sched.as_path()).unwrap()
+            resolve_shared_libs(sched.as_path()).unwrap().found
         );
     }
 
@@ -1116,12 +1290,12 @@ mod tests {
         let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         // Dynamic ELF should pull in libc shared libs.
-        let libs = resolve_shared_libs(sh).unwrap();
-        if !libs.is_empty() {
+        let shared = resolve_shared_libs(sh).unwrap();
+        if !shared.found.is_empty() {
             assert!(
-                libs.iter().any(|(g, _)| s.contains(g.as_str())),
+                shared.found.iter().any(|(g, _)| s.contains(g.as_str())),
                 "include ELF shared libs should appear in archive: {:?}",
-                libs
+                shared.found
             );
         }
     }
@@ -1132,7 +1306,7 @@ mod tests {
         std::fs::write(&tmp, b"#!/bin/sh\necho hello\n").unwrap();
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/hello.sh", tmp.as_path())];
-        // Should not fail (ldd not run on non-ELF).
+        // Should not fail (ELF parsing skipped for non-ELF).
         let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("include-files/hello.sh"));
