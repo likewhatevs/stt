@@ -1179,6 +1179,342 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    // -- structural validation --
+
+    #[test]
+    fn cli_debug_assert() {
+        Cargo::command().debug_assert();
+    }
+
+    // -- try_get_matches_from: test subcommand --
+
+    #[test]
+    fn parse_test_minimal() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "test"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_test_with_kernel() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "test", "--kernel", "6.14.2"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_test_with_passthrough_args() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "test",
+            "--",
+            "-p",
+            "ktstr",
+            "--no-capture",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Test { args, .. } => {
+                assert_eq!(args, vec!["-p", "ktstr", "--no-capture"]);
+            }
+            _ => panic!("expected Test"),
+        }
+    }
+
+    // -- try_get_matches_from: shell subcommand --
+
+    #[test]
+    fn parse_shell_minimal() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "shell"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_shell_with_topology() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--topology", "2,4,1"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Shell { topology, .. } => {
+                assert_eq!(topology, "2,4,1");
+            }
+            _ => panic!("expected Shell"),
+        }
+    }
+
+    #[test]
+    fn parse_shell_default_topology() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "shell"]).unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Shell { topology, .. } => {
+                assert_eq!(topology, "1,1,1");
+            }
+            _ => panic!("expected Shell"),
+        }
+    }
+
+    #[test]
+    fn parse_shell_include_files() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "-i", "/tmp/a", "-i", "/tmp/b"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Shell { include_files, .. } => {
+                assert_eq!(include_files.len(), 2);
+            }
+            _ => panic!("expected Shell"),
+        }
+    }
+
+    // -- try_get_matches_from: kernel list --
+
+    #[test]
+    fn parse_kernel_list() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "list"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_kernel_list_json() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "list", "--json"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    // -- try_get_matches_from: kernel build --
+
+    #[test]
+    fn parse_kernel_build_version() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "6.14.2"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_kernel_build_source() {
+        let m =
+            Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "--source", "../linux"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_kernel_build_source_conflicts_with_version() {
+        let m = Cargo::try_parse_from([
+            "cargo", "ktstr", "kernel", "build", "--source", "../linux", "6.14.2",
+        ]);
+        assert!(m.is_err());
+    }
+
+    #[test]
+    fn parse_kernel_build_git_requires_ref() {
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "kernel",
+            "build",
+            "--git",
+            "https://example.com/linux.git",
+        ]);
+        assert!(m.is_err());
+    }
+
+    #[test]
+    fn parse_kernel_build_git_with_ref() {
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "kernel",
+            "build",
+            "--git",
+            "https://example.com/linux.git",
+            "--ref",
+            "v6.14",
+        ]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_kernel_build_git_conflicts_with_source() {
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "kernel",
+            "build",
+            "--git",
+            "https://example.com/linux.git",
+            "--ref",
+            "v6.14",
+            "--source",
+            "../linux",
+        ]);
+        assert!(m.is_err());
+    }
+
+    // -- try_get_matches_from: kernel clean --
+
+    #[test]
+    fn parse_kernel_clean() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "clean"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_kernel_clean_keep() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "clean", "--keep", "3"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Kernel {
+                command: KernelCommand::Clean { keep, .. },
+            } => {
+                assert_eq!(keep, Some(3));
+            }
+            _ => panic!("expected Kernel Clean"),
+        }
+    }
+
+    // -- try_get_matches_from: verifier --
+
+    #[test]
+    fn parse_verifier_with_scheduler() {
+        let m =
+            Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--scheduler", "scx_rustland"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_verifier_with_scheduler_bin() {
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "verifier",
+            "--scheduler-bin",
+            "/tmp/sched",
+        ]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_verifier_scheduler_conflicts_with_scheduler_bin() {
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "verifier",
+            "--scheduler",
+            "scx_rustland",
+            "--scheduler-bin",
+            "/tmp/sched",
+        ]);
+        assert!(m.is_err());
+    }
+
+    #[test]
+    fn parse_verifier_all_profiles() {
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "verifier",
+            "--scheduler",
+            "scx_rustland",
+            "--all-profiles",
+        ]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_verifier_profiles_filter() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "verifier",
+            "--scheduler",
+            "scx_rustland",
+            "--profiles",
+            "default,llc,llc+steal",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Verifier { profiles, .. } => {
+                assert_eq!(profiles, vec!["default", "llc", "llc+steal"]);
+            }
+            _ => panic!("expected Verifier"),
+        }
+    }
+
+    // -- try_get_matches_from: completions --
+
+    #[test]
+    fn parse_completions_bash() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "completions", "bash"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_completions_invalid_shell() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "completions", "noshell"]);
+        assert!(m.is_err());
+    }
+
+    // -- error cases --
+
+    #[test]
+    fn parse_missing_subcommand() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr"]);
+        assert!(m.is_err());
+    }
+
+    #[test]
+    fn parse_unknown_subcommand() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "nonexistent"]);
+        assert!(m.is_err());
+    }
+
+    // -- topology parsing --
+
+    #[test]
+    fn topology_valid() {
+        let parts: Vec<&str> = "2,4,1".split(',').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].parse::<u32>().is_ok());
+        assert!(parts[1].parse::<u32>().is_ok());
+        assert!(parts[2].parse::<u32>().is_ok());
+    }
+
+    #[test]
+    fn topology_invalid_one_component() {
+        let parts: Vec<&str> = "abc".split(',').collect();
+        assert_ne!(parts.len(), 3);
+    }
+
+    #[test]
+    fn topology_invalid_non_numeric() {
+        let parts: Vec<&str> = "a,b,c".split(',').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].parse::<u32>().is_err());
+    }
+
+    #[test]
+    fn topology_invalid_two_components() {
+        let parts: Vec<&str> = "1,2".split(',').collect();
+        assert_ne!(parts.len(), 3);
+    }
+
+    #[test]
+    fn topology_invalid_zero_component() {
+        // run_shell rejects zero values.
+        let parts: Vec<&str> = "0,1,1".split(',').collect();
+        assert_eq!(parts.len(), 3);
+        let val: u32 = parts[0].parse().unwrap();
+        assert_eq!(val, 0);
+    }
 
     // -- days_to_ymd --
 
@@ -1228,5 +1564,85 @@ mod tests {
             output.contains("kernel"),
             "zsh completions missing 'kernel'"
         );
+    }
+
+    // -- generate_flag_profiles --
+
+    #[test]
+    fn generate_flag_profiles_empty() {
+        let profiles = generate_flag_profiles(&[]);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].0, "default");
+        assert!(profiles[0].1.is_empty());
+    }
+
+    #[test]
+    fn generate_flag_profiles_single_flag() {
+        let flags = vec![ktstr::scenario::flags::FlagDeclJson {
+            name: "llc".to_string(),
+            args: vec!["--llc".to_string()],
+            requires: vec![],
+        }];
+        let profiles = generate_flag_profiles(&flags);
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].0, "default");
+        assert_eq!(profiles[1].0, "llc");
+    }
+
+    #[test]
+    fn generate_flag_profiles_requires_constraint() {
+        let flags = vec![
+            ktstr::scenario::flags::FlagDeclJson {
+                name: "llc".to_string(),
+                args: vec!["--llc".to_string()],
+                requires: vec![],
+            },
+            ktstr::scenario::flags::FlagDeclJson {
+                name: "steal".to_string(),
+                args: vec!["--steal".to_string()],
+                requires: vec!["llc".to_string()],
+            },
+        ];
+        let profiles = generate_flag_profiles(&flags);
+        // Valid: default, llc, llc+steal. Invalid: steal alone.
+        let names: Vec<&str> = profiles.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(profiles.len(), 3);
+        assert!(names.contains(&"default"));
+        assert!(names.contains(&"llc"));
+        assert!(names.contains(&"llc+steal"));
+        assert!(!names.contains(&"steal"));
+    }
+
+    // -- profile_sched_args --
+
+    #[test]
+    fn profile_sched_args_collects_args() {
+        let flags = vec![
+            ktstr::scenario::flags::FlagDeclJson {
+                name: "llc".to_string(),
+                args: vec!["--llc".to_string()],
+                requires: vec![],
+            },
+            ktstr::scenario::flags::FlagDeclJson {
+                name: "steal".to_string(),
+                args: vec!["--steal".to_string(), "--aggressive".to_string()],
+                requires: vec![],
+            },
+        ];
+        let active = vec!["llc".to_string(), "steal".to_string()];
+        let args = profile_sched_args(&active, &flags);
+        assert_eq!(args, vec!["--llc", "--steal", "--aggressive"]);
+    }
+
+    #[test]
+    fn profile_sched_args_empty() {
+        let flags = vec![ktstr::scenario::flags::FlagDeclJson {
+            name: "llc".to_string(),
+            args: vec!["--llc".to_string()],
+            requires: vec![],
+        }];
+        let active: Vec<String> = vec![];
+        let args = profile_sched_args(&active, &flags);
+        assert!(args.is_empty());
     }
 }
