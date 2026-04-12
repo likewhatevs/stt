@@ -23,8 +23,6 @@ pub struct RunConfig {
     pub parent_cgroup: String,
     pub duration: Duration,
     pub workers_per_cgroup: usize,
-    pub json: bool,
-    pub verbose: bool,
     pub active_flags: Option<Vec<&'static str>>,
     pub repro: bool,
     /// Crash stack for auto-probe (file path or comma-separated function names).
@@ -48,8 +46,6 @@ impl Default for RunConfig {
             parent_cgroup: "/sys/fs/cgroup/ktstr".into(),
             duration: Duration::from_secs(20),
             workers_per_cgroup: 4,
-            json: false,
-            verbose: false,
             active_flags: None,
             repro: false,
             probe_stack: None,
@@ -72,40 +68,6 @@ pub struct ScenarioResult {
     pub details: Vec<String>,
     #[serde(default)]
     pub stats: ScenarioStats,
-}
-
-/// Extract auto-repro function names from scenario result details.
-///
-/// Looks for a "functions:" line first, then falls back to stack extraction.
-/// Returns `None` if no function names are found.
-pub fn extract_auto_repro_functions(results: &[ScenarioResult]) -> Option<String> {
-    let all_text: String = results
-        .iter()
-        .flat_map(|r| r.details.iter())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-    all_text
-        .lines()
-        .find(|l| l.contains("functions:"))
-        .map(|l| {
-            l.split("functions:")
-                .nth(1)
-                .unwrap_or("")
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .or_else(|| {
-            let fns = crate::probe::stack::extract_stack_function_names(&all_text);
-            if fns.is_empty() {
-                None
-            } else {
-                Some(fns.join(","))
-            }
-        })
 }
 
 /// Expand scenarios into (scenario, profile) runs based on active_flags config.
@@ -570,8 +532,6 @@ mod tests {
         let config = RunConfig {
             duration: Duration::from_secs(30),
             workers_per_cgroup: 8,
-            json: true,
-            verbose: true,
             active_flags: Some(vec![flags::BORROW, flags::LLC]),
             cleanup: Duration::from_millis(300),
             ..Default::default()
@@ -580,8 +540,6 @@ mod tests {
         assert_eq!(runner.topo.total_cpus(), 16);
         assert_eq!(runner.config.duration, Duration::from_secs(30));
         assert_eq!(runner.config.workers_per_cgroup, 8);
-        assert!(runner.config.json);
-        assert!(runner.config.verbose);
         assert_eq!(runner.config.settle, Duration::from_millis(500));
         assert_eq!(runner.config.cleanup, Duration::from_millis(300));
         assert_eq!(runner.config.active_flags.as_ref().unwrap().len(), 2);
@@ -632,7 +590,6 @@ mod tests {
     fn run_config_debug_shows_field_values() {
         let config = RunConfig {
             duration: Duration::from_secs(30),
-            verbose: true,
             ..Default::default()
         };
         let s = format!("{:?}", config);
@@ -646,8 +603,6 @@ mod tests {
             parent_cgroup: "/sys/fs/cgroup/ktstr".into(),
             duration: Duration::from_secs(10),
             workers_per_cgroup: 4,
-            json: true,
-            verbose: true,
             active_flags: Some(vec![flags::LLC]),
             repro: true,
             probe_stack: Some("func1".into()),
@@ -661,8 +616,6 @@ mod tests {
         let c2 = config.clone();
         assert_eq!(c2.duration, config.duration);
         assert_eq!(c2.workers_per_cgroup, config.workers_per_cgroup);
-        assert_eq!(c2.json, config.json);
-        assert_eq!(c2.verbose, config.verbose);
         assert_eq!(c2.repro, config.repro);
         assert_eq!(c2.auto_repro, config.auto_repro);
         assert_eq!(c2.probe_stack, config.probe_stack);

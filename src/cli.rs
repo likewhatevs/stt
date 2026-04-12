@@ -66,8 +66,6 @@ pub fn build_run_config(
     parent_cgroup: String,
     duration: u64,
     workers: usize,
-    json: bool,
-    verbose: bool,
     active_flags: Option<Vec<&'static str>>,
     repro: bool,
     probe_stack: Option<String>,
@@ -79,8 +77,6 @@ pub fn build_run_config(
         parent_cgroup,
         duration: Duration::from_secs(duration),
         workers_per_cgroup: workers,
-        json,
-        verbose,
         active_flags,
         repro,
         probe_stack,
@@ -234,8 +230,6 @@ mod tests {
             "/sys/fs/cgroup/ktstr".into(),
             20,
             4,
-            false,
-            false,
             None,
             false,
             None,
@@ -246,8 +240,6 @@ mod tests {
         assert_eq!(config.parent_cgroup, "/sys/fs/cgroup/ktstr");
         assert_eq!(config.duration, Duration::from_secs(20));
         assert_eq!(config.workers_per_cgroup, 4);
-        assert!(!config.json);
-        assert!(!config.verbose);
         assert!(config.active_flags.is_none());
         assert!(!config.repro);
         assert!(config.probe_stack.is_none());
@@ -262,8 +254,6 @@ mod tests {
             "/sys/fs/cgroup/test".into(),
             30,
             8,
-            true,
-            true,
             Some(vec!["llc", "borrow"]),
             true,
             Some("do_enqueue_task".into()),
@@ -274,8 +264,6 @@ mod tests {
         assert_eq!(config.parent_cgroup, "/sys/fs/cgroup/test");
         assert_eq!(config.duration, Duration::from_secs(30));
         assert_eq!(config.workers_per_cgroup, 8);
-        assert!(config.json);
-        assert!(config.verbose);
         let af = config.active_flags.unwrap();
         assert_eq!(af, vec!["llc", "borrow"]);
         assert!(config.repro);
@@ -287,19 +275,7 @@ mod tests {
 
     #[test]
     fn cli_build_run_config_duration_converts() {
-        let config = build_run_config(
-            "cg".into(),
-            60,
-            1,
-            false,
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-            None,
-        );
+        let config = build_run_config("cg".into(), 60, 1, None, false, None, false, None, None);
         assert_eq!(config.duration, Duration::from_secs(60));
     }
 

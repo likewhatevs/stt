@@ -2,7 +2,7 @@
 ///
 /// When the test binary is
 /// packed as `/init` in the initramfs, `ktstr_guest_init()` is called
-/// from the ctor or test harness `main()` when PID 1 is detected.
+/// from the ctor when PID 1 is detected.
 /// It never returns — it mounts filesystems, then either dispatches
 /// a test (start scheduler, run test, reboot) or drops into an
 /// interactive shell (when `KTSTR_MODE=shell` is on the kernel
@@ -37,10 +37,10 @@ fn force_reboot() -> ! {
     }
 }
 
-/// Full guest init lifecycle. Called from the ctor or test harness
-/// `main()` when PID 1 is detected. Mounts filesystems, then either
-/// runs the test lifecycle (scheduler + dispatch + reboot) or drops
-/// into an interactive shell. Never returns.
+/// Full guest init lifecycle. Called from the ctor when PID 1 is
+/// detected. Mounts filesystems, then either runs the test lifecycle
+/// (scheduler + dispatch + reboot) or drops into an interactive
+/// shell. Never returns.
 pub(crate) fn ktstr_guest_init() -> ! {
     // Panic hook: write crash diagnostic to COM2 then reboot.
     std::panic::set_hook(Box::new(|info| {
@@ -862,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_shell_line_ignores_comments() {
+    fn exec_shell_line_unsupported_input_no_panic() {
         exec_shell_line("# this is a comment");
     }
 

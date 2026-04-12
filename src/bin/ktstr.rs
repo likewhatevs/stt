@@ -42,10 +42,6 @@ enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Verbose output.
-        #[arg(long, short)]
-        verbose: bool,
-
         /// Enable repro mode (attach BPF probes).
         #[arg(long)]
         repro: bool,
@@ -119,7 +115,6 @@ fn main() -> Result<()> {
             flags: flag_arg,
             filter,
             json,
-            verbose,
             repro,
             probe_stack,
             auto_repro,
@@ -140,8 +135,6 @@ fn main() -> Result<()> {
                 parent_cgroup,
                 duration,
                 workers,
-                json,
-                verbose,
                 active_flags,
                 repro,
                 probe_stack,
