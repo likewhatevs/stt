@@ -161,7 +161,7 @@ int main(void) {{
 
         // Shallow-clone busybox tag via gix and checkout working tree.
         if !busybox_src.join(".git").exists() {
-            let url = "https://git.busybox.net/busybox";
+            let url = "https://github.com/mirror/busybox";
             let interrupt = std::sync::atomic::AtomicBool::new(false);
             let mut prep = gix::prepare_clone(url, &busybox_src)
                 .expect("prepare busybox clone")
@@ -174,7 +174,7 @@ int main(void) {{
                 .fetch_then_checkout(gix::progress::Discard, &interrupt)
                 .unwrap_or_else(|e| {
                     panic!(
-                        "failed to clone busybox from https://git.busybox.net/busybox — \
+                        "failed to clone busybox from https://github.com/mirror/busybox — \
                          check network connectivity. First build requires internet access: {e}"
                     )
                 });
