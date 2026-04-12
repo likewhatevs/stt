@@ -46,6 +46,8 @@ jobs:
 
   test-arm64:
     runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]
+    env:
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

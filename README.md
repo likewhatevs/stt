@@ -37,11 +37,11 @@ not need a separate install.
 
 ## Setup
 
-**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang, libelf-dev, libbpf-dev, pkg-config.
+**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang, pkg-config.
 
 ```sh
 # Ubuntu/Debian
-sudo apt install clang libelf-dev libbpf-dev pkg-config
+sudo apt install clang pkg-config
 ```
 
 **Add to your crate**:

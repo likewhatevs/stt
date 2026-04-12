@@ -5,20 +5,18 @@
 - Linux host with KVM access (`/dev/kvm`)
 - Rust toolchain (stable, >= 1.88)
 - clang and BPF toolchain (builds BPF skeletons via libbpf-cargo)
-- libelf development headers
-- libbpf development headers (vmlinux.h generation)
 - pkg-config
 
 **Ubuntu/Debian:**
 
 ```sh
-sudo apt install clang libelf-dev libbpf-dev pkg-config
+sudo apt install clang pkg-config
 ```
 
 **Fedora:**
 
 ```sh
-sudo dnf install clang elfutils-libelf-devel libbpf-devel pkgconf
+sudo dnf install clang pkgconf
 ```
 
 ## Install tools

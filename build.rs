@@ -1,7 +1,6 @@
 // Generates vmlinux.h from kernel BTF using libbpf's btf_dump API.
 // Uses the shared kernel resolver (src/kernel_path.rs) to find the
-// BTF source: $KTSTR_KERNEL/vmlinux, ./linux/vmlinux, ../linux/vmlinux,
-// or /sys/kernel/btf/vmlinux as fallback.
+// BTF source. See resolve_btf() for the full search order.
 
 use std::env;
 use std::path::PathBuf;
@@ -61,6 +60,10 @@ int main(void) {{
         )
         .expect("write driver source");
 
+        // libbpf-sys with vendored feature installs static libraries
+        // (libbpf.a, libelf.a, libz.a) in the parent of DEP_BPF_INCLUDE.
+        let libbpf_lib_dir = libbpf_include.parent().unwrap();
+
         let compiler = cc::Build::new().get_compiler();
         let status = Command::new(compiler.path())
             .args([
@@ -69,6 +72,7 @@ int main(void) {{
                 "-o",
                 vmlinux_gen_bin.to_str().unwrap(),
                 &format!("-I{}", libbpf_include.display()),
+                &format!("-L{}", libbpf_lib_dir.display()),
                 "-lbpf",
                 "-lelf",
                 "-lz",
