@@ -153,34 +153,39 @@ int main(void) {{
 
         let busybox_src = out_dir.join("busybox-src");
 
-        // Recover from interrupted clone: if the directory exists but
-        // has no Makefile, the previous clone was incomplete.
+        // Recover from interrupted download: if the directory exists but
+        // has no Makefile, the previous extraction was incomplete.
         if busybox_src.exists() && !busybox_src.join("Makefile").exists() {
             std::fs::remove_dir_all(&busybox_src).expect("remove incomplete busybox-src");
         }
 
-        // Shallow-clone busybox tag via gix and checkout working tree.
-        if !busybox_src.join(".git").exists() {
-            let url = "https://github.com/mirror/busybox";
-            let interrupt = std::sync::atomic::AtomicBool::new(false);
-            let mut prep = gix::prepare_clone(url, &busybox_src)
-                .expect("prepare busybox clone")
-                .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
-                    std::num::NonZeroU32::new(1).unwrap(),
-                ))
-                .with_ref_name(Some("1_36_1"))
-                .expect("valid ref name");
-            let (mut checkout, _outcome) = prep
-                .fetch_then_checkout(gix::progress::Discard, &interrupt)
+        // Download and extract busybox source tarball.
+        if !busybox_src.join("Makefile").exists() {
+            let url = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
+            let resp = reqwest::blocking::get(url)
+                .and_then(|r| r.error_for_status())
                 .unwrap_or_else(|e| {
                     panic!(
-                        "failed to clone busybox from https://github.com/mirror/busybox — \
+                        "failed to download busybox tarball from {url} — \
                          check network connectivity. First build requires internet access: {e}"
                     )
                 });
-            checkout
-                .main_worktree(gix::progress::Discard, &interrupt)
-                .expect("checkout busybox worktree");
+            let gz = flate2::read::GzDecoder::new(resp);
+            let mut archive = tar::Archive::new(gz);
+            let extract_dir = out_dir.join("busybox-extract");
+            archive
+                .unpack(&extract_dir)
+                .expect("extract busybox tarball");
+
+            // GitHub tarballs extract to busybox-1_36_1/ inside the archive.
+            let inner = extract_dir.join("busybox-1_36_1");
+            std::fs::rename(&inner, &busybox_src).unwrap_or_else(|e| {
+                panic!(
+                    "expected extracted directory {} — tarball layout may have changed: {e}",
+                    inner.display()
+                )
+            });
+            std::fs::remove_dir_all(&extract_dir).ok();
         }
 
         // Configure busybox.

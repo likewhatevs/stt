@@ -84,8 +84,11 @@ tempfile = "3"
 
 [build-dependencies]
 cc = "1"
-gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
+flate2 = "1"
+gix = { version = "0.81", default-features = false, features = ["sha1"] }
 libbpf-cargo = "0.26"
+reqwest = { version = "0.13", features = ["blocking"] }
+tar = "0.4"
 
 [[bin]]
 name = "ktstr"
