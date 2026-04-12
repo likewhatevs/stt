@@ -66,6 +66,27 @@ enum KtstrCommand {
         #[command(subcommand)]
         command: KernelCommand,
     },
+    /// Collect BPF verifier statistics for a scheduler.
+    ///
+    /// Builds the scheduler (or uses a pre-built binary), boots a VM,
+    /// loads the scheduler's BPF programs, and reports per-program
+    /// verified instruction counts from host-side memory introspection.
+    Verifier {
+        /// Scheduler package name to build and analyze.
+        #[arg(long)]
+        scheduler: Option<String>,
+        /// Path to pre-built scheduler binary (alternative to --scheduler).
+        #[arg(long, conflicts_with = "scheduler")]
+        scheduler_bin: Option<PathBuf>,
+        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
+        /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).
+        /// When absent, resolves automatically via cache then filesystem.
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Print raw verifier output without formatting.
+        #[arg(long)]
+        raw: bool,
+    },
     /// Boot an interactive shell in a KVM virtual machine.
     ///
     /// Launches a VM with busybox and drops into a shell. Files passed
@@ -625,6 +646,63 @@ fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, S
     }
 }
 
+/// Pre-flight check for /dev/kvm availability and permissions.
+fn check_kvm() -> Result<(), String> {
+    if !Path::new("/dev/kvm").exists() {
+        return Err("/dev/kvm not found. KVM requires:\n  \
+             - Linux kernel with KVM support (CONFIG_KVM)\n  \
+             - Access to /dev/kvm (check permissions or add user to 'kvm' group)\n  \
+             - Hardware virtualization enabled in BIOS (VT-x/AMD-V)"
+            .to_string());
+    }
+    if let Err(e) = std::fs::File::open("/dev/kvm") {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return Err(
+                "/dev/kvm: permission denied. Add your user to the 'kvm' group:\n  \
+                 sudo usermod -aG kvm $USER\n  \
+                 then log out and back in."
+                    .to_string(),
+            );
+        }
+        return Err(format!("/dev/kvm: {e}"));
+    }
+    Ok(())
+}
+
+/// Resolve a kernel identifier to a bootable image path.
+///
+/// Handles all `KernelId` variants (path to file or directory,
+/// version string, cache key) and the `None` case (automatic
+/// resolution via cache then filesystem).
+fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
+    use ktstr::kernel_path::KernelId;
+
+    if let Some(val) = kernel {
+        match KernelId::parse(val) {
+            KernelId::Path(p) => {
+                let path = PathBuf::from(&p);
+                if path.is_file() {
+                    Ok(path)
+                } else if path.is_dir() {
+                    ktstr::kernel_path::find_image_in_dir(&path)
+                        .ok_or_else(|| format!("no kernel image found in {}", path.display()))
+                } else {
+                    Err(format!("kernel path not found: {}", path.display()))
+                }
+            }
+            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => resolve_cached_kernel(&id),
+        }
+    } else {
+        ktstr::find_kernel()
+            .map_err(|e| format!("kernel resolution: {e}"))?
+            .ok_or_else(|| {
+                "no kernel found. Provide --kernel or run \
+                 `cargo ktstr kernel build` to download and cache one."
+                    .to_string()
+            })
+    }
+}
+
 /// Search PATH for a bare executable name.
 fn resolve_in_path(name: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
@@ -646,53 +724,8 @@ fn run_shell(
     topology: String,
     include_files: Vec<PathBuf>,
 ) -> Result<(), String> {
-    use ktstr::kernel_path::KernelId;
-
-    // /dev/kvm pre-flight check.
-    if !Path::new("/dev/kvm").exists() {
-        return Err("/dev/kvm not found. KVM requires:\n  \
-             - Linux kernel with KVM support (CONFIG_KVM)\n  \
-             - Access to /dev/kvm (check permissions or add user to 'kvm' group)\n  \
-             - Hardware virtualization enabled in BIOS (VT-x/AMD-V)"
-            .to_string());
-    }
-    if let Err(e) = std::fs::File::open("/dev/kvm") {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            return Err(
-                "/dev/kvm: permission denied. Add your user to the 'kvm' group:\n  \
-                 sudo usermod -aG kvm $USER\n  \
-                 then log out and back in."
-                    .to_string(),
-            );
-        }
-        return Err(format!("/dev/kvm: {e}"));
-    }
-
-    // Resolve kernel.
-    let kernel_path = if let Some(ref val) = kernel {
-        match KernelId::parse(val) {
-            KernelId::Path(p) => {
-                let path = PathBuf::from(&p);
-                if path.is_file() {
-                    path
-                } else if path.is_dir() {
-                    ktstr::kernel_path::find_image_in_dir(&path)
-                        .ok_or_else(|| format!("no kernel image found in {}", path.display()))?
-                } else {
-                    return Err(format!("kernel path not found: {}", path.display()));
-                }
-            }
-            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => resolve_cached_kernel(&id)?,
-        }
-    } else {
-        ktstr::find_kernel()
-            .map_err(|e| format!("kernel resolution: {e}"))?
-            .ok_or_else(|| {
-                "no kernel found. Provide --kernel or run \
-                 `cargo ktstr kernel build` to download and cache one."
-                    .to_string()
-            })?
-    };
+    check_kvm()?;
+    let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 
     // Parse topology "S,C,T".
     let parts: Vec<&str> = topology.split(',').collect();
@@ -769,6 +802,49 @@ fn run_shell(
         .map_err(|e| format!("{e:#}"))
 }
 
+fn run_verifier(
+    scheduler: Option<String>,
+    scheduler_bin: Option<PathBuf>,
+    kernel: Option<String>,
+    raw: bool,
+) -> Result<(), String> {
+    check_kvm()?;
+
+    // Resolve scheduler binary.
+    let sched_bin = match (scheduler, scheduler_bin) {
+        (Some(package), None) => {
+            ktstr::build_and_find_binary(&package).map_err(|e| format!("build scheduler: {e}"))?
+        }
+        (None, Some(path)) => {
+            if !path.exists() {
+                return Err(format!("scheduler binary not found: {}", path.display()));
+            }
+            path
+        }
+        (None, None) => {
+            return Err("either --scheduler or --scheduler-bin is required".to_string());
+        }
+        // clap conflicts_with prevents this.
+        (Some(_), Some(_)) => unreachable!(),
+    };
+
+    let kernel_path = resolve_kernel_image(kernel.as_deref())?;
+
+    // Build the ktstr init binary.
+    let ktstr_bin =
+        ktstr::build_and_find_binary("ktstr").map_err(|e| format!("build ktstr: {e}"))?;
+
+    eprintln!("cargo-ktstr: collecting verifier stats");
+    let result =
+        ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel_path, &[])
+            .map_err(|e| format!("collect verifier output: {e}"))?;
+
+    let output = ktstr::verifier::format_verifier_output("verifier", &result, raw);
+    print!("{output}");
+
+    Ok(())
+}
+
 fn main() {
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
@@ -783,6 +859,12 @@ fn main() {
             build_kernel(&kernel, clean)
         }
         KtstrCommand::Test { kernel, args } => run_test(kernel, args),
+        KtstrCommand::Verifier {
+            scheduler,
+            scheduler_bin,
+            kernel,
+            raw,
+        } => run_verifier(scheduler, scheduler_bin, kernel, raw),
         KtstrCommand::TestStats { ref dir } => test_stats(dir),
         KtstrCommand::Shell {
             kernel,
