@@ -6,8 +6,8 @@
 //! both. Remote failures are non-fatal (logged as warnings).
 //!
 //! Cache entries are serialized as tar archives containing the kernel
-//! image and metadata.json, stored as a single blob per cache key in
-//! the GHA cache service.
+//! image, vmlinux (if present), and metadata.json, stored as a single
+//! blob per cache key in the GHA cache service.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -60,9 +60,9 @@ fn create_operator() -> Result<opendal::Operator, String> {
 
 /// Pack a cache entry directory into a tar archive in memory.
 ///
-/// The tar contains the kernel image and metadata.json from the
-/// cache entry directory. Paths inside the tar are relative
-/// filenames (no directory prefix).
+/// The tar contains the kernel image, vmlinux (if present), and
+/// metadata.json from the cache entry directory. Paths inside the
+/// tar are relative filenames (no directory prefix).
 fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, String> {
     let mut archive = tar::Builder::new(Vec::new());
 
@@ -99,6 +99,22 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
         .append_data(&mut header, &metadata.image_name, &mut image_file)
         .map_err(|e| format!("tar append image: {e}"))?;
 
+    // Add vmlinux if present (BTF source for build.rs).
+    let vmlinux_path = entry_dir.join("vmlinux");
+    if let Ok(mut vmlinux_file) = std::fs::File::open(&vmlinux_path) {
+        let vmlinux_size = vmlinux_file
+            .metadata()
+            .map_err(|e| format!("vmlinux metadata: {e}"))?
+            .len();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(vmlinux_size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "vmlinux", &mut vmlinux_file)
+            .map_err(|e| format!("tar append vmlinux: {e}"))?;
+    }
+
     archive
         .into_inner()
         .map_err(|e| format!("finalize tar: {e}"))
@@ -106,9 +122,9 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
 
 /// Unpack a tar archive into a cache directory via CacheDir::store.
 ///
-/// Extracts metadata.json and the kernel image from the tar blob,
-/// writes the image to a temp file, then stores via the local cache
-/// API for atomic placement.
+/// Extracts metadata.json, the kernel image, and vmlinux (if present)
+/// from the tar blob, writes them to temp files, then stores via the
+/// local cache API for atomic placement.
 fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<CacheEntry, String> {
     let mut archive = tar::Archive::new(data);
     let entries = archive
@@ -117,6 +133,7 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
 
     let mut metadata: Option<KernelMetadata> = None;
     let mut image_data: Option<(String, Vec<u8>)> = None;
+    let mut vmlinux_data: Option<Vec<u8>> = None;
 
     for entry_result in entries {
         let mut entry = entry_result.map_err(|e| format!("tar entry: {e}"))?;
@@ -135,6 +152,12 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
                 serde_json::from_str(&content)
                     .map_err(|e| format!("parse metadata from tar: {e}"))?,
             );
+        } else if path == "vmlinux" {
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| format!("read vmlinux from tar: {e}"))?;
+            vmlinux_data = Some(data);
         } else {
             let mut data = Vec::new();
             entry
@@ -148,7 +171,7 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
     let (_, img_bytes) =
         image_data.ok_or_else(|| "tar archive missing kernel image".to_string())?;
 
-    // Write image to a temp file for CacheDir::store.
+    // Write image and vmlinux to temp files for CacheDir::store.
     let tmp_dir = tempfile::TempDir::new().map_err(|e| format!("create temp dir: {e}"))?;
     let tmp_image = tmp_dir.path().join(&meta.image_name);
     let mut f = std::fs::File::create(&tmp_image).map_err(|e| format!("create temp image: {e}"))?;
@@ -156,8 +179,21 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
         .map_err(|e| format!("write temp image: {e}"))?;
     drop(f);
 
+    let tmp_vmlinux_path;
+    let vmlinux_ref = if let Some(ref vml_bytes) = vmlinux_data {
+        tmp_vmlinux_path = tmp_dir.path().join("vmlinux");
+        let mut vf = std::fs::File::create(&tmp_vmlinux_path)
+            .map_err(|e| format!("create temp vmlinux: {e}"))?;
+        vf.write_all(vml_bytes)
+            .map_err(|e| format!("write temp vmlinux: {e}"))?;
+        drop(vf);
+        Some(tmp_vmlinux_path.as_path())
+    } else {
+        None
+    };
+
     cache
-        .store(cache_key, &tmp_image, &meta)
+        .store(cache_key, &tmp_image, vmlinux_ref, &meta)
         .map_err(|e| format!("local cache store: {e}"))
 }
 
@@ -313,7 +349,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("test-key", &image, &meta).unwrap();
+        let entry = cache.store("test-key", &image, None, &meta).unwrap();
 
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
         assert!(!packed.is_empty());
@@ -343,7 +379,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("valid-tar", &image, &meta).unwrap();
+        let entry = cache.store("valid-tar", &image, None, &meta).unwrap();
 
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
 
@@ -423,7 +459,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("test-entry", &image, &meta).unwrap();
+        let entry = cache.store("test-entry", &image, None, &meta).unwrap();
 
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap());
         assert!(packed.is_ok());
@@ -447,7 +483,7 @@ mod tests {
         .with_git_hash(Some("a1b2c3d".to_string()))
         .with_git_ref(Some("v6.15-rc3".to_string()));
 
-        let entry = cache.store("git-key", &image, &meta).unwrap();
+        let entry = cache.store("git-key", &image, None, &meta).unwrap();
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
 
         let tmp2 = tempfile::TempDir::new().unwrap();

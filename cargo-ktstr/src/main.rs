@@ -265,9 +265,9 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
                 cmd.env("KTSTR_KERNEL", &dir);
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let image = resolve_cached_kernel(&id)?;
-                eprintln!("cargo-ktstr: using cached kernel {}", image.display());
-                cmd.env("KTSTR_TEST_KERNEL", &image);
+                let cache_dir = resolve_cached_kernel(&id)?;
+                eprintln!("cargo-ktstr: using cached kernel {}", cache_dir.display());
+                cmd.env("KTSTR_KERNEL", &cache_dir);
             }
         }
     }
@@ -348,6 +348,7 @@ fn kernel_list(json: bool) -> Result<(), String> {
                         "config_hash": meta.config_hash,
                         "image_name": meta.image_name,
                         "image_path": e.path.join(&meta.image_name).display().to_string(),
+                        "vmlinux_name": meta.vmlinux_name,
                         "git_hash": meta.git_hash,
                         "git_ref": meta.git_ref,
                         "source_tree_path": meta.source_tree_path,
@@ -495,9 +496,13 @@ fn kernel_build(
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}");
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
-            eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
-            eprintln!("cargo-ktstr: use --force to rebuild");
-            return Ok(());
+            if is_stale_kconfig(&entry, &embedded_kconfig_hash()) {
+                eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
+            } else {
+                eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
+                eprintln!("cargo-ktstr: use --force to rebuild");
+                return Ok(());
+            }
         }
         fetch::download_tarball(&ver, tmp_dir.path())?
     };
@@ -509,9 +514,13 @@ fn kernel_build(
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
-        eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
-        eprintln!("cargo-ktstr: use --force to rebuild");
-        return Ok(());
+        if is_stale_kconfig(&entry, &embedded_kconfig_hash()) {
+            eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
+        } else {
+            eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
+            eprintln!("cargo-ktstr: use --force to rebuild");
+            return Ok(());
+        }
     }
 
     let source_dir = &acquired.source_dir;
@@ -541,9 +550,20 @@ fn kernel_build(
         gen_compile_commands(source_dir)?;
     }
 
-    // Find the built kernel image.
+    // Find the built kernel image and vmlinux.
     let image_path = ktstr::kernel_path::find_image_in_dir(source_dir)
         .ok_or_else(|| format!("no kernel image found in {}", source_dir.display()))?;
+    let vmlinux_path = source_dir.join("vmlinux");
+    let vmlinux_ref = if vmlinux_path.exists() {
+        if let Ok(file_meta) = std::fs::metadata(&vmlinux_path) {
+            let mb = file_meta.len() as f64 / (1024.0 * 1024.0);
+            eprintln!("cargo-ktstr: caching vmlinux ({mb:.0} MB)");
+        }
+        Some(vmlinux_path.as_path())
+    } else {
+        eprintln!("cargo-ktstr: warning: vmlinux not found, BTF will not be cached");
+        None
+    };
 
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
@@ -582,7 +602,7 @@ fn kernel_build(
     });
 
     let entry = cache
-        .store(&acquired.cache_key, &image_path, &metadata)
+        .store(&acquired.cache_key, &image_path, vmlinux_ref, &metadata)
         .map_err(|e| format!("cache store: {e}"))?;
 
     // Store to remote cache when enabled.
@@ -651,7 +671,12 @@ fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
     None
 }
 
-/// Resolve a kernel image path from a Version or CacheKey identifier.
+/// Resolve the cache entry directory from a Version or CacheKey identifier.
+///
+/// Returns the cache entry directory path, which contains the boot
+/// image and optionally vmlinux. Callers set KTSTR_KERNEL to this directory
+/// so build.rs (BTF/vmlinux.h) and nextest (boot image) both resolve
+/// from the same location.
 fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, String> {
     use ktstr::kernel_path::KernelId;
     match id {
@@ -660,11 +685,13 @@ fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, S
             let (arch, _) = fetch::arch_info();
             let cache_key = format!("{ver}-tarball-{arch}");
             match cache_lookup(&cache, &cache_key) {
-                Some(entry) => entry
-                    .metadata
-                    .as_ref()
-                    .map(|m| entry.path.join(&m.image_name))
-                    .ok_or_else(|| format!("cached entry {cache_key} has corrupt metadata")),
+                Some(entry) => {
+                    entry
+                        .metadata
+                        .as_ref()
+                        .ok_or_else(|| format!("cached entry {cache_key} has corrupt metadata"))?;
+                    Ok(entry.path)
+                }
                 None => Err(format!(
                     "kernel version {ver} not found in cache. \
                      Run `cargo ktstr kernel build {ver}` first."
@@ -674,11 +701,13 @@ fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, S
         KernelId::CacheKey(key) => {
             let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
             match cache_lookup(&cache, key) {
-                Some(entry) => entry
-                    .metadata
-                    .as_ref()
-                    .map(|m| entry.path.join(&m.image_name))
-                    .ok_or_else(|| format!("cached entry {key} has corrupt metadata")),
+                Some(entry) => {
+                    entry
+                        .metadata
+                        .as_ref()
+                        .ok_or_else(|| format!("cached entry {key} has corrupt metadata"))?;
+                    Ok(entry.path)
+                }
                 None => Err(format!(
                     "cache key {key} not found. \
                      Run `cargo ktstr kernel list` to see available entries."
@@ -733,7 +762,11 @@ fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
                     Err(format!("kernel path not found: {}", path.display()))
                 }
             }
-            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => resolve_cached_kernel(&id),
+            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
+                let cache_dir = resolve_cached_kernel(&id)?;
+                ktstr::kernel_path::find_image_in_dir(&cache_dir)
+                    .ok_or_else(|| format!("no kernel image found in {}", cache_dir.display()))
+            }
         }
     } else {
         ktstr::find_kernel()

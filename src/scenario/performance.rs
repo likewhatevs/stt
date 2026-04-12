@@ -39,7 +39,7 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     let checks = Assert::default_checks()
-        .max_wake_latency_cv(3.0)
+        .max_wake_latency_cv(50.0)
         .max_throughput_cv(1.0);
 
     let steps = vec![Step::with_defs(

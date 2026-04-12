@@ -2,7 +2,8 @@
 //!
 //! Manages a local cache of built kernel images under an XDG-compliant
 //! directory. Each cached kernel is a directory containing the boot
-//! image and a `metadata.json` descriptor.
+//! image, optionally the uncompressed vmlinux ELF (for BTF), and a
+//! `metadata.json` descriptor.
 //!
 //! # Cache location
 //!
@@ -17,9 +18,11 @@
 //! $CACHE_ROOT/
 //!   6.14.2-tarball-x86_64/
 //!     bzImage           # kernel boot image
+//!     vmlinux           # uncompressed ELF (BTF source)
 //!     metadata.json     # KernelMetadata descriptor
 //!   local-deadbeef-x86_64/
 //!     bzImage
+//!     vmlinux
 //!     metadata.json
 //! ```
 //!
@@ -85,6 +88,10 @@ pub struct KernelMetadata {
     /// Path to the source tree on disk (local builds only).
     #[serde(default)]
     pub source_tree_path: Option<PathBuf>,
+    /// Filename of the cached vmlinux ELF (BTF/DWARF source).
+    /// `None` when vmlinux was not available at cache time.
+    #[serde(default)]
+    pub vmlinux_name: Option<String>,
 }
 
 impl KernelMetadata {
@@ -104,6 +111,7 @@ impl KernelMetadata {
             git_hash: None,
             git_ref: None,
             source_tree_path: None,
+            vmlinux_name: None,
         }
     }
 
@@ -278,15 +286,20 @@ impl CacheDir {
     ///
     /// `image_path`: path to the kernel boot image to cache.
     ///
+    /// `vmlinux_path`: optional path to the uncompressed vmlinux ELF.
+    /// When present, vmlinux is copied alongside the boot image so
+    /// that build.rs can resolve BTF from the cache entry directory.
+    ///
     /// `metadata`: descriptor to serialize as `metadata.json`.
     ///
-    /// The image is copied (not moved) so the caller retains the
-    /// original. Writes atomically via a temporary directory that is
+    /// Files are copied (not moved) so the caller retains the
+    /// originals. Writes atomically via a temporary directory that is
     /// renamed into place on success.
     pub fn store(
         &self,
         cache_key: &str,
         image_path: &Path,
+        vmlinux_path: Option<&Path>,
         metadata: &KernelMetadata,
     ) -> anyhow::Result<CacheEntry> {
         validate_cache_key(cache_key)?;
@@ -306,13 +319,28 @@ impl CacheDir {
         // path, including serde serialization failures.
         let guard = TmpDirGuard(&tmp_dir);
 
-        // Copy image.
+        // Copy boot image.
         let image_dest = tmp_dir.join(&metadata.image_name);
         fs::copy(image_path, &image_dest)
             .map_err(|e| anyhow::anyhow!("copy kernel image to cache: {e}"))?;
 
-        // Write metadata.
-        let meta_json = serde_json::to_string_pretty(metadata)?;
+        // Copy vmlinux (BTF source for build.rs and BPF map writes).
+        let has_vmlinux = if let Some(vmlinux) = vmlinux_path {
+            fs::copy(vmlinux, tmp_dir.join("vmlinux"))
+                .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
+            true
+        } else {
+            false
+        };
+
+        // Write metadata (record vmlinux_name if vmlinux was stored).
+        let mut meta = metadata.clone();
+        meta.vmlinux_name = if has_vmlinux {
+            Some("vmlinux".to_string())
+        } else {
+            None
+        };
+        let meta_json = serde_json::to_string_pretty(&meta)?;
         fs::write(tmp_dir.join("metadata.json"), meta_json)
             .map_err(|e| anyhow::anyhow!("write cache metadata: {e}"))?;
 
@@ -340,7 +368,7 @@ impl CacheDir {
         Ok(CacheEntry {
             key: cache_key.to_string(),
             path: final_dir,
-            metadata: Some(metadata.clone()),
+            metadata: Some(meta),
         })
     }
 
@@ -485,6 +513,7 @@ mod tests {
             git_hash: None,
             git_ref: None,
             source_tree_path: None,
+            vmlinux_name: None,
         }
     }
 
@@ -526,6 +555,7 @@ mod tests {
             git_hash: Some("a1b2c3d".to_string()),
             git_ref: Some("v6.15-rc3".to_string()),
             source_tree_path: None,
+            vmlinux_name: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -547,6 +577,7 @@ mod tests {
             git_hash: Some("deadbeef".to_string()),
             git_ref: None,
             source_tree_path: Some(PathBuf::from("/tmp/linux")),
+            vmlinux_name: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -656,7 +687,9 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         // Store.
-        let entry = cache.store("6.14.2-tarball-x86_64", &image, &meta).unwrap();
+        let entry = cache
+            .store("6.14.2-tarball-x86_64", &image, None, &meta)
+            .unwrap();
         assert_eq!(entry.key, "6.14.2-tarball-x86_64");
         assert!(entry.path.join("bzImage").exists());
         assert!(entry.path.join("metadata.json").exists());
@@ -723,7 +756,7 @@ mod tests {
             ..test_metadata("6.14.2")
         };
         cache
-            .store("6.14.2-tarball-x86_64", &image, &meta1)
+            .store("6.14.2-tarball-x86_64", &image, None, &meta1)
             .unwrap();
 
         let meta2 = KernelMetadata {
@@ -731,7 +764,7 @@ mod tests {
             ..test_metadata("6.14.2")
         };
         cache
-            .store("6.14.2-tarball-x86_64", &image, &meta2)
+            .store("6.14.2-tarball-x86_64", &image, None, &meta2)
             .unwrap();
 
         let found = cache.lookup("6.14.2-tarball-x86_64").unwrap();
@@ -760,9 +793,9 @@ mod tests {
         };
 
         // Store in non-chronological order.
-        cache.store("old", &image, &meta_old).unwrap();
-        cache.store("new", &image, &meta_new).unwrap();
-        cache.store("mid", &image, &meta_mid).unwrap();
+        cache.store("old", &image, None, &meta_old).unwrap();
+        cache.store("new", &image, None, &meta_new).unwrap();
+        cache.store("mid", &image, None, &meta_mid).unwrap();
 
         let entries = cache.list().unwrap();
         assert_eq!(entries.len(), 3);
@@ -780,7 +813,7 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
-        cache.store("valid", &image, &meta).unwrap();
+        cache.store("valid", &image, None, &meta).unwrap();
 
         // Create a corrupt entry (no metadata).
         let bad_dir = tmp.path().join("corrupt");
@@ -828,9 +861,15 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
 
-        cache.store("a", &image, &test_metadata("6.14.0")).unwrap();
-        cache.store("b", &image, &test_metadata("6.14.1")).unwrap();
-        cache.store("c", &image, &test_metadata("6.14.2")).unwrap();
+        cache
+            .store("a", &image, None, &test_metadata("6.14.0"))
+            .unwrap();
+        cache
+            .store("b", &image, None, &test_metadata("6.14.1"))
+            .unwrap();
+        cache
+            .store("c", &image, None, &test_metadata("6.14.2"))
+            .unwrap();
 
         let removed = cache.clean(None).unwrap();
         assert_eq!(removed, 3);
@@ -857,9 +896,9 @@ mod tests {
             ..test_metadata("6.14.0")
         };
 
-        cache.store("old", &image, &meta_old).unwrap();
-        cache.store("new", &image, &meta_new).unwrap();
-        cache.store("mid", &image, &meta_mid).unwrap();
+        cache.store("old", &image, None, &meta_old).unwrap();
+        cache.store("new", &image, None, &meta_new).unwrap();
+        cache.store("mid", &image, None, &meta_mid).unwrap();
 
         let removed = cache.clean(Some(1)).unwrap();
         assert_eq!(removed, 2);
@@ -877,7 +916,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
 
         cache
-            .store("only", &image, &test_metadata("6.14.2"))
+            .store("only", &image, None, &test_metadata("6.14.2"))
             .unwrap();
 
         let removed = cache.clean(Some(5)).unwrap();
@@ -1059,7 +1098,7 @@ mod tests {
         let mut meta = test_metadata("6.14.2");
         meta.image_name = "../escape".to_string();
 
-        let err = cache.store("valid-key", &image, &meta).unwrap_err();
+        let err = cache.store("valid-key", &image, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains("image name"),
             "expected image_name rejection, got: {err}"
@@ -1076,7 +1115,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store(".tmp-sneaky", &image, &meta).unwrap_err();
+        let err = cache.store(".tmp-sneaky", &image, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains(".tmp-"),
             "expected .tmp- rejection, got: {err}"
@@ -1100,7 +1139,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("", &image, &meta).unwrap_err();
+        let err = cache.store("", &image, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains("empty"),
             "expected empty-key error, got: {err}"
@@ -1122,7 +1161,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("../escape", &image, &meta).unwrap_err();
+        let err = cache.store("../escape", &image, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains("path"),
             "expected path-traversal error, got: {err}"
@@ -1145,7 +1184,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("a/b", &image, &meta).unwrap_err();
+        let err = cache.store("a/b", &image, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains("path separator"),
             "expected path-separator error, got: {err}"
@@ -1160,7 +1199,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("   ", &image, &meta).unwrap_err();
+        let err = cache.store("   ", &image, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains("empty"),
             "expected empty/whitespace error, got: {err}"
@@ -1185,8 +1224,8 @@ mod tests {
             built_at: "2026-04-10T10:00:00Z".to_string(),
             ..test_metadata("6.13.0")
         };
-        cache.store("new", &image, &meta_new).unwrap();
-        cache.store("old", &image, &meta_old).unwrap();
+        cache.store("new", &image, None, &meta_new).unwrap();
+        cache.store("old", &image, None, &meta_old).unwrap();
 
         // One corrupt entry (no metadata).
         let corrupt_dir = tmp.path().join("cache").join("corrupt");
@@ -1221,10 +1260,51 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         // Store should succeed despite stale tmp dir.
-        let entry = cache.store("mykey", &image, &meta).unwrap();
+        let entry = cache.store("mykey", &image, None, &meta).unwrap();
         assert!(entry.path.join("bzImage").exists());
         // Stale tmp dir should be gone.
         assert!(!stale_tmp.exists());
+    }
+
+    #[test]
+    fn cache_dir_store_with_vmlinux() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let vmlinux = src_dir.path().join("vmlinux");
+        fs::write(&vmlinux, b"fake vmlinux ELF").unwrap();
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache
+            .store("with-vmlinux", &image, Some(&vmlinux), &meta)
+            .unwrap();
+        assert!(entry.path.join("bzImage").exists());
+        assert!(entry.path.join("vmlinux").exists());
+        assert!(entry.path.join("metadata.json").exists());
+        // Metadata records vmlinux_name.
+        let entry_meta = entry.metadata.unwrap();
+        assert_eq!(entry_meta.vmlinux_name.as_deref(), Some("vmlinux"));
+        // Original files still exist (copy, not move).
+        assert!(image.exists());
+        assert!(vmlinux.exists());
+    }
+
+    #[test]
+    fn cache_dir_store_without_vmlinux() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache.store("no-vmlinux", &image, None, &meta).unwrap();
+        assert!(entry.path.join("bzImage").exists());
+        assert!(!entry.path.join("vmlinux").exists());
+        assert!(entry.path.join("metadata.json").exists());
+        // Metadata has no vmlinux_name.
+        let entry_meta = entry.metadata.unwrap();
+        assert!(entry_meta.vmlinux_name.is_none());
     }
 
     #[test]
@@ -1235,7 +1315,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        cache.store("key", &image, &meta).unwrap();
+        cache.store("key", &image, None, &meta).unwrap();
 
         // Original image must still exist (copy, not move).
         assert!(image.exists());

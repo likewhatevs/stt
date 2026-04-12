@@ -55,7 +55,7 @@ jobs:
     runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]
     env:
       RUSTC_WRAPPER: ""
-      KTSTR_KERNEL: linux
+      KTSTR_GHA_CACHE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,12 +64,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - name: Download and build test kernel
-        run: |
-          STABLE=$(curl -s https://www.kernel.org/releases.json | python3 -c "import sys,json; r=json.load(sys.stdin)['releases']; print(next(x['version'] for x in r if x['moniker']=='stable'))")
-          curl -sL "https://cdn.kernel.org/pub/linux/kernel/v${STABLE%%.*}.x/linux-${STABLE}.tar.xz" | tar xJ
-          mv "linux-${STABLE}" linux
-          cargo run -p cargo-ktstr -- ktstr build-kernel --kernel linux
+      - name: Cache kernel images
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ktstr/kernels
+          key: ktstr-kernels-arm64-${{ hashFiles('ktstr.kconfig') }}
+          restore-keys: ktstr-kernels-arm64-
+      - name: Build test kernel
+        run: cargo run -p cargo-ktstr --features gha-cache -- ktstr kernel build
       - run: cargo build --workspace
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics

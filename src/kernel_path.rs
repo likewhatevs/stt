@@ -124,8 +124,13 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
 }
 
 /// Find a bootable kernel image within a directory.
+///
+/// Checks the arch-specific build tree path first (`arch/x86/boot/bzImage`
+/// or `arch/arm64/boot/Image`), then falls back to the directory root
+/// (for cache entries that store the boot image directly).
 #[allow(dead_code)]
 pub fn find_image_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Build tree layout: arch-specific subdirectory.
     #[cfg(target_arch = "x86_64")]
     {
         let p = dir.join("arch/x86/boot/bzImage");
@@ -136,6 +141,21 @@ pub fn find_image_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     #[cfg(target_arch = "aarch64")]
     {
         let p = dir.join("arch/arm64/boot/Image");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Cache entry layout: boot image at directory root.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let p = dir.join("bzImage");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let p = dir.join("Image");
         if p.exists() {
             return Some(p);
         }
@@ -224,17 +244,20 @@ pub fn resolve_btf(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
 }
 
 /// Check if a directory contains kernel build artifacts.
+///
+/// Checks both build tree layout (arch subdirectories) and cache
+/// entry layout (boot image at directory root).
 #[allow(dead_code)]
 fn _has_kernel_artifacts(dir: &std::path::Path) -> bool {
     if dir.join("vmlinux").exists() {
         return true;
     }
     #[cfg(target_arch = "x86_64")]
-    if dir.join("arch/x86/boot/bzImage").exists() {
+    if dir.join("arch/x86/boot/bzImage").exists() || dir.join("bzImage").exists() {
         return true;
     }
     #[cfg(target_arch = "aarch64")]
-    if dir.join("arch/arm64/boot/Image").exists() {
+    if dir.join("arch/arm64/boot/Image").exists() || dir.join("Image").exists() {
         return true;
     }
     false
@@ -338,6 +361,38 @@ mod tests {
     fn kernel_path_find_image_in_dir_empty() {
         let tmp = TempDir::new().unwrap();
         assert!(find_image_in_dir(tmp.path()).is_none());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernel_path_find_image_in_dir_cache_layout() {
+        // Cache entries store bzImage at directory root (no arch/ subdir).
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("bzImage"), b"fake").unwrap();
+        let result = find_image_in_dir(tmp.path());
+        assert_eq!(result, Some(tmp.path().join("bzImage")));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernel_path_find_image_in_dir_prefers_build_tree() {
+        // When both arch/ and root-level bzImage exist, prefer arch/.
+        let tmp = TempDir::new().unwrap();
+        let boot = tmp.path().join("arch/x86/boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        std::fs::write(boot.join("bzImage"), b"build-tree").unwrap();
+        std::fs::write(tmp.path().join("bzImage"), b"root-level").unwrap();
+        let result = find_image_in_dir(tmp.path());
+        assert_eq!(result, Some(boot.join("bzImage")));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernel_path_has_artifacts_root_bzimage() {
+        // Cache entry layout: bzImage at directory root.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("bzImage"), b"fake").unwrap();
+        assert!(_has_kernel_artifacts(tmp.path()));
     }
 
     // -- resolve_btf --
