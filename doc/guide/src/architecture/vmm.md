@@ -40,7 +40,7 @@ The VMM builds a cpio initramfs containing:
 
 - The test binary (as `/init`)
 - Optional scheduler binary (as `/scheduler`)
-- Shared library dependencies (resolved via `ldd`)
+- Shared library dependencies (resolved via ELF DT_NEEDED parsing)
 
 The initramfs is cached based on a `BaseKey` derived from the binary
 contents. A compressed SHM segment enables COW overlay into guest

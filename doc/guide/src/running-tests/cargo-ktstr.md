@@ -199,9 +199,8 @@ cargo ktstr shell -i ./my-binary -i strace
 Files passed via `-i` are available at `/include-files/<name>` inside
 the guest. Bare names (without path separators) are resolved via
 `PATH` lookup. Dynamically-linked ELF binaries get automatic shared
-library resolution via `ldd`. Non-ELF files are copied as-is.
-`ldd` executes the binary's ELF interpreter -- only include trusted
-binaries.
+library resolution via ELF DT_NEEDED parsing. Non-ELF files are
+copied as-is.
 
 Stdin is a terminal requirement. The host terminal enters raw mode
 for bidirectional stdin/stdout forwarding. Terminal state is restored

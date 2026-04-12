@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// Result of shared library resolution for a binary.
 #[derive(Debug)]
@@ -30,11 +31,91 @@ pub struct MissingLib {
     pub direct: bool,
 }
 
+/// Parse `/etc/ld.so.conf` and any included files to produce additional
+/// library search paths. The format:
+/// - One directory path per line
+/// - Lines starting with `#` are comments
+/// - `include <glob>` directives match files (e.g. `/etc/ld.so.conf.d/*.conf`)
+/// - Empty lines are skipped
+///
+/// Parsed once and cached for the process lifetime.
+static LD_SO_CONF_PATHS: LazyLock<Vec<PathBuf>> =
+    LazyLock::new(|| parse_ld_so_conf(Path::new("/etc/ld.so.conf")));
+
+/// Parse a single ld.so.conf-format file, recursing into `include` directives.
+fn parse_ld_so_conf_file(path: &Path, out: &mut Vec<PathBuf>) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(glob_pattern) = trimmed.strip_prefix("include") {
+            let glob_pattern = glob_pattern.trim();
+            if glob_pattern.is_empty() {
+                continue;
+            }
+            // Expand the glob by reading the parent directory and matching.
+            let pattern_path = Path::new(glob_pattern);
+            if let Some(parent) = pattern_path.parent()
+                && let Some(file_pattern) = pattern_path.file_name()
+            {
+                let pat = file_pattern.to_string_lossy();
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    let mut paths: Vec<PathBuf> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .is_some_and(|n| glob_match(&pat, &n.to_string_lossy()))
+                        })
+                        .collect();
+                    paths.sort();
+                    for p in paths {
+                        parse_ld_so_conf_file(&p, out);
+                    }
+                }
+            }
+        } else {
+            let dir = PathBuf::from(trimmed);
+            if dir.is_dir() {
+                out.push(dir);
+            }
+        }
+    }
+}
+
+/// Parse `/etc/ld.so.conf` and return all library search directories.
+fn parse_ld_so_conf(path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    parse_ld_so_conf_file(path, &mut paths);
+    paths
+}
+
+/// Simple glob matching supporting only `*` as a wildcard.
+/// Matches the full string (not a substring).
+fn glob_match(pattern: &str, s: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        s.starts_with(prefix)
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        s.ends_with(suffix)
+    } else if let Some((prefix, suffix)) = pattern.split_once('*') {
+        s.starts_with(prefix) && s[prefix.len()..].ends_with(suffix)
+    } else {
+        pattern == s
+    }
+}
+
 /// Resolve shared library dependencies for a dynamically-linked ELF binary.
 /// Parses the ELF dynamic section to read DT_NEEDED entries, then resolves
-/// each soname to a host path using DT_RUNPATH/DT_RPATH and default library
-/// paths. Recurses into resolved libraries to build the full transitive
-/// closure. Returns empty result for static binaries or non-ELF files.
+/// each soname to a host path matching the host dynamic linker's search
+/// order: LD_LIBRARY_PATH → DT_RUNPATH/DT_RPATH →
+/// /etc/ld.so.conf paths → default library paths. Recurses into resolved
+/// libraries to build the full transitive closure. Returns empty result
+/// for static binaries or non-ELF files.
 pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     let data =
         std::fs::read(binary).with_context(|| format!("read binary: {}", binary.display()))?;
@@ -171,18 +252,49 @@ const DEFAULT_LIB_PATHS: &[&str] = &[
     "/usr/lib/aarch64-linux-gnu",
 ];
 
+/// Directories from the `LD_LIBRARY_PATH` environment variable, parsed
+/// once on first access. Empty when the variable is unset or empty.
+static LD_LIBRARY_PATH_DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+    std::env::var("LD_LIBRARY_PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+});
+
 /// Resolve a soname to a host path.
-/// Search order: RUNPATH/RPATH dirs, then default library paths.
-fn resolve_soname(soname: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
-    // 1. RUNPATH / RPATH directories.
-    for dir in search_paths {
+/// Search order matches the host dynamic linker (ld.so):
+///   1. LD_LIBRARY_PATH
+///   2. DT_RUNPATH / DT_RPATH from the binary
+///   3. /etc/ld.so.conf paths
+///   4. Default library paths (/lib, /usr/lib, etc.)
+fn resolve_soname(soname: &str, elf_search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    // 1. LD_LIBRARY_PATH.
+    for dir in LD_LIBRARY_PATH_DIRS.iter() {
         let candidate = dir.join(soname);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
 
-    // 2. Default paths.
+    // 2. DT_RUNPATH / DT_RPATH directories.
+    for dir in elf_search_dirs {
+        let candidate = dir.join(soname);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 3. Paths from /etc/ld.so.conf.
+    for dir in LD_SO_CONF_PATHS.iter() {
+        let candidate = dir.join(soname);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 4. Default paths.
     for dir in DEFAULT_LIB_PATHS {
         let candidate = Path::new(dir).join(soname);
         if candidate.is_file() {
@@ -366,9 +478,8 @@ pub fn create_initramfs_base(
                 .collect();
             if !direct.is_empty() {
                 anyhow::bail!(
-                    "include file '{}' directly requires missing shared libraries: {}. \
-                     The binary will not load inside the guest VM. \
-                     Use a statically-linked binary or install the missing libraries.",
+                    "include file '{}' requires shared libraries not found in \
+                     LD_LIBRARY_PATH, RPATH, ld.so.conf, or default paths: {}",
                     path.display(),
                     direct.join(", ")
                 );
@@ -376,7 +487,7 @@ pub fn create_initramfs_base(
             for m in result.missing.iter().filter(|m| !m.direct) {
                 eprintln!(
                     "warning: include file '{}': transitive dependency {} \
-                     is not found — the binary may not load in the guest VM",
+                     not found — the binary may not load in the guest VM",
                     path.display(),
                     m.soname
                 );
@@ -1389,5 +1500,101 @@ mod tests {
             "busybox=true should have bin/busybox entry even without includes: {:?}",
             names
         );
+    }
+
+    // -- ld.so.conf parsing tests --
+
+    #[test]
+    fn parse_ld_so_conf_empty_file() {
+        let tmp = std::env::temp_dir().join("ktstr-test-ldso-empty");
+        std::fs::write(&tmp, "").unwrap();
+        let paths = parse_ld_so_conf(&tmp);
+        assert!(paths.is_empty());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn parse_ld_so_conf_comments_and_blank_lines() {
+        let tmp = std::env::temp_dir().join("ktstr-test-ldso-comments");
+        std::fs::write(&tmp, "# comment\n\n# another\n").unwrap();
+        let paths = parse_ld_so_conf(&tmp);
+        assert!(paths.is_empty());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn parse_ld_so_conf_directory_entries() {
+        let tmp = std::env::temp_dir().join("ktstr-test-ldso-dirs");
+        // /usr/lib exists on all Linux systems.
+        std::fs::write(&tmp, "/usr/lib\n/nonexistent-dir-xyz\n").unwrap();
+        let paths = parse_ld_so_conf(&tmp);
+        assert!(
+            paths.contains(&PathBuf::from("/usr/lib")),
+            "should include existing directory: {:?}",
+            paths
+        );
+        assert!(
+            !paths.contains(&PathBuf::from("/nonexistent-dir-xyz")),
+            "should skip nonexistent directories: {:?}",
+            paths
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn parse_ld_so_conf_include_directive() {
+        let tmp_dir = std::env::temp_dir().join("ktstr-test-ldso-include");
+        let conf_d = tmp_dir.join("conf.d");
+        let _ = std::fs::create_dir_all(&conf_d);
+        // Create a sub-config that points to /usr/lib.
+        std::fs::write(conf_d.join("test.conf"), "/usr/lib\n").unwrap();
+        // Create main config with include.
+        let main_conf = tmp_dir.join("ld.so.conf");
+        std::fs::write(
+            &main_conf,
+            format!("include {}/conf.d/*.conf\n", tmp_dir.display()),
+        )
+        .unwrap();
+        let paths = parse_ld_so_conf(&main_conf);
+        assert!(
+            paths.contains(&PathBuf::from("/usr/lib")),
+            "include directive should pull in /usr/lib: {:?}",
+            paths
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn parse_ld_so_conf_nonexistent_returns_empty() {
+        let paths = parse_ld_so_conf(Path::new("/nonexistent/ld.so.conf"));
+        assert!(paths.is_empty());
+    }
+
+    // -- glob_match tests --
+
+    #[test]
+    fn glob_match_suffix_star() {
+        assert!(glob_match("*.conf", "test.conf"));
+        assert!(glob_match("*.conf", ".conf"));
+        assert!(!glob_match("*.conf", "test.txt"));
+    }
+
+    #[test]
+    fn glob_match_prefix_star() {
+        assert!(glob_match("test*", "test.conf"));
+        assert!(glob_match("test*", "test"));
+        assert!(!glob_match("test*", "other"));
+    }
+
+    #[test]
+    fn glob_match_middle_star() {
+        assert!(glob_match("lib*.so", "libfoo.so"));
+        assert!(!glob_match("lib*.so", "libfoo.a"));
+    }
+
+    #[test]
+    fn glob_match_no_star() {
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "other"));
     }
 }
