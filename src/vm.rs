@@ -211,26 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn vm_topology_total_cpus() {
-        let t = Topology {
-            sockets: 2,
-            cores_per_socket: 4,
-            threads_per_core: 2,
-        };
-        assert_eq!(t.total_cpus(), 16);
-    }
-
-    #[test]
-    fn vm_topology_num_llcs() {
-        let t = Topology {
-            sockets: 3,
-            cores_per_socket: 4,
-            threads_per_core: 2,
-        };
-        assert_eq!(t.num_llcs(), 3);
-    }
-
-    #[test]
     fn gauntlet_presets_count() {
         #[cfg(target_arch = "x86_64")]
         assert_eq!(gauntlet_presets().len(), 13);
@@ -340,22 +320,50 @@ mod tests {
     }
 
     #[test]
-    fn gauntlet_presets_llc_count_matches() {
-        for p in &gauntlet_presets() {
-            let llcs = p.topology.num_llcs();
-            let desc = p.description;
-            if let Some(start) = desc.find(" LLC") {
-                let num_part = &desc[..start];
-                let num_str = num_part.rsplit(", ").next().unwrap_or("");
-                let num_str = num_str.rsplit(' ').next().unwrap_or("");
-                if let Ok(expected) = num_str.parse::<u32>() {
-                    assert_eq!(
-                        llcs, expected,
-                        "{}: description says {} LLCs but topology gives {}",
-                        p.name, expected, llcs
-                    );
-                }
-            }
+    fn gauntlet_presets_topology_pinned() {
+        // (name, expected LLCs, expected total CPUs)
+        let expected: &[(&str, u32, u32)] = &[
+            ("tiny-1llc", 1, 4),
+            ("tiny-2llc", 2, 4),
+            ("odd-3llc", 3, 9),
+            ("odd-5llc", 5, 15),
+            ("odd-7llc", 7, 14),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("smt-2llc", 2, 8),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("smt-3llc", 3, 12),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("medium-4llc", 4, 32),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("medium-8llc", 8, 64),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("large-4llc", 4, 128),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("large-8llc", 8, 128),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("near-max-llc", 15, 240),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("max-cpu", 14, 252),
+        ];
+        let presets = gauntlet_presets();
+        for &(name, llcs, cpus) in expected {
+            let p = presets.iter().find(|p| p.name == name).unwrap();
+            assert_eq!(
+                p.topology.num_llcs(),
+                llcs,
+                "{}: expected {} LLCs, got {}",
+                name,
+                llcs,
+                p.topology.num_llcs()
+            );
+            assert_eq!(
+                p.topology.total_cpus(),
+                cpus,
+                "{}: expected {} CPUs, got {}",
+                name,
+                cpus,
+                p.topology.total_cpus()
+            );
         }
     }
 
@@ -426,45 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn gauntlet_presets_cpu_counts() {
-        let expected: &[(&str, u32)] = &[
-            ("tiny-1llc", 4),
-            ("tiny-2llc", 4),
-            ("odd-3llc", 9),
-            ("odd-5llc", 15),
-            ("odd-7llc", 14),
-            #[cfg(not(target_arch = "aarch64"))]
-            ("smt-2llc", 8),
-            #[cfg(not(target_arch = "aarch64"))]
-            ("smt-3llc", 12),
-            #[cfg(not(target_arch = "aarch64"))]
-            ("medium-4llc", 32),
-            #[cfg(not(target_arch = "aarch64"))]
-            ("medium-8llc", 64),
-            #[cfg(not(target_arch = "aarch64"))]
-            ("large-4llc", 128),
-            #[cfg(not(target_arch = "aarch64"))]
-            ("large-8llc", 128),
-            #[cfg(not(target_arch = "aarch64"))]
-            ("near-max-llc", 240),
-            #[cfg(not(target_arch = "aarch64"))]
-            ("max-cpu", 252),
-        ];
-        let presets = gauntlet_presets();
-        for &(name, cpus) in expected {
-            let p = presets.iter().find(|p| p.name == name).unwrap();
-            assert_eq!(
-                p.topology.total_cpus(),
-                cpus,
-                "{}: expected {} CPUs, got {}",
-                name,
-                cpus,
-                p.topology.total_cpus()
-            );
-        }
-    }
-
-    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn gauntlet_presets_smt_presets_have_threads() {
         let presets = gauntlet_presets();
         for p in &presets {
@@ -483,13 +453,10 @@ mod tests {
         let presets = gauntlet_presets();
         for p in &presets {
             if p.name.starts_with("odd-") {
-                let cpus = p.topology.total_cpus();
-                // Odd presets have odd socket counts or produce odd CPU counts
                 assert!(
-                    cpus % 2 != 0 || p.topology.sockets % 2 != 0,
-                    "{} should be odd: {} CPUs, {} sockets",
+                    p.topology.sockets % 2 != 0,
+                    "{}: odd-* presets must have odd LLC count, got {} sockets",
                     p.name,
-                    cpus,
                     p.topology.sockets
                 );
             }
@@ -497,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn topo_preset_description_non_empty() {
+    fn gauntlet_presets_description_non_empty() {
         for p in &gauntlet_presets() {
             assert!(
                 !p.description.is_empty(),
