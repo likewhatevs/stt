@@ -11,7 +11,6 @@
 /// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
 /// - Otherwise: [`KernelId::CacheKey`]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum KernelId {
     /// Filesystem path to kernel source/build directory.
     Path(std::path::PathBuf),
@@ -21,7 +20,6 @@ pub enum KernelId {
     CacheKey(String),
 }
 
-#[allow(dead_code)]
 impl KernelId {
     /// Parse a string into a kernel identifier.
     pub fn parse(s: &str) -> Self {
@@ -50,7 +48,6 @@ impl std::fmt::Display for KernelId {
 /// Matches: `6.14`, `6.14.2`, `6.15-rc3`, `6.14.2-rc1`.
 /// Does not match: `v6.14` (git tag prefix), `6` (no minor),
 /// `6.14.2-tarball-x86_64` (cache key with extra segments).
-#[allow(dead_code)]
 fn _is_version_string(s: &str) -> bool {
     let (version_part, rc_part) = match s.split_once("-rc") {
         Some((v, rc)) => (v, Some(rc)),

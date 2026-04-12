@@ -640,13 +640,13 @@ pub(crate) fn is_final_nextest_attempt() -> bool {
 /// extract profraw from SHM, and return the test result.
 ///
 /// Validates KVM access and auto-discovers a kernel image via
-/// `resolve_kernel()` when `KTSTR_TEST_KERNEL` is not set.
+/// `resolve_test_kernel()` when `KTSTR_TEST_KERNEL` is not set.
 pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     if entry.host_only {
         return run_host_only_test_inner(entry);
     }
     if entry.bpf_map_write.is_some()
-        && let Ok(kernel) = resolve_kernel()
+        && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {
         return Ok(crate::assert::AssertResult::skip(
@@ -881,7 +881,7 @@ fn run_named_test(test_name: &str) -> i32 {
     }
 
     if entry.bpf_map_write.is_some()
-        && let Ok(kernel) = resolve_kernel()
+        && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {
         eprintln!("skipped: vmlinux not found, bpf_map_write requires vmlinux");
@@ -977,7 +977,7 @@ fn run_gauntlet_test(rest: &str) -> i32 {
     };
 
     if entry.bpf_map_write.is_some()
-        && let Ok(kernel) = resolve_kernel()
+        && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {
         eprintln!("skipped: vmlinux not found, bpf_map_write requires vmlinux");
@@ -1252,7 +1252,7 @@ fn run_ktstr_test_inner(
     active_flags: &[String],
 ) -> Result<AssertResult> {
     ensure_kvm()?;
-    let kernel = resolve_kernel()?;
+    let kernel = resolve_test_kernel()?;
     let scheduler = resolve_scheduler(&entry.scheduler.binary)?;
     let ktstr_bin = crate::resolve_current_exe()?;
 
@@ -2185,7 +2185,7 @@ pub(crate) fn format_probe_diagnostics(
 /// to `env_writer`, and warms the SHM initramfs cache for each binary.
 pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<()> {
     ensure_kvm()?;
-    let kernel = resolve_kernel()?;
+    let kernel = resolve_test_kernel()?;
     writeln!(env_writer, "KTSTR_TEST_KERNEL={}", kernel.display())
         .context("write KTSTR_TEST_KERNEL to env")?;
 
@@ -3056,8 +3056,12 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
 // Kernel resolution
 // ---------------------------------------------------------------------------
 
-/// Find a kernel bzImage for running tests.
-pub fn resolve_kernel() -> Result<PathBuf> {
+/// Find a kernel image for running tests.
+///
+/// Checks `KTSTR_TEST_KERNEL` env var first (direct image path),
+/// then delegates to [`crate::find_kernel()`] for cache and
+/// filesystem discovery. Bails with actionable hints on failure.
+pub fn resolve_test_kernel() -> Result<PathBuf> {
     // Check environment variable first.
     if let Ok(path) = std::env::var("KTSTR_TEST_KERNEL") {
         let p = PathBuf::from(&path);
@@ -3070,7 +3074,12 @@ pub fn resolve_kernel() -> Result<PathBuf> {
         return Ok(p);
     }
 
-    anyhow::bail!("no kernel found. Set KTSTR_TEST_KERNEL or build one at ../linux/")
+    anyhow::bail!(
+        "no kernel found\n  \
+         hint: run `cargo ktstr kernel build` to download and build the latest stable kernel\n  \
+         hint: or set KTSTR_KERNEL=/path/to/linux\n  \
+         hint: or set KTSTR_TEST_KERNEL=/path/to/bzImage"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3526,17 +3535,17 @@ mod tests {
         assert_eq!(written, 0);
     }
 
-    // -- resolve_kernel tests --
+    // -- resolve_test_kernel tests --
 
     #[test]
-    fn resolve_kernel_with_env_var() {
+    fn resolve_test_kernel_with_env_var() {
         let _guard = ENV_LOCK.lock().unwrap();
         let key = "KTSTR_TEST_KERNEL";
         let prev = std::env::var(key).ok();
         let exe = crate::resolve_current_exe().unwrap();
         // SAFETY: test-only, single-threaded env mutation with save/restore.
         unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
-        let result = resolve_kernel();
+        let result = resolve_test_kernel();
         match prev {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },
@@ -3546,13 +3555,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_kernel_with_nonexistent_env_path() {
+    fn resolve_test_kernel_with_nonexistent_env_path() {
         let _guard = ENV_LOCK.lock().unwrap();
         let key = "KTSTR_TEST_KERNEL";
         let prev = std::env::var(key).ok();
         // SAFETY: test-only, single-threaded env mutation with save/restore.
         unsafe { std::env::set_var(key, "/nonexistent/kernel/path") };
-        let result = resolve_kernel();
+        let result = resolve_test_kernel();
         match prev {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },

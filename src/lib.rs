@@ -274,27 +274,93 @@ pub mod prelude {
 
 /// Find a bootable kernel image on the host.
 ///
-/// Returns `Err` when `KTSTR_KERNEL` is set but the path does not
-/// exist or contains no kernel image. Returns `Ok(None)` when
-/// `KTSTR_KERNEL` is not set and no fallback location has a kernel.
+/// Resolution chain:
+/// 1. `KTSTR_KERNEL` env var, parsed via `KernelId`:
+///    - Path: search that directory for an arch-specific image
+///    - Version/CacheKey: look up in XDG cache; on miss, skip
+///      the general cache scan (step 2) and fall to filesystem
+/// 2. XDG cache: most recent cached image (newest first)
+/// 3. Local build trees (`./linux`, `../linux`,
+///    `/lib/modules/{release}/build`)
+/// 4. Host paths (`/lib/modules/{release}/vmlinuz`,
+///    `/boot/vmlinuz-{release}`, `/boot/vmlinuz`)
 ///
-/// Without `KTSTR_KERNEL`, searches build trees (`./linux`,
-/// `../linux`, `/lib/modules/{release}/build`) for arch-specific
-/// images, then `/lib/modules/{release}/vmlinuz`,
-/// `/boot/vmlinuz-{release}`, and `/boot/vmlinuz`.
+/// Returns `Err` when `KTSTR_KERNEL` is a path that does not contain
+/// a kernel image. Returns `Ok(None)` when no kernel is found.
 pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
+    use kernel_path::KernelId;
+
     let release = nix::sys::utsname::uname()
         .ok()
         .map(|u| u.release().to_string_lossy().into_owned());
     let release_ref = release.as_deref();
-    if let Ok(val) = std::env::var("KTSTR_KERNEL") {
-        // Explicit path: find_image with Some(dir) checks only that
-        // directory, no fallthrough to build trees or host paths.
-        match kernel_path::find_image(Some(&val), release_ref) {
-            Some(p) => return Ok(Some(p)),
-            None => anyhow::bail!("KTSTR_KERNEL={val} does not contain a kernel image"),
+
+    // Track whether KTSTR_KERNEL was set with a non-path value.
+    // When the user explicitly requests a version or cache key that
+    // misses cache, the general cache scan (step 2) must be skipped
+    // to avoid silently returning a different kernel.
+    let mut skip_cache_scan = false;
+
+    // 1. KTSTR_KERNEL env var with KernelId parsing.
+    if let Some(val) = std::env::var("KTSTR_KERNEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        match KernelId::parse(&val) {
+            KernelId::Path(_) => match kernel_path::find_image(Some(&val), release_ref) {
+                Some(p) => return Ok(Some(p)),
+                None => anyhow::bail!("KTSTR_KERNEL={val} does not contain a kernel image"),
+            },
+            KernelId::Version(ref ver) => {
+                // Only tarball keys use the {ver}-tarball-{arch} pattern.
+                // Git keys are {ref}-git-{hash}-{arch} and local keys are
+                // local-{hash}-{arch} — neither contains the version as a
+                // prefix, so only tarball lookup is valid here.
+                if let Ok(cache) = cache::CacheDir::new() {
+                    let arch = std::env::consts::ARCH;
+                    let key = format!("{ver}-tarball-{arch}");
+                    if let Some(entry) = cache.lookup(&key)
+                        && let Some(ref meta) = entry.metadata
+                    {
+                        return Ok(Some(entry.path.join(&meta.image_name)));
+                    }
+                }
+                // Version not in cache — skip general cache scan to
+                // avoid returning a different kernel version.
+                skip_cache_scan = true;
+            }
+            KernelId::CacheKey(ref key) => {
+                if let Ok(cache) = cache::CacheDir::new()
+                    && let Some(entry) = cache.lookup(key)
+                    && let Some(ref meta) = entry.metadata
+                {
+                    return Ok(Some(entry.path.join(&meta.image_name)));
+                }
+                // Explicit cache key not found — skip general cache scan.
+                skip_cache_scan = true;
+            }
         }
     }
+
+    // 2. XDG cache: most recent cached image.
+    // Skipped when KTSTR_KERNEL was an explicit version or cache key
+    // that missed — returning a different kernel would be surprising.
+    if !skip_cache_scan
+        && let Ok(cache) = cache::CacheDir::new()
+        && let Ok(entries) = cache.list()
+    {
+        for entry in &entries {
+            if let Some(ref meta) = entry.metadata {
+                let image = entry.path.join(&meta.image_name);
+                if image.exists() {
+                    return Ok(Some(image));
+                }
+            }
+        }
+    }
+
+    // 3-4. Filesystem fallbacks (local build trees, host paths).
     Ok(kernel_path::find_image(None, release_ref))
 }
 

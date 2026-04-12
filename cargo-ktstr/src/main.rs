@@ -44,9 +44,11 @@ enum KtstrCommand {
     },
     /// Build the kernel (if needed) and run tests via cargo nextest.
     Test {
-        /// Path to the kernel source directory.
+        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
+        /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).
+        /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
-        kernel: PathBuf,
+        kernel: Option<String>,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -185,15 +187,70 @@ fn gen_compile_commands(kernel_dir: &Path) -> Result<(), String> {
     run_make(kernel_dir, &["compile_commands.json"])
 }
 
-fn run_test(kernel_dir: &Path, args: Vec<String>) -> Result<(), String> {
-    build_kernel(kernel_dir, false)?;
+fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
+    use ktstr::kernel_path::KernelId;
+
+    let mut cmd = Command::new("cargo");
+    cmd.args(["nextest", "run"]).args(&args);
+
+    if let Some(ref val) = kernel {
+        match KernelId::parse(val) {
+            KernelId::Path(p) => {
+                let dir = PathBuf::from(&p);
+                build_kernel(&dir, false)?;
+                cmd.env("KTSTR_KERNEL", &dir);
+            }
+            KernelId::Version(ver) => {
+                let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+                let (arch, _) = fetch::arch_info();
+                let cache_key = format!("{ver}-tarball-{arch}");
+                match cache.lookup(&cache_key) {
+                    Some(entry) => {
+                        let image = entry
+                            .metadata
+                            .as_ref()
+                            .map(|m| entry.path.join(&m.image_name))
+                            .ok_or_else(|| {
+                                format!("cached entry {cache_key} has corrupt metadata")
+                            })?;
+                        eprintln!("cargo-ktstr: using cached kernel {}", image.display());
+                        cmd.env("KTSTR_TEST_KERNEL", &image);
+                    }
+                    None => {
+                        return Err(format!(
+                            "kernel version {ver} not found in cache. \
+                             Run `cargo ktstr kernel build {ver}` first."
+                        ));
+                    }
+                }
+            }
+            KernelId::CacheKey(key) => {
+                let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+                match cache.lookup(&key) {
+                    Some(entry) => {
+                        let image = entry
+                            .metadata
+                            .as_ref()
+                            .map(|m| entry.path.join(&m.image_name))
+                            .ok_or_else(|| format!("cached entry {key} has corrupt metadata"))?;
+                        eprintln!("cargo-ktstr: using cached kernel {}", image.display());
+                        cmd.env("KTSTR_TEST_KERNEL", &image);
+                    }
+                    None => {
+                        return Err(format!(
+                            "cache key {key} not found. \
+                             Run `cargo ktstr kernel list` to see available entries."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // When kernel is None, the test framework discovers a kernel via
+    // find_kernel() (which now includes cache lookup).
 
     eprintln!("cargo-ktstr: running tests");
-    let err = Command::new("cargo")
-        .args(["nextest", "run"])
-        .args(&args)
-        .env("KTSTR_KERNEL", kernel_dir)
-        .exec();
+    let err = cmd.exec();
     Err(format!("exec cargo nextest run: {err}"))
 }
 
@@ -554,7 +611,7 @@ fn main() {
 
     let result = match ktstr.command {
         KtstrCommand::BuildKernel { kernel, clean } => build_kernel(&kernel, clean),
-        KtstrCommand::Test { kernel, args } => run_test(&kernel, args),
+        KtstrCommand::Test { kernel, args } => run_test(kernel, args),
         KtstrCommand::TestStats { ref dir } => test_stats(dir),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => kernel_list(json),
