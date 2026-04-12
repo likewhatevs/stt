@@ -30,7 +30,7 @@ fn verbose() -> bool {
 
 /// Test result sidecar written to KTSTR_SIDECAR_DIR for post-run analysis.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct SidecarResult {
+pub struct SidecarResult {
     pub test_name: String,
     pub topology: String,
     pub scheduler: String,
@@ -964,28 +964,46 @@ fn run_gauntlet_test(rest: &str) -> i32 {
     result_to_exit_code(result, entry.expect_err)
 }
 
-/// Collect sidecar files and print aggregate stats to stderr.
-/// Retained for post-suite analysis.
-#[allow(dead_code)]
-pub(crate) fn collect_and_print_sidecar_stats() {
-    let dir = sidecar_dir();
-    let sidecars = collect_sidecars(&dir);
+/// Collect sidecar JSON files and return the full gauntlet analysis.
+///
+/// When `dir` is `Some`, reads sidecars from that directory. Otherwise
+/// uses the default sidecar directory (`KTSTR_SIDECAR_DIR` or
+/// `target/ktstr/{branch}-{hash}/`).
+///
+/// Returns the concatenated output of `analyze_rows`, verifier stats,
+/// callback profile, and KVM stats. Returns an empty string when no
+/// sidecars are found.
+pub fn analyze_sidecars(dir: Option<&std::path::Path>) -> String {
+    let default_dir;
+    let dir = match dir {
+        Some(d) => d,
+        None => {
+            default_dir = sidecar_dir();
+            &default_dir
+        }
+    };
+    let sidecars = collect_sidecars(dir);
+    if sidecars.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
     let rows: Vec<_> = sidecars.iter().map(crate::stats::sidecar_to_row).collect();
     if !rows.is_empty() {
-        eprintln!("{}", crate::stats::analyze_rows(&rows));
+        out.push_str(&crate::stats::analyze_rows(&rows));
     }
     let vstats = format_verifier_stats(&sidecars);
     if !vstats.is_empty() {
-        eprintln!("{vstats}");
+        out.push_str(&vstats);
     }
     let cprofile = format_callback_profile(&sidecars);
     if !cprofile.is_empty() {
-        eprintln!("{cprofile}");
+        out.push_str(&cprofile);
     }
     let kstats = format_kvm_stats(&sidecars);
     if !kstats.is_empty() {
-        eprintln!("{kstats}");
+        out.push_str(&kstats);
     }
+    out
 }
 
 /// Nextest protocol handler.

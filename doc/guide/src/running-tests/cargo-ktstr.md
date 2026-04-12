@@ -55,49 +55,41 @@ and rebuild. Both `build-kernel` and `test` generate
 
 ## test-stats
 
-`cargo ktstr test-stats` prints aggregate statistics from the most
-recent nextest run by parsing its JUnit XML output.
+`cargo ktstr test-stats` reads sidecar JSON files produced by ktstr
+tests and prints the gauntlet analysis report.
 
 ```sh
-cargo ktstr test-stats                           # default profile
-cargo ktstr test-stats --profile ci              # ci profile
-cargo ktstr test-stats --junit path/to/junit.xml # explicit file
+cargo ktstr test-stats                     # default sidecar directory
+cargo ktstr test-stats --dir path/to/dir   # explicit directory
 ```
 
 The output includes:
 
-- **Summary line** -- total, passed, failed, flaky, skipped, retries,
-  wall-clock time.
-- **Per-suite table** -- pass/fail/flaky counts and cumulative test
-  time per test binary.
-- **Failed tests** -- names, suites, retry counts, and failure
-  messages.
-- **Flaky tests** -- tests that passed after one or more retries.
-- **Slowest tests** -- top 10 by duration.
-
-Output is colorized when writing to a terminal.
-`CARGO_TERM_COLOR=always` forces color even without a terminal (useful
-in CI); `CARGO_TERM_COLOR=never` disables it even in a terminal. Set
-`NO_COLOR` to disable color regardless (see
-[Environment Variables](../reference/environment-variables.md)).
+- **Gauntlet analysis** -- outlier detection, per-scenario/flags/topology
+  dimension summaries, stimulus cross-tab.
+- **BPF verifier stats** -- per-program verified instruction counts,
+  warnings for programs near the 1M complexity limit.
+- **BPF callback profile** -- per-program invocation counts, total
+  CPU time, and average nanoseconds per call.
+- **KVM stats** -- cross-VM averages for exits, halt polling, host
+  preemptions.
 
 ### Prerequisites
 
-The nextest profile must have JUnit output enabled. The default
-profile is configured with `[profile.default.junit]` in
-`.config/nextest.toml`. Run tests first to generate the XML:
+Run tests first to generate sidecar JSON files:
 
 ```sh
-cargo nextest run --workspace        # generates target/nextest/default/junit.xml
-cargo ktstr test-stats               # reads it
+cargo nextest run --workspace        # generates target/ktstr/{branch}-{hash}/*.json
+cargo ktstr test-stats               # reads them
 ```
+
+Set `KTSTR_SIDECAR_DIR` to override the default sidecar directory.
 
 ### Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--junit <PATH>` | -- | Path to a JUnit XML file. Overrides `--profile`. |
-| `--profile <NAME>` | `default` | Nextest profile whose `junit.xml` to read. |
+| `--dir <PATH>` | -- | Path to the sidecar directory. Defaults to `KTSTR_SIDECAR_DIR` or `target/ktstr/{branch}-{hash}/`. |
 
 ## Install
 

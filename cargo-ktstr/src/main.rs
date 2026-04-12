@@ -47,14 +47,12 @@ enum KtstrCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Print aggregate test statistics from nextest JUnit XML output.
+    /// Print gauntlet analysis from sidecar JSON files.
     TestStats {
-        /// Path to a JUnit XML file. Overrides --profile.
+        /// Path to the sidecar directory. Defaults to KTSTR_SIDECAR_DIR
+        /// or target/ktstr/{branch}-{hash}/.
         #[arg(long)]
-        junit: Option<PathBuf>,
-        /// Nextest profile name whose junit.xml to read.
-        #[arg(long, default_value = "default")]
-        profile: String,
+        dir: Option<PathBuf>,
     },
 }
 
@@ -167,9 +165,11 @@ fn run_test(kernel_dir: &Path, args: Vec<String>) -> Result<(), String> {
     Err(format!("exec cargo nextest run: {err}"))
 }
 
-fn test_stats(junit: &Option<PathBuf>, profile: &str) -> Result<(), String> {
-    let output = run_test_stats(junit.as_deref(), profile)?;
-    print!("{output}");
+fn test_stats(dir: &Option<PathBuf>) -> Result<(), String> {
+    let output = run_test_stats(dir.as_deref());
+    if !output.is_empty() {
+        print!("{output}");
+    }
     Ok(())
 }
 
@@ -181,10 +181,7 @@ fn main() {
     let result = match ktstr.command {
         KtstrCommand::BuildKernel { kernel, clean } => build_kernel(&kernel, clean),
         KtstrCommand::Test { kernel, args } => run_test(&kernel, args),
-        KtstrCommand::TestStats {
-            ref junit,
-            ref profile,
-        } => test_stats(junit, profile),
+        KtstrCommand::TestStats { ref dir } => test_stats(dir),
     };
 
     if let Err(e) = result {

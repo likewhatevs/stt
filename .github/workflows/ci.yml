@@ -42,7 +42,7 @@ jobs:
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
-        run: cargo run -p cargo-ktstr -- ktstr test-stats --profile ci
+        run: cargo run -p cargo-ktstr -- ktstr test-stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
@@ -67,7 +67,7 @@ jobs:
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
-        run: cargo run -p cargo-ktstr -- ktstr test-stats --profile ci
+        run: cargo run -p cargo-ktstr -- ktstr test-stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
