@@ -249,11 +249,11 @@ cargo ktstr kernel build --source ../linux
 ## Install
 
 ```sh
-cargo install cargo-ktstr
+cargo install ktstr                   # installs both ktstr and cargo-ktstr
 ```
 
 Or build from the workspace:
 
 ```sh
-cargo build -p cargo-ktstr
+cargo build --bin cargo-ktstr
 ```

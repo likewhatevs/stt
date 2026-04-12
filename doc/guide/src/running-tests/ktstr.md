@@ -6,10 +6,10 @@ KVM VMs), `ktstr` operates on the host's real topology and cgroups.
 It does not manage scheduler lifecycle -- start your scheduler
 externally before running.
 
-Build with the `cli` feature:
+Build from the workspace:
 
 ```sh
-cargo build --features cli --bin ktstr
+cargo build --bin ktstr
 ```
 
 ## Subcommands

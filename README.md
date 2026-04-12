@@ -25,16 +25,18 @@ scheduler.
 ## Installation
 
 ```sh
-cargo install ktstr --features full   # host-side CLI with all capabilities
-cargo install cargo-ktstr             # dev workflow plugin (kernel build + nextest)
+cargo install ktstr                   # both binaries (ktstr + cargo-ktstr)
+cargo install ktstr --features full   # both binaries + GHA remote cache
 cargo install cargo-nextest           # required test runner
 ```
 
 `ktstr` is the host-side CLI for running scenarios and managing cached
-kernel images (outside VMs). `cargo-ktstr` automates kernel configuration,
-building, and test execution in one command. `scx-ktstr` (the test
-fixture scheduler) is built automatically by the workspace and does
-not need a separate install.
+kernel images (outside VMs). `cargo-ktstr` (included in the same crate)
+automates kernel configuration, building, and test execution in one
+command. `scx-ktstr` (the test fixture scheduler) is built automatically
+by the workspace and does not need a separate install. Library consumers
+should use `default-features = false` to avoid pulling in CLI
+dependencies.
 
 ## Setup
 
@@ -49,7 +51,7 @@ sudo apt install clang pkg-config
 
 ```toml
 [dev-dependencies]
-ktstr = "0.1"
+ktstr = { version = "0.1", default-features = false }
 ```
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
@@ -140,14 +142,21 @@ cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # pass nextest filter
 scheduler is already active, and manages cached kernel images:
 
 ```sh
-cargo run --features cli --bin ktstr -- list
-cargo run --features cli --bin ktstr -- run
-cargo run --features cli --bin ktstr -- topo
-cargo run --features cli --bin ktstr -- cleanup
-cargo run --features cli --bin ktstr -- kernel list
-cargo run --features cli --bin ktstr -- kernel build 6.14.2
-cargo run --features cli --bin ktstr -- kernel clean
-cargo run --features cli --bin ktstr -- completions bash
+ktstr list
+ktstr run
+ktstr topo
+ktstr cleanup
+ktstr kernel list
+ktstr kernel build 6.14.2
+ktstr kernel clean
+ktstr completions bash
+```
+
+Or via `cargo run` from the workspace:
+
+```sh
+cargo run --bin ktstr -- list
+cargo run --bin ktstr -- run
 ```
 
 ## Documentation

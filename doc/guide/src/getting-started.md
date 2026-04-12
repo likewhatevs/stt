@@ -23,13 +23,13 @@ sudo dnf install clang pkgconf
 
 ```sh
 cargo install cargo-nextest           # required test runner
-cargo install ktstr --features cli    # host-side test runner (optional)
-cargo install cargo-ktstr             # dev workflow plugin (optional)
+cargo install ktstr                   # both binaries: ktstr + cargo-ktstr (optional)
 ```
 
-`cargo-nextest` is the test runner. `ktstr` is the host-side CLI for
-running scenarios outside VMs. `cargo-ktstr` automates kernel
-configuration, building, and test execution.
+`cargo-nextest` is the test runner. `cargo install ktstr` installs
+both the host-side CLI (`ktstr`) and the dev workflow plugin
+(`cargo-ktstr`). Library consumers should add `default-features = false`
+in their `[dev-dependencies]`.
 
 ## Add the dependency
 
@@ -37,7 +37,7 @@ Add ktstr as a dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = "0.1"
+ktstr = { version = "0.1", default-features = false }
 ```
 
 ## Write a test

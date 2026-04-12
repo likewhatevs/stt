@@ -252,13 +252,7 @@ fn kernel_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Check if a kernel .config contains CONFIG_SCHED_CLASS_EXT=y.
-fn has_sched_ext(kernel_dir: &std::path::Path) -> bool {
-    let config = kernel_dir.join(".config");
-    std::fs::read_to_string(config)
-        .map(|s| s.lines().any(|l| l == "CONFIG_SCHED_CLASS_EXT=y"))
-        .unwrap_or(false)
-}
+use ktstr::cli::has_sched_ext;
 
 /// Run make in a kernel directory.
 fn run_make(kernel_dir: &std::path::Path, args: &[&str]) -> Result<()> {
@@ -294,8 +288,9 @@ fn make_kernel(kernel_dir: &std::path::Path) -> Result<()> {
     let nproc = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let j_arg = format!("-j{nproc}");
-    run_make(kernel_dir, &[&j_arg, "KCFLAGS=-Wno-error"])
+    let args = ktstr::cli::build_make_args(nproc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_make(kernel_dir, &arg_refs)
 }
 
 /// Acquire source, configure, build, and cache a kernel image.
@@ -329,23 +324,7 @@ fn kernel_build(
         // Check cache before downloading.
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}");
-        if !force {
-            if let Some(entry) = cache.lookup(&cache_key) {
-                if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
-                    eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
-                } else {
-                    eprintln!("ktstr: cached kernel found: {}", entry.path.display());
-                    eprintln!("ktstr: use --force to rebuild");
-                    return Ok(());
-                }
-            }
-        }
-        fetch::download_tarball(&ver, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"))?
-    };
-
-    // Check cache for --source and --git (tarball already checked above).
-    if !force && (source.is_some() || git.is_some()) && !acquired.is_dirty {
-        if let Some(entry) = cache.lookup(&acquired.cache_key) {
+        if !force && let Some(entry) = cache.lookup(&cache_key) {
             if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
                 eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
             } else {
@@ -353,6 +332,22 @@ fn kernel_build(
                 eprintln!("ktstr: use --force to rebuild");
                 return Ok(());
             }
+        }
+        fetch::download_tarball(&ver, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+
+    // Check cache for --source and --git (tarball already checked above).
+    if !force
+        && (source.is_some() || git.is_some())
+        && !acquired.is_dirty
+        && let Some(entry) = cache.lookup(&acquired.cache_key)
+    {
+        if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
+            eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
+        } else {
+            eprintln!("ktstr: cached kernel found: {}", entry.path.display());
+            eprintln!("ktstr: use --force to rebuild");
+            return Ok(());
         }
     }
 
@@ -613,11 +608,7 @@ fn main() -> Result<()> {
             let scenarios = scenario::all_scenarios();
             let filtered: Vec<&scenario::Scenario> = scenarios
                 .iter()
-                .filter(|s| {
-                    filter
-                        .as_ref()
-                        .map_or(true, |f| s.name.contains(f.as_str()))
-                })
+                .filter(|s| filter.as_ref().is_none_or(|f| s.name.contains(f.as_str())))
                 .collect();
 
             if json {

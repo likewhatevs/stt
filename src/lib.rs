@@ -215,6 +215,8 @@ pub mod test_support;
 pub(crate) mod timeline;
 pub mod topology;
 
+#[cfg(feature = "gha-cache")]
+pub mod remote_cache;
 pub mod verifier;
 #[allow(dead_code)]
 pub(crate) mod vm;

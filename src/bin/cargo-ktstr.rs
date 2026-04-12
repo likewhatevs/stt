@@ -3,13 +3,13 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cargo_ktstr::{build_make_args, has_sched_ext, run_test_stats};
+use ktstr::cli::{build_make_args, has_sched_ext, run_test_stats};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
 
 use ktstr::fetch;
 #[cfg(feature = "gha-cache")]
-mod remote_cache;
+use ktstr::remote_cache;
 
 /// ktstr.kconfig embedded at compile time so `cargo install` works.
 const EMBEDDED_KCONFIG: &str = include_str!("../../ktstr.kconfig");
@@ -1173,7 +1173,7 @@ fn main() {
     {
         eprintln!(
             "cargo-ktstr: warning: KTSTR_GHA_CACHE=1 but binary compiled without gha-cache feature. \
-             Rebuild with: cargo install cargo-ktstr --features gha-cache"
+             Rebuild with: cargo install ktstr --features gha-cache"
         );
     }
 

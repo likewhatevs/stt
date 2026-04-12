@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
+use crate::cache::{CacheDir, CacheEntry, KernelMetadata};
 
 /// Tokio runtime for opendal async operations.
 ///
@@ -301,7 +301,7 @@ pub fn remote_store(entry: &CacheEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ktstr::cache::{CacheDir, KernelMetadata, SourceType};
+    use crate::cache::{CacheDir, KernelMetadata, SourceType};
 
     fn test_metadata() -> KernelMetadata {
         KernelMetadata::new(

@@ -40,7 +40,7 @@ jobs:
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
-        run: cargo run -p cargo-ktstr -- ktstr test-stats
+        run: cargo run --bin cargo-ktstr -- ktstr test-stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
@@ -69,11 +69,11 @@ jobs:
           key: ktstr-kernels-arm64-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-arm64-
       - name: Build test kernel
-        run: cargo run -p cargo-ktstr --features gha-cache -- ktstr kernel build
+        run: cargo run --bin cargo-ktstr --features gha-cache -- ktstr kernel build
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
-        run: cargo run -p cargo-ktstr -- ktstr test-stats
+        run: cargo run --bin cargo-ktstr -- ktstr test-stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
