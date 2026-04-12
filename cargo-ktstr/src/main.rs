@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cargo_ktstr::{build_make_args, has_sched_ext, run_test_stats};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
 
 mod fetch;
@@ -65,6 +65,27 @@ enum KtstrCommand {
     Kernel {
         #[command(subcommand)]
         command: KernelCommand,
+    },
+    /// Boot an interactive shell in a KVM virtual machine.
+    ///
+    /// Launches a VM with busybox and drops into a shell. Files passed
+    /// via -i are available at /include-files/<name> inside the guest.
+    /// Dynamically-linked ELF binaries get automatic shared library
+    /// resolution via ldd. Note: ldd executes the binary's ELF
+    /// interpreter, so only include trusted binaries.
+    Shell {
+        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
+        /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).
+        /// When absent, resolves automatically via cache then filesystem.
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Virtual topology as "sockets,cores,threads" (default: "1,1,1").
+        #[arg(long, default_value = "1,1,1")]
+        topology: String,
+        /// Files to include in the guest at /include-files/<name>.
+        /// Dynamically-linked ELF binaries get shared library resolution.
+        #[arg(short = 'i', long = "include-files", action = ArgAction::Append)]
+        include_files: Vec<PathBuf>,
     },
 }
 
@@ -201,49 +222,10 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
                 build_kernel(&dir, false)?;
                 cmd.env("KTSTR_KERNEL", &dir);
             }
-            KernelId::Version(ver) => {
-                let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
-                let (arch, _) = fetch::arch_info();
-                let cache_key = format!("{ver}-tarball-{arch}");
-                match cache.lookup(&cache_key) {
-                    Some(entry) => {
-                        let image = entry
-                            .metadata
-                            .as_ref()
-                            .map(|m| entry.path.join(&m.image_name))
-                            .ok_or_else(|| {
-                                format!("cached entry {cache_key} has corrupt metadata")
-                            })?;
-                        eprintln!("cargo-ktstr: using cached kernel {}", image.display());
-                        cmd.env("KTSTR_TEST_KERNEL", &image);
-                    }
-                    None => {
-                        return Err(format!(
-                            "kernel version {ver} not found in cache. \
-                             Run `cargo ktstr kernel build {ver}` first."
-                        ));
-                    }
-                }
-            }
-            KernelId::CacheKey(key) => {
-                let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
-                match cache.lookup(&key) {
-                    Some(entry) => {
-                        let image = entry
-                            .metadata
-                            .as_ref()
-                            .map(|m| entry.path.join(&m.image_name))
-                            .ok_or_else(|| format!("cached entry {key} has corrupt metadata"))?;
-                        eprintln!("cargo-ktstr: using cached kernel {}", image.display());
-                        cmd.env("KTSTR_TEST_KERNEL", &image);
-                    }
-                    None => {
-                        return Err(format!(
-                            "cache key {key} not found. \
-                             Run `cargo ktstr kernel list` to see available entries."
-                        ));
-                    }
-                }
+            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
+                let image = resolve_cached_kernel(&id)?;
+                eprintln!("cargo-ktstr: using cached kernel {}", image.display());
+                cmd.env("KTSTR_TEST_KERNEL", &image);
             }
         }
     }
@@ -605,6 +587,188 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+/// Resolve a kernel image path from a Version or CacheKey identifier.
+fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, String> {
+    use ktstr::kernel_path::KernelId;
+    match id {
+        KernelId::Version(ver) => {
+            let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+            let (arch, _) = fetch::arch_info();
+            let cache_key = format!("{ver}-tarball-{arch}");
+            match cache.lookup(&cache_key) {
+                Some(entry) => entry
+                    .metadata
+                    .as_ref()
+                    .map(|m| entry.path.join(&m.image_name))
+                    .ok_or_else(|| format!("cached entry {cache_key} has corrupt metadata")),
+                None => Err(format!(
+                    "kernel version {ver} not found in cache. \
+                     Run `cargo ktstr kernel build {ver}` first."
+                )),
+            }
+        }
+        KernelId::CacheKey(key) => {
+            let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+            match cache.lookup(key) {
+                Some(entry) => entry
+                    .metadata
+                    .as_ref()
+                    .map(|m| entry.path.join(&m.image_name))
+                    .ok_or_else(|| format!("cached entry {key} has corrupt metadata")),
+                None => Err(format!(
+                    "cache key {key} not found. \
+                     Run `cargo ktstr kernel list` to see available entries."
+                )),
+            }
+        }
+        KernelId::Path(_) => Err("resolve_cached_kernel called with Path variant".to_string()),
+    }
+}
+
+/// Search PATH for a bare executable name.
+fn resolve_in_path(name: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if let Ok(meta) = std::fs::metadata(&candidate)
+            && meta.is_file()
+            && meta.permissions().mode() & 0o111 != 0
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn run_shell(
+    kernel: Option<String>,
+    topology: String,
+    include_files: Vec<PathBuf>,
+) -> Result<(), String> {
+    use ktstr::kernel_path::KernelId;
+
+    // /dev/kvm pre-flight check.
+    if !Path::new("/dev/kvm").exists() {
+        return Err("/dev/kvm not found. KVM requires:\n  \
+             - Linux kernel with KVM support (CONFIG_KVM)\n  \
+             - Access to /dev/kvm (check permissions or add user to 'kvm' group)\n  \
+             - Hardware virtualization enabled in BIOS (VT-x/AMD-V)"
+            .to_string());
+    }
+    if let Err(e) = std::fs::File::open("/dev/kvm") {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return Err(
+                "/dev/kvm: permission denied. Add your user to the 'kvm' group:\n  \
+                 sudo usermod -aG kvm $USER\n  \
+                 then log out and back in."
+                    .to_string(),
+            );
+        }
+        return Err(format!("/dev/kvm: {e}"));
+    }
+
+    // Resolve kernel.
+    let kernel_path = if let Some(ref val) = kernel {
+        match KernelId::parse(val) {
+            KernelId::Path(p) => {
+                let path = PathBuf::from(&p);
+                if path.is_file() {
+                    path
+                } else if path.is_dir() {
+                    ktstr::kernel_path::find_image_in_dir(&path)
+                        .ok_or_else(|| format!("no kernel image found in {}", path.display()))?
+                } else {
+                    return Err(format!("kernel path not found: {}", path.display()));
+                }
+            }
+            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => resolve_cached_kernel(&id)?,
+        }
+    } else {
+        ktstr::find_kernel()
+            .map_err(|e| format!("kernel resolution: {e}"))?
+            .ok_or_else(|| {
+                "no kernel found. Provide --kernel or run \
+                 `cargo ktstr kernel build` to download and cache one."
+                    .to_string()
+            })?
+    };
+
+    // Parse topology "S,C,T".
+    let parts: Vec<&str> = topology.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "invalid topology '{topology}': expected 'sockets,cores,threads' (e.g. '2,4,1')"
+        ));
+    }
+    let sockets: u32 = parts[0]
+        .parse()
+        .map_err(|_| format!("invalid sockets value: '{}'", parts[0]))?;
+    let cores: u32 = parts[1]
+        .parse()
+        .map_err(|_| format!("invalid cores value: '{}'", parts[1]))?;
+    let threads: u32 = parts[2]
+        .parse()
+        .map_err(|_| format!("invalid threads value: '{}'", parts[2]))?;
+    if sockets == 0 || cores == 0 || threads == 0 {
+        return Err(format!(
+            "invalid topology '{topology}': sockets, cores, and threads must all be >= 1"
+        ));
+    }
+
+    // Build include_files vec: resolve each path, construct archive pairs.
+    let mut resolved_includes: Vec<(String, PathBuf)> = Vec::new();
+    for path in &include_files {
+        let is_explicit_path = {
+            use std::path::Component;
+            matches!(
+                path.components().next(),
+                Some(Component::RootDir | Component::CurDir | Component::ParentDir)
+            ) || path.components().count() > 1
+        };
+        let resolved = if is_explicit_path {
+            // Explicit path (contains / or starts with . or ..): must exist.
+            if !path.exists() {
+                return Err(format!(
+                    "--include-files path not found: {}",
+                    path.display()
+                ));
+            }
+            path.clone()
+        } else {
+            // Bare name: search PATH.
+            if path.exists() {
+                path.clone()
+            } else {
+                resolve_in_path(path).ok_or_else(|| {
+                    format!("-i {}: not found in filesystem or PATH", path.display())
+                })?
+            }
+        };
+        if resolved.is_dir() {
+            return Err(format!(
+                "-i {}: is a directory. --include-files does not support directories, \
+                 pass individual files",
+                resolved.display()
+            ));
+        }
+        let file_name = resolved
+            .file_name()
+            .ok_or_else(|| format!("include file has no filename: {}", resolved.display()))?
+            .to_string_lossy();
+        let archive_path = format!("include-files/{file_name}");
+        resolved_includes.push((archive_path, resolved));
+    }
+
+    let include_refs: Vec<(&str, &Path)> = resolved_includes
+        .iter()
+        .map(|(a, p)| (a.as_str(), p.as_path()))
+        .collect();
+
+    ktstr::run_shell(kernel_path, sockets, cores, threads, &include_refs)
+        .map_err(|e| format!("{e:#}"))
+}
+
 fn main() {
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
@@ -620,6 +784,11 @@ fn main() {
         }
         KtstrCommand::Test { kernel, args } => run_test(kernel, args),
         KtstrCommand::TestStats { ref dir } => test_stats(dir),
+        KtstrCommand::Shell {
+            kernel,
+            topology,
+            include_files,
+        } => run_shell(kernel, topology, include_files),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => kernel_list(json),
             KernelCommand::Build {

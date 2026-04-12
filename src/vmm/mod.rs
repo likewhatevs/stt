@@ -255,6 +255,27 @@ impl BaseKey {
         Ok(BaseKey(hasher.finish()))
     }
 
+    /// Shell mode key: hashes a sentinel so shell and test initramfs
+    /// never collide in the SHM cache (busybox changes the content).
+    pub(crate) fn new_shell(payload: &Path, scheduler: Option<&Path>) -> Result<Self> {
+        let mut hasher = std::hash::DefaultHasher::new();
+
+        "ktstr-shell".hash(&mut hasher);
+        hash_file(payload)?.hash(&mut hasher);
+        Self::hash_shared_libs(payload, &mut hasher);
+
+        match scheduler {
+            Some(s) => {
+                1u8.hash(&mut hasher);
+                hash_file(s)?.hash(&mut hasher);
+                Self::hash_shared_libs(s, &mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+
+        Ok(BaseKey(hasher.finish()))
+    }
+
     /// Hash shared library paths and content samples for a binary so
     /// the cache key changes when any shared lib is updated on the host.
     fn hash_shared_libs(binary: &Path, hasher: &mut std::hash::DefaultHasher) {
@@ -871,6 +892,11 @@ pub struct KtstrVm {
     sched_enable_cmds: Vec<String>,
     /// Shell commands to run in the guest to disable a kernel-built scheduler.
     sched_disable_cmds: Vec<String>,
+    /// Files to include in the guest initramfs at their archive paths.
+    /// Each entry is (archive_path, host_path).
+    include_files: Vec<(String, PathBuf)>,
+    /// Embed busybox in the initramfs for shell mode.
+    busybox: bool,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -1197,6 +1223,8 @@ impl KtstrVm {
         let bin = self.init_binary.as_ref()?;
         let payload = bin.clone();
         let scheduler = self.scheduler_binary.clone();
+        let include_files = self.include_files.clone();
+        let busybox = self.busybox;
         std::thread::Builder::new()
             .name("initramfs-resolve".into())
             .spawn(move || -> Result<(BaseRef, BaseKey)> {
@@ -1204,9 +1232,31 @@ impl KtstrVm {
                     .as_deref()
                     .map(|p| vec![("scheduler", p)])
                     .unwrap_or_default();
-                let key = BaseKey::new(&payload, scheduler.as_deref())?;
-                let base = get_or_build_base(&payload, &extras, &key)?;
-                Ok((base, key))
+                let shell_mode = busybox || !include_files.is_empty();
+                let key = if shell_mode {
+                    BaseKey::new_shell(&payload, scheduler.as_deref())?
+                } else {
+                    BaseKey::new(&payload, scheduler.as_deref())?
+                };
+
+                if shell_mode {
+                    // Shell mode: build directly with include_files and busybox.
+                    // No SHM caching — shell sessions are one-off.
+                    let include_refs: Vec<(&str, &std::path::Path)> = include_files
+                        .iter()
+                        .map(|(a, p)| (a.as_str(), p.as_path()))
+                        .collect();
+                    let data = initramfs::create_initramfs_base(
+                        &payload,
+                        &extras,
+                        &include_refs,
+                        busybox,
+                    )?;
+                    Ok((BaseRef::Owned(std::sync::Arc::new(data)), key))
+                } else {
+                    let base = get_or_build_base(&payload, &extras, &key)?;
+                    Ok((base, key))
+                }
             })
             .ok()
     }
@@ -2784,6 +2834,8 @@ pub struct KtstrVmBuilder {
     performance_mode: bool,
     sched_enable_cmds: Vec<String>,
     sched_disable_cmds: Vec<String>,
+    include_files: Vec<(String, PathBuf)>,
+    busybox: bool,
 }
 
 impl Default for KtstrVmBuilder {
@@ -2809,6 +2861,8 @@ impl Default for KtstrVmBuilder {
             performance_mode: false,
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
+            include_files: Vec::new(),
+            busybox: false,
         }
     }
 }
@@ -2933,6 +2987,21 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Add files to include in the guest initramfs.
+    /// Each entry is `(archive_path, host_path)`.
+    #[allow(dead_code)]
+    pub fn include_files(mut self, files: Vec<(String, PathBuf)>) -> Self {
+        self.include_files = files;
+        self
+    }
+
+    /// Embed busybox in the initramfs for shell mode.
+    #[allow(dead_code)]
+    pub fn busybox(mut self, enabled: bool) -> Self {
+        self.busybox = enabled;
+        self
+    }
+
     pub fn build(mut self) -> Result<KtstrVm> {
         let (pinning_plan, mbind_nodes, cpu_locks) = if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
@@ -2991,6 +3060,8 @@ impl KtstrVmBuilder {
             cpu_locks,
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
+            include_files: self.include_files,
+            busybox: self.busybox,
         })
     }
 

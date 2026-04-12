@@ -429,6 +429,45 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
     Ok(proc_exe)
 }
 
+/// Boot a KVM VM in interactive shell mode.
+///
+/// Builds an initramfs with busybox and optional include files, then
+/// launches a VM with bidirectional stdin/stdout forwarding. The guest
+/// runs a shell via busybox; user-provided files are available at
+/// `/include-files/<name>`.
+///
+/// `kernel`: path to the kernel image (bzImage/Image).
+/// `sockets`, `cores`, `threads`: guest CPU topology.
+/// `include_files`: `(archive_path, host_path)` pairs for files to
+///   include in the guest.
+pub fn run_shell(
+    kernel: std::path::PathBuf,
+    sockets: u32,
+    cores: u32,
+    threads: u32,
+    include_files: &[(&str, &std::path::Path)],
+) -> anyhow::Result<()> {
+    let payload = resolve_current_exe()?;
+    let memory_mb = vmm::estimate_min_memory_mb(&payload, None, 0).max(256);
+
+    let owned_includes: Vec<(String, std::path::PathBuf)> = include_files
+        .iter()
+        .map(|(a, p)| (a.to_string(), p.to_path_buf()))
+        .collect();
+
+    let vm = vmm::KtstrVm::builder()
+        .kernel(&kernel)
+        .init_binary(&payload)
+        .topology(sockets, cores, threads)
+        .memory_mb(memory_mb)
+        .cmdline("KTSTR_MODE=shell")
+        .include_files(owned_includes)
+        .busybox(true)
+        .build()?;
+
+    vm.run_interactive()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
