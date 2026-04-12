@@ -24,8 +24,28 @@ jobs:
       - run: cargo build --workspace
       - run: cargo clippy --workspace --all-targets
 
-  test:
+  test-x64:
     runs-on: [self-hosted, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo build --workspace
+      - run: cargo nextest run --workspace --profile ci --features integration
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/nextest/ci/junit.xml
+          report_type: test_results
+
+  test-arm64:
+    runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
