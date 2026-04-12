@@ -11,4 +11,7 @@ categories = ["development-tools::testing", "development-tools::cargo-plugins"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
 tempfile = "3"

@@ -53,6 +53,46 @@ runs `make mrproper` before configuring, forcing a full reconfigure
 and rebuild. Both `build-kernel` and `test` generate
 `compile_commands.json` after building.
 
+## test-stats
+
+`cargo ktstr test-stats` prints aggregate statistics from the most
+recent nextest run by parsing its JUnit XML output.
+
+```sh
+cargo ktstr test-stats                           # default profile
+cargo ktstr test-stats --profile ci              # ci profile
+cargo ktstr test-stats --junit path/to/junit.xml # explicit file
+```
+
+The output includes:
+
+- **Summary line** -- total, passed, failed, flaky, skipped, retries,
+  wall-clock time.
+- **Per-suite table** -- pass/fail/flaky counts and cumulative test
+  time per test binary.
+- **Failed tests** -- names, suites, retry counts, and failure
+  messages.
+- **Flaky tests** -- tests that passed after one or more retries.
+- **Slowest tests** -- top 10 by duration.
+
+### Prerequisites
+
+The nextest profile must have JUnit output enabled. The default
+profile is configured with `[profile.default.junit]` in
+`.config/nextest.toml`. Run tests first to generate the XML:
+
+```sh
+cargo nextest run --workspace        # generates target/nextest/default/junit.xml
+cargo ktstr test-stats               # reads it
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--junit <PATH>` | -- | Path to a JUnit XML file. Overrides `--profile`. |
+| `--profile <NAME>` | `default` | Nextest profile whose `junit.xml` to read. |
+
 ## Install
 
 ```sh

@@ -2,7 +2,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cargo_ktstr::{build_make_args, has_sched_ext};
+use cargo_ktstr::{build_make_args, has_sched_ext, run_test_stats};
 use clap::{Parser, Subcommand};
 
 /// ktstr.kconfig embedded at compile time so `cargo install` works.
@@ -46,6 +46,15 @@ enum KtstrCommand {
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Print aggregate test statistics from nextest JUnit XML output.
+    TestStats {
+        /// Path to a JUnit XML file. Overrides --profile.
+        #[arg(long)]
+        junit: Option<PathBuf>,
+        /// Nextest profile name whose junit.xml to read.
+        #[arg(long, default_value = "default")]
+        profile: String,
     },
 }
 
@@ -158,6 +167,12 @@ fn run_test(kernel_dir: &Path, args: Vec<String>) -> Result<(), String> {
     Err(format!("exec cargo nextest run: {err}"))
 }
 
+fn test_stats(junit: &Option<PathBuf>, profile: &str) -> Result<(), String> {
+    let output = run_test_stats(junit.as_deref(), profile)?;
+    print!("{output}");
+    Ok(())
+}
+
 fn main() {
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
@@ -166,6 +181,10 @@ fn main() {
     let result = match ktstr.command {
         KtstrCommand::BuildKernel { kernel, clean } => build_kernel(&kernel, clean),
         KtstrCommand::Test { kernel, args } => run_test(&kernel, args),
+        KtstrCommand::TestStats {
+            ref junit,
+            ref profile,
+        } => test_stats(junit, profile),
     };
 
     if let Err(e) = result {
