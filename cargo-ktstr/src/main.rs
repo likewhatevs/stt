@@ -33,7 +33,8 @@ struct Ktstr {
 
 #[derive(Subcommand)]
 enum KtstrCommand {
-    /// Build the kernel with sched_ext support.
+    /// Deprecated: use `cargo ktstr kernel build` instead.
+    #[command(hide = true)]
     BuildKernel {
         /// Path to the kernel source directory.
         #[arg(long)]
@@ -610,7 +611,13 @@ fn main() {
     } = Cargo::parse();
 
     let result = match ktstr.command {
-        KtstrCommand::BuildKernel { kernel, clean } => build_kernel(&kernel, clean),
+        KtstrCommand::BuildKernel { kernel, clean } => {
+            eprintln!(
+                "cargo-ktstr: warning: build-kernel is deprecated, use `cargo ktstr kernel build --source {}` instead",
+                kernel.display()
+            );
+            build_kernel(&kernel, clean)
+        }
         KtstrCommand::Test { kernel, args } => run_test(kernel, args),
         KtstrCommand::TestStats { ref dir } => test_stats(dir),
         KtstrCommand::Kernel { command } => match command {
