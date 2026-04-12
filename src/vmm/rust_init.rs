@@ -3,8 +3,10 @@
 /// When the test binary is
 /// packed as `/init` in the initramfs, `ktstr_guest_init()` is called
 /// from the ctor or test harness `main()` when PID 1 is detected.
-/// It never returns — it mounts filesystems, starts the scheduler,
-/// dispatches the test, then reboots.
+/// It never returns — it mounts filesystems, then either dispatches
+/// a test (start scheduler, run test, reboot) or drops into an
+/// interactive shell (when `KTSTR_MODE=shell` is on the kernel
+/// cmdline).
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -36,8 +38,9 @@ fn force_reboot() -> ! {
 }
 
 /// Full guest init lifecycle. Called from the ctor or test harness
-/// `main()` when PID 1 is detected. Mounts filesystems, starts the
-/// scheduler, dispatches the test, then reboots. Never returns.
+/// `main()` when PID 1 is detected. Mounts filesystems, then either
+/// runs the test lifecycle (scheduler + dispatch + reboot) or drops
+/// into an interactive shell. Never returns.
 pub(crate) fn ktstr_guest_init() -> ! {
     // Panic hook: write crash diagnostic to COM2 then reboot.
     std::panic::set_hook(Box::new(|info| {
@@ -106,6 +109,43 @@ pub(crate) fn ktstr_guest_init() -> ! {
     unsafe {
         std::env::set_var("PATH", "/bin");
         std::env::set_var("LD_LIBRARY_PATH", "/lib:/lib64:/usr/lib:/usr/lib64");
+    }
+
+    // Shell mode: interactive busybox shell instead of test dispatch.
+    if shell_mode_requested() {
+        redirect_all_stdio_to_com2();
+
+        // Create busybox applet symlinks.
+        let _ = Command::new("/bin/busybox")
+            .args(["--install", "-s", "/bin"])
+            .status();
+
+        // MOTD.
+        let kernel_version = fs::read_to_string("/proc/version")
+            .ok()
+            .and_then(|v| v.split_whitespace().nth(2).map(|s| s.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("ktstr shell");
+        println!("  kernel:    {kernel_version}");
+        println!("  tools:     busybox (ls, ps, top, dmesg, ip, vi, ...)");
+        println!("  mounts:    /proc /sys /dev /sys/fs/cgroup /sys/fs/bpf /tmp");
+        println!("             /sys/kernel/debug /sys/kernel/tracing");
+        println!("  type `exit` for clean shutdown");
+        let _ = std::io::stdout().flush();
+
+        // Spawn sh as child (not exec) so PID 1 can clean up.
+        let status = Command::new("/bin/busybox")
+            .arg("sh")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+
+        if let Err(e) = status {
+            eprintln!("ktstr-init: shell exited with error: {e}");
+        }
+
+        force_reboot();
     }
 
     // Phase 3: Cgroup parent + Scheduler.
@@ -233,6 +273,33 @@ fn redirect_stdio_to_com2() {
         libc::dup2(fd, 2); // stderr
     }
     // com2 is dropped here but fd 1 and 2 keep the file open.
+}
+
+/// Check kernel cmdline for KTSTR_MODE=shell.
+fn shell_mode_requested() -> bool {
+    fs::read_to_string("/proc/cmdline")
+        .map(|c| c.split_whitespace().any(|s| s == "KTSTR_MODE=shell"))
+        .unwrap_or(false)
+}
+
+/// Redirect stdin, stdout, and stderr to COM2 with O_RDWR.
+///
+/// Shell mode needs all three fds on COM2: stdin for reading input
+/// from the serial port, stdout/stderr for writing output. The
+/// existing `redirect_stdio_to_com2()` opens write-only and only
+/// redirects fd 1 and fd 2.
+fn redirect_all_stdio_to_com2() {
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(com2) = fs::OpenOptions::new().read(true).write(true).open(COM2) else {
+        return;
+    };
+    let fd = com2.as_raw_fd();
+    unsafe {
+        libc::dup2(fd, 0); // stdin
+        libc::dup2(fd, 1); // stdout
+        libc::dup2(fd, 2); // stderr
+    }
 }
 
 /// Mount essential filesystems.
@@ -704,5 +771,11 @@ mod tests {
     #[test]
     fn is_pid1_false_in_test() {
         assert!(!is_pid1());
+    }
+
+    #[test]
+    fn shell_mode_not_requested_in_test() {
+        // /proc/cmdline exists on the host but won't contain KTSTR_MODE=shell.
+        assert!(!shell_mode_requested());
     }
 }
