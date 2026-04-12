@@ -502,11 +502,15 @@ pub fn run_shell(
             .filter_map(|(_, p)| std::fs::metadata(p).ok())
             .map(|m| m.len())
             .sum();
-        // 3x for shared lib overhead (typical ELF deps are ~1-2x the
-        // binary size plus cpio metadata), then 2x for
-        // compressed+uncompressed coexistence during initramfs extraction.
-        let include_mb = ((include_size * 3 + (1 << 20) - 1) >> 20) as u32;
-        (base + 2 * include_mb).max(256)
+        let include_lib_size: u64 = include_files
+            .iter()
+            .filter_map(|(_, p)| vmm::initramfs::resolve_shared_libs(p).ok())
+            .flat_map(|r| r.found.into_iter().map(|(_, p)| p))
+            .filter_map(|p| std::fs::metadata(&p).ok())
+            .map(|m| m.len())
+            .sum();
+        let include_mb = ((include_size + include_lib_size + (1 << 20) - 1) >> 20) as u32;
+        base + 2 * include_mb + 256
     });
 
     let owned_includes: Vec<(String, std::path::PathBuf)> = include_files

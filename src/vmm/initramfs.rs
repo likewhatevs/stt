@@ -511,10 +511,6 @@ pub fn create_initramfs_base(
         let result = resolve_shared_libs(path)
             .with_context(|| format!("resolve libs for {}", path.display()))?;
 
-        for m in &result.missing {
-            eprintln!("warning: {}: {} => not found", path.display(), m.soname);
-        }
-
         // Pack non-standard PT_INTERP (custom dynamic linker) into the
         // initramfs so the guest kernel uses the same linker as the host.
         if include_elf_paths.contains(path)
@@ -535,13 +531,6 @@ pub fn create_initramfs_base(
 
                 // Resolve the interpreter's own shared lib deps.
                 if let Ok(interp_result) = resolve_shared_libs(interp_path) {
-                    for m in &interp_result.missing {
-                        eprintln!(
-                            "warning: {}: {} => not found",
-                            interp_path.display(),
-                            m.soname
-                        );
-                    }
                     for (g, h) in interp_result.found {
                         if let Some(parent) = Path::new(&g).parent() {
                             let mut dir = PathBuf::new();
