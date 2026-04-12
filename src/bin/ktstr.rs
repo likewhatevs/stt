@@ -19,16 +19,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run test scenarios against a scheduler.
+    /// Run test scenarios on the host under whatever scheduler is already active.
     Run {
-        /// Scheduler binary path.
-        #[arg(long)]
-        scheduler: Option<String>,
-
-        /// Extra arguments passed to the scheduler.
-        #[arg(long = "sched-arg", num_args = 1)]
-        sched_args: Vec<String>,
-
         /// Scenario duration in seconds.
         #[arg(long, default_value = "20")]
         duration: u64,
@@ -75,10 +67,6 @@ enum Command {
         /// FutexPingPong, CachePressure, CacheYield, CachePipe, FutexFanOut.
         #[arg(long)]
         work_type: Option<String>,
-
-        /// Parent cgroup path. Auto-generated with PID suffix if omitted.
-        #[arg(long)]
-        parent_cgroup: Option<String>,
     },
     /// List available scenarios.
     List {
@@ -126,8 +114,6 @@ fn main() -> Result<()> {
 
     match args.command {
         Command::Run {
-            scheduler,
-            sched_args,
             duration,
             workers,
             flags: flag_arg,
@@ -139,27 +125,18 @@ fn main() -> Result<()> {
             auto_repro,
             kernel_dir,
             work_type,
-            parent_cgroup,
         } => {
-            let auto_generated = parent_cgroup.is_none();
-            let parent_cgroup = parent_cgroup
-                .unwrap_or_else(|| format!("/sys/fs/cgroup/ktstr-{}", std::process::id()));
+            let parent_cgroup = format!("/sys/fs/cgroup/ktstr-{}", std::process::id());
 
             // Guard cleans up auto-generated cgroups on exit (pass or fail).
-            let _guard = if auto_generated {
-                Some(CgroupGuard {
-                    path: parent_cgroup.clone(),
-                })
-            } else {
-                None
+            let _guard = CgroupGuard {
+                path: parent_cgroup.clone(),
             };
 
             let active_flags = cli::resolve_flags(flag_arg)?;
             let work_type_override = cli::parse_work_type(work_type.as_deref())?;
 
             let config = cli::build_run_config(
-                scheduler,
-                sched_args,
                 parent_cgroup,
                 duration,
                 workers,

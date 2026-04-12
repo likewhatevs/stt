@@ -1,8 +1,10 @@
 # ktstr
 
-`ktstr` runs ktstr scenarios directly on the host against a
-scheduler. Unlike `#[ktstr_test]` (which boots KVM VMs),
-`ktstr` operates on the host's real topology and cgroups.
+`ktstr` runs ktstr scenarios directly on the host under whatever
+scheduler is already active. Unlike `#[ktstr_test]` (which boots
+KVM VMs), `ktstr` operates on the host's real topology and cgroups.
+It does not manage scheduler lifecycle -- start your scheduler
+externally before running.
 
 Build with the `cli` feature:
 
@@ -14,20 +16,23 @@ cargo build --features cli --bin ktstr
 
 ### run
 
-Run scenarios against a scheduler binary:
+Run scenarios on the host:
 
 ```sh
-ktstr run --scheduler scx_my_sched
-ktstr run --scheduler scx_my_sched --flags llc,borrow --duration 30
-ktstr run --scheduler scx_my_sched --filter cpuset --json
-ktstr run --scheduler scx_my_sched --work-type YieldHeavy
+ktstr run
+ktstr run --flags llc,borrow --duration 30
+ktstr run --filter cpuset --json
+ktstr run --work-type YieldHeavy
 ```
 
-Without `--scheduler`, scenarios run under the kernel's default
-scheduler (EEVDF).
+Scenarios run under whatever scheduler is currently active on the
+host. Start your scheduler before invoking `ktstr run`.
 
 Without `--flags`, all valid flag profiles are generated for each
-scenario. With `--flags`, only the specified flags are active.
+scenario. With `--flags`, only the specified profile is run. Flags
+select which test profiles to run -- they do not configure the
+scheduler. Start the scheduler with the desired features before
+running ktstr.
 
 `--filter` selects scenarios whose name contains the given substring.
 

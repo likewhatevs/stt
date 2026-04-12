@@ -1,29 +1,25 @@
-//! Scenario execution engine with scheduler lifecycle management.
+//! Scenario execution engine.
 //!
 //! See the [Running Tests](https://likewhatevs.github.io/ktstr/guide/running-tests.html)
 //! chapter of the guide.
 
-use anyhow::{Context, Result, bail};
-use std::process::{Child, Command, Stdio};
+use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
 use crate::assert::ScenarioStats;
 use crate::cgroup::CgroupManager;
 use crate::probe::btf::discover_bpf_symbols;
-use crate::probe::stack::{
-    expand_bpf_to_kernel_callers, extract_stack_functions_all, filter_traceable, load_probe_stack,
-};
+use crate::probe::stack::{expand_bpf_to_kernel_callers, filter_traceable, load_probe_stack};
 use crate::scenario::{self, Ctx, FlagProfile, Scenario, flags};
 use crate::topology::TestTopology;
 
 /// Full configuration for a scenario run session.
 ///
-/// Controls scheduler binary, flag selection, durations, and
-/// verification behavior.
+/// Controls flag selection, durations, and verification behavior.
+/// The scheduler is managed externally -- `ktstr run` does not
+/// start or stop schedulers.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    pub scheduler_bin: Option<String>,
-    pub scheduler_args: Vec<String>,
     pub parent_cgroup: String,
     pub duration: Duration,
     pub workers_per_cgroup: usize,
@@ -38,8 +34,6 @@ pub struct RunConfig {
     pub kernel_dir: Option<String>,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
-    /// Sleep after scheduler process start to let it initialize.
-    pub scheduler_startup: Duration,
     /// Sleep after cgroup cleanup before next scenario.
     pub cleanup: Duration,
     /// Override work_type for all swappable CgroupDefs and steady-state cgroups.
@@ -51,8 +45,6 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
-            scheduler_bin: None,
-            scheduler_args: Vec::new(),
             parent_cgroup: "/sys/fs/cgroup/ktstr".into(),
             duration: Duration::from_secs(20),
             workers_per_cgroup: 4,
@@ -64,7 +56,6 @@ impl Default for RunConfig {
             auto_repro: false,
             kernel_dir: None,
             settle: Duration::from_millis(500),
-            scheduler_startup: Duration::from_millis(2000),
             cleanup: Duration::from_millis(200),
             work_type_override: None,
             assert: crate::assert::Assert::NONE,
@@ -145,14 +136,15 @@ pub fn expand_scenario_runs<'a>(
     runs
 }
 
-/// Orchestrates scenario execution with scheduler lifecycle management.
+/// Orchestrates scenario execution.
 ///
-/// Starts/stops the scheduler process as needed when flag profiles
-/// change, and runs each scenario with the appropriate configuration.
+/// Runs each scenario with the appropriate configuration. The
+/// scheduler is managed externally -- the runner does not start
+/// or stop scheduler processes.
 pub struct Runner {
     /// Run configuration.
     pub config: RunConfig,
-    /// VM CPU topology.
+    /// Host CPU topology.
     pub topo: TestTopology,
 }
 
@@ -165,51 +157,27 @@ impl Runner {
         Ok(Self { config, topo })
     }
 
-    /// Run all scenarios with their flag profiles. Manages scheduler
-    /// process lifecycle between profile changes.
+    /// Run all scenarios with their flag profiles.
     pub fn run_scenarios(&self, scenarios: &[&Scenario]) -> Result<Vec<ScenarioResult>> {
         let runs = expand_scenario_runs(scenarios, &self.config.active_flags);
 
         let mut results = Vec::new();
-        let mut cur_profile = String::new();
-        let mut sched: Option<SchedulerProcess> = None;
 
         for (s, profile) in &runs {
             let qname = s.qualified_name(profile);
-            let pname = profile.name();
 
             let start = Instant::now();
             let cgroups = CgroupManager::new(&self.config.parent_cgroup);
             let needs_cpu_ctrl = !profile.flags.contains(&flags::NO_CTRL);
             cgroups.setup(needs_cpu_ctrl).context("cgroup setup")?;
 
-            if pname != cur_profile {
-                if let Some(mut p) = sched.take() {
-                    p.stop();
-                }
-                if let Some(ref bin) = self.config.scheduler_bin {
-                    let args = self.config.scheduler_args.clone();
-                    tracing::info!(bin = %bin, ?args, "starting scheduler");
-                    let mut p = SchedulerProcess::start(bin, &args)?;
-                    std::thread::sleep(self.config.scheduler_startup);
-                    if p.is_dead() {
-                        let _ = cgroups.cleanup_all();
-                        bail!("scheduler exited immediately");
-                    }
-                    tracing::info!("scheduler running");
-                    sched = Some(p);
-                }
-                cur_profile = pname;
-            }
-
-            let sched_pid = sched.as_ref().map(|s| s.pid()).unwrap_or(0);
-            crate::workload::set_sched_pid(sched_pid as i32);
+            crate::workload::set_sched_pid(0);
             let ctx = Ctx {
                 cgroups: &cgroups,
                 topo: &self.topo,
                 duration: self.config.duration,
                 workers_per_cgroup: self.config.workers_per_cgroup,
-                sched_pid,
+                sched_pid: 0,
                 settle: self.config.settle,
                 work_type_override: self.config.work_type_override.clone(),
                 assert: crate::assert::Assert::default_checks().merge(&self.config.assert),
@@ -330,16 +298,6 @@ impl Runner {
                 None
             };
 
-            let sched_dead = sched.as_mut().map(|s| s.is_dead()).unwrap_or(false);
-            let elapsed_secs = start.elapsed().as_secs_f64();
-            if sched_dead {
-                tracing::warn!(
-                    qname,
-                    elapsed_s = format!("{elapsed_secs:.1}"),
-                    "scheduler crashed"
-                );
-            }
-
             let _ = cgroups.cleanup_all();
             std::thread::sleep(self.config.cleanup);
 
@@ -353,75 +311,6 @@ impl Runner {
                             }
                         }
                     }
-                    if sched_dead {
-                        v.passed = false;
-                        v.details.push(format!(
-                            "scheduler crashed ({:.1}s into test)",
-                            elapsed_secs,
-                        ));
-                    }
-                    // On failure: kill scheduler so it writes exit dump, then read it
-                    if !v.passed {
-                        if let Some(mut s) = sched.take() {
-                            s.stop();
-                            std::thread::sleep(Duration::from_millis(100));
-                            let dump = s.read_stderr();
-                            if !dump.is_empty() {
-                                let is_autoprobe =
-                                    self.config.probe_stack.is_some() || self.config.auto_repro;
-                                for line in dump.lines() {
-                                    if line.trim().is_empty() {
-                                        continue;
-                                    }
-                                    if is_autoprobe && !self.config.verbose {
-                                        if line.contains("runtime error")
-                                            || line.contains("EXIT:")
-                                            || line.contains("Error:")
-                                            || line.starts_with("CELL[")
-                                            || line.starts_with("  CELL[")
-                                            || line.starts_with("CPU[")
-                                            || line.starts_with("  CPU[")
-                                        {
-                                            v.details.push(line.to_string());
-                                        }
-                                    } else {
-                                        v.details.push(line.to_string());
-                                    }
-                                }
-                                // Extract stack from the FULL dump (not the
-                                // filtered details) for auto-probe rerun
-                                if self.config.repro && self.config.probe_stack.is_none() {
-                                    let stack_fns = extract_stack_functions_all(&dump);
-                                    if !stack_fns.is_empty() {
-                                        let stack_path = std::env::temp_dir().join(format!(
-                                            "ktstr-crash-stack-{}.txt",
-                                            std::process::id()
-                                        ));
-                                        let stack_text: String = stack_fns
-                                            .iter()
-                                            .map(|f| f.raw_name.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join("\n");
-                                        let _ = std::fs::write(&stack_path, &stack_text);
-                                        let names: Vec<&str> = stack_fns
-                                            .iter()
-                                            .map(|f| f.display_name.as_str())
-                                            .collect();
-                                        v.details.push(format!(
-                                            "auto-probe: rerun with --probe-stack {}",
-                                            stack_path.display()
-                                        ));
-                                        v.details
-                                            .push(format!("  functions: {}", names.join(", ")));
-                                    }
-                                }
-                            }
-                        }
-                        cur_profile.clear();
-                    } else if sched_dead {
-                        sched.take();
-                        cur_profile.clear();
-                    }
                     ScenarioResult {
                         scenario_name: qname,
                         passed: v.passed,
@@ -430,91 +319,18 @@ impl Runner {
                         stats: v.stats,
                     }
                 }
-                Err(e) => {
-                    let mut details = vec![format!("{e:#}")];
-                    if let Some(mut s) = sched.take() {
-                        s.stop();
-                        std::thread::sleep(Duration::from_millis(100));
-                        let dump = s.read_stderr();
-                        for line in dump.lines() {
-                            if !line.trim().is_empty() {
-                                details.push(line.to_string());
-                            }
-                        }
-                    }
-                    cur_profile.clear();
-                    ScenarioResult {
-                        scenario_name: qname,
-                        passed: false,
-                        duration_s: start.elapsed().as_secs_f64(),
-                        details,
-                        stats: Default::default(),
-                    }
-                }
+                Err(e) => ScenarioResult {
+                    scenario_name: qname,
+                    passed: false,
+                    duration_s: start.elapsed().as_secs_f64(),
+                    details: vec![format!("{e:#}")],
+                    stats: Default::default(),
+                },
             };
             results.push(r);
         }
 
-        if let Some(mut p) = sched.take() {
-            p.stop();
-        }
         Ok(results)
-    }
-}
-
-/// RAII handle to a running scheduler process.
-pub(crate) struct SchedulerProcess {
-    child: Child,
-    stderr_path: std::path::PathBuf,
-}
-
-impl SchedulerProcess {
-    fn start(bin: &str, args: &[String]) -> Result<Self> {
-        let stderr_path =
-            std::env::temp_dir().join(format!("ktstr-sched-{}.log", std::process::id()));
-        let stderr_file = std::fs::File::create(&stderr_path)?;
-        let child = Command::new(bin)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .with_context(|| format!("spawn {bin}"))?;
-        Ok(Self { child, stderr_path })
-    }
-    /// PID of the scheduler process.
-    pub fn pid(&self) -> u32 {
-        self.child.id()
-    }
-    /// Read scheduler output (includes watchdog dumps on stall exit).
-    pub fn read_stderr(&self) -> String {
-        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
-    }
-    /// Check if the scheduler has exited.
-    pub fn is_dead(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_some()
-    }
-    fn stop(&mut self) {
-        use nix::sys::signal::{Signal, kill};
-        use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(self.child.id() as i32), Signal::SIGTERM);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if self.child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            if Instant::now() > deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
-
-impl Drop for SchedulerProcess {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -623,45 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_process_stop_terminates() {
-        // Spawn a long-running process, wrap in SchedulerProcess, call stop(),
-        // verify it terminates within a reasonable time (SIGTERM -> poll -> SIGKILL).
-        let stderr_path =
-            std::env::temp_dir().join(format!("ktstr-test-stop-{}.log", std::process::id()));
-        let stderr_file = std::fs::File::create(&stderr_path).unwrap();
-        let child = Command::new("sleep")
-            .arg("999")
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .unwrap();
-        let mut proc = SchedulerProcess {
-            child,
-            stderr_path: stderr_path.clone(),
-        };
-
-        // Process should be alive before stop.
-        assert!(!proc.is_dead(), "process should be alive before stop");
-
-        let before = Instant::now();
-        proc.stop();
-        let elapsed = before.elapsed();
-
-        // stop() sends SIGTERM then polls for 3s then SIGKILL.
-        // sleep handles SIGTERM by exiting, so it should complete quickly.
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "stop() took too long: {elapsed:?}"
-        );
-
-        // Process must be dead after stop.
-        assert!(proc.is_dead(), "process should be dead after stop");
-
-        // Clean up.
-        let _ = std::fs::remove_file(&stderr_path);
-    }
-
-    #[test]
     fn scenario_result_serde_special_chars() {
         let r = ScenarioResult {
             scenario_name: "test/with\"quotes".into(),
@@ -691,136 +468,12 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_process_read_stderr_empty() {
-        let stderr_path =
-            std::env::temp_dir().join(format!("ktstr-test-stderr-{}.log", std::process::id()));
-        std::fs::write(&stderr_path, "").unwrap();
-        let child = Command::new("true")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let proc = SchedulerProcess {
-            child,
-            stderr_path: stderr_path.clone(),
-        };
-        let stderr = proc.read_stderr();
-        assert!(stderr.is_empty());
-        let _ = std::fs::remove_file(&stderr_path);
-    }
-
-    #[test]
-    fn scheduler_process_read_stderr_content() {
-        let stderr_path =
-            std::env::temp_dir().join(format!("ktstr-test-stderr2-{}.log", std::process::id()));
-        std::fs::write(&stderr_path, "error: scheduler died").unwrap();
-        let child = Command::new("true")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let proc = SchedulerProcess {
-            child,
-            stderr_path: stderr_path.clone(),
-        };
-        let stderr = proc.read_stderr();
-        assert_eq!(stderr, "error: scheduler died");
-        let _ = std::fs::remove_file(&stderr_path);
-    }
-
-    #[test]
-    fn scheduler_process_pid() {
-        let stderr_path =
-            std::env::temp_dir().join(format!("ktstr-test-pid-{}.log", std::process::id()));
-        let stderr_file = std::fs::File::create(&stderr_path).unwrap();
-        let child = Command::new("sleep")
-            .arg("999")
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .unwrap();
-        let expected_pid = child.id();
-        let mut proc = SchedulerProcess {
-            child,
-            stderr_path: stderr_path.clone(),
-        };
-        assert_eq!(proc.pid(), expected_pid);
-        assert!(!proc.is_dead());
-        proc.stop();
-        let _ = std::fs::remove_file(&stderr_path);
-    }
-
-    #[test]
     fn flag_profile_with_other_flags_still_needs_ctrl() {
         let profile = FlagProfile {
             flags: vec![flags::LLC, flags::BORROW],
         };
         let needs_cpu_ctrl = !profile.flags.contains(&flags::NO_CTRL);
         assert!(needs_cpu_ctrl);
-    }
-
-    #[test]
-    fn scheduler_process_start_nonexistent_fails() {
-        let result = SchedulerProcess::start("__nonexistent_scheduler_binary_xyz__", &[]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn scheduler_process_start_and_immediate_death() {
-        let stderr_path =
-            std::env::temp_dir().join(format!("ktstr-test-death-{}.log", std::process::id()));
-        let stderr_file = std::fs::File::create(&stderr_path).unwrap();
-        let child = Command::new("false") // exits immediately with code 1
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .unwrap();
-        let mut proc = SchedulerProcess {
-            child,
-            stderr_path: stderr_path.clone(),
-        };
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(proc.is_dead(), "'false' should exit immediately");
-        let _ = std::fs::remove_file(&stderr_path);
-    }
-
-    #[test]
-    fn scheduler_process_drop_stops_child() {
-        let stderr_path =
-            std::env::temp_dir().join(format!("ktstr-test-drop-{}.log", std::process::id()));
-        let stderr_file = std::fs::File::create(&stderr_path).unwrap();
-        let child = Command::new("sleep")
-            .arg("999")
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        {
-            let _proc = SchedulerProcess {
-                child,
-                stderr_path: stderr_path.clone(),
-            };
-            // proc drops here, calling stop()
-        }
-        // Verify process is gone by trying to send signal 0.
-        let kill_result = unsafe { libc::kill(pid as i32, 0) };
-        assert_eq!(kill_result, -1, "process should be gone after drop");
-        let _ = std::fs::remove_file(&stderr_path);
-    }
-
-    #[test]
-    fn scheduler_process_read_stderr_nonexistent_path() {
-        let child = Command::new("true")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let proc = SchedulerProcess {
-            child,
-            stderr_path: std::path::PathBuf::from("/nonexistent/path.log"),
-        };
-        assert!(proc.read_stderr().is_empty());
     }
 
     #[test]
@@ -915,8 +568,6 @@ mod tests {
     fn runner_new_preserves_config() {
         let topo = TestTopology::from_spec(2, 4, 2);
         let config = RunConfig {
-            scheduler_bin: Some("scx_mitosis".into()),
-            scheduler_args: vec!["--verbose".into()],
             duration: Duration::from_secs(30),
             workers_per_cgroup: 8,
             json: true,
@@ -926,17 +577,12 @@ mod tests {
             ..Default::default()
         };
         let runner = Runner::new(config, topo).unwrap();
-        // Verify topology was correctly propagated (2*4*2=16 CPUs).
         assert_eq!(runner.topo.total_cpus(), 16);
-        // Verify config fields survived construction.
-        assert_eq!(runner.config.scheduler_bin.as_deref(), Some("scx_mitosis"));
-        assert_eq!(runner.config.scheduler_args, vec!["--verbose"]);
         assert_eq!(runner.config.duration, Duration::from_secs(30));
         assert_eq!(runner.config.workers_per_cgroup, 8);
         assert!(runner.config.json);
         assert!(runner.config.verbose);
         assert_eq!(runner.config.settle, Duration::from_millis(500));
-        assert_eq!(runner.config.scheduler_startup, Duration::from_millis(2000));
         assert_eq!(runner.config.cleanup, Duration::from_millis(300));
         assert_eq!(runner.config.active_flags.as_ref().unwrap().len(), 2);
     }
@@ -985,13 +631,11 @@ mod tests {
     #[test]
     fn run_config_debug_shows_field_values() {
         let config = RunConfig {
-            scheduler_bin: Some("scx_mitosis".into()),
             duration: Duration::from_secs(30),
             verbose: true,
             ..Default::default()
         };
         let s = format!("{:?}", config);
-        assert!(s.contains("scx_mitosis"), "must show scheduler_bin value");
         assert!(s.contains("30"), "must show duration value");
         assert!(s.contains("4"), "must show workers_per_cgroup value");
     }
@@ -999,8 +643,6 @@ mod tests {
     #[test]
     fn run_config_clone_preserves_all_fields() {
         let config = RunConfig {
-            scheduler_bin: Some("scx_mitosis".into()),
-            scheduler_args: vec!["--arg".into()],
             parent_cgroup: "/sys/fs/cgroup/ktstr".into(),
             duration: Duration::from_secs(10),
             workers_per_cgroup: 4,
@@ -1012,14 +654,11 @@ mod tests {
             auto_repro: true,
             kernel_dir: Some("/path".into()),
             settle: Duration::from_millis(500),
-            scheduler_startup: Duration::from_millis(2000),
             cleanup: Duration::from_millis(100),
             work_type_override: Some(crate::workload::WorkType::CpuSpin),
             assert: crate::assert::Assert::NONE.max_gap_ms(5000),
         };
         let c2 = config.clone();
-        assert_eq!(c2.scheduler_bin, config.scheduler_bin);
-        assert_eq!(c2.scheduler_args, config.scheduler_args);
         assert_eq!(c2.duration, config.duration);
         assert_eq!(c2.workers_per_cgroup, config.workers_per_cgroup);
         assert_eq!(c2.json, config.json);
@@ -1057,33 +696,6 @@ mod tests {
         assert_eq!(r2.stats.total_workers, 4);
         assert_eq!(r2.stats.worst_gap_ms, 3000);
         assert_eq!(r2.stats.worst_gap_cpu, 5);
-    }
-
-    #[test]
-    fn scheduler_process_stop_then_read_stderr_empty() {
-        // Exercises the combined stop+read path: after stopping a process
-        // that wrote nothing to stderr, read_stderr returns empty.
-        let stderr_path =
-            std::env::temp_dir().join(format!("ktstr-test-stop-read-{}.log", std::process::id()));
-        let stderr_file = std::fs::File::create(&stderr_path).unwrap();
-        let child = Command::new("sleep")
-            .arg("999")
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let mut proc = SchedulerProcess {
-            child,
-            stderr_path: stderr_path.clone(),
-        };
-        assert_eq!(proc.pid(), pid);
-        assert!(!proc.is_dead());
-        proc.stop();
-        assert!(proc.is_dead(), "must be dead after stop");
-        let stderr = proc.read_stderr();
-        assert!(stderr.is_empty(), "sleep writes nothing to stderr");
-        let _ = std::fs::remove_file(&stderr_path);
     }
 
     // -- expand_scenario_runs tests --

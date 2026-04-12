@@ -63,8 +63,6 @@ pub fn filter_scenarios<'a>(
 /// Build a RunConfig from parsed CLI arguments.
 #[allow(clippy::too_many_arguments)]
 pub fn build_run_config(
-    scheduler: Option<String>,
-    sched_args: Vec<String>,
     parent_cgroup: String,
     duration: u64,
     workers: usize,
@@ -78,8 +76,6 @@ pub fn build_run_config(
     work_type_override: Option<WorkType>,
 ) -> RunConfig {
     RunConfig {
-        scheduler_bin: scheduler,
-        scheduler_args: sched_args,
         parent_cgroup,
         duration: Duration::from_secs(duration),
         workers_per_cgroup: workers,
@@ -235,8 +231,6 @@ mod tests {
     #[test]
     fn cli_build_run_config_defaults() {
         let config = build_run_config(
-            None,
-            vec![],
             "/sys/fs/cgroup/ktstr".into(),
             20,
             4,
@@ -249,8 +243,6 @@ mod tests {
             None,
             None,
         );
-        assert!(config.scheduler_bin.is_none());
-        assert!(config.scheduler_args.is_empty());
         assert_eq!(config.parent_cgroup, "/sys/fs/cgroup/ktstr");
         assert_eq!(config.duration, Duration::from_secs(20));
         assert_eq!(config.workers_per_cgroup, 4);
@@ -267,8 +259,6 @@ mod tests {
     #[test]
     fn cli_build_run_config_all_fields() {
         let config = build_run_config(
-            Some("scx_test".into()),
-            vec!["--verbose".into()],
             "/sys/fs/cgroup/test".into(),
             30,
             8,
@@ -281,8 +271,6 @@ mod tests {
             Some("/usr/src/linux".into()),
             Some(WorkType::Mixed),
         );
-        assert_eq!(config.scheduler_bin.as_deref(), Some("scx_test"));
-        assert_eq!(config.scheduler_args, vec!["--verbose"]);
         assert_eq!(config.parent_cgroup, "/sys/fs/cgroup/test");
         assert_eq!(config.duration, Duration::from_secs(30));
         assert_eq!(config.workers_per_cgroup, 8);
@@ -300,8 +288,6 @@ mod tests {
     #[test]
     fn cli_build_run_config_duration_converts() {
         let config = build_run_config(
-            None,
-            vec![],
             "cg".into(),
             60,
             1,
