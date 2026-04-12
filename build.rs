@@ -32,10 +32,7 @@ fn main() {
                  directory, or ensure /sys/kernel/btf/vmlinux exists."
             );
         });
-        println!(
-            "cargo::warning=generating vmlinux.h from {}",
-            btf_source.display()
-        );
+        println!("generating vmlinux.h from {}", btf_source.display());
 
         // libbpf-sys (links = "bpf") emits installed headers at
         // DEP_BPF_INCLUDE with bpf/ prefix (bpf/btf.h, bpf/libbpf.h).

@@ -25,8 +25,6 @@ pub use x86_64::mptable;
 pub use aarch64::boot;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::kvm;
-#[cfg(target_arch = "aarch64")]
-pub use aarch64::topology as arch_topology;
 
 pub use topology::Topology;
 
@@ -920,6 +918,8 @@ impl KtstrVm {
 
         let run = self.run_vm(start, vm)?;
 
+        // mut needed on x86_64 for kvm_stats assignment below.
+        #[allow(unused_mut)]
         let mut result = self.collect_results(start, run)?;
 
         // Read cumulative KVM stats after VM exit.
