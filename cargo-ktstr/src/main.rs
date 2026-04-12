@@ -77,12 +77,12 @@ fn configure_kernel(kernel_dir: &Path, kconfig: &Path) -> Result<(), String> {
     }
 
     let merge_script = kernel_dir.join("scripts/kconfig/merge_config.sh");
-    if !merge_script.exists() {
-        return Err(format!(
-            "merge_config.sh not found at {}",
+    let merge_script = merge_script.canonicalize().map_err(|e| {
+        format!(
+            "merge_config.sh not found at {}: {e}",
             merge_script.display()
-        ));
-    }
+        )
+    })?;
     let status = Command::new("sh")
         .arg(&merge_script)
         .args(["-m", ".config"])
