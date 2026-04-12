@@ -75,8 +75,11 @@ The output includes:
 - **Flaky tests** -- tests that passed after one or more retries.
 - **Slowest tests** -- top 10 by duration.
 
-Output is colorized when writing to a terminal. Set `NO_COLOR` to
-disable color (see [Environment Variables](../reference/environment-variables.md)).
+Output is colorized when writing to a terminal.
+`CARGO_TERM_COLOR=always` forces color even without a terminal (useful
+in CI); `CARGO_TERM_COLOR=never` disables it even in a terminal. Set
+`NO_COLOR` to disable color regardless (see
+[Environment Variables](../reference/environment-variables.md)).
 
 ### Prerequisites
 

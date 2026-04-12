@@ -39,7 +39,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo build --workspace
-      - run: cargo nextest run --workspace --profile ci --features integration -j $(($(nproc) / 4))
+      - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
         run: cargo run -p cargo-ktstr -- ktstr test-stats --profile ci
@@ -64,7 +64,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo build --workspace
-      - run: cargo nextest run --workspace --profile ci --features integration -j $(($(nproc) / 4))
+      - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
         run: cargo run -p cargo-ktstr -- ktstr test-stats --profile ci
@@ -87,7 +87,7 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: cargo build --workspace
-      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration -j $(($(nproc) / 4))
+      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:

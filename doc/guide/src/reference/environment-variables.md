@@ -13,7 +13,8 @@ Environment variables that control ktstr behavior.
 | `KTSTR_SIDECAR_DIR` | Directory for per-test result sidecar JSON files. See [Baselines](../running-tests/baselines.md). | `target/ktstr/{branch}-{hash}/` |
 | `KTSTR_VERBOSE` | Set to `"1"` for verbose VM console output (`earlyprintk`, `loglevel=7`). | None |
 | `RUST_BACKTRACE` | Gates verbose diagnostic output on failure. Also enables verbose VM console output (same as `KTSTR_VERBOSE=1`) when set to `"1"` or `"full"`. Propagated to the guest. | None |
-| `NO_COLOR` | Disables colored output in `cargo ktstr test-stats` when set. Follows [no-color.org](https://no-color.org). | None |
+| `CARGO_TERM_COLOR` | Controls colored output in `cargo ktstr test-stats`: `always` forces color even without a terminal, `never` disables color even in a terminal. `NO_COLOR` still takes precedence over both. | None |
+| `NO_COLOR` | Disables colored output in `cargo ktstr test-stats` when set, regardless of `CARGO_TERM_COLOR`. Follows [no-color.org](https://no-color.org). | None |
 | `RUST_LOG` | Controls tracing filter for guest-side logging. Propagated to the VM kernel command line and parsed by the guest tracing subscriber. | None |
 | `LINUX_ROOT` | Path to a Linux source tree containing `vmlinux` for BTF monitor tests. | None |
 

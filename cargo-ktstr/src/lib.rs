@@ -285,9 +285,18 @@ fn fmt_duration(seconds: f64) -> String {
 
 /// Whether colored output should be used.
 ///
-/// Returns `true` when stdout is a terminal and `NO_COLOR` is not set.
+/// Returns `false` when `NO_COLOR` is set or `CARGO_TERM_COLOR=never`.
+/// Returns `true` when `CARGO_TERM_COLOR=always` or stdout is a terminal.
 fn use_color() -> bool {
-    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    match std::env::var("CARGO_TERM_COLOR").as_deref() {
+        Ok("never") => return false,
+        Ok("always") => return true,
+        _ => {}
+    }
+    std::io::stdout().is_terminal()
 }
 
 /// Wrap `text` in ANSI SGR codes if `color` is true.
@@ -300,9 +309,10 @@ fn ansi(text: &str, code: &str, color: bool) -> String {
 }
 
 /// Format test stats into a pretty report string.
-pub fn format_stats(stats: &TestStats) -> String {
+///
+/// When `color` is true, output includes ANSI color codes.
+pub fn format_stats(stats: &TestStats, color: bool) -> String {
     let mut out = String::new();
-    let color = use_color();
 
     // Summary line.
     out.push_str(&format!(
@@ -452,7 +462,7 @@ pub fn run_test_stats(junit: Option<&Path>, profile: &str) -> Result<String, Str
 
     let report = parse_junit_xml(&xml)?;
     let stats = compute_stats(&report);
-    Ok(format_stats(&stats))
+    Ok(format_stats(&stats, use_color()))
 }
 
 #[cfg(test)]
@@ -771,12 +781,105 @@ mod tests {
 </testsuites>"#;
         let report = parse_junit_xml(xml).unwrap();
         let stats = compute_stats(&report);
-        let out = format_stats(&stats);
+        let out = format_stats(&stats, false);
         assert!(out.contains("2 tests"), "total, got:\n{out}");
         assert!(out.contains("1 passed"), "passed, got:\n{out}");
         assert!(out.contains("1 failed"), "failed, got:\n{out}");
         assert!(out.contains("FAILED:"), "failed section, got:\n{out}");
         assert!(out.contains("bad [s]"), "failed test name, got:\n{out}");
+    }
+
+    #[test]
+    fn format_stats_summary_line_no_ansi() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" failures="1" errors="0" time="10.0">
+    <testsuite name="s" tests="2" disabled="0" errors="0" failures="1">
+        <testcase name="ok" classname="s" time="1.0"></testcase>
+        <testcase name="bad" classname="s" time="9.0">
+            <failure type="exit code 1"/>
+        </testcase>
+    </testsuite>
+</testsuites>"#;
+        let report = parse_junit_xml(xml).unwrap();
+        let stats = compute_stats(&report);
+        let out = format_stats(&stats, false);
+        assert!(
+            !out.contains("\x1b["),
+            "color=false must not emit ANSI escapes, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn format_stats_summary_line_with_color() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" failures="1" errors="0" time="10.0">
+    <testsuite name="s" tests="2" disabled="0" errors="0" failures="1">
+        <testcase name="ok" classname="s" time="1.0"></testcase>
+        <testcase name="bad" classname="s" time="9.0">
+            <failure type="exit code 1"/>
+        </testcase>
+    </testsuite>
+</testsuites>"#;
+        let report = parse_junit_xml(xml).unwrap();
+        let stats = compute_stats(&report);
+        let out = format_stats(&stats, true);
+        // Green for passed count.
+        assert!(
+            out.contains("\x1b[32m1 passed\x1b[0m"),
+            "expected green passed, got:\n{out}"
+        );
+        // Red for failed count.
+        assert!(
+            out.contains("\x1b[31m1 failed\x1b[0m"),
+            "expected red failed, got:\n{out}"
+        );
+        // Bold red FAILED header.
+        assert!(
+            out.contains("\x1b[31;1mFAILED\x1b[0m"),
+            "expected bold red FAILED header, got:\n{out}"
+        );
+        // Red failed test name.
+        assert!(
+            out.contains("\x1b[31mbad\x1b[0m"),
+            "expected red failed test name, got:\n{out}"
+        );
+        // Dim duration.
+        assert!(
+            out.contains("\x1b[2m"),
+            "expected dim duration, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn format_stats_flaky_with_color() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="1" failures="0" errors="0" time="1.0">
+    <testsuite name="s" tests="1" disabled="0" errors="0" failures="0">
+        <testcase name="wobbly" classname="s" time="1.0">
+            <flakyFailure timestamp="2026-01-01T00:00:00Z" time="0.5" type="retry">
+                <system-err>transient</system-err>
+            </flakyFailure>
+        </testcase>
+    </testsuite>
+</testsuites>"#;
+        let report = parse_junit_xml(xml).unwrap();
+        let stats = compute_stats(&report);
+        let out = format_stats(&stats, true);
+        // Yellow for flaky count in summary.
+        assert!(
+            out.contains("\x1b[33m1 flaky\x1b[0m"),
+            "expected yellow flaky count, got:\n{out}"
+        );
+        // Bold yellow FLAKY header.
+        assert!(
+            out.contains("\x1b[33;1mFLAKY\x1b[0m"),
+            "expected bold yellow FLAKY header, got:\n{out}"
+        );
+        // Yellow flaky test name.
+        assert!(
+            out.contains("\x1b[33mwobbly\x1b[0m"),
+            "expected yellow flaky test name, got:\n{out}"
+        );
     }
 
     #[test]
@@ -789,7 +892,7 @@ mod tests {
 </testsuites>"#;
         let report = parse_junit_xml(xml).unwrap();
         let stats = compute_stats(&report);
-        let out = format_stats(&stats);
+        let out = format_stats(&stats, false);
         assert!(!out.contains("FAILED:"), "no failed section, got:\n{out}");
         assert!(!out.contains("FLAKY"), "no flaky section, got:\n{out}");
     }
