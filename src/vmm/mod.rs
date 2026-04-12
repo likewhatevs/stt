@@ -935,7 +935,13 @@ impl KtstrVm {
     ///
     /// Sets the host terminal to raw mode, spawns threads for stdin->COM2
     /// and COM2->stdout forwarding, and runs until the guest shuts down.
-    /// Terminal state is restored on all exit paths including panic.
+    /// Terminal state is restored on all exit paths including panic and
+    /// process-killing signals (SIGINT, SIGTERM, SIGQUIT).
+    ///
+    /// Builder settings ignored in interactive mode: `monitor_thresholds`,
+    /// `watchdog_timeout`, `bpf_map_write`, `performance_mode` pinning,
+    /// and KVM stats collection. These are test-specific features that
+    /// do not apply to interactive shell sessions.
     pub fn run_interactive(&self) -> Result<()> {
         let start = Instant::now();
 
@@ -975,6 +981,27 @@ impl KtstrVm {
                 .context("register serial2 irqfd")?;
         }
 
+        // Pre-flight: verify stdin is a tty, enter raw mode, and create
+        // the wakeup pipe before spawning threads. Failing after thread
+        // spawn would abandon AP threads.
+        {
+            use std::os::unix::io::AsRawFd;
+            let stdin_fd = std::io::stdin().as_raw_fd();
+            let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stdin_fd) };
+            anyhow::ensure!(
+                nix::unistd::isatty(borrowed).unwrap_or(false),
+                "stdin must be a terminal for interactive shell mode",
+            );
+        }
+
+        // Set host terminal to raw mode. TerminalRawGuard restores on drop
+        // and installs signal handlers for SIGINT/SIGTERM/SIGQUIT.
+        let _raw_guard = TerminalRawGuard::enter().context("failed to set terminal to raw mode")?;
+
+        // Wakeup pipe: write end signals the stdin reader to exit when
+        // the kill flag is set, avoiding a blocking read that prevents join.
+        let (wakeup_r, wakeup_w) = nix::unistd::pipe().context("create stdin wakeup pipe")?;
+
         let kill = Arc::new(AtomicBool::new(false));
         let has_immediate_exit = vm.has_immediate_exit;
         let mut vcpus = std::mem::take(&mut vm.vcpus);
@@ -984,35 +1011,72 @@ impl KtstrVm {
         let ap_threads =
             self.spawn_ap_threads(vcpus, has_immediate_exit, &com1, &com2, &kill, &ap_pins)?;
 
-        // Set host terminal to raw mode. TerminalRawGuard restores on drop.
-        let _raw_guard = TerminalRawGuard::enter().context("failed to set terminal to raw mode")?;
-
         // Stdin reader thread: host stdin -> COM2 input.
+        // Uses poll() on both stdin and the wakeup pipe so the thread can
+        // be cleanly joined on shutdown.
         let com2_for_stdin = com2.clone();
         let kill_for_stdin = kill.clone();
         let stdin_thread = std::thread::Builder::new()
             .name("interactive-stdin".into())
             .spawn(move || {
                 use std::io::Read;
-                let mut stdin = std::io::stdin().lock();
+                use std::os::unix::io::{AsFd, AsRawFd};
+
+                // wakeup_r is an OwnedFd moved into this closure; closed on exit.
+                let wakeup_fd = wakeup_r;
+                let stdin_fd = std::io::stdin().as_raw_fd();
                 let mut buf = [0u8; 64];
+
                 loop {
                     if kill_for_stdin.load(Ordering::Acquire) {
                         break;
                     }
-                    match stdin.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            com2_for_stdin.lock().queue_input(&buf[..n]);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+
+                    // Poll stdin and wakeup fd with 100ms timeout.
+                    let stdin_borrowed =
+                        unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stdin_fd) };
+                    let wakeup_borrowed = wakeup_fd.as_fd();
+                    let mut fds = [
+                        nix::poll::PollFd::new(stdin_borrowed, nix::poll::PollFlags::POLLIN),
+                        nix::poll::PollFd::new(wakeup_borrowed, nix::poll::PollFlags::POLLIN),
+                    ];
+                    match nix::poll::poll(&mut fds, 100u16) {
+                        Ok(0) => continue, // timeout
+                        Err(nix::errno::Errno::EINTR) => continue,
                         Err(_) => break,
+                        Ok(_) => {}
+                    }
+
+                    // Wakeup fd readable means shutdown requested.
+                    if fds[1]
+                        .revents()
+                        .is_some_and(|r| r.intersects(nix::poll::PollFlags::POLLIN))
+                    {
+                        break;
+                    }
+
+                    // Stdin readable.
+                    if fds[0]
+                        .revents()
+                        .is_some_and(|r| r.intersects(nix::poll::PollFlags::POLLIN))
+                    {
+                        let mut stdin = std::io::stdin().lock();
+                        match stdin.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                com2_for_stdin.lock().queue_input(&buf[..n]);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
                     }
                 }
             })
             .context("spawn stdin reader thread")?;
 
         // Stdout writer thread: COM2 output -> host stdout.
+        // On write errors (including BrokenPipe), sets kill flag and exits
+        // to stop the VM rather than polling a dead pipe until timeout.
         let com2_for_stdout = com2.clone();
         let kill_for_stdout = kill.clone();
         let stdout_thread = std::thread::Builder::new()
@@ -1025,9 +1089,11 @@ impl KtstrVm {
                         break;
                     }
                     let data = com2_for_stdout.lock().drain_output();
-                    if !data.is_empty() {
-                        let _ = stdout.write_all(&data);
-                        let _ = stdout.flush();
+                    if !data.is_empty()
+                        && (stdout.write_all(&data).is_err() || stdout.flush().is_err())
+                    {
+                        kill_for_stdout.store(true, Ordering::Release);
+                        break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1041,11 +1107,28 @@ impl KtstrVm {
             .context("spawn stdout writer thread")?;
 
         // BSP run loop (same shutdown detection as run()).
+        // Interactive sessions are user-controlled; the builder's timeout
+        // (default 60s) must not kill the shell. Use 24 hours as a
+        // practical upper bound.
         register_vcpu_signal_handler();
-        self.run_bsp_loop(&mut bsp, &com1, &com2, &kill, has_immediate_exit, start);
+        let interactive_timeout = Duration::from_secs(24 * 60 * 60);
+        self.run_bsp_loop(
+            &mut bsp,
+            &com1,
+            &com2,
+            &kill,
+            has_immediate_exit,
+            start,
+            interactive_timeout,
+        );
 
         // Shutdown.
         kill.store(true, Ordering::Release);
+
+        // Wake the stdin reader so it exits poll() and can be joined.
+        let _ = nix::unistd::write(&wakeup_w, &[0u8]);
+        drop(wakeup_w);
+
         for vt in &ap_threads {
             if !vt.exited.load(Ordering::Acquire) {
                 vt.kick();
@@ -1056,12 +1139,21 @@ impl KtstrVm {
             let _ = vt.handle.join();
         }
 
-        // Kill flag stops the stdout thread.
         let _ = stdout_thread.join();
-        // stdin_thread may be blocked on read; don't join to avoid hanging.
-        drop(stdin_thread);
+        let _ = stdin_thread.join();
 
-        // _raw_guard drops here, restoring terminal.
+        // _raw_guard drops here, restoring terminal and signal handlers.
+        drop(_raw_guard);
+
+        // Print kernel console output (COM1) to stderr if non-empty.
+        // Guest kernel panics go to COM1 which is not forwarded during
+        // the interactive session. This gives the user crash diagnostics.
+        let console_output = com1.lock().output();
+        if !console_output.is_empty() {
+            eprintln!("{console_output}");
+        }
+
+        println!("Connection to VM closed.");
         Ok(())
     }
 
@@ -1596,8 +1688,15 @@ impl KtstrVm {
 
         // BSP run loop.
         eprintln!("BSP: entering run loop");
-        let (exit_code, timed_out) =
-            self.run_bsp_loop(&mut bsp, &com1, &com2, &kill, has_immediate_exit, start);
+        let (exit_code, timed_out) = self.run_bsp_loop(
+            &mut bsp,
+            &com1,
+            &com2,
+            &kill,
+            has_immediate_exit,
+            start,
+            timeout,
+        );
         bsp_done.store(true, Ordering::Release);
         eprintln!("BSP: exited run loop, code={exit_code} timed_out={timed_out}");
 
@@ -1966,6 +2065,7 @@ impl KtstrVm {
     /// Handles arch-specific I/O dispatch (port I/O on x86_64, MMIO on
     /// aarch64) and HLT semantics (x86_64 BSP: check kill + continue;
     /// aarch64 BSP: shutdown).
+    #[allow(clippy::too_many_arguments)]
     fn run_bsp_loop(
         &self,
         bsp: &mut kvm_ioctls::VcpuFd,
@@ -1974,8 +2074,8 @@ impl KtstrVm {
         kill: &Arc<AtomicBool>,
         has_immediate_exit: bool,
         start: Instant,
+        timeout: Duration,
     ) -> (i32, bool) {
-        let timeout = self.timeout;
         let mut exit_code: i32 = -1;
 
         loop {
@@ -3017,14 +3117,59 @@ fn acquire_slot_with_locks(
 }
 
 // ---------------------------------------------------------------------------
-// TerminalRawGuard — raw mode with RAII restore
+// TerminalRawGuard — raw mode with RAII restore + signal safety
 // ---------------------------------------------------------------------------
 
+/// Stdin fd for signal handler. Set by TerminalRawGuard::enter, cleared by Drop.
+static SAVED_TERMIOS_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Original termios for signal handler restore. Accessed only when
+/// SAVED_TERMIOS_FD >= 0. Written once by enter(), read by the signal
+/// handler and Drop. Not behind a lock because the signal handler must
+/// be async-signal-safe.
+///
+/// SAFETY: only one TerminalRawGuard can exist at a time (single interactive
+/// session). enter() writes before setting SAVED_TERMIOS_FD; Drop clears
+/// SAVED_TERMIOS_FD before reading. The signal handler only reads when
+/// SAVED_TERMIOS_FD >= 0, which guarantees the write has completed.
+static mut SAVED_TERMIOS: std::mem::MaybeUninit<libc::termios> = std::mem::MaybeUninit::uninit();
+
+/// Signal handler that restores terminal state then re-raises.
+/// Async-signal-safe: uses only libc::tcsetattr (POSIX async-signal-safe)
+/// and libc::raise. SA_RESETHAND restores SIG_DFL before entry, so the
+/// re-raised signal terminates normally.
+extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
+    let fd = SAVED_TERMIOS_FD.load(std::sync::atomic::Ordering::Acquire);
+    if fd >= 0 {
+        // SAFETY: SAVED_TERMIOS was written before SAVED_TERMIOS_FD was
+        // set to a non-negative value. SA_RESETHAND ensures this handler
+        // runs at most once per signal. addr_of! avoids creating a
+        // reference to the static mut (Rust 2024 edition requirement).
+        unsafe {
+            libc::tcsetattr(
+                fd,
+                libc::TCSANOW,
+                std::ptr::addr_of!(SAVED_TERMIOS).cast::<libc::termios>(),
+            );
+        }
+    }
+    // SA_RESETHAND already restored SIG_DFL; re-raise terminates.
+    unsafe {
+        libc::raise(sig);
+    }
+}
+
 /// Sets stdin to raw mode on creation, restores original termios on drop.
-/// Handles panic paths via Drop.
+/// Handles panic paths via Drop. Installs signal handlers for SIGINT,
+/// SIGTERM, SIGQUIT with SA_RESETHAND that restore termios via raw
+/// libc::tcsetattr (async-signal-safe) before the default handler runs.
 struct TerminalRawGuard {
     original: nix::sys::termios::Termios,
     fd: std::os::unix::io::RawFd,
+    /// Previous signal actions, restored on drop.
+    prev_sigint: libc::sigaction,
+    prev_sigterm: libc::sigaction,
+    prev_sigquit: libc::sigaction,
 }
 
 impl TerminalRawGuard {
@@ -3034,24 +3179,71 @@ impl TerminalRawGuard {
         use std::os::unix::io::AsRawFd;
 
         let fd = std::io::stdin().as_raw_fd();
-        // nix 0.31 tcgetattr/tcsetattr require AsFd, not RawFd.
         // SAFETY: stdin fd is valid for the lifetime of this process.
         let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) };
         let original = termios::tcgetattr(borrowed).context("tcgetattr")?;
         let mut raw = original.clone();
         termios::cfmakeraw(&mut raw);
         termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw).context("tcsetattr raw")?;
-        Ok(Self { original, fd })
+
+        // Store original termios as libc::termios for the signal handler.
+        // Write SAVED_TERMIOS before setting SAVED_TERMIOS_FD so the
+        // handler sees a fully initialized struct.
+        // SAFETY: no concurrent writer — single interactive session.
+        // Use addr_of_mut! to avoid creating a reference to static mut
+        // (Rust 2024 edition requirement).
+        unsafe {
+            let ptr = std::ptr::addr_of_mut!(SAVED_TERMIOS);
+            (*ptr).write(original.clone().into());
+        }
+        SAVED_TERMIOS_FD.store(fd, std::sync::atomic::Ordering::Release);
+
+        // Install signal handlers with SA_RESETHAND. Matches the raw libc
+        // pattern used by register_vcpu_signal_handler (mod.rs:625-639).
+        let mut prev_sigint: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut prev_sigterm: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut prev_sigquit: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = terminal_restore_signal_handler as *const () as usize;
+            sa.sa_flags = libc::SA_RESETHAND;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGINT, &sa, &mut prev_sigint);
+            libc::sigaction(libc::SIGTERM, &sa, &mut prev_sigterm);
+            libc::sigaction(libc::SIGQUIT, &sa, &mut prev_sigquit);
+        }
+
+        Ok(Self {
+            original,
+            fd,
+            prev_sigint,
+            prev_sigterm,
+            prev_sigquit,
+        })
     }
 }
 
 impl Drop for TerminalRawGuard {
     fn drop(&mut self) {
-        use nix::sys::termios::{self, SetArg};
-        // SAFETY: fd was valid at construction and stdin persists for
-        // the process lifetime.
+        // Disable the signal handler before restoring termios to prevent
+        // a stale restore racing with our own restore below.
+        SAVED_TERMIOS_FD.store(-1, std::sync::atomic::Ordering::Release);
+
+        // Restore original termios.
+        // SAFETY: fd was valid at construction, stdin persists for process lifetime.
         let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(self.fd) };
-        let _ = termios::tcsetattr(borrowed, SetArg::TCSANOW, &self.original);
+        let _ = nix::sys::termios::tcsetattr(
+            borrowed,
+            nix::sys::termios::SetArg::TCSANOW,
+            &self.original,
+        );
+
+        // Restore previous signal handlers.
+        unsafe {
+            libc::sigaction(libc::SIGINT, &self.prev_sigint, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &self.prev_sigterm, std::ptr::null_mut());
+            libc::sigaction(libc::SIGQUIT, &self.prev_sigquit, std::ptr::null_mut());
+        }
     }
 }
 
