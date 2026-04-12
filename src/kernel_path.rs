@@ -4,6 +4,88 @@
 // Only uses std — no external crate dependencies.
 // All functions are pure: callers supply inputs, handle caching.
 
+/// Kernel identifier: filesystem path, version string, or cache key.
+///
+/// Parsing heuristic (see [`KernelId::parse`]):
+/// - Contains `/` or starts with `.` or `~`: [`KernelId::Path`]
+/// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
+/// - Otherwise: [`KernelId::CacheKey`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum KernelId {
+    /// Filesystem path to kernel source/build directory.
+    Path(std::path::PathBuf),
+    /// Kernel version string (e.g. "6.14.2", "6.15-rc3").
+    Version(String),
+    /// Cache key (e.g. "6.14.2-tarball-x86_64").
+    CacheKey(String),
+}
+
+#[allow(dead_code)]
+impl KernelId {
+    /// Parse a string into a kernel identifier.
+    pub fn parse(s: &str) -> Self {
+        if s.contains('/') || s.starts_with('.') || s.starts_with('~') {
+            return KernelId::Path(std::path::PathBuf::from(s));
+        }
+        if _is_version_string(s) {
+            return KernelId::Version(s.to_string());
+        }
+        KernelId::CacheKey(s.to_string())
+    }
+}
+
+impl std::fmt::Display for KernelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KernelId::Path(p) => write!(f, "{}", p.display()),
+            KernelId::Version(v) => write!(f, "{v}"),
+            KernelId::CacheKey(k) => write!(f, "{k}"),
+        }
+    }
+}
+
+/// Check if a string matches a kernel version pattern.
+///
+/// Matches: `6.14`, `6.14.2`, `6.15-rc3`, `6.14.2-rc1`.
+/// Does not match: `v6.14` (git tag prefix), `6` (no minor),
+/// `6.14.2-tarball-x86_64` (cache key with extra segments).
+#[allow(dead_code)]
+fn _is_version_string(s: &str) -> bool {
+    let (version_part, rc_part) = match s.split_once("-rc") {
+        Some((v, rc)) => (v, Some(rc)),
+        None => (s, None),
+    };
+
+    // The part after -rc must be a non-empty digit string.
+    if let Some(rc) = rc_part
+        && (rc.is_empty() || !rc.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+
+    let mut parts = version_part.split('.');
+
+    // Major: required, non-empty digits.
+    match parts.next() {
+        Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {}
+        _ => return false,
+    }
+    // Minor: required, non-empty digits.
+    match parts.next() {
+        Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {}
+        _ => return false,
+    }
+    // Patch: optional, non-empty digits.
+    if let Some(patch) = parts.next()
+        && (patch.is_empty() || !patch.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+    // No more segments allowed (rejects `1.2.3.4`).
+    parts.next().is_none()
+}
+
 /// Resolve a kernel source/build directory.
 ///
 /// `kernel_dir`: value of `KTSTR_KERNEL` env var (if set).
@@ -321,5 +403,138 @@ mod tests {
         let s = rel.unwrap();
         assert!(!s.is_empty());
         assert!(!s.contains('\n'));
+    }
+
+    // -- KernelId parsing --
+
+    #[test]
+    fn kernel_id_parse_path_with_slash() {
+        assert_eq!(
+            KernelId::parse("../linux"),
+            KernelId::Path(PathBuf::from("../linux"))
+        );
+        assert_eq!(
+            KernelId::parse("/boot/vmlinuz"),
+            KernelId::Path(PathBuf::from("/boot/vmlinuz"))
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_path_dot_prefix() {
+        assert_eq!(
+            KernelId::parse("./linux"),
+            KernelId::Path(PathBuf::from("./linux"))
+        );
+        assert_eq!(KernelId::parse("."), KernelId::Path(PathBuf::from(".")));
+    }
+
+    #[test]
+    fn kernel_id_parse_path_tilde_prefix() {
+        assert_eq!(
+            KernelId::parse("~/linux"),
+            KernelId::Path(PathBuf::from("~/linux"))
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_version_stable() {
+        assert_eq!(
+            KernelId::parse("6.14.2"),
+            KernelId::Version("6.14.2".to_string())
+        );
+        assert_eq!(
+            KernelId::parse("6.14"),
+            KernelId::Version("6.14".to_string())
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_version_rc() {
+        assert_eq!(
+            KernelId::parse("6.15-rc3"),
+            KernelId::Version("6.15-rc3".to_string())
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_version_patch_rc() {
+        assert_eq!(
+            KernelId::parse("6.14.2-rc1"),
+            KernelId::Version("6.14.2-rc1".to_string())
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_cache_key() {
+        assert_eq!(
+            KernelId::parse("6.14.2-tarball-x86_64"),
+            KernelId::CacheKey("6.14.2-tarball-x86_64".to_string())
+        );
+        assert_eq!(
+            KernelId::parse("local-deadbeef-x86_64"),
+            KernelId::CacheKey("local-deadbeef-x86_64".to_string())
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_v_prefix_not_version() {
+        // "v6.14" starts with 'v', not a digit -- cache key.
+        assert_eq!(
+            KernelId::parse("v6.14"),
+            KernelId::CacheKey("v6.14".to_string())
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_bare_major_not_version() {
+        // "6" alone has no minor component -- cache key.
+        assert_eq!(KernelId::parse("6"), KernelId::CacheKey("6".to_string()));
+    }
+
+    #[test]
+    fn kernel_id_display() {
+        assert_eq!(
+            KernelId::Version("6.14.2".to_string()).to_string(),
+            "6.14.2"
+        );
+        assert_eq!(
+            KernelId::Path(PathBuf::from("../linux")).to_string(),
+            "../linux"
+        );
+        assert_eq!(
+            KernelId::CacheKey("my-key".to_string()).to_string(),
+            "my-key"
+        );
+    }
+
+    // -- _is_version_string --
+
+    #[test]
+    fn kernel_id_is_version_string_valid() {
+        assert!(_is_version_string("6.14"));
+        assert!(_is_version_string("6.14.2"));
+        assert!(_is_version_string("6.15-rc3"));
+        assert!(_is_version_string("6.14.0-rc1"));
+        assert!(_is_version_string("5.0"));
+        assert!(_is_version_string("5.0.0"));
+        assert!(_is_version_string("5.4.0"));
+    }
+
+    #[test]
+    fn kernel_id_is_version_string_invalid() {
+        assert!(!_is_version_string("6"));
+        assert!(!_is_version_string("v6.14"));
+        assert!(!_is_version_string(""));
+        assert!(!_is_version_string("6.14.2-tarball-x86_64"));
+        assert!(!_is_version_string("6.14.2.3"));
+        assert!(!_is_version_string("6.14-rc"));
+        assert!(!_is_version_string("6.14-rcX"));
+        // rc_part contains non-digits after splitting on "-rc".
+        assert!(!_is_version_string("6.14-rc3-tarball-x86_64"));
+        assert!(!_is_version_string("abc"));
+        assert!(!_is_version_string(".14"));
+        assert!(!_is_version_string("6."));
+        assert!(!_is_version_string("linux"));
+        assert!(!_is_version_string(".6"));
     }
 }

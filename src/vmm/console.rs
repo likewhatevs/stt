@@ -93,10 +93,14 @@ impl Serial {
         self.inner.read(offset)
     }
 
-    /// Queue input bytes (for host->guest communication).
-    #[cfg(test)]
+    /// Queue input bytes for host->guest communication.
     pub fn queue_input(&mut self, bytes: &[u8]) {
         let _ = self.inner.enqueue_raw_bytes(bytes);
+    }
+
+    /// Return and clear accumulated output. O(1) via buffer swap.
+    pub fn drain_output(&mut self) -> Vec<u8> {
+        std::mem::take(self.inner.writer_mut())
     }
 
     /// Get all captured output as a string.
@@ -475,5 +479,45 @@ mod tests {
         s.handle_in(COM1_BASE + MCR, &mut buf);
         // vm-superio defaults MCR to MCR_OUT2 (0x08).
         assert_eq!(buf[0], MCR_OUT2);
+    }
+
+    #[test]
+    fn drain_output_returns_and_clears() {
+        let mut s = Serial::default();
+        for c in b"hello" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        let drained = s.drain_output();
+        assert_eq!(drained, b"hello");
+        assert!(s.output().is_empty(), "buffer should be empty after drain");
+    }
+
+    #[test]
+    fn drain_output_empty() {
+        let mut s = Serial::default();
+        let drained = s.drain_output();
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn drain_output_incremental() {
+        let mut s = Serial::default();
+        s.handle_out(COM1_BASE, b"A");
+        s.handle_out(COM1_BASE, b"B");
+        let first = s.drain_output();
+        assert_eq!(first, b"AB");
+
+        s.handle_out(COM1_BASE, b"C");
+        let second = s.drain_output();
+        assert_eq!(second, b"C");
+    }
+
+    #[test]
+    fn queue_input_pub_accessible() {
+        let mut s = Serial::default();
+        s.queue_input(&[0x41, 0x42]);
+        let mut lsr = [0u8; 1];
+        s.handle_in(COM1_BASE + LSR, &mut lsr);
+        assert_ne!(lsr[0] & LSR_DR, 0, "data should be ready after queue_input");
     }
 }

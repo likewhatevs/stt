@@ -107,6 +107,7 @@
 //!
 //! # Crate organization
 //!
+//! - [`cache`] -- kernel image cache (XDG directories, metadata, atomic writes)
 //! - [`cgroup`] -- cgroup v2 filesystem operations
 //! - [`scenario`] -- test case definitions, flag system, cgroup helpers
 //! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
@@ -125,6 +126,7 @@
 )]
 mod bpf_skel;
 
+pub mod cache;
 pub mod cgroup;
 
 /// Map a raw errno value to its C constant name.

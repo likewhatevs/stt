@@ -931,6 +931,140 @@ impl KtstrVm {
         Ok(result)
     }
 
+    /// Boot the VM with bidirectional stdin/stdout forwarding via COM2.
+    ///
+    /// Sets the host terminal to raw mode, spawns threads for stdin->COM2
+    /// and COM2->stdout forwarding, and runs until the guest shuts down.
+    /// Terminal state is restored on all exit paths including panic.
+    pub fn run_interactive(&self) -> Result<()> {
+        let start = Instant::now();
+
+        let initramfs_handle = self.spawn_initramfs_resolve();
+        let (mut vm, kernel_result) = self.create_vm_and_load_kernel()?;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.setup_memory(&vm, &kernel_result, initramfs_handle)?;
+            self.setup_vcpus(&vm, kernel_result.entry)?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.setup_memory_aarch64(&vm, &kernel_result, initramfs_handle)?;
+            self.setup_vcpus_aarch64(&vm, kernel_result.entry)?;
+        }
+
+        let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
+        let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
+
+        #[cfg(target_arch = "x86_64")]
+        if !vm.split_irqchip {
+            vm.vm_fd
+                .register_irqfd(com1.lock().irq_evt(), console::COM1_IRQ)
+                .context("register COM1 irqfd")?;
+            vm.vm_fd
+                .register_irqfd(com2.lock().irq_evt(), console::COM2_IRQ)
+                .context("register COM2 irqfd")?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            vm.vm_fd
+                .register_irqfd(com1.lock().irq_evt(), kvm::SERIAL_IRQ)
+                .context("register serial irqfd")?;
+            vm.vm_fd
+                .register_irqfd(com2.lock().irq_evt(), kvm::SERIAL2_IRQ)
+                .context("register serial2 irqfd")?;
+        }
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let has_immediate_exit = vm.has_immediate_exit;
+        let mut vcpus = std::mem::take(&mut vm.vcpus);
+        let mut bsp = vcpus.remove(0);
+
+        let ap_pins = vec![None; vcpus.len()];
+        let ap_threads =
+            self.spawn_ap_threads(vcpus, has_immediate_exit, &com1, &com2, &kill, &ap_pins)?;
+
+        // Set host terminal to raw mode. TerminalRawGuard restores on drop.
+        let _raw_guard = TerminalRawGuard::enter().context("failed to set terminal to raw mode")?;
+
+        // Stdin reader thread: host stdin -> COM2 input.
+        let com2_for_stdin = com2.clone();
+        let kill_for_stdin = kill.clone();
+        let stdin_thread = std::thread::Builder::new()
+            .name("interactive-stdin".into())
+            .spawn(move || {
+                use std::io::Read;
+                let mut stdin = std::io::stdin().lock();
+                let mut buf = [0u8; 64];
+                loop {
+                    if kill_for_stdin.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match stdin.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            com2_for_stdin.lock().queue_input(&buf[..n]);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            })
+            .context("spawn stdin reader thread")?;
+
+        // Stdout writer thread: COM2 output -> host stdout.
+        let com2_for_stdout = com2.clone();
+        let kill_for_stdout = kill.clone();
+        let stdout_thread = std::thread::Builder::new()
+            .name("interactive-stdout".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut stdout = std::io::stdout().lock();
+                loop {
+                    if kill_for_stdout.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let data = com2_for_stdout.lock().drain_output();
+                    if !data.is_empty() {
+                        let _ = stdout.write_all(&data);
+                        let _ = stdout.flush();
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Final drain after kill.
+                let data = com2_for_stdout.lock().drain_output();
+                if !data.is_empty() {
+                    let _ = stdout.write_all(&data);
+                    let _ = stdout.flush();
+                }
+            })
+            .context("spawn stdout writer thread")?;
+
+        // BSP run loop (same shutdown detection as run()).
+        register_vcpu_signal_handler();
+        self.run_bsp_loop(&mut bsp, &com1, &com2, &kill, has_immediate_exit, start);
+
+        // Shutdown.
+        kill.store(true, Ordering::Release);
+        for vt in &ap_threads {
+            if !vt.exited.load(Ordering::Acquire) {
+                vt.kick();
+            }
+        }
+        for vt in ap_threads {
+            vt.wait_for_exit(Duration::from_secs(5));
+            let _ = vt.handle.join();
+        }
+
+        // Kill flag stops the stdout thread.
+        let _ = stdout_thread.join();
+        // stdin_thread may be blocked on read; don't join to avoid hanging.
+        drop(stdin_thread);
+
+        // _raw_guard drops here, restoring terminal.
+        Ok(())
+    }
+
     /// Create the KVM VM and load the kernel.
     fn create_vm_and_load_kernel(&self) -> Result<(kvm::KtstrKvm, boot::KernelLoadResult)> {
         let t0 = Instant::now();
@@ -2880,6 +3014,45 @@ fn acquire_slot_with_locks(
     Err(anyhow::Error::new(host_topology::ResourceContention {
         reason: format!("all {max_slots} LLC slots busy"),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// TerminalRawGuard — raw mode with RAII restore
+// ---------------------------------------------------------------------------
+
+/// Sets stdin to raw mode on creation, restores original termios on drop.
+/// Handles panic paths via Drop.
+struct TerminalRawGuard {
+    original: nix::sys::termios::Termios,
+    fd: std::os::unix::io::RawFd,
+}
+
+impl TerminalRawGuard {
+    /// Set stdin to raw mode. Returns the guard that restores on drop.
+    fn enter() -> Result<Self> {
+        use nix::sys::termios::{self, SetArg};
+        use std::os::unix::io::AsRawFd;
+
+        let fd = std::io::stdin().as_raw_fd();
+        // nix 0.31 tcgetattr/tcsetattr require AsFd, not RawFd.
+        // SAFETY: stdin fd is valid for the lifetime of this process.
+        let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) };
+        let original = termios::tcgetattr(borrowed).context("tcgetattr")?;
+        let mut raw = original.clone();
+        termios::cfmakeraw(&mut raw);
+        termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw).context("tcsetattr raw")?;
+        Ok(Self { original, fd })
+    }
+}
+
+impl Drop for TerminalRawGuard {
+    fn drop(&mut self) {
+        use nix::sys::termios::{self, SetArg};
+        // SAFETY: fd was valid at construction and stdin persists for
+        // the process lifetime.
+        let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(self.fd) };
+        let _ = termios::tcsetattr(borrowed, SetArg::TCSANOW, &self.original);
+    }
 }
 
 #[cfg(test)]

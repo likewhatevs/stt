@@ -1,0 +1,1229 @@
+//! Kernel image cache for ktstr.
+//!
+//! Manages a local cache of built kernel images under an XDG-compliant
+//! directory. Each cached kernel is a directory containing the boot
+//! image and a `metadata.json` descriptor.
+//!
+//! # Cache location
+//!
+//! Resolved in order:
+//! 1. `KTSTR_CACHE_DIR` environment variable
+//! 2. `$XDG_CACHE_HOME/ktstr/kernels/`
+//! 3. `$HOME/.cache/ktstr/kernels/`
+//!
+//! # Directory structure
+//!
+//! ```text
+//! $CACHE_ROOT/
+//!   6.14.2-tarball-x86_64/
+//!     bzImage           # kernel boot image
+//!     metadata.json     # KernelMetadata descriptor
+//!   local-deadbeef-x86_64/
+//!     bzImage
+//!     metadata.json
+//! ```
+//!
+//! # Atomic writes
+//!
+//! [`CacheDir::store`] writes to a temporary directory inside the cache
+//! root, then atomically renames to the final path. Partial failures
+//! never leave corrupt entries.
+
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Kernel source type recorded in cache metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceType {
+    Tarball,
+    Git,
+    Local,
+}
+
+impl fmt::Display for SourceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourceType::Tarball => f.write_str("tarball"),
+            SourceType::Git => f.write_str("git"),
+            SourceType::Local => f.write_str("local"),
+        }
+    }
+}
+
+/// Metadata stored alongside a cached kernel image.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct KernelMetadata {
+    /// Kernel version string (e.g. "6.14.2", "6.15-rc3").
+    /// `None` for local builds without a version tag.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// How the kernel source was acquired.
+    pub source: SourceType,
+    /// Target architecture (e.g. "x86_64", "aarch64").
+    pub arch: String,
+    /// Boot image filename (e.g. "bzImage", "Image").
+    pub image_name: String,
+    /// CRC32 of the final .config used for the build.
+    #[serde(default)]
+    pub config_hash: Option<String>,
+    /// ISO 8601 timestamp of when the image was built.
+    pub built_at: String,
+    /// CRC32 of ktstr.kconfig at build time.
+    #[serde(default)]
+    pub ktstr_kconfig_hash: Option<String>,
+    /// Git commit hash of the kernel source (short form).
+    #[serde(default)]
+    pub git_hash: Option<String>,
+    /// Git ref used for checkout (branch, tag, or ref spec).
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    /// Path to the source tree on disk (local builds only).
+    #[serde(default)]
+    pub source_tree_path: Option<PathBuf>,
+}
+
+// Re-export KernelId from kernel_path (canonical definition, std-only).
+pub use crate::kernel_path::KernelId;
+
+/// A cached kernel entry returned by [`CacheDir::lookup`],
+/// [`CacheDir::store`], and [`CacheDir::list`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct CacheEntry {
+    /// Cache key (directory name).
+    pub key: String,
+    /// Path to the cache entry directory.
+    pub path: PathBuf,
+    /// Deserialized metadata, if the metadata file is valid.
+    pub metadata: Option<KernelMetadata>,
+}
+
+/// Handle to the kernel image cache directory.
+///
+/// All operations are local filesystem operations via `std::fs`.
+/// Thread safety: individual operations are atomic (rename-based
+/// writes), but concurrent callers must coordinate externally.
+#[derive(Debug)]
+pub struct CacheDir {
+    root: PathBuf,
+}
+
+impl CacheDir {
+    /// Open or create a cache directory.
+    ///
+    /// Resolution order:
+    /// 1. `KTSTR_CACHE_DIR` environment variable
+    /// 2. `$XDG_CACHE_HOME/ktstr/kernels/`
+    /// 3. `$HOME/.cache/ktstr/kernels/`
+    ///
+    /// Creates the directory tree if it does not exist.
+    pub fn new() -> anyhow::Result<Self> {
+        let root = resolve_cache_root()?;
+        fs::create_dir_all(&root)?;
+        Ok(CacheDir { root })
+    }
+
+    /// Open a cache directory at a specific path.
+    ///
+    /// Creates the directory if it does not exist. Used by tests and
+    /// callers that need an explicit cache location.
+    pub fn with_root(root: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&root)?;
+        Ok(CacheDir { root })
+    }
+
+    /// Root directory of the cache.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Look up a cached kernel by cache key.
+    ///
+    /// Returns the cache entry if it exists, has valid metadata, and
+    /// contains the expected kernel image file. Returns `None` if the
+    /// key is invalid, the entry does not exist, or is corrupted.
+    pub fn lookup(&self, cache_key: &str) -> Option<CacheEntry> {
+        if let Err(e) = validate_cache_key(cache_key) {
+            tracing::warn!("invalid cache key: {e}");
+            return None;
+        }
+        let entry_dir = self.root.join(cache_key);
+        if !entry_dir.is_dir() {
+            return None;
+        }
+        let metadata = read_metadata(&entry_dir);
+        // Entry must have a kernel image file.
+        let image_exists = metadata
+            .as_ref()
+            .map(|m| entry_dir.join(&m.image_name).exists())
+            .unwrap_or(false);
+        if !image_exists {
+            return None;
+        }
+        Some(CacheEntry {
+            key: cache_key.to_string(),
+            path: entry_dir,
+            metadata,
+        })
+    }
+
+    /// List all cached kernel entries, sorted by build time (newest first).
+    ///
+    /// Entries with missing or corrupt metadata are included with
+    /// `metadata: None`. The caller decides how to handle them.
+    pub fn list(&self) -> anyhow::Result<Vec<CacheEntry>> {
+        let mut entries = Vec::new();
+        let read_dir = match fs::read_dir(&self.root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+            Err(e) => return Err(e.into()),
+        };
+        for dir_entry in read_dir {
+            let dir_entry = dir_entry?;
+            let path = dir_entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // Skip temp directories from in-progress stores.
+            let name = match dir_entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if name.starts_with(".tmp-") {
+                continue;
+            }
+            let metadata = read_metadata(&path);
+            entries.push(CacheEntry {
+                key: name,
+                path,
+                metadata,
+            });
+        }
+        // Sort by built_at descending (newest first). Entries without
+        // metadata sort last.
+        entries.sort_by(|a, b| {
+            let a_time = a.metadata.as_ref().map(|m| m.built_at.as_str());
+            let b_time = b.metadata.as_ref().map(|m| m.built_at.as_str());
+            b_time.cmp(&a_time)
+        });
+        Ok(entries)
+    }
+
+    /// Store a kernel image in the cache.
+    ///
+    /// `cache_key`: directory name for the entry (e.g.
+    /// `6.14.2-tarball-x86_64`).
+    ///
+    /// `image_path`: path to the kernel boot image to cache.
+    ///
+    /// `metadata`: descriptor to serialize as `metadata.json`.
+    ///
+    /// The image is copied (not moved) so the caller retains the
+    /// original. Writes atomically via a temporary directory that is
+    /// renamed into place on success.
+    pub fn store(
+        &self,
+        cache_key: &str,
+        image_path: &Path,
+        metadata: &KernelMetadata,
+    ) -> anyhow::Result<CacheEntry> {
+        validate_cache_key(cache_key)?;
+        validate_filename(&metadata.image_name)?;
+        let final_dir = self.root.join(cache_key);
+        let tmp_dir = self
+            .root
+            .join(format!(".tmp-{}-{}", cache_key, std::process::id()));
+
+        // Clean up any stale temp dir from a prior crash.
+        if tmp_dir.exists() {
+            fs::remove_dir_all(&tmp_dir)?;
+        }
+        fs::create_dir_all(&tmp_dir)?;
+
+        // TmpGuard ensures the temp dir is cleaned up on any error
+        // path, including serde serialization failures.
+        let guard = TmpDirGuard(&tmp_dir);
+
+        // Copy image.
+        let image_dest = tmp_dir.join(&metadata.image_name);
+        fs::copy(image_path, &image_dest)
+            .map_err(|e| anyhow::anyhow!("copy kernel image to cache: {e}"))?;
+
+        // Write metadata.
+        let meta_json = serde_json::to_string_pretty(metadata)?;
+        fs::write(tmp_dir.join("metadata.json"), meta_json)
+            .map_err(|e| anyhow::anyhow!("write cache metadata: {e}"))?;
+
+        // Atomic rename. Try rename first; if the target exists
+        // (ENOTEMPTY / EEXIST), remove it and retry once. This avoids
+        // the TOCTOU race of check-then-remove-then-rename.
+        match fs::rename(&tmp_dir, &final_dir) {
+            Ok(()) => {}
+            Err(e)
+                if e.raw_os_error() == Some(libc::ENOTEMPTY)
+                    || e.raw_os_error() == Some(libc::EEXIST) =>
+            {
+                fs::remove_dir_all(&final_dir)?;
+                fs::rename(&tmp_dir, &final_dir)
+                    .map_err(|e2| anyhow::anyhow!("atomic rename cache entry (retry): {e2}"))?;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("atomic rename cache entry: {e}"));
+            }
+        }
+
+        // Rename succeeded — disarm the cleanup guard.
+        guard.disarm();
+
+        Ok(CacheEntry {
+            key: cache_key.to_string(),
+            path: final_dir,
+            metadata: Some(metadata.clone()),
+        })
+    }
+
+    /// Remove cached entries, optionally keeping the N most recent.
+    ///
+    /// When `keep` is `Some(n)`, retains the `n` most recent entries
+    /// (by `built_at` timestamp). When `keep` is `None`, removes all
+    /// entries.
+    ///
+    /// Returns the number of entries removed.
+    pub fn clean(&self, keep: Option<usize>) -> anyhow::Result<usize> {
+        let entries = self.list()?;
+        let skip = keep.unwrap_or(0);
+        let to_remove = entries.into_iter().skip(skip).collect::<Vec<_>>();
+        let count = to_remove.len();
+        for entry in &to_remove {
+            fs::remove_dir_all(&entry.path)?;
+        }
+        Ok(count)
+    }
+}
+
+/// Validate a cache key.
+///
+/// Rejects empty keys, whitespace-only keys, keys starting with
+/// `.tmp-` (reserved for in-progress stores), and keys containing
+/// path separators (`/`, `\`), parent-directory traversal (`..`),
+/// or null bytes. Returns `Ok(())` on valid keys.
+fn validate_cache_key(key: &str) -> anyhow::Result<()> {
+    if key.is_empty() || key.trim().is_empty() {
+        anyhow::bail!("cache key must not be empty or whitespace-only");
+    }
+    if key.contains('/') || key.contains('\\') {
+        anyhow::bail!("cache key must not contain path separators: {key:?}");
+    }
+    if key == "." || key == ".." {
+        anyhow::bail!("cache key must not be a directory reference: {key:?}");
+    }
+    if key.contains("..") {
+        anyhow::bail!("cache key must not contain path traversal: {key:?}");
+    }
+    if key.contains('\0') {
+        anyhow::bail!("cache key must not contain null bytes");
+    }
+    if key.starts_with(".tmp-") {
+        anyhow::bail!("cache key must not start with .tmp- (reserved): {key:?}");
+    }
+    Ok(())
+}
+
+/// Validate a filename (e.g. image_name in metadata).
+///
+/// Rejects empty names, path separators (`/`, `\`), parent-directory
+/// traversal (`..`), and null bytes to prevent path traversal when
+/// joining the filename to a directory path.
+fn validate_filename(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("image name must not be empty");
+    }
+    if name.contains('/') || name.contains('\\') {
+        anyhow::bail!("image name must not contain path separators: {name:?}");
+    }
+    if name.contains("..") {
+        anyhow::bail!("image name must not contain path traversal: {name:?}");
+    }
+    if name.contains('\0') {
+        anyhow::bail!("image name must not contain null bytes");
+    }
+    Ok(())
+}
+
+/// RAII guard that removes a temporary directory on drop.
+///
+/// Call [`disarm`](TmpDirGuard::disarm) after a successful rename to
+/// prevent cleanup of the (now-moved) directory.
+struct TmpDirGuard<'a>(&'a Path);
+
+impl TmpDirGuard<'_> {
+    /// Prevent cleanup. Call after the tmp dir has been renamed.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for TmpDirGuard<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(self.0);
+    }
+}
+
+/// Read and deserialize metadata.json from a cache entry directory.
+fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
+    let meta_path = dir.join("metadata.json");
+    let contents = fs::read_to_string(meta_path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Resolve the cache root directory path.
+///
+/// Does not create the directory -- the caller is responsible for
+/// ensuring it exists.
+fn resolve_cache_root() -> anyhow::Result<PathBuf> {
+    // 1. Explicit override.
+    if let Ok(dir) = std::env::var("KTSTR_CACHE_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    // 2. XDG_CACHE_HOME/ktstr/kernels.
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
+        && !xdg.is_empty()
+    {
+        return Ok(PathBuf::from(xdg).join("ktstr").join("kernels"));
+    }
+    // 3. $HOME/.cache/ktstr/kernels.
+    let home = std::env::var("HOME").map_err(|_| {
+        anyhow::anyhow!(
+            "HOME not set; cannot resolve cache directory. \
+             Set KTSTR_CACHE_DIR to specify a cache location."
+        )
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".cache")
+        .join("ktstr")
+        .join("kernels"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_metadata(version: &str) -> KernelMetadata {
+        KernelMetadata {
+            version: Some(version.to_string()),
+            source: SourceType::Tarball,
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: Some("abc123".to_string()),
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: Some("def456".to_string()),
+            git_hash: None,
+            git_ref: None,
+            source_tree_path: None,
+        }
+    }
+
+    fn create_fake_image(dir: &Path) -> PathBuf {
+        let image = dir.join("bzImage");
+        fs::write(&image, b"fake kernel image").unwrap();
+        image
+    }
+
+    // -- KernelMetadata serde --
+
+    #[test]
+    fn cache_metadata_serde_roundtrip() {
+        let meta = test_metadata("6.14.2");
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version.as_deref(), Some("6.14.2"));
+        assert_eq!(parsed.source, SourceType::Tarball);
+        assert_eq!(parsed.arch, "x86_64");
+        assert_eq!(parsed.image_name, "bzImage");
+        assert_eq!(parsed.config_hash.as_deref(), Some("abc123"));
+        assert_eq!(parsed.built_at, "2026-04-12T10:00:00Z");
+        assert_eq!(parsed.ktstr_kconfig_hash.as_deref(), Some("def456"));
+        assert!(parsed.git_hash.is_none());
+        assert!(parsed.git_ref.is_none());
+        assert!(parsed.source_tree_path.is_none());
+    }
+
+    #[test]
+    fn cache_metadata_serde_with_optional_fields() {
+        let meta = KernelMetadata {
+            version: Some("6.15-rc3".to_string()),
+            source: SourceType::Git,
+            arch: "aarch64".to_string(),
+            image_name: "Image".to_string(),
+            config_hash: None,
+            built_at: "2026-04-12T12:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            git_hash: Some("a1b2c3d".to_string()),
+            git_ref: Some("v6.15-rc3".to_string()),
+            source_tree_path: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source, SourceType::Git);
+        assert_eq!(parsed.git_hash.as_deref(), Some("a1b2c3d"));
+        assert_eq!(parsed.git_ref.as_deref(), Some("v6.15-rc3"));
+    }
+
+    #[test]
+    fn cache_metadata_serde_local_with_source_tree() {
+        let meta = KernelMetadata {
+            version: Some("6.14.0".to_string()),
+            source: SourceType::Local,
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: Some("fff000".to_string()),
+            built_at: "2026-04-12T14:00:00Z".to_string(),
+            ktstr_kconfig_hash: Some("aaa111".to_string()),
+            git_hash: Some("deadbeef".to_string()),
+            git_ref: None,
+            source_tree_path: Some(PathBuf::from("/tmp/linux")),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source, SourceType::Local);
+        assert_eq!(parsed.source_tree_path, Some(PathBuf::from("/tmp/linux")));
+    }
+
+    #[test]
+    fn cache_metadata_deserialize_missing_optional_fields() {
+        let json = r#"{
+            "version": "6.14.2",
+            "source": "tarball",
+            "arch": "x86_64",
+            "image_name": "bzImage",
+            "config_hash": null,
+            "built_at": "2026-04-12T10:00:00Z",
+            "ktstr_kconfig_hash": null,
+            "git_hash": null,
+            "git_ref": null,
+            "source_tree_path": null
+        }"#;
+        let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.version.as_deref(), Some("6.14.2"));
+        assert!(parsed.config_hash.is_none());
+    }
+
+    #[test]
+    fn cache_metadata_deserialize_null_version() {
+        let json = r#"{
+            "version": null,
+            "source": "local",
+            "arch": "x86_64",
+            "image_name": "bzImage",
+            "config_hash": null,
+            "built_at": "2026-04-12T10:00:00Z",
+            "ktstr_kconfig_hash": null,
+            "git_hash": null,
+            "git_ref": null,
+            "source_tree_path": null
+        }"#;
+        let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
+        assert!(parsed.version.is_none());
+        assert_eq!(parsed.source, SourceType::Local);
+    }
+
+    #[test]
+    fn cache_metadata_deserialize_absent_optional_keys() {
+        // Optional field keys entirely absent from JSON (not null —
+        // absent). #[serde(default)] on Option<T> fields makes this
+        // work for forward compatibility when new fields are added.
+        let json = r#"{
+            "source": "tarball",
+            "arch": "x86_64",
+            "image_name": "bzImage",
+            "built_at": "2026-04-12T10:00:00Z"
+        }"#;
+        let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
+        assert!(parsed.version.is_none());
+        assert!(parsed.config_hash.is_none());
+        assert!(parsed.ktstr_kconfig_hash.is_none());
+        assert!(parsed.git_hash.is_none());
+        assert!(parsed.git_ref.is_none());
+        assert!(parsed.source_tree_path.is_none());
+        assert_eq!(parsed.source, SourceType::Tarball);
+        assert_eq!(parsed.arch, "x86_64");
+    }
+
+    #[test]
+    fn cache_metadata_source_type_serde() {
+        // Verify lowercase serialization.
+        let tarball = serde_json::to_string(&SourceType::Tarball).unwrap();
+        assert_eq!(tarball, "\"tarball\"");
+        let git = serde_json::to_string(&SourceType::Git).unwrap();
+        assert_eq!(git, "\"git\"");
+        let local = serde_json::to_string(&SourceType::Local).unwrap();
+        assert_eq!(local, "\"local\"");
+    }
+
+    // -- CacheDir --
+
+    #[test]
+    fn cache_dir_with_root_creates_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("kernels");
+        assert!(!root.exists());
+        let cache = CacheDir::with_root(root.clone()).unwrap();
+        assert!(root.exists());
+        assert_eq!(cache.root(), root);
+    }
+
+    #[test]
+    fn cache_dir_list_empty() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let entries = cache.list().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn cache_dir_store_and_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+
+        // Create a fake kernel image.
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        // Store.
+        let entry = cache.store("6.14.2-tarball-x86_64", &image, &meta).unwrap();
+        assert_eq!(entry.key, "6.14.2-tarball-x86_64");
+        assert!(entry.path.join("bzImage").exists());
+        assert!(entry.path.join("metadata.json").exists());
+
+        // Lookup.
+        let found = cache.lookup("6.14.2-tarball-x86_64");
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.key, "6.14.2-tarball-x86_64");
+        assert!(found.metadata.is_some());
+        let found_meta = found.metadata.unwrap();
+        assert_eq!(found_meta.version.as_deref(), Some("6.14.2"));
+    }
+
+    #[test]
+    fn cache_dir_lookup_missing() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        assert!(cache.lookup("nonexistent").is_none());
+    }
+
+    #[test]
+    fn cache_dir_lookup_corrupt_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+
+        // Create entry dir with image but corrupt metadata.
+        let entry_dir = tmp.path().join("bad-entry");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("bzImage"), b"fake").unwrap();
+        fs::write(entry_dir.join("metadata.json"), b"not json").unwrap();
+
+        // lookup returns None because metadata is corrupt and we
+        // cannot determine the image_name field.
+        let found = cache.lookup("bad-entry");
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn cache_dir_lookup_missing_image() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+
+        // Create entry dir with valid metadata but no image file.
+        let entry_dir = tmp.path().join("no-image");
+        fs::create_dir_all(&entry_dir).unwrap();
+        let meta = test_metadata("6.14.2");
+        let json = serde_json::to_string(&meta).unwrap();
+        fs::write(entry_dir.join("metadata.json"), json).unwrap();
+
+        let found = cache.lookup("no-image");
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn cache_dir_store_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta1 = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        cache
+            .store("6.14.2-tarball-x86_64", &image, &meta1)
+            .unwrap();
+
+        let meta2 = KernelMetadata {
+            built_at: "2026-04-12T11:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        cache
+            .store("6.14.2-tarball-x86_64", &image, &meta2)
+            .unwrap();
+
+        let found = cache.lookup("6.14.2-tarball-x86_64").unwrap();
+        let found_meta = found.metadata.unwrap();
+        assert_eq!(found_meta.built_at, "2026-04-12T11:00:00Z");
+    }
+
+    #[test]
+    fn cache_dir_list_sorted_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta_old = KernelMetadata {
+            built_at: "2026-04-10T10:00:00Z".to_string(),
+            ..test_metadata("6.13.0")
+        };
+        let meta_new = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        let meta_mid = KernelMetadata {
+            built_at: "2026-04-11T10:00:00Z".to_string(),
+            ..test_metadata("6.14.0")
+        };
+
+        // Store in non-chronological order.
+        cache.store("old", &image, &meta_old).unwrap();
+        cache.store("new", &image, &meta_new).unwrap();
+        cache.store("mid", &image, &meta_mid).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].key, "new");
+        assert_eq!(entries[1].key, "mid");
+        assert_eq!(entries[2].key, "old");
+    }
+
+    #[test]
+    fn cache_dir_list_includes_corrupt_entries() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+
+        // Create a valid entry.
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        cache.store("valid", &image, &meta).unwrap();
+
+        // Create a corrupt entry (no metadata).
+        let bad_dir = tmp.path().join("corrupt");
+        fs::create_dir_all(&bad_dir).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 2);
+        // Valid entry has metadata.
+        let valid = entries.iter().find(|e| e.key == "valid").unwrap();
+        assert!(valid.metadata.is_some());
+        // Corrupt entry has no metadata.
+        let corrupt = entries.iter().find(|e| e.key == "corrupt").unwrap();
+        assert!(corrupt.metadata.is_none());
+    }
+
+    #[test]
+    fn cache_dir_list_skips_tmp_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+
+        // Create a .tmp- directory (in-progress store).
+        let tmp_dir = tmp.path().join(".tmp-in-progress-12345");
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn cache_dir_list_skips_regular_files() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+
+        // Create a regular file in the cache root.
+        fs::write(tmp.path().join("stray-file.txt"), b"stray").unwrap();
+
+        let entries = cache.list().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn cache_dir_clean_all() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        cache.store("a", &image, &test_metadata("6.14.0")).unwrap();
+        cache.store("b", &image, &test_metadata("6.14.1")).unwrap();
+        cache.store("c", &image, &test_metadata("6.14.2")).unwrap();
+
+        let removed = cache.clean(None).unwrap();
+        assert_eq!(removed, 3);
+        assert!(cache.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_dir_clean_keep_n() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta_old = KernelMetadata {
+            built_at: "2026-04-10T10:00:00Z".to_string(),
+            ..test_metadata("6.13.0")
+        };
+        let meta_new = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        let meta_mid = KernelMetadata {
+            built_at: "2026-04-11T10:00:00Z".to_string(),
+            ..test_metadata("6.14.0")
+        };
+
+        cache.store("old", &image, &meta_old).unwrap();
+        cache.store("new", &image, &meta_new).unwrap();
+        cache.store("mid", &image, &meta_mid).unwrap();
+
+        let removed = cache.clean(Some(1)).unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = cache.list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].key, "new");
+    }
+
+    #[test]
+    fn cache_dir_clean_keep_more_than_exist() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        cache
+            .store("only", &image, &test_metadata("6.14.2"))
+            .unwrap();
+
+        let removed = cache.clean(Some(5)).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(cache.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cache_dir_clean_empty_cache() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let removed = cache.clean(None).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    // -- resolve_cache_root --
+
+    #[test]
+    fn cache_resolve_root_ktstr_cache_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("custom-cache");
+        // Temporarily set env var for this test.
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", dir.to_str().unwrap());
+        let root = resolve_cache_root().unwrap();
+        assert_eq!(root, dir);
+    }
+
+    #[test]
+    fn cache_resolve_root_xdg_cache_home() {
+        let tmp = TempDir::new().unwrap();
+        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path().to_str().unwrap());
+        let root = resolve_cache_root().unwrap();
+        assert_eq!(root, tmp.path().join("ktstr").join("kernels"));
+    }
+
+    #[test]
+    fn cache_resolve_root_empty_ktstr_cache_dir_falls_through() {
+        let tmp = TempDir::new().unwrap();
+        let _guard1 = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+        let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path().to_str().unwrap());
+        let root = resolve_cache_root().unwrap();
+        assert_eq!(root, tmp.path().join("ktstr").join("kernels"));
+    }
+
+    #[test]
+    fn cache_resolve_root_empty_xdg_falls_to_home() {
+        let tmp = TempDir::new().unwrap();
+        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", "");
+        let _guard3 = EnvVarGuard::set("HOME", tmp.path().to_str().unwrap());
+        let root = resolve_cache_root().unwrap();
+        assert_eq!(
+            root,
+            tmp.path().join(".cache").join("ktstr").join("kernels")
+        );
+    }
+
+    // -- resolve_cache_root error paths --
+
+    #[test]
+    fn cache_resolve_root_home_unset_error() {
+        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _guard3 = EnvVarGuard::remove("HOME");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HOME not set"),
+            "expected HOME-unset error, got: {msg}"
+        );
+        assert!(
+            msg.contains("KTSTR_CACHE_DIR"),
+            "error should suggest KTSTR_CACHE_DIR, got: {msg}"
+        );
+    }
+
+    // -- validate_cache_key unit tests --
+
+    #[test]
+    fn cache_validate_key_rejects_empty() {
+        let err = validate_cache_key("").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn cache_validate_key_rejects_whitespace_only() {
+        let err = validate_cache_key("   ").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn cache_validate_key_rejects_forward_slash() {
+        let err = validate_cache_key("a/b").unwrap_err();
+        assert!(err.to_string().contains("path separator"));
+    }
+
+    #[test]
+    fn cache_validate_key_rejects_backslash() {
+        let err = validate_cache_key("a\\b").unwrap_err();
+        assert!(err.to_string().contains("path separator"));
+    }
+
+    #[test]
+    fn cache_validate_key_rejects_dotdot() {
+        // Use a key without slashes to specifically hit the ".." check
+        // (slashes are rejected first by the separator check).
+        let err = validate_cache_key("foo..bar").unwrap_err();
+        assert!(err.to_string().contains("path traversal"));
+    }
+
+    #[test]
+    fn cache_validate_key_rejects_null_byte() {
+        let err = validate_cache_key("key\0evil").unwrap_err();
+        assert!(err.to_string().contains("null"));
+    }
+
+    #[test]
+    fn cache_validate_key_rejects_tmp_prefix() {
+        let err = validate_cache_key(".tmp-in-progress").unwrap_err();
+        assert!(
+            err.to_string().contains(".tmp-"),
+            "expected .tmp- rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_validate_key_rejects_dot() {
+        let err = validate_cache_key(".").unwrap_err();
+        assert!(
+            err.to_string().contains("directory reference"),
+            "expected dot rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_validate_key_rejects_dotdot_bare() {
+        let err = validate_cache_key("..").unwrap_err();
+        assert!(
+            err.to_string().contains("directory reference"),
+            "expected dotdot rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_validate_key_accepts_valid() {
+        assert!(validate_cache_key("6.14.2-tarball-x86_64").is_ok());
+        assert!(validate_cache_key("local-deadbeef-x86_64").is_ok());
+        assert!(validate_cache_key("v6.14-git-a1b2c3d-aarch64").is_ok());
+    }
+
+    // -- validate_filename --
+
+    #[test]
+    fn cache_validate_filename_rejects_traversal() {
+        assert!(validate_filename("../etc/passwd").is_err());
+        assert!(validate_filename("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn cache_validate_filename_rejects_empty() {
+        assert!(validate_filename("").is_err());
+    }
+
+    #[test]
+    fn cache_validate_filename_accepts_valid() {
+        assert!(validate_filename("bzImage").is_ok());
+        assert!(validate_filename("Image").is_ok());
+    }
+
+    // -- image_name traversal via store --
+
+    #[test]
+    fn cache_dir_store_rejects_image_name_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let mut meta = test_metadata("6.14.2");
+        meta.image_name = "../escape".to_string();
+
+        let err = cache.store("valid-key", &image, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("image name"),
+            "expected image_name rejection, got: {err}"
+        );
+    }
+
+    // -- .tmp- prefix via store/lookup --
+
+    #[test]
+    fn cache_dir_store_tmp_prefix_key_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache.store(".tmp-sneaky", &image, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains(".tmp-"),
+            "expected .tmp- rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_dir_lookup_tmp_prefix_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        assert!(cache.lookup(".tmp-sneaky").is_none());
+    }
+
+    // -- cache key validation via store/lookup --
+
+    #[test]
+    fn cache_dir_store_empty_key_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache.store("", &image, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_dir_lookup_empty_key_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        assert!(cache.lookup("").is_none());
+    }
+
+    #[test]
+    fn cache_dir_store_path_traversal_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache.store("../escape", &image, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("path"),
+            "expected path-traversal error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_dir_lookup_path_traversal_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        assert!(cache.lookup("../escape").is_none());
+        assert!(cache.lookup("foo/../bar").is_none());
+    }
+
+    #[test]
+    fn cache_dir_store_slash_in_key_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache.store("a/b", &image, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("path separator"),
+            "expected path-separator error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_dir_store_whitespace_only_key_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache.store("   ", &image, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty/whitespace error, got: {err}"
+        );
+    }
+
+    // -- clean with mixed valid + corrupt entries --
+
+    #[test]
+    fn cache_dir_clean_keep_n_with_mixed_entries() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        // Two valid entries with different timestamps.
+        let meta_new = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        let meta_old = KernelMetadata {
+            built_at: "2026-04-10T10:00:00Z".to_string(),
+            ..test_metadata("6.13.0")
+        };
+        cache.store("new", &image, &meta_new).unwrap();
+        cache.store("old", &image, &meta_old).unwrap();
+
+        // One corrupt entry (no metadata).
+        let corrupt_dir = tmp.path().join("cache").join("corrupt");
+        fs::create_dir_all(&corrupt_dir).unwrap();
+
+        // list() returns 3 entries. Corrupt entries (no built_at) sort
+        // last. keep=1 should keep the newest valid entry and remove
+        // the old valid + corrupt entries.
+        let removed = cache.clean(Some(1)).unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = cache.list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].key, "new");
+    }
+
+    // -- atomic write safety --
+
+    #[test]
+    fn cache_dir_store_cleans_stale_tmp() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone()).unwrap();
+
+        // Create a stale .tmp- directory simulating a prior crash.
+        let stale_tmp = cache_root.join(format!(".tmp-mykey-{}", std::process::id()));
+        fs::create_dir_all(&stale_tmp).unwrap();
+        fs::write(stale_tmp.join("junk"), b"leftover").unwrap();
+
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        // Store should succeed despite stale tmp dir.
+        let entry = cache.store("mykey", &image, &meta).unwrap();
+        assert!(entry.path.join("bzImage").exists());
+        // Stale tmp dir should be gone.
+        assert!(!stale_tmp.exists());
+    }
+
+    #[test]
+    fn cache_dir_store_preserves_original_image() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        cache.store("key", &image, &meta).unwrap();
+
+        // Original image must still exist (copy, not move).
+        assert!(image.exists());
+    }
+
+    // -- EnvVarGuard for test isolation --
+
+    /// RAII guard that sets/unsets an environment variable and restores
+    /// the original value on drop. Not thread-safe -- tests using this
+    /// must run serially (nextest runs each test in its own process).
+    struct EnvVarGuard {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: nextest runs each test in its own process, so
+            // concurrent env var mutation cannot occur.
+            unsafe { std::env::set_var(key, value) };
+            EnvVarGuard {
+                key: key.to_string(),
+                original,
+            }
+        }
+
+        fn remove(key: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: nextest runs each test in its own process.
+            unsafe { std::env::remove_var(key) };
+            EnvVarGuard {
+                key: key.to_string(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                // SAFETY: nextest runs each test in its own process.
+                Some(val) => unsafe { std::env::set_var(&self.key, val) },
+                None => unsafe { std::env::remove_var(&self.key) },
+            }
+        }
+    }
+}
