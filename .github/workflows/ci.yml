@@ -35,7 +35,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo build --workspace
-      - run: cargo nextest run --workspace --profile ci --features integration
+      - run: cargo nextest run --workspace --profile ci --features integration -j $(($(nproc) / 4))
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
@@ -57,7 +57,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo build --workspace
-      - run: cargo nextest run --workspace --profile ci --features integration
+      - run: cargo nextest run --workspace --profile ci --features integration -j $(($(nproc) / 4))
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
