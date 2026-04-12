@@ -1,3 +1,4 @@
+use std::io::{BufRead, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -69,6 +70,15 @@ enum KernelCommand {
         /// Output in JSON format for CI scripting.
         #[arg(long)]
         json: bool,
+    },
+    /// Remove cached kernel images.
+    Clean {
+        /// Keep the N most recent cached kernels.
+        #[arg(long)]
+        keep: Option<usize>,
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -284,6 +294,71 @@ fn kernel_list(json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove cached kernels with optional keep-N and confirmation prompt.
+fn kernel_clean(keep: Option<usize>, force: bool) -> Result<(), String> {
+    let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+    let entries = cache.list().map_err(|e| format!("list cache: {e}"))?;
+
+    if entries.is_empty() {
+        println!("nothing to clean");
+        return Ok(());
+    }
+
+    let kconfig_hash = embedded_kconfig_hash();
+    let skip = keep.unwrap_or(0);
+    let to_remove: Vec<&CacheEntry> = entries.iter().skip(skip).collect();
+
+    if to_remove.is_empty() {
+        println!("nothing to clean");
+        return Ok(());
+    }
+
+    if !force {
+        // SAFETY: isatty is always safe to call with a valid fd.
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+            return Err("confirmation requires a terminal. Use --force to skip.".to_string());
+        }
+        println!("the following entries will be removed:");
+        for entry in &to_remove {
+            println!("{}", format_entry_row(entry, &kconfig_hash));
+        }
+        eprint!("remove {} entries? [y/N] ", to_remove.len());
+        std::io::stderr()
+            .flush()
+            .map_err(|e| format!("flush stderr: {e}"))?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut answer)
+            .map_err(|e| format!("read stdin: {e}"))?;
+        if !matches!(answer.trim(), "y" | "Y") {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    let total = to_remove.len();
+    let mut removed = 0usize;
+    let mut last_err: Option<String> = None;
+    for entry in &to_remove {
+        match std::fs::remove_dir_all(&entry.path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                removed += 1;
+            }
+            Err(e) => {
+                last_err = Some(format!("remove {}: {e}", entry.key));
+            }
+        }
+    }
+
+    println!("removed {removed} cached kernel(s).");
+    if let Some(err) = last_err {
+        return Err(format!("removed {removed} of {total} entries; {err}"));
+    }
+    Ok(())
+}
+
 fn main() {
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
@@ -295,6 +370,7 @@ fn main() {
         KtstrCommand::TestStats { ref dir } => test_stats(dir),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => kernel_list(json),
+            KernelCommand::Clean { keep, force } => kernel_clean(keep, force),
         },
     };
 

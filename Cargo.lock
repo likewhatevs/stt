@@ -371,6 +371,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "ktstr",
+ "libc",
  "serde_json",
  "tempfile",
 ]
