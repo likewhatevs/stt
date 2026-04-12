@@ -1,8 +1,8 @@
 # cargo-ktstr
 
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
-workflow. Subcommands: `test`, `kernel`, `verifier`, `shell`,
-`completions`, `test-stats`.
+workflow. Subcommands: `test`, `coverage`, `kernel`, `verifier`,
+`shell`, `completions`, `test-stats`.
 
 ## test
 
@@ -48,6 +48,36 @@ Arguments after `test` are passed through to `cargo nextest run`:
 cargo ktstr test -- -E 'test(my_test)'        # nextest filter
 cargo ktstr test -- --workspace               # all workspace tests
 cargo ktstr test -- --retries 2               # nextest retries
+```
+
+## coverage
+
+Build the kernel (if needed) and run tests with coverage via
+`cargo llvm-cov nextest`. Same kernel resolution as `test`.
+
+```sh
+cargo ktstr coverage                                               # auto-discover kernel
+cargo ktstr coverage --kernel ../linux                             # local source tree
+cargo ktstr coverage --kernel 6.14.2                               # cached version
+cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
+```
+
+Requires `cargo-llvm-cov` and the `llvm-tools-preview` rustup
+component:
+
+```sh
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+```
+
+### Passing arguments
+
+Arguments after `coverage` are passed through to
+`cargo llvm-cov nextest`:
+
+```sh
+cargo ktstr coverage -- --workspace --profile ci --lcov --output-path lcov.info
+cargo ktstr coverage -- --features integration
 ```
 
 ## kernel

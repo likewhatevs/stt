@@ -52,6 +52,17 @@ enum KtstrCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Build the kernel (if needed) and run tests with coverage via cargo llvm-cov nextest.
+    Coverage {
+        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
+        /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).
+        /// When absent, resolves automatically via cache then filesystem.
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Arguments passed through to cargo llvm-cov nextest.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Print gauntlet analysis from sidecar JSON files.
     TestStats {
         /// Path to the sidecar directory. Defaults to KTSTR_SIDECAR_DIR
@@ -217,6 +228,32 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
     eprintln!("cargo-ktstr: running tests");
     let err = cmd.exec();
     Err(format!("exec cargo nextest run: {err}"))
+}
+
+fn run_coverage(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
+    use ktstr::kernel_path::KernelId;
+
+    let mut cmd = Command::new("cargo");
+    cmd.args(["llvm-cov", "nextest"]).args(&args);
+
+    if let Some(ref val) = kernel {
+        match KernelId::parse(val) {
+            KernelId::Path(p) => {
+                let dir = PathBuf::from(&p);
+                build_kernel(&dir, false)?;
+                cmd.env("KTSTR_KERNEL", &dir);
+            }
+            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
+                let cache_dir = resolve_cached_kernel_with_remote(&id)?;
+                eprintln!("cargo-ktstr: using cached kernel {}", cache_dir.display());
+                cmd.env("KTSTR_KERNEL", &cache_dir);
+            }
+        }
+    }
+
+    eprintln!("cargo-ktstr: running coverage");
+    let err = cmd.exec();
+    Err(format!("exec cargo llvm-cov nextest: {err}"))
 }
 
 fn test_stats(dir: &Option<PathBuf>) -> Result<(), String> {
@@ -885,6 +922,7 @@ fn main() {
             Ok(())
         }
         KtstrCommand::Test { kernel, args } => run_test(kernel, args),
+        KtstrCommand::Coverage { kernel, args } => run_coverage(kernel, args),
         KtstrCommand::Verifier {
             scheduler,
             scheduler_bin,
@@ -973,6 +1011,46 @@ mod tests {
                 assert_eq!(args, vec!["-p", "ktstr", "--no-capture"]);
             }
             _ => panic!("expected Test"),
+        }
+    }
+
+    // -- try_get_matches_from: coverage subcommand --
+
+    #[test]
+    fn parse_coverage_minimal() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "coverage"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_coverage_with_kernel() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "coverage", "--kernel", "6.14.2"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_coverage_with_passthrough_args() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "coverage",
+            "--",
+            "--workspace",
+            "--lcov",
+            "--output-path",
+            "lcov.info",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Coverage { args, .. } => {
+                assert_eq!(
+                    args,
+                    vec!["--workspace", "--lcov", "--output-path", "lcov.info"]
+                );
+            }
+            _ => panic!("expected Coverage"),
         }
     }
 
@@ -1311,6 +1389,10 @@ mod tests {
         clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, "cargo", &mut buf);
         let output = String::from_utf8(buf).expect("completions should be valid UTF-8");
         assert!(output.contains("test"), "zsh completions missing 'test'");
+        assert!(
+            output.contains("coverage"),
+            "zsh completions missing 'coverage'"
+        );
         assert!(output.contains("shell"), "zsh completions missing 'shell'");
         assert!(
             output.contains("kernel"),
