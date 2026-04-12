@@ -135,6 +135,10 @@ enum KtstrCommand {
         /// Dynamically-linked ELF binaries get shared library resolution.
         #[arg(short = 'i', long = "include-files", action = ArgAction::Append)]
         include_files: Vec<PathBuf>,
+        /// Guest memory in MB (minimum 128). When absent, estimated
+        /// from payload and include file sizes.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(128..))]
+        memory: Option<u32>,
     },
 }
 
@@ -518,6 +522,7 @@ fn run_shell(
     kernel: Option<String>,
     topology: String,
     include_files: Vec<PathBuf>,
+    memory_mb: Option<u32>,
 ) -> Result<(), String> {
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
@@ -593,8 +598,15 @@ fn run_shell(
         .map(|(a, p)| (a.as_str(), p.as_path()))
         .collect();
 
-    ktstr::run_shell(kernel_path, sockets, cores, threads, &include_refs)
-        .map_err(|e| format!("{e:#}"))
+    ktstr::run_shell(
+        kernel_path,
+        sockets,
+        cores,
+        threads,
+        &include_refs,
+        memory_mb,
+    )
+    .map_err(|e| format!("{e:#}"))
 }
 
 /// Query a scheduler binary's flag declarations via `--ktstr-list-flags`.
@@ -943,7 +955,8 @@ fn main() {
             kernel,
             topology,
             include_files,
-        } => run_shell(kernel, topology, include_files),
+            memory,
+        } => run_shell(kernel, topology, include_files, memory),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             KernelCommand::Build {

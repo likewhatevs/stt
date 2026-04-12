@@ -138,6 +138,9 @@ Files passed via `-i`/`--include-files` are available at
 PATH. Dynamically-linked ELF binaries get automatic shared library
 resolution. Directories are not supported -- pass individual files.
 
+`--memory` sets guest memory in MB (minimum 128). When absent, memory
+is estimated from the payload binary and include file sizes.
+
 ### completions
 
 Generate shell completions:

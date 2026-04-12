@@ -484,15 +484,36 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 /// `sockets`, `cores`, `threads`: guest CPU topology.
 /// `include_files`: `(archive_path, host_path)` pairs for files to
 ///   include in the guest.
+/// `memory_mb`: explicit guest memory override in MB. When `None`,
+///   memory is estimated from payload and include file sizes.
 pub fn run_shell(
     kernel: std::path::PathBuf,
     sockets: u32,
     cores: u32,
     threads: u32,
     include_files: &[(&str, &std::path::Path)],
+    memory_mb: Option<u32>,
 ) -> anyhow::Result<()> {
     let payload = resolve_current_exe()?;
-    let memory_mb = vmm::estimate_min_memory_mb(&payload, None, 0).max(256);
+    let memory_mb = memory_mb.unwrap_or_else(|| {
+        let base = vmm::estimate_min_memory_mb(&payload, None, 0);
+        let include_size: u64 = include_files
+            .iter()
+            .filter_map(|(_, p)| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        let include_lib_size: u64 = include_files
+            .iter()
+            .filter_map(|(_, p)| vmm::initramfs::resolve_shared_libs(p).ok())
+            .flat_map(|libs| libs.into_iter().map(|(_, p)| p))
+            .filter_map(|p| std::fs::metadata(&p).ok())
+            .map(|m| m.len())
+            .sum();
+        let include_mb = ((include_size + include_lib_size + (1 << 20) - 1) >> 20) as u32;
+        // Include files are not stripped, so count their full size
+        // in the initramfs memory floor (2x for compressed+uncompressed).
+        (base + 2 * include_mb).max(256)
+    });
 
     let owned_includes: Vec<(String, std::path::PathBuf)> = include_files
         .iter()

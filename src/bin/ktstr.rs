@@ -110,6 +110,10 @@ enum Command {
         /// Dynamically-linked ELF binaries get shared library resolution.
         #[arg(short = 'i', long = "include-files", action = ArgAction::Append)]
         include_files: Vec<PathBuf>,
+        /// Guest memory in MB (minimum 128). When absent, estimated
+        /// from payload and include file sizes.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(128..))]
+        memory: Option<u32>,
     },
     /// Generate shell completions for ktstr.
     Completions {
@@ -463,6 +467,7 @@ fn main() -> Result<()> {
             kernel,
             topology,
             include_files,
+            memory,
         } => {
             cli::check_kvm()?;
             let kernel_path = cli::resolve_kernel_image(kernel.as_deref())?;
@@ -538,7 +543,7 @@ fn main() -> Result<()> {
                 .map(|(a, p)| (a.as_str(), p.as_path()))
                 .collect();
 
-            ktstr::run_shell(kernel_path, sockets, cores, threads, &include_refs)?;
+            ktstr::run_shell(kernel_path, sockets, cores, threads, &include_refs, memory)?;
         }
 
         Command::Completions { shell } => {
