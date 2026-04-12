@@ -369,6 +369,7 @@ name = "cargo-ktstr"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "clap_complete",
  "crc32fast",
  "flate2",
  "gix",
@@ -533,6 +534,15 @@ dependencies = [
  "terminal_size",
  "unicase",
  "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "406e68b4de5c59cfb8f750a7cbd4d31ae153788b8352167c1e5f4fc26e8c91e9"
+dependencies = [
+ "clap",
 ]
 
 [[package]]

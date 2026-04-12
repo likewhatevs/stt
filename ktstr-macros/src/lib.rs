@@ -1015,6 +1015,9 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
         };
     }
 
+    // Generate the ctor function name for --ktstr-list-flags interception.
+    let list_flags_ctor = format_ident!("__ktstr_list_flags_{}", enum_upper.to_lowercase());
+
     let expanded = quote! {
         #(#decl_statics)*
 
@@ -1024,6 +1027,24 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
 
         impl #enum_name {
             #(#name_consts)*
+        }
+
+        /// Intercept `--ktstr-list-flags` before `main()` runs.
+        /// Serializes this scheduler's flag declarations as JSON to
+        /// stdout and exits, avoiding BPF program loading.
+        #[::ktstr::__ctor::ctor]
+        fn #list_flags_ctor() {
+            if !::std::env::args().any(|a| a == "--ktstr-list-flags") {
+                return;
+            }
+            let decls: ::std::vec::Vec<::ktstr::scenario::flags::FlagDeclJson> =
+                #flags_array_ident
+                    .iter()
+                    .map(|d| ::ktstr::scenario::flags::FlagDeclJson::from_decl(d))
+                    .collect();
+            let json = ::ktstr::__serde_json::to_string(&decls).expect("serialize flags");
+            println!("{json}");
+            ::std::process::exit(0);
         }
     };
 

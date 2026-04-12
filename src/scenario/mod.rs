@@ -185,6 +185,30 @@ pub mod flags {
     pub fn decl_by_name(name: &str) -> Option<&'static FlagDecl> {
         ALL_DECLS.iter().find(|d| d.name == name).copied()
     }
+
+    /// JSON-serializable representation of a [`FlagDecl`].
+    ///
+    /// Flattens `requires` from `&[&FlagDecl]` to `Vec<String>` (flag
+    /// names) so it can be serialized/deserialized without static
+    /// references. Used by `--ktstr-list-flags` output and the
+    /// `cargo ktstr verifier --all-profiles` parser.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct FlagDeclJson {
+        pub name: String,
+        pub args: Vec<String>,
+        pub requires: Vec<String>,
+    }
+
+    impl FlagDeclJson {
+        /// Convert a static [`FlagDecl`] to its JSON-serializable form.
+        pub fn from_decl(decl: &FlagDecl) -> Self {
+            Self {
+                name: decl.name.to_string(),
+                args: decl.args.iter().map(|s| s.to_string()).collect(),
+                requires: decl.requires.iter().map(|r| r.name.to_string()).collect(),
+            }
+        }
+    }
 }
 
 /// A set of active flags for a scenario run.

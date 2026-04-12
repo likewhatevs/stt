@@ -230,7 +230,11 @@ pub const GIT_HASH: &str = env!("KTSTR_GIT_HASH");
 pub const GIT_BRANCH: &str = env!("KTSTR_GIT_BRANCH");
 
 #[doc(hidden)]
+pub use ctor as __ctor;
+#[doc(hidden)]
 pub use linkme as __linkme;
+#[doc(hidden)]
+pub use serde_json as __serde_json;
 
 pub use ktstr_macros::Scheduler;
 pub use ktstr_macros::ktstr_test;

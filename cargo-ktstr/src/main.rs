@@ -86,6 +86,17 @@ enum KtstrCommand {
         /// Print raw verifier output without formatting.
         #[arg(long)]
         raw: bool,
+        /// Run verifier for all flag profiles. Discovers flags via
+        /// `--ktstr-list-flags`, constructs profiles (power set
+        /// respecting requires dependencies), and collects verifier
+        /// stats per profile.
+        #[arg(long)]
+        all_profiles: bool,
+        /// Run verifier for specific profiles only (comma-separated
+        /// names, e.g. `default,llc,llc+steal`). Implies --all-profiles
+        /// for flag discovery.
+        #[arg(long, value_delimiter = ',')]
+        profiles: Vec<String>,
     },
     /// Generate shell completions for cargo-ktstr.
     Completions {
@@ -810,11 +821,111 @@ fn run_shell(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Query a scheduler binary's flag declarations via `--ktstr-list-flags`.
+///
+/// Runs the binary with `--ktstr-list-flags` and parses its stdout as
+/// JSON. Returns an empty vec if the binary doesn't support the flag
+/// (exits non-zero or produces no output).
+fn query_scheduler_flags(
+    sched_bin: &Path,
+) -> Result<Vec<ktstr::scenario::flags::FlagDeclJson>, String> {
+    let output = Command::new(sched_bin)
+        .arg("--ktstr-list-flags")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("run scheduler --ktstr-list-flags: {e}"))?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str(trimmed).map_err(|e| format!("parse --ktstr-list-flags output: {e}"))
+}
+
+/// Generate flag profiles from flag declarations.
+///
+/// Produces the power set of flags, filtered by requires constraints.
+/// Each profile's flags are sorted in declaration order (matching the
+/// library's `Scheduler::generate_profiles`).
+fn generate_flag_profiles(
+    flags: &[ktstr::scenario::flags::FlagDeclJson],
+) -> Vec<(String, Vec<String>)> {
+    let n = flags.len();
+    let mut profiles = Vec::new();
+
+    if n > 31 {
+        eprintln!(
+            "cargo-ktstr: error: scheduler has {n} flags, power set too large (2^{n}). \
+             Use --profiles to select specific profiles."
+        );
+        return profiles;
+    }
+
+    for mask in 0..(1u32 << n) {
+        let active: Vec<&ktstr::scenario::flags::FlagDeclJson> = (0..n)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| &flags[i])
+            .collect();
+        let active_names: Vec<&str> = active.iter().map(|f| f.name.as_str()).collect();
+
+        // Check requires constraints: every active flag's requires
+        // must also be in the active set.
+        let valid = active.iter().all(|f| {
+            f.requires
+                .iter()
+                .all(|r| active_names.contains(&r.as_str()))
+        });
+        if !valid {
+            continue;
+        }
+
+        // Sort by declaration order (position in the input slice).
+        let mut flag_names: Vec<String> = active.iter().map(|f| f.name.clone()).collect();
+        flag_names.sort_by_key(|name| {
+            flags
+                .iter()
+                .position(|f| f.name == *name)
+                .unwrap_or(usize::MAX)
+        });
+        let name = if flag_names.is_empty() {
+            "default".to_string()
+        } else {
+            flag_names.join("+")
+        };
+        profiles.push((name, flag_names));
+    }
+
+    profiles
+}
+
+/// Collect the extra scheduler args for a set of active flags.
+fn profile_sched_args(
+    active_flags: &[String],
+    all_flags: &[ktstr::scenario::flags::FlagDeclJson],
+) -> Vec<String> {
+    let mut args = Vec::new();
+    for flag_name in active_flags {
+        if let Some(decl) = all_flags.iter().find(|f| f.name == *flag_name) {
+            args.extend(decl.args.iter().cloned());
+        }
+    }
+    args
+}
+
 fn run_verifier(
     scheduler: Option<String>,
     scheduler_bin: Option<PathBuf>,
     kernel: Option<String>,
     raw: bool,
+    all_profiles: bool,
+    profiles_filter: Vec<String>,
 ) -> Result<(), String> {
     check_kvm()?;
 
@@ -842,6 +953,16 @@ fn run_verifier(
     let ktstr_bin =
         ktstr::build_and_find_binary("ktstr").map_err(|e| format!("build ktstr: {e}"))?;
 
+    if all_profiles || !profiles_filter.is_empty() {
+        return run_verifier_all_profiles(
+            &sched_bin,
+            &ktstr_bin,
+            &kernel_path,
+            raw,
+            &profiles_filter,
+        );
+    }
+
     eprintln!("cargo-ktstr: collecting verifier stats");
     let result =
         ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel_path, &[])
@@ -851,6 +972,144 @@ fn run_verifier(
     print!("{output}");
 
     Ok(())
+}
+
+fn run_verifier_all_profiles(
+    sched_bin: &Path,
+    ktstr_bin: &Path,
+    kernel_path: &Path,
+    raw: bool,
+    profiles_filter: &[String],
+) -> Result<(), String> {
+    let flags = query_scheduler_flags(sched_bin)?;
+    if flags.is_empty() {
+        eprintln!(
+            "cargo-ktstr: scheduler does not support --ktstr-list-flags, \
+             running with default profile only"
+        );
+        let result =
+            ktstr::verifier::collect_verifier_output(sched_bin, ktstr_bin, kernel_path, &[])
+                .map_err(|e| format!("collect verifier output: {e}"))?;
+        let output = ktstr::verifier::format_verifier_output("default", &result, raw);
+        print!("{output}");
+        return Ok(());
+    }
+
+    let all_profiles = generate_flag_profiles(&flags);
+
+    // Filter profiles if --profiles was specified.
+    let profiles: Vec<&(String, Vec<String>)> = if profiles_filter.is_empty() {
+        all_profiles.iter().collect()
+    } else {
+        let filtered: Vec<_> = all_profiles
+            .iter()
+            .filter(|(name, _)| profiles_filter.iter().any(|f| f == name))
+            .collect();
+        if filtered.is_empty() {
+            return Err(format!(
+                "no matching profiles found. Available: {}",
+                all_profiles
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        filtered
+    };
+
+    let total = profiles.len();
+    if total > 32 {
+        eprintln!(
+            "cargo-ktstr: warning: {total} profiles to verify (>32). \
+             Use --profiles to select a subset."
+        );
+    }
+
+    eprintln!(
+        "cargo-ktstr: verifying {total} profile{}",
+        if total == 1 { "" } else { "s" }
+    );
+
+    // Per-profile summary table: (profile_name, Vec<(prog_name, verified_insns)>).
+    let mut summary: Vec<(String, Vec<(String, u32)>)> = Vec::new();
+
+    for (i, (profile_name, active_flags)) in profiles.iter().enumerate() {
+        eprintln!(
+            "cargo-ktstr: [{}/{}] profile: {}",
+            i + 1,
+            total,
+            profile_name
+        );
+
+        let extra_args = profile_sched_args(active_flags, &flags);
+        let result = ktstr::verifier::collect_verifier_output(
+            sched_bin,
+            ktstr_bin,
+            kernel_path,
+            &extra_args,
+        )
+        .map_err(|e| format!("profile {profile_name}: {e}"))?;
+
+        let output = ktstr::verifier::format_verifier_output(profile_name, &result, raw);
+        print!("{output}");
+
+        let prog_stats: Vec<(String, u32)> = result
+            .stats
+            .iter()
+            .map(|ps| (ps.name.clone(), ps.verified_insns))
+            .collect();
+        summary.push((profile_name.clone(), prog_stats));
+    }
+
+    // Print per-profile summary table.
+    if summary.len() > 1 {
+        print_profile_summary(&summary);
+    }
+
+    Ok(())
+}
+
+/// Print a summary table comparing verified_insns across profiles.
+fn print_profile_summary(summary: &[(String, Vec<(String, u32)>)]) {
+    // Collect all unique program names in insertion order.
+    let mut prog_names: Vec<String> = Vec::new();
+    for (_, progs) in summary {
+        for (name, _) in progs {
+            if !prog_names.contains(name) {
+                prog_names.push(name.clone());
+            }
+        }
+    }
+
+    println!("\n--- profile summary ---");
+
+    // Header: program name, then one column per profile.
+    let profile_names: Vec<&str> = summary.iter().map(|(n, _)| n.as_str()).collect();
+    print!("  {:<40}", "program");
+    for pn in &profile_names {
+        print!(" {:>12}", pn);
+    }
+    println!();
+    print!("  {}", "-".repeat(40));
+    for _ in &profile_names {
+        print!(" {}", "-".repeat(12));
+    }
+    println!();
+
+    // Rows: one per program.
+    for prog in &prog_names {
+        print!("  {:<40}", prog);
+        for (_, progs) in summary {
+            let insns = progs
+                .iter()
+                .find(|(n, _)| n == prog)
+                .map(|(_, v)| *v)
+                .unwrap_or(0);
+            print!(" {:>12}", insns);
+        }
+        println!();
+    }
 }
 
 fn run_completions(shell: clap_complete::Shell, binary: &str) {
@@ -881,7 +1140,16 @@ fn main() {
             scheduler_bin,
             kernel,
             raw,
-        } => run_verifier(scheduler, scheduler_bin, kernel, raw),
+            all_profiles,
+            profiles,
+        } => run_verifier(
+            scheduler,
+            scheduler_bin,
+            kernel,
+            raw,
+            all_profiles,
+            profiles,
+        ),
         KtstrCommand::TestStats { ref dir } => test_stats(dir),
         KtstrCommand::Shell {
             kernel,
