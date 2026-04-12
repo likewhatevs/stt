@@ -79,42 +79,27 @@ fn resolve_addrs_from_elf(
     vmlinux: &std::path::Path,
     func_names: &[(u32, String)],
 ) -> Vec<(String, u64)> {
-    use object::elf;
-    use object::read::elf::{FileHeader, Sym};
-
     let data = match std::fs::read(vmlinux) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
-    let header = match elf::FileHeader64::<object::Endianness>::parse(&*data) {
-        Ok(h) => h,
-        Err(_) => return Vec::new(),
-    };
-    let endian = match header.endian() {
+    let elf = match goblin::elf::Elf::parse(&data) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let sections = match header.sections(endian, &*data) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let symbols = match sections.symbols(endian, &*data, elf::SHT_SYMTAB) {
-        Ok(s) => s,
         Err(_) => return Vec::new(),
     };
 
     let mut result = Vec::new();
     for (_, name) in func_names {
-        for sym in symbols.iter() {
-            if sym.st_size(endian) == 0 {
+        for sym in elf.syms.iter() {
+            if sym.st_size == 0 {
                 continue;
             }
-            let sym_name = match sym.name(endian, symbols.strings()) {
-                Ok(n) => n,
-                Err(_) => continue,
+            let sym_name = match elf.strtab.get_at(sym.st_name) {
+                Some(n) => n,
+                None => continue,
             };
-            if sym_name == name.as_bytes() {
-                result.push((name.clone(), sym.st_value(endian)));
+            if sym_name == name {
+                result.push((name.clone(), sym.st_value));
                 break;
             }
         }
@@ -1014,5 +999,37 @@ mod tests {
             "should show struct type header: {out}"
         );
         assert!(out.contains("cpu"), "should show field under header: {out}");
+    }
+
+    // -- resolve_addrs_from_elf --
+
+    #[test]
+    fn resolve_addrs_from_elf_finds_kernel_function() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => {
+                eprintln!("skipping: no vmlinux available");
+                return;
+            }
+        };
+        // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
+        // not an ELF), which resolve_addrs_from_elf cannot parse.
+        if path.starts_with("/sys/") {
+            eprintln!("skipping: {} is raw BTF, not ELF", path.display());
+            return;
+        }
+        let func_names = vec![(0u32, "schedule".to_string())];
+        let result = resolve_addrs_from_elf(&path, &func_names);
+        assert!(!result.is_empty(), "should resolve 'schedule' from vmlinux");
+        assert_eq!(result[0].0, "schedule");
+        assert_ne!(result[0].1, 0, "schedule address should be nonzero");
+    }
+
+    #[test]
+    fn resolve_addrs_from_elf_nonexistent_returns_empty() {
+        let func_names = vec![(0u32, "schedule".to_string())];
+        let result =
+            resolve_addrs_from_elf(std::path::Path::new("/nonexistent/vmlinux"), &func_names);
+        assert!(result.is_empty());
     }
 }

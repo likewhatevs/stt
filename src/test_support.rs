@@ -2620,43 +2620,28 @@ pub(crate) fn try_flush_profraw() {
 /// Resolve multiple symbol virtual addresses in a single pass through
 /// the ELF .symtab. Returns addresses in the same order as `names`.
 fn find_symbol_vaddrs(data: &[u8], names: &[&str]) -> Vec<Option<u64>> {
-    use object::elf;
-    use object::read::elf::{FileHeader, Sym};
-
     let mut results = vec![None; names.len()];
     let mut remaining = names.len();
 
-    let header = match elf::FileHeader64::<object::Endianness>::parse(data) {
-        Ok(h) => h,
-        Err(_) => return results,
-    };
-    let endian = match header.endian() {
+    let elf = match goblin::elf::Elf::parse(data) {
         Ok(e) => e,
         Err(_) => return results,
     };
-    let sections = match header.sections(endian, data) {
-        Ok(s) => s,
-        Err(_) => return results,
-    };
-    let symbols = match sections.symbols(endian, data, elf::SHT_SYMTAB) {
-        Ok(s) => s,
-        Err(_) => return results,
-    };
 
-    for sym in symbols.iter() {
+    for sym in elf.syms.iter() {
         if remaining == 0 {
             break;
         }
-        if sym.st_size(endian) == 0 {
+        if sym.st_size == 0 {
             continue;
         }
-        let sym_name = match sym.name(endian, symbols.strings()) {
-            Ok(n) => n,
-            Err(_) => continue,
+        let sym_name = match elf.strtab.get_at(sym.st_name) {
+            Some(n) => n,
+            None => continue,
         };
         for (i, name) in names.iter().enumerate() {
-            if results[i].is_none() && sym_name == name.as_bytes() {
-                results[i] = Some(sym.st_value(endian));
+            if results[i].is_none() && sym_name == *name {
+                results[i] = Some(sym.st_value);
                 remaining -= 1;
                 break;
             }
@@ -2674,23 +2659,16 @@ fn find_symbol_vaddrs(data: &[u8], names: &[&str]) -> Vec<Option<u64>> {
 ///
 /// Returns 0 for ET_EXEC (non-PIE), where st_value is already absolute.
 fn pie_load_bias(data: &[u8]) -> usize {
-    use object::elf;
-    use object::read::elf::FileHeader;
-
-    let header = match elf::FileHeader64::<object::Endianness>::parse(data) {
-        Ok(h) => h,
-        Err(_) => return 0,
-    };
-    let endian = match header.endian() {
+    let elf = match goblin::elf::Elf::parse(data) {
         Ok(e) => e,
         Err(_) => return 0,
     };
 
-    if header.e_type(endian) != elf::ET_DYN {
+    if elf.header.e_type != goblin::elf::header::ET_DYN {
         return 0;
     }
 
-    let phdr_file_offset = header.e_phoff(endian) as usize;
+    let phdr_file_offset = elf.header.e_phoff as usize;
     // SAFETY: AT_PHDR is a well-defined auxiliary vector key.
     let phdr_runtime = unsafe { libc::getauxval(libc::AT_PHDR) } as usize;
     if phdr_runtime == 0 {
@@ -5534,5 +5512,40 @@ mod tests {
             "got: {msg}"
         );
         assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
+    }
+
+    // -- find_symbol_vaddrs --
+
+    #[test]
+    fn find_symbol_vaddrs_resolves_known_symbol() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        // "main" is present in the symtab of any Rust test binary.
+        let results = find_symbol_vaddrs(&data, &["main"]);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_some(),
+            "main symbol should be resolved in test binary"
+        );
+        assert_ne!(results[0].unwrap(), 0, "main address should be nonzero");
+    }
+
+    #[test]
+    fn find_symbol_vaddrs_missing_symbol_returns_none() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let results = find_symbol_vaddrs(&data, &["__nonexistent_symbol_xyz__"]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_none());
+    }
+
+    #[test]
+    fn find_symbol_vaddrs_mixed_results() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let results = find_symbol_vaddrs(&data, &["main", "__nonexistent_symbol_xyz__"]);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_some(), "main should resolve");
+        assert!(results[1].is_none(), "nonexistent should not resolve");
     }
 }

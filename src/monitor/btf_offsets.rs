@@ -23,10 +23,17 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
         return Btf::from_bytes(&data).map_err(|e| anyhow::anyhow!("{e}"));
     }
     // Try ELF — extract .BTF section
-    if let Ok(elf) = object::File::parse(&*data) {
-        use object::{Object, ObjectSection};
-        if let Some(section) = elf.section_by_name(".BTF") {
-            let btf_data = section.data().context(".BTF section data")?;
+    if let Ok(elf) = goblin::elf::Elf::parse(&data) {
+        let btf_shdr = elf
+            .section_headers
+            .iter()
+            .find(|shdr| elf.shdr_strtab.get_at(shdr.sh_name) == Some(".BTF"));
+        if let Some(shdr) = btf_shdr {
+            let offset = shdr.sh_offset as usize;
+            let size = shdr.sh_size as usize;
+            let btf_data = data
+                .get(offset..offset + size)
+                .context(".BTF section data out of bounds")?;
             return Btf::from_bytes(btf_data).map_err(|e| anyhow::anyhow!("{e}"));
         }
         bail!("vmlinux ELF has no .BTF section");

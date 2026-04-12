@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use object::{Object, ObjectSymbol};
 
 use super::reader::GuestMem;
 use super::symbols::{kva_to_pa, resolve_page_offset, resolve_pgtable_l5, text_kva_to_pa};
@@ -50,15 +49,15 @@ impl<'a> GuestKernel<'a> {
     pub fn new(mem: &'a GuestMem, vmlinux: &Path) -> Result<Self> {
         let data = std::fs::read(vmlinux)
             .with_context(|| format!("read vmlinux: {}", vmlinux.display()))?;
-        let elf = object::File::parse(&*data).context("parse vmlinux ELF")?;
+        let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
 
         let mut symbols = HashMap::new();
-        for sym in elf.symbols() {
-            if let Ok(name) = sym.name()
+        for sym in elf.syms.iter() {
+            if let Some(name) = elf.strtab.get_at(sym.st_name)
                 && !name.is_empty()
-                && sym.address() != 0
+                && sym.st_value != 0
             {
-                symbols.insert(name.to_string(), sym.address());
+                symbols.insert(name.to_string(), sym.st_value);
             }
         }
 
@@ -439,5 +438,44 @@ mod tests {
         assert_eq!(kernel.cr3_pa(), 0x5678);
         assert!(kernel.l5());
         assert!(std::ptr::eq(kernel.mem(), mem_ref));
+    }
+
+    #[test]
+    fn new_parses_vmlinux_symbols() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => {
+                eprintln!("skipping: no vmlinux available");
+                return;
+            }
+        };
+        // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
+        // not an ELF), which GuestKernel cannot parse.
+        if path.starts_with("/sys/") {
+            eprintln!("skipping: {} is raw BTF, not ELF", path.display());
+            return;
+        }
+        // Allocate a buffer large enough for text_kva_to_pa reads.
+        // GuestKernel::new reads page_offset_base and pgtable_l5_enabled
+        // from guest memory; a zeroed buffer causes safe fallbacks.
+        let mut buf = vec![0u8; 64 << 20];
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let kernel = match GuestKernel::new(&mem, &path) {
+            Ok(k) => k,
+            Err(e) => {
+                // init_top_pgt missing in some kernel configs.
+                eprintln!("skipping: GuestKernel::new failed: {e}");
+                return;
+            }
+        };
+        assert!(
+            kernel.symbol_kva("runqueues").is_some(),
+            "symbol map should contain runqueues"
+        );
+        assert_ne!(
+            kernel.symbol_kva("runqueues").unwrap(),
+            0,
+            "runqueues address should be nonzero"
+        );
     }
 }

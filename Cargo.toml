@@ -59,9 +59,9 @@ vm-superio = "0.8.1"
 parking_lot = "0.12"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
-object = { version = "0.39.0", features = ["read"] }
 linkme = "0.3"
 ktstr-macros = { version = "0.1.0", path = "ktstr-macros" }
+goblin = { version = "0.10.5", features = ["elf64"] }
 
 [profile.release]
 lto = "thin"

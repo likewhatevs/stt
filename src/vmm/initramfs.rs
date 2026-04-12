@@ -38,7 +38,7 @@ pub struct MissingLib {
 pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     let data =
         std::fs::read(binary).with_context(|| format!("read binary: {}", binary.display()))?;
-    let elf = match object::read::elf::ElfFile64::<object::Endianness>::parse(&*data) {
+    let elf = match goblin::elf::Elf::parse(&data) {
         Ok(e) => e,
         Err(_) => {
             // Not a valid ELF (or 32-bit) — treat as static/non-dynamic.
@@ -49,20 +49,17 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
         }
     };
 
-    let dynamic = match elf.elf_dynamic_table() {
-        Ok(d) => d,
-        Err(_) => {
-            // No dynamic section — static binary.
-            return Ok(SharedLibs {
-                found: vec![],
-                missing: vec![],
-            });
-        }
-    };
+    if elf.libraries.is_empty() && elf.dynamic.is_none() {
+        // No dynamic section — static binary.
+        return Ok(SharedLibs {
+            found: vec![],
+            missing: vec![],
+        });
+    }
 
     // Extract DT_NEEDED, DT_RUNPATH, and DT_RPATH from the root binary.
-    let root_needed = elf_dynamic_needed(&dynamic);
-    let root_search = elf_search_paths(&dynamic, binary);
+    let root_needed: Vec<String> = elf.libraries.iter().map(|s| s.to_string()).collect();
+    let root_search = elf_search_paths(&elf, binary);
 
     // Resolve the full transitive closure. Each queued entry carries the
     // search paths from the library that declared the DT_NEEDED, since
@@ -100,12 +97,11 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
             // Recurse: parse the resolved lib's own DT_NEEDED and use
             // its own DT_RUNPATH/DT_RPATH for resolving those deps.
             if let Ok(lib_data) = std::fs::read(&canonical)
-                && let Ok(lib_elf) =
-                    object::read::elf::ElfFile64::<object::Endianness>::parse(&*lib_data)
-                && let Ok(lib_dynamic) = lib_elf.elf_dynamic_table()
+                && let Ok(lib_elf) = goblin::elf::Elf::parse(&lib_data)
             {
-                let lib_search = elf_search_paths(&lib_dynamic, &canonical);
-                for transitive in elf_dynamic_needed(&lib_dynamic) {
+                let lib_search = elf_search_paths(&lib_elf, &canonical);
+                for lib_name in &lib_elf.libraries {
+                    let transitive = lib_name.to_string();
                     if !visited.contains(&transitive) {
                         queue.push_back((transitive, false, lib_search.clone()));
                     }
@@ -122,63 +118,29 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     Ok(SharedLibs { found, missing })
 }
 
-/// Extract DT_NEEDED sonames from a parsed dynamic table.
-fn elf_dynamic_needed(
-    dynamic: &object::read::elf::DynamicTable<'_, object::elf::FileHeader64<object::Endianness>>,
-) -> Vec<String> {
-    let mut needed = Vec::new();
-    for entry in dynamic {
-        if entry.tag == object::elf::DT_NEEDED
-            && let Ok(name) = dynamic.string(entry)
-        {
-            needed.push(String::from_utf8_lossy(name).into_owned());
-        }
-    }
-    needed
-}
-
 /// Extract search paths from DT_RUNPATH (preferred) or DT_RPATH, with
 /// dynamic string tokens expanded:
 /// - `$ORIGIN` / `${ORIGIN}`: binary's parent directory
 /// - `$LIB` / `${LIB}`: `lib` or `lib64` based on ELF class
 /// - `$PLATFORM` / `${PLATFORM}`: `x86_64` or `aarch64`
-fn elf_search_paths(
-    dynamic: &object::read::elf::DynamicTable<'_, object::elf::FileHeader64<object::Endianness>>,
-    binary: &Path,
-) -> Vec<PathBuf> {
+fn elf_search_paths(elf: &goblin::elf::Elf, binary: &Path) -> Vec<PathBuf> {
     let origin = binary
         .parent()
         .and_then(|p| std::fs::canonicalize(p).ok())
         .unwrap_or_default();
 
     // DT_RUNPATH takes precedence over DT_RPATH when both are present.
-    let mut raw_paths: Option<String> = None;
-    for entry in dynamic {
-        if entry.tag == object::elf::DT_RUNPATH
-            && let Ok(val) = dynamic.string(entry)
-        {
-            raw_paths = Some(String::from_utf8_lossy(val).into_owned());
-            break;
-        }
-    }
-    if raw_paths.is_none() {
-        for entry in dynamic {
-            if entry.tag == object::elf::DT_RPATH
-                && let Ok(val) = dynamic.string(entry)
-            {
-                raw_paths = Some(String::from_utf8_lossy(val).into_owned());
-                break;
-            }
-        }
-    }
-
-    let Some(raw) = raw_paths else {
+    let raw = if !elf.runpaths.is_empty() {
+        elf.runpaths.join(":")
+    } else if !elf.rpaths.is_empty() {
+        elf.rpaths.join(":")
+    } else {
         return vec![];
     };
 
     let origin_str = origin.to_string_lossy();
-    // ElfFile64 implies 64-bit ELF class → lib64. 32-bit would be lib.
-    let lib_str = "lib64";
+    // goblin's is_64 distinguishes 64-bit vs 32-bit ELF class.
+    let lib_str = if elf.is_64 { "lib64" } else { "lib" };
     let platform_str = std::env::consts::ARCH;
 
     raw.split(':')
@@ -1045,9 +1007,8 @@ mod tests {
             return;
         }
         let data = std::fs::read(sh).unwrap();
-        let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*data).unwrap();
-        let dynamic = elf.elf_dynamic_table().unwrap();
-        let needed = elf_dynamic_needed(&dynamic);
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let needed: Vec<&str> = elf.libraries.clone();
         assert!(
             needed.iter().any(|n| n.contains("libc")),
             "/bin/sh should need libc: {:?}",

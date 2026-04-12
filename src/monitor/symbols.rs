@@ -6,7 +6,6 @@
 //! physical addresses via the text mapping and direct mapping.
 
 use anyhow::{Context, Result};
-use object::{Object, ObjectSymbol};
 use std::path::Path;
 
 /// Kernel text mapping base (non-KASLR).
@@ -71,35 +70,30 @@ impl KernelSymbols {
     pub fn from_vmlinux(path: &Path) -> Result<Self> {
         let data =
             std::fs::read(path).with_context(|| format!("read vmlinux: {}", path.display()))?;
-        let elf = object::File::parse(&*data).context("parse vmlinux ELF")?;
+        let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
 
-        let runqueues = elf
-            .symbol_by_name("runqueues")
-            .context("symbol 'runqueues' not found in vmlinux")?
-            .address();
+        let sym_addr = |name: &str| -> Option<u64> {
+            elf.syms
+                .iter()
+                .find(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
+                .map(|s| s.st_value)
+        };
 
-        let per_cpu_offset = elf
-            .symbol_by_name("__per_cpu_offset")
-            .context("symbol '__per_cpu_offset' not found in vmlinux")?
-            .address();
+        let runqueues = sym_addr("runqueues").context("symbol 'runqueues' not found in vmlinux")?;
 
-        let page_offset_base_kva = elf.symbol_by_name("page_offset_base").map(|s| s.address());
+        let per_cpu_offset = sym_addr("__per_cpu_offset")
+            .context("symbol '__per_cpu_offset' not found in vmlinux")?;
 
-        let scx_root = elf.symbol_by_name("scx_root").map(|s| s.address());
-        let scx_watchdog_timeout = elf
-            .symbol_by_name("scx_watchdog_timeout")
-            .map(|s| s.address());
+        let page_offset_base_kva = sym_addr("page_offset_base");
 
-        let init_top_pgt = elf
-            .symbol_by_name("init_top_pgt")
-            .or_else(|| elf.symbol_by_name("swapper_pg_dir"))
-            .map(|s| s.address());
+        let scx_root = sym_addr("scx_root");
+        let scx_watchdog_timeout = sym_addr("scx_watchdog_timeout");
 
-        let pgtable_l5_enabled = elf
-            .symbol_by_name("__pgtable_l5_enabled")
-            .map(|s| s.address());
+        let init_top_pgt = sym_addr("init_top_pgt").or_else(|| sym_addr("swapper_pg_dir"));
 
-        let prog_idr = elf.symbol_by_name("prog_idr").map(|s| s.address());
+        let pgtable_l5_enabled = sym_addr("__pgtable_l5_enabled");
+
+        let prog_idr = sym_addr("prog_idr");
 
         Ok(Self {
             runqueues,
