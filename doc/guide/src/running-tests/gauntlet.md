@@ -50,7 +50,7 @@ cargo nextest run --run-ignored ignored-only \
 | `large-4llc` | 4s16c2t | 128 | 4 | Large, few LLCs |
 | `large-8llc` | 8s8c2t | 128 | 8 | Large, many LLCs |
 | `near-max-llc` | 15s8c2t | 240 | 15 | Near maximum |
-| `max-cpu` | 14s9c2t | 252 | 14 | Near i440fx limit |
+| `max-cpu` | 14s9c2t | 252 | 14 | Near KVM vCPU limit |
 
 Topology format: `{sockets}s{cores_per_socket}c{threads_per_core}t`.
 Presets are defined in `gauntlet_presets()`.

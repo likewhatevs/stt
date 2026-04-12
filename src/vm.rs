@@ -31,7 +31,7 @@ impl Default for VmConfig {
             topology: Topology {
                 sockets: 2,
                 cores_per_socket: 2,
-                threads_per_core: 2,
+                threads_per_core: 1,
             },
             memory_mb: 4096,
             timeout: None,
@@ -125,7 +125,7 @@ pub struct TopoPreset {
 /// Topology presets used by gauntlet mode (13 on x86_64, 5 on aarch64).
 ///
 /// Ranges from `tiny-1llc` (4 CPUs) to `max-cpu` (252 CPUs, near
-/// the i440fx vCPU limit). On aarch64, presets with SMT
+/// the KVM vCPU limit). On aarch64, presets with SMT
 /// (`threads_per_core > 1`) are excluded because ARM64 CPUs do not
 /// have SMT.
 pub fn gauntlet_presets() -> Vec<TopoPreset> {
@@ -151,7 +151,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
         ),
         (
             "max-cpu",
-            "252 CPUs, 14 LLCs (near i440fx limit)",
+            "252 CPUs, 14 LLCs (near KVM vCPU limit)",
             14,
             9,
             2,
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn vm_config_default() {
         let c = VmConfig::default();
-        assert_eq!(c.topology.total_cpus(), 8);
+        assert_eq!(c.topology.total_cpus(), 4);
         assert_eq!(c.memory_mb, 4096);
         assert!(c.kernel.is_none());
         assert!(c.timeout.is_none());
@@ -382,10 +382,10 @@ mod tests {
         let presets = gauntlet_presets();
         let max = presets.iter().find(|p| p.name == "max-cpu").unwrap();
         let cpus = max.topology.total_cpus();
-        // i440fx limit is 255 CPUs; near-limit means < 255
+        // KVM vCPU limit is 255 on x86_64; near-limit means < 255
         assert!(
             cpus <= 255,
-            "max-cpu has {} CPUs, exceeds i440fx limit",
+            "max-cpu has {} CPUs, exceeds KVM vCPU limit",
             cpus
         );
         assert!(
