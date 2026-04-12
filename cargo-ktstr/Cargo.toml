@@ -11,7 +11,9 @@ categories = ["development-tools::testing", "development-tools::cargo-plugins"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+crc32fast = "1.5"
 ktstr = { path = ".." }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
