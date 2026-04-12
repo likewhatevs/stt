@@ -26,6 +26,11 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"], optional = true }
 clap_complete = { version = "4", optional = true }
 crc32fast = "1.5"
+gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status"], optional = true }
+reqwest = { version = "0.13", features = ["blocking"], optional = true }
+tar = { version = "0.4", optional = true }
+tempfile = { version = "3", optional = true }
+xz2 = { version = "0.1", optional = true }
 flate2 = "1"
 ctor = "0.8"
 libc = "0.2"
@@ -60,7 +65,9 @@ lto = "thin"
 
 [features]
 integration = []
-cli = ["dep:clap", "dep:clap_complete"]
+fetch = ["dep:gix", "dep:reqwest", "dep:tar", "dep:tempfile", "dep:xz2"]
+cli = ["dep:clap", "dep:clap_complete", "fetch"]
+full = ["cli"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }

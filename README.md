@@ -25,7 +25,7 @@ scheduler.
 ## Installation
 
 ```sh
-cargo install ktstr --features cli    # host-side test runner
+cargo install ktstr --features full   # host-side CLI with all capabilities
 cargo install cargo-ktstr             # dev workflow plugin (kernel build + nextest)
 cargo install cargo-nextest           # required test runner
 ```
@@ -145,7 +145,7 @@ cargo run --features cli --bin ktstr -- run
 cargo run --features cli --bin ktstr -- topo
 cargo run --features cli --bin ktstr -- cleanup
 cargo run --features cli --bin ktstr -- kernel list
-cargo run --features cli --bin ktstr -- kernel build --source ../linux
+cargo run --features cli --bin ktstr -- kernel build 6.14.2
 cargo run --features cli --bin ktstr -- kernel clean
 cargo run --features cli --bin ktstr -- completions bash
 ```

@@ -107,15 +107,24 @@ enum KernelCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Build a kernel image from a local source tree.
+    /// Download, build, and cache a kernel image.
     Build {
+        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3).
+        #[arg(conflicts_with_all = ["source", "git"])]
+        version: Option<String>,
         /// Path to existing kernel source directory.
-        #[arg(long)]
-        source: PathBuf,
+        #[arg(long, conflicts_with_all = ["version", "git"])]
+        source: Option<PathBuf>,
+        /// Git URL to clone kernel source from.
+        #[arg(long, requires = "git_ref", conflicts_with_all = ["version", "source"])]
+        git: Option<String>,
+        /// Git ref to checkout (branch, tag, commit).
+        #[arg(long = "ref", requires = "git")]
+        git_ref: Option<String>,
         /// Rebuild even if a cached image exists.
         #[arg(long)]
         force: bool,
-        /// Run make mrproper before configuring.
+        /// Run make mrproper before configuring (local source only).
         #[arg(long)]
         clean: bool,
     },
@@ -237,7 +246,7 @@ fn kernel_list(json: bool) -> Result<()> {
     if has_stale {
         eprintln!(
             "warning: entries marked (stale kconfig) were built with a different ktstr.kconfig. \
-             Rebuild with: ktstr kernel build --force --source PATH"
+             Rebuild with: ktstr kernel build --force VERSION"
         );
     }
     Ok(())
@@ -279,39 +288,64 @@ fn configure_kernel(kernel_dir: &std::path::Path, fragment: &str) -> Result<()> 
     Ok(())
 }
 
-/// Build a kernel from a local source directory and cache the result.
-fn kernel_build(source: PathBuf, force: bool, clean: bool) -> Result<()> {
-    anyhow::ensure!(source.is_dir(), "{}: not a directory", source.display());
+/// Build the kernel (parallel make).
+fn make_kernel(kernel_dir: &std::path::Path) -> Result<()> {
+    eprintln!("ktstr: building kernel in {}", kernel_dir.display());
+    let nproc = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let j_arg = format!("-j{nproc}");
+    run_make(kernel_dir, &[&j_arg, "KCFLAGS=-Wno-error"])
+}
 
-    let canonical = source.canonicalize()?;
-
-    // Detect git state for cache key.
-    let short_hash = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&canonical)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-    let is_dirty = std::process::Command::new("git")
-        .args(["diff", "--quiet", "HEAD"])
-        .current_dir(&canonical)
-        .status()
-        .ok()
-        .is_some_and(|s| !s.success());
-
-    let arch = std::env::consts::ARCH;
-    let cache_key = match &short_hash {
-        Some(hash) => format!("local-{hash}-{arch}"),
-        None => format!("local-unknown-{arch}"),
-    };
+/// Acquire source, configure, build, and cache a kernel image.
+fn kernel_build(
+    version: Option<String>,
+    source: Option<PathBuf>,
+    git: Option<String>,
+    git_ref: Option<String>,
+    force: bool,
+    clean: bool,
+) -> Result<()> {
+    use ktstr::fetch;
 
     let cache = CacheDir::new()?;
 
-    // Check cache before building.
-    if !force && !is_dirty {
-        if let Some(entry) = cache.lookup(&cache_key) {
+    // Temporary directory for tarball/git source extraction.
+    let tmp_dir = tempfile::TempDir::new()?;
+
+    // Acquire source.
+    let acquired = if let Some(ref src_path) = source {
+        fetch::local_source(src_path).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else if let Some(ref url) = git {
+        let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
+        fetch::git_clone(url, ref_name, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        // Tarball download: explicit version or latest stable.
+        let ver = match version {
+            Some(v) => v,
+            None => fetch::fetch_latest_stable_version().map_err(|e| anyhow::anyhow!("{e}"))?,
+        };
+        // Check cache before downloading.
+        let (arch, _) = fetch::arch_info();
+        let cache_key = format!("{ver}-tarball-{arch}");
+        if !force {
+            if let Some(entry) = cache.lookup(&cache_key) {
+                if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
+                    eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
+                } else {
+                    eprintln!("ktstr: cached kernel found: {}", entry.path.display());
+                    eprintln!("ktstr: use --force to rebuild");
+                    return Ok(());
+                }
+            }
+        }
+        fetch::download_tarball(&ver, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+
+    // Check cache for --source and --git (tarball already checked above).
+    if !force && (source.is_some() || git.is_some()) && !acquired.is_dirty {
+        if let Some(entry) = cache.lookup(&acquired.cache_key) {
             if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
                 eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
             } else {
@@ -322,31 +356,38 @@ fn kernel_build(source: PathBuf, force: bool, clean: bool) -> Result<()> {
         }
     }
 
+    let source_dir = &acquired.source_dir;
+
+    // Clean step (local source only).
     if clean {
-        eprintln!("ktstr: make mrproper");
-        run_make(&canonical, &["mrproper"])?;
+        if source.is_none() {
+            eprintln!(
+                "ktstr: --clean is only meaningful with --source (downloaded sources start clean)"
+            );
+        } else {
+            eprintln!("ktstr: make mrproper");
+            run_make(source_dir, &["mrproper"])?;
+        }
     }
 
-    if !has_sched_ext(&canonical) {
-        configure_kernel(&canonical, EMBEDDED_KCONFIG)?;
+    // Configure.
+    if !has_sched_ext(source_dir) {
+        configure_kernel(source_dir, EMBEDDED_KCONFIG)?;
     }
 
     // Build.
-    eprintln!("ktstr: building kernel in {}", canonical.display());
-    let nproc = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let j_arg = format!("-j{nproc}");
-    run_make(&canonical, &[&j_arg, "KCFLAGS=-Wno-error"])?;
+    make_kernel(source_dir)?;
 
-    // Generate compile_commands.json for LSP support.
-    eprintln!("ktstr: generating compile_commands.json");
-    run_make(&canonical, &["compile_commands.json"])?;
+    // Generate compile_commands.json for local trees (LSP support).
+    if !acquired.is_temp {
+        eprintln!("ktstr: generating compile_commands.json");
+        run_make(source_dir, &["compile_commands.json"])?;
+    }
 
-    // Find the built kernel image.
-    let image_path = ktstr::kernel_path::find_image_in_dir(&canonical)
-        .ok_or_else(|| anyhow::anyhow!("no kernel image found in {}", canonical.display()))?;
-    let vmlinux_path = canonical.join("vmlinux");
+    // Find the built kernel image and vmlinux.
+    let image_path = ktstr::kernel_path::find_image_in_dir(source_dir)
+        .ok_or_else(|| anyhow::anyhow!("no kernel image found in {}", source_dir.display()))?;
+    let vmlinux_path = source_dir.join("vmlinux");
     let vmlinux_ref = if vmlinux_path.exists() {
         if let Ok(file_meta) = std::fs::metadata(&vmlinux_path) {
             let mb = file_meta.len() as f64 / (1024.0 * 1024.0);
@@ -358,15 +399,15 @@ fn kernel_build(source: PathBuf, force: bool, clean: bool) -> Result<()> {
         None
     };
 
-    // Skip caching for dirty trees.
-    if is_dirty {
+    // Cache (skip for dirty local trees).
+    if acquired.is_dirty {
         eprintln!("ktstr: kernel built at {}", image_path.display());
         eprintln!("ktstr: skipping cache (dirty tree)");
         return Ok(());
     }
 
     // Compute config hash.
-    let config_path = canonical.join(".config");
+    let config_path = source_dir.join(".config");
     let config_hash = if config_path.exists() {
         let data = std::fs::read(&config_path)?;
         Some(format!("{:08x}", crc32fast::hash(&data)))
@@ -374,27 +415,29 @@ fn kernel_build(source: PathBuf, force: bool, clean: bool) -> Result<()> {
         None
     };
 
-    #[cfg(target_arch = "x86_64")]
-    let image_name = "bzImage";
-    #[cfg(target_arch = "aarch64")]
-    let image_name = "Image";
-
+    let (arch, image_name) = fetch::arch_info();
     let kconfig_hash = embedded_kconfig_hash();
 
     let metadata = KernelMetadata::new(
-        ktstr::cache::SourceType::Local,
+        acquired.source_type.clone(),
         arch.to_string(),
         image_name.to_string(),
         now_iso8601(),
     )
+    .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
     .with_ktstr_kconfig_hash(Some(kconfig_hash))
-    .with_git_hash(short_hash)
-    .with_source_tree_path(Some(canonical));
+    .with_git_hash(acquired.git_hash.clone())
+    .with_git_ref(acquired.git_ref.clone())
+    .with_source_tree_path(if source.is_some() {
+        Some(acquired.source_dir.clone())
+    } else {
+        None
+    });
 
-    let entry = cache.store(&cache_key, &image_path, vmlinux_ref, &metadata)?;
+    let entry = cache.store(&acquired.cache_key, &image_path, vmlinux_ref, &metadata)?;
 
-    eprintln!("ktstr: kernel cached as {cache_key}");
+    eprintln!("ktstr: kernel cached as {}", acquired.cache_key);
     eprintln!("ktstr: image: {}", entry.path.join(image_name).display());
 
     Ok(())
@@ -625,10 +668,13 @@ fn main() -> Result<()> {
         Command::Kernel { command } => match command {
             KernelCommand::List { json } => kernel_list(json)?,
             KernelCommand::Build {
+                version,
                 source,
+                git,
+                git_ref,
                 force,
                 clean,
-            } => kernel_build(source, force, clean)?,
+            } => kernel_build(version, source, git, git_ref, force, clean)?,
             KernelCommand::Clean { keep, force } => kernel_clean(keep, force)?,
         },
 

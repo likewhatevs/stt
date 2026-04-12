@@ -79,20 +79,25 @@ ktstr kernel list --json
 
 ### kernel build
 
-Build a kernel from a local source tree and cache the result:
+Download, build, and cache a kernel image:
 
 ```sh
+ktstr kernel build 6.14.2
+ktstr kernel build 6.15-rc3
+ktstr kernel build                                    # latest stable
 ktstr kernel build --source ../linux
-ktstr kernel build --source ../linux --force
+ktstr kernel build --git https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git --ref v6.14
+ktstr kernel build --force 6.14.2
 ktstr kernel build --source ../linux --clean
 ```
 
-Only local source trees are supported. For version downloads and git
-clones, use `cargo ktstr kernel build`.
+Three source modes: positional VERSION (tarball download), `--source PATH`
+(local tree), `--git URL --ref REF` (shallow clone). Without arguments,
+downloads the latest stable release.
 
 `--force` rebuilds even if a cached image exists. `--clean` runs
-`make mrproper` before configuring. Dirty trees (uncommitted changes)
-are built but not cached.
+`make mrproper` before configuring (local source only). Dirty trees
+(uncommitted changes) are built but not cached.
 
 ### kernel clean
 

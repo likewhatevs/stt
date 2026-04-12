@@ -16,17 +16,12 @@ gha-cache = ["dep:opendal", "dep:tokio", "dep:zstd"]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crc32fast = "1.5"
-flate2 = "1"
-gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status"] }
-ktstr = { path = ".." }
+ktstr = { path = "..", features = ["fetch"] }
 libc = "0.2"
 opendal = { version = "0.55", default-features = false, features = ["services-ghac"], optional = true }
-reqwest = { version = "0.13", features = ["blocking"] }
 serde_json = "1"
-tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["rt"], optional = true }
-xz2 = "0.1"
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]

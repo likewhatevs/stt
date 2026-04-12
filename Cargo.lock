@@ -398,18 +398,13 @@ dependencies = [
  "clap",
  "clap_complete",
  "crc32fast",
- "flate2",
- "gix",
  "ktstr",
  "libc",
  "opendal",
  "predicates",
- "reqwest 0.13.2",
  "serde_json",
- "tar",
  "tempfile",
  "tokio",
- "xz2",
  "zstd",
 ]
 
@@ -2755,9 +2750,11 @@ dependencies = [
  "parking_lot",
  "polars",
  "rand 0.10.0",
+ "reqwest 0.13.2",
  "rmesg",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -2765,6 +2762,7 @@ dependencies = [
  "vm-memory",
  "vm-superio",
  "vmm-sys-util",
+ "xz2",
  "zerocopy",
 ]
 

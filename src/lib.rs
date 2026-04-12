@@ -195,6 +195,8 @@ pub mod cli;
 #[cfg(not(feature = "cli"))]
 #[allow(dead_code)]
 pub(crate) mod cli;
+#[cfg(feature = "fetch")]
+pub mod fetch;
 pub mod kernel_path;
 #[allow(dead_code)]
 pub(crate) mod monitor;

@@ -7,7 +7,7 @@ use cargo_ktstr::{build_make_args, has_sched_ext, run_test_stats};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
 
-mod fetch;
+use ktstr::fetch;
 #[cfg(feature = "gha-cache")]
 mod remote_cache;
 
