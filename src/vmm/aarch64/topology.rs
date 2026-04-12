@@ -136,6 +136,12 @@ mod tests {
             (8, 8, 2),
             (15, 8, 2),
             (14, 9, 2),
+            (4, 8, 1),
+            (8, 8, 1),
+            (4, 32, 1),
+            (8, 16, 1),
+            (15, 16, 1),
+            (14, 18, 1),
         ];
         for (sockets, cores, threads) in presets {
             let t = Topology {

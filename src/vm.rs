@@ -122,12 +122,13 @@ pub struct TopoPreset {
     pub memory_mb: usize,
 }
 
-/// Topology presets used by gauntlet mode (13 on x86_64, 5 on aarch64).
+/// Topology presets used by gauntlet mode (19 on x86_64, 11 on aarch64).
 ///
 /// Ranges from `tiny-1llc` (4 CPUs) to `max-cpu` (252 CPUs, near
 /// the KVM vCPU limit). On aarch64, presets with SMT
 /// (`threads_per_core > 1`) are excluded because ARM64 CPUs do not
-/// have SMT.
+/// have SMT. Non-SMT medium/large/max presets ensure ARM64 still
+/// gets full topology scale coverage.
 pub fn gauntlet_presets() -> Vec<TopoPreset> {
     let defs: &[(&str, &str, u32, u32, u32, usize)] = &[
         ("tiny-1llc", "4 CPUs, 1 LLC", 1, 4, 1, 2048),
@@ -155,6 +156,56 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             14,
             9,
             2,
+            4096,
+        ),
+        // Non-SMT medium/large/max presets for ARM64 coverage.
+        // These also run on x86_64 to test non-SMT topologies at scale.
+        (
+            "medium-4llc-nosmt",
+            "32 CPUs, 4 LLCs (no SMT)",
+            4,
+            8,
+            1,
+            2048,
+        ),
+        (
+            "medium-8llc-nosmt",
+            "64 CPUs, 8 LLCs (no SMT)",
+            8,
+            8,
+            1,
+            2048,
+        ),
+        (
+            "large-4llc-nosmt",
+            "128 CPUs, 4 LLCs (no SMT)",
+            4,
+            32,
+            1,
+            2048,
+        ),
+        (
+            "large-8llc-nosmt",
+            "128 CPUs, 8 LLCs (no SMT)",
+            8,
+            16,
+            1,
+            2048,
+        ),
+        (
+            "near-max-llc-nosmt",
+            "240 CPUs, 15 LLCs (no SMT)",
+            15,
+            16,
+            1,
+            2048,
+        ),
+        (
+            "max-cpu-nosmt",
+            "252 CPUs, 14 LLCs (no SMT, near KVM vCPU limit)",
+            14,
+            18,
+            1,
             4096,
         ),
     ];
@@ -213,9 +264,9 @@ mod tests {
     #[test]
     fn gauntlet_presets_count() {
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(gauntlet_presets().len(), 13);
+        assert_eq!(gauntlet_presets().len(), 19);
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(gauntlet_presets().len(), 5);
+        assert_eq!(gauntlet_presets().len(), 11);
     }
 
     #[test]
@@ -344,6 +395,12 @@ mod tests {
             ("near-max-llc", 15, 240),
             #[cfg(not(target_arch = "aarch64"))]
             ("max-cpu", 14, 252),
+            ("medium-4llc-nosmt", 4, 32),
+            ("medium-8llc-nosmt", 8, 64),
+            ("large-4llc-nosmt", 4, 128),
+            ("large-8llc-nosmt", 8, 128),
+            ("near-max-llc-nosmt", 15, 240),
+            ("max-cpu-nosmt", 14, 252),
         ];
         let presets = gauntlet_presets();
         for &(name, llcs, cpus) in expected {
@@ -385,22 +442,31 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_arch = "aarch64"))]
     fn gauntlet_presets_max_cpu_near_limit() {
         let presets = gauntlet_presets();
-        let max = presets.iter().find(|p| p.name == "max-cpu").unwrap();
-        let cpus = max.topology.total_cpus();
-        // KVM vCPU limit is 255 on x86_64; near-limit means < 255
+        let max_presets: Vec<_> = presets
+            .iter()
+            .filter(|p| p.name.starts_with("max-cpu"))
+            .collect();
         assert!(
-            cpus <= 255,
-            "max-cpu has {} CPUs, exceeds KVM vCPU limit",
-            cpus
+            !max_presets.is_empty(),
+            "at least one max-cpu preset must exist"
         );
-        assert!(
-            cpus >= 200,
-            "max-cpu should be near the limit: {} CPUs",
-            cpus
-        );
+        for p in &max_presets {
+            let cpus = p.topology.total_cpus();
+            assert!(
+                cpus <= 255,
+                "{} has {} CPUs, exceeds KVM vCPU limit",
+                p.name,
+                cpus
+            );
+            assert!(
+                cpus >= 200,
+                "{} should be near the limit: {} CPUs",
+                p.name,
+                cpus
+            );
+        }
     }
 
     #[test]

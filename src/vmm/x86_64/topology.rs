@@ -674,19 +674,25 @@ mod tests {
     #[test]
     fn apic_ids_unique_for_all_gauntlet_presets() {
         let presets = [
-            (1, 4, 1),  // tiny-1llc
-            (2, 2, 1),  // tiny-2llc
-            (3, 3, 1),  // odd-3llc
-            (5, 3, 1),  // odd-5llc
-            (7, 2, 1),  // odd-7llc
-            (2, 2, 2),  // smt-2llc
-            (3, 2, 2),  // smt-3llc
-            (4, 4, 2),  // medium-4llc
-            (8, 4, 2),  // medium-8llc
-            (4, 16, 2), // large-4llc
-            (8, 8, 2),  // large-8llc
-            (15, 8, 2), // near-max-llc
-            (14, 9, 2), // max-cpu
+            (1, 4, 1),   // tiny-1llc
+            (2, 2, 1),   // tiny-2llc
+            (3, 3, 1),   // odd-3llc
+            (5, 3, 1),   // odd-5llc
+            (7, 2, 1),   // odd-7llc
+            (2, 2, 2),   // smt-2llc
+            (3, 2, 2),   // smt-3llc
+            (4, 4, 2),   // medium-4llc
+            (8, 4, 2),   // medium-8llc
+            (4, 16, 2),  // large-4llc
+            (8, 8, 2),   // large-8llc
+            (15, 8, 2),  // near-max-llc
+            (14, 9, 2),  // max-cpu
+            (4, 8, 1),   // medium-4llc-nosmt
+            (8, 8, 1),   // medium-8llc-nosmt
+            (4, 32, 1),  // large-4llc-nosmt
+            (8, 16, 1),  // large-8llc-nosmt
+            (15, 16, 1), // near-max-llc-nosmt
+            (14, 18, 1), // max-cpu-nosmt
         ];
         for (sockets, cores, threads) in presets {
             let t = Topology {
@@ -999,6 +1005,12 @@ mod tests {
             (8, 8, 2),
             (15, 8, 2),
             (14, 9, 2),
+            (4, 8, 1),
+            (8, 8, 1),
+            (4, 32, 1),
+            (8, 16, 1),
+            (15, 16, 1),
+            (14, 18, 1),
         ];
         for (sockets, cores, threads) in presets {
             let t = Topology {
@@ -1286,6 +1298,12 @@ mod tests {
             (8, 8, 2),
             (15, 8, 2),
             (14, 9, 2),
+            (4, 8, 1),
+            (8, 8, 1),
+            (4, 32, 1),
+            (8, 16, 1),
+            (15, 16, 1),
+            (14, 18, 1),
         ];
         for (sockets, cores, threads) in presets {
             let topo = Topology {
@@ -1695,16 +1713,22 @@ mod tests {
         };
 
         let presets = [
-            (2, 2, 1),  // tiny-2llc
-            (3, 3, 1),  // odd-3llc
-            (5, 3, 1),  // odd-5llc
-            (7, 2, 1),  // odd-7llc
-            (2, 2, 2),  // smt-2llc
-            (3, 2, 2),  // smt-3llc
-            (4, 4, 2),  // medium-4llc
-            (8, 4, 2),  // medium-8llc
-            (4, 16, 2), // large-4llc
-            (8, 8, 2),  // large-8llc
+            (2, 2, 1),   // tiny-2llc
+            (3, 3, 1),   // odd-3llc
+            (5, 3, 1),   // odd-5llc
+            (7, 2, 1),   // odd-7llc
+            (2, 2, 2),   // smt-2llc
+            (3, 2, 2),   // smt-3llc
+            (4, 4, 2),   // medium-4llc
+            (8, 4, 2),   // medium-8llc
+            (4, 16, 2),  // large-4llc
+            (8, 8, 2),   // large-8llc
+            (4, 8, 1),   // medium-4llc-nosmt
+            (8, 8, 1),   // medium-8llc-nosmt
+            (4, 32, 1),  // large-4llc-nosmt
+            (8, 16, 1),  // large-8llc-nosmt
+            (15, 16, 1), // near-max-llc-nosmt
+            (14, 18, 1), // max-cpu-nosmt
         ];
         for (sockets, cores, threads) in presets {
             let topo = Topology {

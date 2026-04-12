@@ -1,6 +1,6 @@
 # Gauntlet
 
-The gauntlet runs every test across 13 topology presets (5 on aarch64)
+The gauntlet runs every test across 19 topology presets (11 on aarch64)
 and all valid flag profiles. Gauntlet variants are prefixed with `gauntlet/` and
 ignored by default.
 
@@ -51,13 +51,19 @@ cargo nextest run --run-ignored ignored-only \
 | `large-8llc` | 8s8c2t | 128 | 8 | Large, many LLCs |
 | `near-max-llc` | 15s8c2t | 240 | 15 | Near maximum |
 | `max-cpu` | 14s9c2t | 252 | 14 | Near KVM vCPU limit |
+| `medium-4llc-nosmt` | 4s8c1t | 32 | 4 | Medium, no SMT |
+| `medium-8llc-nosmt` | 8s8c1t | 64 | 8 | Medium, many LLCs, no SMT |
+| `large-4llc-nosmt` | 4s32c1t | 128 | 4 | Large, no SMT |
+| `large-8llc-nosmt` | 8s16c1t | 128 | 8 | Large, many LLCs, no SMT |
+| `near-max-llc-nosmt` | 15s16c1t | 240 | 15 | Near maximum, no SMT |
+| `max-cpu-nosmt` | 14s18c1t | 252 | 14 | Near KVM vCPU limit, no SMT |
 
 Topology format: `{sockets}s{cores_per_socket}c{threads_per_core}t`.
 Presets are defined in `gauntlet_presets()`.
 
 > **aarch64:** ARM64 CPUs do not have SMT. Presets with
-> `threads_per_core > 1` are excluded on aarch64, leaving 5 presets
-> (`tiny-1llc` through `odd-7llc`).
+> `threads_per_core > 1` are excluded on aarch64, leaving 11 presets
+> (the 5 small presets plus 6 `-nosmt` variants).
 
 ## Constraint filtering
 
@@ -82,9 +88,8 @@ Example:
 fn cross_llc_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
-This test skips `tiny-1llc` (1 LLC) and all non-SMT presets
-(`tiny-2llc`, `odd-3llc`, `odd-5llc`, `odd-7llc`). It runs on 8
-presets: `smt-2llc`, `smt-3llc`, `medium-4llc`, `medium-8llc`,
+This test skips `tiny-1llc` (1 LLC) and all non-SMT presets. It runs
+on 8 presets: `smt-2llc`, `smt-3llc`, `medium-4llc`, `medium-8llc`,
 `large-4llc`, `large-8llc`, `near-max-llc`, `max-cpu`. Every
 generated flag profile includes `llc`.
 

@@ -6,7 +6,7 @@ controls which cells of the matrix it populates.
 
 ## Controlling topology coverage
 
-Topology constraints filter which of the 13 gauntlet presets (5 on
+Topology constraints filter which of the 19 gauntlet presets (11 on
 aarch64) a test runs on. Set constraints in `#[ktstr_test]` attributes:
 
 | Attribute | Type | Default | Effect |
@@ -37,9 +37,15 @@ A test with `min_llcs = 2` and `requires_smt = true`:
 | `large-8llc` | 8s8c2t | 8 | yes | **yes** |
 | `near-max-llc` | 15s8c2t | 15 | yes | **yes** |
 | `max-cpu` | 14s9c2t | 14 | yes | **yes** |
+| `medium-4llc-nosmt` | 4s8c1t | 4 | no | no (no SMT) |
+| `medium-8llc-nosmt` | 8s8c1t | 8 | no | no (no SMT) |
+| `large-4llc-nosmt` | 4s32c1t | 4 | no | no (no SMT) |
+| `large-8llc-nosmt` | 8s16c1t | 8 | no | no (no SMT) |
+| `near-max-llc-nosmt` | 15s16c1t | 15 | no | no (no SMT) |
+| `max-cpu-nosmt` | 14s18c1t | 14 | no | no (no SMT) |
 
-Result: 8 of 13 presets survive. On aarch64, none survive -- all 8
-matching presets require SMT, which ARM64 does not have.
+Result: 8 of 19 presets survive. On aarch64, none survive -- all
+aarch64 presets lack SMT.
 
 ## Controlling flag coverage
 

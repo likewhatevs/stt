@@ -689,11 +689,11 @@ fn topo_bucket(topo: &str) -> &'static str {
         "odd-7llc" => 14,
         "smt-2llc" => 8,
         "smt-3llc" => 12,
-        "medium-4llc" => 32,
-        "medium-8llc" => 64,
-        "large-4llc" | "large-8llc" => 128,
-        "near-max-llc" => 240,
-        "max-cpu" => 252,
+        "medium-4llc" | "medium-4llc-nosmt" => 32,
+        "medium-8llc" | "medium-8llc-nosmt" => 64,
+        "large-4llc" | "large-8llc" | "large-4llc-nosmt" | "large-8llc-nosmt" => 128,
+        "near-max-llc" | "near-max-llc-nosmt" => 240,
+        "max-cpu" | "max-cpu-nosmt" => 252,
         _ => return "unknown",
     };
     match cpus {
@@ -1313,6 +1313,7 @@ mod tests {
         assert_eq!(topo_bucket("odd-7llc"), "9-32cpu");
         assert_eq!(topo_bucket("smt-3llc"), "9-32cpu");
         assert_eq!(topo_bucket("medium-4llc"), "9-32cpu");
+        assert_eq!(topo_bucket("medium-4llc-nosmt"), "9-32cpu");
     }
 
     #[test]
@@ -1320,12 +1321,17 @@ mod tests {
         assert_eq!(topo_bucket("medium-8llc"), "33-128cpu");
         assert_eq!(topo_bucket("large-4llc"), "33-128cpu");
         assert_eq!(topo_bucket("large-8llc"), "33-128cpu");
+        assert_eq!(topo_bucket("medium-8llc-nosmt"), "33-128cpu");
+        assert_eq!(topo_bucket("large-4llc-nosmt"), "33-128cpu");
+        assert_eq!(topo_bucket("large-8llc-nosmt"), "33-128cpu");
     }
 
     #[test]
     fn topo_bucket_large() {
         assert_eq!(topo_bucket("near-max-llc"), ">128cpu");
         assert_eq!(topo_bucket("max-cpu"), ">128cpu");
+        assert_eq!(topo_bucket("near-max-llc-nosmt"), ">128cpu");
+        assert_eq!(topo_bucket("max-cpu-nosmt"), ">128cpu");
     }
 
     #[test]
