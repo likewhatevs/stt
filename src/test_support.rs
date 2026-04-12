@@ -964,8 +964,9 @@ fn run_gauntlet_test(rest: &str) -> i32 {
     result_to_exit_code(result, entry.expect_err)
 }
 
-/// Run sidecar collection and stats summary. Called after test
-/// execution completes.
+/// Collect sidecar files and print aggregate stats to stderr.
+/// Retained for post-suite analysis.
+#[allow(dead_code)]
 pub(crate) fn collect_and_print_sidecar_stats() {
     let dir = sidecar_dir();
     let sidecars = collect_sidecars(&dir);
@@ -1008,7 +1009,6 @@ pub fn ktstr_main() -> ! {
     if let Some(pos) = args.iter().position(|a| a == "--exact") {
         if let Some(name) = args.get(pos + 1) {
             let code = run_named_test(name);
-            collect_and_print_sidecar_stats();
             std::process::exit(code);
         }
         eprintln!("--exact requires a test name");
