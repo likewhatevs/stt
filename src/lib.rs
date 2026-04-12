@@ -281,8 +281,9 @@ pub mod prelude {
 /// Resolution chain:
 /// 1. `KTSTR_KERNEL` env var, parsed via `KernelId`:
 ///    - Path: search that directory for an arch-specific image
-///    - Version/CacheKey: look up in XDG cache; on miss, skip
-///      the general cache scan (step 2) and fall to filesystem
+///    - Version/CacheKey: require cache access (error if cache
+///      directory cannot be opened); on cache miss, skip the
+///      general cache scan (step 2) and fall to filesystem
 /// 2. XDG cache: most recent cached image (newest first)
 /// 3. Local build trees (`./linux`, `../linux`,
 ///    `/lib/modules/{release}/build`)
@@ -290,7 +291,9 @@ pub mod prelude {
 ///    `/boot/vmlinuz-{release}`, `/boot/vmlinuz`)
 ///
 /// Returns `Err` when `KTSTR_KERNEL` is a path that does not contain
-/// a kernel image. Returns `Ok(None)` when no kernel is found.
+/// a kernel image, or when it is a version/cache key and the cache
+/// directory cannot be opened. Returns `Ok(None)` when no kernel is
+/// found.
 pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
     use kernel_path::KernelId;
 
@@ -321,22 +324,31 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 // Git keys are {ref}-git-{hash}-{arch} and local keys are
                 // local-{hash}-{arch} — neither contains the version as a
                 // prefix, so only tarball lookup is valid here.
-                if let Ok(cache) = cache::CacheDir::new() {
-                    let arch = std::env::consts::ARCH;
-                    let key = format!("{ver}-tarball-{arch}");
-                    if let Some(entry) = cache.lookup(&key)
-                        && let Some(ref meta) = entry.metadata
-                    {
-                        return Ok(Some(entry.path.join(&meta.image_name)));
-                    }
+                let cache = cache::CacheDir::new().map_err(|e| {
+                    anyhow::anyhow!(
+                        "KTSTR_KERNEL={val} requires cache access, \
+                         but cache directory could not be opened: {e}"
+                    )
+                })?;
+                let arch = std::env::consts::ARCH;
+                let key = format!("{ver}-tarball-{arch}");
+                if let Some(entry) = cache.lookup(&key)
+                    && let Some(ref meta) = entry.metadata
+                {
+                    return Ok(Some(entry.path.join(&meta.image_name)));
                 }
                 // Version not in cache — skip general cache scan to
                 // avoid returning a different kernel version.
                 skip_cache_scan = true;
             }
             KernelId::CacheKey(ref key) => {
-                if let Ok(cache) = cache::CacheDir::new()
-                    && let Some(entry) = cache.lookup(key)
+                let cache = cache::CacheDir::new().map_err(|e| {
+                    anyhow::anyhow!(
+                        "KTSTR_KERNEL={val} requires cache access, \
+                         but cache directory could not be opened: {e}"
+                    )
+                })?;
+                if let Some(entry) = cache.lookup(key)
                     && let Some(ref meta) = entry.metadata
                 {
                     return Ok(Some(entry.path.join(&meta.image_name)));

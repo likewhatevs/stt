@@ -10,7 +10,7 @@ keywords = ["sched_ext", "scheduler", "testing", "cargo-plugin", "linux"]
 categories = ["development-tools::testing", "development-tools::cargo-plugins"]
 
 [features]
-gha-cache = ["dep:opendal", "dep:tokio"]
+gha-cache = ["dep:opendal", "dep:tokio", "dep:zstd"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -27,6 +27,7 @@ tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["rt"], optional = true }
 xz2 = "0.1"
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2"

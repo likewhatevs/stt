@@ -1713,4 +1713,204 @@ mod tests {
         let args = profile_sched_args(&active, &flags);
         assert!(args.is_empty());
     }
+
+    // -- format_entry_row / is_stale_kconfig helpers --
+
+    fn test_metadata() -> KernelMetadata {
+        KernelMetadata::new(
+            ktstr::cache::SourceType::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()))
+    }
+
+    /// Store a fake kernel image and return the CacheEntry.
+    fn store_test_entry(cache: &CacheDir, key: &str, meta: &KernelMetadata) -> CacheEntry {
+        let src = tempfile::TempDir::new().unwrap();
+        let image = src.path().join(&meta.image_name);
+        std::fs::write(&image, b"fake kernel").unwrap();
+        cache.store(key, &image, None, meta).unwrap()
+    }
+
+    /// Create a corrupt entry (directory exists but no valid metadata).
+    fn store_corrupt_entry(cache: &CacheDir, key: &str) -> CacheEntry {
+        let dir = cache.root().join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        // list() returns entries with metadata: None for corrupt dirs.
+        cache
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.key == key)
+            .unwrap()
+    }
+
+    // -- format_entry_row --
+
+    #[test]
+    fn format_entry_row_with_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata();
+        let entry = store_test_entry(&cache, "6.14.2-tarball-x86_64", &meta);
+        let row = format_entry_row(&entry, "abc123");
+        assert!(row.contains("6.14.2-tarball-x86_64"));
+        assert!(row.contains("6.14.2"));
+        assert!(row.contains("tarball"));
+        assert!(row.contains("x86_64"));
+        assert!(row.contains("2026-04-12T10:00:00Z"));
+    }
+
+    #[test]
+    fn format_entry_row_stale_kconfig() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata().with_ktstr_kconfig_hash(Some("old_hash".to_string()));
+        let entry = store_test_entry(&cache, "stale-key", &meta);
+        let row = format_entry_row(&entry, "new_hash");
+        assert!(
+            row.contains("stale kconfig"),
+            "should show stale kconfig marker"
+        );
+    }
+
+    #[test]
+    fn format_entry_row_matching_kconfig() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
+        let entry = store_test_entry(&cache, "match-key", &meta);
+        let row = format_entry_row(&entry, "same");
+        assert!(
+            !row.contains("stale kconfig"),
+            "should not show stale marker when hashes match"
+        );
+    }
+
+    #[test]
+    fn format_entry_row_no_kconfig_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata();
+        let entry = store_test_entry(&cache, "no-hash-key", &meta);
+        let row = format_entry_row(&entry, "anything");
+        assert!(
+            !row.contains("stale kconfig"),
+            "should not show stale marker when entry has no hash"
+        );
+    }
+
+    #[test]
+    fn format_entry_row_no_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = KernelMetadata::new(
+            ktstr::cache::SourceType::Local,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        let entry = store_test_entry(&cache, "local-key", &meta);
+        let row = format_entry_row(&entry, "hash");
+        assert!(row.contains("-"), "missing version should show dash");
+    }
+
+    #[test]
+    fn format_entry_row_corrupt_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let entry = store_corrupt_entry(&cache, "corrupt-key");
+        let row = format_entry_row(&entry, "hash");
+        assert!(row.contains("corrupt-key"));
+        assert!(row.contains("corrupt metadata"));
+    }
+
+    // -- is_stale_kconfig --
+
+    #[test]
+    fn is_stale_kconfig_different_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata().with_ktstr_kconfig_hash(Some("old".to_string()));
+        let entry = store_test_entry(&cache, "stale", &meta);
+        assert!(is_stale_kconfig(&entry, "new"));
+    }
+
+    #[test]
+    fn is_stale_kconfig_same_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
+        let entry = store_test_entry(&cache, "fresh", &meta);
+        assert!(!is_stale_kconfig(&entry, "same"));
+    }
+
+    #[test]
+    fn is_stale_kconfig_no_hash_in_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata();
+        let entry = store_test_entry(&cache, "no-hash", &meta);
+        assert!(!is_stale_kconfig(&entry, "anything"));
+    }
+
+    #[test]
+    fn is_stale_kconfig_no_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let entry = store_corrupt_entry(&cache, "corrupt");
+        assert!(!is_stale_kconfig(&entry, "anything"));
+    }
+
+    // -- embedded_kconfig_hash --
+
+    #[test]
+    fn embedded_kconfig_hash_deterministic() {
+        let h1 = embedded_kconfig_hash();
+        let h2 = embedded_kconfig_hash();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn embedded_kconfig_hash_is_hex() {
+        let h = embedded_kconfig_hash();
+        assert_eq!(h.len(), 8, "CRC32 hex should be 8 chars");
+        assert!(
+            h.chars().all(|c| c.is_ascii_hexdigit()),
+            "should be hex digits: {h}"
+        );
+    }
+
+    #[test]
+    fn embedded_kconfig_hash_matches_manual_crc32() {
+        let expected = format!("{:08x}", crc32fast::hash(EMBEDDED_KCONFIG.as_bytes()));
+        assert_eq!(embedded_kconfig_hash(), expected);
+    }
+
+    // -- resolve_in_path --
+
+    #[test]
+    fn resolve_in_path_finds_existing_binary() {
+        // "sh" is always in PATH on Linux.
+        let result = resolve_in_path(Path::new("sh"));
+        assert!(result.is_some(), "sh should be found in PATH");
+        let path = result.unwrap();
+        assert!(path.exists());
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn resolve_in_path_not_found() {
+        let result = resolve_in_path(Path::new("nonexistent_binary_xyz_ktstr_test"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_in_path_bare_name() {
+        // "cargo" should be in PATH in this test environment.
+        let result = resolve_in_path(Path::new("cargo"));
+        assert!(result.is_some(), "cargo should be found in PATH");
+    }
 }

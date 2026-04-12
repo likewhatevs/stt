@@ -209,6 +209,19 @@ or a missing kernel image file.
 - Override the cache directory via `KTSTR_CACHE_DIR` if the default
   location is on a problematic filesystem.
 
+## Cache directory not found
+
+```text
+HOME not set; cannot resolve cache directory. Set KTSTR_CACHE_DIR to specify a cache location.
+```
+
+The kernel image cache requires a writable directory. ktstr resolves
+it as: `KTSTR_CACHE_DIR` > `$XDG_CACHE_HOME/ktstr/kernels/` >
+`$HOME/.cache/ktstr/kernels/`.
+
+**Fix:** Set `KTSTR_CACHE_DIR` to an explicit path, or ensure `HOME`
+is set.
+
 ## Stale kconfig
 
 ```text

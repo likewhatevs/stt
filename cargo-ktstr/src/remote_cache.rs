@@ -63,6 +63,15 @@ fn create_operator() -> Result<opendal::Operator, String> {
 /// The tar contains the kernel image, vmlinux (if present), and
 /// metadata.json from the cache entry directory. Paths inside the
 /// tar are relative filenames (no directory prefix).
+///
+/// The tar is then compressed with zstd before upload.
+/// [`unpack_and_store`] detects the zstd magic number on download
+/// and decompresses transparently, falling back to raw tar for
+/// entries stored before compression was added.
+
+/// Zstd magic number (first 4 bytes of any zstd frame).
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, String> {
     let mut archive = tar::Builder::new(Vec::new());
 
@@ -115,9 +124,23 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
             .map_err(|e| format!("tar append vmlinux: {e}"))?;
     }
 
-    archive
+    let tar_bytes = archive
         .into_inner()
-        .map_err(|e| format!("finalize tar: {e}"))
+        .map_err(|e| format!("finalize tar: {e}"))?;
+
+    // Compress with zstd (level 3: good ratio at fast speed).
+    zstd::encode_all(tar_bytes.as_slice(), 3).map_err(|e| format!("zstd compress: {e}"))
+}
+
+/// Decompress data if it starts with the zstd magic number,
+/// otherwise return as-is (backward compatibility with
+/// uncompressed tar entries written before zstd was added).
+fn maybe_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
+        zstd::decode_all(data).map_err(|e| format!("zstd decompress: {e}"))
+    } else {
+        Ok(data.to_vec())
+    }
 }
 
 /// Unpack a tar archive into a cache directory via CacheDir::store.
@@ -126,7 +149,8 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
 /// from the tar blob, writes them to temp files, then stores via the
 /// local cache API for atomic placement.
 fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<CacheEntry, String> {
-    let mut archive = tar::Archive::new(data);
+    let tar_bytes = maybe_decompress(data)?;
+    let mut archive = tar::Archive::new(tar_bytes.as_slice());
     let entries = archive
         .entries()
         .map_err(|e| format!("read tar entries: {e}"))?;
@@ -383,9 +407,67 @@ mod tests {
 
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
 
-        let mut archive = tar::Archive::new(packed.as_slice());
+        // pack_entry returns zstd-compressed data; decompress before
+        // validating tar contents.
+        let tar_bytes = maybe_decompress(&packed).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
         let entries: Vec<_> = archive.entries().unwrap().collect();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn remote_cache_pack_is_zstd_compressed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+
+        let src = tempfile::TempDir::new().unwrap();
+        let image = create_fake_image(src.path());
+        let meta = test_metadata();
+        let entry = cache.store("zstd-key", &image, None, &meta).unwrap();
+
+        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+        assert!(
+            packed.len() >= 4 && packed[..4] == ZSTD_MAGIC,
+            "packed data should start with zstd magic"
+        );
+    }
+
+    #[test]
+    fn remote_cache_unpack_handles_raw_tar() {
+        // Verify backward compatibility: unpack_and_store accepts
+        // uncompressed tar data (entries written before zstd was added).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+
+        let mut archive = tar::Builder::new(Vec::new());
+        let meta = test_metadata();
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        let meta_bytes = meta_json.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(meta_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "metadata.json", meta_bytes)
+            .unwrap();
+
+        let img_data = b"fake kernel image";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(img_data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "bzImage", img_data.as_slice())
+            .unwrap();
+        let raw_tar = archive.into_inner().unwrap();
+
+        // Raw tar should not start with zstd magic.
+        assert!(raw_tar.len() < 4 || raw_tar[..4] != ZSTD_MAGIC);
+
+        let restored = unpack_and_store(&cache, "raw-tar-key", &raw_tar).unwrap();
+        assert_eq!(restored.key, "raw-tar-key");
+        let rmeta = restored.metadata.unwrap();
+        assert_eq!(rmeta.version.as_deref(), Some("6.14.2"));
     }
 
     #[test]

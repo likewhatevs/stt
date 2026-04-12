@@ -25,7 +25,6 @@ jobs:
         with:
           rust-components: clippy,rustfmt
       - run: cargo fmt -- --check
-      - run: cargo build --workspace
       - run: cargo clippy --workspace --all-targets
 
   test-x64:
@@ -38,7 +37,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo build --workspace
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
@@ -72,7 +70,6 @@ jobs:
           restore-keys: ktstr-kernels-arm64-
       - name: Build test kernel
         run: cargo run -p cargo-ktstr --features gha-cache -- ktstr kernel build
-      - run: cargo build --workspace
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
@@ -95,7 +92,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: cargo build --workspace
       - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

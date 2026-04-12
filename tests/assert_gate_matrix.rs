@@ -16,12 +16,15 @@ fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, Some(checks))
 }
 
-// Macros emit module-scope distributed_slice entries. Each test gets a
+// Macro emits a module-scope distributed_slice entry. Each test gets a
 // scenario function that captures its Assert checks, and a static
 // KtstrTestEntry registered in KTSTR_TESTS.
+//
+// perf: performance_mode value (true/false)
+// negative: when true, passes --degrade, expects failure, uses 4 workers
 
-macro_rules! perf_positive_test {
-    ($name:ident, $checks:expr) => {
+macro_rules! gate_test {
+    ($name:ident, perf: $perf:expr, negative: $neg:expr, $checks:expr) => {
         mod $name {
             use super::*;
             pub(super) fn scenario(ctx: &Ctx) -> Result<AssertResult> {
@@ -38,89 +41,11 @@ macro_rules! perf_positive_test {
             func: $name::scenario,
             scheduler: &KTSTR_SCHED,
             auto_repro: false,
-            performance_mode: true,
+            performance_mode: $perf,
+            extra_sched_args: if $neg { &["--degrade"] } else { &[] },
+            expect_err: $neg,
+            workers_per_cgroup: if $neg { 4 } else { 2 },
             duration: std::time::Duration::from_secs(5),
-            workers_per_cgroup: 2,
-            ..KtstrTestEntry::DEFAULT
-        };
-    };
-}
-
-macro_rules! perf_negative_test {
-    ($name:ident, $checks:expr) => {
-        mod $name {
-            use super::*;
-            pub(super) fn scenario(ctx: &Ctx) -> Result<AssertResult> {
-                let checks = $checks;
-                scenario_with_checks(ctx, &checks)
-            }
-        }
-
-        #[allow(non_upper_case_globals)]
-        #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-        #[linkme(crate = ktstr::__linkme)]
-        static $name: KtstrTestEntry = KtstrTestEntry {
-            name: stringify!($name),
-            func: $name::scenario,
-            scheduler: &KTSTR_SCHED,
-            auto_repro: false,
-            extra_sched_args: &["--degrade"],
-            performance_mode: true,
-            duration: std::time::Duration::from_secs(5),
-            workers_per_cgroup: 4,
-            expect_err: true,
-            ..KtstrTestEntry::DEFAULT
-        };
-    };
-}
-
-macro_rules! noperf_positive_test {
-    ($name:ident, $checks:expr) => {
-        mod $name {
-            use super::*;
-            pub(super) fn scenario(ctx: &Ctx) -> Result<AssertResult> {
-                let checks = $checks;
-                scenario_with_checks(ctx, &checks)
-            }
-        }
-
-        #[allow(non_upper_case_globals)]
-        #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-        #[linkme(crate = ktstr::__linkme)]
-        static $name: KtstrTestEntry = KtstrTestEntry {
-            name: stringify!($name),
-            func: $name::scenario,
-            scheduler: &KTSTR_SCHED,
-            auto_repro: false,
-            duration: std::time::Duration::from_secs(5),
-            workers_per_cgroup: 2,
-            ..KtstrTestEntry::DEFAULT
-        };
-    };
-}
-
-macro_rules! noperf_negative_test {
-    ($name:ident, $checks:expr) => {
-        mod $name {
-            use super::*;
-            pub(super) fn scenario(ctx: &Ctx) -> Result<AssertResult> {
-                let checks = $checks;
-                scenario_with_checks(ctx, &checks)
-            }
-        }
-
-        #[allow(non_upper_case_globals)]
-        #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-        #[linkme(crate = ktstr::__linkme)]
-        static $name: KtstrTestEntry = KtstrTestEntry {
-            name: stringify!($name),
-            func: $name::scenario,
-            scheduler: &KTSTR_SCHED,
-            auto_repro: false,
-            extra_sched_args: &["--degrade"],
-            duration: std::time::Duration::from_secs(5),
-            workers_per_cgroup: 4,
-            expect_err: true,
             ..KtstrTestEntry::DEFAULT
         };
     };
@@ -130,166 +55,89 @@ macro_rules! noperf_negative_test {
 // max_p99_wake_latency_ns
 // ===========================================================================
 
-perf_positive_test!(
-    demo_gate_p99_wake_perf_on_positive,
-    Assert::default_checks().max_p99_wake_latency_ns(100_000_000)
-);
-
-perf_negative_test!(
-    demo_gate_p99_wake_perf_on_negative,
-    Assert::default_checks().max_p99_wake_latency_ns(1)
-);
-
-noperf_positive_test!(
-    demo_gate_p99_wake_perf_off_positive,
-    Assert::default_checks().max_p99_wake_latency_ns(100_000_000)
-);
-
-noperf_negative_test!(
-    demo_gate_p99_wake_perf_off_negative,
-    Assert::default_checks().max_p99_wake_latency_ns(1)
-);
+gate_test!(demo_gate_p99_wake_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().max_p99_wake_latency_ns(100_000_000));
+gate_test!(demo_gate_p99_wake_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().max_p99_wake_latency_ns(1));
+gate_test!(demo_gate_p99_wake_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().max_p99_wake_latency_ns(100_000_000));
+gate_test!(demo_gate_p99_wake_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().max_p99_wake_latency_ns(1));
 
 // ===========================================================================
 // max_wake_latency_cv
 // ===========================================================================
 
-perf_positive_test!(
-    demo_gate_wake_cv_perf_on_positive,
-    Assert::default_checks().max_wake_latency_cv(100.0)
-);
-
-perf_negative_test!(
-    demo_gate_wake_cv_perf_on_negative,
-    Assert::default_checks().max_wake_latency_cv(0.0001)
-);
-
-noperf_positive_test!(
-    demo_gate_wake_cv_perf_off_positive,
-    Assert::default_checks().max_wake_latency_cv(100.0)
-);
-
-noperf_negative_test!(
-    demo_gate_wake_cv_perf_off_negative,
-    Assert::default_checks().max_wake_latency_cv(0.0001)
-);
+gate_test!(demo_gate_wake_cv_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().max_wake_latency_cv(100.0));
+gate_test!(demo_gate_wake_cv_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().max_wake_latency_cv(0.0001));
+gate_test!(demo_gate_wake_cv_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().max_wake_latency_cv(100.0));
+gate_test!(demo_gate_wake_cv_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().max_wake_latency_cv(0.0001));
 
 // ===========================================================================
 // min_iteration_rate
 // ===========================================================================
 
-perf_positive_test!(
-    demo_gate_iter_rate_perf_on_positive,
-    Assert::default_checks().min_iteration_rate(1.0)
-);
-
-perf_negative_test!(
-    demo_gate_iter_rate_perf_on_negative,
-    Assert::default_checks().min_iteration_rate(1_000_000_000.0)
-);
-
-noperf_positive_test!(
-    demo_gate_iter_rate_perf_off_positive,
-    Assert::default_checks().min_iteration_rate(1.0)
-);
-
-noperf_negative_test!(
-    demo_gate_iter_rate_perf_off_negative,
-    Assert::default_checks().min_iteration_rate(1_000_000_000.0)
-);
+gate_test!(demo_gate_iter_rate_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().min_iteration_rate(1.0));
+gate_test!(demo_gate_iter_rate_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().min_iteration_rate(1_000_000_000.0));
+gate_test!(demo_gate_iter_rate_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().min_iteration_rate(1.0));
+gate_test!(demo_gate_iter_rate_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().min_iteration_rate(1_000_000_000.0));
 
 // ===========================================================================
 // max_gap_ms
 // ===========================================================================
 
-perf_positive_test!(
-    demo_gate_gap_ms_perf_on_positive,
-    Assert::default_checks().max_gap_ms(10_000)
-);
-
-perf_negative_test!(
-    demo_gate_gap_ms_perf_on_negative,
-    Assert::default_checks().max_gap_ms(50)
-);
-
-noperf_positive_test!(
-    demo_gate_gap_ms_perf_off_positive,
-    Assert::default_checks().max_gap_ms(10_000)
-);
-
-noperf_negative_test!(
-    demo_gate_gap_ms_perf_off_negative,
-    Assert::default_checks().max_gap_ms(50)
-);
+gate_test!(demo_gate_gap_ms_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().max_gap_ms(10_000));
+gate_test!(demo_gate_gap_ms_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().max_gap_ms(50));
+gate_test!(demo_gate_gap_ms_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().max_gap_ms(10_000));
+gate_test!(demo_gate_gap_ms_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().max_gap_ms(50));
 
 // ===========================================================================
 // max_spread_pct
 // ===========================================================================
 
-perf_positive_test!(
-    demo_gate_spread_perf_on_positive,
-    Assert::default_checks().max_spread_pct(99.0)
-);
-
-perf_negative_test!(
-    demo_gate_spread_perf_on_negative,
-    Assert::default_checks().max_spread_pct(0.01)
-);
-
-noperf_positive_test!(
-    demo_gate_spread_perf_off_positive,
-    Assert::default_checks().max_spread_pct(99.0)
-);
-
-noperf_negative_test!(
-    demo_gate_spread_perf_off_negative,
-    Assert::default_checks().max_spread_pct(0.01)
-);
+gate_test!(demo_gate_spread_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().max_spread_pct(99.0));
+gate_test!(demo_gate_spread_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().max_spread_pct(0.01));
+gate_test!(demo_gate_spread_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().max_spread_pct(99.0));
+gate_test!(demo_gate_spread_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().max_spread_pct(0.01));
 
 // ===========================================================================
 // max_throughput_cv
 // ===========================================================================
 
-perf_positive_test!(
-    demo_gate_throughput_cv_perf_on_positive,
-    Assert::default_checks().max_throughput_cv(100.0)
-);
-
-perf_negative_test!(
-    demo_gate_throughput_cv_perf_on_negative,
-    Assert::default_checks().max_throughput_cv(0.0001)
-);
-
-noperf_positive_test!(
-    demo_gate_throughput_cv_perf_off_positive,
-    Assert::default_checks().max_throughput_cv(100.0)
-);
-
-noperf_negative_test!(
-    demo_gate_throughput_cv_perf_off_negative,
-    Assert::default_checks().max_throughput_cv(0.0001)
-);
+gate_test!(demo_gate_throughput_cv_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().max_throughput_cv(100.0));
+gate_test!(demo_gate_throughput_cv_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().max_throughput_cv(0.0001));
+gate_test!(demo_gate_throughput_cv_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().max_throughput_cv(100.0));
+gate_test!(demo_gate_throughput_cv_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().max_throughput_cv(0.0001));
 
 // ===========================================================================
 // min_work_rate
 // ===========================================================================
 
-perf_positive_test!(
-    demo_gate_work_rate_perf_on_positive,
-    Assert::default_checks().min_work_rate(1.0)
-);
-
-perf_negative_test!(
-    demo_gate_work_rate_perf_on_negative,
-    Assert::default_checks().min_work_rate(1_000_000_000_000.0)
-);
-
-noperf_positive_test!(
-    demo_gate_work_rate_perf_off_positive,
-    Assert::default_checks().min_work_rate(1.0)
-);
-
-noperf_negative_test!(
-    demo_gate_work_rate_perf_off_negative,
-    Assert::default_checks().min_work_rate(1_000_000_000_000.0)
-);
+gate_test!(demo_gate_work_rate_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().min_work_rate(1.0));
+gate_test!(demo_gate_work_rate_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().min_work_rate(1_000_000_000_000.0));
+gate_test!(demo_gate_work_rate_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().min_work_rate(1.0));
+gate_test!(demo_gate_work_rate_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().min_work_rate(1_000_000_000_000.0));
