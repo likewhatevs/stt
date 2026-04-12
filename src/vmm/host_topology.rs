@@ -241,8 +241,8 @@ fn try_flock(path: &str, mode: i32) -> Result<Option<std::os::fd::OwnedFd>> {
     if rc == 0 {
         Ok(Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
     } else {
-        unsafe { libc::close(fd) };
         let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
             Ok(None)
         } else {
