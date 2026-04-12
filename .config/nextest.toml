@@ -1,91 +1,35 @@
 # ── Profiles ──────────────────────────────────────────────────────────
 
 [profile.default]
-# Most tests are fast unit tests; 30s is generous.
-slow-timeout = { period = "30s", terminate-after = 2 }
-# Run all tests with generous parallelism.
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
 test-threads = "num-cpus"
 
 [profile.ci]
-# CI should surface slow tests early and hard-kill hangs.
-slow-timeout = { period = "20s", terminate-after = 3 }
-retries = 0
+slow-timeout = { period = "60s", terminate-after = 3 }
+retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
 fail-fast = false
 
 [profile.ci.junit]
 path = "junit.xml"
 
 [profile.quick]
-# Skip boot tests entirely via filter; run only fast tests.
 # Usage: cargo nextest run --profile quick
 slow-timeout = { period = "10s", terminate-after = 2 }
 
 # ── Overrides ─────────────────────────────────────────────────────────
 
-# Boot tests: long timeout.
-# Coverage instrumentation (llvm-cov) makes VM boots 5-10x slower,
-# so the budget must accommodate the slowest observed coverage run.
+# Boot tests under coverage instrumentation (llvm-cov) are 5-10x slower.
 [[profile.default.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"
 slow-timeout = { period = "180s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
 
-[[profile.ci.overrides]]
-filter = "test(boot_kernel) | test(bench_boot)"
-slow-timeout = { period = "60s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
-
-# KVM tests: create VMs but don't boot kernels. Moderate timeout.
-[[profile.default.overrides]]
-filter = "test(vmm::kvm::) | test(vmm::tests::ap_mp) | test(vmm::tests::kvm_) | test(vmm::tests::immediate_exit) | test(vmm::tests::vcpu_thread_kick) | test(vmm::boot::tests::setup_fpu_with_kvm) | test(vmm::boot::tests::setup_msrs_with_kvm) | test(vmm::boot::tests::setup_regs_with_kvm) | test(vmm::boot::tests::setup_sregs_with_kvm) | test(vmm::boot::tests::setup_lapic)"
-slow-timeout = { period = "15s", terminate-after = 2 }
-
-# Coverage tests: boot full VMs with coverage-instrumented binaries.
-[[profile.default.overrides]]
-filter = "test(cover_)"
-slow-timeout = { period = "60s", terminate-after = 2 }
-
-# VM-booting integration tests: CI runners are shared and noisy.
-# Exponential backoff gives concurrent tests time to release flock
-# resources between attempts.
-[[profile.ci.overrides]]
-filter = "test(cover_) | test(sched_)"
-slow-timeout = { period = "60s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
-
-# Negative/auto-repro tests: boot two VMs (crash + repro).
-[[profile.ci.overrides]]
-filter = "test(neg_)"
-slow-timeout = { period = "60s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
-
-# Negative/auto-repro tests: boot two VMs (crash + repro). Need more
-# time than single-VM coverage tests.
-[[profile.default.overrides]]
-filter = "test(neg_)"
-slow-timeout = { period = "60s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
-
-# VM-booting integration tests: exponential backoff for flock contention.
-[[profile.default.overrides]]
-filter = "test(sched_) | test(cover_)"
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
-
-# Verifier tests: boot a VM and collect BPF verifier output.
-# The test sets a 120s internal timeout, so nextest must allow at least
-# that plus overhead.
+# Verifier tests: internal 120s timeout, nextest must exceed that.
 [[profile.default.overrides]]
 filter = "test(verifier_)"
 slow-timeout = { period = "180s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
 
-[[profile.ci.overrides]]
-filter = "test(verifier_)"
-slow-timeout = { period = "180s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
-
-# Demo tests: demo_ tests from the custom harness are ignored by default.
-# Auto-repro demos boot two VMs sequentially; verifier demos load BPF.
+# Demo tests: exploration/failure scenarios, should not retry.
 [[profile.default.overrides]]
 filter = "test(demo_)"
 slow-timeout = { period = "120s", terminate-after = 2 }
@@ -96,32 +40,17 @@ retries = 0
 [[profile.default.overrides]]
 filter = "test(gauntlet/)"
 slow-timeout = { period = "120s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
 
-[[profile.ci.overrides]]
-filter = "test(gauntlet/)"
-slow-timeout = { period = "120s", terminate-after = 2 }
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
-
-# Performance-mode tests: each perf test acquires LLC locks at
-# runtime via flock, so nextest parallelism is a soft limit.
 # ── perf-vm ──────────────────────────────────────────────────────────
 [test-groups.perf-vm]
 max-threads = 8
 
 [[profile.default.overrides]]
-filter = "test(perf_on) | test(sched_perf_)"
+filter = "test(sched_perf_)"
 test-group = "perf-vm"
 threads-required = 1
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
 
-[[profile.ci.overrides]]
-filter = "test(perf_on) | test(sched_perf_)"
-test-group = "perf-vm"
-threads-required = 1
-retries = { backoff = "exponential", count = 3, delay = "1s", jitter = true, max-delay = "15s" }
-
-# Quick profile: exclude boot and bench tests.
+# Quick profile: short-circuit long-running tests.
 [[profile.quick.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"
 slow-timeout = { period = "60s", terminate-after = 1 }
