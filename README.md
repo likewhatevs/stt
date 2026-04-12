@@ -17,7 +17,7 @@ scheduler.
 - **Real isolation** -- each test boots its own kernel. No host interference, no shared state.
 - **Any topology** -- 1 to 252 CPUs with arbitrary LLC structure via synthetic ACPI tables.
 - **Data-driven** -- scenarios declare cgroups, cpusets, workloads, and verification as data.
-- **Gauntlet** -- all scenarios across 13 topology presets in parallel VMs. Baseline save/compare for A/B testing.
+- **Gauntlet** -- all scenarios across 19 topology presets in parallel VMs. Baseline save/compare for A/B testing.
 - **`#[ktstr_test]`** -- proc macro for integration tests that boot their own VMs.
 - **Auto-repro** -- reruns failures with BPF kprobes on the crash call chain.
 

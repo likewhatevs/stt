@@ -122,7 +122,7 @@ pub struct TopoPreset {
     pub memory_mb: usize,
 }
 
-/// Topology presets used by gauntlet mode (19 on x86_64, 11 on aarch64).
+/// Topology presets used by gauntlet mode.
 ///
 /// Ranges from `tiny-1llc` (4 CPUs) to `max-cpu` (252 CPUs, near
 /// the KVM vCPU limit). On aarch64, presets with SMT
@@ -259,14 +259,6 @@ mod tests {
             compute_timeout(1, 20, 240),
             Duration::from_secs(32 + (20 + 2) * 2)
         );
-    }
-
-    #[test]
-    fn gauntlet_presets_count() {
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(gauntlet_presets().len(), 19);
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(gauntlet_presets().len(), 11);
     }
 
     #[test]

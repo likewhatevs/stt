@@ -1326,7 +1326,6 @@ mod tests {
                 let nc = entry.ecx & 0xff;
 
                 if threads_per_pkg > 1 {
-                    // ApicIdSize must accommodate all thread IDs in package
                     assert!(
                         (1u32 << apic_id_size) >= threads_per_pkg,
                         "{sockets}s/{cores}c/{threads}t: ApicIdSize {apic_id_size} too small \
