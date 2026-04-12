@@ -645,6 +645,14 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     if entry.host_only {
         return run_host_only_test_inner(entry);
     }
+    if entry.bpf_map_write.is_some()
+        && let Ok(kernel) = resolve_kernel()
+        && crate::vmm::find_vmlinux(&kernel).is_none()
+    {
+        return Ok(crate::assert::AssertResult::skip(
+            "skipped: vmlinux not found, bpf_map_write requires vmlinux",
+        ));
+    }
     run_ktstr_test_inner(entry, None, &[])
 }
 
@@ -872,6 +880,14 @@ fn run_named_test(test_name: &str) -> i32 {
         return run_host_only_test(entry);
     }
 
+    if entry.bpf_map_write.is_some()
+        && let Ok(kernel) = resolve_kernel()
+        && crate::vmm::find_vmlinux(&kernel).is_none()
+    {
+        eprintln!("skipped: vmlinux not found, bpf_map_write requires vmlinux");
+        return 0;
+    }
+
     let result = run_ktstr_test_inner(entry, None, &[]);
     result_to_exit_code(result, entry.expect_err)
 }
@@ -959,6 +975,14 @@ fn run_gauntlet_test(rest: &str) -> i32 {
             return 1;
         }
     };
+
+    if entry.bpf_map_write.is_some()
+        && let Ok(kernel) = resolve_kernel()
+        && crate::vmm::find_vmlinux(&kernel).is_none()
+    {
+        eprintln!("skipped: vmlinux not found, bpf_map_write requires vmlinux");
+        return 0;
+    }
 
     let result = run_ktstr_test_inner(entry, Some(&topo), &flags);
     result_to_exit_code(result, entry.expect_err)

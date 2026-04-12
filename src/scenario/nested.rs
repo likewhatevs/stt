@@ -16,12 +16,16 @@ pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
             vec![
                 CgroupDef::named("cg_0/sub_a"),
                 CgroupDef::named("cg_0/sub_b"),
-                CgroupDef::named("cg_1/sub_a"),
+                CgroupDef::named("cg_1/sub_b"),
                 CgroupDef::named("cg_1/sub_a/deep"),
             ],
             HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration),
         )
-        .with_ops(vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")]),
+        .with_ops(vec![
+            Op::add_cgroup("cg_0"),
+            Op::add_cgroup("cg_1"),
+            Op::add_cgroup("cg_1/sub_a"),
+        ]),
     ];
 
     execute_steps(ctx, steps)
