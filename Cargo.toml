@@ -69,7 +69,7 @@ tempfile = "3"
 
 [build-dependencies]
 cc = "1"
-gix = { version = "0.81", default-features = false, features = ["sha1"] }
+gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
 libbpf-cargo = "0.26"
 
 [[bin]]

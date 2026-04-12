@@ -220,6 +220,10 @@ pub(crate) mod vm;
 pub(crate) mod vmm;
 pub mod workload;
 
+/// Static busybox binary compiled in build.rs for guest shell mode.
+#[allow(dead_code)]
+pub(crate) const BUSYBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
+
 /// Short git commit hash at build time.
 pub const GIT_HASH: &str = env!("KTSTR_GIT_HASH");
 /// Git branch name at build time.

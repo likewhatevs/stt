@@ -4,7 +4,7 @@
 
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use libbpf_cargo::SkeletonBuilder;
 
@@ -129,4 +129,93 @@ int main(void) {{
         }
     }
     println!("cargo:rerun-if-changed=.git/HEAD");
+
+    // Build busybox from source for guest shell mode.
+    // Cache: skip if $OUT_DIR/busybox exists. After build.rs config
+    // changes, run `cargo clean` to force a rebuild.
+    let busybox_bin = out_dir.join("busybox");
+    if !busybox_bin.exists() {
+        println!("cargo:warning=compiling busybox (first build only)...");
+
+        // Check required tools before attempting build.
+        if Command::new("make").arg("--version").output().is_err() {
+            panic!(
+                "busybox build requires 'make' — install build-essential \
+                 (Debian/Ubuntu) or base-devel (Fedora/Arch)"
+            );
+        }
+        if Command::new("gcc").arg("--version").output().is_err() {
+            panic!(
+                "busybox build requires 'gcc' — install build-essential \
+                 (Debian/Ubuntu) or base-devel (Fedora/Arch)"
+            );
+        }
+
+        let busybox_src = out_dir.join("busybox-src");
+
+        // Recover from interrupted clone: if the directory exists but
+        // has no Makefile, the previous clone was incomplete.
+        if busybox_src.exists() && !busybox_src.join("Makefile").exists() {
+            std::fs::remove_dir_all(&busybox_src).expect("remove incomplete busybox-src");
+        }
+
+        // Shallow-clone busybox tag via gix and checkout working tree.
+        if !busybox_src.join(".git").exists() {
+            let url = "https://git.busybox.net/busybox";
+            let interrupt = std::sync::atomic::AtomicBool::new(false);
+            let mut prep = gix::prepare_clone(url, &busybox_src)
+                .expect("prepare busybox clone")
+                .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+                    std::num::NonZeroU32::new(1).unwrap(),
+                ))
+                .with_ref_name(Some("1_36_1"))
+                .expect("valid ref name");
+            let (mut checkout, _outcome) = prep
+                .fetch_then_checkout(gix::progress::Discard, &interrupt)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to clone busybox from https://git.busybox.net/busybox — \
+                         check network connectivity. First build requires internet access: {e}"
+                    )
+                });
+            checkout
+                .main_worktree(gix::progress::Discard, &interrupt)
+                .expect("checkout busybox worktree");
+        }
+
+        // Configure busybox.
+        let status = Command::new("make")
+            .arg("defconfig")
+            .current_dir(&busybox_src)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("make defconfig");
+        assert!(status.success(), "busybox make defconfig failed");
+
+        // Enable static linking, disable CONFIG_TC (requires iproute2 headers).
+        let config_path = busybox_src.join(".config");
+        let config = std::fs::read_to_string(&config_path).expect("read busybox .config");
+        let config = config
+            .replace("# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
+            .replace("CONFIG_TC=y", "# CONFIG_TC is not set");
+        std::fs::write(&config_path, config).expect("write patched busybox .config");
+
+        // Build busybox.
+        let nproc = std::thread::available_parallelism()
+            .map(|n| n.get().to_string())
+            .unwrap_or_else(|_| "1".to_string());
+        let status = Command::new("make")
+            .arg(format!("-j{nproc}"))
+            .current_dir(&busybox_src)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("busybox make");
+        assert!(status.success(), "busybox build failed");
+
+        // Copy binary to OUT_DIR.
+        std::fs::copy(busybox_src.join("busybox"), &busybox_bin)
+            .expect("copy busybox binary to OUT_DIR");
+    }
 }
