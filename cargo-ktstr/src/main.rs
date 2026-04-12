@@ -314,15 +314,6 @@ fn format_entry_row(entry: &CacheEntry, kconfig_hash: &str) -> String {
     }
 }
 
-/// Check if a cache entry has a stale kconfig hash.
-fn is_stale_kconfig(entry: &CacheEntry, kconfig_hash: &str) -> bool {
-    entry
-        .metadata
-        .as_ref()
-        .and_then(|m| m.ktstr_kconfig_hash.as_deref())
-        .is_some_and(|h| h != kconfig_hash)
-}
-
 fn kernel_list(json: bool) -> Result<(), String> {
     let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
     let entries = cache.list().map_err(|e| format!("list cache: {e}"))?;
@@ -344,7 +335,7 @@ fn kernel_list(json: bool) -> Result<(), String> {
                         "arch": meta.arch,
                         "built_at": meta.built_at,
                         "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
-                        "stale_kconfig": is_stale_kconfig(e, &kconfig_hash),
+                        "stale_kconfig": e.has_stale_kconfig(&kconfig_hash),
                         "config_hash": meta.config_hash,
                         "image_name": meta.image_name,
                         "image_path": e.path.join(&meta.image_name).display().to_string(),
@@ -386,7 +377,7 @@ fn kernel_list(json: bool) -> Result<(), String> {
     );
     let mut has_stale = false;
     for entry in &entries {
-        if is_stale_kconfig(entry, &kconfig_hash) {
+        if entry.has_stale_kconfig(&kconfig_hash) {
             has_stale = true;
         }
         println!("{}", format_entry_row(entry, &kconfig_hash));
@@ -496,7 +487,7 @@ fn kernel_build(
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}");
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
-            if is_stale_kconfig(&entry, &embedded_kconfig_hash()) {
+            if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
                 eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
             } else {
                 eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
@@ -514,7 +505,7 @@ fn kernel_build(
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
-        if is_stale_kconfig(&entry, &embedded_kconfig_hash()) {
+        if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
             eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
         } else {
             eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
@@ -1714,7 +1705,7 @@ mod tests {
         assert!(args.is_empty());
     }
 
-    // -- format_entry_row / is_stale_kconfig helpers --
+    // -- format_entry_row helpers --
 
     fn test_metadata() -> KernelMetadata {
         KernelMetadata::new(
@@ -1827,41 +1818,41 @@ mod tests {
         assert!(row.contains("corrupt metadata"));
     }
 
-    // -- is_stale_kconfig --
+    // -- has_stale_kconfig (via CacheEntry method) --
 
     #[test]
-    fn is_stale_kconfig_different_hash() {
+    fn has_stale_kconfig_different_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("old".to_string()));
         let entry = store_test_entry(&cache, "stale", &meta);
-        assert!(is_stale_kconfig(&entry, "new"));
+        assert!(entry.has_stale_kconfig("new"));
     }
 
     #[test]
-    fn is_stale_kconfig_same_hash() {
+    fn has_stale_kconfig_same_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "fresh", &meta);
-        assert!(!is_stale_kconfig(&entry, "same"));
+        assert!(!entry.has_stale_kconfig("same"));
     }
 
     #[test]
-    fn is_stale_kconfig_no_hash_in_entry() {
+    fn has_stale_kconfig_no_hash_in_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "no-hash", &meta);
-        assert!(!is_stale_kconfig(&entry, "anything"));
+        assert!(!entry.has_stale_kconfig("anything"));
     }
 
     #[test]
-    fn is_stale_kconfig_no_metadata() {
+    fn has_stale_kconfig_no_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let entry = store_corrupt_entry(&cache, "corrupt");
-        assert!(!is_stale_kconfig(&entry, "anything"));
+        assert!(!entry.has_stale_kconfig("anything"));
     }
 
     // -- embedded_kconfig_hash --

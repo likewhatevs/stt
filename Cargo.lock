@@ -2735,6 +2735,7 @@ dependencies = [
  "btf-rs",
  "cc",
  "clap",
+ "clap_complete",
  "cpio",
  "crc32fast",
  "ctor",

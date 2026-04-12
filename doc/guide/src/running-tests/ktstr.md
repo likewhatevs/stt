@@ -67,3 +67,54 @@ Remove leftover cgroups from a previous run:
 ktstr cleanup
 ktstr cleanup --parent-cgroup /sys/fs/cgroup/ktstr
 ```
+
+### kernel list
+
+List cached kernel images:
+
+```sh
+ktstr kernel list
+ktstr kernel list --json
+```
+
+### kernel build
+
+Build a kernel from a local source tree and cache the result:
+
+```sh
+ktstr kernel build --source ../linux
+ktstr kernel build --source ../linux --force
+ktstr kernel build --source ../linux --clean
+```
+
+Only local source trees are supported. For version downloads and git
+clones, use `cargo ktstr kernel build`.
+
+`--force` rebuilds even if a cached image exists. `--clean` runs
+`make mrproper` before configuring. Dirty trees (uncommitted changes)
+are built but not cached.
+
+### kernel clean
+
+Remove cached kernel images:
+
+```sh
+ktstr kernel clean
+ktstr kernel clean --keep 2
+ktstr kernel clean --force
+```
+
+`--keep N` retains the N most recent entries. Without `--force`,
+prompts for confirmation (requires a terminal).
+
+### completions
+
+Generate shell completions:
+
+```sh
+ktstr completions bash
+ktstr completions zsh
+ktstr completions fish
+```
+
+Supported shells: bash, zsh, fish, elvish, powershell.

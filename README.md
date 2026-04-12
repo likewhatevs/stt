@@ -30,8 +30,8 @@ cargo install cargo-ktstr             # dev workflow plugin (kernel build + next
 cargo install cargo-nextest           # required test runner
 ```
 
-`ktstr` is the host-side CLI for running scenarios directly under the
-host's active scheduler (outside VMs). `cargo-ktstr` automates kernel configuration,
+`ktstr` is the host-side CLI for running scenarios and managing cached
+kernel images (outside VMs). `cargo-ktstr` automates kernel configuration,
 building, and test execution in one command. `scx-ktstr` (the test
 fixture scheduler) is built automatically by the workspace and does
 not need a separate install.
@@ -136,14 +136,18 @@ cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # pass nextest filter
 
 ### Host-side CLI
 
-`ktstr` runs scenarios directly on the host (outside VMs) under
-whatever scheduler is already active:
+`ktstr` runs scenarios on the host (outside VMs) under whatever
+scheduler is already active, and manages cached kernel images:
 
 ```sh
 cargo run --features cli --bin ktstr -- list
 cargo run --features cli --bin ktstr -- run
 cargo run --features cli --bin ktstr -- topo
 cargo run --features cli --bin ktstr -- cleanup
+cargo run --features cli --bin ktstr -- kernel list
+cargo run --features cli --bin ktstr -- kernel build --source ../linux
+cargo run --features cli --bin ktstr -- kernel clean
+cargo run --features cli --bin ktstr -- completions bash
 ```
 
 ## Documentation

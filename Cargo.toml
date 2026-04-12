@@ -24,6 +24,7 @@ exclude = [".build-cache/", "doc/guide/book/", ".github/", ".githooks/", ".confi
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"], optional = true }
+clap_complete = { version = "4", optional = true }
 crc32fast = "1.5"
 flate2 = "1"
 ctor = "0.8"
@@ -59,7 +60,7 @@ lto = "thin"
 
 [features]
 integration = []
-cli = ["dep:clap"]
+cli = ["dep:clap", "dep:clap_complete"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
