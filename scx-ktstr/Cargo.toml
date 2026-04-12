@@ -12,7 +12,7 @@ categories = ["development-tools::testing"]
 [dependencies]
 anyhow = "1"
 ctrlc = "3"
-libbpf-rs = "0.26"
+libbpf-rs = { version = "0.26", features = ["vendored"] }
 scx_utils = "1.1.0"
 
 [build-dependencies]

@@ -293,9 +293,14 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
 }
 
 /// Build a cargo binary package and return its output path.
+///
+/// Runs from the workspace root so that workspace-level feature
+/// unification (e.g. vendored libbpf-sys) is always in effect,
+/// regardless of the calling process's working directory.
 pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf> {
     let output = std::process::Command::new("cargo")
         .args(["build", "-p", package, "--message-format=json"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
