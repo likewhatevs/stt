@@ -112,6 +112,32 @@ ktstr kernel clean --force
 `--keep N` retains the N most recent entries. Without `--force`,
 prompts for confirmation (requires a terminal).
 
+### shell
+
+Boot an interactive shell in a KVM virtual machine:
+
+```sh
+ktstr shell
+ktstr shell --kernel ../linux
+ktstr shell --kernel 6.14.2
+ktstr shell --topology 2,4,1
+ktstr shell -i /path/to/binary
+ktstr shell -i my_tool -i another_tool
+```
+
+Launches a VM with busybox and drops into a shell. The `--kernel`
+flag accepts the same identifiers as other subcommands (path, version,
+cache key). Without `--kernel`, resolves automatically via cache then
+filesystem.
+
+`--topology` sets the guest CPU topology as `sockets,cores,threads`
+(default: `1,1,1`).
+
+Files passed via `-i`/`--include-files` are available at
+`/include-files/<name>` inside the guest. Bare names are resolved via
+PATH. Dynamically-linked ELF binaries get automatic shared library
+resolution. Directories are not supported -- pass individual files.
+
 ### completions
 
 Generate shell completions:

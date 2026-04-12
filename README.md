@@ -146,6 +146,7 @@ ktstr list
 ktstr run
 ktstr topo
 ktstr cleanup
+ktstr shell --kernel 6.14.2
 ktstr kernel list
 ktstr kernel build 6.14.2
 ktstr kernel clean

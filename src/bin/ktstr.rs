@@ -1,11 +1,9 @@
-use std::io::{BufRead, Write};
-use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
-use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
+use ktstr::cache::KernelMetadata;
 use ktstr::cgroup::CgroupManager;
 use ktstr::cli;
 use ktstr::runner::Runner;
@@ -92,6 +90,27 @@ enum Command {
         #[command(subcommand)]
         command: KernelCommand,
     },
+    /// Boot an interactive shell in a KVM virtual machine.
+    ///
+    /// Launches a VM with busybox and drops into a shell. Files passed
+    /// via -i are available at /include-files/<name> inside the guest.
+    /// Dynamically-linked ELF binaries get automatic shared library
+    /// resolution via ldd. Note: ldd executes the binary's ELF
+    /// interpreter, so only include trusted binaries.
+    Shell {
+        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
+        /// or cache key (`6.14.2-tarball-x86_64`, see `ktstr kernel list`).
+        /// When absent, resolves automatically via cache then filesystem.
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Virtual topology as "sockets,cores,threads" (default: "1,1,1").
+        #[arg(long, default_value = "1,1,1")]
+        topology: String,
+        /// Files to include in the guest at /include-files/<name>.
+        /// Dynamically-linked ELF binaries get shared library resolution.
+        #[arg(short = 'i', long = "include-files", action = ArgAction::Append)]
+        include_files: Vec<PathBuf>,
+    },
     /// Generate shell completions for ktstr.
     Completions {
         /// Shell to generate completions for.
@@ -152,147 +171,6 @@ impl Drop for CgroupGuard {
     }
 }
 
-/// ktstr.kconfig embedded at compile time.
-const EMBEDDED_KCONFIG: &str = include_str!("../../ktstr.kconfig");
-
-/// Compute CRC32 of the embedded ktstr.kconfig fragment.
-fn embedded_kconfig_hash() -> String {
-    let hash = crc32fast::hash(EMBEDDED_KCONFIG.as_bytes());
-    format!("{hash:08x}")
-}
-
-/// Format a human-readable table row for a cache entry.
-fn format_entry_row(entry: &CacheEntry, kconfig_hash: &str) -> String {
-    match &entry.metadata {
-        Some(meta) => {
-            let version = meta.version.as_deref().unwrap_or("-");
-            let source = meta.source.to_string();
-            let stale = match &meta.ktstr_kconfig_hash {
-                Some(h) if h != kconfig_hash => " (stale kconfig)",
-                _ => "",
-            };
-            format!(
-                "  {:<36} {:<12} {:<8} {:<7} {}{}",
-                entry.key, version, source, meta.arch, meta.built_at, stale,
-            )
-        }
-        None => {
-            format!("  {:<36} (corrupt metadata)", entry.key)
-        }
-    }
-}
-
-fn kernel_list(json: bool) -> Result<()> {
-    let cache = CacheDir::new()?;
-    let entries = cache.list()?;
-    let kconfig_hash = embedded_kconfig_hash();
-
-    if json {
-        let json_entries: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|e| match &e.metadata {
-                Some(meta) => serde_json::json!({
-                    "key": e.key,
-                    "path": e.path.display().to_string(),
-                    "version": meta.version,
-                    "source": meta.source,
-                    "arch": meta.arch,
-                    "built_at": meta.built_at,
-                    "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
-                    "stale_kconfig": e.has_stale_kconfig(&kconfig_hash),
-                    "config_hash": meta.config_hash,
-                    "image_name": meta.image_name,
-                    "image_path": e.path.join(&meta.image_name).display().to_string(),
-                    "vmlinux_name": meta.vmlinux_name,
-                    "git_hash": meta.git_hash,
-                    "git_ref": meta.git_ref,
-                    "source_tree_path": meta.source_tree_path,
-                }),
-                None => serde_json::json!({
-                    "key": e.key,
-                    "path": e.path.display().to_string(),
-                    "error": "corrupt metadata",
-                }),
-            })
-            .collect();
-        let wrapper = serde_json::json!({
-            "current_ktstr_kconfig_hash": kconfig_hash,
-            "entries": json_entries,
-        });
-        println!("{}", serde_json::to_string_pretty(&wrapper)?);
-        return Ok(());
-    }
-
-    eprintln!("cache: {}", cache.root().display());
-
-    if entries.is_empty() {
-        println!(
-            "no cached kernels. Run `ktstr kernel build --source PATH` to build and cache a kernel."
-        );
-        return Ok(());
-    }
-
-    println!(
-        "  {:<36} {:<12} {:<8} {:<7} BUILT",
-        "KEY", "VERSION", "SOURCE", "ARCH"
-    );
-    let mut has_stale = false;
-    for entry in &entries {
-        if entry.has_stale_kconfig(&kconfig_hash) {
-            has_stale = true;
-        }
-        println!("{}", format_entry_row(entry, &kconfig_hash));
-    }
-    if has_stale {
-        eprintln!(
-            "warning: entries marked (stale kconfig) were built with a different ktstr.kconfig. \
-             Rebuild with: ktstr kernel build --force VERSION"
-        );
-    }
-    Ok(())
-}
-
-use ktstr::cli::has_sched_ext;
-
-/// Run make in a kernel directory.
-fn run_make(kernel_dir: &std::path::Path, args: &[&str]) -> Result<()> {
-    let status = ProcessCommand::new("make")
-        .args(args)
-        .current_dir(kernel_dir)
-        .status()?;
-    anyhow::ensure!(status.success(), "make {} failed", args.join(" "));
-    Ok(())
-}
-
-/// Configure the kernel with sched_ext support.
-fn configure_kernel(kernel_dir: &std::path::Path, fragment: &str) -> Result<()> {
-    eprintln!("ktstr: configuring kernel (sched_ext not found in .config)");
-
-    let config_path = kernel_dir.join(".config");
-    if !config_path.exists() {
-        run_make(kernel_dir, &["defconfig"])?;
-    }
-
-    let mut config = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&config_path)?;
-    std::io::Write::write_all(&mut config, fragment.as_bytes())?;
-
-    run_make(kernel_dir, &["olddefconfig"])?;
-    Ok(())
-}
-
-/// Build the kernel (parallel make).
-fn make_kernel(kernel_dir: &std::path::Path) -> Result<()> {
-    eprintln!("ktstr: building kernel in {}", kernel_dir.display());
-    let nproc = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let args = ktstr::cli::build_make_args(nproc);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_make(kernel_dir, &arg_refs)
-}
-
 /// Acquire source, configure, build, and cache a kernel image.
 fn kernel_build(
     version: Option<String>,
@@ -302,6 +180,7 @@ fn kernel_build(
     force: bool,
     clean: bool,
 ) -> Result<()> {
+    use ktstr::cache::CacheDir;
     use ktstr::fetch;
 
     let cache = CacheDir::new()?;
@@ -325,7 +204,7 @@ fn kernel_build(
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}");
         if !force && let Some(entry) = cache.lookup(&cache_key) {
-            if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
+            if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
                 eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
             } else {
                 eprintln!("ktstr: cached kernel found: {}", entry.path.display());
@@ -342,7 +221,7 @@ fn kernel_build(
         && !acquired.is_dirty
         && let Some(entry) = cache.lookup(&acquired.cache_key)
     {
-        if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
+        if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
             eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
         } else {
             eprintln!("ktstr: cached kernel found: {}", entry.path.display());
@@ -361,22 +240,24 @@ fn kernel_build(
             );
         } else {
             eprintln!("ktstr: make mrproper");
-            run_make(source_dir, &["mrproper"])?;
+            cli::run_make(source_dir, &["mrproper"])?;
         }
     }
 
     // Configure.
-    if !has_sched_ext(source_dir) {
-        configure_kernel(source_dir, EMBEDDED_KCONFIG)?;
+    if !cli::has_sched_ext(source_dir) {
+        eprintln!("ktstr: configuring kernel (sched_ext not found in .config)");
+        cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG)?;
     }
 
     // Build.
-    make_kernel(source_dir)?;
+    eprintln!("ktstr: building kernel in {}", source_dir.display());
+    cli::make_kernel(source_dir)?;
 
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
         eprintln!("ktstr: generating compile_commands.json");
-        run_make(source_dir, &["compile_commands.json"])?;
+        cli::run_make(source_dir, &["compile_commands.json"])?;
     }
 
     // Find the built kernel image and vmlinux.
@@ -411,13 +292,13 @@ fn kernel_build(
     };
 
     let (arch, image_name) = fetch::arch_info();
-    let kconfig_hash = embedded_kconfig_hash();
+    let kconfig_hash = cli::embedded_kconfig_hash();
 
     let metadata = KernelMetadata::new(
         acquired.source_type.clone(),
         arch.to_string(),
         image_name.to_string(),
-        now_iso8601(),
+        cli::now_iso8601(),
     )
     .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
@@ -435,97 +316,6 @@ fn kernel_build(
     eprintln!("ktstr: kernel cached as {}", acquired.cache_key);
     eprintln!("ktstr: image: {}", entry.path.join(image_name).display());
 
-    Ok(())
-}
-
-/// Current time as ISO 8601 string (UTC, second precision).
-fn now_iso8601() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs();
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
-}
-
-/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-/// Remove cached kernels with optional keep-N and confirmation prompt.
-fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
-    let cache = CacheDir::new()?;
-    let entries = cache.list()?;
-
-    if entries.is_empty() {
-        println!("nothing to clean");
-        return Ok(());
-    }
-
-    let kconfig_hash = embedded_kconfig_hash();
-    let skip = keep.unwrap_or(0);
-    let to_remove: Vec<&CacheEntry> = entries.iter().skip(skip).collect();
-
-    if to_remove.is_empty() {
-        println!("nothing to clean");
-        return Ok(());
-    }
-
-    if !force {
-        // SAFETY: isatty is always safe to call with a valid fd.
-        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
-            anyhow::bail!("confirmation requires a terminal. Use --force to skip.");
-        }
-        println!("the following entries will be removed:");
-        for entry in &to_remove {
-            println!("{}", format_entry_row(entry, &kconfig_hash));
-        }
-        eprint!("remove {} entries? [y/N] ", to_remove.len());
-        std::io::stderr().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().lock().read_line(&mut answer)?;
-        if !matches!(answer.trim(), "y" | "Y") {
-            println!("aborted");
-            return Ok(());
-        }
-    }
-
-    let total = to_remove.len();
-    let mut removed = 0usize;
-    let mut last_err: Option<String> = None;
-    for entry in &to_remove {
-        match std::fs::remove_dir_all(&entry.path) {
-            Ok(()) => removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                removed += 1;
-            }
-            Err(e) => {
-                last_err = Some(format!("remove {}: {e}", entry.key));
-            }
-        }
-    }
-
-    println!("removed {removed} cached kernel(s).");
-    if let Some(err) = last_err {
-        anyhow::bail!("removed {removed} of {total} entries; {err}");
-    }
     Ok(())
 }
 
@@ -657,7 +447,7 @@ fn main() -> Result<()> {
         }
 
         Command::Kernel { command } => match command {
-            KernelCommand::List { json } => kernel_list(json)?,
+            KernelCommand::List { json } => cli::kernel_list(json)?,
             KernelCommand::Build {
                 version,
                 source,
@@ -666,8 +456,90 @@ fn main() -> Result<()> {
                 force,
                 clean,
             } => kernel_build(version, source, git, git_ref, force, clean)?,
-            KernelCommand::Clean { keep, force } => kernel_clean(keep, force)?,
+            KernelCommand::Clean { keep, force } => cli::kernel_clean(keep, force)?,
         },
+
+        Command::Shell {
+            kernel,
+            topology,
+            include_files,
+        } => {
+            cli::check_kvm()?;
+            let kernel_path = cli::resolve_kernel_image(kernel.as_deref())?;
+
+            // Parse topology "S,C,T".
+            let parts: Vec<&str> = topology.split(',').collect();
+            anyhow::ensure!(
+                parts.len() == 3,
+                "invalid topology '{topology}': expected 'sockets,cores,threads' (e.g. '2,4,1')"
+            );
+            let sockets: u32 = parts[0]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid sockets value: '{}'", parts[0]))?;
+            let cores: u32 = parts[1]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid cores value: '{}'", parts[1]))?;
+            let threads: u32 = parts[2]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid threads value: '{}'", parts[2]))?;
+            anyhow::ensure!(
+                sockets > 0 && cores > 0 && threads > 0,
+                "invalid topology '{topology}': sockets, cores, and threads must all be >= 1"
+            );
+
+            // Build include_files vec: resolve each path, construct archive pairs.
+            let mut resolved_includes: Vec<(String, PathBuf)> = Vec::new();
+            for path in &include_files {
+                let is_explicit_path = {
+                    use std::path::Component;
+                    matches!(
+                        path.components().next(),
+                        Some(Component::RootDir | Component::CurDir | Component::ParentDir)
+                    ) || path.components().count() > 1
+                };
+                let resolved = if is_explicit_path {
+                    anyhow::ensure!(
+                        path.exists(),
+                        "--include-files path not found: {}",
+                        path.display()
+                    );
+                    path.clone()
+                } else {
+                    // Bare name: search PATH.
+                    if path.exists() {
+                        path.clone()
+                    } else {
+                        cli::resolve_in_path(path).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "-i {}: not found in filesystem or PATH",
+                                path.display()
+                            )
+                        })?
+                    }
+                };
+                anyhow::ensure!(
+                    !resolved.is_dir(),
+                    "-i {}: is a directory. --include-files does not support directories, \
+                     pass individual files",
+                    resolved.display()
+                );
+                let file_name = resolved
+                    .file_name()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("include file has no filename: {}", resolved.display())
+                    })?
+                    .to_string_lossy();
+                let archive_path = format!("include-files/{file_name}");
+                resolved_includes.push((archive_path, resolved));
+            }
+
+            let include_refs: Vec<(&str, &Path)> = resolved_includes
+                .iter()
+                .map(|(a, p)| (a.as_str(), p.as_path()))
+                .collect();
+
+            ktstr::run_shell(kernel_path, sockets, cores, threads, &include_refs)?;
+        }
 
         Command::Completions { shell } => {
             run_completions(shell);

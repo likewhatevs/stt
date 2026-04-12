@@ -1,18 +1,14 @@
-use std::io::{BufRead, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ktstr::cli::{build_make_args, has_sched_ext, run_test_stats};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
+use ktstr::cli;
 
 use ktstr::fetch;
 #[cfg(feature = "gha-cache")]
 use ktstr::remote_cache;
-
-/// ktstr.kconfig embedded at compile time so `cargo install` works.
-const EMBEDDED_KCONFIG: &str = include_str!("../../ktstr.kconfig");
 
 #[derive(Parser)]
 #[command(name = "cargo-ktstr", bin_name = "cargo")]
@@ -171,56 +167,6 @@ enum KernelCommand {
     },
 }
 
-/// Configure the kernel with sched_ext support.
-///
-/// Appends the kconfig fragment to .config and runs `make olddefconfig`
-/// to resolve dependencies. kconfig uses last-value-wins semantics for
-/// duplicate symbols (confdata.c:conf_read_simple), so appending is
-/// equivalent to merge_config.sh's delete-then-append approach — both
-/// produce the same resolved config after olddefconfig.
-fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<(), String> {
-    eprintln!("cargo-ktstr: configuring kernel (sched_ext not found in .config)");
-
-    let config_path = kernel_dir.join(".config");
-    if !config_path.exists() {
-        run_make(kernel_dir, &["defconfig"])?;
-    }
-
-    let mut config = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&config_path)
-        .map_err(|e| format!("open .config: {e}"))?;
-    std::io::Write::write_all(&mut config, fragment.as_bytes())
-        .map_err(|e| format!("append kconfig: {e}"))?;
-
-    run_make(kernel_dir, &["olddefconfig"])?;
-    Ok(())
-}
-
-/// Run make in the kernel directory with the given args.
-fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<(), String> {
-    let status = Command::new("make")
-        .args(args)
-        .current_dir(kernel_dir)
-        .status()
-        .map_err(|e| format!("make {}: {e}", args.join(" ")))?;
-    if !status.success() {
-        return Err(format!("make {} failed", args.join(" ")));
-    }
-    Ok(())
-}
-
-/// Run make in the kernel directory for a parallel build.
-fn make_kernel(kernel_dir: &Path) -> Result<(), String> {
-    eprintln!("cargo-ktstr: building kernel in {}", kernel_dir.display());
-    let nproc = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let args = build_make_args(nproc);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_make(kernel_dir, &arg_refs)
-}
-
 /// Configure if needed and build the kernel.
 fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     if !kernel_dir.is_dir() {
@@ -229,26 +175,20 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
 
     if clean {
         eprintln!("cargo-ktstr: make mrproper");
-        run_make(kernel_dir, &["mrproper"])?;
+        cli::run_make(kernel_dir, &["mrproper"]).map_err(|e| format!("{e:#}"))?;
     }
 
-    if !has_sched_ext(kernel_dir) {
-        configure_kernel(kernel_dir, EMBEDDED_KCONFIG)?;
+    if !cli::has_sched_ext(kernel_dir) {
+        eprintln!("cargo-ktstr: configuring kernel (sched_ext not found in .config)");
+        cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"))?;
     }
 
-    make_kernel(kernel_dir)?;
-    gen_compile_commands(kernel_dir)?;
-    Ok(())
-}
+    eprintln!("cargo-ktstr: building kernel in {}", kernel_dir.display());
+    cli::make_kernel(kernel_dir).map_err(|e| format!("{e:#}"))?;
 
-/// Generate compile_commands.json for LSP support.
-///
-/// Runs `make compile_commands.json` which invokes
-/// `scripts/clang-tools/gen_compile_commands.py` over the build
-/// artifacts. Requires a completed kernel build (depends on vmlinux.a).
-fn gen_compile_commands(kernel_dir: &Path) -> Result<(), String> {
     eprintln!("cargo-ktstr: generating compile_commands.json");
-    run_make(kernel_dir, &["compile_commands.json"])
+    cli::run_make(kernel_dir, &["compile_commands.json"]).map_err(|e| format!("{e:#}"))?;
+    Ok(())
 }
 
 fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
@@ -265,7 +205,7 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
                 cmd.env("KTSTR_KERNEL", &dir);
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = resolve_cached_kernel(&id)?;
+                let cache_dir = resolve_cached_kernel_with_remote(&id)?;
                 eprintln!("cargo-ktstr: using cached kernel {}", cache_dir.display());
                 cmd.env("KTSTR_KERNEL", &cache_dir);
             }
@@ -280,178 +220,9 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
 }
 
 fn test_stats(dir: &Option<PathBuf>) -> Result<(), String> {
-    let output = run_test_stats(dir.as_deref());
+    let output = cli::run_test_stats(dir.as_deref());
     if !output.is_empty() {
         print!("{output}");
-    }
-    Ok(())
-}
-
-/// Compute CRC32 of the embedded ktstr.kconfig fragment.
-fn embedded_kconfig_hash() -> String {
-    let hash = crc32fast::hash(EMBEDDED_KCONFIG.as_bytes());
-    format!("{hash:08x}")
-}
-
-/// Format a human-readable table row for a cache entry.
-fn format_entry_row(entry: &CacheEntry, kconfig_hash: &str) -> String {
-    match &entry.metadata {
-        Some(meta) => {
-            let version = meta.version.as_deref().unwrap_or("-");
-            let source = meta.source.to_string();
-            let stale = match &meta.ktstr_kconfig_hash {
-                Some(h) if h != kconfig_hash => " (stale kconfig)",
-                _ => "",
-            };
-            format!(
-                "  {:<36} {:<12} {:<8} {:<7} {}{}",
-                entry.key, version, source, meta.arch, meta.built_at, stale,
-            )
-        }
-        None => {
-            format!("  {:<36} (corrupt metadata)", entry.key)
-        }
-    }
-}
-
-fn kernel_list(json: bool) -> Result<(), String> {
-    let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
-    let entries = cache.list().map_err(|e| format!("list cache: {e}"))?;
-    let kconfig_hash = embedded_kconfig_hash();
-
-    if json {
-        let json_entries: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|e| match &e.metadata {
-                Some(meta) => {
-                    // source_tree_path contains local filesystem paths.
-                    // Included for completeness since JSON output is local
-                    // tool output, not a published artifact.
-                    serde_json::json!({
-                        "key": e.key,
-                        "path": e.path.display().to_string(),
-                        "version": meta.version,
-                        "source": meta.source,
-                        "arch": meta.arch,
-                        "built_at": meta.built_at,
-                        "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
-                        "stale_kconfig": e.has_stale_kconfig(&kconfig_hash),
-                        "config_hash": meta.config_hash,
-                        "image_name": meta.image_name,
-                        "image_path": e.path.join(&meta.image_name).display().to_string(),
-                        "vmlinux_name": meta.vmlinux_name,
-                        "git_hash": meta.git_hash,
-                        "git_ref": meta.git_ref,
-                        "source_tree_path": meta.source_tree_path,
-                    })
-                }
-                None => serde_json::json!({
-                    "key": e.key,
-                    "path": e.path.display().to_string(),
-                    "error": "corrupt metadata",
-                }),
-            })
-            .collect();
-        let wrapper = serde_json::json!({
-            "current_ktstr_kconfig_hash": kconfig_hash,
-            "entries": json_entries,
-        });
-        let output =
-            serde_json::to_string_pretty(&wrapper).map_err(|e| format!("serialize json: {e}"))?;
-        println!("{output}");
-        return Ok(());
-    }
-
-    eprintln!("cache: {}", cache.root().display());
-
-    if entries.is_empty() {
-        println!(
-            "no cached kernels. Run `cargo ktstr kernel build` to download and build a kernel."
-        );
-        return Ok(());
-    }
-
-    println!(
-        "  {:<36} {:<12} {:<8} {:<7} BUILT",
-        "KEY", "VERSION", "SOURCE", "ARCH"
-    );
-    let mut has_stale = false;
-    for entry in &entries {
-        if entry.has_stale_kconfig(&kconfig_hash) {
-            has_stale = true;
-        }
-        println!("{}", format_entry_row(entry, &kconfig_hash));
-    }
-    if has_stale {
-        eprintln!(
-            "warning: entries marked (stale kconfig) were built with a different ktstr.kconfig. \
-             Rebuild with: cargo ktstr kernel build --force VERSION"
-        );
-    }
-    Ok(())
-}
-
-/// Remove cached kernels with optional keep-N and confirmation prompt.
-fn kernel_clean(keep: Option<usize>, force: bool) -> Result<(), String> {
-    let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
-    let entries = cache.list().map_err(|e| format!("list cache: {e}"))?;
-
-    if entries.is_empty() {
-        println!("nothing to clean");
-        return Ok(());
-    }
-
-    let kconfig_hash = embedded_kconfig_hash();
-    let skip = keep.unwrap_or(0);
-    let to_remove: Vec<&CacheEntry> = entries.iter().skip(skip).collect();
-
-    if to_remove.is_empty() {
-        println!("nothing to clean");
-        return Ok(());
-    }
-
-    if !force {
-        // SAFETY: isatty is always safe to call with a valid fd.
-        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
-            return Err("confirmation requires a terminal. Use --force to skip.".to_string());
-        }
-        println!("the following entries will be removed:");
-        for entry in &to_remove {
-            println!("{}", format_entry_row(entry, &kconfig_hash));
-        }
-        eprint!("remove {} entries? [y/N] ", to_remove.len());
-        std::io::stderr()
-            .flush()
-            .map_err(|e| format!("flush stderr: {e}"))?;
-        let mut answer = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut answer)
-            .map_err(|e| format!("read stdin: {e}"))?;
-        if !matches!(answer.trim(), "y" | "Y") {
-            println!("aborted");
-            return Ok(());
-        }
-    }
-
-    let total = to_remove.len();
-    let mut removed = 0usize;
-    let mut last_err: Option<String> = None;
-    for entry in &to_remove {
-        match std::fs::remove_dir_all(&entry.path) {
-            Ok(()) => removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                removed += 1;
-            }
-            Err(e) => {
-                last_err = Some(format!("remove {}: {e}", entry.key));
-            }
-        }
-    }
-
-    println!("removed {removed} cached kernel(s).");
-    if let Some(err) = last_err {
-        return Err(format!("removed {removed} of {total} entries; {err}"));
     }
     Ok(())
 }
@@ -465,11 +236,10 @@ fn kernel_build(
     force: bool,
     clean: bool,
 ) -> Result<(), String> {
-    let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+    let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
 
     // Temporary directory for tarball/git source extraction.
-    // Lives until end of function so the source tree persists through build.
-    let tmp_dir = tempfile::TempDir::new().map_err(|e| format!("create temp dir: {e}"))?;
+    let tmp_dir = tempfile::TempDir::new().map_err(|e| format!("create temp dir: {e:#}"))?;
 
     // Acquire source.
     let acquired = if let Some(ref src_path) = source {
@@ -487,7 +257,7 @@ fn kernel_build(
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}");
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
-            if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
+            if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
                 eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
             } else {
                 eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
@@ -505,7 +275,7 @@ fn kernel_build(
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
-        if entry.has_stale_kconfig(&embedded_kconfig_hash()) {
+        if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
             eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
         } else {
             eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
@@ -524,21 +294,24 @@ fn kernel_build(
             );
         } else {
             eprintln!("cargo-ktstr: make mrproper");
-            run_make(source_dir, &["mrproper"])?;
+            cli::run_make(source_dir, &["mrproper"]).map_err(|e| format!("{e:#}"))?;
         }
     }
 
     // Configure.
-    if !has_sched_ext(source_dir) {
-        configure_kernel(source_dir, EMBEDDED_KCONFIG)?;
+    if !cli::has_sched_ext(source_dir) {
+        eprintln!("cargo-ktstr: configuring kernel (sched_ext not found in .config)");
+        cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"))?;
     }
 
     // Build.
-    make_kernel(source_dir)?;
+    eprintln!("cargo-ktstr: building kernel in {}", source_dir.display());
+    cli::make_kernel(source_dir).map_err(|e| format!("{e:#}"))?;
 
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
-        gen_compile_commands(source_dir)?;
+        eprintln!("cargo-ktstr: generating compile_commands.json");
+        cli::run_make(source_dir, &["compile_commands.json"]).map_err(|e| format!("{e:#}"))?;
     }
 
     // Find the built kernel image and vmlinux.
@@ -566,20 +339,20 @@ fn kernel_build(
     // Compute config hash.
     let config_path = source_dir.join(".config");
     let config_hash = if config_path.exists() {
-        let data = std::fs::read(&config_path).map_err(|e| format!("read .config: {e}"))?;
+        let data = std::fs::read(&config_path).map_err(|e| format!("read .config: {e:#}"))?;
         Some(format!("{:08x}", crc32fast::hash(&data)))
     } else {
         None
     };
 
     let (arch, image_name) = fetch::arch_info();
-    let kconfig_hash = embedded_kconfig_hash();
+    let kconfig_hash = cli::embedded_kconfig_hash();
 
     let metadata = KernelMetadata::new(
         acquired.source_type.clone(),
         arch.to_string(),
         image_name.to_string(),
-        now_iso8601(),
+        cli::now_iso8601(),
     )
     .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
@@ -594,7 +367,7 @@ fn kernel_build(
 
     let entry = cache
         .store(&acquired.cache_key, &image_path, vmlinux_ref, &metadata)
-        .map_err(|e| format!("cache store: {e}"))?;
+        .map_err(|e| format!("cache store: {e:#}"))?;
 
     // Store to remote cache when enabled.
     #[cfg(feature = "gha-cache")]
@@ -611,49 +384,12 @@ fn kernel_build(
     Ok(())
 }
 
-/// Current time as ISO 8601 string (UTC, second precision).
-fn now_iso8601() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs();
-    // Manual UTC formatting to avoid adding chrono as a dependency.
-    // Good enough for cache metadata timestamps.
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Days since Unix epoch to Y-M-D (simplified Gregorian).
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
-}
-
-/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
 /// Look up a cache key, checking local first, then remote (if enabled).
 fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
-    // Local first.
     if let Some(entry) = cache.lookup(cache_key) {
         return Some(entry);
     }
 
-    // Remote fallback.
     #[cfg(feature = "gha-cache")]
     if remote_cache::is_enabled() {
         return remote_cache::remote_lookup(cache, cache_key);
@@ -662,17 +398,49 @@ fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
     None
 }
 
-/// Resolve the cache entry directory from a Version or CacheKey identifier.
+/// Resolve a kernel identifier to a bootable image path.
 ///
-/// Returns the cache entry directory path, which contains the boot
-/// image and optionally vmlinux. Callers set KTSTR_KERNEL to this directory
-/// so build.rs (BTF/vmlinux.h) and nextest (boot image) both resolve
-/// from the same location.
-fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, String> {
+/// Uses `resolve_cached_kernel_with_remote` for Version/CacheKey
+/// lookups so GHA remote cache is checked when enabled.
+fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
+    use ktstr::kernel_path::KernelId;
+
+    if let Some(val) = kernel {
+        match KernelId::parse(val) {
+            KernelId::Path(p) => {
+                let path = PathBuf::from(&p);
+                if path.is_file() {
+                    Ok(path)
+                } else if path.is_dir() {
+                    ktstr::kernel_path::find_image_in_dir(&path)
+                        .ok_or_else(|| format!("no kernel image found in {}", path.display()))
+                } else {
+                    Err(format!("kernel path not found: {}", path.display()))
+                }
+            }
+            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
+                let cache_dir = resolve_cached_kernel_with_remote(&id)?;
+                ktstr::kernel_path::find_image_in_dir(&cache_dir)
+                    .ok_or_else(|| format!("no kernel image found in {}", cache_dir.display()))
+            }
+        }
+    } else {
+        ktstr::find_kernel()
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| {
+                "no kernel found. Provide --kernel or run \
+                 `cargo ktstr kernel build` to download and cache one."
+                    .to_string()
+            })
+    }
+}
+
+/// Resolve cached kernel with remote cache fallback.
+fn resolve_cached_kernel_with_remote(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, String> {
     use ktstr::kernel_path::KernelId;
     match id {
         KernelId::Version(ver) => {
-            let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+            let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
             let (arch, _) = fetch::arch_info();
             let cache_key = format!("{ver}-tarball-{arch}");
             match cache_lookup(&cache, &cache_key) {
@@ -690,7 +458,7 @@ fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, S
             }
         }
         KernelId::CacheKey(key) => {
-            let cache = CacheDir::new().map_err(|e| format!("open cache: {e}"))?;
+            let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
             match cache_lookup(&cache, key) {
                 Some(entry) => {
                     entry
@@ -709,89 +477,12 @@ fn resolve_cached_kernel(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, S
     }
 }
 
-/// Pre-flight check for /dev/kvm availability and permissions.
-fn check_kvm() -> Result<(), String> {
-    if !Path::new("/dev/kvm").exists() {
-        return Err("/dev/kvm not found. KVM requires:\n  \
-             - Linux kernel with KVM support (CONFIG_KVM)\n  \
-             - Access to /dev/kvm (check permissions or add user to 'kvm' group)\n  \
-             - Hardware virtualization enabled in BIOS (VT-x/AMD-V)"
-            .to_string());
-    }
-    if let Err(e) = std::fs::File::open("/dev/kvm") {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            return Err(
-                "/dev/kvm: permission denied. Add your user to the 'kvm' group:\n  \
-                 sudo usermod -aG kvm $USER\n  \
-                 then log out and back in."
-                    .to_string(),
-            );
-        }
-        return Err(format!("/dev/kvm: {e}"));
-    }
-    Ok(())
-}
-
-/// Resolve a kernel identifier to a bootable image path.
-///
-/// Handles all `KernelId` variants (path to file or directory,
-/// version string, cache key) and the `None` case (automatic
-/// resolution via cache then filesystem).
-fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
-    use ktstr::kernel_path::KernelId;
-
-    if let Some(val) = kernel {
-        match KernelId::parse(val) {
-            KernelId::Path(p) => {
-                let path = PathBuf::from(&p);
-                if path.is_file() {
-                    Ok(path)
-                } else if path.is_dir() {
-                    ktstr::kernel_path::find_image_in_dir(&path)
-                        .ok_or_else(|| format!("no kernel image found in {}", path.display()))
-                } else {
-                    Err(format!("kernel path not found: {}", path.display()))
-                }
-            }
-            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = resolve_cached_kernel(&id)?;
-                ktstr::kernel_path::find_image_in_dir(&cache_dir)
-                    .ok_or_else(|| format!("no kernel image found in {}", cache_dir.display()))
-            }
-        }
-    } else {
-        ktstr::find_kernel()
-            .map_err(|e| format!("kernel resolution: {e}"))?
-            .ok_or_else(|| {
-                "no kernel found. Provide --kernel or run \
-                 `cargo ktstr kernel build` to download and cache one."
-                    .to_string()
-            })
-    }
-}
-
-/// Search PATH for a bare executable name.
-fn resolve_in_path(name: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if let Ok(meta) = std::fs::metadata(&candidate)
-            && meta.is_file()
-            && meta.permissions().mode() & 0o111 != 0
-        {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 fn run_shell(
     kernel: Option<String>,
     topology: String,
     include_files: Vec<PathBuf>,
 ) -> Result<(), String> {
-    check_kvm()?;
+    cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 
     // Parse topology "S,C,T".
@@ -840,7 +531,7 @@ fn run_shell(
             if path.exists() {
                 path.clone()
             } else {
-                resolve_in_path(path).ok_or_else(|| {
+                cli::resolve_in_path(path).ok_or_else(|| {
                     format!("-i {}: not found in filesystem or PATH", path.display())
                 })?
             }
@@ -882,7 +573,7 @@ fn query_scheduler_flags(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|e| format!("run scheduler --ktstr-list-flags: {e}"))?;
+        .map_err(|e| format!("run scheduler --ktstr-list-flags: {e:#}"))?;
 
     if !output.status.success() {
         return Ok(Vec::new());
@@ -894,7 +585,7 @@ fn query_scheduler_flags(
         return Ok(Vec::new());
     }
 
-    serde_json::from_str(trimmed).map_err(|e| format!("parse --ktstr-list-flags output: {e}"))
+    serde_json::from_str(trimmed).map_err(|e| format!("parse --ktstr-list-flags output: {e:#}"))
 }
 
 /// Generate flag profiles from flag declarations.
@@ -975,12 +666,12 @@ fn run_verifier(
     all_profiles: bool,
     profiles_filter: Vec<String>,
 ) -> Result<(), String> {
-    check_kvm()?;
+    cli::check_kvm().map_err(|e| format!("{e:#}"))?;
 
     // Resolve scheduler binary.
     let sched_bin = match (scheduler, scheduler_bin) {
         (Some(package), None) => {
-            ktstr::build_and_find_binary(&package).map_err(|e| format!("build scheduler: {e}"))?
+            ktstr::build_and_find_binary(&package).map_err(|e| format!("build scheduler: {e:#}"))?
         }
         (None, Some(path)) => {
             if !path.exists() {
@@ -999,7 +690,7 @@ fn run_verifier(
 
     // Build the ktstr init binary.
     let ktstr_bin =
-        ktstr::build_and_find_binary("ktstr").map_err(|e| format!("build ktstr: {e}"))?;
+        ktstr::build_and_find_binary("ktstr").map_err(|e| format!("build ktstr: {e:#}"))?;
 
     if all_profiles || !profiles_filter.is_empty() {
         return run_verifier_all_profiles(
@@ -1014,7 +705,7 @@ fn run_verifier(
     eprintln!("cargo-ktstr: collecting verifier stats");
     let result =
         ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel_path, &[])
-            .map_err(|e| format!("collect verifier output: {e}"))?;
+            .map_err(|e| format!("collect verifier output: {e:#}"))?;
 
     let output = ktstr::verifier::format_verifier_output("verifier", &result, raw);
     print!("{output}");
@@ -1037,7 +728,7 @@ fn run_verifier_all_profiles(
         );
         let result =
             ktstr::verifier::collect_verifier_output(sched_bin, ktstr_bin, kernel_path, &[])
-                .map_err(|e| format!("collect verifier output: {e}"))?;
+                .map_err(|e| format!("collect verifier output: {e:#}"))?;
         let output = ktstr::verifier::format_verifier_output("default", &result, raw);
         print!("{output}");
         return Ok(());
@@ -1097,7 +788,7 @@ fn run_verifier_all_profiles(
             kernel_path,
             &extra_args,
         )
-        .map_err(|e| format!("profile {profile_name}: {e}"))?;
+        .map_err(|e| format!("profile {profile_name}: {e:#}"))?;
 
         let output = ktstr::verifier::format_verifier_output(profile_name, &result, raw);
         print!("{output}");
@@ -1216,7 +907,7 @@ fn main() {
             include_files,
         } => run_shell(kernel, topology, include_files),
         KtstrCommand::Kernel { command } => match command {
-            KernelCommand::List { json } => kernel_list(json),
+            KernelCommand::List { json } => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             KernelCommand::Build {
                 version,
                 source,
@@ -1225,12 +916,14 @@ fn main() {
                 force,
                 clean,
             } => kernel_build(version, source, git, git_ref, force, clean),
-            KernelCommand::Clean { keep, force } => kernel_clean(keep, force),
+            KernelCommand::Clean { keep, force } => {
+                cli::kernel_clean(keep, force).map_err(|e| format!("{e:#}"))
+            }
         },
     };
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 }
@@ -1580,25 +1273,25 @@ mod tests {
     #[test]
     fn days_to_ymd_epoch() {
         // Day 0 = 1970-01-01.
-        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+        assert_eq!(cli::days_to_ymd(0), (1970, 1, 1));
     }
 
     #[test]
     fn days_to_ymd_known_date() {
         // 2026-04-12 = 20555 days since epoch.
-        assert_eq!(days_to_ymd(20555), (2026, 4, 12));
+        assert_eq!(cli::days_to_ymd(20555), (2026, 4, 12));
     }
 
     #[test]
     fn days_to_ymd_leap_year_feb29() {
         // 2024-02-29 = 19782 days since epoch.
-        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
+        assert_eq!(cli::days_to_ymd(19782), (2024, 2, 29));
     }
 
     #[test]
     fn days_to_ymd_end_of_year() {
         // 2023-12-31 = 19722 days since epoch.
-        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
+        assert_eq!(cli::days_to_ymd(19722), (2023, 12, 31));
     }
 
     // -- completions --
@@ -1746,7 +1439,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "6.14.2-tarball-x86_64", &meta);
-        let row = format_entry_row(&entry, "abc123");
+        let row = cli::format_entry_row(&entry, "abc123");
         assert!(row.contains("6.14.2-tarball-x86_64"));
         assert!(row.contains("6.14.2"));
         assert!(row.contains("tarball"));
@@ -1760,7 +1453,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("old_hash".to_string()));
         let entry = store_test_entry(&cache, "stale-key", &meta);
-        let row = format_entry_row(&entry, "new_hash");
+        let row = cli::format_entry_row(&entry, "new_hash");
         assert!(
             row.contains("stale kconfig"),
             "should show stale kconfig marker"
@@ -1773,7 +1466,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "match-key", &meta);
-        let row = format_entry_row(&entry, "same");
+        let row = cli::format_entry_row(&entry, "same");
         assert!(
             !row.contains("stale kconfig"),
             "should not show stale marker when hashes match"
@@ -1786,7 +1479,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "no-hash-key", &meta);
-        let row = format_entry_row(&entry, "anything");
+        let row = cli::format_entry_row(&entry, "anything");
         assert!(
             !row.contains("stale kconfig"),
             "should not show stale marker when entry has no hash"
@@ -1804,7 +1497,7 @@ mod tests {
             "2026-04-12T10:00:00Z".to_string(),
         );
         let entry = store_test_entry(&cache, "local-key", &meta);
-        let row = format_entry_row(&entry, "hash");
+        let row = cli::format_entry_row(&entry, "hash");
         assert!(row.contains("-"), "missing version should show dash");
     }
 
@@ -1813,7 +1506,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let entry = store_corrupt_entry(&cache, "corrupt-key");
-        let row = format_entry_row(&entry, "hash");
+        let row = cli::format_entry_row(&entry, "hash");
         assert!(row.contains("corrupt-key"));
         assert!(row.contains("corrupt metadata"));
     }
@@ -1859,14 +1552,14 @@ mod tests {
 
     #[test]
     fn embedded_kconfig_hash_deterministic() {
-        let h1 = embedded_kconfig_hash();
-        let h2 = embedded_kconfig_hash();
+        let h1 = cli::embedded_kconfig_hash();
+        let h2 = cli::embedded_kconfig_hash();
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn embedded_kconfig_hash_is_hex() {
-        let h = embedded_kconfig_hash();
+        let h = cli::embedded_kconfig_hash();
         assert_eq!(h.len(), 8, "CRC32 hex should be 8 chars");
         assert!(
             h.chars().all(|c| c.is_ascii_hexdigit()),
@@ -1876,8 +1569,8 @@ mod tests {
 
     #[test]
     fn embedded_kconfig_hash_matches_manual_crc32() {
-        let expected = format!("{:08x}", crc32fast::hash(EMBEDDED_KCONFIG.as_bytes()));
-        assert_eq!(embedded_kconfig_hash(), expected);
+        let expected = format!("{:08x}", crc32fast::hash(cli::EMBEDDED_KCONFIG.as_bytes()));
+        assert_eq!(cli::embedded_kconfig_hash(), expected);
     }
 
     // -- resolve_in_path --
@@ -1885,7 +1578,7 @@ mod tests {
     #[test]
     fn resolve_in_path_finds_existing_binary() {
         // "sh" is always in PATH on Linux.
-        let result = resolve_in_path(Path::new("sh"));
+        let result = cli::resolve_in_path(Path::new("sh"));
         assert!(result.is_some(), "sh should be found in PATH");
         let path = result.unwrap();
         assert!(path.exists());
@@ -1894,14 +1587,14 @@ mod tests {
 
     #[test]
     fn resolve_in_path_not_found() {
-        let result = resolve_in_path(Path::new("nonexistent_binary_xyz_ktstr_test"));
+        let result = cli::resolve_in_path(Path::new("nonexistent_binary_xyz_ktstr_test"));
         assert!(result.is_none());
     }
 
     #[test]
     fn resolve_in_path_bare_name() {
         // "cargo" should be in PATH in this test environment.
-        let result = resolve_in_path(Path::new("cargo"));
+        let result = cli::resolve_in_path(Path::new("cargo"));
         assert!(result.is_some(), "cargo should be found in PATH");
     }
 }
