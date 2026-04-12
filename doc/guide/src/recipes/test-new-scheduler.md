@@ -50,11 +50,46 @@ fn llc_aware_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-## 3. Run
+## 3. Build a kernel
+
+Build a kernel with sched_ext support:
+
+```sh
+cargo ktstr kernel build
+```
+
+See [Getting Started: Build a kernel](../getting-started.md#build-a-kernel)
+for version selection and local source builds.
+
+## 4. Run
 
 ```sh
 cargo nextest run
 ```
+
+## 5. Check BPF complexity (optional)
+
+Collect per-program verifier statistics:
+
+```sh
+cargo ktstr verifier --scheduler scx_my_sched
+```
+
+See [BPF Verifier](../running-tests/verifier.md) for output format and
+cycle collapse.
+
+## 6. Debug failures
+
+Boot an interactive shell with the scheduler binary:
+
+```sh
+cargo ktstr shell -i ./target/debug/scx_my_sched
+```
+
+Inside the guest, run `/include-files/scx_my_sched` manually to
+inspect behavior. See
+[cargo-ktstr shell](../running-tests/cargo-ktstr.md#shell) for all
+flags.
 
 See [The #\[ktstr_test\] Macro](../writing-tests/ktstr-test-macro.md) for
 all available attributes and

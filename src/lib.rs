@@ -464,7 +464,9 @@ pub fn run_shell(
         .init_binary(&payload)
         .topology(sockets, cores, threads)
         .memory_mb(memory_mb)
-        .cmdline("KTSTR_MODE=shell")
+        .cmdline(&format!(
+            "KTSTR_MODE=shell KTSTR_TOPO={sockets},{cores},{threads}"
+        ))
         .include_files(owned_includes)
         .busybox(true)
         .build()?;

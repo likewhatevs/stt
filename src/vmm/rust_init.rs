@@ -127,6 +127,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
             .unwrap_or_else(|| "unknown".to_string());
         println!("ktstr shell");
         println!("  kernel:    {kernel_version}");
+        print_topology_line();
+        print_includes_line();
         println!("  tools:     busybox (ls, ps, top, dmesg, ip, vi, ...)");
         println!("  mounts:    /proc /sys /dev /sys/fs/cgroup /sys/fs/bpf /tmp");
         println!("             /sys/kernel/debug /sys/kernel/tracing");
@@ -299,6 +301,102 @@ fn redirect_all_stdio_to_com2() {
         libc::dup2(fd, 0); // stdin
         libc::dup2(fd, 1); // stdout
         libc::dup2(fd, 2); // stderr
+    }
+}
+
+/// Print the topology line for the shell MOTD.
+///
+/// Parses KTSTR_TOPO=S,C,T from /proc/cmdline (passed by the host).
+/// Falls back to counting online CPUs via /sys/devices/system/cpu/online.
+fn print_topology_line() {
+    if let Some((s, c, t)) = parse_topo_from_cmdline() {
+        let total = s * c * t;
+        println!(
+            "  topology:  {s} socket{}, {c} core{}, {t} thread{} ({total} vCPU{})",
+            if s == 1 { "" } else { "s" },
+            if c == 1 { "" } else { "s" },
+            if t == 1 { "" } else { "s" },
+            if total == 1 { "" } else { "s" },
+        );
+    } else if let Some(count) = count_online_cpus() {
+        println!(
+            "  topology:  {count} vCPU{}",
+            if count == 1 { "" } else { "s" }
+        );
+    }
+}
+
+/// Parse KTSTR_TOPO=S,C,T from /proc/cmdline.
+fn parse_topo_from_cmdline() -> Option<(u32, u32, u32)> {
+    let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
+    let val = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("KTSTR_TOPO="))?
+        .strip_prefix("KTSTR_TOPO=")?;
+    let parts: Vec<&str> = val.split(',').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let s: u32 = parts[0].parse().ok()?;
+    let c: u32 = parts[1].parse().ok()?;
+    let t: u32 = parts[2].parse().ok()?;
+    Some((s, c, t))
+}
+
+/// Count online CPUs from /sys/devices/system/cpu/online.
+///
+/// The file contains a range list like "0-3" or "0-1,3". Parse and
+/// count individual CPUs.
+fn count_online_cpus() -> Option<u32> {
+    let content = fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+    let mut count = 0u32;
+    for range in content.trim().split(',') {
+        if let Some((start, end)) = range.split_once('-') {
+            let s: u32 = start.parse().ok()?;
+            let e: u32 = end.parse().ok()?;
+            count += e - s + 1;
+        } else {
+            let _: u32 = range.parse().ok()?;
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+/// Print the include-files line for the shell MOTD.
+///
+/// Scans /include-files/ and lists each entry. Executable files
+/// are marked with "(executable)".
+fn print_includes_line() {
+    let include_dir = Path::new("/include-files");
+    let entries = match fs::read_dir(include_dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    let mut files: Vec<(String, bool)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let executable = entry
+            .metadata()
+            .map(|m| {
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode() & 0o111 != 0
+            })
+            .unwrap_or(false);
+        files.push((name, executable));
+    }
+    if files.is_empty() {
+        return;
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (i, (name, executable)) in files.iter().enumerate() {
+        let marker = if *executable { " (executable)" } else { "" };
+        let path = format!("/include-files/{name}{marker}");
+        if i == 0 {
+            println!("  includes:  {path}");
+        } else {
+            println!("             {path}");
+        }
     }
 }
 
@@ -777,5 +875,19 @@ mod tests {
     fn shell_mode_not_requested_in_test() {
         // /proc/cmdline exists on the host but won't contain KTSTR_MODE=shell.
         assert!(!shell_mode_requested());
+    }
+
+    #[test]
+    fn count_online_cpus_returns_some() {
+        // On any Linux host, /sys/devices/system/cpu/online exists.
+        let count = count_online_cpus();
+        assert!(count.is_some());
+        assert!(count.unwrap() >= 1);
+    }
+
+    #[test]
+    fn parse_topo_from_cmdline_not_present_on_host() {
+        // Host /proc/cmdline won't contain KTSTR_TOPO.
+        assert!(parse_topo_from_cmdline().is_none());
     }
 }
