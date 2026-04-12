@@ -20,6 +20,17 @@ collapse to verifier logs instead of truncating.
 
 ## Quick start
 
+### CLI (via cargo-ktstr)
+
+```sh
+cargo ktstr verifier --scheduler scx_rustland
+cargo ktstr verifier --scheduler scx_rustland --all-profiles
+```
+
+See [cargo-ktstr verifier](cargo-ktstr.md#verifier) for all flags.
+
+### Library (via tests)
+
 ```sh
 # Run the verifier pipeline test
 cargo nextest run -E 'test(verifier_)'
@@ -73,7 +84,7 @@ iteration:
 --- end repeat ---
 ```
 
-### Raw (`raw: true`)
+### Raw (`--raw` / `raw: true`)
 
 Full raw verifier log without cycle collapse. Use for debugging
 verification failures where the exact register state at each iteration

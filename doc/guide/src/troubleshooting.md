@@ -20,7 +20,16 @@ KVM enabled and the user must have read+write access to `/dev/kvm`.
 ## No kernel found
 
 ```text
-no kernel found. Set KTSTR_TEST_KERNEL or build one at ../linux/
+no kernel found
+  hint: run `cargo ktstr kernel build` to download and build the latest stable kernel
+  hint: or set KTSTR_KERNEL=/path/to/linux
+  hint: or set KTSTR_TEST_KERNEL=/path/to/bzImage
+```
+
+`cargo ktstr shell` and `cargo ktstr verifier` show a similar message:
+
+```text
+no kernel found. Provide --kernel or run `cargo ktstr kernel build` to download and cache one.
 ```
 
 ktstr needs a bootable Linux kernel image (bzImage). See
@@ -29,10 +38,9 @@ search order.
 
 **Fixes:**
 
-- Build a kernel using `ktstr.kconfig` (see
-  [Getting Started](getting-started.md#build-a-kernel)).
-- Set `KTSTR_TEST_KERNEL` to an explicit path.
-- Build a kernel in a sibling `linux/` directory.
+- Download and cache a kernel: `cargo ktstr kernel build`
+- Build from a local tree: `cargo ktstr kernel build --source ../linux`
+- Set `KTSTR_TEST_KERNEL` to an explicit image path.
 - The host's installed kernel works for basic testing.
 
 ## Scheduler not found
@@ -182,6 +190,108 @@ Grouped work types (`PipeIo`, `FutexPingPong`, `CachePipe`,
   FutexFanOut).
 - Use an ungrouped work type (`CpuSpin`, `Mixed`, `Bursty`,
   `IoSync`, `YieldHeavy`) if worker count flexibility is needed.
+
+## Cache corruption
+
+```text
+cached entry 6.14.2-tarball-x86_64 has corrupt metadata
+```
+
+A cached kernel entry has missing or unparseable `metadata.json`.
+This can happen after a partial write (e.g. disk full, killed process).
+`CacheDir::lookup` returns `None` for entries with corrupt metadata
+or a missing kernel image file.
+
+**Fixes:**
+
+- Remove the corrupt entry: `cargo ktstr kernel clean --force`
+- Rebuild: `cargo ktstr kernel build --force 6.14.2`
+- Override the cache directory via `KTSTR_CACHE_DIR` if the default
+  location is on a problematic filesystem.
+
+## Stale kconfig
+
+```text
+warning: entries marked (stale kconfig) were built with a different ktstr.kconfig.
+Rebuild with: cargo ktstr kernel build --force VERSION
+```
+
+`cargo ktstr kernel list` marks entries whose stored `ktstr_kconfig_hash`
+differs from the current embedded `ktstr.kconfig` fragment. This
+happens after updating ktstr (which may change the kconfig fragment).
+
+**Fix:**
+
+Rebuilds happen automatically on the next `cargo ktstr kernel build`
+for stale entries. Use `--force` to override the cache for other
+reasons.
+
+## Kernel download failures
+
+```text
+download https://cdn.kernel.org/.../linux-6.99.0.tar.xz: HTTP 404
+```
+
+The version does not exist on kernel.org. RC releases are removed from
+git.kernel.org after the stable version ships.
+
+```text
+download ...: server returned HTML instead of tarball (URL may be invalid)
+```
+
+Some CDN error pages return HTTP 200 with `text/html` content type.
+The download rejects these responses.
+
+**Fixes:**
+
+- Verify the version exists: check
+  `https://www.kernel.org/releases.json` for available versions.
+- For RC releases, use `--git` with a git.kernel.org URL instead of
+  a tarball download.
+- Run `cargo ktstr kernel build` without a version to automatically
+  fetch the latest stable.
+
+## Shell mode issues
+
+### stdin must be a terminal
+
+```text
+stdin must be a terminal for interactive shell mode
+```
+
+`cargo ktstr shell` requires a terminal for bidirectional I/O
+forwarding. Piped or redirected stdin is rejected.
+
+**Fix:** Run from an interactive terminal session.
+
+### include file not found
+
+```text
+-i strace: not found in filesystem or PATH
+```
+
+Bare names (without `/`, `.`, or `..`) are searched in `PATH`. If the
+binary is not in `PATH`, use an explicit path.
+
+```text
+--include-files path not found: ./missing-file
+```
+
+Explicit paths (containing `/` or starting with `.`) must exist on
+disk.
+
+**Fix:** Verify the file exists and use the correct path.
+
+### include file is a directory
+
+```text
+-i ./mydir: is a directory. --include-files does not support directories, pass individual files
+```
+
+`--include-files` only accepts regular files. Directories, FIFOs,
+device nodes, and sockets are rejected.
+
+**Fix:** Pass individual files, not directories.
 
 ## Tests pass locally but fail in CI
 

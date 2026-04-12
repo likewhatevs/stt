@@ -109,13 +109,18 @@ for gauntlet expansion and budget-driven test selection.
 Tests require a bootable Linux kernel. ktstr searches (in order):
 
 1. `KTSTR_TEST_KERNEL` environment variable (direct image path)
-2. `KTSTR_KERNEL` directory / `arch/<arch>/boot/<image>`
-3. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
-4. `../linux/arch/<arch>/boot/<image>` (sibling directory)
-5. `/lib/modules/$(uname -r)/build/arch/<arch>/boot/<image>` (installed kernel build tree)
-6. `/lib/modules/$(uname -r)/vmlinuz` (installed kernel)
-7. `/boot/vmlinuz-$(uname -r)`
-8. `/boot/vmlinuz` (unversioned symlink)
+2. `KTSTR_KERNEL` environment variable, parsed as a `KernelId`:
+   - Path: search that directory for `arch/<arch>/boot/<image>`
+   - Version (e.g. `6.14.2`): look up `{ver}-tarball-{arch}` in XDG cache
+   - Cache key (e.g. `6.14.2-tarball-x86_64`): exact cache lookup
+3. XDG cache: most recent cached image (newest first). Skipped when
+   `KTSTR_KERNEL` was an explicit version or cache key that missed.
+4. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
+5. `../linux/arch/<arch>/boot/<image>` (sibling directory)
+6. `/lib/modules/$(uname -r)/build/arch/<arch>/boot/<image>` (installed kernel build tree)
+7. `/lib/modules/$(uname -r)/vmlinuz` (installed kernel)
+8. `/boot/vmlinuz-$(uname -r)`
+9. `/boot/vmlinuz` (unversioned symlink)
 
 On x86_64, the build-tree image is `arch/x86/boot/bzImage`; on
 aarch64, `arch/arm64/boot/Image`.
@@ -123,6 +128,50 @@ aarch64, `arch/arm64/boot/Image`.
 The host's installed kernel works for basic testing. For sched_ext
 tests, build a kernel with the ktstr config fragment (below). See
 [Troubleshooting](troubleshooting.md#no-kernel-found) for details.
+
+## Build a kernel
+
+`cargo ktstr kernel build` downloads a kernel tarball from kernel.org,
+configures it with the embedded `ktstr.kconfig` fragment, builds it,
+and caches the result:
+
+```sh
+cargo ktstr kernel build               # latest stable
+cargo ktstr kernel build 6.14.2        # specific version
+```
+
+Subsequent runs of `cargo ktstr test` or `cargo nextest run` will
+find the cached kernel automatically (step 3 in the discovery chain
+above).
+
+To build from a local source tree:
+
+```sh
+cargo ktstr kernel build --source ../linux
+```
+
+To list and manage cached kernels:
+
+```sh
+cargo ktstr kernel list
+cargo ktstr kernel clean --keep 3
+```
+
+See [cargo-ktstr](running-tests/cargo-ktstr.md#kernel) for all
+options.
+
+### Manual
+
+```sh
+cd /path/to/linux
+make defconfig
+cat /path/to/ktstr/ktstr.kconfig >> .config
+make olddefconfig
+make -j$(nproc)
+```
+
+`ktstr.kconfig` in the repo root contains a kernel config fragment
+tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
 
 ## Run
 
@@ -136,37 +185,32 @@ is unavailable.
 
 ### Using cargo-ktstr
 
-`cargo ktstr test` handles kernel configuration, building, and test
-execution in one command:
+`cargo ktstr test` handles kernel resolution and test execution in
+one command:
 
 ```sh
-cargo ktstr test --kernel ~/linux
-cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'   # pass nextest args
+cargo ktstr test                                              # auto-discover kernel
+cargo ktstr test --kernel ../linux                            # local source tree
+cargo ktstr test --kernel 6.14.2                              # cached version
+cargo ktstr test -- -E 'test(my_test)'                        # pass nextest args
 ```
 
 See [cargo-ktstr](running-tests/cargo-ktstr.md) for details.
 
-## Build a kernel
+### Interactive shell
 
-`ktstr.kconfig` in the repo root contains a kernel config fragment
-tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
-
-### Manual
+`cargo ktstr shell` boots a VM with busybox for manual exploration:
 
 ```sh
-cd /path/to/linux
-make defconfig
-cat /path/to/ktstr/ktstr.kconfig >> .config
-make olddefconfig
-make -j$(nproc)
+cargo ktstr shell                              # default 1,1,1 topology
+cargo ktstr shell --topology 2,4,1             # custom CPU topology
+cargo ktstr shell -i ./my-scheduler            # include files in the guest
 ```
 
-### Automated
-
-`cargo ktstr test --kernel /path/to/linux` does this automatically
-when the kernel `.config` is missing or lacks sched_ext support.
-Both `build-kernel` and `test` generate `compile_commands.json` after
-building, so clangd / LSP works out of the box.
+Included ELF binaries get automatic shared library resolution.
+Files are available at `/include-files/<name>` inside the guest.
+See [cargo-ktstr shell](running-tests/cargo-ktstr.md#shell) for
+details.
 
 ## Next steps
 
