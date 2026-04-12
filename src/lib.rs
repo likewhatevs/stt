@@ -1,9 +1,10 @@
-//! Test harness for Linux process schedulers, with a focus on sched_ext.
+//! VM-based test framework for Linux kernel subsystems, with a focus on sched_ext.
 //!
-//! ktstr runs scheduler test scenarios inside lightweight KVM virtual machines
-//! with controlled CPU topologies. Each test creates cgroups, spawns worker
-//! processes, and verifies that the scheduler handled the workload correctly.
-//! Also tests under the kernel's default EEVDF scheduler.
+//! ktstr boots lightweight KVM virtual machines with controlled CPU topologies,
+//! runs scheduler test scenarios inside them, and evaluates results from the
+//! host via guest memory introspection. Each test creates cgroups, spawns
+//! worker processes, and verifies that the scheduler handled the workload
+//! correctly. Also tests under the kernel's default EEVDF scheduler.
 //!
 //! # Quick start
 //!
@@ -21,6 +22,8 @@
 //!     ])
 //! }
 //! ```
+//!
+//! Requires a kernel image; see [`find_kernel()`] for the resolution chain.
 //!
 //! For multi-phase scenarios with dynamic topology changes:
 //!
@@ -45,9 +48,10 @@
 //!
 //! # Scheduler definition
 //!
-//! Use `#[derive(Scheduler)]` to declare a scheduler with typed flags
-//! and a default topology. Tests reference the generated const and
-//! inherit its configuration:
+//! Tests work with just topology parameters (as above). When multiple
+//! tests share a scheduler, use `#[derive(Scheduler)]` to declare it
+//! once with typed flags and a default topology. Tests reference the
+//! generated const and inherit its configuration:
 //!
 //! ```rust
 //! use ktstr::prelude::*;
@@ -105,17 +109,35 @@
 //!
 //! See the [`prelude`] module for the full set of re-exports.
 //!
+//! # Library usage
+//!
+//! Library consumers should disable the default `cli` feature:
+//!
+//! ```toml
+//! [dev-dependencies]
+//! ktstr = { version = "0.1", default-features = false }
+//! ```
+//!
+//! Feature flags:
+//! - `cli` (default) -- enables `ktstr` and `cargo-ktstr` binaries, implies `fetch`
+//! - `fetch` -- kernel source download via git clone and tarball fetch
+//! - `gha-cache` -- GitHub Actions cache integration
+//! - `full` -- all features
+//!
 //! # Crate organization
 //!
 //! - [`cache`] -- kernel image cache (XDG directories, metadata, atomic writes)
 //! - [`cgroup`] -- cgroup v2 filesystem operations
-//! - [`scenario`] -- test case definitions, flag system, cgroup helpers
+//! - [`scenario`] -- declarative ops API (`CgroupDef`, `Step`, `Op`, `execute_defs`, `execute_steps`)
 //! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
 //! - [`mod@assert`] -- pass/fail assertions (starvation, isolation, fairness)
 //! - [`workload`] -- worker process types and telemetry collection
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
-//! - [`verifier`] -- BPF verifier complexity analysis
+//! - [`kernel_path`] -- kernel ID parsing and filesystem image discovery
+//! - [`verifier`] -- BPF verifier log parsing, cycle detection, and output formatting
 //! - [`test_support`] -- `#[ktstr_test]` runtime and registration
+//! - [`fetch`] -- kernel tarball and git source acquisition (`fetch` feature)
+//! - [`remote_cache`] -- GitHub Actions cache integration (`gha-cache` feature)
 
 #[allow(
     clippy::all,
@@ -188,6 +210,7 @@ pub(crate) fn read_kmsg() -> String {
         Err(_) => String::new(),
     }
 }
+
 pub mod assert;
 pub(crate) mod budget;
 #[cfg(feature = "cli")]
@@ -233,15 +256,16 @@ pub const GIT_HASH: &str = env!("KTSTR_GIT_HASH");
 /// Git branch name at build time.
 pub const GIT_BRANCH: &str = env!("KTSTR_GIT_BRANCH");
 
+pub use ktstr_macros::Scheduler;
+pub use ktstr_macros::ktstr_test;
+
+// Internal re-exports for proc macro generated code. Not public API.
 #[doc(hidden)]
 pub use ctor as __ctor;
 #[doc(hidden)]
 pub use linkme as __linkme;
 #[doc(hidden)]
 pub use serde_json as __serde_json;
-
-pub use ktstr_macros::Scheduler;
-pub use ktstr_macros::ktstr_test;
 
 #[cfg(feature = "integration")]
 pub use crate::probe::process::resolve_func_ip;
