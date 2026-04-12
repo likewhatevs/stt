@@ -122,10 +122,12 @@ pub struct TopoPreset {
     pub memory_mb: usize,
 }
 
-/// The 13 topology presets used by gauntlet mode.
+/// Topology presets used by gauntlet mode (13 on x86_64, 5 on aarch64).
 ///
 /// Ranges from `tiny-1llc` (4 CPUs) to `max-cpu` (252 CPUs, near
-/// the i440fx vCPU limit).
+/// the i440fx vCPU limit). On aarch64, presets with SMT
+/// (`threads_per_core > 1`) are excluded because ARM64 CPUs do not
+/// have SMT.
 pub fn gauntlet_presets() -> Vec<TopoPreset> {
     let defs: &[(&str, &str, u32, u32, u32, usize)] = &[
         ("tiny-1llc", "4 CPUs, 1 LLC", 1, 4, 1, 2048),
@@ -156,7 +158,8 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             4096,
         ),
     ];
-    defs.iter()
+    let mut presets: Vec<TopoPreset> = defs
+        .iter()
         .map(|&(n, d, s, c, t, m)| TopoPreset {
             name: n,
             description: d,
@@ -167,7 +170,14 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             },
             memory_mb: m,
         })
-        .collect()
+        .collect();
+
+    // ARM64 has no SMT -- exclude presets with threads_per_core > 1.
+    if cfg!(target_arch = "aarch64") {
+        presets.retain(|p| p.topology.threads_per_core <= 1);
+    }
+
+    presets
 }
 
 #[cfg(test)]
@@ -222,7 +232,10 @@ mod tests {
 
     #[test]
     fn gauntlet_presets_count() {
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(gauntlet_presets().len(), 13);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(gauntlet_presets().len(), 5);
     }
 
     #[test]
@@ -364,6 +377,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn gauntlet_presets_max_cpu_near_limit() {
         let presets = gauntlet_presets();
         let max = presets.iter().find(|p| p.name == "max-cpu").unwrap();
@@ -419,13 +433,21 @@ mod tests {
             ("odd-3llc", 9),
             ("odd-5llc", 15),
             ("odd-7llc", 14),
+            #[cfg(not(target_arch = "aarch64"))]
             ("smt-2llc", 8),
+            #[cfg(not(target_arch = "aarch64"))]
             ("smt-3llc", 12),
+            #[cfg(not(target_arch = "aarch64"))]
             ("medium-4llc", 32),
+            #[cfg(not(target_arch = "aarch64"))]
             ("medium-8llc", 64),
+            #[cfg(not(target_arch = "aarch64"))]
             ("large-4llc", 128),
+            #[cfg(not(target_arch = "aarch64"))]
             ("large-8llc", 128),
+            #[cfg(not(target_arch = "aarch64"))]
             ("near-max-llc", 240),
+            #[cfg(not(target_arch = "aarch64"))]
             ("max-cpu", 252),
         ];
         let presets = gauntlet_presets();

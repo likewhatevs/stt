@@ -1,7 +1,7 @@
 # Gauntlet
 
-The gauntlet runs every test across 13 topology presets and all valid
-flag profiles. Gauntlet variants are prefixed with `gauntlet/` and
+The gauntlet runs every test across 13 topology presets (5 on aarch64)
+and all valid flag profiles. Gauntlet variants are prefixed with `gauntlet/` and
 ignored by default.
 
 ```sh
@@ -23,7 +23,7 @@ variation is meaningless without a VM).
 Each gauntlet variant is named `gauntlet/{test_name}/{preset}/{profile}`:
 
 - `{test_name}` -- the `#[ktstr_test]` function name
-- `{preset}` -- one of the 13 topology preset names below
+- `{preset}` -- one of the topology preset names below
 - `{profile}` -- `default` when no flags are active, otherwise the
   active flags joined with `+` (e.g. `llc+borrow`)
 
@@ -54,6 +54,10 @@ cargo nextest run --run-ignored ignored-only \
 
 Topology format: `{sockets}s{cores_per_socket}c{threads_per_core}t`.
 Presets are defined in `gauntlet_presets()`.
+
+> **aarch64:** ARM64 CPUs do not have SMT. Presets with
+> `threads_per_core > 1` are excluded on aarch64, leaving 5 presets
+> (`tiny-1llc` through `odd-7llc`).
 
 ## Constraint filtering
 

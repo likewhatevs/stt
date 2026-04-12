@@ -6,8 +6,8 @@ controls which cells of the matrix it populates.
 
 ## Controlling topology coverage
 
-Topology constraints filter which of the 13 gauntlet presets a test
-runs on. Set constraints in `#[ktstr_test]` attributes:
+Topology constraints filter which of the 13 gauntlet presets (5 on
+aarch64) a test runs on. Set constraints in `#[ktstr_test]` attributes:
 
 | Attribute | Type | Default | Effect |
 |---|---|---|---|
@@ -38,7 +38,8 @@ A test with `min_llcs = 2` and `requires_smt = true`:
 | `near-max-llc` | 15s8c2t | 15 | yes | **yes** |
 | `max-cpu` | 14s9c2t | 14 | yes | **yes** |
 
-Result: 8 of 13 presets survive.
+Result: 8 of 13 presets survive. On aarch64, none survive -- all 8
+matching presets require SMT, which ARM64 does not have.
 
 ## Controlling flag coverage
 
