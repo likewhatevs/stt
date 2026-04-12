@@ -17,8 +17,8 @@ cargo ktstr test --kernel ~/linux
 1. **Config check** -- reads `<kernel>/.config` for
    `CONFIG_SCHED_CLASS_EXT=y`.
 2. **Auto-configure** -- if the config sentinel is missing, runs
-   `make defconfig` (when no `.config` exists), merges `ktstr.kconfig`
-   via `scripts/kconfig/merge_config.sh`, then runs `make olddefconfig`.
+   `make defconfig` (when no `.config` exists), appends `ktstr.kconfig`
+   to `.config`, then runs `make olddefconfig`.
 3. **Kernel build** -- runs `make -j$(nproc) KCFLAGS=-Wno-error`.
    This always runs; `make` handles the no-op case when the kernel
    is already built.

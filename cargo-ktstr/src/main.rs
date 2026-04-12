@@ -56,43 +56,27 @@ enum KtstrCommand {
     },
 }
 
-/// Write the embedded ktstr.kconfig to a temporary file.
-///
-/// Returns the path to the temp file. The caller must keep the
-/// `TempDir` alive until merge_config.sh finishes.
-fn write_embedded_kconfig() -> Result<(tempfile::TempDir, PathBuf), String> {
-    let dir = tempfile::TempDir::new().map_err(|e| format!("create temp dir: {e}"))?;
-    let path = dir.path().join("ktstr.kconfig");
-    std::fs::write(&path, EMBEDDED_KCONFIG).map_err(|e| format!("write embedded kconfig: {e}"))?;
-    Ok((dir, path))
-}
-
 /// Configure the kernel with sched_ext support.
-fn configure_kernel(kernel_dir: &Path, kconfig: &Path) -> Result<(), String> {
+///
+/// Appends the kconfig fragment to .config and runs `make olddefconfig`
+/// to resolve dependencies. kconfig uses last-value-wins semantics for
+/// duplicate symbols (confdata.c:conf_read_simple), so appending is
+/// equivalent to merge_config.sh's delete-then-append approach — both
+/// produce the same resolved config after olddefconfig.
+fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<(), String> {
     eprintln!("cargo-ktstr: configuring kernel (sched_ext not found in .config)");
 
-    let has_config = kernel_dir.join(".config").exists();
-    if !has_config {
+    let config_path = kernel_dir.join(".config");
+    if !config_path.exists() {
         run_make(kernel_dir, &["defconfig"])?;
     }
 
-    let merge_script = kernel_dir.join("scripts/kconfig/merge_config.sh");
-    let merge_script = merge_script.canonicalize().map_err(|e| {
-        format!(
-            "merge_config.sh not found at {}: {e}",
-            merge_script.display()
-        )
-    })?;
-    let status = Command::new("sh")
-        .arg(&merge_script)
-        .args(["-m", ".config"])
-        .arg(kconfig)
-        .current_dir(kernel_dir)
-        .status()
-        .map_err(|e| format!("merge_config.sh: {e}"))?;
-    if !status.success() {
-        return Err("merge_config.sh failed".into());
-    }
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&config_path)
+        .map_err(|e| format!("open .config: {e}"))?;
+    std::io::Write::write_all(&mut config, fragment.as_bytes())
+        .map_err(|e| format!("append kconfig: {e}"))?;
 
     run_make(kernel_dir, &["olddefconfig"])?;
     Ok(())
@@ -134,8 +118,7 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     }
 
     if !has_sched_ext(kernel_dir) {
-        let (_tmpdir, kconfig) = write_embedded_kconfig()?;
-        configure_kernel(kernel_dir, &kconfig)?;
+        configure_kernel(kernel_dir, EMBEDDED_KCONFIG)?;
     }
 
     make_kernel(kernel_dir)?;
