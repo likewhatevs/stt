@@ -321,7 +321,7 @@ pub(crate) fn get_or_build_base(
             // We won the race — build, write, release.
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
-            let data = initramfs::create_initramfs_base(payload, extras)?;
+            let data = initramfs::create_initramfs_base(payload, extras, &[], false)?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
                 bytes = data.len(),
@@ -370,7 +370,7 @@ pub(crate) fn get_or_build_base(
 
     // 3. Fallback: build without SHM coordination.
     let t0 = std::time::Instant::now();
-    let data = initramfs::create_initramfs_base(payload, extras)?;
+    let data = initramfs::create_initramfs_base(payload, extras, &[], false)?;
     let arc = Arc::new(data);
     tracing::debug!(
         elapsed_us = t0.elapsed().as_micros(),

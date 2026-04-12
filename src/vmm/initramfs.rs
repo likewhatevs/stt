@@ -1,15 +1,18 @@
 /// Minimal initramfs (cpio newc format) creation via the `cpio` crate.
-/// Packs the test binary as `/init` along with scheduler binaries and
-/// shared libraries into a cpio archive for use as Linux initrd.
+/// Packs the test binary as `/init` along with scheduler binaries,
+/// shared libraries, optional busybox, and user-provided include files
+/// into a cpio archive for use as Linux initrd.
 /// Init setup is handled by Rust code in `vmm::rust_init`.
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Resolve shared library dependencies for a dynamically-linked binary.
 /// Runs `ldd`, parses output, returns `(guest_path, host_path)` pairs.
 /// Skips linux-vdso (kernel-provided). Returns empty vec for static binaries.
+/// Warns to stderr for any dependency ldd reports as "not found".
 pub fn resolve_shared_libs(binary: &Path) -> Result<Vec<(String, PathBuf)>> {
     let output = std::process::Command::new("ldd")
         .arg(binary)
@@ -28,6 +31,10 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<Vec<(String, PathBuf)>> {
     for line in stdout.lines() {
         let line = line.trim();
         if line.contains("linux-vdso") || line.contains("linux-gate") {
+            continue;
+        }
+        if line.contains("not found") {
+            eprintln!("warning: ldd {}: {line}", binary.display());
             continue;
         }
         if let Some(path) = parse_ldd_line(line) {
@@ -66,6 +73,21 @@ fn parse_ldd_line(line: &str) -> Option<String> {
         return Some(path.to_string());
     }
     None
+}
+
+/// ELF magic bytes: `\x7fELF`.
+const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+
+/// Check if the first 4 bytes of a file match ELF magic.
+fn is_elf(path: &Path) -> bool {
+    std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            let mut magic = [0u8; 4];
+            f.read_exact(&mut magic)?;
+            Ok(magic)
+        })
+        .is_ok_and(|m| m == *ELF_MAGIC)
 }
 
 /// Write one entry (file or directory) into the cpio archive.
@@ -147,19 +169,72 @@ fn is_deleted_self(path: &Path) -> bool {
 /// The test binary is packed as `/init` (the kernel's rdinit entry point).
 /// Init setup (mounts, scheduler start, etc.) is handled by the Rust init
 /// code in `vmm::rust_init`, which runs when the binary detects PID 1.
-pub fn create_initramfs_base(payload: &Path, extra_binaries: &[(&str, &Path)]) -> Result<Vec<u8>> {
+///
+/// When `busybox` is true, embeds busybox at `bin/busybox` for shell mode.
+///
+/// `include_files` adds files verbatim to the archive (no strip_debug).
+/// Each entry is `(archive_path, host_path)`. ELF files get shared library
+/// resolution; non-ELF files are copied as-is. Only regular files are
+/// accepted; FIFOs, device nodes, and sockets are rejected. Archive paths
+/// must not contain `..` components.
+pub fn create_initramfs_base(
+    payload: &Path,
+    extra_binaries: &[(&str, &Path)],
+    include_files: &[(&str, &Path)],
+    busybox: bool,
+) -> Result<Vec<u8>> {
+    // Validate include_files and collect metadata (reused in the write
+    // loop to avoid a second stat syscall per file).
+    let mut validated_includes: Vec<(&str, &Path, u32)> = Vec::with_capacity(include_files.len());
+    for (archive_path, host_path) in include_files {
+        // Reject path traversal.
+        if Path::new(archive_path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("include_files archive path contains '..': {}", archive_path);
+        }
+        // Reject non-regular files (FIFOs, device nodes, sockets block or
+        // produce garbage).
+        let meta = std::fs::metadata(host_path).with_context(|| {
+            format!(
+                "stat include file '{}': {}",
+                archive_path,
+                host_path.display()
+            )
+        })?;
+        if !meta.file_type().is_file() {
+            anyhow::bail!(
+                "include_files entry '{}' is not a regular file: {}",
+                archive_path,
+                host_path.display()
+            );
+        }
+        validated_includes.push((archive_path, host_path, meta.permissions().mode()));
+    }
+
     let binary = strip_debug(payload)
         .with_context(|| format!("strip/read binary: {}", payload.display()))?;
     let mut archive = Vec::new();
 
-    // Collect directory entries needed for shared libraries.
+    // Collect directory entries needed for shared libraries and includes.
     let mut dirs = BTreeSet::new();
 
     // Resolve shared library dependencies for init binary and extras.
     let mut shared_libs: Vec<(String, PathBuf)> = Vec::new();
-    let all_binaries: Vec<&Path> = std::iter::once(payload)
+    let mut all_binaries: Vec<&Path> = std::iter::once(payload)
         .chain(extra_binaries.iter().map(|(_, p)| *p))
         .collect();
+
+    // ELF files from include_files join the shared lib resolution chain.
+    // "not found" warnings are emitted by resolve_shared_libs during the
+    // ldd parse loop below.
+    for (_, host_path) in include_files {
+        if is_elf(host_path) {
+            all_binaries.push(host_path);
+        }
+    }
+
     for path in &all_binaries {
         let libs = resolve_shared_libs(path)
             .with_context(|| format!("resolve libs for {}", path.display()))?;
@@ -177,6 +252,23 @@ pub fn create_initramfs_base(payload: &Path, extra_binaries: &[(&str, &Path)]) -
     shared_libs.sort_by(|a, b| a.0.cmp(&b.0));
     shared_libs.dedup_by(|a, b| a.0 == b.0);
 
+    // Busybox needs bin/ directory.
+    if busybox {
+        dirs.insert("bin".to_string());
+    }
+    // Include files need their parent directories in the cpio archive.
+    // The component walk produces all ancestors (e.g. "include-files/sub/f"
+    // yields "include-files" and "include-files/sub").
+    for (archive_path, _, _) in &validated_includes {
+        if let Some(parent) = Path::new(archive_path).parent() {
+            let mut dir = PathBuf::new();
+            for component in parent.components() {
+                dir.push(component);
+                dirs.insert(dir.to_string_lossy().to_string());
+            }
+        }
+    }
+
     // Directory entries
     for dir in &dirs {
         write_entry(&mut archive, dir, &[], 0o40755)?;
@@ -186,11 +278,30 @@ pub fn create_initramfs_base(payload: &Path, extra_binaries: &[(&str, &Path)]) -
     // all setup (mounts, scheduler, etc.) before running the test function.
     write_entry(&mut archive, "init", &binary, 0o100755)?;
 
+    // Shell mode: embed busybox.
+    if busybox {
+        write_entry(&mut archive, "bin/busybox", crate::BUSYBOX, 0o100755)?;
+    }
+
     // Extra binaries (stripped to reduce initramfs size)
     for (name, path) in extra_binaries {
         let data = strip_debug(path)
             .with_context(|| format!("strip/read extra binary '{}': {}", name, path.display()))?;
         write_entry(&mut archive, name, &data, 0o100755)?;
+    }
+
+    // Include files: copied verbatim, preserving original content and
+    // debug symbols. No strip_debug — included files are user-provided
+    // and may be non-ELF.
+    for (archive_path, host_path, mode) in &validated_includes {
+        let data = std::fs::read(host_path).with_context(|| {
+            format!(
+                "read include file '{}': {}",
+                archive_path,
+                host_path.display()
+            )
+        })?;
+        write_entry(&mut archive, archive_path, &data, *mode)?;
     }
 
     // Shared libraries
@@ -266,7 +377,7 @@ pub fn create_initramfs(
     extra_binaries: &[(&str, &Path)],
     args: &[String],
 ) -> Result<Vec<u8>> {
-    let base = create_initramfs_base(payload, extra_binaries)?;
+    let base = create_initramfs_base(payload, extra_binaries, &[], false)?;
     let suffix = build_suffix(base.len(), args, &[])?;
     let mut archive = Vec::with_capacity(base.len() + suffix.len());
     archive.extend_from_slice(&base);
@@ -544,6 +655,21 @@ pub fn load_initramfs_parts(
 mod tests {
     use super::*;
 
+    /// Extract cpio entry names from a newc archive for test assertions.
+    fn cpio_entry_names(archive: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut remaining: &[u8] = archive;
+        while let Ok(reader) = cpio::newc::Reader::new(remaining) {
+            let name = reader.entry().name().to_string();
+            if reader.entry().is_trailer() {
+                break;
+            }
+            names.push(name);
+            remaining = reader.finish().unwrap();
+        }
+        names
+    }
+
     #[test]
     fn cpio_header_format() {
         let mut archive = Vec::new();
@@ -572,7 +698,7 @@ mod tests {
     #[test]
     fn create_initramfs_base_is_valid_cpio() {
         let exe = crate::resolve_current_exe().unwrap();
-        let initrd = create_initramfs_base(&exe, &[]).unwrap();
+        let initrd = create_initramfs_base(&exe, &[], &[], false).unwrap();
         assert_eq!(&initrd[..6], b"070701");
         // Base is NOT 512-aligned on its own; only base+suffix is.
         let full = create_initramfs(&exe, &[], &[]).unwrap();
@@ -620,7 +746,7 @@ mod tests {
     #[test]
     fn suffix_adds_args_and_trailer() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[]).unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let args = vec!["run".into(), "--json".into()];
         let suffix = build_suffix(base.len(), &args, &[]).unwrap();
         let s = String::from_utf8_lossy(&suffix);
@@ -638,7 +764,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let args = vec!["run".into(), "--json".into(), "scenario".into()];
         let monolithic = create_initramfs(&exe, &[], &args).unwrap();
-        let base = create_initramfs_base(&exe, &[]).unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let suffix = build_suffix(base.len(), &args, &[]).unwrap();
         let mut split = Vec::with_capacity(base.len() + suffix.len());
         split.extend_from_slice(&base);
@@ -652,7 +778,7 @@ mod tests {
     #[test]
     fn suffix_different_args_differ() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[]).unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let a = build_suffix(base.len(), &["a".into()], &[]).unwrap();
         let b = build_suffix(base.len(), &["b".into()], &[]).unwrap();
         assert_ne!(a, b, "different args should produce different suffixes");
@@ -661,7 +787,7 @@ mod tests {
     #[test]
     fn suffix_empty_args() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[]).unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let suffix = build_suffix(base.len(), &[], &[]).unwrap();
         assert_eq!((base.len() + suffix.len()) % 512, 0);
         let s = String::from_utf8_lossy(&suffix);
@@ -751,7 +877,7 @@ mod tests {
     #[test]
     fn suffix_with_sched_args() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[]).unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let sched_args = vec!["--enable-borrow".into(), "--llc".into()];
         let suffix = build_suffix(base.len(), &[], &sched_args).unwrap();
         let s = String::from_utf8_lossy(&suffix);
@@ -766,7 +892,7 @@ mod tests {
     #[test]
     fn suffix_without_sched_args_omits_entry() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[]).unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let suffix = build_suffix(base.len(), &[], &[]).unwrap();
         let s = String::from_utf8_lossy(&suffix);
         assert!(
@@ -883,7 +1009,7 @@ mod tests {
     #[test]
     fn create_initramfs_base_contains_init() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[]).unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("init"), "base should contain init entry");
     }
@@ -897,7 +1023,7 @@ mod tests {
             return;
         }
         let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
-        let base = create_initramfs_base(&exe, &extras).unwrap();
+        let base = create_initramfs_base(&exe, &extras, &[], false).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(
             s.contains("lib64/libelf"),
@@ -922,5 +1048,211 @@ mod tests {
         use vm_memory::{Bytes, GuestAddress};
         mem.read_slice(&mut buf, GuestAddress(0x200000)).unwrap();
         assert_eq!(buf, data);
+    }
+
+    // -- include_files and busybox tests --
+
+    #[test]
+    fn busybox_with_include_files() {
+        let exe = crate::resolve_current_exe().unwrap();
+        // Create a temp file to include.
+        let tmp = std::env::temp_dir().join("ktstr-test-include-busybox");
+        std::fs::write(&tmp, b"hello").unwrap();
+        let includes: Vec<(&str, &Path)> = vec![("include-files/test.txt", tmp.as_path())];
+        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let names = cpio_entry_names(&base);
+        assert!(
+            names.iter().any(|n| n == "bin/busybox"),
+            "busybox=true should have bin/busybox entry: {:?}",
+            names
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn include_files_no_busybox_when_empty() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let names = cpio_entry_names(&base);
+        assert!(
+            !names.iter().any(|n| n == "bin/busybox"),
+            "busybox=false should not have bin/busybox entry: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn include_files_preserves_mode() {
+        let tmp = std::env::temp_dir().join("ktstr-test-include-mode");
+        std::fs::write(&tmp, b"script content").unwrap();
+        // Set executable mode.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o100755)).unwrap();
+
+        let exe = crate::resolve_current_exe().unwrap();
+        let includes: Vec<(&str, &Path)> = vec![("include-files/run.sh", tmp.as_path())];
+        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let s = String::from_utf8_lossy(&base);
+        assert!(
+            s.contains("include-files/run.sh"),
+            "include path should appear in cpio"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn include_files_elf_gets_shared_libs() {
+        // /bin/sh is a dynamic ELF on most systems.
+        let sh = Path::new("/bin/sh");
+        if !sh.exists() {
+            eprintln!("skipping: /bin/sh not found");
+            return;
+        }
+        if !is_elf(sh) {
+            eprintln!("skipping: /bin/sh is not ELF");
+            return;
+        }
+        let exe = crate::resolve_current_exe().unwrap();
+        let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
+        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let s = String::from_utf8_lossy(&base);
+        // Dynamic ELF should pull in libc shared libs.
+        let libs = resolve_shared_libs(sh).unwrap();
+        if !libs.is_empty() {
+            assert!(
+                libs.iter().any(|(g, _)| s.contains(g.as_str())),
+                "include ELF shared libs should appear in archive: {:?}",
+                libs
+            );
+        }
+    }
+
+    #[test]
+    fn include_files_non_elf_no_shared_libs() {
+        let tmp = std::env::temp_dir().join("ktstr-test-include-nonelf");
+        std::fs::write(&tmp, b"#!/bin/sh\necho hello\n").unwrap();
+        let exe = crate::resolve_current_exe().unwrap();
+        let includes: Vec<(&str, &Path)> = vec![("include-files/hello.sh", tmp.as_path())];
+        // Should not fail (ldd not run on non-ELF).
+        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let s = String::from_utf8_lossy(&base);
+        assert!(s.contains("include-files/hello.sh"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn include_files_adds_directory_entries() {
+        let tmp = std::env::temp_dir().join("ktstr-test-include-dirs");
+        std::fs::write(&tmp, b"data").unwrap();
+        let exe = crate::resolve_current_exe().unwrap();
+        let includes: Vec<(&str, &Path)> =
+            vec![("include-files/subdir/nested/file.txt", tmp.as_path())];
+        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let s = String::from_utf8_lossy(&base);
+        assert!(s.contains("include-files"), "should have include-files dir");
+        assert!(
+            s.contains("include-files/subdir"),
+            "should have subdir entry"
+        );
+        assert!(
+            s.contains("include-files/subdir/nested"),
+            "should have nested subdir entry"
+        );
+        assert!(s.contains("bin"), "should have bin dir for busybox");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn is_elf_detects_elf_binary() {
+        let exe = crate::resolve_current_exe().unwrap();
+        assert!(is_elf(&exe), "test binary should be ELF");
+    }
+
+    #[test]
+    fn is_elf_rejects_non_elf() {
+        let tmp = std::env::temp_dir().join("ktstr-test-not-elf");
+        std::fs::write(&tmp, b"not an elf file").unwrap();
+        assert!(!is_elf(&tmp));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn is_elf_rejects_short_file() {
+        let tmp = std::env::temp_dir().join("ktstr-test-short-elf");
+        std::fs::write(&tmp, b"ab").unwrap();
+        assert!(!is_elf(&tmp));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn is_elf_nonexistent_returns_false() {
+        assert!(!is_elf(Path::new("/nonexistent/file")));
+    }
+
+    #[test]
+    fn include_files_rejects_path_traversal() {
+        let tmp = std::env::temp_dir().join("ktstr-test-traversal");
+        std::fs::write(&tmp, b"data").unwrap();
+        let exe = crate::resolve_current_exe().unwrap();
+        let includes: Vec<(&str, &Path)> = vec![("include-files/../etc/passwd", tmp.as_path())];
+        let result = create_initramfs_base(&exe, &[], &includes, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(".."),
+            "error should mention path traversal: {err}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn include_files_rejects_fifo() {
+        let fifo_path = std::env::temp_dir().join("ktstr-test-fifo");
+        let _ = std::fs::remove_file(&fifo_path);
+        // Create a FIFO.
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        if rc != 0 {
+            eprintln!("skipping: mkfifo failed");
+            return;
+        }
+        let exe = crate::resolve_current_exe().unwrap();
+        let includes: Vec<(&str, &Path)> = vec![("include-files/pipe", fifo_path.as_path())];
+        let result = create_initramfs_base(&exe, &[], &includes, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not a regular file"),
+            "error should reject FIFO: {err}"
+        );
+        let _ = std::fs::remove_file(&fifo_path);
+    }
+
+    #[test]
+    fn include_files_rejects_directory() {
+        let dir_path = std::env::temp_dir().join("ktstr-test-include-dir");
+        let _ = std::fs::create_dir(&dir_path);
+        let exe = crate::resolve_current_exe().unwrap();
+        let includes: Vec<(&str, &Path)> = vec![("include-files/mydir", dir_path.as_path())];
+        let result = create_initramfs_base(&exe, &[], &includes, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not a regular file"),
+            "error should reject directory: {err}"
+        );
+        let _ = std::fs::remove_dir(&dir_path);
+    }
+
+    #[test]
+    fn busybox_independent_of_include_files() {
+        let exe = crate::resolve_current_exe().unwrap();
+        // busybox=true but no include_files.
+        let base = create_initramfs_base(&exe, &[], &[], true).unwrap();
+        let names = cpio_entry_names(&base);
+        assert!(
+            names.iter().any(|n| n == "bin/busybox"),
+            "busybox=true should have bin/busybox entry even without includes: {:?}",
+            names
+        );
     }
 }
