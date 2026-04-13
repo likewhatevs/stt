@@ -44,6 +44,11 @@ CONFIG_DYNAMIC_FTRACE=y
 # Both drivers are included so the same fragment works on either arch.
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
+# FDT-based probing for 8250 ports — required on arm64 where the
+# VMM's ns16550a UARTs are described in the device tree. Without
+# this, the kernel has no driver to match the ns16550a FDT nodes
+# and /dev/ttyS* devices are never created.
+CONFIG_SERIAL_OF_PLATFORM=y
 CONFIG_SERIAL_AMBA_PL011=y
 CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
 # Virtio-console: MMIO transport, creates /dev/hvc0 for shell mode.
