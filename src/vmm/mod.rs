@@ -1468,10 +1468,19 @@ impl KtstrVm {
                         }
                     }
                 }
-                // Skip final drain — on forced kill (Ctrl+A X), the VM
-                // was terminated mid-operation and remaining TX data is
-                // likely partial/garbled. On clean exit, the guest
-                // flushed before shutting down so there's nothing left.
+                // Final drain: the guest may have flushed output just
+                // before shutdown that hasn't been polled yet.
+                let data = vc_for_stdout.lock().drain_output();
+                if !data.is_empty() {
+                    let valid_len = match std::str::from_utf8(&data) {
+                        Ok(_) => data.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if valid_len > 0 {
+                        let _ = stdout.write_all(&data[..valid_len]);
+                        let _ = stdout.flush();
+                    }
+                }
             })
             .context("spawn stdout writer thread")?;
 
@@ -1566,7 +1575,7 @@ impl KtstrVm {
             }
         }
 
-        println!("Connection to VM closed.");
+        eprintln!("Connection to VM closed.");
         Ok(())
     }
 
