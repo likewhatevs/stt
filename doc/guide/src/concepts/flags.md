@@ -5,6 +5,12 @@ enabled or disabled. The `#[derive(Scheduler)]` macro defines typed
 flags from enum variants, generating compile-time checked constants
 and `FlagDecl` statics.
 
+Schedulers have optional features (LLC awareness, work stealing, CPU
+borrowing) toggled via CLI arguments. Flags let you test every valid
+combination automatically -- the gauntlet generates one test variant per
+flag combination, ensuring the scheduler works with any subset of
+features enabled.
+
 ## Defining flags
 
 Annotate an enum with `#[derive(Scheduler)]`. Each variant becomes a
