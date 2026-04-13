@@ -1410,10 +1410,12 @@ impl KtstrVm {
         // to stop the VM rather than polling a dead pipe until timeout.
         let vc_for_stdout = virtio_con.clone();
         let kill_for_stdout = kill.clone();
-        let stdout_thread = std::thread::Builder::new()
+        let stdout_thread: JoinHandle<bool> = std::thread::Builder::new()
             .name("interactive-stdout".into())
             .spawn(move || {
                 use std::io::Write;
+
+                let mut wrote_any = false;
 
                 // Cache the raw fd for poll. The eventfd lives as long as
                 // VirtioConsole which is behind Arc<PiMutex> — valid for
@@ -1462,12 +1464,14 @@ impl KtstrVm {
                             Ok(_) => data.len(),
                             Err(e) => e.valid_up_to(),
                         };
-                        if valid_len > 0
-                            && (stdout.write_all(&data[..valid_len]).is_err()
-                                || stdout.flush().is_err())
-                        {
-                            kill_for_stdout.store(true, Ordering::Release);
-                            break;
+                        if valid_len > 0 {
+                            if stdout.write_all(&data[..valid_len]).is_err()
+                                || stdout.flush().is_err()
+                            {
+                                kill_for_stdout.store(true, Ordering::Release);
+                                break;
+                            }
+                            wrote_any = true;
                         }
                     }
                 }
@@ -1482,8 +1486,10 @@ impl KtstrVm {
                     if valid_len > 0 {
                         let _ = stdout.write_all(&data[..valid_len]);
                         let _ = stdout.flush();
+                        wrote_any = true;
                     }
                 }
+                wrote_any
             })
             .context("spawn stdout writer thread")?;
 
@@ -1560,7 +1566,7 @@ impl KtstrVm {
             let _ = vt.handle.join();
         }
 
-        let _ = stdout_thread.join();
+        let stdout_wrote = stdout_thread.join().unwrap_or(false);
         let _ = stdin_thread.join();
         if let Some(dt) = dmesg_thread {
             let _ = dt.join();
@@ -1568,6 +1574,25 @@ impl KtstrVm {
 
         // _raw_guard drops here, restoring terminal and signal handlers.
         drop(_raw_guard);
+
+        // Exec mode fallback: if virtio-console produced no output
+        // (kernel lacks CONFIG_VIRTIO_CONSOLE, guest fell back to
+        // COM2), print COM2 output to stdout so the caller sees it.
+        // Filter out the KTSTR_EXEC_EXIT sentinel which the guest
+        // writes to stderr (also COM2 in the fallback case).
+        if exec_mode && !stdout_wrote {
+            let app_output = com2.lock().output();
+            if !app_output.is_empty() {
+                use std::io::Write;
+                let mut stdout = std::io::stdout().lock();
+                for line in app_output.lines() {
+                    if !line.starts_with("KTSTR_EXEC_EXIT=") {
+                        let _ = writeln!(stdout, "{line}");
+                    }
+                }
+                let _ = stdout.flush();
+            }
+        }
 
         // Print kernel console output (COM1) to stderr if non-empty.
         // Skip when --dmesg was active (already streamed to stderr).

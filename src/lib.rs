@@ -419,14 +419,6 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 if entry.has_stale_kconfig(&kc_hash) {
                     continue;
                 }
-                // Skip entries built by a different ktstr version.
-                if meta
-                    .ktstr_git_hash
-                    .as_deref()
-                    .is_some_and(|h| h != GIT_FULL_HASH)
-                {
-                    continue;
-                }
                 let image = entry.path.join(&meta.image_name);
                 if image.exists() {
                     return Ok(Some(image));

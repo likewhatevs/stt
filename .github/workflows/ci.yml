@@ -29,6 +29,8 @@ jobs:
 
   test-x64:
     runs-on: [self-hosted, X64]
+    env:
+      KTSTR_GHA_CACHE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,6 +39,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - name: Cache kernel images
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ktstr/kernels
+          key: ktstr-kernels-x64-${{ hashFiles('ktstr.kconfig') }}
+          restore-keys: ktstr-kernels-x64-
+      - name: Build test kernel
+        run: cargo run --bin cargo-ktstr --features gha-cache -- ktstr kernel build
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
