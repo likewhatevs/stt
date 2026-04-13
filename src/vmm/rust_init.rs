@@ -198,13 +198,26 @@ pub(crate) fn ktstr_guest_init() -> ! {
         let _ = std::io::stdout().flush();
 
         // --exec mode: run a command non-interactively instead of
-        // dropping into an interactive shell. The exit code is passed
-        // to force_reboot (0 = clean shutdown, non-zero = error).
+        // dropping into an interactive shell. Output goes to /dev/hvc0
+        // (virtio-console) so the host captures it on stdout. Without
+        // this redirect, output goes to /dev/console (COM1) which the
+        // host reads as kernel console, not command output.
         if let Some(cmd) = shell_exec_cmd() {
             tracing::debug!(cmd = %cmd, "shell exec mode");
-            let status = Command::new("/bin/busybox")
-                .args(["sh", "-c", &cmd])
-                .status();
+            use std::os::unix::io::OwnedFd;
+            let hvc0 = std::fs::OpenOptions::new().write(true).open("/dev/hvc0");
+            let mut child_cmd = Command::new("/bin/busybox");
+            child_cmd.args(["sh", "-c", &cmd]);
+            if let Ok(f) = hvc0 {
+                let fd: OwnedFd = f.into();
+                child_cmd
+                    .stdout(unsafe { Stdio::from(OwnedFd::from_raw_fd(fd.as_raw_fd())) })
+                    .stderr(unsafe {
+                        Stdio::from(OwnedFd::from_raw_fd(libc::dup(fd.as_raw_fd())))
+                    });
+                std::mem::forget(fd); // ownership transferred to Stdio
+            }
+            let status = child_cmd.status();
             let code = match status {
                 Ok(s) => s.code().unwrap_or(1),
                 Err(e) => {
