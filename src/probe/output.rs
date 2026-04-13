@@ -346,6 +346,14 @@ fn format_probe_events_inner(
         }
     }
 
+    /// Extract struct name from a field key like `"p:task_struct.field"`.
+    /// Returns `""` when no struct context is present.
+    fn struct_from_key(key: &str) -> &str {
+        let (param_part, _) = key.split_once('.').unwrap_or((key, key));
+        let (_, sname) = param_part.split_once(':').unwrap_or(("", ""));
+        if sname == "val" { "" } else { sname }
+    }
+
     // Dynamic field name width for column alignment.
     let max_field_w: usize = events
         .iter()
@@ -374,8 +382,9 @@ fn format_probe_events_inner(
         .iter()
         .flat_map(|e| e.fields.iter())
         .map(|(k, v)| {
+            let sname = struct_from_key(k);
             let (_, field) = k.split_once('.').unwrap_or((k, k));
-            let decoded = super::decode::decode_named_value(field, &v.to_string());
+            let decoded = super::decode::decode_named_value(sname, field, &v.to_string());
             6 + max_field_w + 2 + decoded.len()
         })
         .max()
@@ -431,7 +440,7 @@ fn format_probe_events_inner(
                         } else if ptype == "ptr" {
                             format_raw_arg(val)
                         } else {
-                            decode_named_value(pname, &val.to_string())
+                            decode_named_value("", pname, &val.to_string())
                         };
                         (lbl, dec)
                     } else {
@@ -496,10 +505,11 @@ fn format_probe_events_inner(
                 } else {
                     pname.to_string()
                 };
+                let sname = struct_from_key(key);
                 let entry_decoded = if field == "cpumask_0" {
                     merged_cpumask_str.clone()
                 } else {
-                    decode_named_value(field, &val.to_string())
+                    decode_named_value(sname, field, &val.to_string())
                 };
                 let exit_decoded = if has_exit {
                     if field == "cpumask_0" {
@@ -507,7 +517,7 @@ fn format_probe_events_inner(
                     } else {
                         exit_map
                             .get(field)
-                            .map(|ev| decode_named_value(field, &ev.to_string()))
+                            .map(|ev| decode_named_value(sname, field, &ev.to_string()))
                     }
                 } else {
                     None

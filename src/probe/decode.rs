@@ -126,14 +126,19 @@ pub(crate) fn format_raw_arg(val: u64) -> String {
     }
 }
 
-/// Decode a named field value based on the field key.
+/// Decode a named field value based on the struct type and field name.
+///
+/// `struct_name` is the originating struct (e.g. `"task_struct"`,
+/// `"rq"`). SCX-specific decoders only fire for their owning struct
+/// to avoid misinterpreting identically-named fields on unrelated types.
+/// Pass `""` for scalar params or unknown context.
 ///
 /// Dispatches to specialized decoders: `dsq_id` -> [`decode_dsq_id`],
 /// `cpus_ptr`/`cpumask*` -> [`decode_cpumask`], `enq_flags` ->
 /// [`decode_enq_flags`], `exit_kind` -> [`decode_exit_kind`],
 /// `scx_flags` -> task state/queue flags, etc. Unknown keys pass
 /// the value through unchanged.
-pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
+pub(crate) fn decode_named_value(struct_name: &str, key: &str, val: &str) -> String {
     let as_u64 = || -> u64 {
         if let Some(hex) = val.strip_prefix("0x") {
             u64::from_str_radix(hex, 16).unwrap_or(0)
@@ -155,8 +160,14 @@ pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
                 "false".into()
             }
         }
-        "enq_flags" | "enq" | "enqflags" => decode_enq_flags(as_u64()),
-        "exit_kind" => decode_exit_kind(as_u64()),
+        "enq_flags" | "enq" | "enqflags"
+            if struct_name.is_empty() || struct_name == "task_struct" =>
+        {
+            decode_enq_flags(as_u64())
+        }
+        "exit_kind" if struct_name.is_empty() || struct_name == "scx_exit_info" => {
+            decode_exit_kind(as_u64())
+        }
         "sticky_cpu" | "sticky" => {
             let v = as_u64();
             if v == 0xffffffff || v == 0xffffffffffffffff {
@@ -175,7 +186,7 @@ pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
         "weight" => val.to_string(),
         "kick_flags" | "kick" => decode_kick_flags(as_u64()),
         "ops_state" | "opss" => decode_ops_state(as_u64()),
-        "flags" | "scx_flags" => {
+        "flags" | "scx_flags" if struct_name.is_empty() || struct_name == "task_struct" => {
             let v = as_u64();
             let mut parts = Vec::new();
             if v & TASK_QUEUED != 0 {
@@ -389,55 +400,61 @@ mod tests {
     fn decode_named_value_dsq_id() {
         let v = (1u64 << 63) | 2;
         assert_eq!(
-            decode_named_value("dsq_id", &v.to_string()),
+            decode_named_value("", "dsq_id", &v.to_string()),
             "SCX_DSQ_LOCAL"
         );
     }
 
     #[test]
     fn decode_named_value_cpus_ptr() {
-        let out = decode_named_value("cpus_ptr", "15");
+        let out = decode_named_value("", "cpus_ptr", "15");
         assert!(out.contains("0-3"), "got: {out}");
     }
 
     #[test]
     fn decode_named_value_enq_flags() {
-        assert_eq!(decode_named_value("enq_flags", "1"), "WAKEUP");
+        assert_eq!(
+            decode_named_value("task_struct", "enq_flags", "1"),
+            "WAKEUP"
+        );
     }
 
     #[test]
     fn decode_named_value_exit_kind() {
-        assert_eq!(decode_named_value("exit_kind", "1024"), "ERROR");
+        assert_eq!(
+            decode_named_value("scx_exit_info", "exit_kind", "1024"),
+            "ERROR"
+        );
     }
 
     #[test]
     fn decode_named_value_sticky_minus_one() {
         assert_eq!(
-            decode_named_value("sticky_cpu", &0xffffffffu64.to_string()),
+            decode_named_value("", "sticky_cpu", &0xffffffffu64.to_string()),
             "-1"
         );
     }
 
     #[test]
     fn decode_named_value_pid_passthrough() {
-        assert_eq!(decode_named_value("pid", "1234"), "1234");
+        assert_eq!(decode_named_value("", "pid", "1234"), "1234");
     }
 
     #[test]
     fn decode_named_value_unknown_key() {
-        assert_eq!(decode_named_value("foobar", "hello"), "hello");
+        assert_eq!(decode_named_value("", "foobar", "hello"), "hello");
     }
 
     #[test]
     fn decode_named_value_enforce_true() {
-        assert_eq!(decode_named_value("enforce", "1"), "true");
+        assert_eq!(decode_named_value("", "enforce", "1"), "true");
     }
 
     #[test]
     fn decode_named_value_scx_flags() {
         let v = TASK_QUEUED | (TASK_STATE_ENABLED << TASK_STATE_SHIFT);
         assert_eq!(
-            decode_named_value("scx_flags", &v.to_string()),
+            decode_named_value("task_struct", "scx_flags", &v.to_string()),
             "QUEUED|ENABLED"
         );
     }
@@ -564,54 +581,54 @@ mod tests {
 
     #[test]
     fn decode_named_value_enforce_true_literal() {
-        assert_eq!(decode_named_value("enforce", "true"), "true");
+        assert_eq!(decode_named_value("", "enforce", "true"), "true");
     }
 
     #[test]
     fn decode_named_value_enforce_zero() {
-        assert_eq!(decode_named_value("enforce", "0"), "false");
+        assert_eq!(decode_named_value("", "enforce", "0"), "false");
     }
 
     #[test]
     fn decode_named_value_enforce_other() {
-        assert_eq!(decode_named_value("enforce", "2"), "false");
+        assert_eq!(decode_named_value("", "enforce", "2"), "false");
     }
 
     #[test]
     fn decode_named_value_dsq_id_hex_prefix() {
         // hex-prefixed dsq_id value
         let hex_val = format!("0x{:x}", (DSQ_TYPE_BUILTIN << DSQ_TYPE_SHIFT) | 1);
-        assert_eq!(decode_named_value("dsq_id", &hex_val), "SCX_DSQ_GLOBAL");
+        assert_eq!(decode_named_value("", "dsq_id", &hex_val), "SCX_DSQ_GLOBAL");
     }
 
     #[test]
     fn decode_named_value_slice_key() {
-        assert_eq!(decode_named_value("slice", "5000000"), "5000000");
+        assert_eq!(decode_named_value("", "slice", "5000000"), "5000000");
     }
 
     #[test]
     fn decode_named_value_vtime_key() {
-        assert_eq!(decode_named_value("vtime", "123456789"), "123456789");
+        assert_eq!(decode_named_value("", "vtime", "123456789"), "123456789");
     }
 
     #[test]
     fn decode_named_value_slice_hex_prefix() {
         // Hex-prefixed slice value
-        assert_eq!(decode_named_value("slice", "0x4c4b40"), "5000000");
+        assert_eq!(decode_named_value("", "slice", "0x4c4b40"), "5000000");
     }
 
     #[test]
     fn decode_named_value_sticky_cpu_64bit_minus_one() {
         // 64-bit -1 (0xffffffffffffffff) should decode to "-1"
         assert_eq!(
-            decode_named_value("sticky_cpu", &0xffffffffffffffffu64.to_string()),
+            decode_named_value("", "sticky_cpu", &0xffffffffffffffffu64.to_string()),
             "-1"
         );
     }
 
     #[test]
     fn decode_named_value_sticky_cpu_normal() {
-        assert_eq!(decode_named_value("sticky_cpu", "7"), "7");
+        assert_eq!(decode_named_value("", "sticky_cpu", "7"), "7");
     }
 
     #[test]
@@ -761,19 +778,19 @@ mod tests {
 
     #[test]
     fn decode_named_value_cpumask_0() {
-        let out = decode_named_value("cpumask_0", "15");
+        let out = decode_named_value("", "cpumask_0", "15");
         assert!(out.contains("0-3"), "got: {out}");
     }
 
     #[test]
     fn decode_named_value_cpumask_1() {
-        let out = decode_named_value("cpumask_1", "1");
+        let out = decode_named_value("", "cpumask_1", "1");
         assert!(out.contains("0x1"), "got: {out}");
     }
 
     #[test]
     fn decode_named_value_cpumask_3() {
-        let out = decode_named_value("cpumask_3", "0");
+        let out = decode_named_value("", "cpumask_3", "0");
         assert!(out.contains("0x0"), "got: {out}");
     }
 
@@ -781,7 +798,50 @@ mod tests {
 
     #[test]
     fn decode_named_value_key_containing_cpumask() {
-        let out = decode_named_value("my_cpumask_field", "255");
+        let out = decode_named_value("", "my_cpumask_field", "255");
         assert!(out.contains("0-7"), "wildcard cpumask key: {out}");
+    }
+
+    // -- decode_named_value struct scoping --
+
+    #[test]
+    fn decode_named_value_flags_wrong_struct_passthrough() {
+        // "flags" on a non-task_struct should pass through raw, not decode as scx flags.
+        assert_eq!(decode_named_value("rq_flags", "flags", "42"), "42");
+    }
+
+    #[test]
+    fn decode_named_value_flags_task_struct_decodes() {
+        let v = TASK_QUEUED;
+        assert_eq!(
+            decode_named_value("task_struct", "flags", &v.to_string()),
+            "QUEUED"
+        );
+    }
+
+    #[test]
+    fn decode_named_value_enq_flags_wrong_struct_passthrough() {
+        // "enq_flags" on a non-task_struct should pass through raw.
+        assert_eq!(decode_named_value("some_other", "enq_flags", "1"), "1");
+    }
+
+    #[test]
+    fn decode_named_value_exit_kind_wrong_struct_passthrough() {
+        // "exit_kind" on a non-scx_exit_info struct should pass through raw.
+        assert_eq!(
+            decode_named_value("other_struct", "exit_kind", "1024"),
+            "1024"
+        );
+    }
+
+    #[test]
+    fn decode_named_value_enq_flags_empty_struct_decodes() {
+        // Empty struct_name (scalar param) should still decode.
+        assert_eq!(decode_named_value("", "enq_flags", "1"), "WAKEUP");
+    }
+
+    #[test]
+    fn decode_named_value_exit_kind_empty_struct_decodes() {
+        assert_eq!(decode_named_value("", "exit_kind", "1024"), "ERROR");
     }
 }
