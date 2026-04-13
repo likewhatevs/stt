@@ -293,10 +293,10 @@ pub fn run_make_with_output(
 
     let status = child.wait()?;
     if !status.success() {
-        if spinner.is_none() {
-            for line in &captured {
-                eprintln!("{line}");
-            }
+        // Always show captured output on failure so CI logs contain
+        // the actual compiler errors, not just "make failed".
+        for line in &captured {
+            eprintln!("{line}");
         }
         bail!("make {} failed", args.join(" "));
     }

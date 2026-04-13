@@ -1236,10 +1236,13 @@ impl KtstrVm {
                 .context("register virtio-console irqfd")?;
         }
 
+        // Non-interactive exec mode (--exec) does not need a TTY.
+        let exec_mode = self.cmdline_extra.contains("KTSTR_SHELL_EXEC=");
+
         // Pre-flight: verify stdin is a tty, enter raw mode, and create
         // the wakeup pipe before spawning threads. Failing after thread
         // spawn would abandon AP threads.
-        {
+        if !exec_mode {
             use std::os::unix::io::AsRawFd;
             let stdin_fd = std::io::stdin().as_raw_fd();
             let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stdin_fd) };
@@ -1251,7 +1254,12 @@ impl KtstrVm {
 
         // Set host terminal to raw mode. TerminalRawGuard restores on drop
         // and installs signal handlers for SIGINT/SIGTERM/SIGQUIT.
-        let _raw_guard = TerminalRawGuard::enter().context("failed to set terminal to raw mode")?;
+        // Skip for exec mode — no interactive terminal needed.
+        let _raw_guard = if exec_mode {
+            None
+        } else {
+            Some(TerminalRawGuard::enter().context("failed to set terminal to raw mode")?)
+        };
 
         // Wakeup pipe: write end signals the stdin reader to exit when
         // the kill flag is set, avoiding a blocking read that prevents join.
