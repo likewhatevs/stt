@@ -140,7 +140,7 @@ files under `release/` at `/include-files/release/...`). Bare names
 are resolved via PATH. Dynamically-linked ELF binaries get automatic
 shared library resolution.
 
-`--memory` sets guest memory in MB (minimum 128). When absent, memory
+`--memory-mb` sets guest memory in MB (minimum 128). When absent, memory
 is computed from the actual initramfs size after build.
 
 ### completions

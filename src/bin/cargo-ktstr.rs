@@ -138,8 +138,8 @@ enum KtstrCommand {
         include_files: Vec<PathBuf>,
         /// Guest memory in MB (minimum 128). When absent, estimated
         /// from payload and include file sizes.
-        #[arg(long, value_parser = clap::value_parser!(u32).range(128..))]
-        memory: Option<u32>,
+        #[arg(long = "memory-mb", value_parser = clap::value_parser!(u32).range(128..))]
+        memory_mb: Option<u32>,
         /// Forward kernel console (COM1/dmesg) to stderr in real-time.
         /// Sets loglevel=7 for verbose kernel output.
         #[arg(long)]
@@ -971,10 +971,10 @@ fn main() {
             kernel,
             topology,
             include_files,
-            memory,
+            memory_mb,
             dmesg,
             exec,
-        } => run_shell(kernel, topology, include_files, memory, dmesg, exec),
+        } => run_shell(kernel, topology, include_files, memory_mb, dmesg, exec),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             KernelCommand::Build {

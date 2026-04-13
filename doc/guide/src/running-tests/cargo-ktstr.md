@@ -213,7 +213,7 @@ on all exit paths.
 | `--kernel ID` | auto | Kernel identifier (path, version, or cache key). |
 | `--topology S,C,T` | `1,1,1` | Virtual CPU topology as `sockets,cores,threads`. All values must be >= 1. |
 | `-i, --include-files PATH` | -- | Files or directories to include in the guest. Repeatable. Directories are walked recursively. |
-| `--memory MB` | auto | Guest memory in MB (minimum 128). When absent, computed from actual initramfs size after build. |
+| `--memory-mb MB` | auto | Guest memory in MB (minimum 128). When absent, computed from actual initramfs size after build. |
 
 ## completions
 
