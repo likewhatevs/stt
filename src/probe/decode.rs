@@ -6,11 +6,7 @@ use super::scx_defs::*;
 /// - `DSQ_TYPE_LOCAL_ON` (0b11): `SCX_DSQ_LOCAL_ON|{cpu}`
 /// - `DSQ_TYPE_BUILTIN` (0b10): `SCX_DSQ_INVALID`, `SCX_DSQ_GLOBAL`, `SCX_DSQ_LOCAL`, `SCX_DSQ_BYPASS`
 /// - Otherwise: `DSQ(0x{id:x})`
-/// - Zero: `"0"`
 pub(crate) fn decode_dsq_id(id: u64) -> String {
-    if id == 0 {
-        return "0".into();
-    }
     match id >> DSQ_TYPE_SHIFT {
         DSQ_TYPE_LOCAL_ON => format!("SCX_DSQ_LOCAL_ON|{}", id & 0xffffffff),
         DSQ_TYPE_BUILTIN => match (id & 0xffffffff) as u32 {
@@ -250,7 +246,7 @@ mod tests {
 
     #[test]
     fn decode_dsq_id_zero() {
-        assert_eq!(decode_dsq_id(0), "0");
+        assert_eq!(decode_dsq_id(0), "DSQ(0x0)");
     }
 
     #[test]
