@@ -1431,6 +1431,16 @@ impl KtstrVm {
                             let _ = vc_for_stdout.lock().tx_evt().read();
                         }
                     }
+                    // Re-check kill after poll. During shutdown the
+                    // dying guest may enqueue a stray byte into the
+                    // virtio TX queue (from kernel hvc_close flushing
+                    // n_outbuf via tty_wait_until_sent → hvc_push →
+                    // put_chars). That byte passes from_utf8 (valid
+                    // single-byte UTF-8) but is unprintable, producing
+                    // a garbled character on the terminal.
+                    if kill_for_stdout.load(Ordering::Acquire) {
+                        break;
+                    }
                     let data = vc_for_stdout.lock().drain_output();
                     if !data.is_empty() {
                         // Write only valid UTF-8 prefix. Trailing
