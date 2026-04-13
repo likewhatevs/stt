@@ -30,8 +30,6 @@ Environment variables that control ktstr behavior.
 | Variable | Description | Default |
 |---|---|---|
 | `NEXTEST` | Set by nextest. ktstr intercepts `--list` and `--exact` args when present. | None |
-| `NEXTEST_ATTEMPT` | Current retry attempt number (1-based). | `1` |
-| `NEXTEST_TOTAL_ATTEMPTS` | Total configured retry attempts. | `1` |
 
 ## VM-internal
 

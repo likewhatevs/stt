@@ -185,10 +185,8 @@ The `perf-vm` test group in `.config/nextest.toml` sets a static
 (`acquire_resource_locks`) handles runtime contention: if all LLC
 slots are busy, the test returns `ResourceContention`.
 
-On contention, nextest retries with exponential backoff (configured
-in `.config/nextest.toml`). Non-final attempts return exit code 1
-so nextest retries; the final attempt returns exit code 0 with an
-"ignored" message so the test does not fail the suite.
+On contention, the test returns exit code 1 and nextest retries
+with exponential backoff (configured in `.config/nextest.toml`).
 
 ## LLC exclusivity validation
 
@@ -197,4 +195,4 @@ exclusivity: each virtual socket must reserve the entire physical
 LLC group it maps to. The validation sums the actual CPU count of
 each LLC group and checks the total (plus service CPU) fits within
 the host's online CPUs. If validation fails, the build returns an
-error (tests skip on resource contention).
+error (tests fail with `ResourceContention` and nextest retries).

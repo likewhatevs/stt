@@ -619,23 +619,6 @@ pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
     Some((sockets, cores, threads))
 }
 
-/// Whether this is the final nextest attempt for the current test.
-///
-/// Reads `NEXTEST_ATTEMPT` and `NEXTEST_TOTAL_ATTEMPTS` env vars.
-/// Returns `true` when not running under nextest (no retries available)
-/// or when on the last attempt.
-pub(crate) fn is_final_nextest_attempt() -> bool {
-    let attempt = std::env::var("NEXTEST_ATTEMPT")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(1);
-    let total = std::env::var("NEXTEST_TOTAL_ATTEMPTS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(1);
-    attempt >= total
-}
-
 /// Host-side entry point: build a VM, boot it with `--ktstr-test-fn=NAME`,
 /// extract profraw from SHM, and return the test result.
 ///
@@ -649,9 +632,7 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
         && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {
-        return Ok(crate::assert::AssertResult::skip(
-            "skipped: vmlinux not found, bpf_map_write requires vmlinux",
-        ));
+        anyhow::bail!("vmlinux not found, bpf_map_write requires vmlinux");
     }
     run_ktstr_test_inner(entry, None, &[])
 }
@@ -669,13 +650,8 @@ pub(crate) fn run_ktstr_test_with_topo_and_flags(
 
 /// Run a test result through expect_err logic and return an exit code.
 ///
-/// Returns 0 on pass, 1 on failure.
-///
-/// On `ResourceContention`:
-/// - Non-final nextest attempt: return 1 so nextest retries with
-///   exponential backoff.
-/// - Final attempt (or not running under nextest): return 0 with
-///   "ignored" message so the test doesn't fail the suite.
+/// Returns 0 on pass, 1 on failure. `ResourceContention` always
+/// returns 1 so nextest retries with exponential backoff.
 fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
     match result {
         Ok(_) if expect_err => {
@@ -692,13 +668,8 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                 .unwrap()
                 .reason
                 .clone();
-            if is_final_nextest_attempt() {
-                eprintln!("resource contention (ignored): {reason}");
-                0
-            } else {
-                eprintln!("resource contention (will retry): {reason}");
-                1
-            }
+            eprintln!("resource contention: {reason}");
+            1
         }
         Err(_) if expect_err => 0,
         Err(e) => {
@@ -752,9 +723,20 @@ fn list_tests(ignored_only: bool) {
 /// List all tests without budget filtering.
 fn list_tests_all(ignored_only: bool) {
     let presets = crate::vm::gauntlet_presets();
+    let has_vmlinux = resolve_test_kernel()
+        .ok()
+        .and_then(|k| crate::vmm::find_vmlinux(&k))
+        .is_some();
 
     for entry in KTSTR_TESTS.iter() {
         validate_entry_flags(entry);
+
+        // bpf_map_write tests require vmlinux to resolve BPF map
+        // addresses. Don't list them when vmlinux is unavailable —
+        // they cannot run and would produce false PASS results.
+        if entry.bpf_map_write.is_some() && !has_vmlinux {
+            continue;
+        }
 
         if !ignored_only || is_ignored(entry) {
             println!("{}: test", entry.name);
@@ -771,9 +753,8 @@ fn list_tests_all(ignored_only: bool) {
             .generate_profiles(entry.required_flags, entry.excluded_flags);
 
         // Gauntlet variants are always ignored — users opt in with
-        // --run-ignored. Presets that exceed the host's CPU count are
-        // filtered from the listing entirely so nextest never runs them
-        // (avoids false PASS from ResourceContention exit-0 fallback).
+        // --run-ignored. Presets that exceed the host's CPU count or
+        // LLC count are filtered from the listing entirely.
         let host_cpus = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1);
@@ -807,10 +788,18 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
 
     let presets = crate::vm::gauntlet_presets();
+    let has_vmlinux = resolve_test_kernel()
+        .ok()
+        .and_then(|k| crate::vmm::find_vmlinux(&k))
+        .is_some();
     let mut candidates: Vec<TestCandidate> = Vec::new();
 
     for entry in KTSTR_TESTS.iter() {
         validate_entry_flags(entry);
+
+        if entry.bpf_map_write.is_some() && !has_vmlinux {
+            continue;
+        }
 
         let base_ignored = is_ignored(entry);
         let base_topo = entry.topology;
@@ -844,8 +833,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             {
                 continue;
             }
-            // Skip presets that exceed host CPU count — they can never
-            // run and would produce false PASS results.
+            // Skip presets that exceed host CPU count.
             if t.total_cpus() > host_cpus {
                 continue;
             }
@@ -903,8 +891,8 @@ fn run_named_test(test_name: &str) -> i32 {
         && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {
-        eprintln!("skipped: vmlinux not found, bpf_map_write requires vmlinux");
-        return 0;
+        eprintln!("FAIL: vmlinux not found, bpf_map_write requires vmlinux");
+        return 1;
     }
 
     let result = run_ktstr_test_inner(entry, None, &[]);
@@ -977,17 +965,6 @@ fn run_gauntlet_test(rest: &str) -> i32 {
     let t = &preset.topology;
     let cpus = t.total_cpus();
 
-    // Skip topologies the host cannot support. Without this check,
-    // ResourceContention is returned during VM build and silently
-    // converted to PASS on the final nextest attempt.
-    let host_cpus = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(1);
-    if cpus > host_cpus {
-        eprintln!("skipped: preset {preset_name} needs {cpus} CPUs, host has {host_cpus}",);
-        return 0;
-    }
-
     let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
     let topo = TopoOverride {
         sockets: t.sockets,
@@ -1011,8 +988,8 @@ fn run_gauntlet_test(rest: &str) -> i32 {
         && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {
-        eprintln!("skipped: vmlinux not found, bpf_map_write requires vmlinux");
-        return 0;
+        eprintln!("FAIL: vmlinux not found, bpf_map_write requires vmlinux");
+        return 1;
     }
 
     let result = run_ktstr_test_inner(entry, Some(&topo), &flags);
