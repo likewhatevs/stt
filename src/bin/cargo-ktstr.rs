@@ -318,8 +318,12 @@ fn kernel_build(
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
         fetch::git_clone(url, ref_name, tmp_dir.path())?
     } else {
-        // Tarball download: explicit version or latest stable.
+        // Tarball download: explicit version, prefix, or latest stable.
         let ver = match version {
+            Some(v) if v.matches('.').count() < 2 => {
+                // Major.minor prefix (e.g., "6.12") — resolve latest patch.
+                fetch::fetch_version_for_prefix(&v)?
+            }
             Some(v) => v,
             None => fetch::fetch_latest_stable_version()?,
         };

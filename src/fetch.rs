@@ -178,30 +178,96 @@ pub fn download_tarball(version: &str, dest_dir: &Path) -> Result<AcquiredSource
     })
 }
 
-/// Fetch the latest stable kernel version from kernel.org releases.json.
-pub fn fetch_latest_stable_version() -> Result<String, String> {
-    let url = "https://www.kernel.org/releases.json";
-    eprintln!("ktstr: fetching latest kernel version");
+/// Parse the patch level from a kernel version string.
+/// "6.12.8" → Some(8), "7.0" → Some(0), "abc" → None.
+fn patch_level(version: &str) -> Option<u32> {
+    let parts: Vec<&str> = version.split('.').collect();
+    match parts.len() {
+        2 => Some(0), // "7.0" has patch level 0
+        3 => parts[2].parse().ok(),
+        _ => None,
+    }
+}
 
+/// Fetch releases.json from kernel.org and return stable releases.
+fn fetch_releases() -> Result<Vec<(String, String)>, String> {
+    let url = "https://www.kernel.org/releases.json";
     let response = reqwest::blocking::get(url).map_err(|e| format!("fetch {url}: {e}"))?;
     if !response.status().is_success() {
         return Err(format!("fetch {url}: HTTP {}", response.status()));
     }
-
     let body = response
         .text()
         .map_err(|e| format!("read response body: {e}"))?;
     let json: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("parse releases.json: {e}"))?;
+    let releases = json
+        .get("releases")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "releases.json: missing releases array".to_string())?;
+    Ok(releases
+        .iter()
+        .filter_map(|r| {
+            let moniker = r.get("moniker")?.as_str()?;
+            let version = r.get("version")?.as_str()?;
+            Some((moniker.to_string(), version.to_string()))
+        })
+        .collect())
+}
 
-    // releases.json has { "latest_stable": { "version": "X.Y.Z" } }
-    let version = json
-        .get("latest_stable")
-        .and_then(|ls| ls.get("version"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "releases.json: missing latest_stable.version".to_string())?;
+/// Fetch the latest stable kernel version from kernel.org.
+///
+/// Selects from the `releases` array (moniker "stable" or "longterm"),
+/// requiring at least 8 patch releases to avoid brand-new major versions
+/// that may have build issues on CI runners.
+pub fn fetch_latest_stable_version() -> Result<String, String> {
+    eprintln!("ktstr: fetching latest kernel version");
+    let releases = fetch_releases()?;
 
+    let mut best: Option<&str> = None;
+    for (moniker, version) in &releases {
+        if moniker != "stable" && moniker != "longterm" {
+            continue;
+        }
+        if patch_level(version).unwrap_or(0) < 8 {
+            continue;
+        }
+        // Pick the first matching release — releases.json is ordered
+        // newest first, so the first stable with patch >= 8 is the best.
+        best = Some(version.as_str());
+        break;
+    }
+
+    let version =
+        best.ok_or_else(|| "no stable kernel with patch >= 8 found in releases.json".to_string())?;
     eprintln!("ktstr: latest stable kernel: {version}");
+    Ok(version.to_string())
+}
+
+/// Resolve the latest patch release for a major.minor prefix.
+///
+/// E.g., "6.12" → "6.12.8" (the highest 6.12.x in releases.json).
+pub fn fetch_version_for_prefix(prefix: &str) -> Result<String, String> {
+    eprintln!("ktstr: fetching latest {prefix}.x kernel version");
+    let releases = fetch_releases()?;
+
+    let mut best: Option<&str> = None;
+    for (moniker, version) in &releases {
+        if moniker == "mainline" {
+            continue;
+        }
+        if version.starts_with(prefix)
+            && (version.len() == prefix.len() || version.as_bytes()[prefix.len()] == b'.')
+        {
+            // First match is newest (releases.json is ordered newest first).
+            if best.is_none() {
+                best = Some(version.as_str());
+            }
+        }
+    }
+
+    let version = best.ok_or_else(|| format!("no release matching {prefix}.x found"))?;
+    eprintln!("ktstr: latest {prefix}.x kernel: {version}");
     Ok(version.to_string())
 }
 
