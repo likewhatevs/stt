@@ -657,7 +657,9 @@ fn is_deleted_self(path: &Path) -> bool {
 /// Each entry is `(archive_path, host_path)`. ELF files get shared library
 /// resolution; non-ELF files are copied as-is. Only regular files are
 /// accepted; FIFOs, device nodes, and sockets are rejected. Archive paths
-/// must not contain `..` components.
+/// must not contain `..` components. Callers expand directories into
+/// individual file entries before calling this function (see
+/// `cli::resolve_include_files`).
 #[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
 pub fn create_initramfs_base(
     payload: &Path,

@@ -180,7 +180,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
         println!("  tools:     busybox (ls, ps, top, dmesg, ip, vi, ...)");
         println!("  mounts:    /proc /sys /dev /sys/fs/cgroup /sys/fs/bpf /tmp");
         println!("             /sys/kernel/debug /sys/kernel/tracing /dev/pts");
-        println!("  type `exit` for clean shutdown");
+        println!("  type `exit` for clean shutdown, Ctrl+A X to force-kill");
         let _ = std::io::stdout().flush();
 
         // Allocate a PTY pair so busybox sh gets a controlling terminal
@@ -595,13 +595,24 @@ fn count_online_cpus() -> Option<u32> {
 /// are marked with "(executable)".
 fn print_includes_line() {
     let include_dir = Path::new("/include-files");
-    let entries = match fs::read_dir(include_dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
+    if !include_dir.is_dir() {
+        return;
+    }
     let mut files: Vec<(String, bool)> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
+    // Walk recursively to discover files in nested directories.
+    for entry in walkdir::WalkDir::new(include_dir)
+        .min_depth(1)
+        .sort_by_file_name()
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(include_dir)
+            .unwrap_or(entry.path());
+        let name = rel.to_string_lossy().to_string();
         let executable = entry
             .metadata()
             .map(|m| {
@@ -614,7 +625,6 @@ fn print_includes_line() {
     if files.is_empty() {
         return;
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
     for (i, (name, executable)) in files.iter().enumerate() {
         let marker = if *executable { " (executable)" } else { "" };
         let path = format!("/include-files/{name}{marker}");

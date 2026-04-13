@@ -67,6 +67,7 @@ ktstr-macros = { version = "0.1.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 rayon = "1"
 object = { version = "0.36", default-features = false, features = ["build", "std", "elf"] }
+walkdir = "2"
 
 [profile.release]
 lto = "thin"

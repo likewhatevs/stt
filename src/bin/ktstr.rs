@@ -92,10 +92,11 @@ enum Command {
     },
     /// Boot an interactive shell in a KVM virtual machine.
     ///
-    /// Launches a VM with busybox and drops into a shell. Files passed
-    /// via -i are available at /include-files/<name> inside the guest.
-    /// Dynamically-linked ELF binaries get automatic shared library
-    /// resolution via ELF DT_NEEDED parsing.
+    /// Launches a VM with busybox and drops into a shell. Files and
+    /// directories passed via -i are available at /include-files/<name>
+    /// inside the guest. Directories are walked recursively, preserving
+    /// structure. Dynamically-linked ELF binaries get automatic shared
+    /// library resolution via ELF DT_NEEDED parsing.
     Shell {
         /// Kernel identifier: path (`../linux`), version (`6.14.2`),
         /// or cache key (`6.14.2-tarball-x86_64`, see `ktstr kernel list`).
@@ -105,7 +106,8 @@ enum Command {
         /// Virtual topology as "sockets,cores,threads" (default: "1,1,1").
         #[arg(long, default_value = "1,1,1")]
         topology: String,
-        /// Files to include in the guest at /include-files/<name>.
+        /// Files or directories to include in the guest at /include-files/<name>.
+        /// Directories are walked recursively, preserving structure.
         /// Dynamically-linked ELF binaries get shared library resolution.
         #[arg(short = 'i', long = "include-files", action = ArgAction::Append)]
         include_files: Vec<PathBuf>,
@@ -491,51 +493,7 @@ fn main() -> Result<()> {
                 "invalid topology '{topology}': sockets, cores, and threads must all be >= 1"
             );
 
-            // Build include_files vec: resolve each path, construct archive pairs.
-            let mut resolved_includes: Vec<(String, PathBuf)> = Vec::new();
-            for path in &include_files {
-                let is_explicit_path = {
-                    use std::path::Component;
-                    matches!(
-                        path.components().next(),
-                        Some(Component::RootDir | Component::CurDir | Component::ParentDir)
-                    ) || path.components().count() > 1
-                };
-                let resolved = if is_explicit_path {
-                    anyhow::ensure!(
-                        path.exists(),
-                        "--include-files path not found: {}",
-                        path.display()
-                    );
-                    path.clone()
-                } else {
-                    // Bare name: search PATH.
-                    if path.exists() {
-                        path.clone()
-                    } else {
-                        cli::resolve_in_path(path).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "-i {}: not found in filesystem or PATH",
-                                path.display()
-                            )
-                        })?
-                    }
-                };
-                anyhow::ensure!(
-                    !resolved.is_dir(),
-                    "-i {}: is a directory. --include-files does not support directories, \
-                     pass individual files",
-                    resolved.display()
-                );
-                let file_name = resolved
-                    .file_name()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("include file has no filename: {}", resolved.display())
-                    })?
-                    .to_string_lossy();
-                let archive_path = format!("include-files/{file_name}");
-                resolved_includes.push((archive_path, resolved));
-            }
+            let resolved_includes = cli::resolve_include_files(&include_files)?;
 
             let include_refs: Vec<(&str, &Path)> = resolved_includes
                 .iter()

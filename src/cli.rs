@@ -397,6 +397,105 @@ pub fn resolve_in_path(name: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Resolve `--include-files` arguments into `(archive_path, host_path)` pairs.
+///
+/// Each path is resolved as follows:
+/// - Explicit paths (starting with `/`, `.`, `..`, or containing `/`): must exist.
+/// - Bare names: searched in PATH.
+/// - Directories: walked recursively via `walkdir`, following symlinks.
+///   The directory's basename becomes the root under `include-files/`.
+///   Non-regular files (sockets, pipes, device nodes) are skipped.
+///   Empty directories produce a warning to stderr.
+/// - Regular files: included directly as `include-files/<filename>`.
+pub fn resolve_include_files(
+    paths: &[std::path::PathBuf],
+) -> Result<Vec<(String, std::path::PathBuf)>> {
+    use std::path::{Component, PathBuf};
+
+    let mut resolved_includes: Vec<(String, PathBuf)> = Vec::new();
+    for path in paths {
+        let is_explicit_path = {
+            matches!(
+                path.components().next(),
+                Some(Component::RootDir | Component::CurDir | Component::ParentDir)
+            ) || path.components().count() > 1
+        };
+        let resolved = if is_explicit_path {
+            anyhow::ensure!(
+                path.exists(),
+                "--include-files path not found: {}",
+                path.display()
+            );
+            path.clone()
+        } else {
+            // Bare name: search PATH.
+            if path.exists() {
+                path.clone()
+            } else {
+                resolve_in_path(path).ok_or_else(|| {
+                    anyhow::anyhow!("-i {}: not found in filesystem or PATH", path.display())
+                })?
+            }
+        };
+        if resolved.is_dir() {
+            let dir_name = resolved
+                .file_name()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("include directory has no name: {}", resolved.display())
+                })?
+                .to_string_lossy()
+                .to_string();
+            let prefix = format!("include-files/{dir_name}");
+            let mut count = 0usize;
+            for entry in walkdir::WalkDir::new(&resolved).follow_links(true) {
+                let entry = entry.map_err(|e| anyhow::anyhow!("-i {}: {e}", resolved.display()))?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let rel = entry
+                    .path()
+                    .strip_prefix(&resolved)
+                    .expect("walkdir entry is under root");
+                let archive_path = format!("{prefix}/{}", rel.display());
+                resolved_includes.push((archive_path, entry.into_path()));
+                count += 1;
+            }
+            if count == 0 {
+                eprintln!(
+                    "warning: -i {}: directory contains no regular files",
+                    resolved.display()
+                );
+            }
+        } else {
+            let file_name = resolved
+                .file_name()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("include file has no filename: {}", resolved.display())
+                })?
+                .to_string_lossy();
+            let archive_path = format!("include-files/{file_name}");
+            resolved_includes.push((archive_path, resolved));
+        }
+    }
+
+    // Detect duplicate archive paths (e.g. `-i ./a/dir -i ./b/dir` both
+    // containing the same relative file). The cpio format silently
+    // overwrites earlier entries, so duplicates must be caught here.
+    let mut seen = std::collections::HashMap::<&str, &std::path::Path>::new();
+    for (archive_path, host_path) in &resolved_includes {
+        if let Some(prev) = seen.insert(archive_path.as_str(), host_path.as_path()) {
+            anyhow::bail!(
+                "duplicate include path '{}': provided by both {} and {}",
+                archive_path,
+                prev.display(),
+                host_path.display(),
+            );
+        }
+    }
+
+    Ok(resolved_includes)
+}
+
 /// Resolve the cache entry directory from a Version or CacheKey identifier.
 ///
 /// Checks local cache first. When the `gha-cache` feature is enabled

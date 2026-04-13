@@ -295,16 +295,17 @@ disk.
 
 **Fix:** Verify the file exists and use the correct path.
 
-### include file is a directory
+### include directory contains no files
 
 ```text
--i ./mydir: is a directory. --include-files does not support directories, pass individual files
+warning: -i ./empty-dir: directory contains no regular files
 ```
 
-`--include-files` only accepts regular files. Directories, FIFOs,
-device nodes, and sockets are rejected.
+The directory passed to `--include-files` was walked recursively but
+contained no regular files. FIFOs, device nodes, and sockets are
+skipped during the walk.
 
-**Fix:** Pass individual files, not directories.
+**Fix:** Verify the directory contains the files you expect.
 
 ## Tests pass locally but fail in CI
 

@@ -204,11 +204,14 @@ See [cargo-ktstr](running-tests/cargo-ktstr.md) for details.
 ```sh
 cargo ktstr shell                              # default 1,1,1 topology
 cargo ktstr shell --topology 2,4,1             # custom CPU topology
-cargo ktstr shell -i ./my-scheduler            # include files in the guest
+cargo ktstr shell -i ./my-scheduler            # include a file in the guest
+cargo ktstr shell -i ./test-data/              # include a directory recursively
 ```
 
 Included ELF binaries get automatic shared library resolution.
-Files are available at `/include-files/<name>` inside the guest.
+Directories are walked recursively; their contents appear under
+`/include-files/<dirname>/` preserving the original structure.
+Individual files are available at `/include-files/<name>` inside the guest.
 See [cargo-ktstr shell](running-tests/cargo-ktstr.md#shell) for
 details.
 

@@ -133,10 +133,12 @@ filesystem.
 `--topology` sets the guest CPU topology as `sockets,cores,threads`
 (default: `1,1,1`).
 
-Files passed via `-i`/`--include-files` are available at
-`/include-files/<name>` inside the guest. Bare names are resolved via
-PATH. Dynamically-linked ELF binaries get automatic shared library
-resolution. Directories are not supported -- pass individual files.
+Files and directories passed via `-i`/`--include-files` are available
+at `/include-files/<name>` inside the guest. Directories are walked
+recursively, preserving structure (e.g. `-i ./release` includes all
+files under `release/` at `/include-files/release/...`). Bare names
+are resolved via PATH. Dynamically-linked ELF binaries get automatic
+shared library resolution.
 
 `--memory` sets guest memory in MB (minimum 128). When absent, memory
 is computed from the actual initramfs size after build.

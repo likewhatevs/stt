@@ -222,6 +222,9 @@ impl VirtioConsole {
             Some(m) => m,
             None => return,
         };
+        if !self.queues[RXQ].ready() {
+            return;
+        }
         let q = &mut self.queues[RXQ];
         let mut total_written = 0u32;
         while !self.pending_rx.is_empty() {

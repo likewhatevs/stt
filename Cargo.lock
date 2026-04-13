@@ -2778,6 +2778,7 @@ dependencies = [
  "vm-memory",
  "vm-superio",
  "vmm-sys-util",
+ "walkdir",
  "xz2",
  "zerocopy",
  "zstd",
