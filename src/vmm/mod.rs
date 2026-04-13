@@ -1656,7 +1656,7 @@ impl KtstrVm {
             cmdline.push_str(" loglevel=0");
         }
         if self.init_binary.is_some() {
-            cmdline.push_str(" rdinit=/init");
+            cmdline.push_str(" rdinit=/init rootflags=size=90%");
         }
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;
@@ -2672,7 +2672,7 @@ impl KtstrVm {
             cmdline.push_str(" loglevel=0");
         }
         if self.init_binary.is_some() {
-            cmdline.push_str(" rdinit=/init");
+            cmdline.push_str(" rdinit=/init rootflags=size=90%");
         }
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;
