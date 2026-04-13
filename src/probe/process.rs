@@ -231,7 +231,7 @@ pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashM
 ///
 /// The trigger fires on `sched_ext_exit` inside `scx_claim_exit()`
 /// — exactly once per scheduler lifetime, in the context of the
-/// task that caused the exit. If the tracepoint is unavailable
+/// current task at exit time. If the tracepoint is unavailable
 /// (kernel lacks CONFIG_SCHED_CLASS_EXT tracepoint support), auto-repro
 /// is skipped.
 ///
@@ -857,7 +857,7 @@ pub fn run_probe_skeleton(
     }
 
     // Attach trigger: tp_btf/sched_ext_exit fires inside
-    // scx_claim_exit() in the context of the causal task.
+    // scx_claim_exit() in the context of the current task at exit time.
     match skel.progs.ktstr_trigger_tp.attach_trace() {
         Ok(link) => {
             tracing::debug!("trigger attached via tp_btf/sched_ext_exit");
@@ -1070,8 +1070,15 @@ pub fn run_probe_skeleton(
             // Stitch by task_struct pointer. Build a map of func_idx ->
             // task_struct param index from BPF_OP_CALLERS and BTF, then
             // filter events to those referencing the same task_struct
-            // pointer as the last event with a task_struct arg (the task
-            // that triggered the exit).
+            // pointer as the task running when the exit fired.
+            //
+            // Source: the trigger event's bpf_get_current_task()
+            // (args[0]).
+            //
+            // Limitation: for stall exits (SCX_EXIT_ERROR_STALL) the
+            // current task at exit time is the watchdog kworker or timer
+            // interrupt context, not the stalled task. Stitching will
+            // select an arbitrary task in that case.
             let task_param_idx: std::collections::HashMap<u32, usize> = func_ips
                 .iter()
                 .filter_map(|(idx, _, name)| {
@@ -1092,13 +1099,16 @@ pub fn run_probe_skeleton(
                 })
                 .collect();
 
-            // The last event with a non-zero task_struct arg value
-            // (closest to trigger time) identifies the target task.
-            let target_tptr: Option<u64> = probe_events.iter().rev().find_map(|e| {
-                let pidx = task_param_idx.get(&e.func_idx)?;
-                let ptr = e.args[*pidx];
-                if ptr != 0 { Some(ptr) } else { None }
-            });
+            // Extract tptr and kstack from the trigger event in one
+            // lock acquisition. When the trigger did not fire (stop-
+            // signaled), there is no causal task — events pass through
+            // unstitched.
+            let (target_tptr, trigger_kstack) = {
+                let guard = events.lock().unwrap();
+                let tptr = guard.last().map(|e| e.task_ptr).filter(|&p| p != 0);
+                let kstack = guard.last().map(|e| e.kstack.clone()).unwrap_or_default();
+                (tptr, kstack)
+            };
 
             let before = probe_events.len();
             if let Some(tptr) = target_tptr {
@@ -1120,12 +1130,6 @@ pub fn run_probe_skeleton(
             diag.events_after_stitch = probe_events.len() as u32;
 
             // Attach trigger kstack if available.
-            let trigger_kstack = events
-                .lock()
-                .unwrap()
-                .last()
-                .map(|e| e.kstack.clone())
-                .unwrap_or_default();
             if let Some(last) = probe_events.last_mut() {
                 last.kstack = trigger_kstack;
             }

@@ -315,12 +315,12 @@ The output formatter decodes field values based on their key name:
 
 ### Event stitching
 
-After the trigger fires (or stop is signaled), all `probe_data`
-entries are read, matched to functions by IP, then filtered to a
-single task's scheduling journey:
+After the trigger fires, all `probe_data` entries are read, matched
+to functions by IP, then filtered to a single task's scheduling
+journey:
 
-1. Find the task_struct pointer from the last probe event (closest
-   to trigger time) with a non-zero task_struct argument
+1. Read the task_struct pointer from the trigger event's
+   `bpf_get_current_task()` value (`args[0]`)
 2. For functions with a task_struct parameter: keep events where
    `args[param_idx] == tptr`
 3. For functions without a task_struct parameter: drop (cannot

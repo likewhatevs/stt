@@ -44,12 +44,12 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
      post-mutation state alongside the entry snapshot.
    - Tracepoint trigger (`tp_btf/sched_ext_exit`) fires inside
      `scx_claim_exit()` when the scheduler exits, in the context
-     of the causal task
+     of the current task at exit time
 
-6. **Stitching** -- the task_struct pointer is found from the last
-   event (closest to trigger time) that has a non-zero task_struct
-   argument. Events with a task_struct parameter are filtered to that
-   pointer; events without a task_struct parameter are dropped
+6. **Stitching** -- the task_struct pointer is read from the trigger
+   event's `bpf_get_current_task()` value. Events with a task_struct
+   parameter are filtered to that pointer; events without a
+   task_struct parameter are dropped
    (they cannot be associated with the triggering task). Events
    are sorted by timestamp and
    formatted with decoded field values (cpumask ranges, DSQ names,

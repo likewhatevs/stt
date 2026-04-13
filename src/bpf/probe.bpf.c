@@ -153,7 +153,7 @@ int ktstr_probe(struct pt_regs *ctx)
 /*
  * Tracepoint trigger. Fires on sched_ext_exit inside scx_claim_exit()
  * after the atomic cmpxchg succeeds — exactly once per scheduler
- * lifetime, in the context of the task that caused the exit.
+ * lifetime, in the context of the current task at exit time.
  *
  * Typed arg gives the exit kind directly.
  */
@@ -175,7 +175,7 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	event->ts = bpf_ktime_get_ns();
 	event->nr_fields = 0;
 
-	/* In scx_claim_exit(), current is the task that caused the exit. */
+	/* current task at exit time (may differ from causal task for stalls). */
 	event->args[0] = (u64)bpf_get_current_task();
 
 	/* Capture kernel stack. */
