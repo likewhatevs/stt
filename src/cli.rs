@@ -15,12 +15,11 @@ use crate::scenario::{Scenario, flags};
 use crate::workload::WorkType;
 
 /// ktstr.kconfig embedded at compile time.
-pub const EMBEDDED_KCONFIG: &str = include_str!("../ktstr.kconfig");
+pub const EMBEDDED_KCONFIG: &str = crate::EMBEDDED_KCONFIG;
 
 /// Compute CRC32 of the embedded ktstr.kconfig fragment.
 pub fn embedded_kconfig_hash() -> String {
-    let hash = crc32fast::hash(EMBEDDED_KCONFIG.as_bytes());
-    format!("{hash:08x}")
+    crate::kconfig_hash()
 }
 
 /// Format a human-readable table row for a cache entry.
@@ -507,7 +506,7 @@ pub fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::p
         KernelId::Version(ver) => {
             let cache = crate::cache::CacheDir::new()?;
             let (arch, _) = crate::fetch::arch_info();
-            let cache_key = format!("{ver}-tarball-{arch}");
+            let cache_key = format!("{ver}-tarball-{arch}-kc{}", embedded_kconfig_hash());
             if let Some(entry) = cache.lookup(&cache_key) {
                 entry.metadata.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("cached entry {cache_key} has corrupt metadata")

@@ -303,7 +303,7 @@ fn kernel_build(
         };
         // Check cache before downloading.
         let (arch, _) = fetch::arch_info();
-        let cache_key = format!("{ver}-tarball-{arch}");
+        let cache_key = format!("{ver}-tarball-{arch}-kc{}", cli::embedded_kconfig_hash());
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
             if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
                 eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
@@ -495,7 +495,7 @@ fn resolve_cached_kernel_with_remote(id: &ktstr::kernel_path::KernelId) -> Resul
         KernelId::Version(ver) => {
             let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
             let (arch, _) = fetch::arch_info();
-            let cache_key = format!("{ver}-tarball-{arch}");
+            let cache_key = format!("{ver}-tarball-{arch}-kc{}", cli::embedded_kconfig_hash());
             match cache_lookup(&cache, &cache_key) {
                 Some(entry) => {
                     entry

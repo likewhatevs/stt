@@ -258,6 +258,16 @@ pub const GIT_FULL_HASH: &str = env!("KTSTR_GIT_FULL_HASH");
 /// Git branch name at build time.
 pub const GIT_BRANCH: &str = env!("KTSTR_GIT_BRANCH");
 
+/// Embedded ktstr.kconfig fragment.
+pub const EMBEDDED_KCONFIG: &str = include_str!("../ktstr.kconfig");
+
+/// CRC32 hash of the embedded kconfig fragment (8 hex chars).
+/// Used as a suffix in kernel cache keys so kconfig changes
+/// produce distinct cache entries.
+pub fn kconfig_hash() -> String {
+    format!("{:08x}", crc32fast::hash(EMBEDDED_KCONFIG.as_bytes()))
+}
+
 pub use ktstr_macros::Scheduler;
 pub use ktstr_macros::ktstr_test;
 
@@ -361,7 +371,7 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                     )
                 })?;
                 let arch = std::env::consts::ARCH;
-                let key = format!("{ver}-tarball-{arch}");
+                let key = format!("{ver}-tarball-{arch}-kc{}", kconfig_hash());
                 if let Some(entry) = cache.lookup(&key)
                     && let Some(ref meta) = entry.metadata
                 {
