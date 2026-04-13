@@ -785,6 +785,22 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         result?;
     }
 
+    // Fast path: `make -q` returns 0 if the image is up to date.
+    // Skip the full build when nothing changed.
+    let (_, image_name) = crate::fetch::arch_info();
+    let up_to_date = std::process::Command::new("make")
+        .args(["-q", image_name])
+        .current_dir(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if up_to_date && let Some(image) = crate::kernel_path::find_image_in_dir(path) {
+        eprintln!("ktstr: kernel up to date");
+        return Ok(image);
+    }
+
     let sp = Spinner::start("Building kernel...");
     let result = make_kernel_with_output(path, Some(&sp));
     if result.is_err() {
