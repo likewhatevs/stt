@@ -761,6 +761,13 @@ fn mount_filesystems() {
             eprintln!("ktstr-init: mount {fstype} on {target}: {e}");
         }
     }
+
+    // Standard /dev/fd symlinks. Needed by bpftrace and shell
+    // process substitution (e.g. <(cmd)).
+    let _ = std::os::unix::fs::symlink("/proc/self/fd", "/dev/fd");
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/0", "/dev/stdin");
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/1", "/dev/stdout");
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/2", "/dev/stderr");
 }
 
 /// Recursive mkdir -p equivalent.
