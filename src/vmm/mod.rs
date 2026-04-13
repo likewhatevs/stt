@@ -1389,15 +1389,11 @@ impl KtstrVm {
             })
             .context("spawn stdin reader thread")?;
 
-        // Stdout writer thread: COM2 + virtio-console TX -> host stdout.
-        // Polls virtio tx_evt with 50ms timeout, then drains both devices.
-        // The guest writes to COM2 during early boot and to VirtioConsole
-        // after driver probe — never both simultaneously. The host just
-        // forwards whatever arrives from either device.
+        // Stdout writer thread: virtio-console TX -> host stdout.
+        // Polls tx_evt for zero-latency wakeup when guest writes data.
         // On write errors (including BrokenPipe), sets kill flag and exits
         // to stop the VM rather than polling a dead pipe until timeout.
         let vc_for_stdout = virtio_con.clone();
-        let com2_for_stdout = com2.clone();
         let kill_for_stdout = kill.clone();
         let stdout_thread = std::thread::Builder::new()
             .name("interactive-stdout".into())
@@ -1416,9 +1412,6 @@ impl KtstrVm {
                     if kill_for_stdout.load(Ordering::Acquire) {
                         break;
                     }
-                    // Poll virtio tx_evt with 50ms timeout. On timeout,
-                    // still drain COM2 below so serial output during boot
-                    // is forwarded before virtio-console activates.
                     let borrowed =
                         unsafe { std::os::unix::io::BorrowedFd::borrow_raw(tx_evt_raw_fd) };
                     let mut fds = [nix::poll::PollFd::new(
@@ -1426,7 +1419,7 @@ impl KtstrVm {
                         nix::poll::PollFlags::POLLIN,
                     )];
                     match nix::poll::poll(&mut fds, 50u16) {
-                        Ok(0) => {}
+                        Ok(0) => continue,
                         Err(nix::errno::Errno::EINTR) => continue,
                         Err(_) => break,
                         Ok(_) => {
@@ -1434,33 +1427,18 @@ impl KtstrVm {
                             let _ = vc_for_stdout.lock().tx_evt().read();
                         }
                     }
-                    let vc_out = vc_for_stdout.lock().drain_output();
-                    let com2_out = com2_for_stdout.lock().drain_output();
-                    let mut err = false;
-                    if !vc_out.is_empty() {
-                        err = stdout.write_all(&vc_out).is_err();
-                    }
-                    if !err && !com2_out.is_empty() {
-                        err = stdout.write_all(&com2_out).is_err();
-                    }
-                    if !err && (!vc_out.is_empty() || !com2_out.is_empty()) {
-                        err = stdout.flush().is_err();
-                    }
-                    if err {
+                    let data = vc_for_stdout.lock().drain_output();
+                    if !data.is_empty()
+                        && (stdout.write_all(&data).is_err() || stdout.flush().is_err())
+                    {
                         kill_for_stdout.store(true, Ordering::Release);
                         break;
                     }
                 }
                 // Final drain after kill.
-                let vc_out = vc_for_stdout.lock().drain_output();
-                let com2_out = com2_for_stdout.lock().drain_output();
-                if !vc_out.is_empty() {
-                    let _ = stdout.write_all(&vc_out);
-                }
-                if !com2_out.is_empty() {
-                    let _ = stdout.write_all(&com2_out);
-                }
-                if !vc_out.is_empty() || !com2_out.is_empty() {
+                let data = vc_for_stdout.lock().drain_output();
+                if !data.is_empty() {
+                    let _ = stdout.write_all(&data);
                     let _ = stdout.flush();
                 }
             })
