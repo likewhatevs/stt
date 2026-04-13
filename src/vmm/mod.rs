@@ -3212,12 +3212,17 @@ impl KtstrVm {
             "kfence.sample_interval=0",
         )
         .to_string();
+        // earlycon is always enabled so the kernel has a console from
+        // the earliest boot stage. Without it, stdout-path auto-detection
+        // is the only path to early output — and that can fail silently
+        // if the FDT node isn't matched by OF_EARLYCON_DECLARE.
+        cmdline.push_str(" earlycon=uart,mmio,0x09000000");
         let verbose = std::env::var("KTSTR_VERBOSE")
             .map(|v| v == "1")
             .unwrap_or(false)
             || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
         if verbose {
-            cmdline.push_str(" earlycon=uart,mmio,0x09000000 loglevel=7");
+            cmdline.push_str(" loglevel=7");
         } else {
             cmdline.push_str(" loglevel=0");
         }
