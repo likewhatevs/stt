@@ -214,13 +214,14 @@ pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Configure the kernel with sched_ext support.
+/// Merge the kconfig fragment into the kernel's .config.
 ///
-/// Appends the kconfig fragment to .config and runs `make olddefconfig`
-/// to resolve dependencies. kconfig uses last-value-wins semantics for
-/// duplicate symbols (confdata.c:conf_read_simple), so appending is
-/// equivalent to merge_config.sh's delete-then-append approach -- both
-/// produce the same resolved config after olddefconfig.
+/// Creates a default .config via `make defconfig` if none exists,
+/// then appends the fragment. kconfig uses last-value-wins semantics
+/// for duplicate symbols (confdata.c:conf_read_simple), so appending
+/// is idempotent. The kernel build system runs syncconfig implicitly
+/// when .config is newer than include/config/auto.conf, resolving
+/// dependencies without an explicit `make olddefconfig`.
 pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
     let config_path = kernel_dir.join(".config");
     if !config_path.exists() {
@@ -232,7 +233,6 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
         .open(&config_path)?;
     std::io::Write::write_all(&mut config, fragment.as_bytes())?;
 
-    run_make(kernel_dir, &["olddefconfig"])?;
     Ok(())
 }
 
