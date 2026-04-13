@@ -1432,11 +1432,22 @@ impl KtstrVm {
                         }
                     }
                     let data = vc_for_stdout.lock().drain_output();
-                    if !data.is_empty()
-                        && (stdout.write_all(&data).is_err() || stdout.flush().is_err())
-                    {
-                        kill_for_stdout.store(true, Ordering::Release);
-                        break;
+                    if !data.is_empty() {
+                        // Write only valid UTF-8 prefix. Trailing
+                        // incomplete sequences (from guest shutdown
+                        // mid-write) are dropped to prevent garbled
+                        // output.
+                        let valid_len = match std::str::from_utf8(&data) {
+                            Ok(_) => data.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if valid_len > 0
+                            && (stdout.write_all(&data[..valid_len]).is_err()
+                                || stdout.flush().is_err())
+                        {
+                            kill_for_stdout.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                 }
                 // Skip final drain — on forced kill (Ctrl+A X), the VM
