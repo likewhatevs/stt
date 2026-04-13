@@ -13,6 +13,11 @@ CONFIG_SCHED_CLASS_EXT=y
 CONFIG_DEBUG_INFO=y
 CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 CONFIG_DEBUG_INFO_BTF=y
+# Module BTF embeds BTF into .ko files. ktstr runs a monolithic
+# kernel with no loadable modules — the scheduler is a BPF program,
+# not a .ko. Disable to avoid resolve_btfids/pahole crashes during
+# modfinal on some arm64 toolchains.
+# CONFIG_DEBUG_INFO_BTF_MODULES is not set
 # CONFIG_DEBUG_INFO_REDUCED is not set
 
 # -- Tracing/probes (required) --
