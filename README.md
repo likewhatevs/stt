@@ -20,7 +20,7 @@ scheduler.
 - **Data-driven** -- scenarios declare cgroups, cpusets, workloads, and verification as data.
 - **Gauntlet** -- all scenarios across 19 topology presets in parallel VMs. Baseline save/compare for A/B testing.
 - **`#[ktstr_test]`** -- proc macro for integration tests that boot their own VMs.
-- **Auto-repro** -- reruns failures with BPF kprobes on the crash call chain.
+- **Auto-repro** -- reruns failures with BPF probes on the crash call chain.
 
 ## Installation
 
