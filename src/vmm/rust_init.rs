@@ -744,6 +744,8 @@ fn mount_filesystems() {
         ("/sys/fs/bpf", "bpffs", "bpf", false),
         ("/sys/fs/cgroup", "none", "cgroup2", false),
         ("/tmp", "tmpfs", "tmpfs", true),
+        ("/dev/shm", "tmpfs", "tmpfs", false),
+        ("/run", "tmpfs", "tmpfs", false),
     ];
 
     for &(target, source, fstype, required) in mounts {
