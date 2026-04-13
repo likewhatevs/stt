@@ -1205,7 +1205,6 @@ impl KtstrVm {
         // Virtio-console for shell I/O via /dev/hvc0.
         let mut vc = virtio_console::VirtioConsole::new();
         vc.set_mem(vm.guest_mem.clone());
-        let vc_activated = vc.activated().clone();
         let virtio_con = Arc::new(PiMutex::new(vc));
 
         #[cfg(target_arch = "x86_64")]
@@ -1279,18 +1278,15 @@ impl KtstrVm {
         };
         let bsp_tid = unsafe { libc::pthread_self() };
 
-        // Stdin reader thread: host stdin -> COM2 or virtio-console.
-        // Starts with COM2. Once the virtio-console driver reaches
-        // DRIVER_OK (vc_activated flag), switches to VirtioConsole
-        // permanently. This avoids wasting input to an inactive device.
-        // Uses poll() on both stdin and the wakeup pipe so the thread
-        // can be cleanly joined on shutdown.
+        // Stdin reader thread: host stdin -> virtio-console RX queue.
+        // The guest reads stdin from /dev/hvc0 (virtio-console), never
+        // from COM2. pending_rx buffers input until the guest activates
+        // the RX queue. Uses poll() on both stdin and the wakeup pipe
+        // so the thread can be cleanly joined on shutdown.
         //
         // Escape sequence: Ctrl+A X (0x01 followed by 'x' or 'X') triggers
         // host-side VM teardown without guest cooperation.
         let vc_for_stdin = virtio_con.clone();
-        let com2_for_stdin = com2.clone();
-        let vc_activated_for_stdin = vc_activated.clone();
         let kill_for_stdin = kill.clone();
         let stdin_thread = std::thread::Builder::new()
             .name("interactive-stdin".into())
@@ -1303,15 +1299,6 @@ impl KtstrVm {
                 let stdin_fd = std::io::stdin().as_raw_fd();
                 let mut buf = [0u8; 64];
                 let mut saw_ctrl_a = false;
-
-                // Helper: queue input to the active device.
-                let queue_input = |data: &[u8]| {
-                    if vc_activated_for_stdin.load(Ordering::Relaxed) {
-                        vc_for_stdin.lock().queue_input(data);
-                    } else {
-                        com2_for_stdin.lock().queue_input(data);
-                    }
-                };
 
                 loop {
                     if kill_for_stdin.load(Ordering::Acquire) {
@@ -1375,14 +1362,14 @@ impl KtstrVm {
                                         }
                                         // Not 'x'/'X' after Ctrl+A: the 0x01
                                         // was a real keystroke. Forward it now.
-                                        queue_input(&[0x01]);
+                                        vc_for_stdin.lock().queue_input(&[0x01]);
                                         // Current byte is processed normally
                                         // below (may itself be 0x01).
                                     }
                                     if buf[i] == 0x01 {
                                         // Flush bytes before the Ctrl+A.
                                         if forward_start < i {
-                                            queue_input(&buf[forward_start..i]);
+                                            vc_for_stdin.lock().queue_input(&buf[forward_start..i]);
                                         }
                                         saw_ctrl_a = true;
                                         forward_start = i + 1;
@@ -1391,7 +1378,7 @@ impl KtstrVm {
                                 }
                                 // Forward remaining bytes.
                                 if forward_start < n {
-                                    queue_input(&buf[forward_start..n]);
+                                    vc_for_stdin.lock().queue_input(&buf[forward_start..n]);
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1402,14 +1389,15 @@ impl KtstrVm {
             })
             .context("spawn stdin reader thread")?;
 
-        // Stdout writer thread: COM2 or virtio-console TX -> host stdout.
-        // Before virtio-console activation: polls COM2 with 50ms timeout.
-        // After activation: polls virtio tx_evt for zero-latency wakeup.
+        // Stdout writer thread: COM2 + virtio-console TX -> host stdout.
+        // Polls virtio tx_evt with 50ms timeout, then drains both devices.
+        // The guest writes to COM2 during early boot and to VirtioConsole
+        // after driver probe — never both simultaneously. The host just
+        // forwards whatever arrives from either device.
         // On write errors (including BrokenPipe), sets kill flag and exits
         // to stop the VM rather than polling a dead pipe until timeout.
         let vc_for_stdout = virtio_con.clone();
         let com2_for_stdout = com2.clone();
-        let vc_activated_for_stdout = vc_activated.clone();
         let kill_for_stdout = kill.clone();
         let stdout_thread = std::thread::Builder::new()
             .name("interactive-stdout".into())
@@ -1428,56 +1416,52 @@ impl KtstrVm {
                     if kill_for_stdout.load(Ordering::Acquire) {
                         break;
                     }
-                    let use_virtio = vc_activated_for_stdout.load(Ordering::Relaxed);
-                    if use_virtio {
-                        // Virtio-console active: poll tx_evt for
-                        // zero-latency wakeup on guest writes.
-                        let borrowed =
-                            unsafe { std::os::unix::io::BorrowedFd::borrow_raw(tx_evt_raw_fd) };
-                        let mut fds = [nix::poll::PollFd::new(
-                            borrowed,
-                            nix::poll::PollFlags::POLLIN,
-                        )];
-                        match nix::poll::poll(&mut fds, 50u16) {
-                            Ok(0) => continue,
-                            Err(nix::errno::Errno::EINTR) => continue,
-                            Err(_) => break,
-                            Ok(_) => {
-                                let _ = vc_for_stdout.lock().tx_evt().read();
-                            }
+                    // Poll virtio tx_evt with 50ms timeout. On timeout,
+                    // still drain COM2 below so serial output during boot
+                    // is forwarded before virtio-console activates.
+                    let borrowed =
+                        unsafe { std::os::unix::io::BorrowedFd::borrow_raw(tx_evt_raw_fd) };
+                    let mut fds = [nix::poll::PollFd::new(
+                        borrowed,
+                        nix::poll::PollFlags::POLLIN,
+                    )];
+                    match nix::poll::poll(&mut fds, 50u16) {
+                        Ok(0) => {}
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(_) => break,
+                        Ok(_) => {
+                            // Consume eventfd counter.
+                            let _ = vc_for_stdout.lock().tx_evt().read();
                         }
-                        let data = vc_for_stdout.lock().drain_output();
-                        if !data.is_empty()
-                            && (stdout.write_all(&data).is_err() || stdout.flush().is_err())
-                        {
-                            kill_for_stdout.store(true, Ordering::Release);
-                            break;
-                        }
-                    } else {
-                        // COM2 mode: no eventfd wakeup, poll with timeout.
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        let data = com2_for_stdout.lock().drain_output();
-                        if !data.is_empty()
-                            && (stdout.write_all(&data).is_err() || stdout.flush().is_err())
-                        {
-                            kill_for_stdout.store(true, Ordering::Release);
-                            break;
-                        }
+                    }
+                    let vc_out = vc_for_stdout.lock().drain_output();
+                    let com2_out = com2_for_stdout.lock().drain_output();
+                    let mut err = false;
+                    if !vc_out.is_empty() {
+                        err = stdout.write_all(&vc_out).is_err();
+                    }
+                    if !err && !com2_out.is_empty() {
+                        err = stdout.write_all(&com2_out).is_err();
+                    }
+                    if !err && (!vc_out.is_empty() || !com2_out.is_empty()) {
+                        err = stdout.flush().is_err();
+                    }
+                    if err {
+                        kill_for_stdout.store(true, Ordering::Release);
+                        break;
                     }
                 }
-                // Final drain from whichever device was active.
-                if vc_activated_for_stdout.load(Ordering::Relaxed) {
-                    let data = vc_for_stdout.lock().drain_output();
-                    if !data.is_empty() {
-                        let _ = stdout.write_all(&data);
-                        let _ = stdout.flush();
-                    }
-                } else {
-                    let data = com2_for_stdout.lock().drain_output();
-                    if !data.is_empty() {
-                        let _ = stdout.write_all(&data);
-                        let _ = stdout.flush();
-                    }
+                // Final drain after kill.
+                let vc_out = vc_for_stdout.lock().drain_output();
+                let com2_out = com2_for_stdout.lock().drain_output();
+                if !vc_out.is_empty() {
+                    let _ = stdout.write_all(&vc_out);
+                }
+                if !com2_out.is_empty() {
+                    let _ = stdout.write_all(&com2_out);
+                }
+                if !vc_out.is_empty() || !com2_out.is_empty() {
+                    let _ = stdout.flush();
                 }
             })
             .context("spawn stdout writer thread")?;

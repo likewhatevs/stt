@@ -109,8 +109,12 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // only populates bpf_prog_stats when bpf_stats_enabled_key is set.
     let _ = fs::write("/proc/sys/kernel/bpf_stats_enabled", "1");
 
-    // Phase 2: Sentinel + stdio redirect.
-    write_com2("KTSTR_INIT_STARTED");
+    // Phase 2: Sentinel + stdio redirect. The sentinel is for the test
+    // harness on the host; shell mode doesn't need it and it would leak
+    // to the user's terminal via COM2 stdout drain.
+    if !shell_mode_requested() {
+        write_com2("KTSTR_INIT_STARTED");
+    }
     redirect_stdio_to_com2();
     let t_stdio = t0.elapsed();
 

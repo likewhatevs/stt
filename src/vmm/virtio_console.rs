@@ -1,6 +1,4 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 /// Single-port virtio-console with inline MMIO transport.
 ///
 /// Two virtqueues (RX index 0, TX index 1), no multiport/control queues.
@@ -75,9 +73,6 @@ pub struct VirtioConsole {
     /// Pending host input that could not be delivered because the guest
     /// RX queue had no available buffers. Drained on RX queue notify.
     pending_rx: VecDeque<u8>,
-    /// Set when device_status reaches DRIVER_OK. Shared with I/O threads
-    /// so they can switch from COM2 to virtio-console without locking.
-    activated: Arc<AtomicBool>,
 }
 
 impl Default for VirtioConsole {
@@ -110,7 +105,6 @@ impl VirtioConsole {
             mem: None,
             tx_buf: Vec::new(),
             pending_rx: VecDeque::new(),
-            activated: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -123,13 +117,6 @@ impl VirtioConsole {
     /// stdout thread's poll set for zero-latency wakeup.
     pub fn tx_evt(&self) -> &EventFd {
         &self.tx_evt
-    }
-
-    /// Shared activation flag. Set when device_status reaches DRIVER_OK.
-    /// I/O threads check this with Relaxed ordering to switch from COM2
-    /// to virtio-console without locking the PiMutex.
-    pub fn activated(&self) -> &Arc<AtomicBool> {
-        &self.activated
     }
 
     /// Set guest memory reference. Must be called before starting vCPUs.
@@ -426,9 +413,6 @@ impl VirtioConsole {
         };
         if valid {
             self.device_status = val;
-            if val == S_OK {
-                self.activated.store(true, Ordering::Release);
-            }
         }
     }
 
