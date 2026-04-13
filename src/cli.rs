@@ -273,7 +273,7 @@ pub fn run_make_with_output(
         .map_while(Result::ok)
     {
         if let Some(sp) = spinner {
-            sp.suspend(|| eprintln!("{line}"));
+            sp.println(&line);
         }
         captured.push(line);
     }
