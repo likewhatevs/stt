@@ -650,8 +650,8 @@ pub(crate) fn run_ktstr_test_with_topo_and_flags(
 
 /// Run a test result through expect_err logic and return an exit code.
 ///
-/// Returns 0 on pass, 1 on failure. `ResourceContention` returns
-/// 0 (skip) — the test never ran due to insufficient host resources.
+/// Returns 0 on pass, 1 on failure. `ResourceContention` always
+/// returns 1 so nextest retries with exponential backoff.
 fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
     match result {
         Ok(_) if expect_err => {
@@ -668,8 +668,8 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                 .unwrap()
                 .reason
                 .clone();
-            eprintln!("SKIP: resource contention: {reason}");
-            0
+            eprintln!("resource contention: {reason}");
+            1
         }
         Err(_) if expect_err => 0,
         Err(e) => {
