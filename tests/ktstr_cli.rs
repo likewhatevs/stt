@@ -163,6 +163,31 @@ fn include_files_dir_walks_recursively() {
     assert!(paths.iter().any(|p| p.contains("sub/file.txt")));
 }
 
+// -- virtio-console end-to-end via --exec --
+
+/// Full data path test: host → virtio RX → guest hvc0 → busybox sh -c →
+/// virtio TX → host stdout. Requires /dev/kvm and a cached kernel.
+/// Skips when either is unavailable.
+#[test]
+fn shell_exec_echo() {
+    // Skip if no /dev/kvm.
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("skipping shell_exec_echo: /dev/kvm not found");
+        return;
+    }
+    // Skip if no kernel available (don't trigger auto-download in tests).
+    if ktstr::find_kernel().ok().flatten().is_none() {
+        eprintln!("skipping shell_exec_echo: no cached kernel");
+        return;
+    }
+    ktstr()
+        .args(["shell", "--exec", "echo hello-from-guest"])
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello-from-guest"));
+}
+
 #[test]
 fn include_files_duplicate_archive_path_errors() {
     let tmp1 = tempfile::TempDir::new().unwrap();
