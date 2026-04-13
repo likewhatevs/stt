@@ -214,25 +214,30 @@ pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Merge the kconfig fragment into the kernel's .config.
+/// Ensure the kconfig fragment is applied to the kernel's .config.
 ///
 /// Creates a default .config via `make defconfig` if none exists.
-/// Uses a hash marker (`# ktstr-kconfig:{hash}`) at the end of
-/// .config to skip the append when the fragment is already applied.
-/// This preserves .config mtime so `make -q` returns 0 on repeat
-/// invocations with no changes.
+/// Checks each non-comment CONFIG line from the fragment against
+/// the current .config. If all are present, .config is not touched
+/// (preserving mtime for make's dependency tracking). If any are
+/// missing, appends the full fragment — kconfig last-value-wins
+/// makes this idempotent.
 pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
     let config_path = kernel_dir.join(".config");
     if !config_path.exists() {
         run_make(kernel_dir, &["defconfig"])?;
     }
 
-    let hash = format!("{:08x}", crc32fast::hash(fragment.as_bytes()));
-    let marker = format!("# ktstr-kconfig:{hash}");
-
-    // Check if the fragment is already applied.
     let config_content = std::fs::read_to_string(&config_path)?;
-    if config_content.contains(&marker) {
+    let all_present = fragment
+        .lines()
+        .filter(|l| {
+            let trimmed = l.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .all(|l| config_content.contains(l.trim()));
+
+    if all_present {
         return Ok(());
     }
 
@@ -240,7 +245,6 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
         .append(true)
         .open(&config_path)?;
     std::io::Write::write_all(&mut config, fragment.as_bytes())?;
-    std::io::Write::write_all(&mut config, format!("\n{marker}\n").as_bytes())?;
 
     Ok(())
 }
