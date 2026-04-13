@@ -770,8 +770,6 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
 /// image, configures and builds the kernel automatically, caches the
 /// result, and returns the image path.
 fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
-    // Source trees always build. The user expects their changes and
-    // the current kconfig reflected every time. No cache lookup.
     let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
     if !is_source_tree {
         bail!(
@@ -781,23 +779,44 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         );
     }
 
-    // Auto-build: configure + build + cache.
-    eprintln!("ktstr: auto-building kernel from {}", path.display());
+    // Ensure kconfig fragment is applied (skips append if all
+    // options already present in .config).
+    configure_kernel(path, EMBEDDED_KCONFIG)?;
 
-    // Always merge the kconfig fragment. The fragment contains more
-    // than sched_ext (e.g. CONFIG_VIRTIO_CONSOLE). kconfig uses
-    // last-value-wins so re-appending is idempotent.
+    // Dirty detection: dirty trees always build, never use cache.
+    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let is_dirty = acquired.is_dirty;
+
+    // Compute cache key from final .config CRC32.
+    let (arch, image_name) = crate::fetch::arch_info();
+    let git_short = &crate::GIT_FULL_HASH[..7.min(crate::GIT_FULL_HASH.len())];
+    let config_path = path.join(".config");
+    let config_hash = std::fs::read(&config_path)
+        .ok()
+        .map(|data| format!("{:08x}", crc32fast::hash(&data)));
+    let cfg_tag = config_hash.as_deref().unwrap_or("nocfg");
+    let cache_key = match &acquired.git_hash {
+        Some(h) => format!("local-{h}-{arch}-cfg{cfg_tag}-{git_short}"),
+        None => format!("local-unknown-{arch}-cfg{cfg_tag}-{git_short}"),
+    };
+
+    // Clean trees: cache lookup before build.
+    if !is_dirty
+        && let Ok(cache) = crate::cache::CacheDir::new()
+        && let Some(entry) = cache.lookup(&cache_key)
+        && let Some(ref meta) = entry.metadata
     {
-        let sp = Spinner::start("Configuring kernel...");
-        let result = configure_kernel(path, EMBEDDED_KCONFIG);
-        if result.is_err() {
-            sp.clear();
-        } else {
-            sp.finish("Kernel configured");
+        let image = entry.path.join(&meta.image_name);
+        if image.exists() {
+            eprintln!("ktstr: using cached kernel {cache_key}");
+            return Ok(image);
         }
-        result?;
     }
 
+    // Build.
+    if is_dirty {
+        eprintln!("ktstr: dirty tree, building kernel");
+    }
     let sp = Spinner::start("Building kernel...");
     let result = make_kernel_with_output(path, Some(&sp));
     if result.is_err() {
@@ -814,32 +833,10 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         )
     })?;
 
-    // Cache the build for find_kernel() fallback scan (skip dirty trees).
-    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    if !acquired.is_dirty
-        && let Ok(cache) = crate::cache::CacheDir::new()
-    {
+    // Cache the build (skip dirty trees).
+    if !is_dirty && let Ok(cache) = crate::cache::CacheDir::new() {
         let vmlinux_path = path.join("vmlinux");
         let vmlinux_ref = vmlinux_path.exists().then_some(vmlinux_path.as_path());
-
-        let config_path = path.join(".config");
-        let config_hash = if config_path.exists() {
-            std::fs::read(&config_path)
-                .ok()
-                .map(|data| format!("{:08x}", crc32fast::hash(&data)))
-        } else {
-            None
-        };
-
-        // Cache key uses the final .config CRC32 (captures kconfig
-        // fragment + any user menuconfig changes) and ktstr git hash.
-        let (arch, image_name) = crate::fetch::arch_info();
-        let git_short = &crate::GIT_FULL_HASH[..7.min(crate::GIT_FULL_HASH.len())];
-        let cfg_tag = config_hash.as_deref().unwrap_or("nocfg");
-        let cache_key = match &acquired.git_hash {
-            Some(h) => format!("local-{h}-{arch}-cfg{cfg_tag}-{git_short}"),
-            None => format!("local-unknown-{arch}-cfg{cfg_tag}-{git_short}"),
-        };
 
         let metadata = crate::cache::KernelMetadata::new(
             acquired.source_type.clone(),
