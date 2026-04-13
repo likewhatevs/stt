@@ -2761,6 +2761,7 @@ dependencies = [
  "polars",
  "predicates",
  "rand 0.10.1",
+ "rayon",
  "reqwest 0.13.2",
  "rmesg",
  "serde",

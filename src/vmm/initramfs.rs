@@ -242,58 +242,82 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     let root_needed: Vec<String> = elf.libraries.iter().map(|s| s.to_string()).collect();
     let root_search = elf_search_paths(&elf, binary);
 
-    // Resolve the full transitive closure. Each queued entry carries the
-    // search paths from the library that declared the DT_NEEDED, since
-    // each ELF has its own DT_RUNPATH/DT_RPATH.
+    // Resolve the full transitive closure via level-parallel BFS.
+    // Each level's file reads (read + ELF parse) run in parallel via
+    // rayon. Soname resolution (resolve_soname) is cheap (cache lookups
+    // + stat calls), so it stays sequential per level.
+    use rayon::prelude::*;
+
     let mut found: Vec<(String, PathBuf)> = Vec::new();
     let mut missing: Vec<MissingLib> = Vec::new();
     let mut visited = std::collections::HashSet::new();
-    // Queue: (soname, is_direct_dep_of_root, search_paths_from_parent)
-    let mut queue: std::collections::VecDeque<(String, bool, Vec<PathBuf>)> = root_needed
+
+    // Current level: (soname, is_direct_dep_of_root, search_paths_from_parent)
+    let mut level: Vec<(String, bool, Vec<PathBuf>)> = root_needed
         .iter()
         .map(|s| (s.clone(), true, root_search.clone()))
         .collect();
 
-    while let Some((soname, is_direct, search_paths)) = queue.pop_front() {
-        if !visited.insert(soname.clone()) {
-            continue;
-        }
-        if let Some(host_path) = resolve_soname(&soname, &search_paths) {
-            let canonical = std::fs::canonicalize(&host_path).unwrap_or_else(|_| host_path.clone());
-            let canon_str = canonical.to_string_lossy();
-            let canon_guest = canon_str
-                .strip_prefix('/')
-                .unwrap_or(&canon_str)
-                .to_string();
-            found.push((canon_guest.clone(), canonical.clone()));
-
-            // Also add the non-canonical path if it differs, so the
-            // guest dynamic linker can find the lib via either path.
-            let host_str = host_path.to_string_lossy();
-            let host_guest = host_str.strip_prefix('/').unwrap_or(&host_str).to_string();
-            if host_guest != canon_guest {
-                found.push((host_guest, canonical.clone()));
+    while !level.is_empty() {
+        // Phase 1: resolve sonames to host paths (sequential, cheap).
+        let mut resolved: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+        for (soname, is_direct, search_paths) in &level {
+            if !visited.insert(soname.clone()) {
+                continue;
             }
+            if let Some(host_path) = resolve_soname(soname, search_paths) {
+                let canonical =
+                    std::fs::canonicalize(&host_path).unwrap_or_else(|_| host_path.clone());
+                let canon_str = canonical.to_string_lossy();
+                let canon_guest = canon_str
+                    .strip_prefix('/')
+                    .unwrap_or(&canon_str)
+                    .to_string();
+                found.push((canon_guest.clone(), canonical.clone()));
 
-            // Recurse: parse the resolved lib's own DT_NEEDED and use
-            // its own DT_RUNPATH/DT_RPATH for resolving those deps.
-            if let Ok(lib_data) = std::fs::read(&canonical)
-                && let Ok(lib_elf) = goblin::elf::Elf::parse(&lib_data)
-            {
-                let lib_search = elf_search_paths(&lib_elf, &canonical);
-                for lib_name in &lib_elf.libraries {
-                    let transitive = lib_name.to_string();
-                    if !visited.contains(&transitive) {
-                        queue.push_back((transitive, false, lib_search.clone()));
-                    }
+                // Also add the non-canonical path if it differs, so the
+                // guest dynamic linker can find the lib via either path.
+                let host_str = host_path.to_string_lossy();
+                let host_guest = host_str.strip_prefix('/').unwrap_or(&host_str).to_string();
+                if host_guest != canon_guest {
+                    found.push((host_guest, canonical.clone()));
                 }
+
+                resolved.push((soname.clone(), host_path, canonical));
+            } else {
+                missing.push(MissingLib {
+                    soname: soname.clone(),
+                    direct: *is_direct,
+                });
             }
-        } else {
-            missing.push(MissingLib {
-                soname,
-                direct: is_direct,
-            });
         }
+
+        // Phase 2: read + parse resolved libs in parallel to discover
+        // their DT_NEEDED entries and search paths.
+        let next_deps: Vec<(String, Vec<PathBuf>)> = resolved
+            .par_iter()
+            .flat_map(|(_, _, canonical)| {
+                let Ok(lib_data) = std::fs::read(canonical) else {
+                    return Vec::new();
+                };
+                let Ok(lib_elf) = goblin::elf::Elf::parse(&lib_data) else {
+                    return Vec::new();
+                };
+                let lib_search = elf_search_paths(&lib_elf, canonical);
+                lib_elf
+                    .libraries
+                    .iter()
+                    .map(|name| (name.to_string(), lib_search.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Build next level from discovered deps, skipping already-visited.
+        level = next_deps
+            .into_iter()
+            .filter(|(soname, _)| !visited.contains(soname))
+            .map(|(soname, search)| (soname, false, search))
+            .collect();
     }
 
     // If there are unresolved libs and the binary has a non-standard
