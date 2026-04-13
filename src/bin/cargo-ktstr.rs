@@ -204,16 +204,26 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
 
     if !cli::has_sched_ext(kernel_dir) {
         let sp = cli::Spinner::start("Configuring kernel...");
-        cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"))?;
-        sp.finish("Kernel configured");
+        let result =
+            cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"));
+        if result.is_err() {
+            sp.clear();
+        } else {
+            sp.finish("Kernel configured");
+        }
+        result?;
     }
 
     let sp = cli::Spinner::start("Building kernel...");
-    cli::make_kernel(kernel_dir).map_err(|e| format!("{e:#}"))?;
-    sp.finish("Kernel built");
+    let result = cli::make_kernel_quiet(kernel_dir).map_err(|e| format!("{e:#}"));
+    if result.is_err() {
+        sp.clear();
+    } else {
+        sp.finish("Kernel built");
+    }
+    result?;
 
-    eprintln!("cargo-ktstr: generating compile_commands.json");
-    cli::run_make(kernel_dir, &["compile_commands.json"]).map_err(|e| format!("{e:#}"))?;
+    cli::run_make_quiet(kernel_dir, &["compile_commands.json"]).map_err(|e| format!("{e:#}"))?;
     Ok(())
 }
 
@@ -356,19 +366,30 @@ fn kernel_build(
     // Configure.
     if !cli::has_sched_ext(source_dir) {
         let sp = cli::Spinner::start("Configuring kernel...");
-        cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"))?;
-        sp.finish("Kernel configured");
+        let result =
+            cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"));
+        if result.is_err() {
+            sp.clear();
+        } else {
+            sp.finish("Kernel configured");
+        }
+        result?;
     }
 
     // Build.
     let sp = cli::Spinner::start("Building kernel...");
-    cli::make_kernel(source_dir).map_err(|e| format!("{e:#}"))?;
-    sp.finish("Kernel built");
+    let result = cli::make_kernel_quiet(source_dir).map_err(|e| format!("{e:#}"));
+    if result.is_err() {
+        sp.clear();
+    } else {
+        sp.finish("Kernel built");
+    }
+    result?;
 
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
-        eprintln!("cargo-ktstr: generating compile_commands.json");
-        cli::run_make(source_dir, &["compile_commands.json"]).map_err(|e| format!("{e:#}"))?;
+        cli::run_make_quiet(source_dir, &["compile_commands.json"])
+            .map_err(|e| format!("{e:#}"))?;
     }
 
     // Find the built kernel image and vmlinux.

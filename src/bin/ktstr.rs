@@ -264,14 +264,25 @@ fn kernel_build(
     // Configure.
     if !cli::has_sched_ext(source_dir) {
         let sp = cli::Spinner::start("Configuring kernel...");
-        cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG)?;
-        sp.finish("Kernel configured");
+        let result = cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG);
+        if result.is_err() {
+            sp.clear();
+        } else {
+            sp.finish("Kernel configured");
+        }
+        result?;
     }
 
     // Build.
     let sp = cli::Spinner::start("Building kernel...");
-    cli::make_kernel(source_dir)?;
-    sp.finish("Kernel built");
+    let result = cli::make_kernel_quiet(source_dir);
+    if let Err(ref e) = result {
+        sp.clear();
+        eprintln!("{e}");
+    } else {
+        sp.finish("Kernel built");
+    }
+    result?;
 
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
