@@ -542,7 +542,13 @@ fn shm_write_and_release(fd: std::os::unix::io::RawFd, data: &[u8], seg_name: &s
 pub fn initramfs_min_memory_mb(initramfs_bytes: u64, shm_bytes: u64) -> u32 {
     let initramfs_mb = ((initramfs_bytes + (1 << 20) - 1) >> 20) as u32;
     let shm_mb = ((shm_bytes + (1 << 20) - 1) >> 20) as u32;
-    2 * initramfs_mb + 128 + shm_mb
+    // The kernel decompresses the initrd into tmpfs (default 50% of
+    // RAM), then frees the compressed region. Peak memory is the
+    // uncompressed initramfs in tmpfs + kernel overhead (slab, page
+    // tables, kernel image). 256MB covers kernel overhead and leaves
+    // room for runtime use. Since tmpfs is 50% of RAM, we need 2x
+    // the initramfs size so that 50% of total >= initramfs.
+    2 * initramfs_mb + 256 + shm_mb
 }
 
 /// Estimate minimum guest memory from binary file sizes.
