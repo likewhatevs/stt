@@ -440,7 +440,7 @@ fn mount_devpts() {
         "/dev/pts",
         Some("devpts"),
         MsFlags::empty(),
-        Some("newinstance,ptmxmode=0666"),
+        None::<&str>,
     );
     if let Err(e) = result {
         eprintln!("ktstr-init: mount devpts on /dev/pts: {e}");
