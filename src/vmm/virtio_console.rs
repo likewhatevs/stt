@@ -354,17 +354,15 @@ impl VirtioConsole {
                 }
             }
             VIRTIO_MMIO_QUEUE_SEL => self.queue_select = val,
-            VIRTIO_MMIO_QUEUE_NUM
-                if self.queue_config_allowed()
-                    && let Some(i) = self.selected_queue() =>
-            {
-                self.queues[i].set_size(val as u16);
+            VIRTIO_MMIO_QUEUE_NUM if self.queue_config_allowed() => {
+                if let Some(i) = self.selected_queue() {
+                    self.queues[i].set_size(val as u16);
+                }
             }
-            VIRTIO_MMIO_QUEUE_READY
-                if self.queue_config_allowed()
-                    && let Some(i) = self.selected_queue() =>
-            {
-                self.queues[i].set_ready(val == 1);
+            VIRTIO_MMIO_QUEUE_READY if self.queue_config_allowed() => {
+                if let Some(i) = self.selected_queue() {
+                    self.queues[i].set_ready(val == 1);
+                }
             }
             VIRTIO_MMIO_QUEUE_NOTIFY => {
                 let idx = val as usize;
@@ -384,41 +382,35 @@ impl VirtioConsole {
                     self.set_status(val);
                 }
             }
-            VIRTIO_MMIO_QUEUE_DESC_LOW
-                if self.queue_config_allowed()
-                    && let Some(i) = self.selected_queue() =>
-            {
-                self.queues[i].set_desc_table_address(Some(val), None);
+            VIRTIO_MMIO_QUEUE_DESC_LOW if self.queue_config_allowed() => {
+                if let Some(i) = self.selected_queue() {
+                    self.queues[i].set_desc_table_address(Some(val), None);
+                }
             }
-            VIRTIO_MMIO_QUEUE_DESC_HIGH
-                if self.queue_config_allowed()
-                    && let Some(i) = self.selected_queue() =>
-            {
-                self.queues[i].set_desc_table_address(None, Some(val));
+            VIRTIO_MMIO_QUEUE_DESC_HIGH if self.queue_config_allowed() => {
+                if let Some(i) = self.selected_queue() {
+                    self.queues[i].set_desc_table_address(None, Some(val));
+                }
             }
-            VIRTIO_MMIO_QUEUE_AVAIL_LOW
-                if self.queue_config_allowed()
-                    && let Some(i) = self.selected_queue() =>
-            {
-                self.queues[i].set_avail_ring_address(Some(val), None);
+            VIRTIO_MMIO_QUEUE_AVAIL_LOW if self.queue_config_allowed() => {
+                if let Some(i) = self.selected_queue() {
+                    self.queues[i].set_avail_ring_address(Some(val), None);
+                }
             }
-            VIRTIO_MMIO_QUEUE_AVAIL_HIGH
-                if self.queue_config_allowed()
-                    && let Some(i) = self.selected_queue() =>
-            {
-                self.queues[i].set_avail_ring_address(None, Some(val));
+            VIRTIO_MMIO_QUEUE_AVAIL_HIGH if self.queue_config_allowed() => {
+                if let Some(i) = self.selected_queue() {
+                    self.queues[i].set_avail_ring_address(None, Some(val));
+                }
             }
-            VIRTIO_MMIO_QUEUE_USED_LOW
-                if self.queue_config_allowed()
-                    && let Some(i) = self.selected_queue() =>
-            {
-                self.queues[i].set_used_ring_address(Some(val), None);
+            VIRTIO_MMIO_QUEUE_USED_LOW if self.queue_config_allowed() => {
+                if let Some(i) = self.selected_queue() {
+                    self.queues[i].set_used_ring_address(Some(val), None);
+                }
             }
-            VIRTIO_MMIO_QUEUE_USED_HIGH
-                if self.queue_config_allowed()
-                    && let Some(i) = self.selected_queue() =>
-            {
-                self.queues[i].set_used_ring_address(None, Some(val));
+            VIRTIO_MMIO_QUEUE_USED_HIGH if self.queue_config_allowed() => {
+                if let Some(i) = self.selected_queue() {
+                    self.queues[i].set_used_ring_address(None, Some(val));
+                }
             }
             _ => {}
         }
