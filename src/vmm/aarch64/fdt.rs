@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use vm_fdt::FdtWriter;
+use vm_fdt::{FdtReserveEntry, FdtWriter};
 
 use crate::vmm::aarch64::topology::mpidr_to_fdt_reg;
 use crate::vmm::kvm::{
@@ -39,7 +39,24 @@ pub fn create_fdt(
     initrd_size: Option<u32>,
     shm_size: u64,
 ) -> Result<Vec<u8>> {
-    let mut fdt = FdtWriter::new().context("create FDT writer")?;
+    // SHM base address (top of guest DRAM minus SHM size).
+    let shm_base = if shm_size > 0 {
+        let mem_size = (memory_mb as u64) << 20;
+        Some(DRAM_START + mem_size - shm_size)
+    } else {
+        None
+    };
+
+    // Reserve the SHM region via /memreserve/ so the kernel adds it to
+    // memblock.reserved (preventing allocation) while the full DRAM range
+    // in the /memory node keeps it in memblock.memory (ensuring /dev/mem
+    // maps it with Normal cacheable attributes, not Device-nGnRnE).
+    let reserves = if let Some(base) = shm_base {
+        vec![FdtReserveEntry::new(base, shm_size).context("SHM reserve entry")?]
+    } else {
+        vec![]
+    };
+    let mut fdt = FdtWriter::new_with_mem_reserv(&reserves).context("create FDT writer")?;
 
     let root = fdt.begin_node("").context("begin root node")?;
     fdt.property_string("compatible", "linux,dummy-virt")
@@ -55,7 +72,16 @@ pub fn create_fdt(
     write_chosen(&mut fdt, cmdline, initrd_addr, initrd_size)?;
 
     // /memory — guest physical RAM
-    write_memory(&mut fdt, memory_mb, shm_size)?;
+    write_memory(&mut fdt, memory_mb)?;
+
+    // /reserved-memory — SHM region marked reserved (no kernel
+    // allocation) but kept in memblock.memory so /dev/mem maps it
+    // with Normal cacheable attributes. The /memory node above
+    // covers full DRAM including SHM — that is what makes
+    // pfn_is_map_memory() return true for SHM pages.
+    if let Some(base) = shm_base {
+        write_reserved_memory(&mut fdt, base, shm_size)?;
+    }
 
     // /cpus — one node per vCPU with MPIDR from KVM
     write_cpus(&mut fdt, mpidrs)?;
@@ -129,9 +155,13 @@ fn write_chosen(
     Ok(())
 }
 
-fn write_memory(fdt: &mut FdtWriter, memory_mb: u32, shm_size: u64) -> Result<()> {
+fn write_memory(fdt: &mut FdtWriter, memory_mb: u32) -> Result<()> {
+    // Full DRAM range including SHM. arm64 phys_mem_access_prot()
+    // maps addresses outside memblock.memory as Device-nGnRnE, which
+    // faults on paired loads (memcpy STP). Including SHM here puts
+    // its pages in memblock.memory so /dev/mem maps them cacheable.
+    // /reserved-memory prevents kernel allocation from the SHM region.
     let mem_size = (memory_mb as u64) << 20;
-    let usable = mem_size - shm_size;
 
     let name = format!("memory@{DRAM_START:x}");
     let mem = fdt.begin_node(&name).context("begin memory")?;
@@ -143,12 +173,44 @@ fn write_memory(fdt: &mut FdtWriter, memory_mb: u32, shm_size: u64) -> Result<()
         &[
             (DRAM_START >> 32) as u32,
             DRAM_START as u32,
-            (usable >> 32) as u32,
-            usable as u32,
+            (mem_size >> 32) as u32,
+            mem_size as u32,
         ],
     )
     .context("memory reg")?;
     fdt.end_node(mem).context("end memory")?;
+    Ok(())
+}
+
+fn write_reserved_memory(fdt: &mut FdtWriter, shm_base: u64, shm_size: u64) -> Result<()> {
+    let rsv = fdt
+        .begin_node("reserved-memory")
+        .context("begin reserved-memory")?;
+    fdt.property_u32("#address-cells", 2)
+        .context("reserved-memory #address-cells")?;
+    fdt.property_u32("#size-cells", 2)
+        .context("reserved-memory #size-cells")?;
+    fdt.property_null("ranges")
+        .context("reserved-memory ranges")?;
+
+    // SHM child node: reserved but NOT no-map. Without no-map the
+    // kernel keeps the region in memblock.memory (linear map) so
+    // /dev/mem maps it with Normal cacheable attributes.
+    let name = format!("shm@{shm_base:x}");
+    let shm = fdt.begin_node(&name).context("begin shm node")?;
+    fdt.property_array_u32(
+        "reg",
+        &[
+            (shm_base >> 32) as u32,
+            shm_base as u32,
+            (shm_size >> 32) as u32,
+            shm_size as u32,
+        ],
+    )
+    .context("shm reg")?;
+    fdt.end_node(shm).context("end shm node")?;
+
+    fdt.end_node(rsv).context("end reserved-memory")?;
     Ok(())
 }
 

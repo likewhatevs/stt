@@ -233,6 +233,17 @@ impl KtstrKvm {
             .get_preferred_target(&mut kvi)
             .context("get preferred target")?;
         kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
+        // Enable pointer authentication if host supports it.
+        // Shared libraries from the host (packed into the initramfs)
+        // may contain PAC instructions when the toolchain defaults to
+        // -mbranch-protection (e.g. Fedora 38+ aarch64). Without
+        // these flags KVM traps PAC as UNDEF → guest SIGILL.
+        if vm_fd.check_extension(kvm_ioctls::Cap::ArmPtrAuthAddress) {
+            kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_ADDRESS;
+        }
+        if vm_fd.check_extension(kvm_ioctls::Cap::ArmPtrAuthGeneric) {
+            kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_GENERIC;
+        }
 
         for cpu_id in 0..total {
             let vcpu = vm_fd

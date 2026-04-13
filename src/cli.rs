@@ -418,6 +418,19 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
             "requires pahole >= 1.16 (dwarves package)",
         ),
         ("CONFIG_BPF_SYSCALL", "required for BPF program loading"),
+        (
+            "CONFIG_FTRACE",
+            "gate for all tracing infrastructure — arm64 defconfig disables it, \
+             silently dropping KPROBE_EVENTS and BPF_EVENTS",
+        ),
+        (
+            "CONFIG_KPROBE_EVENTS",
+            "required for ktstr probe pipeline (depends on FTRACE + KPROBES)",
+        ),
+        (
+            "CONFIG_BPF_EVENTS",
+            "required for BPF kprobe/tracepoint attachment (depends on KPROBE_EVENTS + PERF_EVENTS)",
+        ),
     ];
 
     let mut missing = Vec::new();

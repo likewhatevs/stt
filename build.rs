@@ -88,6 +88,31 @@ int main(void) {{
         );
     }
 
+    // arm64 bpf_tracing.h casts pt_regs through struct user_pt_regs,
+    // a UAPI type that kernel BTF may omit. Append it if absent so
+    // PT_REGS_PARMn_CORE compiles on arm64 hosts.
+    if cfg!(target_arch = "aarch64") {
+        let content = std::fs::read_to_string(&vmlinux_h).expect("read vmlinux.h");
+        if !content.contains("struct user_pt_regs {") {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&vmlinux_h)
+                .expect("open vmlinux.h for append");
+            writeln!(
+                f,
+                "\n/* Added by build.rs: arm64 UAPI type needed by bpf_tracing.h */\n\
+                 struct user_pt_regs {{\n\
+                 \t__u64 regs[31];\n\
+                 \t__u64 sp;\n\
+                 \t__u64 pc;\n\
+                 \t__u64 pstate;\n\
+                 }};\n"
+            )
+            .expect("append user_pt_regs to vmlinux.h");
+        }
+    }
+
     let clang_args = [
         format!("-I{}", out_dir.display()),
         format!("-I{}", "src/bpf"),

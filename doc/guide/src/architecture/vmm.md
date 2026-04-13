@@ -56,8 +56,9 @@ SHM is unavailable.
 
 **SHM ring buffer** -- the primary guest-to-host data channel. A shared
 memory ring buffer carries test results (`MSG_TYPE_TEST_RESULT`), exit
-codes (`MSG_TYPE_EXIT`), and stimulus events (`MSG_TYPE_STIMULUS`).
-Each entry has a CRC32 for integrity checking.
+codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`), and
+profraw coverage data (`MSG_TYPE_PROFRAW`). Each entry has a CRC32
+for integrity checking.
 
 ## Performance mode
 

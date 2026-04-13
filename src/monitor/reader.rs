@@ -508,7 +508,7 @@ pub(crate) fn resolve_event_pcpu_pas(
         return None;
     }
 
-    let scx_sched_pa = scx_sched_kva.wrapping_sub(page_offset);
+    let scx_sched_pa = super::symbols::kva_to_pa(scx_sched_kva, page_offset);
     let pcpu_kva = mem.read_u64(scx_sched_pa, ev.scx_sched_pcpu_off);
     if pcpu_kva == 0 {
         return None;
@@ -516,7 +516,7 @@ pub(crate) fn resolve_event_pcpu_pas(
 
     let pas: Vec<u64> = per_cpu_offsets
         .iter()
-        .map(|&cpu_off| pcpu_kva.wrapping_add(cpu_off).wrapping_sub(page_offset))
+        .map(|&cpu_off| super::symbols::kva_to_pa(pcpu_kva.wrapping_add(cpu_off), page_offset))
         .collect();
 
     Some(pas)

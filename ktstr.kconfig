@@ -25,6 +25,10 @@ CONFIG_DEBUG_INFO_BTF=y
 # and scx scheduler tracing (e.g. LAVD futex tracing).
 # PERF_EVENTS: explicit dep of BPF_EVENTS (provided by defconfig's
 # PROFILING=y, but stated here so the tracing section is self-contained).
+# FTRACE: top-level gate for all tracing infrastructure. arm64 defconfig
+# disables it — without FTRACE=y, KPROBE_EVENTS, BPF_EVENTS, and
+# FUNCTION_TRACER are silently dropped (inside `if FTRACE` in Kconfig).
+CONFIG_FTRACE=y
 CONFIG_KPROBES=y
 CONFIG_KPROBE_EVENTS=y
 CONFIG_PERF_EVENTS=y

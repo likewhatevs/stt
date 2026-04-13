@@ -1460,12 +1460,12 @@ mod tests {
     /// (leaf level) and the given slots populated with entry pointers.
     /// Returns (buffer, xa_head pointing to the node, page_offset used).
     ///
-    /// Layout: node at PA 0x1000, slots at PA 0x1000 + slots_off.
-    /// page_offset chosen so kva_to_pa(node_kva, page_offset) = 0x1000.
+    /// Layout: node at DRAM offset 0x1000, slots at 0x1000 + slots_off.
+    /// kva_to_pa(node_kva, page_offset) = 0x1000.
     fn setup_xa_node(slots: &[(u64, u64)], slots_off: usize) -> (Vec<u8>, u64, u64) {
         let node_pa: u64 = 0x1000;
-        let page_offset: u64 = 0xFFFF_8880_0000_0000;
-        let node_kva = node_pa + page_offset;
+        let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+        let node_kva = page_offset.wrapping_add(node_pa);
 
         let size = (node_pa as usize) + slots_off + XA_CHUNK_SIZE as usize * 8 + 8;
         let mut buf = vec![0u8; size];
@@ -1917,9 +1917,9 @@ mod tests {
     ) -> (Vec<u8>, u64, u64) {
         let root_pa: u64 = 0x1000;
         let child_pa: u64 = 0x2000;
-        let page_offset: u64 = 0xFFFF_8880_0000_0000;
-        let root_kva = root_pa + page_offset;
-        let child_kva = child_pa + page_offset;
+        let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+        let root_kva = page_offset.wrapping_add(root_pa);
+        let child_kva = page_offset.wrapping_add(child_pa);
 
         let size = (child_pa as usize) + slots_off + XA_CHUNK_SIZE as usize * 8 + 8;
         let mut buf = vec![0u8; size];
@@ -3169,8 +3169,8 @@ mod tests {
     fn xa_node_shift_nonzero_offset() {
         // Place shift at offset 8 within the xa_node instead of 0.
         let node_pa: u64 = 0x1000;
-        let page_offset: u64 = 0xFFFF_8880_0000_0000;
-        let node_kva = node_pa + page_offset;
+        let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+        let node_kva = page_offset.wrapping_add(node_pa);
         let shift_off: usize = 8;
 
         let mut buf = vec![0u8; 0x2000];
@@ -4211,7 +4211,9 @@ mod tests {
     ) -> (Vec<u8>, u64, BpfMapInfo, BpfMapOffsets) {
         let htab = test_htab_offsets();
         let offsets = test_htab_map_offsets();
-        let page_offset: u64 = 0xFFFF_8880_0000_0000;
+        let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+        // Direct-mapping KVA = PAGE_OFFSET + dram_offset.
+        let pa_to_kva = |pa: u64| -> u64 { page_offset.wrapping_add(pa) };
 
         let htab_pa: u64 = 0x0000;
         let buckets_pa: u64 = 0x1000;
@@ -4244,7 +4246,7 @@ mod tests {
         write_u64(
             &mut buf,
             htab_pa + htab.htab_buckets as u64,
-            buckets_pa + page_offset,
+            pa_to_kva(buckets_pa),
         );
         write_u32(&mut buf, htab_pa + htab.htab_n_buckets as u64, n_buckets);
 
@@ -4262,7 +4264,7 @@ mod tests {
         let mut prev_node_pa: Option<u64> = None;
         for (idx, (key, val)) in entries.iter().enumerate().rev() {
             let elem_pa = elems_start + (idx as u64) * (elem_stride as u64);
-            let elem_kva = elem_pa + page_offset;
+            let elem_kva = pa_to_kva(elem_pa);
 
             // Write key at htab_elem_size_base offset.
             let key_off = elem_pa + htab.htab_elem_size_base as u64;
@@ -4274,8 +4276,8 @@ mod tests {
 
             // Set next pointer: points to previous element or nulls marker.
             let next = match prev_node_pa {
-                Some(prev_pa) => prev_pa + page_offset, // KVA of previous elem
-                None => 1u64,                           // nulls end marker
+                Some(prev_pa) => pa_to_kva(prev_pa), // KVA of previous elem
+                None => 1u64,                        // nulls end marker
             };
             write_u64(&mut buf, elem_pa + htab.hlist_nulls_node_next as u64, next);
 
@@ -4299,7 +4301,7 @@ mod tests {
 
         let map = BpfMapInfo {
             map_pa: htab_pa,
-            map_kva: htab_pa + page_offset,
+            map_kva: pa_to_kva(htab_pa),
             name: "test_hash".into(),
             map_type: BPF_MAP_TYPE_HASH,
             map_flags: 0,
@@ -4391,7 +4393,8 @@ mod tests {
         // bucket stride calculation: buckets_kva + i * bucket_size.
         let htab = test_htab_offsets();
         let offsets = test_htab_map_offsets();
-        let page_offset: u64 = 0xFFFF_8880_0000_0000;
+        let page_offset: u64 = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+        let pa_to_kva = |pa: u64| -> u64 { page_offset.wrapping_add(pa) };
         let key_size: u32 = 4;
         let value_size: u32 = 8;
 
@@ -4423,7 +4426,7 @@ mod tests {
         write_u64(
             &mut buf,
             htab_pa + htab.htab_buckets as u64,
-            buckets_pa + page_offset,
+            pa_to_kva(buckets_pa),
         );
         write_u32(&mut buf, htab_pa + htab.htab_n_buckets as u64, n_buckets);
 
@@ -4435,7 +4438,7 @@ mod tests {
 
         // Place one entry in bucket 2.
         let bucket2_pa = buckets_pa + 2 * (htab.bucket_size as u64);
-        let elem_kva = elem_pa + page_offset;
+        let elem_kva = pa_to_kva(elem_pa);
         write_u64(&mut buf, bucket2_pa, elem_kva); // bucket 2 head -> elem
 
         // elem next = nulls marker (end).
@@ -4453,7 +4456,7 @@ mod tests {
 
         let map = BpfMapInfo {
             map_pa: htab_pa,
-            map_kva: htab_pa + page_offset,
+            map_kva: pa_to_kva(htab_pa),
             name: "multi_bucket".into(),
             map_type: BPF_MAP_TYPE_HASH,
             map_flags: 0,

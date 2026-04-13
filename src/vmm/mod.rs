@@ -599,7 +599,7 @@ pub(crate) struct MemoryBudget {
     /// absorbing percpu and misc boot allocations.
     pub kernel_init_size: u64,
     /// SHM region carved from the top of guest memory (E820 gap on
-    /// x86_64, reduced FDT memory node on aarch64).
+    /// x86_64, FDT /reserved-memory and /memreserve/ on aarch64).
     pub shm_bytes: u64,
 }
 
@@ -744,7 +744,7 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 /// ## SHM region
 ///
 /// Carved from the top of guest physical memory. Not part of usable
-/// RAM (E820 gap on x86_64, reduced FDT memory node on aarch64).
+/// RAM (E820 gap on x86_64, FDT /reserved-memory and /memreserve/ on aarch64).
 ///
 /// ```text
 /// total = boot_requirement + 256 + shm
@@ -2850,8 +2850,8 @@ impl KtstrVm {
     /// Unified BSP KVM_RUN loop. Returns (exit_code, timed_out).
     ///
     /// Handles arch-specific I/O dispatch (port I/O on x86_64, MMIO on
-    /// aarch64) and HLT semantics (x86_64 BSP: check kill + continue;
-    /// aarch64 BSP: shutdown).
+    /// aarch64). HLT/WFI checks the kill flag and continues (both arches).
+    /// Shutdown is via PSCI SystemEvent (aarch64) or VcpuExit::Shutdown (x86_64).
     #[allow(clippy::too_many_arguments)]
     fn run_bsp_loop(
         &self,
@@ -3085,7 +3085,9 @@ impl KtstrVm {
         initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path for aarch64.
-        let kernel_result = if kernel_result.is_none() {
+        let kernel_result = if let Some(kr) = kernel_result {
+            kr
+        } else {
             // Join initramfs to learn actual size, then allocate memory.
             if let Some(handle) = initramfs_handle {
                 let (base, _key) = handle
@@ -3146,8 +3148,6 @@ impl KtstrVm {
                     .context("load kernel (aarch64)")?;
                 return self.finish_aarch64_setup(vm, kr, None, None);
             }
-        } else {
-            kernel_result.unwrap()
         };
 
         // Non-deferred path: memory already allocated, kernel already loaded.
@@ -3199,7 +3199,7 @@ impl KtstrVm {
             "console=ttyS0 ",
             "nomodules mitigations=off ",
             "random.trust_cpu=on swiotlb=noforce ",
-            "pci=off panic=-1 iomem=relaxed nokaslr lockdown=none ",
+            "panic=-1 iomem=relaxed nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
             "kfence.sample_interval=0",
@@ -3333,8 +3333,9 @@ fn dispatch_mmio_read(
             *first = com2.lock().inner_read(offset);
         }
     } else if let Some(vc) = virtio_con
-        && addr >= kvm::VIRTIO_CONSOLE_MMIO_BASE
-        && addr < kvm::VIRTIO_CONSOLE_MMIO_BASE + virtio_console::VIRTIO_MMIO_SIZE
+        && (kvm::VIRTIO_CONSOLE_MMIO_BASE
+            ..kvm::VIRTIO_CONSOLE_MMIO_BASE + virtio_console::VIRTIO_MMIO_SIZE)
+            .contains(&addr)
     {
         vc.lock()
             .mmio_read(addr - kvm::VIRTIO_CONSOLE_MMIO_BASE, data);
@@ -3429,7 +3430,7 @@ enum ExitAction {
 
 /// Classify a VcpuExit into an ExitAction, dispatching arch-specific I/O.
 ///
-/// Returns `None` for HLT (role-dependent) and unknown exits (continue).
+/// Returns `None` for HLT (caller handles: check kill flag, continue).
 /// Takes the exit by mutable reference so IoIn/MmioRead data buffers
 /// can be written back.
 ///

@@ -259,13 +259,18 @@ mod tests {
 
     #[test]
     fn direct_mapping_read() {
-        let page_offset: u64 = 0xFFFF_8880_0000_0000;
-        let kva = page_offset + 0x2000;
+        use crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+        // KVA = PAGE_OFFSET + dram_offset.
+        // kva_to_pa returns dram_offset.
+        let page_offset = DEFAULT_PAGE_OFFSET;
+        let dram_offset = 0x2000u64;
+        let kva = page_offset.wrapping_add(dram_offset);
         let pa = kva_to_pa(kva, page_offset);
-        assert_eq!(pa, 0x2000);
+        assert_eq!(pa, dram_offset);
 
         let mut buf = vec![0u8; 0x3000];
-        buf[0x2000..0x2008].copy_from_slice(&0xDEAD_BEEF_1234_5678u64.to_ne_bytes());
+        buf[dram_offset as usize..dram_offset as usize + 8]
+            .copy_from_slice(&0xDEAD_BEEF_1234_5678u64.to_ne_bytes());
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         assert_eq!(mem.read_u64(pa, 0), 0xDEAD_BEEF_1234_5678);
     }
@@ -402,11 +407,15 @@ mod tests {
 
     #[test]
     fn direct_mapping_methods() {
-        let page_offset: u64 = 0xFFFF_8880_0000_0000;
-        let kva = page_offset + 0x200;
+        use crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+        let page_offset = DEFAULT_PAGE_OFFSET;
+        let dram_offset = 0x200u64;
+        // Direct mapping KVA = PAGE_OFFSET + dram_offset.
+        let kva = page_offset.wrapping_add(dram_offset);
         let mut buf = vec![0u8; 0x300];
-        buf[0x200..0x204].copy_from_slice(&77u32.to_ne_bytes());
-        buf[0x208..0x210].copy_from_slice(&0xAAAA_BBBBu64.to_ne_bytes());
+        buf[dram_offset as usize..dram_offset as usize + 4].copy_from_slice(&77u32.to_ne_bytes());
+        buf[dram_offset as usize + 8..dram_offset as usize + 16]
+            .copy_from_slice(&0xAAAA_BBBBu64.to_ne_bytes());
 
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };

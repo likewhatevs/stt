@@ -9,8 +9,8 @@
 ///   [ShmRingHeader (40 bytes)] [data (capacity bytes)]
 ///
 /// The SHM region is excluded from usable RAM: on x86_64 via an E820 gap
-/// (no E820 entry covers it), on aarch64 via a reduced FDT memory node
-/// size. The guest init binary discovers the region via KTSTR_SHM_BASE
+/// (no E820 entry covers it), on aarch64 via FDT /reserved-memory and
+/// /memreserve/. The guest init binary discovers the region via KTSTR_SHM_BASE
 /// and KTSTR_SHM_SIZE environment variables on the kernel command line.
 use zerocopy::IntoBytes;
 
@@ -159,8 +159,8 @@ pub fn signal(slot: u8) {
 }
 
 /// Host-side: write 1 to a signal slot in guest memory.
-/// `mem` provides direct access to guest physical memory;
-/// `shm_base` is the guest physical address of the SHM region.
+/// `mem` provides direct access to guest DRAM;
+/// `shm_base` is the DRAM-relative offset of the SHM region.
 pub fn signal_guest(mem: &crate::monitor::reader::GuestMem, shm_base: u64, slot: u8) {
     signal_guest_value(mem, shm_base, slot, 1);
 }
@@ -551,8 +551,8 @@ pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
 /// this reads from live guest memory via volatile pointers and writes
 /// `read_ptr` back so the guest can reclaim ring space.
 ///
-/// `mem` provides volatile access to guest physical memory.
-/// `shm_base_pa` is the guest physical address of the SHM region.
+/// `mem` provides volatile access to guest DRAM.
+/// `shm_base_pa` is the DRAM-relative offset of the SHM region.
 ///
 /// Returns drained entries. Call periodically (~10ms) from the monitor
 /// thread to prevent ring overflow during long scenarios.

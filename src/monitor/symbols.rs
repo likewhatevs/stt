@@ -2,8 +2,8 @@
 //!
 //! Parses a vmlinux ELF to extract symbol addresses (`runqueues`,
 //! `__per_cpu_offset`, `page_offset_base`, etc.) and provides
-//! functions for translating kernel virtual addresses to guest
-//! physical addresses via the text mapping and direct mapping.
+//! functions for translating kernel virtual addresses to DRAM-relative
+//! offsets (for GuestMem) via the text mapping and direct mapping.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -25,9 +25,9 @@ pub(crate) const START_KERNEL_MAP: u64 = 0xffff_8000_8000_0000;
 /// x86-64 4-level paging: 0xffff_8880_0000_0000.
 /// aarch64 48-bit VA: -(1 << 48) = 0xffff_0000_0000_0000.
 #[cfg(target_arch = "x86_64")]
-const DEFAULT_PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
+pub(crate) const DEFAULT_PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
 #[cfg(target_arch = "aarch64")]
-const DEFAULT_PAGE_OFFSET: u64 = 0xffff_0000_0000_0000;
+pub(crate) const DEFAULT_PAGE_OFFSET: u64 = 0xffff_0000_0000_0000;
 
 /// Kernel symbol addresses extracted from vmlinux ELF.
 #[derive(Debug, Clone)]
@@ -146,17 +146,35 @@ pub(crate) fn resolve_pgtable_l5(mem: &super::reader::GuestMem, symbols: &Kernel
 }
 
 /// Translate a kernel virtual address in the direct mapping
-/// (PAGE_OFFSET region) to guest physical address.
+/// (PAGE_OFFSET region) to a DRAM-relative offset for GuestMem.
+///
+/// On both x86_64 and aarch64, the direct mapping maps DRAM offset 0
+/// at PAGE_OFFSET: `kva = page_offset + dram_offset`. On aarch64 the
+/// kernel's `__phys_to_virt(gpa)` is `(gpa - PHYS_OFFSET) | PAGE_OFFSET`,
+/// and `PHYS_OFFSET = memstart_addr = DRAM_START`, so
+/// `kva = dram_offset | PAGE_OFFSET = PAGE_OFFSET + dram_offset`
+/// (the `|` is equivalent to `+` since the operands don't overlap).
+/// Subtracting PAGE_OFFSET recovers the DRAM offset directly.
 pub(crate) fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
     kva.wrapping_sub(page_offset)
 }
 
-/// Translate a kernel text/data symbol VA to guest physical address.
+/// Translate a kernel text/data symbol VA to a DRAM-relative offset
+/// for GuestMem.
 ///
 /// Kernel text and data symbols (.text, .data, .bss) are mapped via
-/// `__START_KERNEL_map`, not the direct mapping. Their PA is
-/// `VA - __START_KERNEL_map + phys_base`. This function assumes
-/// `phys_base = 0`, which requires `nokaslr` on the guest cmdline.
+/// `__START_KERNEL_map` (x86_64) / `KIMAGE_VADDR` (aarch64), not
+/// the direct mapping. The kernel's `__kimg_to_phys(addr)` is
+/// `addr - kimage_voffset`, where `kimage_voffset = map_base - phys_base`.
+///
+/// On x86_64: `phys_base = 0`, so GPA = `VA - __START_KERNEL_map`,
+/// and DRAM starts at GPA 0, so DRAM offset = GPA.
+/// On aarch64: `phys_base = DRAM_START = 0x4000_0000`, so
+/// `kimage_voffset = KIMAGE_VADDR - 0x4000_0000`, and
+/// GPA = `VA - KIMAGE_VADDR + 0x4000_0000`. DRAM offset =
+/// `GPA - DRAM_START = VA - KIMAGE_VADDR`. The two cancel.
+///
+/// Both cases require `nokaslr` on the guest cmdline.
 pub(crate) fn text_kva_to_pa(kva: u64) -> u64 {
     kva.wrapping_sub(START_KERNEL_MAP)
 }
@@ -244,16 +262,20 @@ mod tests {
 
     #[test]
     fn kva_to_pa_basic() {
-        let page_offset = 0xffff_8880_0000_0000_u64;
-        assert_eq!(kva_to_pa(0xffff_8880_0010_0000, page_offset), 0x10_0000);
+        // KVA = PAGE_OFFSET + dram_offset (kernel's __phys_to_virt
+        // subtracts PHYS_OFFSET then ORs PAGE_OFFSET, producing
+        // PAGE_OFFSET + dram_offset for small offsets).
+        let page_offset = DEFAULT_PAGE_OFFSET;
+        let dram_kva = page_offset.wrapping_add(0x10_0000);
+        assert_eq!(kva_to_pa(dram_kva, page_offset), 0x10_0000);
         assert_eq!(kva_to_pa(page_offset, page_offset), 0);
     }
 
     #[test]
     fn compute_rq_pas_two_cpus() {
-        let runqueues = 0xffff_8880_0020_0000_u64;
+        let page_offset = DEFAULT_PAGE_OFFSET;
+        let runqueues = page_offset.wrapping_add(0x20_0000);
         let offsets = vec![0, 0x4_0000]; // CPU 0 at base, CPU 1 at +256KB
-        let page_offset = 0xffff_8880_0000_0000_u64;
         let pas = compute_rq_pas(runqueues, &offsets, page_offset);
         assert_eq!(pas[0], 0x20_0000);
         assert_eq!(pas[1], 0x24_0000);
@@ -305,7 +327,7 @@ mod tests {
     #[test]
     fn kva_to_pa_wrapping() {
         // KVA < page_offset wraps around via wrapping_sub.
-        let page_offset = 0xffff_8880_0000_0000u64;
+        let page_offset = DEFAULT_PAGE_OFFSET;
         let kva = 0x0000_0000_0001_0000u64;
         let pa = kva_to_pa(kva, page_offset);
         assert_eq!(pa, kva.wrapping_sub(page_offset));
@@ -313,14 +335,16 @@ mod tests {
 
     #[test]
     fn compute_rq_pas_empty_offsets() {
-        let pas = compute_rq_pas(0xffff_8880_0020_0000, &[], 0xffff_8880_0000_0000);
+        let page_offset = DEFAULT_PAGE_OFFSET;
+        let runqueues = page_offset.wrapping_add(0x20_0000);
+        let pas = compute_rq_pas(runqueues, &[], page_offset);
         assert!(pas.is_empty());
     }
 
     #[test]
     fn compute_rq_pas_single_cpu() {
-        let runqueues = 0xffff_8880_0020_0000u64;
-        let page_offset = 0xffff_8880_0000_0000u64;
+        let page_offset = DEFAULT_PAGE_OFFSET;
+        let runqueues = page_offset.wrapping_add(0x20_0000);
         let pas = compute_rq_pas(runqueues, &[0], page_offset);
         assert_eq!(pas.len(), 1);
         assert_eq!(pas[0], 0x20_0000);
