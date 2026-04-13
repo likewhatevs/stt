@@ -766,7 +766,10 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     // Auto-build: configure + build + cache.
     eprintln!("ktstr: auto-building kernel from {}", path.display());
 
-    if !has_sched_ext(path) {
+    // Always merge the kconfig fragment. The fragment contains more
+    // than sched_ext (e.g. CONFIG_VIRTIO_CONSOLE). kconfig uses
+    // last-value-wins so re-appending is idempotent.
+    {
         let sp = Spinner::start("Configuring kernel...");
         let result = configure_kernel(path, EMBEDDED_KCONFIG);
         if result.is_err() {

@@ -1459,7 +1459,8 @@ impl KtstrVm {
                     .name("interactive-dmesg".into())
                     .spawn(move || {
                         use std::io::Write;
-                        let mut stderr = std::io::stderr().lock();
+                        // Lock stderr per-write, not for the whole loop.
+                        // Holding the lock blocks Ctrl+A X's eprintln.
                         loop {
                             if kill_for_dmesg.load(Ordering::Acquire) {
                                 break;
@@ -1467,6 +1468,7 @@ impl KtstrVm {
                             std::thread::sleep(std::time::Duration::from_millis(50));
                             let data = com1_for_dmesg.lock().drain_output();
                             if !data.is_empty() {
+                                let mut stderr = std::io::stderr().lock();
                                 let _ = stderr.write_all(&data);
                                 let _ = stderr.flush();
                             }
@@ -1474,6 +1476,7 @@ impl KtstrVm {
                         // Final drain.
                         let data = com1_for_dmesg.lock().drain_output();
                         if !data.is_empty() {
+                            let mut stderr = std::io::stderr().lock();
                             let _ = stderr.write_all(&data);
                             let _ = stderr.flush();
                         }
