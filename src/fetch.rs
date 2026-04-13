@@ -269,31 +269,61 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource, String> {
         .canonicalize()
         .map_err(|e| format!("canonicalize {}: {e}", source_path.display()))?;
 
-    // Git hash extraction via gix, dirty detection via git CLI.
-    // gix::is_dirty() produces false positives on kernel build trees
-    // (submodule state, stat timestamp mismatches from build artifacts).
-    // git diff-index --quiet HEAD is reliable and ignores untracked files.
-    let short_hash = match gix::discover(&canonical) {
+    // Git hash extraction and dirty detection via gix.
+    // Use the status API directly instead of is_dirty() to skip
+    // submodule checks (which produce false positives on kernel
+    // trees with uninitialized submodules).
+    let (short_hash, is_dirty) = match gix::discover(&canonical) {
         Ok(repo) => {
             let head = repo.head_id().map_err(|e| format!("read HEAD: {e}"))?;
-            Some(format!("{}", head).chars().take(7).collect::<String>())
-        }
-        Err(_) => None,
-    };
+            let short_hash = format!("{}", head).chars().take(7).collect::<String>();
 
-    let is_dirty = std::process::Command::new("git")
-        .args([
-            "-C",
-            &canonical.to_string_lossy(),
-            "diff-index",
-            "--quiet",
-            "HEAD",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| !s.success())
-        .unwrap_or(true); // not a git repo or git not found → treat as dirty
+            // Check HEAD-vs-index for tracked file changes.
+            let mut index_dirty = false;
+            let index = repo
+                .index_or_empty()
+                .map_err(|e| format!("open index: {e}"))?;
+            let _ = repo.tree_index_status(
+                &head,
+                &index,
+                None,
+                gix::status::tree_index::TrackRenames::Disabled,
+                |_, _, _| {
+                    index_dirty = true;
+                    Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+                },
+            );
+
+            // Check index-vs-worktree for modified tracked files,
+            // skipping submodules entirely (Ignore::All).
+            let worktree_dirty = if !index_dirty {
+                repo.status(gix::progress::Discard)
+                    .map_err(|e| format!("status: {e}"))?
+                    .index_worktree_rewrites(None)
+                    .index_worktree_submodules(gix::status::Submodule::Given {
+                        ignore: gix::submodule::config::Ignore::All,
+                        check_dirty: false,
+                    })
+                    .index_worktree_options_mut(|opts| {
+                        opts.dirwalk_options = None;
+                    })
+                    .into_index_worktree_iter(Vec::new())
+                    .map(|mut iter| iter.next().is_some())
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            (Some(short_hash), index_dirty || worktree_dirty)
+        }
+        Err(_) => {
+            eprintln!(
+                "ktstr: warning: {} is not a git repository, cannot detect dirty state",
+                source_path.display()
+            );
+            (None, true)
+        }
+    };
 
     let kc = ktstr_suffix();
     let cache_key = match &short_hash {
