@@ -469,7 +469,7 @@ fn kernel_build(
         remote_cache::remote_store(&entry);
     }
 
-    eprintln!("cargo-ktstr: kernel cached as {}", acquired.cache_key);
+    cli::success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
     eprintln!(
         "cargo-ktstr: image: {}",
         entry.path.join(image_name).display()

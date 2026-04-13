@@ -343,7 +343,7 @@ fn kernel_build(
 
     let entry = cache.store(&acquired.cache_key, &image_path, vmlinux_ref, &metadata)?;
 
-    eprintln!("ktstr: kernel cached as {}", acquired.cache_key);
+    cli::success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
     eprintln!("ktstr: image: {}", entry.path.join(image_name).display());
 
     Ok(())

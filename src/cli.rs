@@ -753,7 +753,7 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
         match cache.store(&acquired.cache_key, &image, vmlinux_ref, &metadata) {
             Ok(entry) => {
                 let cached_image = entry.path.join(image_name);
-                success(&format!("ktstr: kernel cached as {}", acquired.cache_key));
+                success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
                 return Ok(cached_image);
             }
             Err(e) => warn(&format!("ktstr: cache store failed: {e:#}")),
@@ -851,7 +851,7 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         .with_source_tree_path(Some(acquired.source_dir.clone()));
 
         match cache.store(&cache_key, &image, vmlinux_ref, &metadata) {
-            Ok(_) => success(&format!("ktstr: kernel cached as {cache_key}")),
+            Ok(_) => success(&format!("\u{2713} Kernel cached: {cache_key}")),
             Err(e) => warn(&format!("ktstr: cache store failed: {e:#}")),
         }
     }
