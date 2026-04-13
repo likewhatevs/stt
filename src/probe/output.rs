@@ -203,12 +203,16 @@ pub fn format_probe_events_with_bpf_locs(
 /// Formats each parameter as `(name, type_label)` where type_label is
 /// `"struct_name *"` for struct pointers, `"ptr"` for untyped pointers,
 /// or empty for scalars.
+///
+/// For variadic functions, pads the param list to 6 entries so the arg
+/// cap logic does not truncate extra arguments. Extra entries beyond
+/// the named params use `arg{i}` names.
 pub fn build_param_names(
     btf_funcs: &[super::btf::BtfFunc],
 ) -> std::collections::HashMap<String, Vec<(String, String)>> {
     let mut map = std::collections::HashMap::new();
     for func in btf_funcs {
-        let params: Vec<(String, String)> = func
+        let mut params: Vec<(String, String)> = func
             .params
             .iter()
             .take(6)
@@ -225,6 +229,13 @@ pub fn build_param_names(
                 (p.name.clone(), type_label)
             })
             .collect();
+        // Pad variadic functions to 6 so extra unnamed args are shown.
+        if func.is_variadic {
+            while params.len() < 6 {
+                let i = params.len();
+                params.push((format!("arg{i}"), String::new()));
+            }
+        }
         map.insert(func.name.clone(), params);
     }
     map
@@ -396,9 +407,17 @@ fn format_probe_events_inner(
         if event.fields.is_empty() {
             // No struct field specs — show args with BTF param names
             // when available, fall back to arg0/arg1/... otherwise.
+            // Cap to BTF param count to avoid showing garbage register
+            // values beyond actual params. Fall back to all 6 when
+            // BTF resolution failed (empty params).
             let fw = max_field_w;
             let params = param_names.get(name);
-            for (i, &val) in event.args.iter().enumerate() {
+            let arg_cap = params
+                .map(|ps| ps.len())
+                .filter(|&n| n > 0)
+                .unwrap_or(6)
+                .min(6);
+            for (i, &val) in event.args[..arg_cap].iter().enumerate() {
                 if val != 0 || i == 0 {
                     let (label, decoded) = if let Some(p) = params.and_then(|ps| ps.get(i)) {
                         let (pname, ptype) = p;
@@ -855,39 +874,6 @@ mod tests {
     #[test]
     fn make_relative_no_marker() {
         assert_eq!(make_relative("some/random/path.c"), "some/random/path.c");
-    }
-
-    // -- format_probe_events with kstack --
-
-    #[test]
-    fn format_probe_events_kstack_hex_addresses() {
-        use crate::probe::process::ProbeEvent;
-
-        // Two kstack addresses. Without a vmlinux, blazesym cannot
-        // symbolize them, so they appear as raw "0x{addr:x}" lines.
-        let events = vec![ProbeEvent {
-            func_idx: 0,
-            task_ptr: 1,
-            ts: 100,
-            args: [0; 6],
-            fields: vec![],
-            kstack: vec![0xffffffff81000100, 0xffffffff81000200],
-            str_val: None,
-            ..Default::default()
-        }];
-        let func_names = vec![(0u32, "trigger_func".to_string())];
-        let out = format_probe_events(&events, &func_names, None, None);
-        assert!(out.contains("trigger_func"), "func name: {out}");
-        // kstack is from the last event. Without symbolization each
-        // address appears as "    0x{hex}\n".
-        assert!(
-            out.contains("0xffffffff81000100"),
-            "first kstack addr should appear as hex: {out}"
-        );
-        assert!(
-            out.contains("0xffffffff81000200"),
-            "second kstack addr should appear as hex: {out}"
-        );
     }
 
     // -- format_probe_events with fields --

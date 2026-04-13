@@ -154,7 +154,7 @@ fn build_field_keys(btf_func: &BtfFunc) -> Vec<String> {
         } else if !param.auto_fields.is_empty() {
             let tname = param.type_name.as_deref().unwrap_or("void");
             for (fname, _) in &param.auto_fields {
-                keys.push(format!("{}:{}*.{}", param.name, tname, fname));
+                keys.push(format!("{}:{}.{}", param.name, tname, fname));
                 field_idx += 1;
                 if field_idx >= 16 {
                     break;
@@ -615,8 +615,8 @@ pub fn run_probe_skeleton(
 
             if let Some(btf_func) = btf_funcs.iter().find(|f| f.name == t.name) {
                 // Try vmlinux BTF first (for known struct params like
-                // task_struct), then BPF program BTF (for auto-discovered
-                // BPF-local types like task_ctx).
+                // task_struct and auto-discovered vmlinux fields),
+                // then BPF program BTF (for BPF-local types like task_ctx).
                 let mut field_specs = super::btf::resolve_field_specs(btf_func, None);
                 if field_specs.is_empty()
                     && let Some(prog_id) = functions
@@ -1157,6 +1157,7 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let keys = build_field_keys(&func);
         assert!(
@@ -1176,6 +1177,7 @@ mod tests {
                 is_ptr: false,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let keys = build_field_keys(&func);
         assert!(keys.iter().any(|k| k.contains("flags:val.flags")));
@@ -1191,6 +1193,7 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let keys = build_field_keys(&func);
         // Raw pointer with no struct info: no keys generated
@@ -1202,6 +1205,7 @@ mod tests {
         let func = super::BtfFunc {
             name: "empty".into(),
             params: vec![],
+            ..Default::default()
         };
         let keys = build_field_keys(&func);
         assert!(keys.is_empty());
@@ -1222,6 +1226,7 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let keys = build_field_keys(&func);
         assert!(keys.is_empty(), "unknown struct should produce no keys");
@@ -1248,6 +1253,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(detect_str_param(&func), 1);
     }
@@ -1270,6 +1276,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(detect_str_param(&func), 1);
     }
@@ -1284,6 +1291,7 @@ mod tests {
                 is_ptr: false,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert_eq!(detect_str_param(&func), 0xff);
     }
@@ -1298,6 +1306,7 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert_eq!(detect_str_param(&func), 0xff);
     }
@@ -1312,6 +1321,7 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert_eq!(detect_str_param(&func), 0);
     }
@@ -1333,10 +1343,11 @@ mod tests {
                 type_name: Some("task_ctx".into()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let keys = build_field_keys(&func);
         assert_eq!(keys.len(), 2);
-        assert!(keys[0].contains("task_ctx*"));
+        assert!(keys[0].contains("task_ctx"));
         assert!(keys[0].contains("field_a"));
         assert!(keys[1].contains("field_b"));
     }
@@ -1353,6 +1364,7 @@ mod tests {
                 is_ptr: true,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let keys = build_field_keys(&func);
         assert!(
@@ -1378,6 +1390,7 @@ mod tests {
         let func = super::BtfFunc {
             name: "many".into(),
             params,
+            ..Default::default()
         };
         let keys = build_field_keys(&func);
         // Only first 6 params processed

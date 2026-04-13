@@ -289,13 +289,14 @@ fentry or kprobe at function entry) and re-read struct fields into
 
 Two BTF sources:
 
-- **vmlinux BTF** (`btf-rs`): resolves kernel struct offsets for types
-  in `STRUCT_FIELDS` (task_struct, rq, scx_dispatch_q, scx_exit_info,
-  scx_init_task_args, scx_cgroup_init_args). Handles chained pointer
-  dereferences (e.g. `->cpus_ptr->bits[0]`).
+- **vmlinux BTF** (`btf-rs`): resolves kernel struct offsets. Types in
+  `STRUCT_FIELDS` (task_struct, rq, scx_dispatch_q, etc.) use curated
+  field lists with chained pointer dereferences (e.g.
+  `->cpus_ptr->bits[0]`). Other struct pointer params get scalar, enum,
+  and cpumask pointer fields auto-discovered from vmlinux BTF.
 
 - **Program BTF** (`libbpf-rs`): resolves BPF-local struct offsets for
-  types not in `STRUCT_FIELDS` (e.g. scheduler-defined `task_ctx`).
+  types not in vmlinux (e.g. scheduler-defined `task_ctx`).
   Auto-discovers scalar, enum, and cpumask pointer fields.
 
 Callback signatures are resolved by:

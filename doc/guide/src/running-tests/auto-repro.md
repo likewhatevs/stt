@@ -31,9 +31,10 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
 
 4. **BTF resolution** -- function signatures are resolved from vmlinux
    BTF (kernel functions) and program BTF (BPF callbacks). Known struct
-   types (task_struct, rq, scx_dispatch_q, etc.) have their fields
-   resolved to byte offsets. Unknown BPF-local types (e.g. task_ctx)
-   have scalar and cpumask pointer fields auto-discovered.
+   types (task_struct, rq, scx_dispatch_q, etc.) have curated fields
+   resolved to byte offsets. Other struct pointer params have scalar,
+   enum, and cpumask pointer fields auto-discovered from vmlinux or
+   BPF program BTF.
 
 5. **Second VM** -- ktstr boots a new VM and reruns the scenario with
    BPF probes:

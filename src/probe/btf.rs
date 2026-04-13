@@ -4,7 +4,7 @@ use super::stack::StackFunction;
 ///
 /// Each param maps to one register (fentry/kprobe). Struct pointer
 /// params have their fields expanded via [`STRUCT_FIELDS`] or
-/// auto-discovered from BPF program BTF.
+/// auto-discovered from vmlinux or BPF program BTF.
 #[derive(Debug, Clone, Default)]
 pub struct BtfParam {
     pub name: String,
@@ -13,8 +13,9 @@ pub struct BtfParam {
     pub is_ptr: bool,
     /// True if this is a char * / const char * (string pointer).
     pub is_string_ptr: bool,
-    /// Auto-discovered fields from BPF program BTF for types not in
-    /// STRUCT_FIELDS (e.g. task_ctx). Vec of (field_name, access_pattern).
+    /// Auto-discovered fields from vmlinux or BPF program BTF for
+    /// struct pointer types not in STRUCT_FIELDS.
+    /// Vec of (field_name, access_pattern).
     pub auto_fields: Vec<(String, String)>,
     /// Type name for auto-discovered structs (used in output headers).
     pub type_name: Option<String>,
@@ -27,10 +28,14 @@ pub struct BtfParam {
 /// Used by [`run_probe_skeleton`](super::process::run_probe_skeleton) to
 /// populate field specs and by [`build_field_keys`](super::process) to
 /// generate output labels.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BtfFunc {
     pub name: String,
     pub params: Vec<BtfParam>,
+    /// True if BTF FuncProto has a variadic sentinel parameter
+    /// (name_off=0, type=0). Variadic functions should not have
+    /// their displayed arg count capped.
+    pub is_variadic: bool,
 }
 
 /// Known struct types and their fields for probe output decoding.
@@ -93,8 +98,13 @@ pub struct FieldSpec {
 }
 
 /// Resolve struct field offsets from BTF for a single function.
-/// Walks STRUCT_FIELDS entries, resolves member offsets via btf-rs,
-/// and returns one FieldSpec per resolvable field.
+///
+/// Handles both STRUCT_FIELDS entries (curated fields with known output
+/// keys) and auto-discovered fields from [`discover_vmlinux_struct_fields`]
+/// (stored in `BtfParam::auto_fields`). STRUCT_FIELDS entries consume
+/// field slots first; auto-discovered fields fill remaining budget up to
+/// MAX_FIELDS (16). Warns when auto-discovered fields are truncated.
+///
 /// Handles chained pointer dereferences (e.g. `->cpus_ptr->bits[0]`)
 /// by reading through intermediate pointers.
 pub fn resolve_field_specs(btf_func: &BtfFunc, vmlinux_path: Option<&str>) -> Vec<FieldSpec> {
@@ -114,65 +124,125 @@ pub fn resolve_field_specs(btf_func: &BtfFunc, vmlinux_path: Option<&str>) -> Ve
 
     let max_params = btf_func.params.len().min(6);
     for (param_idx, param) in btf_func.params[..max_params].iter().enumerate() {
-        let struct_name = match param.struct_name.as_deref() {
-            Some(n) => n,
-            None => {
-                if !param.is_ptr {
-                    // Scalar param takes one field slot (matched by build_field_keys).
-                    field_idx += 1;
+        if let Some(ref struct_name) = param.struct_name {
+            // Known struct in STRUCT_FIELDS — curated field list.
+            let fields = match STRUCT_FIELDS
+                .iter()
+                .find(|(s, _)| *s == struct_name.as_str())
+            {
+                Some((_, f)) => *f,
+                None => continue,
+            };
+
+            let struct_type = match resolve_struct_type(&btf, struct_name) {
+                Some(s) => s,
+                None => {
+                    // Skip field slots to stay aligned with build_field_keys.
+                    field_idx += fields.len() as u32;
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
-        let fields = match STRUCT_FIELDS.iter().find(|(s, _)| *s == struct_name) {
-            Some((_, f)) => *f,
-            None => continue,
-        };
+            for (access, _key) in fields {
+                let access = access.trim_start_matches("->");
 
-        // Resolve the BTF struct type.
-        let struct_type = match resolve_struct_type(&btf, struct_name) {
-            Some(s) => s,
-            None => {
-                // Skip field slots to stay aligned with build_field_keys.
-                field_idx += fields.len() as u32;
-                continue;
-            }
-        };
-
-        for (access, _key) in fields {
-            let access = access.trim_start_matches("->");
-
-            if access.contains("->") {
-                // Chained pointer dereference: "member->field" or
-                // "member->nested.field". Split on "->" to get the
-                // pointer member and the target field.
-                let (ptr_member, target) = access.split_once("->").unwrap();
-                let ptr_off_result = resolve_member_offset(&btf, &struct_type, ptr_member);
-                if let Some((ptr_off, _)) = ptr_off_result {
-                    let pointed = resolve_pointed_struct(&btf, &struct_type, ptr_member);
-                    if let Some(pointed_struct) = pointed
-                        && let Some((target_off, target_sz)) =
-                            resolve_member_offset(&btf, &pointed_struct, target)
+                if access.contains("->") {
+                    let (ptr_member, target) = access.split_once("->").unwrap();
+                    let ptr_off_result = resolve_member_offset(&btf, &struct_type, ptr_member);
+                    if let Some((ptr_off, _)) = ptr_off_result {
+                        let pointed = resolve_pointed_struct(&btf, &struct_type, ptr_member);
+                        if let Some(pointed_struct) = pointed
+                            && let Some((target_off, target_sz)) =
+                                resolve_member_offset(&btf, &pointed_struct, target)
+                        {
+                            specs.push(FieldSpec {
+                                param_idx: param_idx as u32,
+                                offset: target_off,
+                                size: target_sz,
+                                field_idx,
+                                ptr_offset: ptr_off,
+                            });
+                        }
+                    } else {
+                        tracing::debug!(
+                            member = ptr_member,
+                            "chained deref: member offset not found",
+                        );
+                    }
+                } else {
+                    if let Some((offset, size)) = resolve_member_offset(&btf, &struct_type, access)
                     {
                         specs.push(FieldSpec {
                             param_idx: param_idx as u32,
-                            offset: target_off,
-                            size: target_sz,
+                            offset,
+                            size,
                             field_idx,
-                            ptr_offset: ptr_off,
+                            ptr_offset: 0,
                         });
                     }
-                } else {
-                    tracing::debug!(
-                        member = ptr_member,
-                        "chained deref: member offset not found",
-                    );
                 }
-            } else {
-                // Single-level: resolve offset through possibly nested
-                // members (dot-separated).
-                if let Some((offset, size)) = resolve_member_offset(&btf, &struct_type, access) {
+
+                field_idx += 1;
+                if field_idx >= 16 {
+                    break;
+                }
+            }
+        } else if !param.auto_fields.is_empty() {
+            // Auto-discovered vmlinux struct fields.
+            let sname = match param.type_name.as_deref() {
+                Some(n) => n,
+                None => {
+                    field_idx += param.auto_fields.len() as u32;
+                    continue;
+                }
+            };
+            let struct_type = match resolve_struct_type(&btf, sname) {
+                Some(s) => s,
+                None => {
+                    field_idx += param.auto_fields.len() as u32;
+                    continue;
+                }
+            };
+
+            let remaining = (16 - field_idx) as usize;
+            if param.auto_fields.len() > remaining {
+                tracing::warn!(
+                    func = %btf_func.name,
+                    struct_name = sname,
+                    total = param.auto_fields.len(),
+                    budget = remaining,
+                    "auto-discovered fields truncated to MAX_FIELDS budget",
+                );
+            }
+
+            for (_fname, access) in &param.auto_fields {
+                if field_idx >= 16 {
+                    break;
+                }
+                let access = access.trim_start_matches("->");
+
+                if access.contains("->") {
+                    if let Some((ptr_member, target)) = access.split_once("->") {
+                        let ptr_off_result = resolve_member_offset(&btf, &struct_type, ptr_member);
+                        if let Some((ptr_off, _)) = ptr_off_result {
+                            let pointed = resolve_pointed_struct(&btf, &struct_type, ptr_member);
+                            if let Some(pointed_struct) = pointed
+                                && let Some((target_off, target_sz)) =
+                                    resolve_member_offset(&btf, &pointed_struct, target)
+                            {
+                                specs.push(FieldSpec {
+                                    param_idx: param_idx as u32,
+                                    offset: target_off,
+                                    size: target_sz,
+                                    field_idx,
+                                    ptr_offset: ptr_off,
+                                });
+                            }
+                        }
+                    }
+                } else if let Some((offset, size)) =
+                    resolve_member_offset(&btf, &struct_type, access)
+                {
                     specs.push(FieldSpec {
                         param_idx: param_idx as u32,
                         offset,
@@ -181,12 +251,12 @@ pub fn resolve_field_specs(btf_func: &BtfFunc, vmlinux_path: Option<&str>) -> Ve
                         ptr_offset: 0,
                     });
                 }
-            }
 
-            field_idx += 1;
-            if field_idx >= 16 {
-                break;
+                field_idx += 1;
             }
+        } else if !param.is_ptr {
+            // Scalar param takes one field slot (matched by build_field_keys).
+            field_idx += 1;
         }
     }
 
@@ -352,8 +422,9 @@ fn resolve_pointed_struct(
 /// Parse BTF from vmlinux for kernel function signatures.
 ///
 /// Resolves parameter types via btf-rs, following PTR/CONST/VOLATILE/TYPEDEF
-/// chains to identify struct pointers. Only records `struct_name` for types
-/// listed in [`STRUCT_FIELDS`]; other struct pointers get `struct_name: None`.
+/// chains to identify struct pointers. Records `struct_name` for types
+/// listed in [`STRUCT_FIELDS`]; other struct pointers get auto-discovered
+/// fields via [`discover_vmlinux_struct_fields`] and `type_name` set.
 /// Detects `char *` parameters (`is_string_ptr`) by chasing the type chain
 /// to an `Int` of size 1.
 pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> Vec<BtfFunc> {
@@ -445,25 +516,56 @@ pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> V
                     _ => continue,
                 };
 
+                let variadic = proto
+                    .parameters
+                    .last()
+                    .map(|p| p.is_variadic())
+                    .unwrap_or(false);
+
                 let mut params = Vec::new();
                 for param in &proto.parameters {
+                    // Skip the variadic sentinel (name_off=0, type=0).
+                    if param.is_variadic() {
+                        continue;
+                    }
                     let name = btf.resolve_name(param).unwrap_or_default();
                     let tid = param.get_type_id().unwrap_or(0);
-                    let struct_name = resolve_struct_name(tid)
-                        .filter(|n| STRUCT_FIELDS.iter().any(|(s, _)| s == n));
+                    let all_struct_name = resolve_struct_name(tid);
+                    let known_struct = all_struct_name
+                        .as_ref()
+                        .filter(|n| STRUCT_FIELDS.iter().any(|(s, _)| *s == n.as_str()))
+                        .cloned();
+                    let param_is_ptr = is_ptr(tid);
+
+                    // Auto-discover fields for struct pointers not in STRUCT_FIELDS.
+                    let (auto_fields, type_name) = if param_is_ptr && known_struct.is_none() {
+                        if let Some(ref sname) = all_struct_name {
+                            let fields = discover_vmlinux_struct_fields(&btf, tid);
+                            (fields, Some(sname.clone()))
+                        } else {
+                            (Vec::new(), None)
+                        }
+                    } else {
+                        (
+                            Vec::new(),
+                            all_struct_name.filter(|_| known_struct.is_none()),
+                        )
+                    };
+
                     params.push(BtfParam {
                         name,
-                        struct_name,
-                        is_ptr: is_ptr(tid),
+                        struct_name: known_struct,
+                        is_ptr: param_is_ptr,
                         is_string_ptr: is_str_ptr(tid),
-                        auto_fields: Vec::new(),
-                        type_name: None,
+                        auto_fields,
+                        type_name,
                     });
                 }
 
                 results.push(BtfFunc {
                     name: func_name.to_string(),
                     params,
+                    is_variadic: variadic,
                 });
                 break; // take first match
             }
@@ -853,6 +955,7 @@ pub fn parse_bpf_btf_functions(
                 results.push(BtfFunc {
                     name: func_name.to_string(),
                     params: vec![],
+                    is_variadic: false,
                 });
                 continue;
             };
@@ -943,6 +1046,7 @@ pub fn parse_bpf_btf_functions(
             results.push(BtfFunc {
                 name: func_name.to_string(),
                 params,
+                is_variadic: false,
             });
         }
     }
@@ -1304,6 +1408,115 @@ fn discover_bpf_struct_fields(
     fields
 }
 
+/// Auto-discover struct fields from vmlinux BTF for types not in
+/// STRUCT_FIELDS. Walks members one level deep via btf_rs, emitting
+/// access patterns for scalar, enum, and cpumask pointer fields.
+fn discover_vmlinux_struct_fields(btf: &btf_rs::Btf, type_id: u32) -> Vec<(String, String)> {
+    use btf_rs::{BtfType, Type};
+
+    let t = match btf.resolve_type_by_id(type_id) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    // Follow PTR/CONST/VOLATILE/TYPEDEF to find the struct.
+    let mut current = t;
+    let struct_type = loop {
+        match current {
+            Type::Ptr(_)
+            | Type::Const(_)
+            | Type::Volatile(_)
+            | Type::Typedef(_)
+            | Type::Restrict(_)
+            | Type::TypeTag(_) => {
+                current = match btf.resolve_chained_type(current.as_btf_type().unwrap()) {
+                    Ok(next) => next,
+                    Err(_) => return Vec::new(),
+                };
+            }
+            Type::Struct(s) | Type::Union(s) => break s,
+            _ => return Vec::new(),
+        }
+    };
+
+    let mut fields = Vec::new();
+    for member in &struct_type.members {
+        let fname = match btf.resolve_name(member) {
+            Ok(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+
+        let member_tid = match member.get_type_id() {
+            Ok(tid) => tid,
+            Err(_) => continue,
+        };
+
+        // Follow qualifiers to the underlying type.
+        let mut member_type = match btf.resolve_type_by_id(member_tid) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        for _ in 0..20 {
+            match &member_type {
+                Type::Const(_)
+                | Type::Volatile(_)
+                | Type::Restrict(_)
+                | Type::Typedef(_)
+                | Type::TypeTag(_) => {
+                    member_type = match btf.resolve_chained_type(member_type.as_btf_type().unwrap())
+                    {
+                        Ok(next) => next,
+                        Err(_) => break,
+                    };
+                }
+                _ => break,
+            }
+        }
+
+        match &member_type {
+            Type::Int(_) | Type::Enum(_) | Type::Enum64(_) => {
+                fields.push((fname.clone(), format!("->{fname}")));
+            }
+            Type::Ptr(_) => {
+                // Follow pointer to check if it points to cpumask.
+                let pointed = btf.resolve_chained_type(member_type.as_btf_type().unwrap());
+                if let Ok(pointed_type) = pointed {
+                    // Chase qualifiers on the pointed-to type.
+                    let mut inner = pointed_type;
+                    for _ in 0..20 {
+                        match &inner {
+                            Type::Const(_)
+                            | Type::Volatile(_)
+                            | Type::Restrict(_)
+                            | Type::Typedef(_)
+                            | Type::TypeTag(_) => {
+                                inner = match btf.resolve_chained_type(inner.as_btf_type().unwrap())
+                                {
+                                    Ok(next) => next,
+                                    Err(_) => break,
+                                };
+                            }
+                            _ => break,
+                        }
+                    }
+                    let pointed_name = match &inner {
+                        Type::Struct(s) | Type::Union(s) => btf.resolve_name(s).ok(),
+                        _ => None,
+                    };
+                    match pointed_name.as_deref() {
+                        Some("cpumask") | Some("cpumask_t") => {
+                            fields.push((fname.clone(), format!("->{fname}->bits[0]")));
+                        }
+                        _ => {} // skip unknown pointers
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fields
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1457,6 +1670,7 @@ mod tests {
         let f = BtfFunc {
             name: "empty".into(),
             params: vec![],
+            is_variadic: false,
         };
         assert_eq!(f.name, "empty");
         assert!(f.params.is_empty());
@@ -1486,6 +1700,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            is_variadic: false,
         };
         assert_eq!(f.params.len(), 3);
         assert!(f.params[0].is_ptr);
