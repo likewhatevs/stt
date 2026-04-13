@@ -517,6 +517,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 ///   include in the guest.
 /// `memory_mb`: explicit guest memory override in MB. When `None`,
 ///   memory is computed from actual initramfs size after build.
+#[allow(clippy::too_many_arguments)]
 pub fn run_shell(
     kernel: std::path::PathBuf,
     sockets: u32,
@@ -525,6 +526,7 @@ pub fn run_shell(
     include_files: &[(&str, &std::path::Path)],
     memory_mb: Option<u32>,
     dmesg: bool,
+    exec: Option<&str>,
 ) -> anyhow::Result<()> {
     let payload = resolve_current_exe()?;
 
@@ -536,6 +538,9 @@ pub fn run_shell(
     let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={sockets},{cores},{threads}");
     if dmesg {
         cmdline.push_str(" loglevel=7");
+    }
+    if let Some(cmd) = exec {
+        cmdline.push_str(&format!(" KTSTR_SHELL_EXEC={cmd}"));
     }
     if let Ok(val) = std::env::var("RUST_LOG") {
         cmdline.push_str(&format!(" RUST_LOG={val}"));

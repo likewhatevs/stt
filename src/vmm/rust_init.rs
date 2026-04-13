@@ -187,6 +187,28 @@ pub(crate) fn ktstr_guest_init() -> ! {
         println!("  type `exit` for clean shutdown, Ctrl+A X to force-kill");
         let _ = std::io::stdout().flush();
 
+        // --exec mode: run a command non-interactively instead of
+        // dropping into an interactive shell. The exit code is passed
+        // to force_reboot (0 = clean shutdown, non-zero = error).
+        if let Some(cmd) = shell_exec_cmd() {
+            tracing::debug!(cmd = %cmd, "shell exec mode");
+            let status = Command::new("/bin/busybox")
+                .args(["sh", "-c", &cmd])
+                .status();
+            let code = match status {
+                Ok(s) => s.code().unwrap_or(1),
+                Err(e) => {
+                    eprintln!("ktstr-init: exec failed: {e}");
+                    1
+                }
+            };
+            // Write exit code to COM2 so the host can detect
+            // pass/fail without parsing output.
+            println!("KTSTR_EXEC_EXIT={code}");
+            let _ = std::io::stdout().flush();
+            force_reboot();
+        }
+
         // Allocate a PTY pair so busybox sh gets a controlling terminal
         // (required for job control: Ctrl+Z, bg, fg).
         tracing::debug!("spawning interactive shell with PTY");
@@ -335,6 +357,15 @@ fn shell_mode_requested() -> bool {
     fs::read_to_string("/proc/cmdline")
         .map(|c| c.split_whitespace().any(|s| s == "KTSTR_MODE=shell"))
         .unwrap_or(false)
+}
+
+/// Extract KTSTR_SHELL_EXEC=<cmd> from kernel cmdline if present.
+fn shell_exec_cmd() -> Option<String> {
+    let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
+    cmdline
+        .split_whitespace()
+        .find_map(|s| s.strip_prefix("KTSTR_SHELL_EXEC="))
+        .map(|s| s.to_string())
 }
 
 /// Redirect stdin, stdout, and stderr to the given device with O_RDWR.

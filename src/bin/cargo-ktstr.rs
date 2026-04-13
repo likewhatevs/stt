@@ -144,6 +144,10 @@ enum KtstrCommand {
         /// Sets loglevel=7 for verbose kernel output.
         #[arg(long)]
         dmesg: bool,
+        /// Run a command in the VM instead of an interactive shell.
+        /// The VM exits after the command completes.
+        #[arg(long)]
+        exec: Option<String>,
     },
 }
 
@@ -537,6 +541,7 @@ fn run_shell(
     include_files: Vec<PathBuf>,
     memory_mb: Option<u32>,
     dmesg: bool,
+    exec: Option<String>,
 ) -> Result<(), String> {
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
@@ -579,6 +584,7 @@ fn run_shell(
         &include_refs,
         memory_mb,
         dmesg,
+        exec.as_deref(),
     )
     .map_err(|e| format!("{e:#}"))
 }
@@ -931,7 +937,8 @@ fn main() {
             include_files,
             memory,
             dmesg,
-        } => run_shell(kernel, topology, include_files, memory, dmesg),
+            exec,
+        } => run_shell(kernel, topology, include_files, memory, dmesg, exec),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             KernelCommand::Build {

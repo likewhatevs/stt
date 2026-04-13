@@ -119,6 +119,10 @@ enum Command {
         /// Sets loglevel=7 for verbose kernel output.
         #[arg(long)]
         dmesg: bool,
+        /// Run a command in the VM instead of an interactive shell.
+        /// The VM exits after the command completes.
+        #[arg(long)]
+        exec: Option<String>,
     },
     /// Generate shell completions for ktstr.
     Completions {
@@ -481,6 +485,7 @@ fn main() -> Result<()> {
             include_files,
             memory,
             dmesg,
+            exec,
         } => {
             cli::check_kvm()?;
             let kernel_path = cli::resolve_kernel_image(kernel.as_deref())?;
@@ -520,6 +525,7 @@ fn main() -> Result<()> {
                 &include_refs,
                 memory,
                 dmesg,
+                exec.as_deref(),
             )?;
         }
 
