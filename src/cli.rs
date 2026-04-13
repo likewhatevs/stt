@@ -569,9 +569,7 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
                 if path.is_file() {
                     Ok(path)
                 } else if path.is_dir() {
-                    crate::kernel_path::find_image_in_dir(&path).ok_or_else(|| {
-                        anyhow::anyhow!("no kernel image found in {}", path.display())
-                    })
+                    resolve_kernel_dir(&path)
                 } else {
                     bail!("kernel path not found: {}", path.display())
                 }
@@ -591,6 +589,102 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
             )
         })
     }
+}
+
+/// Resolve a kernel directory: find an existing image or auto-build.
+///
+/// If the directory contains a built kernel image, returns it directly.
+/// If it's a kernel source tree (Makefile + Kconfig) without a built
+/// image, configures and builds the kernel automatically, caches the
+/// result, and returns the image path.
+fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    // Try to find an existing built image first.
+    if let Some(image) = crate::kernel_path::find_image_in_dir(path) {
+        // Check if it was built with current kconfig.
+        let cache = crate::cache::CacheDir::new().ok();
+        if let Some(cache) = &cache {
+            let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let Some(entry) = cache.lookup(&acquired.cache_key) {
+                if !entry.has_stale_kconfig(&embedded_kconfig_hash()) {
+                    return Ok(image);
+                }
+                eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
+            } else {
+                // Image exists but not in cache with current key — use it.
+                return Ok(image);
+            }
+        } else {
+            return Ok(image);
+        }
+    }
+
+    // No image found or stale — check if this is a source tree.
+    let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
+    if !is_source_tree {
+        bail!(
+            "no kernel image found in {} (not a kernel source tree — \
+             missing Makefile or Kconfig)",
+            path.display()
+        );
+    }
+
+    // Auto-build: configure + build + cache.
+    eprintln!("ktstr: auto-building kernel from {}", path.display());
+
+    if !has_sched_ext(path) {
+        let sp = Spinner::start("Configuring kernel...");
+        configure_kernel(path, EMBEDDED_KCONFIG)?;
+        sp.finish("Kernel configured");
+    }
+
+    let sp = Spinner::start("Building kernel...");
+    make_kernel(path)?;
+    sp.finish("Kernel built");
+
+    let image = crate::kernel_path::find_image_in_dir(path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "kernel build succeeded but no image found in {}",
+            path.display()
+        )
+    })?;
+
+    // Cache the build (skip for dirty trees).
+    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !acquired.is_dirty
+        && let Ok(cache) = crate::cache::CacheDir::new()
+    {
+        let vmlinux_path = path.join("vmlinux");
+        let vmlinux_ref = vmlinux_path.exists().then_some(vmlinux_path.as_path());
+
+        let config_path = path.join(".config");
+        let config_hash = if config_path.exists() {
+            std::fs::read(&config_path)
+                .ok()
+                .map(|data| format!("{:08x}", crc32fast::hash(&data)))
+        } else {
+            None
+        };
+
+        let (arch, image_name) = crate::fetch::arch_info();
+        let metadata = crate::cache::KernelMetadata::new(
+            acquired.source_type.clone(),
+            arch.to_string(),
+            image_name.to_string(),
+            now_iso8601(),
+        )
+        .with_config_hash(config_hash)
+        .with_ktstr_kconfig_hash(Some(embedded_kconfig_hash()))
+        .with_ktstr_git_hash(Some(crate::GIT_FULL_HASH.to_string()))
+        .with_git_hash(acquired.git_hash.clone())
+        .with_source_tree_path(Some(acquired.source_dir.clone()));
+
+        match cache.store(&acquired.cache_key, &image, vmlinux_ref, &metadata) {
+            Ok(_) => eprintln!("ktstr: kernel cached as {}", acquired.cache_key),
+            Err(e) => eprintln!("ktstr: warning: cache store failed: {e:#}"),
+        }
+    }
+
+    Ok(image)
 }
 
 /// Progress spinner for long-running CLI operations.
