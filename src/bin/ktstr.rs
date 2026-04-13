@@ -318,6 +318,7 @@ fn kernel_build(
     .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
     .with_ktstr_kconfig_hash(Some(kconfig_hash))
+    .with_ktstr_git_hash(Some(ktstr::GIT_FULL_HASH.to_string()))
     .with_git_hash(acquired.git_hash.clone())
     .with_git_ref(acquired.git_ref.clone())
     .with_source_tree_path(if source.is_some() {

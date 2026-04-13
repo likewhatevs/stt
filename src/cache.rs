@@ -92,6 +92,9 @@ pub struct KernelMetadata {
     /// `None` when vmlinux was not available at cache time.
     #[serde(default)]
     pub vmlinux_name: Option<String>,
+    /// Git commit hash of the ktstr build that cached this kernel.
+    #[serde(default)]
+    pub ktstr_git_hash: Option<String>,
 }
 
 impl KernelMetadata {
@@ -112,6 +115,7 @@ impl KernelMetadata {
             git_ref: None,
             source_tree_path: None,
             vmlinux_name: None,
+            ktstr_git_hash: None,
         }
     }
 
@@ -130,6 +134,12 @@ impl KernelMetadata {
     /// Set the ktstr.kconfig CRC32 hash.
     pub fn with_ktstr_kconfig_hash(mut self, hash: Option<String>) -> Self {
         self.ktstr_kconfig_hash = hash;
+        self
+    }
+
+    /// Set the ktstr build commit hash.
+    pub fn with_ktstr_git_hash(mut self, hash: Option<String>) -> Self {
+        self.ktstr_git_hash = hash;
         self
     }
 
@@ -527,6 +537,7 @@ mod tests {
             git_ref: None,
             source_tree_path: None,
             vmlinux_name: None,
+            ktstr_git_hash: None,
         }
     }
 
@@ -569,6 +580,7 @@ mod tests {
             git_ref: Some("v6.15-rc3".to_string()),
             source_tree_path: None,
             vmlinux_name: None,
+            ktstr_git_hash: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -591,6 +603,7 @@ mod tests {
             git_ref: None,
             source_tree_path: Some(PathBuf::from("/tmp/linux")),
             vmlinux_name: None,
+            ktstr_git_hash: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
