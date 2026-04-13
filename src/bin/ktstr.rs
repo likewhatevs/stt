@@ -275,7 +275,7 @@ fn kernel_build(
 
     // Build.
     let sp = cli::Spinner::start("Building kernel...");
-    let result = cli::make_kernel_quiet(source_dir);
+    let result = cli::make_kernel_with_output(source_dir, Some(&sp));
     if result.is_err() {
         sp.clear();
     } else {
