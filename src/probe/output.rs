@@ -298,16 +298,7 @@ fn format_probe_events_inner(
             .collect()
     };
 
-    let all_addrs: Vec<u64> = func_addrs
-        .iter()
-        .map(|(_, a)| *a)
-        .chain(
-            events
-                .iter()
-                .flat_map(|e| e.kstack.iter().copied())
-                .filter(|a| *a != 0),
-        )
-        .collect();
+    let all_addrs: Vec<u64> = func_addrs.iter().map(|(_, a)| *a).collect();
 
     let mut sym_map: Vec<(u64, String, String, u32)> = Vec::new();
     if !all_addrs.is_empty() {
@@ -570,32 +561,6 @@ fn format_probe_events_inner(
         if let Some(ref s) = event.str_val {
             let fw = max_field_w;
             out.push_str(&format!("      {:<fw$}  \"{s}\"\n", "msg"));
-        }
-    }
-
-    // Kstack from last event (trigger)
-    let kstack_addrs: Vec<u64> = events
-        .last()
-        .map(|e| e.kstack.iter().copied().filter(|a| *a != 0).collect())
-        .unwrap_or_default();
-
-    if !kstack_addrs.is_empty() {
-        out.push('\n');
-        for addr in &kstack_addrs {
-            if let Some((_, name, file, line)) = sym_map.iter().find(|(a, _, _, _)| a == addr) {
-                // _end is the kernel image end marker — BPF JIT addresses
-                // resolve to it because they fall past the last real symbol.
-                if name == "_end" {
-                    continue;
-                }
-                if !file.is_empty() {
-                    out.push_str(&format!("    {name:<40} {file}:{line}\n"));
-                } else {
-                    out.push_str(&format!("    {name}\n"));
-                }
-            } else {
-                out.push_str(&format!("    0x{addr:x}\n"));
-            }
         }
     }
 
