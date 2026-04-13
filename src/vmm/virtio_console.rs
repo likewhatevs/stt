@@ -276,6 +276,13 @@ impl VirtioConsole {
                 "virtio-console drain_pending_rx: delivered to guest",
             );
             self.signal_used();
+            // If data remains in pending_rx (all descriptors consumed),
+            // signal again to prompt the guest to replenish RX buffers
+            // sooner. Without this, large pastes stall until the guest
+            // independently reads from hvc0.
+            if !self.pending_rx.is_empty() {
+                let _ = self.irq_evt.write(1);
+            }
         }
     }
 

@@ -1301,7 +1301,7 @@ impl KtstrVm {
                 // wakeup_r is an OwnedFd moved into this closure; closed on exit.
                 let wakeup_fd = wakeup_r;
                 let stdin_fd = std::io::stdin().as_raw_fd();
-                let mut buf = [0u8; 64];
+                let mut buf = [0u8; 4096];
                 let mut saw_ctrl_a = false;
 
                 loop {
