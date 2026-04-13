@@ -120,23 +120,35 @@ const LD_CACHE_HEADER_SIZE: usize = 48;
 const LD_CACHE_ENTRY_SIZE: usize = 24;
 
 /// Parse the binary `/etc/ld.so.cache` file into a soname->path map.
+///
+/// Scans for the new-format magic because some systems prepend the
+/// old format (`ld.so-1.7.0`) before the new-format section.
 fn parse_ld_so_cache(path: &Path) -> HashMap<String, PathBuf> {
     let mut map = HashMap::new();
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(_) => return map,
     };
-    if data.len() < LD_CACHE_HEADER_SIZE || data[..20] != *LD_CACHE_MAGIC {
+    // Scan for new-format magic. Usually at offset 0, but old-format
+    // systems prepend the legacy section.
+    let Some(magic_pos) = data
+        .windows(LD_CACHE_MAGIC.len())
+        .position(|w| w == LD_CACHE_MAGIC)
+    else {
+        return map;
+    };
+    let hdr = magic_pos;
+    if data.len() < hdr + LD_CACHE_HEADER_SIZE {
         return map;
     }
-    let nlibs = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
-    let min_size = LD_CACHE_HEADER_SIZE + nlibs * LD_CACHE_ENTRY_SIZE;
+    let nlibs = u32::from_le_bytes(data[hdr + 20..hdr + 24].try_into().unwrap()) as usize;
+    let min_size = hdr + LD_CACHE_HEADER_SIZE + nlibs * LD_CACHE_ENTRY_SIZE;
     if data.len() < min_size {
         return map;
     }
     for i in 0..nlibs {
-        let off = LD_CACHE_HEADER_SIZE + i * LD_CACHE_ENTRY_SIZE;
-        // key and value are absolute byte offsets into the file.
+        let off = hdr + LD_CACHE_HEADER_SIZE + i * LD_CACHE_ENTRY_SIZE;
+        // key and value are absolute byte offsets from file start.
         let key_off = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
         let val_off = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
         if key_off >= data.len() || val_off >= data.len() {
@@ -270,6 +282,40 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
                 direct: is_direct,
             });
         }
+    }
+
+    // If there are unresolved libs and the binary has a non-standard
+    // interpreter, search directories relative to the interpreter's
+    // location. Custom toolchain linkers typically live alongside the
+    // libs they resolve.
+    if !missing.is_empty()
+        && let Some(ref interp) = interpreter
+        && !is_standard_interpreter(interp)
+    {
+        let interp_path = Path::new(interp);
+        let mut interp_dirs: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = interp_path.parent() {
+            interp_dirs.push(parent.to_path_buf());
+            interp_dirs.push(parent.join("lib"));
+            interp_dirs.push(parent.join("lib64"));
+        }
+        missing.retain(|m| {
+            for dir in &interp_dirs {
+                let candidate = dir.join(&m.soname);
+                if candidate.is_file() {
+                    let canonical =
+                        std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+                    let canon_str = canonical.to_string_lossy();
+                    let canon_guest = canon_str
+                        .strip_prefix('/')
+                        .unwrap_or(&canon_str)
+                        .to_string();
+                    found.push((canon_guest, canonical));
+                    return false;
+                }
+            }
+            true
+        });
     }
 
     Ok(SharedLibs {
@@ -451,24 +497,43 @@ fn write_entry(archive: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) -> Res
     Ok(())
 }
 
+/// Section names removed during debug stripping. These contain debug
+/// info, compiler metadata, and profiling data that inflate the binary
+/// but are not needed inside the VM.
+const DEBUG_SECTIONS: &[&[u8]] = &[
+    b".debug_info",
+    b".debug_abbrev",
+    b".debug_line",
+    b".debug_line_str",
+    b".debug_str",
+    b".debug_ranges",
+    b".debug_aranges",
+    b".debug_frame",
+    b".debug_loc",
+    b".debug_loclists",
+    b".debug_rnglists",
+    b".debug_str_offsets",
+    b".debug_addr",
+    b".debug_pubtypes",
+    b".debug_pubnames",
+    b".debug_types",
+    b".debug_macro",
+    b".debug_macinfo",
+    b".comment",
+];
+
 /// Strip debug sections from an ELF binary to reduce initramfs size.
 /// Debug info can be 10-50x the loadable segment size and is not needed
-/// inside the VM. Falls back to the original binary if strip fails.
+/// inside the VM. Uses the `object` crate to parse and rewrite the ELF,
+/// removing non-loadable debug sections. Falls back to the original
+/// binary on parse or write failure.
 ///
 /// When the binary has been deleted (e.g. by `cargo llvm-cov`),
 /// retries via `/proc/self/exe` which remains valid as long as the
 /// process is alive.
 fn strip_debug(path: &Path) -> Result<Vec<u8>> {
-    let stripped = std::env::temp_dir().join(format!(
-        "ktstr-stripped-{}-{:?}-{}",
-        std::process::id(),
-        std::thread::current().id(),
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-
-    // Try strip on the original path first, then /proc/self/exe if the
-    // binary was deleted (cargo llvm-cov deletes binaries after
-    // instrumenting them).
+    // Try the original path first, then /proc/self/exe if the binary
+    // was deleted (cargo llvm-cov deletes binaries after instrumenting).
     let paths_to_try: Vec<&Path> = if is_deleted_self(path) {
         vec![path, Path::new("/proc/self/exe")]
     } else {
@@ -476,28 +541,31 @@ fn strip_debug(path: &Path) -> Result<Vec<u8>> {
     };
 
     for src in &paths_to_try {
-        let status = std::process::Command::new("strip")
-            .args(["--strip-debug", "-o"])
-            .arg(&stripped)
-            .arg(src)
-            .status();
-        if let Ok(s) = status
-            && s.success()
-            && let Ok(data) = std::fs::read(&stripped)
-        {
-            let _ = std::fs::remove_file(&stripped);
-            return Ok(data);
-        }
-    }
-
-    // strip failed on all paths — fall back to unstripped read.
-    for src in &paths_to_try {
         if let Ok(data) = std::fs::read(src) {
+            if let Ok(stripped) = strip_debug_sections(&data) {
+                return Ok(stripped);
+            }
+            // object crate failed to parse/write — return unstripped.
             return Ok(data);
         }
     }
 
     std::fs::read(path).with_context(|| format!("read binary: {}", path.display()))
+}
+
+/// Remove debug sections from ELF data using the object crate's
+/// build module. Parses the ELF, marks debug sections for deletion,
+/// and writes back a new ELF without them.
+fn strip_debug_sections(data: &[u8]) -> std::result::Result<Vec<u8>, object::build::Error> {
+    let mut builder = object::build::elf::Builder::read(data)?;
+    for section in builder.sections.iter_mut() {
+        if DEBUG_SECTIONS.contains(&section.name.as_slice()) {
+            section.delete = true;
+        }
+    }
+    let mut out = Vec::new();
+    builder.write(&mut out)?;
+    Ok(out)
 }
 
 /// Check if `path` is the current executable and has been deleted.
@@ -588,6 +656,16 @@ pub fn create_initramfs_base(
     for path in &all_binaries {
         let result = resolve_shared_libs(path)
             .with_context(|| format!("resolve libs for {}", path.display()))?;
+
+        // Include-file ELFs must have all shared libs resolvable.
+        if !result.missing.is_empty() && include_elf_paths.contains(path) {
+            let names: Vec<&str> = result.missing.iter().map(|m| m.soname.as_str()).collect();
+            anyhow::bail!(
+                "{}: missing shared libraries: {}",
+                path.display(),
+                names.join(", ")
+            );
+        }
 
         // Pack non-standard PT_INTERP (custom dynamic linker) into the
         // initramfs so the guest kernel uses the same linker as the host.

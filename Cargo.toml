@@ -62,6 +62,7 @@ polars = { version = "0.53.0", default-features = false, features = ["lazy", "de
 linkme = "0.3"
 ktstr-macros = { version = "0.1.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
+object = { version = "0.36", default-features = false, features = ["build", "std", "elf"] }
 
 [profile.release]
 lto = "thin"
