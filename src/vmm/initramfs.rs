@@ -1285,6 +1285,57 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Compress `data` using the system `lz4 -l -c` command (reference C
+/// implementation). Debug-only path activated by `KTSTR_LZ4_CMD=1`.
+/// Panics if `lz4` is not installed or the command fails.
+pub(crate) fn lz4_cmd_compress(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("lz4")
+        .args(["-l", "-c"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("KTSTR_LZ4_CMD: failed to spawn lz4 — is it installed?");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let data_owned = data.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&data_owned).expect("write to lz4 stdin");
+        drop(stdin);
+    });
+
+    let output = child.wait_with_output().expect("lz4 wait_with_output");
+    writer.join().expect("lz4 stdin writer thread");
+
+    assert!(
+        output.status.success(),
+        "KTSTR_LZ4_CMD: lz4 -l -c failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    tracing::debug!(
+        input = data.len(),
+        output = output.stdout.len(),
+        "lz4_cmd_compress",
+    );
+
+    output.stdout
+}
+
+/// Select the compression function based on `KTSTR_LZ4_CMD` env var.
+/// Returns `lz4_cmd_compress` when set, `lz4_legacy_compress` otherwise.
+pub(crate) fn lz4_compress(data: &[u8]) -> Vec<u8> {
+    if std::env::var_os("KTSTR_LZ4_CMD").is_some() {
+        tracing::info!("KTSTR_LZ4_CMD: using system lz4 -l for compression");
+        lz4_cmd_compress(data)
+    } else {
+        lz4_legacy_compress(data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2301,5 +2352,269 @@ mod tests {
         let compressed = lz4_legacy_compress(&[]);
         // Empty input: just the magic, no chunks.
         assert_eq!(compressed, LZ4_LEGACY_MAGIC);
+    }
+
+    /// Build a synthetic cpio archive from generated data for LZ4 tests.
+    /// Uses generic paths to avoid banned terms.
+    fn build_synthetic_cpio(total_size: usize) -> Vec<u8> {
+        let mut archive = Vec::new();
+        // Directory entries.
+        write_entry(&mut archive, "lib", &[], 0o40755).unwrap();
+        write_entry(&mut archive, "data", &[], 0o40755).unwrap();
+
+        // Fill with generated binary data to reach target size.
+        // Use a simple PRNG for reproducible high-entropy content.
+        let mut rng_state = 0x12345678u64;
+        let entry_size = 256 * 1024; // 256KB per entry
+        let mut entry_num = 0;
+        while archive.len() + entry_size < total_size {
+            let mut payload = vec![0u8; entry_size];
+            for byte in &mut payload {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *byte = (rng_state >> 33) as u8;
+            }
+            let name = format!("lib/test_{entry_num:04}.so");
+            write_entry(&mut archive, &name, &payload, 0o100755).unwrap();
+            entry_num += 1;
+        }
+
+        // Pad remaining space with a data file.
+        if archive.len() < total_size {
+            let remaining = total_size - archive.len() - 200; // room for header
+            let remaining = remaining.min(total_size);
+            let mut payload = vec![0u8; remaining];
+            for byte in &mut payload {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *byte = (rng_state >> 33) as u8;
+            }
+            write_entry(&mut archive, "data/fill.bin", &payload, 0o100644).unwrap();
+        }
+
+        // Trailer and padding.
+        cpio::newc::trailer(&mut archive as &mut dyn std::io::Write).unwrap();
+        let pad = (512 - (archive.len() % 512)) % 512;
+        archive.extend(std::iter::repeat_n(0u8, pad));
+        archive
+    }
+
+    /// Simulate the kernel's unlz4() decompression loop (non-fill path).
+    /// This mirrors lib/decompress_unlz4.c behavior:
+    ///   1. Read and validate 4-byte magic (0x184C2102)
+    ///   2. Loop: read 4-byte LE chunk size, decompress chunk, advance
+    ///   3. Handle concatenated magic (re-encounter mid-stream)
+    ///   4. Terminate on size < 4 or size == 0
+    fn simulate_kernel_unlz4(input: &[u8]) -> Result<Vec<u8>, String> {
+        const UNCOMP_CHUNK_SIZE: usize = 8 << 20; // LZ4_DEFAULT_UNCOMPRESSED_CHUNK_SIZE
+
+        if input.len() < 4 {
+            return Err("input too short for magic".into());
+        }
+
+        let mut inp = 0usize; // current position
+        let mut size = input.len() as isize; // remaining bytes
+
+        // Read and validate magic.
+        let magic = u32::from_le_bytes(input[inp..inp + 4].try_into().unwrap());
+        if magic != 0x184C2102 {
+            return Err(format!("invalid header: 0x{magic:08X}"));
+        }
+        inp += 4;
+        size -= 4;
+
+        let mut output = Vec::new();
+
+        loop {
+            if size < 4 {
+                // End of input — clean exit.
+                break;
+            }
+
+            let chunksize = u32::from_le_bytes(input[inp..inp + 4].try_into().unwrap()) as usize;
+
+            // Handle concatenated magic mid-stream.
+            if chunksize == 0x184C2102 {
+                inp += 4;
+                size -= 4;
+                continue;
+            }
+
+            // Zero chunk size — end of stream.
+            if chunksize == 0 {
+                break;
+            }
+
+            inp += 4;
+            size -= 4;
+
+            // Kernel: LZ4_decompress_safe(inp, outp, chunksize, dest_len)
+            // dest_len = uncomp_chunksize (8MB max output)
+            let chunk_data = &input[inp..inp + chunksize];
+            let decompressed = lz4_flex::block::decompress(chunk_data, UNCOMP_CHUNK_SIZE)
+                .map_err(|e| format!("LZ4_decompress_safe failed: {e}"))?;
+
+            output.extend_from_slice(&decompressed);
+
+            size -= chunksize as isize;
+            if size == 0 {
+                break;
+            } else if size < 0 {
+                return Err("data corrupted: size went negative".into());
+            }
+            inp += chunksize;
+        }
+
+        Ok(output)
+    }
+
+    /// Roundtrip test with synthetic cpio data through the kernel's
+    /// unlz4() decompression logic. Uses generated test data with
+    /// generic paths.
+    #[test]
+    fn lz4_legacy_kernel_unlz4_roundtrip() {
+        // Single chunk (< 8MB).
+        let small = build_synthetic_cpio(1 << 20); // ~1MB
+        let compressed = lz4_legacy_compress(&small);
+        let decompressed = simulate_kernel_unlz4(&compressed)
+            .expect("kernel unlz4 simulation failed on small input");
+        assert_eq!(decompressed, small);
+
+        // Multi-chunk (> 8MB, forces chunk splitting).
+        let large = build_synthetic_cpio(10 << 20); // ~10MB
+        let compressed = lz4_legacy_compress(&large);
+        let decompressed = simulate_kernel_unlz4(&compressed)
+            .expect("kernel unlz4 simulation failed on multi-chunk input");
+        assert_eq!(decompressed, large);
+    }
+
+    /// Test concatenated LZ4 legacy streams (base + suffix) through
+    /// the kernel unlz4 simulation. This is the format used when
+    /// base and suffix are compressed separately.
+    #[test]
+    fn lz4_legacy_kernel_unlz4_concatenated() {
+        let base = build_synthetic_cpio(2 << 20); // ~2MB
+        let suffix_data = b"arg1\narg2\narg3\n";
+
+        let lz4_base = lz4_legacy_compress(&base);
+        let lz4_suffix = lz4_legacy_compress(suffix_data);
+
+        // Concatenate the two streams.
+        let mut combined = Vec::with_capacity(lz4_base.len() + lz4_suffix.len());
+        combined.extend_from_slice(&lz4_base);
+        combined.extend_from_slice(&lz4_suffix);
+
+        let decompressed = simulate_kernel_unlz4(&combined)
+            .expect("kernel unlz4 simulation failed on concatenated streams");
+
+        let mut expected = Vec::with_capacity(base.len() + suffix_data.len());
+        expected.extend_from_slice(&base);
+        expected.extend_from_slice(suffix_data);
+        assert_eq!(decompressed, expected);
+    }
+
+    /// Verify lz4_flex block output is decompressible by the C lz4
+    /// library (same decompressor as the kernel's LZ4_decompress_safe).
+    /// Uses synthetic cpio data with generic paths.
+    #[test]
+    fn lz4_legacy_compress_c_compat() {
+        let lz4_check = std::process::Command::new("lz4").arg("--version").output();
+        if lz4_check.is_err() {
+            eprintln!("skipping: lz4 CLI not found");
+            return;
+        }
+
+        let data = build_synthetic_cpio(2 << 20); // ~2MB
+        let compressed = lz4_legacy_compress(&data);
+        let compressed_path = std::env::temp_dir().join("ktstr-test-lz4-compat.lz4");
+        let decompressed_path = std::env::temp_dir().join("ktstr-test-lz4-compat.bin");
+        std::fs::write(&compressed_path, &compressed).unwrap();
+
+        let output = std::process::Command::new("lz4")
+            .args(["-d", "-f", "--no-frame-crc"])
+            .arg(&compressed_path)
+            .arg(&decompressed_path)
+            .output()
+            .expect("lz4 -d failed to execute");
+
+        let _ = std::fs::remove_file(&compressed_path);
+
+        assert!(
+            output.status.success(),
+            "lz4 -d failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let result = std::fs::read(&decompressed_path).unwrap();
+        let _ = std::fs::remove_file(&decompressed_path);
+        assert_eq!(result.len(), data.len(), "decompressed size mismatch");
+        assert_eq!(&result[..], &data[..], "decompressed content mismatch");
+    }
+
+    /// Verify our output can be decompressed by `lz4 -d` when compressed
+    /// with `lz4 -l` as reference. Tests cross-compatibility of our
+    /// legacy format framing with the reference implementation.
+    #[test]
+    fn lz4_legacy_reference_cross_compat() {
+        let lz4_check = std::process::Command::new("lz4").arg("--version").output();
+        if lz4_check.is_err() {
+            eprintln!("skipping: lz4 CLI not found");
+            return;
+        }
+
+        let data = build_synthetic_cpio(2 << 20);
+
+        // Compress with `lz4 -l` (reference legacy mode).
+        let input_path = std::env::temp_dir().join("ktstr-test-lz4-ref-input.bin");
+        let ref_path = std::env::temp_dir().join("ktstr-test-lz4-ref.lz4");
+        std::fs::write(&input_path, &data).unwrap();
+
+        let ref_output = std::process::Command::new("lz4")
+            .args(["-l", "-f"])
+            .arg(&input_path)
+            .arg(&ref_path)
+            .output()
+            .expect("lz4 -l failed to execute");
+        let _ = std::fs::remove_file(&input_path);
+
+        assert!(
+            ref_output.status.success(),
+            "lz4 -l failed: stderr={}",
+            String::from_utf8_lossy(&ref_output.stderr),
+        );
+
+        // Decompress reference output through our kernel simulation.
+        let ref_compressed = std::fs::read(&ref_path).unwrap();
+        let _ = std::fs::remove_file(&ref_path);
+
+        let ref_decompressed = simulate_kernel_unlz4(&ref_compressed)
+            .expect("kernel unlz4 simulation failed on lz4 -l output");
+        assert_eq!(
+            ref_decompressed, data,
+            "reference lz4 -l roundtrip mismatch"
+        );
+
+        // Also compress with our encoder, decompress with lz4 -d.
+        let our_compressed = lz4_legacy_compress(&data);
+        let our_lz4_path = std::env::temp_dir().join("ktstr-test-lz4-ref-ours.lz4");
+        let our_decompressed_path = std::env::temp_dir().join("ktstr-test-lz4-ref-ours.bin");
+        std::fs::write(&our_lz4_path, &our_compressed).unwrap();
+
+        let our_output = std::process::Command::new("lz4")
+            .args(["-d", "-f", "--no-frame-crc"])
+            .arg(&our_lz4_path)
+            .arg(&our_decompressed_path)
+            .output()
+            .expect("lz4 -d on our output failed to execute");
+
+        let _ = std::fs::remove_file(&our_lz4_path);
+
+        assert!(
+            our_output.status.success(),
+            "lz4 -d on our output failed: stderr={}",
+            String::from_utf8_lossy(&our_output.stderr),
+        );
+
+        let our_result = std::fs::read(&our_decompressed_path).unwrap();
+        let _ = std::fs::remove_file(&our_decompressed_path);
+        assert_eq!(our_result, data, "our lz4 output cross-compat mismatch");
     }
 }

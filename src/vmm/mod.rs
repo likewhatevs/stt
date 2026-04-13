@@ -1388,40 +1388,100 @@ impl KtstrVm {
             );
         }
 
-        // Compress base and suffix as separate LZ4 legacy streams. The
-        // kernel initramfs decompressor handles concatenated LZ4 natively
-        // (re-encountering the magic mid-stream resets the decoder).
-        // Keeping them separate lets us COW-map the base from SHM.
-        let t0 = Instant::now();
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
-        let total_compressed = lz4_base.len() + lz4_suffix.len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            uncompressed = uncompressed_size,
-            lz4_base = lz4_base.len(),
-            lz4_suffix = lz4_suffix.len(),
-            ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-            "lz4_initramfs",
-        );
+        // KTSTR_NO_COMPRESS: skip LZ4, load raw cpio for debugging.
+        let no_compress = std::env::var_os("KTSTR_NO_COMPRESS").is_some();
 
-        // Try COW overlay: mmap compressed base from SHM fd directly
-        // into guest memory, sharing physical pages across VMs.
-        let t0 = Instant::now();
-        let cow_ok = self.try_cow_overlay(vm, &key, lz4_base.len(), load_addr);
-        if cow_ok {
-            // Base is COW-mapped. Write suffix after it.
-            vm.guest_mem
-                .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
-                .context("write lz4 suffix after COW base")?;
-            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cow_initramfs");
+        if no_compress {
+            tracing::info!("KTSTR_NO_COMPRESS: loading raw uncompressed cpio");
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[base_bytes, &suffix], load_addr)?;
+            Ok((Some(load_addr), Some(uncompressed_size as u32)))
         } else {
-            // Fallback: write both parts via write_slice.
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
-            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "copy_initramfs");
-        }
+            // Compress base and suffix as separate LZ4 legacy streams. The
+            // kernel initramfs decompressor handles concatenated LZ4 natively
+            // (re-encountering the magic mid-stream resets the decoder).
+            // Keeping them separate lets us COW-map the base from SHM.
+            let t0 = Instant::now();
+            let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
+            let lz4_suffix = initramfs::lz4_compress(&suffix);
+            let total_compressed = lz4_base.len() + lz4_suffix.len();
+            tracing::debug!(
+                elapsed_us = t0.elapsed().as_micros(),
+                uncompressed = uncompressed_size,
+                lz4_base = lz4_base.len(),
+                lz4_suffix = lz4_suffix.len(),
+                ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
+                "lz4_initramfs",
+            );
 
-        Ok((Some(load_addr), Some(total_compressed as u32)))
+            // Verify compressed data starts with LZ4 legacy magic.
+            tracing::debug!(
+                base_magic = format!(
+                    "{:02x}{:02x}{:02x}{:02x}",
+                    lz4_base[0], lz4_base[1], lz4_base[2], lz4_base[3]
+                ),
+                suffix_magic = format!(
+                    "{:02x}{:02x}{:02x}{:02x}",
+                    lz4_suffix[0], lz4_suffix[1], lz4_suffix[2], lz4_suffix[3]
+                ),
+                base_len = lz4_base.len(),
+                suffix_len = lz4_suffix.len(),
+                total = total_compressed,
+                load_addr = format!("{:#x}", load_addr),
+                suffix_addr = format!("{:#x}", load_addr + lz4_base.len() as u64),
+                "initrd_load_debug",
+            );
+
+            // Try COW overlay: mmap compressed base from SHM fd directly
+            // into guest memory, sharing physical pages across VMs.
+            let t0 = Instant::now();
+            let cow_ok = self.try_cow_overlay(vm, &key, lz4_base.len(), load_addr);
+            if cow_ok {
+                // Base is COW-mapped. Write suffix after it.
+                vm.guest_mem
+                    .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
+                    .context("write lz4 suffix after COW base")?;
+                tracing::debug!(
+                    elapsed_us = t0.elapsed().as_micros(),
+                    cow = true,
+                    "initrd_write"
+                );
+            } else {
+                // Fallback: write both parts via write_slice.
+                initramfs::load_initramfs_parts(
+                    &vm.guest_mem,
+                    &[&lz4_base, &lz4_suffix],
+                    load_addr,
+                )?;
+                tracing::debug!(
+                    elapsed_us = t0.elapsed().as_micros(),
+                    cow = false,
+                    "initrd_write"
+                );
+            }
+
+            // Read back first 8 bytes from guest memory to verify write.
+            let mut verify_buf = [0u8; 8];
+            vm.guest_mem
+                .read_slice(&mut verify_buf, GuestAddress(load_addr))
+                .context("read-back initrd verify")?;
+            tracing::debug!(
+                first_8 = format!(
+                    "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    verify_buf[0],
+                    verify_buf[1],
+                    verify_buf[2],
+                    verify_buf[3],
+                    verify_buf[4],
+                    verify_buf[5],
+                    verify_buf[6],
+                    verify_buf[7]
+                ),
+                expected_magic = "02214c18",
+                "initrd_verify",
+            );
+
+            Ok((Some(load_addr), Some(total_compressed as u32)))
+        }
     }
 
     /// Deferred memory path: join initramfs, compute memory from actual
@@ -1489,33 +1549,93 @@ impl KtstrVm {
         vm.allocate_and_register_memory(memory_mb)
             .context("allocate deferred memory")?;
 
-        // Compress and load initramfs.
-        let t0 = Instant::now();
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
-        let total_compressed = lz4_base.len() + lz4_suffix.len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            uncompressed = uncompressed_size,
-            lz4_base = lz4_base.len(),
-            lz4_suffix = lz4_suffix.len(),
-            ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-            "lz4_initramfs",
-        );
+        // KTSTR_NO_COMPRESS: skip LZ4, load raw cpio for debugging.
+        let no_compress = std::env::var_os("KTSTR_NO_COMPRESS").is_some();
 
-        let t0 = Instant::now();
-        let cow_ok = self.try_cow_overlay(vm, &key, lz4_base.len(), load_addr);
-        if cow_ok {
-            vm.guest_mem
-                .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
-                .context("write lz4 suffix after COW base")?;
-            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cow_initramfs");
+        if no_compress {
+            tracing::info!("KTSTR_NO_COMPRESS: loading raw uncompressed cpio");
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[base_bytes, &suffix], load_addr)?;
+            Ok((Some(load_addr), Some(uncompressed_size as u32), memory_mb))
         } else {
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
-            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "copy_initramfs");
-        }
+            // Compress and load initramfs.
+            let t0 = Instant::now();
+            let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
+            let lz4_suffix = initramfs::lz4_compress(&suffix);
+            let total_compressed = lz4_base.len() + lz4_suffix.len();
+            tracing::debug!(
+                elapsed_us = t0.elapsed().as_micros(),
+                uncompressed = uncompressed_size,
+                lz4_base = lz4_base.len(),
+                lz4_suffix = lz4_suffix.len(),
+                ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
+                "lz4_initramfs",
+            );
 
-        Ok((Some(load_addr), Some(total_compressed as u32), memory_mb))
+            // Verify compressed data starts with LZ4 legacy magic.
+            tracing::debug!(
+                base_magic = format!(
+                    "{:02x}{:02x}{:02x}{:02x}",
+                    lz4_base[0], lz4_base[1], lz4_base[2], lz4_base[3]
+                ),
+                suffix_magic = format!(
+                    "{:02x}{:02x}{:02x}{:02x}",
+                    lz4_suffix[0], lz4_suffix[1], lz4_suffix[2], lz4_suffix[3]
+                ),
+                base_len = lz4_base.len(),
+                suffix_len = lz4_suffix.len(),
+                total = total_compressed,
+                load_addr = format!("{:#x}", load_addr),
+                suffix_addr = format!("{:#x}", load_addr + lz4_base.len() as u64),
+                "initrd_load_debug",
+            );
+
+            let t0 = Instant::now();
+            let cow_ok = self.try_cow_overlay(vm, &key, lz4_base.len(), load_addr);
+            if cow_ok {
+                vm.guest_mem
+                    .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
+                    .context("write lz4 suffix after COW base")?;
+                tracing::debug!(
+                    elapsed_us = t0.elapsed().as_micros(),
+                    cow = true,
+                    "initrd_write"
+                );
+            } else {
+                initramfs::load_initramfs_parts(
+                    &vm.guest_mem,
+                    &[&lz4_base, &lz4_suffix],
+                    load_addr,
+                )?;
+                tracing::debug!(
+                    elapsed_us = t0.elapsed().as_micros(),
+                    cow = false,
+                    "initrd_write"
+                );
+            }
+
+            // Read back first 8 bytes from guest memory to verify write.
+            let mut verify_buf = [0u8; 8];
+            vm.guest_mem
+                .read_slice(&mut verify_buf, GuestAddress(load_addr))
+                .context("read-back initrd verify")?;
+            tracing::debug!(
+                first_8 = format!(
+                    "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    verify_buf[0],
+                    verify_buf[1],
+                    verify_buf[2],
+                    verify_buf[3],
+                    verify_buf[4],
+                    verify_buf[5],
+                    verify_buf[6],
+                    verify_buf[7]
+                ),
+                expected_magic = "02214c18",
+                "initrd_verify",
+            );
+
+            Ok((Some(load_addr), Some(total_compressed as u32), memory_mb))
+        }
     }
 
     /// Resolve effective memory in MB from the actual guest memory allocation.
@@ -1558,7 +1678,7 @@ impl KtstrVm {
         }
 
         // Compress with LZ4 legacy format.
-        let gz = initramfs::lz4_legacy_compress(base_bytes);
+        let gz = initramfs::lz4_compress(base_bytes);
 
         if let Err(e) = initramfs::shm_store_gz(key.0, &gz) {
             tracing::warn!("shm_store_gz: {e:#}");
@@ -2621,14 +2741,25 @@ impl KtstrVm {
                 let kr = boot::load_kernel(&vm.guest_mem, &self.kernel)
                     .context("load kernel (aarch64)")?;
 
-                // Compress and load initramfs.
-                let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
-                full.extend_from_slice(base_bytes);
-                full.extend_from_slice(&suffix);
-                let compressed = initramfs::lz4_legacy_compress(&full);
-                let total_size = compressed.len() as u64;
+                // KTSTR_NO_COMPRESS: skip LZ4, load raw cpio for debugging.
+                let no_compress = std::env::var_os("KTSTR_NO_COMPRESS").is_some();
+                let (initrd_data, total_size) = if no_compress {
+                    tracing::info!("KTSTR_NO_COMPRESS: loading raw uncompressed cpio");
+                    let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
+                    full.extend_from_slice(base_bytes);
+                    full.extend_from_slice(&suffix);
+                    let sz = full.len() as u64;
+                    (full, sz)
+                } else {
+                    let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
+                    full.extend_from_slice(base_bytes);
+                    full.extend_from_slice(&suffix);
+                    let compressed = initramfs::lz4_compress(&full);
+                    let sz = compressed.len() as u64;
+                    (compressed, sz)
+                };
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
-                initramfs::load_initramfs_parts(&vm.guest_mem, &[&compressed], load_addr)?;
+                initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;
 
                 // Fall through to cmdline/FDT setup below with the initrd info.
                 // We need to set up a scope that merges into the non-deferred path.
@@ -2668,10 +2799,16 @@ impl KtstrVm {
                 let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
                 full.extend_from_slice(base_bytes);
                 full.extend_from_slice(&suffix);
-                let compressed = initramfs::lz4_legacy_compress(&full);
-                let total_size = compressed.len() as u64;
+                let no_compress = std::env::var_os("KTSTR_NO_COMPRESS").is_some();
+                let initrd_data = if no_compress {
+                    tracing::info!("KTSTR_NO_COMPRESS: loading raw uncompressed cpio");
+                    full
+                } else {
+                    initramfs::lz4_compress(&full)
+                };
+                let total_size = initrd_data.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
-                initramfs::load_initramfs_parts(&vm.guest_mem, &[&compressed], load_addr)?;
+                initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;
                 (Some(load_addr), Some(total_size as u32))
             }
             None => (None, None),
