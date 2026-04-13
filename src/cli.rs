@@ -693,24 +693,27 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
 /// image, configures and builds the kernel automatically, caches the
 /// result, and returns the image path.
 fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
-    // Try to find an existing built image first.
-    if let Some(image) = crate::kernel_path::find_image_in_dir(path) {
-        // Check if it was built with current kconfig.
-        let cache = crate::cache::CacheDir::new().ok();
-        if let Some(cache) = &cache {
-            let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-            if let Some(entry) = cache.lookup(&acquired.cache_key) {
-                if !entry.has_stale_kconfig(&embedded_kconfig_hash()) {
-                    return Ok(image);
-                }
-                eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
-            } else {
-                // Image exists but not in cache with current key — use it.
-                return Ok(image);
-            }
+    // Check dirty state early. Dirty trees always rebuild — the user
+    // is actively developing and wants their changes reflected.
+    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let force_rebuild = acquired.is_dirty;
+    if force_rebuild {
+        eprintln!("ktstr: dirty tree, rebuilding kernel");
+    }
+
+    // Try to find an existing built image (skip for dirty trees).
+    if !force_rebuild && let Some(image) = crate::kernel_path::find_image_in_dir(path) {
+        let stale = if let Ok(cache) = crate::cache::CacheDir::new()
+            && let Some(entry) = cache.lookup(&acquired.cache_key)
+        {
+            entry.has_stale_kconfig(&embedded_kconfig_hash())
         } else {
+            false
+        };
+        if !stale {
             return Ok(image);
         }
+        eprintln!("ktstr: cached kernel has stale kconfig, rebuilding");
     }
 
     // No image found or stale — check if this is a source tree.
@@ -744,10 +747,7 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     })?;
 
     // Cache the build (skip for dirty trees).
-    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    if !acquired.is_dirty
-        && let Ok(cache) = crate::cache::CacheDir::new()
-    {
+    if !force_rebuild && let Ok(cache) = crate::cache::CacheDir::new() {
         let vmlinux_path = path.join("vmlinux");
         let vmlinux_ref = vmlinux_path.exists().then_some(vmlinux_path.as_path());
 
