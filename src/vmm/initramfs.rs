@@ -4,7 +4,7 @@
 /// into a cpio archive for use as Linux initrd.
 /// Init setup is handled by Rust code in `vmm::rust_init`.
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -95,6 +95,76 @@ fn parse_ld_so_conf(path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     parse_ld_so_conf_file(path, &mut paths);
     paths
+}
+
+/// Parsed soname-to-path mappings from `/etc/ld.so.cache`.
+///
+/// The binary cache is the authoritative lookup used by `ld-linux.so`.
+/// It contains entries for every library indexed by `ldconfig`, including
+/// libraries in directories added via `ldconfig /path` that may not
+/// appear in the text-based `/etc/ld.so.conf` files. Parsing the cache
+/// catches libraries the conf-based directory scan misses.
+///
+/// Format (glibc new format, `glibc-ld.so.cache1.1`):
+///   - 48-byte header: magic[20] + nlibs[4] + len_strings[4] + flags[4] + unused[16]
+///   - nlibs entries of 24 bytes: flags[4] + key[4] + value[4] + osversion[4] + hwcap[8]
+///   - String table: key/value are absolute byte offsets from file start
+static LD_SO_CACHE: LazyLock<HashMap<String, PathBuf>> =
+    LazyLock::new(|| parse_ld_so_cache(Path::new("/etc/ld.so.cache")));
+
+/// Magic bytes at the start of the glibc new-format `ld.so.cache`.
+const LD_CACHE_MAGIC: &[u8; 20] = b"glibc-ld.so.cache1.1";
+/// Header size: magic(20) + nlibs(4) + len_strings(4) + flags(4) + unused(16).
+const LD_CACHE_HEADER_SIZE: usize = 48;
+/// Per-entry size: flags(4) + key(4) + value(4) + osversion(4) + hwcap(8).
+const LD_CACHE_ENTRY_SIZE: usize = 24;
+
+/// Parse the binary `/etc/ld.so.cache` file into a soname->path map.
+fn parse_ld_so_cache(path: &Path) -> HashMap<String, PathBuf> {
+    let mut map = HashMap::new();
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return map,
+    };
+    if data.len() < LD_CACHE_HEADER_SIZE || data[..20] != *LD_CACHE_MAGIC {
+        return map;
+    }
+    let nlibs = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+    let min_size = LD_CACHE_HEADER_SIZE + nlibs * LD_CACHE_ENTRY_SIZE;
+    if data.len() < min_size {
+        return map;
+    }
+    for i in 0..nlibs {
+        let off = LD_CACHE_HEADER_SIZE + i * LD_CACHE_ENTRY_SIZE;
+        // key and value are absolute byte offsets into the file.
+        let key_off = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
+        let val_off = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+        if key_off >= data.len() || val_off >= data.len() {
+            continue;
+        }
+        let soname = match read_cstr(&data, key_off) {
+            Some(s) => s,
+            None => continue,
+        };
+        let path_str = match read_cstr(&data, val_off) {
+            Some(s) => s,
+            None => continue,
+        };
+        // Only accept absolute paths that exist as files.
+        if path_str.starts_with('/') {
+            let p = PathBuf::from(path_str);
+            if p.is_file() {
+                map.entry(soname.to_string()).or_insert(p);
+            }
+        }
+    }
+    map
+}
+
+/// Read a null-terminated C string from `data` at `offset`.
+fn read_cstr(data: &[u8], offset: usize) -> Option<&str> {
+    let end = data[offset..].iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&data[offset..offset + end]).ok()
 }
 
 /// Simple glob matching supporting only `*` as a wildcard.
@@ -309,8 +379,9 @@ static LD_LIBRARY_PATH_DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 /// Search order matches the host dynamic linker (ld.so):
 ///   1. LD_LIBRARY_PATH
 ///   2. DT_RUNPATH / DT_RPATH from the binary
-///   3. /etc/ld.so.conf paths
-///   4. Default library paths (/lib, /usr/lib, etc.)
+///   3. /etc/ld.so.cache (binary cache from ldconfig)
+///   4. /etc/ld.so.conf paths (text config directories)
+///   5. Default library paths (/lib, /usr/lib, etc.)
 fn resolve_soname(soname: &str, elf_search_dirs: &[PathBuf]) -> Option<PathBuf> {
     // 1. LD_LIBRARY_PATH.
     for dir in LD_LIBRARY_PATH_DIRS.iter() {
@@ -328,7 +399,14 @@ fn resolve_soname(soname: &str, elf_search_dirs: &[PathBuf]) -> Option<PathBuf> 
         }
     }
 
-    // 3. Paths from /etc/ld.so.conf.
+    // 3. ld.so.cache — the binary cache is the real dynamic linker's
+    //    primary lookup mechanism. Catches libraries in directories
+    //    added via `ldconfig /path` that don't appear in ld.so.conf.
+    if let Some(cached_path) = LD_SO_CACHE.get(soname) {
+        return Some(cached_path.clone());
+    }
+
+    // 4. Paths from /etc/ld.so.conf.
     for dir in LD_SO_CONF_PATHS.iter() {
         let candidate = dir.join(soname);
         if candidate.is_file() {
@@ -336,7 +414,7 @@ fn resolve_soname(soname: &str, elf_search_dirs: &[PathBuf]) -> Option<PathBuf> 
         }
     }
 
-    // 4. Default paths.
+    // 5. Default paths.
     for dir in DEFAULT_LIB_PATHS {
         let candidate = Path::new(dir).join(soname);
         if candidate.is_file() {
@@ -1643,5 +1721,62 @@ mod tests {
     fn glob_match_no_star() {
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "other"));
+    }
+
+    // -- ld.so.cache parsing tests --
+
+    #[test]
+    fn parse_ld_so_cache_finds_libc() {
+        let cache = parse_ld_so_cache(Path::new("/etc/ld.so.cache"));
+        // libc.so.6 is in every glibc system's ld.so.cache.
+        assert!(
+            cache.contains_key("libc.so.6"),
+            "ld.so.cache should contain libc.so.6: found {} entries",
+            cache.len(),
+        );
+        let path = &cache["libc.so.6"];
+        assert!(
+            path.is_file(),
+            "cached libc path should exist: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn parse_ld_so_cache_nonexistent_returns_empty() {
+        let cache = parse_ld_so_cache(Path::new("/nonexistent/ld.so.cache"));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn parse_ld_so_cache_bad_magic_returns_empty() {
+        let tmp = std::env::temp_dir().join("ktstr-test-ldcache-bad");
+        std::fs::write(&tmp, b"not a valid cache file").unwrap();
+        let cache = parse_ld_so_cache(&tmp);
+        assert!(cache.is_empty());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn parse_ld_so_cache_truncated_returns_empty() {
+        let tmp = std::env::temp_dir().join("ktstr-test-ldcache-trunc");
+        // Valid magic but truncated header.
+        let mut data = LD_CACHE_MAGIC.to_vec();
+        data.extend_from_slice(&[0u8; 10]); // not enough for full header
+        std::fs::write(&tmp, &data).unwrap();
+        let cache = parse_ld_so_cache(&tmp);
+        assert!(cache.is_empty());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn ld_so_cache_consistent_with_resolve_soname() {
+        // If libc.so.6 is in the cache, resolve_soname should find it.
+        let result = resolve_soname("libc.so.6", &[]);
+        assert!(
+            result.is_some(),
+            "resolve_soname should find libc.so.6 (cache or paths)"
+        );
+        assert!(result.unwrap().is_file());
     }
 }

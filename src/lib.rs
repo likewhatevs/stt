@@ -502,14 +502,12 @@ pub fn run_shell(
             .filter_map(|(_, p)| std::fs::metadata(p).ok())
             .map(|m| m.len())
             .sum();
-        let include_lib_size: u64 = include_files
-            .iter()
-            .filter_map(|(_, p)| vmm::initramfs::resolve_shared_libs(p).ok())
-            .flat_map(|r| r.found.into_iter().map(|(_, p)| p))
-            .filter_map(|p| std::fs::metadata(&p).ok())
-            .map(|m| m.len())
-            .sum();
-        let include_mb = ((include_size + include_lib_size + (1 << 20) - 1) >> 20) as u32;
+        // Shared lib resolution for include files happens in
+        // create_initramfs_base. Estimate lib overhead as 4x file size
+        // to avoid a duplicate resolve_shared_libs call per file.
+        // join_and_load_initramfs checks actual size and bails if
+        // memory is insufficient.
+        let include_mb = ((include_size * 5 + (1 << 20) - 1) >> 20) as u32;
         base + 2 * include_mb + 256
     });
 
