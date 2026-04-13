@@ -361,10 +361,16 @@ fn shell_mode_requested() -> bool {
 
 /// Extract KTSTR_SHELL_EXEC=<cmd> from kernel cmdline if present.
 fn shell_exec_cmd() -> Option<String> {
+    cmdline_val("KTSTR_SHELL_EXEC")
+}
+
+/// Extract a KEY=value pair from the kernel cmdline.
+fn cmdline_val(key: &str) -> Option<String> {
     let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
+    let prefix = format!("{key}=");
     cmdline
         .split_whitespace()
-        .find_map(|s| s.strip_prefix("KTSTR_SHELL_EXEC="))
+        .find_map(|s| s.strip_prefix(&prefix))
         .map(|s| s.to_string())
 }
 
@@ -430,6 +436,22 @@ fn spawn_shell_with_pty() {
     };
 
     let slave_fd = pty.slave.as_raw_fd();
+
+    // Set PTY size from host terminal dimensions passed via cmdline.
+    if let (Some(cols), Some(rows)) = (cmdline_val("KTSTR_COLS"), cmdline_val("KTSTR_ROWS"))
+        && let (Ok(cols), Ok(rows)) = (cols.parse::<u16>(), rows.parse::<u16>())
+    {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            libc::ioctl(slave_fd, libc::TIOCSWINSZ, &ws);
+        }
+    }
+
     let child = unsafe {
         Command::new("/bin/busybox")
             .arg("sh")

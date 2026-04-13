@@ -546,6 +546,20 @@ pub fn run_shell(
         cmdline.push_str(&format!(" RUST_LOG={val}"));
     }
 
+    // Pass host terminal dimensions to guest for correct line wrapping.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
+            && ws.ws_col > 0
+            && ws.ws_row > 0
+        {
+            cmdline.push_str(&format!(
+                " KTSTR_COLS={} KTSTR_ROWS={}",
+                ws.ws_col, ws.ws_row
+            ));
+        }
+    }
+
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&payload)
