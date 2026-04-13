@@ -598,7 +598,8 @@ pub(crate) struct MemoryBudget {
     /// kernel (init sections and workspace are freed post-boot),
     /// absorbing percpu and misc boot allocations.
     pub kernel_init_size: u64,
-    /// SHM region carved from the top of guest memory (E820 gap).
+    /// SHM region carved from the top of guest memory (E820 gap on
+    /// x86_64, reduced FDT memory node on aarch64).
     pub shm_bytes: u64,
 }
 
@@ -742,8 +743,8 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 ///
 /// ## SHM region
 ///
-/// Carved from the top of guest physical memory via an E820 reserved
-/// gap. Not part of usable RAM, added directly.
+/// Carved from the top of guest physical memory. Not part of usable
+/// RAM (E820 gap on x86_64, reduced FDT memory node on aarch64).
 ///
 /// ```text
 /// total = boot_requirement + 256 + shm
@@ -2363,7 +2364,7 @@ impl KtstrVm {
                 .map(|host_base| {
                     let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
                     let mem = monitor::reader::GuestMem::new(host_base, mem_size);
-                    let shm_base = DRAM_BASE + mem_size - self.shm_size;
+                    let shm_base = mem_size - self.shm_size;
                     (mem, shm_base)
                 })
         } else {
@@ -2578,7 +2579,7 @@ impl KtstrVm {
         let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
         let shm_base_pa = if self.shm_size > 0 {
-            Some(DRAM_BASE + mem_size - self.shm_size)
+            Some(mem_size - self.shm_size)
         } else {
             None
         };
@@ -2875,21 +2876,13 @@ impl KtstrVm {
 
             match bsp.run() {
                 Ok(mut exit) => {
-                    // HLT is role-dependent: aarch64 BSP = shutdown,
-                    // x86_64 BSP = check kill + continue.
+                    // HLT/WFI = kernel idle. Check kill flag, then continue.
+                    // arm64 shutdown is PSCI reset (SystemEvent), not HLT.
                     if matches!(exit, VcpuExit::Hlt) {
-                        #[cfg(target_arch = "aarch64")]
-                        {
-                            exit_code = 0;
+                        if kill.load(Ordering::Acquire) {
                             break;
                         }
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            if kill.load(Ordering::Acquire) {
-                                break;
-                            }
-                            continue;
-                        }
+                        continue;
                     }
                     match classify_exit(com1, com2, virtio_con.map(|a| a.as_ref()), &mut exit) {
                         Some(ExitAction::Continue) | None => {}
@@ -3206,7 +3199,7 @@ impl KtstrVm {
             "console=ttyS0 ",
             "nomodules mitigations=off ",
             "random.trust_cpu=on swiotlb=noforce ",
-            "pci=off panic=-1 nokaslr lockdown=none ",
+            "pci=off panic=-1 iomem=relaxed nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
             "kfence.sample_interval=0",

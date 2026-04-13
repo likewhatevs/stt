@@ -1,6 +1,6 @@
 //! Guest physical memory access and monitor sampling loop.
 //!
-//! [`GuestMem`] wraps a host pointer to guest physical address 0 and
+//! [`GuestMem`] wraps a host pointer to the start of guest DRAM and
 //! provides bounds-checked volatile reads and writes for scalar types;
 //! `read_bytes` uses `copy_nonoverlapping` for bulk copies. It also implements
 //! 4-level and 5-level x86-64 page table walks and 3-level aarch64 walks
@@ -20,7 +20,8 @@ use super::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Host pointer to guest physical address 0. Guest PA `n` is at `host_base + n`.
+/// Host pointer to the start of guest DRAM. Offsets passed to read/write
+/// methods are DRAM-relative (x86_64: GPA 0, aarch64: GPA DRAM_START).
 ///
 /// SAFETY: The pointer is valid for the lifetime of the KVM VM (GuestMemoryMmap
 /// owns the mmap and outlives all threads).
@@ -37,12 +38,12 @@ impl GuestMem {
         Self { base, size }
     }
 
-    /// Raw pointer to guest physical address 0.
+    /// Raw pointer to the start of guest DRAM.
     pub fn base_ptr(&self) -> *const u8 {
         self.base
     }
 
-    /// Read a u32 at guest physical address `pa + offset`.
+    /// Read a u32 at DRAM offset `pa + offset`.
     pub fn read_u32(&self, pa: u64, offset: usize) -> u32 {
         let addr = pa + offset as u64;
         if addr + 4 > self.size {
@@ -51,7 +52,7 @@ impl GuestMem {
         unsafe { std::ptr::read_volatile(self.base.add(addr as usize) as *const u32) }
     }
 
-    /// Read a u64 at guest physical address `pa + offset`.
+    /// Read a u64 at DRAM offset `pa + offset`.
     pub fn read_u64(&self, pa: u64, offset: usize) -> u64 {
         let addr = pa + offset as u64;
         if addr + 8 > self.size {
@@ -60,12 +61,12 @@ impl GuestMem {
         unsafe { std::ptr::read_volatile(self.base.add(addr as usize) as *const u64) }
     }
 
-    /// Read an i64 at guest physical address `pa + offset`.
+    /// Read an i64 at DRAM offset `pa + offset`.
     pub fn read_i64(&self, pa: u64, offset: usize) -> i64 {
         self.read_u64(pa, offset) as i64
     }
 
-    /// Write a u8 at guest physical address `pa + offset`.
+    /// Write a u8 at DRAM offset `pa + offset`.
     pub fn write_u8(&self, pa: u64, offset: usize, val: u8) {
         let addr = pa + offset as u64;
         if addr + 1 > self.size {
@@ -74,7 +75,7 @@ impl GuestMem {
         unsafe { std::ptr::write_volatile(self.base.add(addr as usize), val) }
     }
 
-    /// Write a u64 at guest physical address `pa + offset`.
+    /// Write a u64 at DRAM offset `pa + offset`.
     pub fn write_u64(&self, pa: u64, offset: usize, val: u64) {
         let addr = pa + offset as u64;
         if addr + 8 > self.size {
@@ -83,7 +84,7 @@ impl GuestMem {
         unsafe { std::ptr::write_volatile(self.base.add(addr as usize) as *mut u64, val) }
     }
 
-    /// Read a u8 at guest physical address `pa + offset`.
+    /// Read a u8 at DRAM offset `pa + offset`.
     pub fn read_u8(&self, pa: u64, offset: usize) -> u8 {
         let addr = pa + offset as u64;
         if addr + 1 > self.size {
@@ -92,7 +93,7 @@ impl GuestMem {
         unsafe { std::ptr::read_volatile(self.base.add(addr as usize)) }
     }
 
-    /// Read `len` bytes from guest physical address `pa` into `buf`.
+    /// Read `len` bytes from DRAM offset `pa` into `buf`.
     /// Returns the number of bytes actually read (may be less than `len`
     /// if the read would go past the end of guest memory).
     pub fn read_bytes(&self, pa: u64, buf: &mut [u8]) -> usize {
@@ -107,7 +108,7 @@ impl GuestMem {
         avail
     }
 
-    /// Write a u32 at guest physical address `pa + offset`.
+    /// Write a u32 at DRAM offset `pa + offset`.
     pub fn write_u32(&self, pa: u64, offset: usize, val: u32) {
         let addr = pa + offset as u64;
         if addr + 4 > self.size {

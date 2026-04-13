@@ -19,9 +19,9 @@ let result = vmm::KtstrVm::builder()
 ## Topology
 
 The VM topology is specified as `(sockets, cores_per_socket,
-threads_per_core)`. The VMM creates the appropriate ACPI tables
-(MADT, SRAT) and MP tables so the guest kernel sees the specified
-topology.
+threads_per_core)`. On x86_64, the VMM creates ACPI tables (MADT,
+SRAT) and MP tables. On aarch64, topology is expressed via FDT cpu
+nodes with MPIDR-derived `reg` properties.
 
 ```rust,ignore
 pub struct Topology {
@@ -56,9 +56,8 @@ SHM is unavailable.
 
 **SHM ring buffer** -- the primary guest-to-host data channel. A shared
 memory ring buffer carries test results (`MSG_TYPE_TEST_RESULT`), exit
-codes (`MSG_TYPE_EXIT`), profraw data (`MSG_TYPE_PROFRAW`), and stimulus
-events (`MSG_TYPE_STIMULUS`). Each entry has a CRC32 for integrity
-checking.
+codes (`MSG_TYPE_EXIT`), and stimulus events (`MSG_TYPE_STIMULUS`).
+Each entry has a CRC32 for integrity checking.
 
 ## Performance mode
 
@@ -101,7 +100,7 @@ that built it.
 
 ## Boot process
 
-1. Load bzImage kernel via `linux-loader`.
+1. Load kernel (bzImage on x86_64, Image on aarch64) via `linux-loader`.
 2. Set up KVM vCPUs with the specified topology.
 3. Build and load initramfs.
 4. Set up serial devices (COM1 for console, COM2 for results).

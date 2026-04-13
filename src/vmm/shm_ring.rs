@@ -8,10 +8,10 @@
 /// Memory layout:
 ///   [ShmRingHeader (40 bytes)] [data (capacity bytes)]
 ///
-/// The SHM region is an E820 gap — no E820 entry covers it, so the kernel
-/// never touches it. The guest init binary discovers the region via
-/// KTSTR_SHM_BASE and KTSTR_SHM_SIZE environment variables on the kernel
-/// command line.
+/// The SHM region is excluded from usable RAM: on x86_64 via an E820 gap
+/// (no E820 entry covers it), on aarch64 via a reduced FDT memory node
+/// size. The guest init binary discovers the region via KTSTR_SHM_BASE
+/// and KTSTR_SHM_SIZE environment variables on the kernel command line.
 use zerocopy::IntoBytes;
 
 /// Result of a successful `/dev/mem` mmap of the SHM region.
