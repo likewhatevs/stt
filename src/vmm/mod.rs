@@ -1439,12 +1439,10 @@ impl KtstrVm {
                         break;
                     }
                 }
-                // Final drain after kill.
-                let data = vc_for_stdout.lock().drain_output();
-                if !data.is_empty() {
-                    let _ = stdout.write_all(&data);
-                    let _ = stdout.flush();
-                }
+                // Skip final drain — on forced kill (Ctrl+A X), the VM
+                // was terminated mid-operation and remaining TX data is
+                // likely partial/garbled. On clean exit, the guest
+                // flushed before shutting down so there's nothing left.
             })
             .context("spawn stdout writer thread")?;
 
