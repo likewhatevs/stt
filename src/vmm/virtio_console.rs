@@ -185,6 +185,10 @@ impl VirtioConsole {
             let _ = q.add_used(mem, head, 0);
         }
         if had_data {
+            tracing::debug!(
+                bytes = self.tx_buf.len(),
+                "virtio-console process_tx: data received"
+            );
             self.signal_used();
             let _ = self.tx_evt.write(1);
         }
@@ -208,6 +212,7 @@ impl VirtioConsole {
     /// delivered (RX queue exhausted) is stored in `pending_rx` and
     /// drained when the guest provides new buffers (RX queue notify).
     pub fn queue_input(&mut self, data: &[u8]) {
+        tracing::debug!(bytes = data.len(), "virtio-console queue_input");
         self.pending_rx.extend(data);
         self.drain_pending_rx();
     }
@@ -220,9 +225,19 @@ impl VirtioConsole {
         }
         let mem = match self.mem.as_ref() {
             Some(m) => m,
-            None => return,
+            None => {
+                tracing::debug!(
+                    pending = self.pending_rx.len(),
+                    "virtio-console drain_pending_rx: no mem"
+                );
+                return;
+            }
         };
         if !self.queues[RXQ].ready() {
+            tracing::debug!(
+                pending = self.pending_rx.len(),
+                "virtio-console drain_pending_rx: RX queue not ready"
+            );
             return;
         }
         let q = &mut self.queues[RXQ];
@@ -255,6 +270,11 @@ impl VirtioConsole {
             let _ = q.add_used(mem, head, written);
         }
         if total_written > 0 {
+            tracing::debug!(
+                delivered = total_written,
+                pending = self.pending_rx.len(),
+                "virtio-console drain_pending_rx: delivered to guest",
+            );
             self.signal_used();
         }
     }
@@ -299,6 +319,7 @@ impl VirtioConsole {
             VIRTIO_MMIO_CONFIG_GENERATION => self.config_generation,
             _ => 0,
         };
+        tracing::debug!(offset, val, "virtio-console mmio_read");
         data.copy_from_slice(&val.to_le_bytes());
     }
 
@@ -308,6 +329,7 @@ impl VirtioConsole {
             return;
         }
         let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        tracing::debug!(offset, val, "virtio-console mmio_write");
         match offset as u32 {
             VIRTIO_MMIO_DEVICE_FEATURES_SEL => self.device_features_sel = val,
             VIRTIO_MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = val,
@@ -399,8 +421,14 @@ impl VirtioConsole {
     /// The driver must not clear bits. Each phase requires the previous
     /// phase's bits to be set. Invalid transitions are ignored.
     fn set_status(&mut self, val: u32) {
+        let old = self.device_status;
         // Driver must not clear bits (except via reset, which writes 0).
         if val & self.device_status != self.device_status {
+            tracing::debug!(
+                old,
+                val,
+                "virtio-console set_status: rejected (clears bits)"
+            );
             return;
         }
         let new_bits = val & !self.device_status;
@@ -413,6 +441,13 @@ impl VirtioConsole {
         };
         if valid {
             self.device_status = val;
+            tracing::debug!(old, new = val, "virtio-console set_status: accepted");
+        } else {
+            tracing::debug!(
+                old,
+                val,
+                "virtio-console set_status: rejected (invalid transition)"
+            );
         }
     }
 
