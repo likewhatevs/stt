@@ -427,12 +427,10 @@ fn spawn_shell_with_pty() {
         }
     }
 
-    // Clean exit message after the proxy stops and shell is reaped.
-    // Flush stdout before printing so the message appears on a fresh
-    // line after whatever the shell last wrote.
-    let _ = std::io::stdout().flush();
-    println!("\nConnection to VM closed.");
-    let _ = std::io::stdout().flush();
+    // No guest-side exit message — the host prints "Connection to VM
+    // closed." after the VM shuts down. Printing here too would
+    // duplicate it, and writing to COM2 in raw mode after PTY teardown
+    // leaks garbage bytes.
 }
 
 /// Proxy data between COM2 serial (fd 0/1) and a PTY master fd.
