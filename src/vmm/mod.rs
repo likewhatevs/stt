@@ -3206,7 +3206,7 @@ impl KtstrVm {
             "console=ttyS0 ",
             "nomodules mitigations=off ",
             "random.trust_cpu=on swiotlb=noforce ",
-            "panic=-1 nokaslr lockdown=none ",
+            "pci=off panic=-1 nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
             "kfence.sample_interval=0",

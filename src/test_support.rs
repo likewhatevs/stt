@@ -1369,9 +1369,31 @@ fn run_ktstr_test_inner(
             builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }
 
-    let vm = builder.build().context("build ktstr_test VM")?;
+    // Catch ResourceContention before .context() wraps it —
+    // downcast_ref only checks the outermost error type, so
+    // .context() would hide ResourceContention from the skip
+    // logic in result_to_exit_code.
+    let vm = match builder.build() {
+        Ok(vm) => vm,
+        Err(e)
+            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+                .is_some() =>
+        {
+            return Err(e);
+        }
+        Err(e) => return Err(e.context("build ktstr_test VM")),
+    };
 
-    let result = vm.run().context("run ktstr_test VM")?;
+    let result = match vm.run() {
+        Ok(r) => r,
+        Err(e)
+            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+                .is_some() =>
+        {
+            return Err(e);
+        }
+        Err(e) => return Err(e.context("run ktstr_test VM")),
+    };
 
     // Drop the VM to release CPU/LLC flock fds before auto-repro.
     drop(vm);
