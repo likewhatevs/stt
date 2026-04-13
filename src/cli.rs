@@ -216,22 +216,31 @@ pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
 
 /// Merge the kconfig fragment into the kernel's .config.
 ///
-/// Creates a default .config via `make defconfig` if none exists,
-/// then appends the fragment. kconfig uses last-value-wins semantics
-/// for duplicate symbols (confdata.c:conf_read_simple), so appending
-/// is idempotent. The kernel build system runs syncconfig implicitly
-/// when .config is newer than include/config/auto.conf, resolving
-/// dependencies without an explicit `make olddefconfig`.
+/// Creates a default .config via `make defconfig` if none exists.
+/// Uses a hash marker (`# ktstr-kconfig:{hash}`) at the end of
+/// .config to skip the append when the fragment is already applied.
+/// This preserves .config mtime so `make -q` returns 0 on repeat
+/// invocations with no changes.
 pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
     let config_path = kernel_dir.join(".config");
     if !config_path.exists() {
         run_make(kernel_dir, &["defconfig"])?;
     }
 
+    let hash = format!("{:08x}", crc32fast::hash(fragment.as_bytes()));
+    let marker = format!("# ktstr-kconfig:{hash}");
+
+    // Check if the fragment is already applied.
+    let config_content = std::fs::read_to_string(&config_path)?;
+    if config_content.contains(&marker) {
+        return Ok(());
+    }
+
     let mut config = std::fs::OpenOptions::new()
         .append(true)
         .open(&config_path)?;
     std::io::Write::write_all(&mut config, fragment.as_bytes())?;
+    std::io::Write::write_all(&mut config, format!("\n{marker}\n").as_bytes())?;
 
     Ok(())
 }
