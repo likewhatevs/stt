@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::btf::{BtfFunc, STRUCT_FIELDS};
+use super::btf::{BtfFunc, RenderHint, STRUCT_FIELDS};
 use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
@@ -135,7 +135,7 @@ fn populate_field_specs(meta: &mut types::func_meta, field_specs: &[super::btf::
 ///
 /// Processes at most 6 params (fentry/kprobe register limit) and
 /// at most 16 fields total (matching `MAX_FIELDS` in intf.h).
-fn build_field_keys(btf_func: &BtfFunc) -> Vec<String> {
+fn build_field_keys(btf_func: &BtfFunc) -> Vec<(String, RenderHint)> {
     let mut keys = Vec::new();
     let mut field_idx: u32 = 0;
 
@@ -144,7 +144,9 @@ fn build_field_keys(btf_func: &BtfFunc) -> Vec<String> {
         if let Some(ref sname) = param.struct_name {
             if let Some((_, fields)) = STRUCT_FIELDS.iter().find(|(s, _)| *s == sname) {
                 for (_, key) in *fields {
-                    keys.push(format!("{}:{}.{}", param.name, sname, key));
+                    // Known struct fields use dedicated decoders in
+                    // decode.rs — hint is irrelevant (Default/Hex).
+                    keys.push((format!("{}:{}.{}", param.name, sname, key), RenderHint::Hex));
                     field_idx += 1;
                     if field_idx >= 16 {
                         break;
@@ -153,15 +155,18 @@ fn build_field_keys(btf_func: &BtfFunc) -> Vec<String> {
             }
         } else if !param.auto_fields.is_empty() {
             let tname = param.type_name.as_deref().unwrap_or("void");
-            for (fname, _) in &param.auto_fields {
-                keys.push(format!("{}:{}.{}", param.name, tname, fname));
+            for (fname, _, hint) in &param.auto_fields {
+                keys.push((format!("{}:{}.{}", param.name, tname, fname), *hint));
                 field_idx += 1;
                 if field_idx >= 16 {
                     break;
                 }
             }
         } else if !param.is_ptr {
-            keys.push(format!("{}:val.{}", param.name, param.name));
+            keys.push((
+                format!("{}:val.{}", param.name, param.name),
+                RenderHint::Hex,
+            ));
             field_idx += 1;
         }
     }
@@ -1000,7 +1005,7 @@ pub fn run_probe_skeleton(
                         continue;
                     }
 
-                    let field_names: Vec<String> = btf_funcs
+                    let field_keys_hints: Vec<(String, RenderHint)> = btf_funcs
                         .iter()
                         .find(|f| f.name == display_name)
                         .map(build_field_keys)
@@ -1010,7 +1015,9 @@ pub fn run_probe_skeleton(
                     let fields: Vec<(String, u64)> = entry.fields[..nr]
                         .iter()
                         .enumerate()
-                        .filter_map(|(i, &val)| field_names.get(i).map(|k| (k.clone(), val)))
+                        .filter_map(|(i, &val)| {
+                            field_keys_hints.get(i).map(|(k, _)| (k.clone(), val))
+                        })
                         .collect();
 
                     let str_val = if entry.has_str != 0 {
@@ -1029,7 +1036,9 @@ pub fn run_probe_skeleton(
                         let ef: Vec<(String, u64)> = entry.exit_fields[..nr_exit]
                             .iter()
                             .enumerate()
-                            .filter_map(|(i, &val)| field_names.get(i).map(|k| (k.clone(), val)))
+                            .filter_map(|(i, &val)| {
+                                field_keys_hints.get(i).map(|(k, _)| (k.clone(), val))
+                            })
                             .collect();
                         (ef, Some(entry.exit_ts))
                     } else {
@@ -1162,9 +1171,9 @@ mod tests {
         let keys = build_field_keys(&func);
         assert!(
             keys.iter()
-                .any(|k| k.contains("task_struct") && k.contains("pid"))
+                .any(|(k, _)| k.contains("task_struct") && k.contains("pid"))
         );
-        assert!(keys.iter().any(|k| k.contains("dsq_id")));
+        assert!(keys.iter().any(|(k, _)| k.contains("dsq_id")));
     }
 
     #[test]
@@ -1180,7 +1189,7 @@ mod tests {
             ..Default::default()
         };
         let keys = build_field_keys(&func);
-        assert!(keys.iter().any(|k| k.contains("flags:val.flags")));
+        assert!(keys.iter().any(|(k, _)| k.contains("flags:val.flags")));
     }
 
     #[test]
@@ -1337,8 +1346,8 @@ mod tests {
                 struct_name: None,
                 is_ptr: true,
                 auto_fields: vec![
-                    ("field_a".into(), "->field_a".into()),
-                    ("field_b".into(), "->field_b".into()),
+                    ("field_a".into(), "->field_a".into(), RenderHint::Bool),
+                    ("field_b".into(), "->field_b".into(), RenderHint::Signed),
                 ],
                 type_name: Some("task_ctx".into()),
                 ..Default::default()
@@ -1347,9 +1356,11 @@ mod tests {
         };
         let keys = build_field_keys(&func);
         assert_eq!(keys.len(), 2);
-        assert!(keys[0].contains("task_ctx"));
-        assert!(keys[0].contains("field_a"));
-        assert!(keys[1].contains("field_b"));
+        assert!(keys[0].0.contains("task_ctx"));
+        assert!(keys[0].0.contains("field_a"));
+        assert_eq!(keys[0].1, RenderHint::Bool);
+        assert!(keys[1].0.contains("field_b"));
+        assert_eq!(keys[1].1, RenderHint::Signed);
     }
 
     // -- build_field_keys with cpumask fields --
@@ -1368,11 +1379,11 @@ mod tests {
         };
         let keys = build_field_keys(&func);
         assert!(
-            keys.iter().any(|k| k.contains("cpumask_0")),
+            keys.iter().any(|(k, _)| k.contains("cpumask_0")),
             "should have cpumask_0: {keys:?}",
         );
         assert!(
-            keys.iter().any(|k| k.contains("cpumask_3")),
+            keys.iter().any(|(k, _)| k.contains("cpumask_3")),
             "should have cpumask_3: {keys:?}",
         );
     }
@@ -1395,7 +1406,7 @@ mod tests {
         let keys = build_field_keys(&func);
         // Only first 6 params processed
         assert!(keys.len() <= 6);
-        assert!(keys.iter().any(|k| k.contains("p5")));
-        assert!(!keys.iter().any(|k| k.contains("p6")));
+        assert!(keys.iter().any(|(k, _)| k.contains("p5")));
+        assert!(!keys.iter().any(|(k, _)| k.contains("p6")));
     }
 }

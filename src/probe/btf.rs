@@ -1,5 +1,24 @@
 use super::stack::StackFunction;
 
+/// Display hint derived from BTF type information.
+///
+/// Controls how auto-discovered field values are formatted in probe
+/// output. Known struct fields (in [`STRUCT_FIELDS`]) use dedicated
+/// decoders in `decode.rs`; this hint only applies to auto-discovered
+/// fields where the default would otherwise be hex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RenderHint {
+    /// Unsigned decimal (u32 sizes, counters).
+    Decimal,
+    /// Hexadecimal (u64 values, pointers, bitmasks).
+    #[default]
+    Hex,
+    /// Boolean (1-byte int with is_bool set in BTF).
+    Bool,
+    /// Signed decimal (signed integers).
+    Signed,
+}
+
 /// BTF-resolved parameter metadata for a probed function.
 ///
 /// Each param maps to one register (fentry/kprobe). Struct pointer
@@ -15,8 +34,8 @@ pub struct BtfParam {
     pub is_string_ptr: bool,
     /// Auto-discovered fields from vmlinux or BPF program BTF for
     /// struct pointer types not in STRUCT_FIELDS.
-    /// Vec of (field_name, access_pattern).
-    pub auto_fields: Vec<(String, String)>,
+    /// Vec of (field_name, access_pattern, render_hint).
+    pub auto_fields: Vec<(String, String, RenderHint)>,
     /// Type name for auto-discovered structs (used in output headers).
     pub type_name: Option<String>,
 }
@@ -215,7 +234,7 @@ pub fn resolve_field_specs(btf_func: &BtfFunc, vmlinux_path: Option<&str>) -> Ve
                 );
             }
 
-            for (_fname, access) in &param.auto_fields {
+            for (_fname, access, _hint) in &param.auto_fields {
                 if field_idx >= 16 {
                     break;
                 }
@@ -1169,7 +1188,7 @@ pub fn resolve_bpf_field_specs(btf_func: &BtfFunc, prog_id: u32) -> Vec<FieldSpe
                 }
             };
 
-            for (_fname, access) in &param.auto_fields {
+            for (_fname, access, _hint) in &param.auto_fields {
                 let access = access.trim_start_matches("->");
                 // Simple single-level field access.
                 if !access.contains("->") {
@@ -1345,7 +1364,7 @@ fn resolve_bpf_member_size(
 fn discover_bpf_struct_fields(
     btf: &libbpf_rs::btf::Btf<'_>,
     type_id: libbpf_rs::btf::TypeId,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, RenderHint)> {
     use libbpf_rs::btf::{BtfKind, BtfType};
 
     let t = match btf.type_by_id::<BtfType<'_>>(type_id) {
@@ -1383,8 +1402,22 @@ fn discover_bpf_struct_fields(
         };
 
         match member_type.kind() {
-            BtfKind::Int | BtfKind::Enum | BtfKind::Enum64 => {
-                fields.push((fname.clone(), format!("->{fname}")));
+            BtfKind::Int => {
+                let hint = if let Ok(int_ty) =
+                    TryInto::<libbpf_rs::btf::types::Int<'_>>::try_into(member_type)
+                {
+                    match int_ty.encoding {
+                        libbpf_rs::btf::types::IntEncoding::Bool => RenderHint::Bool,
+                        libbpf_rs::btf::types::IntEncoding::Signed => RenderHint::Signed,
+                        _ => RenderHint::Hex,
+                    }
+                } else {
+                    RenderHint::Hex
+                };
+                fields.push((fname.clone(), format!("->{fname}"), hint));
+            }
+            BtfKind::Enum | BtfKind::Enum64 => {
+                fields.push((fname.clone(), format!("->{fname}"), RenderHint::Hex));
             }
             BtfKind::Ptr => {
                 let deref = member_type.next_type().map(|t| t.skip_mods_and_typedefs());
@@ -1394,10 +1427,18 @@ fn discover_bpf_struct_fields(
                     .and_then(|n| n.to_str());
                 match pointed_name {
                     Some("cpumask") => {
-                        fields.push((fname.clone(), format!("->{fname}->bits[0]")));
+                        fields.push((
+                            fname.clone(),
+                            format!("->{fname}->bits[0]"),
+                            RenderHint::Hex,
+                        ));
                     }
                     Some("bpf_cpumask") => {
-                        fields.push((fname.clone(), format!("->{fname}->cpumask.bits[0]")));
+                        fields.push((
+                            fname.clone(),
+                            format!("->{fname}->cpumask.bits[0]"),
+                            RenderHint::Hex,
+                        ));
                     }
                     _ => {} // skip unknown pointers
                 }
@@ -1411,7 +1452,10 @@ fn discover_bpf_struct_fields(
 /// Auto-discover struct fields from vmlinux BTF for types not in
 /// STRUCT_FIELDS. Walks members one level deep via btf_rs, emitting
 /// access patterns for scalar, enum, and cpumask pointer fields.
-fn discover_vmlinux_struct_fields(btf: &btf_rs::Btf, type_id: u32) -> Vec<(String, String)> {
+fn discover_vmlinux_struct_fields(
+    btf: &btf_rs::Btf,
+    type_id: u32,
+) -> Vec<(String, String, RenderHint)> {
     use btf_rs::{BtfType, Type};
 
     let t = match btf.resolve_type_by_id(type_id) {
@@ -1474,8 +1518,18 @@ fn discover_vmlinux_struct_fields(btf: &btf_rs::Btf, type_id: u32) -> Vec<(Strin
         }
 
         match &member_type {
-            Type::Int(_) | Type::Enum(_) | Type::Enum64(_) => {
-                fields.push((fname.clone(), format!("->{fname}")));
+            Type::Int(i) => {
+                let hint = if i.is_bool() {
+                    RenderHint::Bool
+                } else if i.is_signed() {
+                    RenderHint::Signed
+                } else {
+                    RenderHint::Hex
+                };
+                fields.push((fname.clone(), format!("->{fname}"), hint));
+            }
+            Type::Enum(_) | Type::Enum64(_) => {
+                fields.push((fname.clone(), format!("->{fname}"), RenderHint::Hex));
             }
             Type::Ptr(_) => {
                 // Follow pointer to check if it points to cpumask.
@@ -1505,7 +1559,11 @@ fn discover_vmlinux_struct_fields(btf: &btf_rs::Btf, type_id: u32) -> Vec<(Strin
                     };
                     match pointed_name.as_deref() {
                         Some("cpumask") | Some("cpumask_t") => {
-                            fields.push((fname.clone(), format!("->{fname}->bits[0]")));
+                            fields.push((
+                                fname.clone(),
+                                format!("->{fname}->bits[0]"),
+                                RenderHint::Hex,
+                            ));
                         }
                         _ => {} // skip unknown pointers
                     }

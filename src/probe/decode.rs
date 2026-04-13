@@ -136,9 +136,19 @@ pub(crate) fn format_raw_arg(val: u64) -> String {
 /// Dispatches to specialized decoders: `dsq_id` -> [`decode_dsq_id`],
 /// `cpus_ptr`/`cpumask*` -> [`decode_cpumask`], `enq_flags` ->
 /// [`decode_enq_flags`], `exit_kind` -> [`decode_exit_kind`],
-/// `scx_flags` -> task state/queue flags, etc. Unknown keys pass
-/// the value through unchanged.
+/// `scx_flags` -> task state/queue flags, etc. Unknown keys fall
+/// through to hint-based formatting (see [`RenderHint`](super::btf::RenderHint)).
 pub(crate) fn decode_named_value(struct_name: &str, key: &str, val: &str) -> String {
+    decode_named_value_hinted(struct_name, key, val, None)
+}
+
+/// Decode with an optional BTF-derived render hint for the default case.
+pub(crate) fn decode_named_value_hinted(
+    struct_name: &str,
+    key: &str,
+    val: &str,
+    hint: Option<super::btf::RenderHint>,
+) -> String {
     let as_u64 = || -> u64 {
         if let Some(hex) = val.strip_prefix("0x") {
             u64::from_str_radix(hex, 16).unwrap_or(0)
@@ -216,10 +226,22 @@ pub(crate) fn decode_named_value(struct_name: &str, key: &str, val: &str) -> Str
             format!("0x{v:x}({cpus})", cpus = decode_cpumask(v))
         }
         _ => {
-            // Undecoded numeric values display as hex.
             let v = as_u64();
             if val.starts_with("0x") || val.parse::<u64>().is_ok() {
-                format!("0x{v:x}")
+                match hint {
+                    Some(super::btf::RenderHint::Decimal) => format!("{v}"),
+                    Some(super::btf::RenderHint::Signed) => {
+                        format!("{}", v as i64)
+                    }
+                    Some(super::btf::RenderHint::Bool) => {
+                        if v != 0 {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        }
+                    }
+                    Some(super::btf::RenderHint::Hex) | None => format!("0x{v:x}"),
+                }
             } else {
                 val.to_string()
             }

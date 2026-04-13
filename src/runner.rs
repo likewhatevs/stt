@@ -156,6 +156,7 @@ impl Runner {
                 Vec<(u32, String)>,
                 std::collections::HashMap<String, String>,
                 std::collections::HashMap<String, Vec<(String, String)>>,
+                std::collections::HashMap<String, crate::probe::btf::RenderHint>,
             );
             let mut skeleton_handle: Option<SkeletonHandle> = if self.config.repro
                 && let Some(ref stack_input) = self.config.probe_stack
@@ -210,6 +211,7 @@ impl Runner {
                     let bpf_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
                     let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
                     let param_names = crate::probe::output::build_param_names(&btf_funcs);
+                    let render_hints = crate::probe::output::build_render_hints(&btf_funcs);
                     let stop_clone = probe_stop.clone();
                     let probes_ready =
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -226,7 +228,7 @@ impl Runner {
                     while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Some((handle, func_names, bpf_locs, param_names))
+                    Some((handle, func_names, bpf_locs, param_names, render_hints))
                 }
             } else {
                 None
@@ -238,7 +240,9 @@ impl Runner {
 
             // Stop probes and collect results.
             let probe_output =
-                if let Some((handle, func_names, bpf_locs, param_names)) = skeleton_handle.take() {
+                if let Some((handle, func_names, bpf_locs, param_names, render_hints)) =
+                    skeleton_handle.take()
+                {
                     probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     handle.join().ok().and_then(|(events, diag)| {
                         let mut out = String::new();
@@ -255,6 +259,7 @@ impl Runner {
                                 &bpf_locs,
                                 Some(self.topo.total_cpus() as u32),
                                 &param_names,
+                                &render_hints,
                             ));
                         }
                         if out.is_empty() { None } else { Some(out) }

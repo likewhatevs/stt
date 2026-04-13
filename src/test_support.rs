@@ -2051,6 +2051,7 @@ fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Option<String
         &payload.bpf_source_locs,
         payload.nr_cpus,
         &payload.param_names,
+        &payload.render_hints,
     ));
     Some(out)
 }
@@ -2355,7 +2356,9 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         // even after the scheduler crashes.
         let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
         let pnames = crate::probe::output::build_param_names(&btf_funcs);
+        let rhints = crate::probe::output::build_render_hints(&btf_funcs);
         let pnames_thread = pnames.clone();
+        let rhints_thread = rhints.clone();
         let stop = probe_stop.clone();
         let funcs = functions.clone();
         let fn_names = func_names.clone();
@@ -2377,6 +2380,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
                 &pd,
                 &diag,
                 &pnames_thread,
+                &rhints_thread,
             );
             output_done_thread.store(true, std::sync::atomic::Ordering::Release);
             (events, diag)
@@ -2389,7 +2393,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        Some((handle, func_names, pipe_diag, output_done, pnames))
+        Some((handle, func_names, pipe_diag, output_done, pnames, rhints))
     });
 
     // Build a minimal Ctx for the test function.
@@ -2470,6 +2474,7 @@ type ProbeHandle = (
     PipelineDiagnostics,
     std::sync::Arc<std::sync::atomic::AtomicBool>, // output_done
     std::collections::HashMap<String, Vec<(String, String)>>, // param_names
+    std::collections::HashMap<String, crate::probe::btf::RenderHint>, // render_hints
 );
 
 /// Pre-skeleton pipeline diagnostics captured during guest probe setup.
@@ -2505,6 +2510,10 @@ pub(crate) struct ProbePayload {
     /// print named args instead of arg0/arg1.
     #[serde(default)]
     pub param_names: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// BTF-derived render hints for auto-discovered fields.
+    /// Maps field key (e.g. `"ctx:task_ctx.data__sz"`) to display format.
+    #[serde(default)]
+    pub render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
 }
 
 /// Combined diagnostics for the probe payload.
@@ -2524,6 +2533,7 @@ fn emit_probe_payload(
     pipeline_diag: &PipelineDiagnostics,
     skeleton_diag: &crate::probe::process::ProbeDiagnostics,
     param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
+    render_hints: &std::collections::HashMap<String, crate::probe::btf::RenderHint>,
 ) {
     let source_loc_names: Vec<&str> = func_names.iter().map(|(_, name)| name.as_str()).collect();
     let bpf_syms = crate::probe::btf::discover_bpf_symbols(&source_loc_names);
@@ -2548,6 +2558,7 @@ fn emit_probe_payload(
         }),
         nr_cpus: crate::probe::output::get_nr_cpus(),
         param_names: param_names.clone(),
+        render_hints: render_hints.clone(),
     };
     println!("{PROBE_OUTPUT_START}");
     if let Ok(json) = serde_json::to_string(&payload) {
@@ -2564,7 +2575,8 @@ fn collect_and_print_probe_data(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<ProbeHandle>,
 ) {
-    let Some((handle, func_names, pipeline_diag, output_done, param_names)) = handle else {
+    let Some((handle, func_names, pipeline_diag, output_done, param_names, render_hints)) = handle
+    else {
         return;
     };
 
@@ -2588,6 +2600,7 @@ fn collect_and_print_probe_data(
             &pipeline_diag,
             &skeleton_diag,
             &param_names,
+            &render_hints,
         );
     }
 }
@@ -3828,6 +3841,7 @@ mod tests {
             diagnostics: None,
             nr_cpus: None,
             param_names: Default::default(),
+            render_hints: Default::default(),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let output = format!("noise\n{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}\nmore");
@@ -3898,6 +3912,7 @@ mod tests {
             diagnostics: None,
             nr_cpus: None,
             param_names: Default::default(),
+            render_hints: Default::default(),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");

@@ -1,4 +1,4 @@
-use super::decode::{decode_named_value, format_raw_arg};
+use super::decode::{decode_named_value, decode_named_value_hinted, format_raw_arg};
 
 /// Read nr_cpu_ids from sysfs. Returns the number of possible CPUs
 /// (upper bound of the "possible" range). Falls back to
@@ -161,6 +161,7 @@ pub fn format_probe_events(
         &std::collections::HashMap::new(),
         nr_cpus,
         &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
     )
 }
 
@@ -187,6 +188,7 @@ pub fn format_probe_events_with_bpf_locs(
     bpf_locs: &std::collections::HashMap<String, String>,
     nr_cpus: Option<u32>,
     param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
+    render_hints: &std::collections::HashMap<String, super::btf::RenderHint>,
 ) -> String {
     format_probe_events_inner(
         events,
@@ -195,6 +197,7 @@ pub fn format_probe_events_with_bpf_locs(
         bpf_locs,
         nr_cpus,
         param_names,
+        render_hints,
     )
 }
 
@@ -241,6 +244,43 @@ pub fn build_param_names(
     map
 }
 
+/// Build render hint map from BtfFunc slices.
+///
+/// Produces a flat map from field key (e.g. `"ctx:task_ctx.data__sz"`)
+/// to the [`RenderHint`](super::btf::RenderHint) derived from BTF
+/// type information. Used by [`format_probe_events_inner`] to override
+/// the hex default for auto-discovered fields.
+pub fn build_render_hints(
+    btf_funcs: &[super::btf::BtfFunc],
+) -> std::collections::HashMap<String, super::btf::RenderHint> {
+    use super::btf::{RenderHint, STRUCT_FIELDS};
+    let mut hints = std::collections::HashMap::new();
+    for func in btf_funcs {
+        let max_params = func.params.len().min(6);
+        for param in &func.params[..max_params] {
+            if let Some(ref sname) = param.struct_name {
+                // Known struct fields use dedicated decoders — no hint needed.
+                if let Some((_, fields)) = STRUCT_FIELDS.iter().find(|(s, _)| *s == sname) {
+                    for (_, key) in *fields {
+                        hints.insert(format!("{}:{}.{}", param.name, sname, key), RenderHint::Hex);
+                    }
+                }
+            } else if !param.auto_fields.is_empty() {
+                let tname = param.type_name.as_deref().unwrap_or("void");
+                for (fname, _, hint) in &param.auto_fields {
+                    hints.insert(format!("{}:{}.{}", param.name, tname, fname), *hint);
+                }
+            } else if !param.is_ptr {
+                hints.insert(
+                    format!("{}:val.{}", param.name, param.name),
+                    RenderHint::Hex,
+                );
+            }
+        }
+    }
+    hints
+}
+
 /// (group_label, vec of (field_name, entry_decoded, exit_decoded_or_none)).
 type FieldGroup = (String, Vec<(String, String, Option<String>)>);
 
@@ -274,6 +314,7 @@ fn format_probe_events_inner(
     bpf_locs: &std::collections::HashMap<String, String>,
     nr_cpus: Option<u32>,
     param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
+    render_hints: &std::collections::HashMap<String, super::btf::RenderHint>,
 ) -> String {
     use blazesym::symbolize::{self, Symbolizer};
 
@@ -384,7 +425,8 @@ fn format_probe_events_inner(
         .map(|(k, v)| {
             let sname = struct_from_key(k);
             let (_, field) = k.split_once('.').unwrap_or((k, k));
-            let decoded = super::decode::decode_named_value(sname, field, &v.to_string());
+            let hint = render_hints.get(k).copied();
+            let decoded = decode_named_value_hinted(sname, field, &v.to_string(), hint);
             6 + max_field_w + 2 + decoded.len()
         })
         .max()
@@ -506,18 +548,19 @@ fn format_probe_events_inner(
                     pname.to_string()
                 };
                 let sname = struct_from_key(key);
+                let hint = render_hints.get(key).copied();
                 let entry_decoded = if field == "cpumask_0" {
                     merged_cpumask_str.clone()
                 } else {
-                    decode_named_value(sname, field, &val.to_string())
+                    decode_named_value_hinted(sname, field, &val.to_string(), hint)
                 };
                 let exit_decoded = if has_exit {
                     if field == "cpumask_0" {
                         exit_cpumask_str.clone()
                     } else {
-                        exit_map
-                            .get(field)
-                            .map(|ev| decode_named_value(sname, field, &ev.to_string()))
+                        exit_map.get(field).map(|ev| {
+                            decode_named_value_hinted(sname, field, &ev.to_string(), hint)
+                        })
                     }
                 } else {
                     None
@@ -1092,6 +1135,7 @@ mod tests {
             None,
             &locs,
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
