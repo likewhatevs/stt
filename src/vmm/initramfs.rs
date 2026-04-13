@@ -902,9 +902,6 @@ pub fn create_initramfs_base(
         let data = std::fs::read(host_path).with_context(|| {
             format!("read shared lib '{}': {}", guest_path, host_path.display())
         })?;
-        if guest_path.contains("local") {
-            tracing::debug!(guest = guest_path, host = %host_path.display(), bytes = data.len(), "writing_custom_lib");
-        }
         write_entry(&mut archive, guest_path, &data, 0o100755)?;
     }
 
@@ -1286,57 +1283,6 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(chunk);
     }
     out
-}
-
-/// Compress `data` using the system `lz4 -l -c` command (reference C
-/// implementation). Debug-only path activated by `KTSTR_LZ4_CMD=1`.
-/// Panics if `lz4` is not installed or the command fails.
-pub(crate) fn lz4_cmd_compress(data: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("lz4")
-        .args(["-l", "-c"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("KTSTR_LZ4_CMD: failed to spawn lz4 — is it installed?");
-
-    let mut stdin = child.stdin.take().unwrap();
-    let data_owned = data.to_vec();
-    let writer = std::thread::spawn(move || {
-        stdin.write_all(&data_owned).expect("write to lz4 stdin");
-        drop(stdin);
-    });
-
-    let output = child.wait_with_output().expect("lz4 wait_with_output");
-    writer.join().expect("lz4 stdin writer thread");
-
-    assert!(
-        output.status.success(),
-        "KTSTR_LZ4_CMD: lz4 -l -c failed: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    tracing::debug!(
-        input = data.len(),
-        output = output.stdout.len(),
-        "lz4_cmd_compress",
-    );
-
-    output.stdout
-}
-
-/// Select the compression function based on `KTSTR_LZ4_CMD` env var.
-/// Returns `lz4_cmd_compress` when set, `lz4_legacy_compress` otherwise.
-pub(crate) fn lz4_compress(data: &[u8]) -> Vec<u8> {
-    if std::env::var_os("KTSTR_LZ4_CMD").is_some() {
-        tracing::info!("KTSTR_LZ4_CMD: using system lz4 -l for compression");
-        lz4_cmd_compress(data)
-    } else {
-        lz4_legacy_compress(data)
-    }
 }
 
 #[cfg(test)]

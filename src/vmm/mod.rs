@@ -1354,23 +1354,6 @@ impl KtstrVm {
             "build_suffix",
         );
 
-        // Debug: save uncompressed cpio archive for inspection.
-        if std::env::var_os("KTSTR_DUMP_INITRAMFS").is_some() {
-            let path = std::path::Path::new("/tmp/ktstr-debug-initramfs.cpio");
-            let mut full = Vec::with_capacity(uncompressed_size);
-            full.extend_from_slice(base_bytes);
-            full.extend_from_slice(&suffix);
-            if let Err(e) = std::fs::write(path, &full) {
-                tracing::warn!(%e, "failed to dump initramfs");
-            } else {
-                tracing::info!(
-                    path = %path.display(),
-                    bytes = full.len(),
-                    "dumped uncompressed initramfs"
-                );
-            }
-        }
-
         // Enforce minimum memory for initramfs extraction.
         // This path is only reached when memory_mb was set explicitly.
         let memory_mb = self.memory_mb.expect(
@@ -1388,21 +1371,14 @@ impl KtstrVm {
             );
         }
 
-        // KTSTR_NO_COMPRESS: skip LZ4, load raw cpio for debugging.
-        let no_compress = std::env::var_os("KTSTR_NO_COMPRESS").is_some();
-
-        if no_compress {
-            tracing::info!("KTSTR_NO_COMPRESS: loading raw uncompressed cpio");
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[base_bytes, &suffix], load_addr)?;
-            Ok((Some(load_addr), Some(uncompressed_size as u32)))
-        } else {
+        {
             // Compress base and suffix as separate LZ4 legacy streams. The
             // kernel initramfs decompressor handles concatenated LZ4 natively
             // (re-encountering the magic mid-stream resets the decoder).
             // Keeping them separate lets us COW-map the base from SHM.
             let t0 = Instant::now();
             let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-            let lz4_suffix = initramfs::lz4_compress(&suffix);
+            let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
             let total_compressed = lz4_base.len() + lz4_suffix.len();
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
@@ -1520,23 +1496,6 @@ impl KtstrVm {
             "build_suffix",
         );
 
-        // Debug: save uncompressed cpio archive for inspection.
-        if std::env::var_os("KTSTR_DUMP_INITRAMFS").is_some() {
-            let path = std::path::Path::new("/tmp/ktstr-debug-initramfs.cpio");
-            let mut full = Vec::with_capacity(uncompressed_size);
-            full.extend_from_slice(base_bytes);
-            full.extend_from_slice(&suffix);
-            if let Err(e) = std::fs::write(path, &full) {
-                tracing::warn!(%e, "failed to dump initramfs");
-            } else {
-                tracing::info!(
-                    path = %path.display(),
-                    bytes = full.len(),
-                    "dumped uncompressed initramfs"
-                );
-            }
-        }
-
         // Compute memory from actual initramfs size.
         let memory_mb = initramfs_min_memory_mb(uncompressed_size as u64, self.shm_size);
         tracing::debug!(
@@ -1549,18 +1508,11 @@ impl KtstrVm {
         vm.allocate_and_register_memory(memory_mb)
             .context("allocate deferred memory")?;
 
-        // KTSTR_NO_COMPRESS: skip LZ4, load raw cpio for debugging.
-        let no_compress = std::env::var_os("KTSTR_NO_COMPRESS").is_some();
-
-        if no_compress {
-            tracing::info!("KTSTR_NO_COMPRESS: loading raw uncompressed cpio");
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[base_bytes, &suffix], load_addr)?;
-            Ok((Some(load_addr), Some(uncompressed_size as u32), memory_mb))
-        } else {
+        {
             // Compress and load initramfs.
             let t0 = Instant::now();
             let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-            let lz4_suffix = initramfs::lz4_compress(&suffix);
+            let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
             let total_compressed = lz4_base.len() + lz4_suffix.len();
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
@@ -1689,7 +1641,7 @@ impl KtstrVm {
         }
 
         // Compress with LZ4 legacy format.
-        let gz = initramfs::lz4_compress(base_bytes);
+        let gz = initramfs::lz4_legacy_compress(base_bytes);
 
         if let Err(e) = initramfs::shm_store_gz(key.0, &gz) {
             tracing::warn!("shm_store_gz: {e:#}");
@@ -2757,23 +2709,6 @@ impl KtstrVm {
                 )?;
                 let uncompressed_size = base_bytes.len() + suffix.len();
 
-                // Debug: save uncompressed cpio archive for inspection.
-                if std::env::var_os("KTSTR_DUMP_INITRAMFS").is_some() {
-                    let path = std::path::Path::new("/tmp/ktstr-debug-initramfs.cpio");
-                    let mut full = Vec::with_capacity(uncompressed_size);
-                    full.extend_from_slice(base_bytes);
-                    full.extend_from_slice(&suffix);
-                    if let Err(e) = std::fs::write(path, &full) {
-                        tracing::warn!(%e, "failed to dump initramfs");
-                    } else {
-                        tracing::info!(
-                            path = %path.display(),
-                            bytes = full.len(),
-                            "dumped uncompressed initramfs"
-                        );
-                    }
-                }
-
                 let memory_mb = initramfs_min_memory_mb(uncompressed_size as u64, self.shm_size);
 
                 vm.allocate_and_register_memory(memory_mb)
@@ -2783,23 +2718,11 @@ impl KtstrVm {
                 let kr = boot::load_kernel(&vm.guest_mem, &self.kernel)
                     .context("load kernel (aarch64)")?;
 
-                // KTSTR_NO_COMPRESS: skip LZ4, load raw cpio for debugging.
-                let no_compress = std::env::var_os("KTSTR_NO_COMPRESS").is_some();
-                let (initrd_data, total_size) = if no_compress {
-                    tracing::info!("KTSTR_NO_COMPRESS: loading raw uncompressed cpio");
-                    let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
-                    full.extend_from_slice(base_bytes);
-                    full.extend_from_slice(&suffix);
-                    let sz = full.len() as u64;
-                    (full, sz)
-                } else {
-                    let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
-                    full.extend_from_slice(base_bytes);
-                    full.extend_from_slice(&suffix);
-                    let compressed = initramfs::lz4_compress(&full);
-                    let sz = compressed.len() as u64;
-                    (compressed, sz)
-                };
+                let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
+                full.extend_from_slice(base_bytes);
+                full.extend_from_slice(&suffix);
+                let initrd_data = initramfs::lz4_legacy_compress(&full);
+                let total_size = initrd_data.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
                 initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;
 
@@ -2841,13 +2764,7 @@ impl KtstrVm {
                 let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
                 full.extend_from_slice(base_bytes);
                 full.extend_from_slice(&suffix);
-                let no_compress = std::env::var_os("KTSTR_NO_COMPRESS").is_some();
-                let initrd_data = if no_compress {
-                    tracing::info!("KTSTR_NO_COMPRESS: loading raw uncompressed cpio");
-                    full
-                } else {
-                    initramfs::lz4_compress(&full)
-                };
+                let initrd_data = initramfs::lz4_legacy_compress(&full);
                 let total_size = initrd_data.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
                 initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;
