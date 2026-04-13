@@ -129,3 +129,52 @@ fn completions_invalid_shell() {
         .assert()
         .failure();
 }
+
+// -- shell flags in help --
+
+#[test]
+fn help_shell_shows_exec() {
+    cargo_ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exec"));
+}
+
+#[test]
+fn help_shell_shows_dmesg() {
+    cargo_ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dmesg"));
+}
+
+#[test]
+fn help_shell_shows_include_files() {
+    cargo_ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--include-files"));
+}
+
+// -- error cases --
+
+#[test]
+fn include_files_nonexistent_path() {
+    cargo_ktstr()
+        .args(["shell", "-i", "/nonexistent/path/to/file"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn shell_invalid_topology() {
+    cargo_ktstr()
+        .args(["shell", "--topology", "abc"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid topology"));
+}
