@@ -426,6 +426,13 @@ fn spawn_shell_with_pty() {
             eprintln!("ktstr-init: wait for shell: {e}");
         }
     }
+
+    // Clean exit message after the proxy stops and shell is reaped.
+    // Flush stdout before printing so the message appears on a fresh
+    // line after whatever the shell last wrote.
+    let _ = std::io::stdout().flush();
+    println!("\nConnection to VM closed.");
+    let _ = std::io::stdout().flush();
 }
 
 /// Proxy data between COM2 serial (fd 0/1) and a PTY master fd.
@@ -477,7 +484,14 @@ fn proxy_serial_pty(master: &OwnedFd, child_pid: u32) {
         }
 
         // PTY master -> serial output (shell output).
+        // Check POLLHUP/POLLERR before POLLIN: when the shell exits,
+        // both flags can arrive in the same poll iteration. Reading
+        // after the slave closes produces partial/garbage bytes from
+        // the PTY teardown (manifests as a raw U+FFFD on the terminal).
         if let Some(revents) = pollfds[1].revents() {
+            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+                break;
+            }
             if revents.contains(PollFlags::POLLIN) {
                 match nix::unistd::read(master_fd, &mut buf) {
                     Ok(0) => break,
@@ -487,9 +501,6 @@ fn proxy_serial_pty(master: &OwnedFd, child_pid: u32) {
                     Err(nix::errno::Errno::EINTR) => {}
                     Err(_) => break,
                 }
-            }
-            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-                break;
             }
         }
     }

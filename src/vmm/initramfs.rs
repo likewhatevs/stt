@@ -902,6 +902,9 @@ pub fn create_initramfs_base(
         let data = std::fs::read(host_path).with_context(|| {
             format!("read shared lib '{}': {}", guest_path, host_path.display())
         })?;
+        if guest_path.contains("local") {
+            tracing::debug!(guest = guest_path, host = %host_path.display(), bytes = data.len(), "writing_custom_lib");
+        }
         write_entry(&mut archive, guest_path, &data, 0o100755)?;
     }
 
