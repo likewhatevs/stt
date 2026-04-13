@@ -583,6 +583,11 @@ fn format_probe_events_inner(
         out.push('\n');
         for addr in &kstack_addrs {
             if let Some((_, name, file, line)) = sym_map.iter().find(|(a, _, _, _)| a == addr) {
+                // _end is the kernel image end marker — BPF JIT addresses
+                // resolve to it because they fall past the last real symbol.
+                if name == "_end" {
+                    continue;
+                }
                 if !file.is_empty() {
                     out.push_str(&format!("    {name:<40} {file}:{line}\n"));
                 } else {
