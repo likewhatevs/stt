@@ -1269,10 +1269,25 @@ impl KtstrVm {
             &ap_pins,
         )?;
 
-        // Stdin reader thread: host stdin -> virtio-console RX queue.
+        // BSP kick handles for the stdin escape sequence. The stdin thread
+        // needs to force the BSP out of KVM_RUN when Ctrl+A X is pressed.
+        let bsp_ie_for_stdin = if has_immediate_exit {
+            Some(ImmediateExitHandle::from_vcpu(&mut bsp))
+        } else {
+            None
+        };
+        let bsp_tid = unsafe { libc::pthread_self() };
+
+        // Stdin reader thread: host stdin -> both COM2 and virtio-console.
+        // Sends to both devices so the guest receives input regardless of
+        // which console it activated (COM2 fallback or virtio hvc0).
         // Uses poll() on both stdin and the wakeup pipe so the thread can
         // be cleanly joined on shutdown.
+        //
+        // Escape sequence: Ctrl+A X (0x01 followed by 'x' or 'X') triggers
+        // host-side VM teardown without guest cooperation.
         let vc_for_stdin = virtio_con.clone();
+        let com2_for_stdin = com2.clone();
         let kill_for_stdin = kill.clone();
         let stdin_thread = std::thread::Builder::new()
             .name("interactive-stdin".into())
@@ -1284,6 +1299,7 @@ impl KtstrVm {
                 let wakeup_fd = wakeup_r;
                 let stdin_fd = std::io::stdin().as_raw_fd();
                 let mut buf = [0u8; 64];
+                let mut saw_ctrl_a = false;
 
                 loop {
                     if kill_for_stdin.load(Ordering::Acquire) {
@@ -1322,7 +1338,54 @@ impl KtstrVm {
                         match stdin.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                vc_for_stdin.lock().queue_input(&buf[..n]);
+                                // Scan for Ctrl+A X escape sequence. Filter
+                                // escape bytes from the forwarded input so
+                                // neither the 0x01 nor 'x'/'X' reaches the
+                                // guest.
+                                let mut forward_start = 0usize;
+                                for i in 0..n {
+                                    if saw_ctrl_a {
+                                        saw_ctrl_a = false;
+                                        if buf[i] == b'x' || buf[i] == b'X' {
+                                            // Trigger host-side teardown. Bytes
+                                            // before the Ctrl+A were already
+                                            // flushed when saw_ctrl_a was set.
+                                            eprintln!("\r\nTerminated.");
+                                            kill_for_stdin.store(true, Ordering::Release);
+                                            if let Some(ref ie) = bsp_ie_for_stdin {
+                                                ie.set(1);
+                                                std::sync::atomic::fence(Ordering::Release);
+                                            }
+                                            unsafe {
+                                                libc::pthread_kill(bsp_tid, vcpu_signal());
+                                            }
+                                            return;
+                                        }
+                                        // Not 'x'/'X' after Ctrl+A: the 0x01
+                                        // was a real keystroke. Forward it now.
+                                        com2_for_stdin.lock().queue_input(&[0x01]);
+                                        vc_for_stdin.lock().queue_input(&[0x01]);
+                                        // Current byte is processed normally
+                                        // below (may itself be 0x01).
+                                    }
+                                    if buf[i] == 0x01 {
+                                        // Flush bytes before the Ctrl+A.
+                                        if forward_start < i {
+                                            com2_for_stdin
+                                                .lock()
+                                                .queue_input(&buf[forward_start..i]);
+                                            vc_for_stdin.lock().queue_input(&buf[forward_start..i]);
+                                        }
+                                        saw_ctrl_a = true;
+                                        forward_start = i + 1;
+                                        continue;
+                                    }
+                                }
+                                // Forward remaining bytes to both devices.
+                                if forward_start < n {
+                                    com2_for_stdin.lock().queue_input(&buf[forward_start..n]);
+                                    vc_for_stdin.lock().queue_input(&buf[forward_start..n]);
+                                }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             Err(_) => break,
@@ -1332,11 +1395,13 @@ impl KtstrVm {
             })
             .context("spawn stdin reader thread")?;
 
-        // Stdout writer thread: virtio-console TX -> host stdout.
-        // Polls tx_evt for zero-latency wakeup when guest writes data.
+        // Stdout writer thread: COM2 + virtio-console TX -> host stdout.
+        // Polls virtio tx_evt with a short timeout, then drains both
+        // devices. Whichever device the guest activated produces output.
         // On write errors (including BrokenPipe), sets kill flag and exits
         // to stop the VM rather than polling a dead pipe until timeout.
         let vc_for_stdout = virtio_con.clone();
+        let com2_for_stdout = com2.clone();
         let kill_for_stdout = kill.clone();
         let stdout_thread = std::thread::Builder::new()
             .name("interactive-stdout".into())
@@ -1355,7 +1420,9 @@ impl KtstrVm {
                     if kill_for_stdout.load(Ordering::Acquire) {
                         break;
                     }
-                    // SAFETY: tx_evt_raw_fd is valid for the Arc's lifetime.
+                    // Poll virtio tx_evt with 50ms timeout. On timeout,
+                    // still drain COM2 below so serial output is forwarded
+                    // even when virtio-console is inactive.
                     let borrowed =
                         unsafe { std::os::unix::io::BorrowedFd::borrow_raw(tx_evt_raw_fd) };
                     let mut fds = [nix::poll::PollFd::new(
@@ -1371,18 +1438,35 @@ impl KtstrVm {
                             let _ = vc_for_stdout.lock().tx_evt().read();
                         }
                     }
-                    let data = vc_for_stdout.lock().drain_output();
-                    if !data.is_empty()
-                        && (stdout.write_all(&data).is_err() || stdout.flush().is_err())
-                    {
+                    // Drain both devices. The guest uses whichever console
+                    // it probed successfully; we forward all output.
+                    let vc_out = vc_for_stdout.lock().drain_output();
+                    let com2_out = com2_for_stdout.lock().drain_output();
+                    let mut err = false;
+                    if !vc_out.is_empty() {
+                        err = stdout.write_all(&vc_out).is_err();
+                    }
+                    if !err && !com2_out.is_empty() {
+                        err = stdout.write_all(&com2_out).is_err();
+                    }
+                    if !err && (!vc_out.is_empty() || !com2_out.is_empty()) {
+                        err = stdout.flush().is_err();
+                    }
+                    if err {
                         kill_for_stdout.store(true, Ordering::Release);
                         break;
                     }
                 }
                 // Final drain after kill.
-                let data = vc_for_stdout.lock().drain_output();
-                if !data.is_empty() {
-                    let _ = stdout.write_all(&data);
+                let vc_out = vc_for_stdout.lock().drain_output();
+                let com2_out = com2_for_stdout.lock().drain_output();
+                if !vc_out.is_empty() {
+                    let _ = stdout.write_all(&vc_out);
+                }
+                if !com2_out.is_empty() {
+                    let _ = stdout.write_all(&com2_out);
+                }
+                if !vc_out.is_empty() || !com2_out.is_empty() {
                     let _ = stdout.flush();
                 }
             })
