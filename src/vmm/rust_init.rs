@@ -402,6 +402,7 @@ fn spawn_shell_with_pty() {
     let child = unsafe {
         Command::new("/bin/busybox")
             .arg("sh")
+            .env("PS1", "\x1b[2m^Ax=quit\x1b[0m \\w # ")
             .stdin(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
             .stdout(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
             .stderr(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
