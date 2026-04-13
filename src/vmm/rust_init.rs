@@ -9,12 +9,16 @@
 /// cmdline).
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::mount::{MsFlags, mount};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::pty::openpty;
 use nix::sys::reboot::{RebootMode, reboot};
 use nix::sys::stat::Mode;
 use nix::unistd::mkdir;
@@ -42,6 +46,8 @@ fn force_reboot() -> ! {
 /// (scheduler + dispatch + reboot) or drops into an interactive
 /// shell. Never returns.
 pub(crate) fn ktstr_guest_init() -> ! {
+    let t0 = std::time::Instant::now();
+
     // Panic hook: write crash diagnostic to COM2 then reboot.
     std::panic::set_hook(Box::new(|info| {
         let bt = std::backtrace::Backtrace::force_capture();
@@ -74,6 +80,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
     // Phase 1: Mounts.
     mount_filesystems();
+    let t_mounts = t0.elapsed();
 
     // Enable per-program BPF runtime stats (cnt, nsecs). The kernel
     // only populates bpf_prog_stats when bpf_stats_enabled_key is set.
@@ -82,6 +89,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 2: Sentinel + stdio redirect.
     write_com2("KTSTR_INIT_STARTED");
     redirect_stdio_to_com2();
+    let t_stdio = t0.elapsed();
 
     // Extract RUST_LOG from kernel cmdline before installing the
     // tracing subscriber so EnvFilter picks it up.
@@ -98,13 +106,21 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Install tracing subscriber so tracing calls in guest code produce
     // output on stderr (COM2). Without this, they are silently dropped.
     // EnvFilter respects RUST_LOG when set.
+    let t_pre_subscriber = t0.elapsed();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    let t_subscriber = t0.elapsed();
 
-    tracing::debug!("tracing subscriber initialized, mounts completed");
+    tracing::debug!(
+        mount_ms = t_mounts.as_millis() as u64,
+        stdio_ms = t_stdio.as_millis() as u64,
+        pre_subscriber_ms = t_pre_subscriber.as_millis() as u64,
+        subscriber_ms = t_subscriber.as_millis() as u64,
+        "guest_init_timing",
+    );
 
     // Set environment variables.
     // SAFETY: single-threaded context — PID 1 before any threads spawn.
@@ -126,7 +142,10 @@ pub(crate) fn ktstr_guest_init() -> ! {
                 .status();
         }
 
-        // MOTD.
+        // Mount devpts so PTY allocation works.
+        mount_devpts();
+
+        // MOTD (printed to COM2 before PTY proxy takes over).
         let kernel_version = fs::read_to_string("/proc/version")
             .ok()
             .and_then(|v| v.split_whitespace().nth(2).map(|s| s.to_string()))
@@ -137,22 +156,14 @@ pub(crate) fn ktstr_guest_init() -> ! {
         print_includes_line();
         println!("  tools:     busybox (ls, ps, top, dmesg, ip, vi, ...)");
         println!("  mounts:    /proc /sys /dev /sys/fs/cgroup /sys/fs/bpf /tmp");
-        println!("             /sys/kernel/debug /sys/kernel/tracing");
+        println!("             /sys/kernel/debug /sys/kernel/tracing /dev/pts");
         println!("  type `exit` for clean shutdown");
         let _ = std::io::stdout().flush();
 
-        // Spawn sh as child (not exec) so PID 1 can clean up.
-        tracing::debug!("spawning interactive shell");
-        let status = Command::new("/bin/busybox")
-            .arg("sh")
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status();
-
-        if let Err(e) = status {
-            eprintln!("ktstr-init: shell exited with error: {e}");
-        }
+        // Allocate a PTY pair so busybox sh gets a controlling terminal
+        // (required for job control: Ctrl+Z, bg, fg).
+        tracing::debug!("spawning interactive shell with PTY");
+        spawn_shell_with_pty();
 
         force_reboot();
     }
@@ -316,6 +327,160 @@ fn redirect_all_stdio_to_com2() {
         libc::dup2(fd, 0); // stdin
         libc::dup2(fd, 1); // stdout
         libc::dup2(fd, 2); // stderr
+    }
+}
+
+/// Mount devpts at /dev/pts for PTY allocation.
+///
+/// Required before `openpty()` — the C library opens `/dev/ptmx` and
+/// the slave device lives under `/dev/pts/N`.
+fn mount_devpts() {
+    mkdir_p("/dev/pts");
+    let result = mount(
+        Some("devpts"),
+        "/dev/pts",
+        Some("devpts"),
+        MsFlags::empty(),
+        None::<&str>,
+    );
+    if let Err(e) = result {
+        eprintln!("ktstr-init: mount devpts on /dev/pts: {e}");
+    }
+}
+
+/// Spawn busybox sh with a PTY as its controlling terminal.
+///
+/// Allocates a PTY pair via `openpty()`, spawns sh with the slave as
+/// stdin/stdout/stderr and `setsid` + `TIOCSCTTY` in `pre_exec` so sh
+/// gets a controlling terminal (job control). The parent proxies data
+/// between COM2 (fd 0/1) and the PTY master until the child exits.
+///
+/// SIGCHLD remains SIG_IGN (set earlier for zombie prevention), so
+/// waitpid returns ECHILD after the kernel auto-reaps the child.
+/// This is expected and suppressed.
+fn spawn_shell_with_pty() {
+    let pty = match openpty(None, None) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ktstr-init: openpty failed: {e}");
+            return;
+        }
+    };
+
+    let slave_fd = pty.slave.as_raw_fd();
+    let child = unsafe {
+        Command::new("/bin/busybox")
+            .arg("sh")
+            .stdin(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
+            .stdout(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
+            .stderr(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
+            .pre_exec(move || {
+                // Create a new session so sh becomes session leader.
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Acquire a controlling terminal.
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+    };
+
+    // Close slave in parent — the child has its own copies.
+    drop(pty.slave);
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ktstr-init: spawn shell: {e}");
+            return;
+        }
+    };
+
+    let child_pid = child.id();
+
+    // Proxy between COM2 (fd 0 for input, fd 1 for output) and PTY master.
+    proxy_serial_pty(&pty.master, child_pid);
+
+    // SIGCHLD is SIG_IGN so the kernel auto-reaps the child. waitpid
+    // returns ECHILD — expected, not an error.
+    match child.wait() {
+        Ok(status) => {
+            tracing::debug!(?status, "shell exited");
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {}
+        Err(e) => {
+            eprintln!("ktstr-init: wait for shell: {e}");
+        }
+    }
+}
+
+/// Proxy data between COM2 serial (fd 0/1) and a PTY master fd.
+///
+/// Uses poll(2) to multiplex reads from both fds. Exits when the PTY
+/// master returns EOF (child closed the slave side) or the child process
+/// no longer exists.
+fn proxy_serial_pty(master: &OwnedFd, child_pid: u32) {
+    let stdin_fd = unsafe { BorrowedFd::borrow_raw(0) };
+    let stdout_fd = unsafe { BorrowedFd::borrow_raw(1) };
+    let master_fd = master.as_fd();
+
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let mut pollfds = [
+            PollFd::new(stdin_fd, PollFlags::POLLIN),
+            PollFd::new(master_fd, PollFlags::POLLIN),
+        ];
+
+        match poll(&mut pollfds, PollTimeout::from(200u16)) {
+            Ok(0) => {
+                // Timeout — check if child is still alive.
+                if !Path::new(&format!("/proc/{child_pid}")).exists() {
+                    break;
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => break,
+        }
+
+        // Serial input -> PTY master (user typing).
+        if let Some(revents) = pollfds[0].revents() {
+            if revents.contains(PollFlags::POLLIN) {
+                match nix::unistd::read(stdin_fd, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = nix::unistd::write(master_fd, &buf[..n]);
+                    }
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(_) => break,
+                }
+            }
+            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+                break;
+            }
+        }
+
+        // PTY master -> serial output (shell output).
+        if let Some(revents) = pollfds[1].revents() {
+            if revents.contains(PollFlags::POLLIN) {
+                match nix::unistd::read(master_fd, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = nix::unistd::write(stdout_fd, &buf[..n]);
+                    }
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(_) => break,
+                }
+            }
+            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+                break;
+            }
+        }
     }
 }
 
