@@ -779,13 +779,17 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         );
     }
 
+    // Dirty detection first — warn the user upfront that the build
+    // won't be cached.
+    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let is_dirty = acquired.is_dirty;
+    if is_dirty {
+        warn("ktstr: dirty tree detected, build will not be cached");
+    }
+
     // Ensure kconfig fragment is applied (skips append if all
     // options already present in .config).
     configure_kernel(path, EMBEDDED_KCONFIG)?;
-
-    // Dirty detection: dirty trees always build, never use cache.
-    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let is_dirty = acquired.is_dirty;
 
     // Compute cache key from final .config CRC32.
     let (arch, image_name) = crate::fetch::arch_info();
@@ -814,9 +818,6 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     }
 
     // Build.
-    if is_dirty {
-        warn("ktstr: dirty tree, building kernel");
-    }
     let sp = Spinner::start("Building kernel...");
     let result = make_kernel_with_output(path, Some(&sp));
     if result.is_err() {
