@@ -1670,11 +1670,22 @@ impl KtstrVm {
                     std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
                     libc::munmap(ptr, len);
                     initramfs::shm_close_fd(fd);
-                    tracing::debug!(bytes = len, "lz4_base cache hit (shm)");
-                    return Ok(buf);
+
+                    // Validate LZ4 legacy magic. Stale segments from a
+                    // previous compression format (zstd) must be discarded.
+                    if buf.len() >= 4 && buf[..4] == initramfs::LZ4_LEGACY_MAGIC {
+                        tracing::debug!(bytes = len, "lz4_base cache hit (shm)");
+                        return Ok(buf);
+                    }
+                    tracing::warn!(
+                        bytes = len,
+                        magic = format!("{:02x}{:02x}{:02x}{:02x}", buf[0], buf[1], buf[2], buf[3]),
+                        "stale compressed shm segment (wrong magic), recompressing"
+                    );
+                } else {
+                    initramfs::shm_close_fd(fd);
                 }
             }
-            initramfs::shm_close_fd(fd);
         }
 
         // Compress with LZ4 legacy format.
@@ -1687,7 +1698,9 @@ impl KtstrVm {
     }
 
     /// Try to COW-overlay the compressed base from gz SHM into guest
-    /// memory. Returns true on success.
+    /// memory. Returns true on success. Validates the segment starts
+    /// with LZ4 legacy magic to reject stale data from a previous
+    /// compression format.
     #[cfg(target_arch = "x86_64")]
     fn try_cow_overlay(
         &self,
@@ -1700,6 +1713,35 @@ impl KtstrVm {
             return false;
         };
         if len != expected_len {
+            initramfs::shm_close_fd(fd);
+            return false;
+        }
+        // Validate LZ4 legacy magic before COW-mapping.
+        let mut magic = [0u8; 4];
+        unsafe {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                initramfs::shm_close_fd(fd);
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(ptr as *const u8, magic.as_mut_ptr(), 4);
+            libc::munmap(ptr, len);
+        }
+        if magic != initramfs::LZ4_LEGACY_MAGIC {
+            tracing::warn!(
+                magic = format!(
+                    "{:02x}{:02x}{:02x}{:02x}",
+                    magic[0], magic[1], magic[2], magic[3]
+                ),
+                "stale compressed shm segment in COW path, skipping"
+            );
             initramfs::shm_close_fd(fd);
             return false;
         }

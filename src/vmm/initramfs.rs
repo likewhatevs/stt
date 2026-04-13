@@ -1143,12 +1143,15 @@ pub fn shm_unlink_base(content_hash: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Compressed SHM cache — stores zstd'd base for COW overlay into guest RAM
+// Compressed SHM cache — stores LZ4-compressed base for COW overlay into
+// guest RAM
 // ---------------------------------------------------------------------------
 
-/// Segment name for the compressed (zstd) version of a base initramfs.
+/// Segment name for the LZ4-compressed version of a base initramfs.
+/// Uses `lz4` prefix to avoid collisions with segments written by
+/// previous compression formats (zstd, gzip).
 fn shm_gz_segment_name(content_hash: u64) -> String {
-    format!("/ktstr-gz-{content_hash:016x}")
+    format!("/ktstr-lz4-{content_hash:016x}")
 }
 
 /// Open the compressed SHM segment and return a held fd + size.
@@ -1252,7 +1255,7 @@ pub fn load_initramfs_parts(
 /// LZ4 legacy format magic number (`0x184C2102` little-endian).
 /// This is the format the kernel's initramfs decompressor expects
 /// (CONFIG_RD_LZ4 / lib/decompress_unlz4.c).
-const LZ4_LEGACY_MAGIC: [u8; 4] = 0x184C2102u32.to_le_bytes();
+pub(crate) const LZ4_LEGACY_MAGIC: [u8; 4] = 0x184C2102u32.to_le_bytes();
 
 /// Maximum uncompressed chunk size for LZ4 legacy format.
 /// Must match `LZ4_DEFAULT_UNCOMPRESSED_CHUNK_SIZE` in the kernel
