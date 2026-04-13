@@ -3,7 +3,11 @@ use super::decode::{decode_named_value, format_raw_arg};
 /// Read nr_cpu_ids from sysfs. Returns the number of possible CPUs
 /// (upper bound of the "possible" range). Falls back to
 /// `libc::sysconf(_SC_NPROCESSORS_CONF)` if sysfs is unavailable.
-fn get_nr_cpus() -> Option<u32> {
+///
+/// Only correct when called on the machine whose cpumask data is
+/// being decoded. For guest VM probes formatted on the host, pass
+/// the guest's CPU count explicitly via `nr_cpus` parameters instead.
+pub(crate) fn get_nr_cpus() -> Option<u32> {
     // /sys/devices/system/cpu/possible contains "0-N" or "0-N,M-P".
     // The highest CPU ID + 1 is nr_cpu_ids.
     if let Ok(content) = std::fs::read_to_string("/sys/devices/system/cpu/possible") {
@@ -148,11 +152,14 @@ pub fn format_probe_events(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)], // (func_idx, display_name)
     kernel_dir: Option<&str>,
+    nr_cpus: Option<u32>,
 ) -> String {
     format_probe_events_inner(
         events,
         func_names,
         kernel_dir,
+        &std::collections::HashMap::new(),
+        nr_cpus,
         &std::collections::HashMap::new(),
     )
 }
@@ -164,13 +171,63 @@ pub fn format_probe_events(
 /// [`resolve_bpf_source_locs`](super::btf::resolve_bpf_source_locs)).
 /// BPF source locations are used when blazesym has no match for a
 /// function name.
+///
+/// `nr_cpus` is the guest VM's CPU count, used to mask garbage bits
+/// beyond `nr_cpu_ids` in cpumask words captured by BPF probes.
+/// Pass `None` to show all bits unmasked.
+///
+/// `param_names` maps function display names to BTF-resolved parameter
+/// labels: `vec![(name, type_label)]`. When present and an event has
+/// no struct field specs, parameters are printed with their real names
+/// (e.g. `prev (task_struct *)`) instead of `arg0`.
 pub fn format_probe_events_with_bpf_locs(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)],
     kernel_dir: Option<&str>,
     bpf_locs: &std::collections::HashMap<String, String>,
+    nr_cpus: Option<u32>,
+    param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
 ) -> String {
-    format_probe_events_inner(events, func_names, kernel_dir, bpf_locs)
+    format_probe_events_inner(
+        events,
+        func_names,
+        kernel_dir,
+        bpf_locs,
+        nr_cpus,
+        param_names,
+    )
+}
+
+/// Build param_names map from BtfFunc slices.
+///
+/// Formats each parameter as `(name, type_label)` where type_label is
+/// `"struct_name *"` for struct pointers, `"ptr"` for untyped pointers,
+/// or empty for scalars.
+pub fn build_param_names(
+    btf_funcs: &[super::btf::BtfFunc],
+) -> std::collections::HashMap<String, Vec<(String, String)>> {
+    let mut map = std::collections::HashMap::new();
+    for func in btf_funcs {
+        let params: Vec<(String, String)> = func
+            .params
+            .iter()
+            .take(6)
+            .map(|p| {
+                let type_label = if let Some(ref sname) = p.struct_name {
+                    format!("{sname} *")
+                } else if let Some(ref tname) = p.type_name {
+                    format!("{tname} *")
+                } else if p.is_ptr {
+                    "ptr".into()
+                } else {
+                    String::new()
+                };
+                (p.name.clone(), type_label)
+            })
+            .collect();
+        map.insert(func.name.clone(), params);
+    }
+    map
 }
 
 fn format_probe_events_inner(
@@ -178,6 +235,8 @@ fn format_probe_events_inner(
     func_names: &[(u32, String)],
     kernel_dir: Option<&str>,
     bpf_locs: &std::collections::HashMap<String, String>,
+    nr_cpus: Option<u32>,
+    param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
 ) -> String {
     use blazesym::symbolize::{self, Symbolizer};
 
@@ -318,12 +377,31 @@ fn format_probe_events_inner(
         }
 
         if event.fields.is_empty() {
-            // No BTF fields -- show raw args.
+            // No struct field specs — show args with BTF param names
+            // when available, fall back to arg0/arg1/... otherwise.
             let fw = max_field_w;
+            let params = param_names.get(name);
             for (i, &val) in event.args.iter().enumerate() {
                 if val != 0 || i == 0 {
-                    let label = format!("arg{i}");
-                    out.push_str(&format!("      {label:<fw$}  {}\n", format_raw_arg(val)));
+                    let (label, decoded) = if let Some(p) = params.and_then(|ps| ps.get(i)) {
+                        let (pname, ptype) = p;
+                        let lbl = if ptype.is_empty() {
+                            pname.clone()
+                        } else {
+                            format!("{pname} ({ptype})")
+                        };
+                        let dec = if ptype.contains("task_struct") {
+                            format!("ptr:{:04x}", val & 0xffff)
+                        } else if ptype == "ptr" {
+                            format_raw_arg(val)
+                        } else {
+                            decode_named_value(pname, &val.to_string())
+                        };
+                        (lbl, dec)
+                    } else {
+                        (format!("arg{i}"), format_raw_arg(val))
+                    };
+                    out.push_str(&format!("      {label:<fw$}  {decoded}\n"));
                 }
             }
         } else {
@@ -340,7 +418,6 @@ fn format_probe_events_inner(
                     _ => {}
                 }
             }
-            let nr_cpus = get_nr_cpus();
             let merged_cpumask_str = format_cpumask_display(&cpumask_words, nr_cpus);
 
             // Group fields by parameter, emit type headers for struct params.
@@ -501,7 +578,7 @@ mod tests {
 
     #[test]
     fn format_probe_events_empty() {
-        let out = format_probe_events(&[], &[], None);
+        let out = format_probe_events(&[], &[], None, None);
         assert!(out.contains("=== AUTO-PROBE: scx_exit fired ==="));
         assert!(out.contains("no probe data captured"));
     }
@@ -538,7 +615,7 @@ mod tests {
             (1u32, "balance_one".to_string()),
         ];
 
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         assert!(out.contains("=== AUTO-PROBE: scx_exit fired ==="));
         assert!(out.contains("do_enqueue_task"), "missing func name: {out}");
         assert!(out.contains("balance_one"), "missing func name: {out}");
@@ -564,7 +641,7 @@ mod tests {
         }];
         let func_names = vec![(0u32, "known_func".to_string())];
 
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         assert!(
             out.contains("unknown"),
             "unresolved func_idx should show 'unknown': {out}"
@@ -676,7 +753,7 @@ mod tests {
             (1u32, "second_func".to_string()),
         ];
 
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         let pos_second = out.find("second_func").unwrap();
         let pos_first = out.find("first_func").unwrap();
         // Both appear but order depends on input (not sorted by this function)
@@ -697,7 +774,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_func".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         assert!(out.contains("arg0"), "arg0 always shown: {out}");
         assert!(out.contains("arg1"), "nonzero arg1 should be shown: {out}");
     }
@@ -735,7 +812,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "trigger_func".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         assert!(out.contains("trigger_func"), "func name: {out}");
         // kstack is from the last event. Without symbolization each
         // address appears as "    0x{hex}\n".
@@ -767,7 +844,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         // Line format: "      {field:<14}{decoded}\n"
         assert!(out.contains("pid"), "field 'pid' should appear: {out}");
         assert!(
@@ -793,7 +870,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "do_enqueue".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         assert!(out.contains("do_enqueue"), "func name: {out}");
         assert!(out.contains("task_struct *p0"), "type header: {out}");
         assert!(out.contains("pid"), "pid field: {out}");
@@ -846,7 +923,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         // cpumask_0..3 should be merged into one "cpus_ptr" line
         assert!(out.contains("cpus_ptr"), "should show cpus_ptr: {out}");
         // CPUs 0-2 from word 0
@@ -888,7 +965,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         // "cpu" as scalar should be suppressed because rq.cpu = 3
         let cpu_lines: Vec<&str> = out
             .lines()
@@ -917,7 +994,7 @@ mod tests {
             str_val: Some("error: task stuck".to_string()),
         }];
         let func_names = vec![(0u32, "scx_exit".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         assert!(out.contains("msg"), "should show msg label: {out}");
         assert!(
             out.contains("\"error: task stuck\""),
@@ -943,7 +1020,14 @@ mod tests {
         let func_names = vec![(0u32, "mitosis_enqueue".to_string())];
         let mut locs = std::collections::HashMap::new();
         locs.insert("mitosis_enqueue".to_string(), "main.bpf.c:42".to_string());
-        let out = format_probe_events_with_bpf_locs(&events, &func_names, None, &locs);
+        let out = format_probe_events_with_bpf_locs(
+            &events,
+            &func_names,
+            None,
+            &locs,
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             out.contains("main.bpf.c:42"),
             "should show BPF source loc: {out}",
@@ -993,7 +1077,7 @@ mod tests {
             str_val: None,
         }];
         let func_names = vec![(0u32, "scx_tick".to_string())];
-        let out = format_probe_events(&events, &func_names, None);
+        let out = format_probe_events(&events, &func_names, None, None);
         assert!(
             out.contains("rq *rq"),
             "should show struct type header: {out}"

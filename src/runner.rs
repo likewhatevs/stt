@@ -155,6 +155,7 @@ impl Runner {
                 )>,
                 Vec<(u32, String)>,
                 std::collections::HashMap<String, String>,
+                std::collections::HashMap<String, Vec<(String, String)>>,
             );
             let mut skeleton_handle: Option<SkeletonHandle> = if self.config.repro
                 && let Some(ref stack_input) = self.config.probe_stack
@@ -208,6 +209,7 @@ impl Runner {
                         functions.iter().filter_map(|f| f.bpf_prog_id).collect();
                     let bpf_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
                     let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
+                    let param_names = crate::probe::output::build_param_names(&btf_funcs);
                     let stop_clone = probe_stop.clone();
                     let probes_ready =
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -224,7 +226,7 @@ impl Runner {
                     while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Some((handle, func_names, bpf_locs))
+                    Some((handle, func_names, bpf_locs, param_names))
                 }
             } else {
                 None
@@ -235,29 +237,31 @@ impl Runner {
             tracing::info!(qname, elapsed = ?start.elapsed(), "scenario complete");
 
             // Stop probes and collect results.
-            let probe_output = if let Some((handle, func_names, bpf_locs)) = skeleton_handle.take()
-            {
-                probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                handle.join().ok().and_then(|(events, diag)| {
-                    let mut out = String::new();
-                    // Format diagnostics summary.
-                    let pipeline = crate::test_support::PipelineDiagnostics::default();
-                    out.push_str(&crate::test_support::format_probe_diagnostics(
-                        &pipeline, &diag,
-                    ));
-                    if let Some(events) = events {
-                        out.push_str(&crate::probe::output::format_probe_events_with_bpf_locs(
-                            &events,
-                            &func_names,
-                            self.config.kernel_dir.as_deref(),
-                            &bpf_locs,
+            let probe_output =
+                if let Some((handle, func_names, bpf_locs, param_names)) = skeleton_handle.take() {
+                    probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    handle.join().ok().and_then(|(events, diag)| {
+                        let mut out = String::new();
+                        // Format diagnostics summary.
+                        let pipeline = crate::test_support::PipelineDiagnostics::default();
+                        out.push_str(&crate::test_support::format_probe_diagnostics(
+                            &pipeline, &diag,
                         ));
-                    }
-                    if out.is_empty() { None } else { Some(out) }
-                })
-            } else {
-                None
-            };
+                        if let Some(events) = events {
+                            out.push_str(&crate::probe::output::format_probe_events_with_bpf_locs(
+                                &events,
+                                &func_names,
+                                self.config.kernel_dir.as_deref(),
+                                &bpf_locs,
+                                Some(self.topo.total_cpus() as u32),
+                                &param_names,
+                            ));
+                        }
+                        if out.is_empty() { None } else { Some(out) }
+                    })
+                } else {
+                    None
+                };
 
             let _ = cgroups.cleanup_all();
             std::thread::sleep(self.config.cleanup);

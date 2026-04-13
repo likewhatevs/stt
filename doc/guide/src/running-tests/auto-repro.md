@@ -47,8 +47,9 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
 6. **Stitching** -- the task_struct pointer is found from the last
    event (closest to trigger time) that has a non-zero task_struct
    argument. Events with a task_struct parameter are filtered to that
-   pointer; events without a task_struct parameter are kept
-   unconditionally for context. Events are sorted by timestamp and
+   pointer; events without a task_struct parameter are dropped
+   (they cannot be associated with the triggering task). Events
+   are sorted by timestamp and
    formatted with decoded field values (cpumask ranges, DSQ names,
    enqueue flags, etc.) and source locations (DWARF for kernel,
    line_info for BPF).

@@ -2071,6 +2071,8 @@ fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Option<String
         &payload.func_names,
         kernel_dir,
         &payload.bpf_source_locs,
+        payload.nr_cpus,
+        &payload.param_names,
     ));
     Some(out)
 }
@@ -2374,6 +2376,8 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         // Holding these FDs keeps programs alive via kernel refcounting
         // even after the scheduler crashes.
         let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
+        let pnames = crate::probe::output::build_param_names(&btf_funcs);
+        let pnames_thread = pnames.clone();
         let stop = probe_stop.clone();
         let funcs = functions.clone();
         let fn_names = func_names.clone();
@@ -2389,7 +2393,13 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             // Serialize probe output immediately so it reaches COM2
             // even if the test function hangs and never calls
             // collect_and_print_probe_data.
-            emit_probe_payload(events.as_deref().unwrap_or(&[]), &fn_names, &pd, &diag);
+            emit_probe_payload(
+                events.as_deref().unwrap_or(&[]),
+                &fn_names,
+                &pd,
+                &diag,
+                &pnames_thread,
+            );
             output_done_thread.store(true, std::sync::atomic::Ordering::Release);
             (events, diag)
         });
@@ -2401,7 +2411,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        Some((handle, func_names, pipe_diag, output_done))
+        Some((handle, func_names, pipe_diag, output_done, pnames))
     });
 
     // Build a minimal Ctx for the test function.
@@ -2481,6 +2491,7 @@ type ProbeHandle = (
     Vec<(u32, String)>,
     PipelineDiagnostics,
     std::sync::Arc<std::sync::atomic::AtomicBool>, // output_done
+    std::collections::HashMap<String, Vec<(String, String)>>, // param_names
 );
 
 /// Pre-skeleton pipeline diagnostics captured during guest probe setup.
@@ -2506,6 +2517,16 @@ pub(crate) struct ProbePayload {
     pub bpf_source_locs: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub diagnostics: Option<ProbePayloadDiagnostics>,
+    /// Guest VM CPU count for cpumask masking. Populated by
+    /// `emit_probe_payload` which runs inside the guest where
+    /// sysfs reports the correct value.
+    #[serde(default)]
+    pub nr_cpus: Option<u32>,
+    /// BTF-resolved parameter labels per function: func_name ->
+    /// vec of (param_name, type_label). Used by the formatter to
+    /// print named args instead of arg0/arg1.
+    #[serde(default)]
+    pub param_names: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
 /// Combined diagnostics for the probe payload.
@@ -2524,6 +2545,7 @@ fn emit_probe_payload(
     func_names: &[(u32, String)],
     pipeline_diag: &PipelineDiagnostics,
     skeleton_diag: &crate::probe::process::ProbeDiagnostics,
+    param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
 ) {
     let source_loc_names: Vec<&str> = func_names.iter().map(|(_, name)| name.as_str()).collect();
     let bpf_syms = crate::probe::btf::discover_bpf_symbols(&source_loc_names);
@@ -2546,6 +2568,8 @@ fn emit_probe_payload(
             pipeline: pipeline_diag.clone(),
             skeleton: skeleton_diag.clone(),
         }),
+        nr_cpus: crate::probe::output::get_nr_cpus(),
+        param_names: param_names.clone(),
     };
     println!("{PROBE_OUTPUT_START}");
     if let Ok(json) = serde_json::to_string(&payload) {
@@ -2562,7 +2586,7 @@ fn collect_and_print_probe_data(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<ProbeHandle>,
 ) {
-    let Some((handle, func_names, pipeline_diag, output_done)) = handle else {
+    let Some((handle, func_names, pipeline_diag, output_done, param_names)) = handle else {
         return;
     };
 
@@ -2580,7 +2604,13 @@ fn collect_and_print_probe_data(
     // Only emit here if it somehow didn't (e.g. thread panicked
     // before reaching emit_probe_payload).
     if !output_done.load(std::sync::atomic::Ordering::Acquire) {
-        emit_probe_payload(&events, &func_names, &pipeline_diag, &skeleton_diag);
+        emit_probe_payload(
+            &events,
+            &func_names,
+            &pipeline_diag,
+            &skeleton_diag,
+            &param_names,
+        );
     }
 }
 
@@ -3817,6 +3847,8 @@ mod tests {
             func_names: vec![(0, "schedule".to_string())],
             bpf_source_locs: Default::default(),
             diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let output = format!("noise\n{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}\nmore");
@@ -3883,6 +3915,8 @@ mod tests {
             ],
             bpf_source_locs: Default::default(),
             diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");

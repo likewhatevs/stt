@@ -247,7 +247,7 @@ crash stack -> extract functions -> BTF resolve -> load skeletons -> poll
                                                          |
                                               read probe_data entries
                                                          |
-                                              stitch by tptr/tid
+                                              stitch by tptr
                                                          |
                                               format with field decoders
 ```
@@ -262,9 +262,9 @@ Attaches to kernel functions via `attach_kprobe`. The BPF handler:
 5. Reads char * string params if configured
 6. Stores result in `probe_data` (keyed by `(func_ip, task_ptr)`)
 
-A separate trigger kprobe fires on `scx_disable_workfn` and sends
-an `EVENT_TRIGGER` via ring buffer with the current task pointer
-and kernel stack.
+The trigger fires via `tp_btf/sched_ext_exit` (inside
+`scx_claim_exit()`) and sends an `EVENT_TRIGGER` via ring buffer
+with the current task pointer and kernel stack.
 
 ### Fentry skeleton (`fentry_probe.bpf.c`)
 
@@ -316,6 +316,7 @@ single task's scheduling journey:
 1. Find the task_struct pointer from the trigger event's args[0]
 2. For functions with a task_struct parameter: keep events where
    `args[param_idx] == tptr`
-3. For functions without task_struct: keep events where `tid == trigger_tid`
+3. For functions without a task_struct parameter: drop (cannot
+   associate with the triggering task)
 
 Events are sorted by timestamp for chronological output.

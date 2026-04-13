@@ -1,7 +1,7 @@
 /// Return true if a function should not be probed.
 ///
 /// Skips generic scheduler
-/// entry points (`schedule`, `__schedule`), syscall handlers,
+/// entry points (`schedule`, `__schedule`, `schedule_idle`), syscall handlers,
 /// low-level infrastructure (`_raw_spin_*`, `asm_*`, `entry_*`,
 /// `sysvec_*`), sched_ext exit/error machinery (`scx_vexit`,
 /// `scx_exit`, `scx_error_irq*`, etc.),
@@ -16,6 +16,7 @@ pub fn should_skip_probe(name: &str) -> bool {
         name,
         "schedule"
             | "__schedule"
+            | "schedule_idle"
             | "do_syscall_64"
             | "__do_sys_sched_yield"
             | "do_sched_yield"
@@ -59,13 +60,13 @@ pub fn should_skip_probe(name: &str) -> bool {
 pub(super) const BPF_OP_CALLERS: &[(&str, &str, u32)] = &[
     ("select_cpu", "do_enqueue_task", 1),
     ("enqueue", "do_enqueue_task", 1),
-    ("dispatch", "balance_one", 0),
+    ("dispatch", "balance_one", 1),
     ("running", "set_next_task_scx", 1),
     ("stopping", "put_prev_task_scx", 1),
     ("tick", "task_tick_scx", 1),
-    ("set_cpumask", "set_cpus_allowed_scx", 1),
-    ("init_task", "scx_enable_task", 1),
-    ("enable", "scx_enable_task", 1),
+    ("set_cpumask", "set_cpus_allowed_scx", 0),
+    ("init_task", "scx_enable_task", 0),
+    ("enable", "scx_enable_task", 0),
 ];
 
 /// Expand BPF functions by adding their kernel-side callers.
@@ -704,6 +705,7 @@ mod tests {
     fn should_skip_probe_schedule_variants() {
         assert!(should_skip_probe("schedule"));
         assert!(should_skip_probe("__schedule"));
+        assert!(should_skip_probe("schedule_idle"));
         assert!(should_skip_probe("preempt_schedule_common"));
         assert!(should_skip_probe("preempt_schedule_irq"));
     }
