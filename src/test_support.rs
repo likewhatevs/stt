@@ -957,6 +957,18 @@ fn run_gauntlet_test(rest: &str) -> i32 {
 
     let t = &preset.topology;
     let cpus = t.total_cpus();
+
+    // Skip topologies the host cannot support. Without this check,
+    // ResourceContention is returned during VM build and silently
+    // converted to PASS on the final nextest attempt.
+    let host_cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+    if cpus > host_cpus {
+        eprintln!("skipped: preset {preset_name} needs {cpus} CPUs, host has {host_cpus}",);
+        return 0;
+    }
+
     let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
     let topo = TopoOverride {
         sockets: t.sockets,
