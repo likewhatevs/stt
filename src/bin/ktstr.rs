@@ -287,6 +287,9 @@ fn kernel_build(
     }
     result?;
 
+    // Validate critical config options were not silently disabled.
+    cli::validate_kernel_config(source_dir)?;
+
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
         eprintln!("ktstr: generating compile_commands.json");

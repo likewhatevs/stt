@@ -398,6 +398,9 @@ fn kernel_build(
     }
     result?;
 
+    // Validate critical config options were not silently disabled.
+    cli::validate_kernel_config(source_dir).map_err(|e| format!("{e:#}"))?;
+
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
         let sp = cli::Spinner::start("Generating compile_commands.json...");

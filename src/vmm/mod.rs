@@ -5308,6 +5308,7 @@ mod tests {
             .topology(1, 1, 1)
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
+            .cmdline("loglevel=7")
             .build()
         {
             Ok(vm) => vm,
@@ -5340,6 +5341,7 @@ mod tests {
             .topology(2, 2, 1) // 4 CPUs
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
+            .cmdline("loglevel=7")
             .build()
         {
             Ok(vm) => vm,

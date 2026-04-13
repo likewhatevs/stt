@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::cache::{CacheDir, CacheEntry};
 use crate::runner::RunConfig;
@@ -397,6 +397,52 @@ pub fn has_sched_ext(kernel_dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Validate the output .config for critical options that the kconfig
+/// fragment requested but the kernel build system may have silently
+/// disabled (e.g. CONFIG_DEBUG_INFO_BTF requires pahole).
+///
+/// Call after `make` succeeds. Returns `Err` with a diagnostic
+/// message listing missing options and likely causes.
+pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
+    let config_path = kernel_dir.join(".config");
+    let config = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+
+    let required: &[(&str, &str)] = &[
+        (
+            "CONFIG_SCHED_CLASS_EXT",
+            "depends on CONFIG_DEBUG_INFO_BTF — ensure pahole >= 1.16 is installed (dwarves package)",
+        ),
+        (
+            "CONFIG_DEBUG_INFO_BTF",
+            "requires pahole >= 1.16 (dwarves package)",
+        ),
+        ("CONFIG_BPF_SYSCALL", "required for BPF program loading"),
+    ];
+
+    let mut missing = Vec::new();
+    for &(option, hint) in required {
+        let enabled = format!("{option}=y");
+        if !config.lines().any(|l| l == enabled) {
+            missing.push((option, hint));
+        }
+    }
+
+    if !missing.is_empty() {
+        let mut msg =
+            String::from("kernel build completed but critical config options are missing:\n");
+        for (option, hint) in &missing {
+            msg.push_str(&format!("  {option} not set — {hint}\n"));
+        }
+        msg.push_str(
+            "\nThe kernel build system silently disables options whose dependencies \
+             are not met. Install missing tools and rebuild with --force.",
+        );
+        bail!("{msg}");
+    }
+    Ok(())
+}
+
 /// Build the make arguments for a kernel build.
 ///
 /// Returns the argument list that would be passed to `make` for a
@@ -717,6 +763,9 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
         sp.finish("Kernel built");
     }
     result?;
+
+    // Validate critical config options were not silently disabled.
+    validate_kernel_config(source_dir)?;
 
     let image = crate::kernel_path::find_image_in_dir(source_dir).ok_or_else(|| {
         anyhow::anyhow!(
