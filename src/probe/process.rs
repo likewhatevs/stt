@@ -1121,7 +1121,7 @@ pub fn run_probe_skeleton(
                 if let Some(&pidx) = task_param_idx.get(&e.func_idx) {
                     e.args[pidx] == tptr
                 } else {
-                    false // no task_struct param — can't associate with trigger task
+                    e.task_ptr == tptr // no task_struct param — match on current
                 }
             });
             tracing::debug!(
