@@ -162,6 +162,16 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 {
 	__sync_fetch_and_add(&ktstr_trigger_count, 1);
 
+	/*
+	 * Only fire for ops callback errors (SCX_EXIT_ERROR,
+	 * SCX_EXIT_ERROR_BPF) where bpf_get_current_task() is the
+	 * causal task. For stalls, sysrq, unregistration, current is
+	 * unrelated — skip the trigger so no misleading probe output
+	 * is produced.
+	 */
+	if (kind < 1024 || kind > 1025)
+		return 0;
+
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 
 	struct probe_event *event = bpf_ringbuf_reserve(&events,
@@ -174,17 +184,7 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	event->func_idx = 0;
 	event->ts = bpf_ktime_get_ns();
 	event->nr_fields = 0;
-
-	/*
-	 * Only use current as causal task for ops callback errors
-	 * (SCX_EXIT_ERROR, SCX_EXIT_ERROR_BPF). For stalls, sysrq,
-	 * unregistration, and other exit kinds, current is unrelated
-	 * to the exit cause — set 0 so stitching is skipped.
-	 */
-	if (kind >= 1024 && kind <= 1025)
-		event->args[0] = (u64)bpf_get_current_task();
-	else
-		event->args[0] = 0;
+	event->args[0] = (u64)bpf_get_current_task();
 
 	/* Capture kernel stack. */
 	int stack_sz = bpf_get_stack(ctx, event->kstack,

@@ -1076,8 +1076,8 @@ pub fn run_probe_skeleton(
             // bpf_get_current_task() only for ops callback errors
             // (SCX_EXIT_ERROR, SCX_EXIT_ERROR_BPF) where current IS
             // the causal task. For all other exit kinds (stalls,
-            // sysrq, unregistration), args[0] is 0 and stitching
-            // is skipped — events pass through unstitched.
+            // sysrq, unregistration), args[0] is 0 and probe output
+            // is suppressed — no causal task means no useful chain.
             let task_param_idx: std::collections::HashMap<u32, usize> = func_ips
                 .iter()
                 .filter_map(|(idx, _, name)| {
@@ -1100,8 +1100,8 @@ pub fn run_probe_skeleton(
 
             // Extract tptr and kstack from the trigger event in one
             // lock acquisition. When the trigger did not fire (stop-
-            // signaled), there is no causal task — events pass through
-            // unstitched.
+            // signaled) or the exit kind lacks a causal task, probe
+            // output is suppressed.
             let (target_tptr, trigger_kstack) = {
                 let guard = events.lock().unwrap();
                 let tptr = guard.last().map(|e| e.task_ptr).filter(|&p| p != 0);
@@ -1109,22 +1109,27 @@ pub fn run_probe_skeleton(
                 (tptr, kstack)
             };
 
+            let Some(tptr) = target_tptr else {
+                // No causal task (stall, sysrq, unregistration) —
+                // suppress probe output rather than dumping unstitched noise.
+                tracing::debug!("no causal tptr — suppressing probe output");
+                return (None, diag);
+            };
+
             let before = probe_events.len();
-            if let Some(tptr) = target_tptr {
-                probe_events.retain(|e| {
-                    if let Some(&pidx) = task_param_idx.get(&e.func_idx) {
-                        e.args[pidx] == tptr
-                    } else {
-                        false // no task_struct param — can't associate with trigger task
-                    }
-                });
-                tracing::debug!(
-                    tptr = format_args!("0x{tptr:x}"),
-                    kept = probe_events.len(),
-                    total = before,
-                    "stitched by task_struct arg",
-                );
-            }
+            probe_events.retain(|e| {
+                if let Some(&pidx) = task_param_idx.get(&e.func_idx) {
+                    e.args[pidx] == tptr
+                } else {
+                    false // no task_struct param — can't associate with trigger task
+                }
+            });
+            tracing::debug!(
+                tptr = format_args!("0x{tptr:x}"),
+                kept = probe_events.len(),
+                total = before,
+                "stitched by task_struct arg",
+            );
 
             diag.events_after_stitch = probe_events.len() as u32;
 
