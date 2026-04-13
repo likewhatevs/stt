@@ -255,12 +255,21 @@ impl BaseKey {
         Ok(BaseKey(hasher.finish()))
     }
 
-    /// Shell mode key: hashes a sentinel so shell and test initramfs
-    /// never collide in the SHM cache (busybox changes the content).
-    pub(crate) fn new_shell(payload: &Path, scheduler: Option<&Path>) -> Result<Self> {
+    /// Shell mode key: hashes a sentinel, include files, and the
+    /// busybox flag so different shell configurations get distinct
+    /// cache keys. Include file archive paths and content are hashed
+    /// so the same payload + same includes = cache hit, while
+    /// different includes = cache miss.
+    pub(crate) fn new_shell(
+        payload: &Path,
+        scheduler: Option<&Path>,
+        include_files: &[(String, PathBuf)],
+        busybox: bool,
+    ) -> Result<Self> {
         let mut hasher = std::hash::DefaultHasher::new();
 
         "ktstr-shell".hash(&mut hasher);
+        busybox.hash(&mut hasher);
         hash_file(payload)?.hash(&mut hasher);
         Self::hash_shared_libs(payload, &mut hasher);
 
@@ -271,6 +280,21 @@ impl BaseKey {
                 Self::hash_shared_libs(s, &mut hasher);
             }
             None => 0u8.hash(&mut hasher),
+        }
+
+        // Hash include files: archive paths (sorted for determinism)
+        // and content hashes.
+        let mut sorted: Vec<(&str, &Path)> = include_files
+            .iter()
+            .map(|(a, p)| (a.as_str(), p.as_path()))
+            .collect();
+        sorted.sort_by_key(|(a, _)| *a);
+        sorted.len().hash(&mut hasher);
+        for (archive_path, host_path) in &sorted {
+            archive_path.hash(&mut hasher);
+            if let Ok(h) = hash_file(host_path) {
+                h.hash(&mut hasher);
+            }
         }
 
         Ok(BaseKey(hasher.finish()))
@@ -1266,7 +1290,7 @@ impl KtstrVm {
                     .unwrap_or_default();
                 let shell_mode = busybox || !include_files.is_empty();
                 let key = if shell_mode {
-                    BaseKey::new_shell(&payload, scheduler.as_deref())?
+                    BaseKey::new_shell(&payload, scheduler.as_deref(), &include_files, busybox)?
                 } else {
                     BaseKey::new(&payload, scheduler.as_deref())?
                 };
@@ -1330,6 +1354,23 @@ impl KtstrVm {
             "build_suffix",
         );
 
+        // Debug: save uncompressed cpio archive for inspection.
+        if std::env::var_os("KTSTR_DUMP_INITRAMFS").is_some() {
+            let path = std::path::Path::new("/tmp/ktstr-debug-initramfs.cpio");
+            let mut full = Vec::with_capacity(uncompressed_size);
+            full.extend_from_slice(base_bytes);
+            full.extend_from_slice(&suffix);
+            if let Err(e) = std::fs::write(path, &full) {
+                tracing::warn!(%e, "failed to dump initramfs");
+            } else {
+                tracing::info!(
+                    path = %path.display(),
+                    bytes = full.len(),
+                    "dumped uncompressed initramfs"
+                );
+            }
+        }
+
         // Enforce minimum memory for initramfs extraction.
         // This path is only reached when memory_mb was set explicitly.
         let memory_mb = self.memory_mb.expect(
@@ -1347,45 +1388,36 @@ impl KtstrVm {
             );
         }
 
-        // Compress base and suffix as separate zstd streams. The kernel
-        // initramfs decompressor handles concatenated zstd natively.
+        // Compress base and suffix as separate LZ4 legacy streams. The
+        // kernel initramfs decompressor handles concatenated LZ4 natively
+        // (re-encountering the magic mid-stream resets the decoder).
         // Keeping them separate lets us COW-map the base from SHM.
         let t0 = Instant::now();
-        let zstd_base = self.get_or_compress_base(base_bytes, &key)?;
-        let zstd_suffix = {
-            use std::io::Write;
-            let mut enc =
-                zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
-            enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
-            enc.write_all(&suffix).context("zstd suffix")?;
-            enc.finish().context("finish zstd suffix")?
-        };
-        let total_compressed = zstd_base.len() + zstd_suffix.len();
+        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
+        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let total_compressed = lz4_base.len() + lz4_suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
             uncompressed = uncompressed_size,
-            zstd_base = zstd_base.len(),
-            zstd_suffix = zstd_suffix.len(),
+            lz4_base = lz4_base.len(),
+            lz4_suffix = lz4_suffix.len(),
             ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-            "zstd_initramfs",
+            "lz4_initramfs",
         );
 
         // Try COW overlay: mmap compressed base from SHM fd directly
         // into guest memory, sharing physical pages across VMs.
         let t0 = Instant::now();
-        let cow_ok = self.try_cow_overlay(vm, &key, zstd_base.len(), load_addr);
+        let cow_ok = self.try_cow_overlay(vm, &key, lz4_base.len(), load_addr);
         if cow_ok {
             // Base is COW-mapped. Write suffix after it.
             vm.guest_mem
-                .write_slice(
-                    &zstd_suffix,
-                    GuestAddress(load_addr + zstd_base.len() as u64),
-                )
-                .context("write zstd suffix after COW base")?;
+                .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
+                .context("write lz4 suffix after COW base")?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cow_initramfs");
         } else {
             // Fallback: write both parts via write_slice.
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[&zstd_base, &zstd_suffix], load_addr)?;
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "copy_initramfs");
         }
 
@@ -1428,6 +1460,23 @@ impl KtstrVm {
             "build_suffix",
         );
 
+        // Debug: save uncompressed cpio archive for inspection.
+        if std::env::var_os("KTSTR_DUMP_INITRAMFS").is_some() {
+            let path = std::path::Path::new("/tmp/ktstr-debug-initramfs.cpio");
+            let mut full = Vec::with_capacity(uncompressed_size);
+            full.extend_from_slice(base_bytes);
+            full.extend_from_slice(&suffix);
+            if let Err(e) = std::fs::write(path, &full) {
+                tracing::warn!(%e, "failed to dump initramfs");
+            } else {
+                tracing::info!(
+                    path = %path.display(),
+                    bytes = full.len(),
+                    "dumped uncompressed initramfs"
+                );
+            }
+        }
+
         // Compute memory from actual initramfs size.
         let memory_mb = initramfs_min_memory_mb(uncompressed_size as u64, self.shm_size);
         tracing::debug!(
@@ -1442,37 +1491,27 @@ impl KtstrVm {
 
         // Compress and load initramfs.
         let t0 = Instant::now();
-        let zstd_base = self.get_or_compress_base(base_bytes, &key)?;
-        let zstd_suffix = {
-            use std::io::Write;
-            let mut enc =
-                zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
-            enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
-            enc.write_all(&suffix).context("zstd suffix")?;
-            enc.finish().context("finish zstd suffix")?
-        };
-        let total_compressed = zstd_base.len() + zstd_suffix.len();
+        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
+        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let total_compressed = lz4_base.len() + lz4_suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
             uncompressed = uncompressed_size,
-            zstd_base = zstd_base.len(),
-            zstd_suffix = zstd_suffix.len(),
+            lz4_base = lz4_base.len(),
+            lz4_suffix = lz4_suffix.len(),
             ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-            "zstd_initramfs",
+            "lz4_initramfs",
         );
 
         let t0 = Instant::now();
-        let cow_ok = self.try_cow_overlay(vm, &key, zstd_base.len(), load_addr);
+        let cow_ok = self.try_cow_overlay(vm, &key, lz4_base.len(), load_addr);
         if cow_ok {
             vm.guest_mem
-                .write_slice(
-                    &zstd_suffix,
-                    GuestAddress(load_addr + zstd_base.len() as u64),
-                )
-                .context("write zstd suffix after COW base")?;
+                .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
+                .context("write lz4 suffix after COW base")?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cow_initramfs");
         } else {
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[&zstd_base, &zstd_suffix], load_addr)?;
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "copy_initramfs");
         }
 
@@ -1511,20 +1550,15 @@ impl KtstrVm {
                     std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
                     libc::munmap(ptr, len);
                     initramfs::shm_close_fd(fd);
-                    tracing::debug!(bytes = len, "zstd_base cache hit (shm)");
+                    tracing::debug!(bytes = len, "lz4_base cache hit (shm)");
                     return Ok(buf);
                 }
             }
             initramfs::shm_close_fd(fd);
         }
 
-        // Compress and store.
-        use std::io::Write;
-        let mut enc =
-            zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
-        enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
-        enc.write_all(base_bytes).context("zstd base")?;
-        let gz = enc.finish().context("finish zstd base")?;
+        // Compress with LZ4 legacy format.
+        let gz = initramfs::lz4_legacy_compress(base_bytes);
 
         if let Err(e) = initramfs::shm_store_gz(key.0, &gz) {
             tracing::warn!("shm_store_gz: {e:#}");
@@ -2560,6 +2594,24 @@ impl KtstrVm {
                     &disable_refs,
                 )?;
                 let uncompressed_size = base_bytes.len() + suffix.len();
+
+                // Debug: save uncompressed cpio archive for inspection.
+                if std::env::var_os("KTSTR_DUMP_INITRAMFS").is_some() {
+                    let path = std::path::Path::new("/tmp/ktstr-debug-initramfs.cpio");
+                    let mut full = Vec::with_capacity(uncompressed_size);
+                    full.extend_from_slice(base_bytes);
+                    full.extend_from_slice(&suffix);
+                    if let Err(e) = std::fs::write(path, &full) {
+                        tracing::warn!(%e, "failed to dump initramfs");
+                    } else {
+                        tracing::info!(
+                            path = %path.display(),
+                            bytes = full.len(),
+                            "dumped uncompressed initramfs"
+                        );
+                    }
+                }
+
                 let memory_mb = initramfs_min_memory_mb(uncompressed_size as u64, self.shm_size);
 
                 vm.allocate_and_register_memory(memory_mb)
@@ -2570,17 +2622,10 @@ impl KtstrVm {
                     .context("load kernel (aarch64)")?;
 
                 // Compress and load initramfs.
-                let compressed = {
-                    use std::io::Write;
-                    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1)
-                        .context("create zstd encoder")?;
-                    enc.multithread(
-                        std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
-                    )?;
-                    enc.write_all(base_bytes).context("zstd initramfs base")?;
-                    enc.write_all(&suffix).context("zstd initramfs suffix")?;
-                    enc.finish().context("finish zstd initramfs")?
-                };
+                let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
+                full.extend_from_slice(base_bytes);
+                full.extend_from_slice(&suffix);
+                let compressed = initramfs::lz4_legacy_compress(&full);
                 let total_size = compressed.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
                 initramfs::load_initramfs_parts(&vm.guest_mem, &[&compressed], load_addr)?;
@@ -2620,17 +2665,10 @@ impl KtstrVm {
                     &enable_refs,
                     &disable_refs,
                 )?;
-                let compressed = {
-                    use std::io::Write;
-                    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1)
-                        .context("create zstd encoder")?;
-                    enc.multithread(
-                        std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
-                    )?;
-                    enc.write_all(base_bytes).context("zstd initramfs base")?;
-                    enc.write_all(&suffix).context("zstd initramfs suffix")?;
-                    enc.finish().context("finish zstd initramfs")?
-                };
+                let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
+                full.extend_from_slice(base_bytes);
+                full.extend_from_slice(&suffix);
+                let compressed = initramfs::lz4_legacy_compress(&full);
                 let total_size = compressed.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
                 initramfs::load_initramfs_parts(&vm.guest_mem, &[&compressed], load_addr)?;

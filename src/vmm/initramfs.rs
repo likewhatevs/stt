@@ -1249,6 +1249,42 @@ pub fn load_initramfs_parts(
     Ok((load_addr, offset as u32))
 }
 
+/// LZ4 legacy format magic number (`0x184C2102` little-endian).
+/// This is the format the kernel's initramfs decompressor expects
+/// (CONFIG_RD_LZ4 / lib/decompress_unlz4.c).
+const LZ4_LEGACY_MAGIC: [u8; 4] = 0x184C2102u32.to_le_bytes();
+
+/// Maximum uncompressed chunk size for LZ4 legacy format.
+/// Must match `LZ4_DEFAULT_UNCOMPRESSED_CHUNK_SIZE` in the kernel
+/// (lib/decompress_unlz4.c: `8 << 20`).
+const LZ4_CHUNK_SIZE: usize = 8 << 20;
+
+/// Compress `data` into LZ4 legacy frame format for the kernel's
+/// initramfs decompressor. The format is:
+///   [4-byte magic] ([4-byte compressed_size LE] [compressed block])*
+///
+/// Input is split into `LZ4_CHUNK_SIZE` (8MB) chunks, compressed in
+/// parallel with rayon, then assembled sequentially.
+pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
+    use rayon::prelude::*;
+
+    // Compress all chunks in parallel.
+    let compressed_chunks: Vec<Vec<u8>> = data
+        .par_chunks(LZ4_CHUNK_SIZE)
+        .map(lz4_flex::block::compress)
+        .collect();
+
+    // Assemble: magic + (size + data) per chunk.
+    let total: usize = 4 + compressed_chunks.iter().map(|c| 4 + c.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&LZ4_LEGACY_MAGIC);
+    for chunk in &compressed_chunks {
+        out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,6 +1302,24 @@ mod tests {
             remaining = reader.finish().unwrap();
         }
         names
+    }
+
+    /// Extract cpio entries with name, size, mode, and inode for diagnostics.
+    fn cpio_entries(archive: &[u8]) -> Vec<(String, u32, u32, u32)> {
+        let mut entries = Vec::new();
+        let mut remaining: &[u8] = archive;
+        while let Ok(reader) = cpio::newc::Reader::new(remaining) {
+            if reader.entry().is_trailer() {
+                break;
+            }
+            let name = reader.entry().name().to_string();
+            let size = reader.entry().file_size();
+            let mode = reader.entry().mode();
+            let ino = reader.entry().ino();
+            entries.push((name, size, mode, ino));
+            remaining = reader.finish().unwrap();
+        }
+        entries
     }
 
     #[test]
@@ -1991,5 +2045,261 @@ mod tests {
             "resolve_soname should find libc.so.6 (cache or paths)"
         );
         assert!(result.unwrap().is_file());
+    }
+
+    #[test]
+    fn no_duplicate_cpio_entries() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let entries = cpio_entries(&base);
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates = Vec::new();
+        for (name, size, mode, ino) in &entries {
+            if !seen.insert(name.clone()) {
+                duplicates.push((name.clone(), *size, *mode, *ino));
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "archive contains duplicate entries: {:?}",
+            duplicates
+        );
+    }
+
+    #[test]
+    fn no_duplicate_entries_with_include_files() {
+        let exe = crate::resolve_current_exe().unwrap();
+        // Create include files in a deeply nested path mimicking custom
+        // linker library directories.
+        let tmp_dir = std::env::temp_dir().join("ktstr-test-cpio-dedup");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let lib_data = vec![0xCCu8; 4096];
+        let f1 = tmp_dir.join("libcustom1.so");
+        let f2 = tmp_dir.join("libcustom2.so");
+        let f3 = tmp_dir.join("libcustom3.so");
+        std::fs::write(&f1, &lib_data).unwrap();
+        std::fs::write(&f2, &lib_data).unwrap();
+        std::fs::write(&f3, &lib_data).unwrap();
+
+        let includes: Vec<(&str, &Path)> = vec![
+            ("usr/local/custom/platform/lib/libcustom1.so", f1.as_path()),
+            ("usr/local/custom/platform/lib/libcustom2.so", f2.as_path()),
+            ("usr/local/custom/platform/lib/libcustom3.so", f3.as_path()),
+        ];
+
+        let base = create_initramfs_base(&exe, &[], &includes, false).unwrap();
+        let entries = cpio_entries(&base);
+        let entry_names: Vec<&str> = entries.iter().map(|(n, _, _, _)| n.as_str()).collect();
+
+        // Verify all include files are present.
+        for (archive_path, _) in &includes {
+            assert!(
+                entry_names.contains(archive_path),
+                "missing include file entry '{}'; archive entries: {:?}",
+                archive_path,
+                entry_names
+            );
+        }
+
+        // Verify all include files have correct size.
+        for (archive_path, _) in &includes {
+            let entry = entries.iter().find(|(n, _, _, _)| n == archive_path);
+            assert!(
+                entry.is_some_and(|(_, size, _, _)| *size == lib_data.len() as u32),
+                "include file '{}' has wrong size: {:?}",
+                archive_path,
+                entry
+            );
+        }
+
+        // Verify directory entries exist for the nested path.
+        assert!(entry_names.contains(&"usr"), "missing 'usr' dir entry");
+        assert!(
+            entry_names.contains(&"usr/local"),
+            "missing 'usr/local' dir entry"
+        );
+        assert!(
+            entry_names.contains(&"usr/local/custom"),
+            "missing 'usr/local/custom' dir entry"
+        );
+        assert!(
+            entry_names.contains(&"usr/local/custom/platform"),
+            "missing 'usr/local/custom/platform' dir entry"
+        );
+        assert!(
+            entry_names.contains(&"usr/local/custom/platform/lib"),
+            "missing 'usr/local/custom/platform/lib' dir entry"
+        );
+
+        // Verify directories come before files they contain.
+        let dir_pos = entries
+            .iter()
+            .position(|(n, _, _, _)| n == "usr/local/custom/platform/lib")
+            .unwrap();
+        for (archive_path, _) in &includes {
+            let file_pos = entries
+                .iter()
+                .position(|(n, _, _, _)| n == *archive_path)
+                .unwrap();
+            assert!(
+                dir_pos < file_pos,
+                "directory entry must precede file '{}': dir at {}, file at {}",
+                archive_path,
+                dir_pos,
+                file_pos
+            );
+        }
+
+        // No duplicate entries.
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates = Vec::new();
+        for (name, _, _, _) in &entries {
+            if !seen.insert(name.clone()) {
+                duplicates.push(name.clone());
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "duplicate entries in archive: {:?}",
+            duplicates
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn include_elf_shared_libs_all_present_in_archive() {
+        // Use /bin/sh as an include file — its shared libs must all
+        // appear in the archive with non-zero sizes.
+        let sh = Path::new("/bin/sh");
+        if !sh.exists() || !is_elf(sh) {
+            eprintln!("skipping: /bin/sh not available or not ELF");
+            return;
+        }
+        let exe = crate::resolve_current_exe().unwrap();
+        let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
+        let base = create_initramfs_base(&exe, &[], &includes, false).unwrap();
+        let entries = cpio_entries(&base);
+        let entry_map: std::collections::HashMap<&str, (u32, u32, u32)> = entries
+            .iter()
+            .map(|(n, s, m, i)| (n.as_str(), (*s, *m, *i)))
+            .collect();
+
+        let shared = resolve_shared_libs(sh).unwrap();
+        for (guest_path, _host_path) in &shared.found {
+            assert!(
+                entry_map.contains_key(guest_path.as_str()),
+                "shared lib '{}' missing from archive; entries: {:?}",
+                guest_path,
+                entries
+                    .iter()
+                    .map(|(n, _, _, _)| n.as_str())
+                    .collect::<Vec<_>>()
+            );
+            let (size, _, _) = entry_map[guest_path.as_str()];
+            assert!(
+                size > 0,
+                "shared lib '{}' has zero size in archive",
+                guest_path
+            );
+        }
+
+        // Verify the include file itself is present.
+        assert!(
+            entry_map.contains_key("include-files/sh"),
+            "include file itself missing from archive"
+        );
+    }
+
+    #[test]
+    fn all_inode_zero_entries_have_nlink_one() {
+        // Verify that all entries use ino=0 and nlink=1, so the kernel
+        // initramfs unpacker never enters the hardlink path.
+        let exe = crate::resolve_current_exe().unwrap();
+        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let mut remaining: &[u8] = base.as_slice();
+        while let Ok(reader) = cpio::newc::Reader::new(remaining) {
+            if reader.entry().is_trailer() {
+                break;
+            }
+            let name = reader.entry().name().to_string();
+            let ino = reader.entry().ino();
+            let nlink = reader.entry().nlink();
+            assert_eq!(
+                ino, 0,
+                "entry '{}' has non-zero inode {}: risk of kernel hardlink confusion",
+                name, ino
+            );
+            assert_eq!(
+                nlink, 1,
+                "entry '{}' has nlink {}: kernel only hardlinks when nlink >= 2",
+                name, nlink
+            );
+            remaining = reader.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn lz4_legacy_compress_format() {
+        let data = vec![0xAAu8; 4096];
+        let compressed = lz4_legacy_compress(&data);
+        // Must start with LZ4 legacy magic.
+        assert_eq!(
+            &compressed[..4],
+            &LZ4_LEGACY_MAGIC,
+            "output must start with LZ4 legacy magic 0x184C2102"
+        );
+        // First chunk: 4-byte compressed size follows magic.
+        let chunk_size = u32::from_le_bytes(compressed[4..8].try_into().unwrap()) as usize;
+        assert!(
+            chunk_size > 0 && chunk_size < data.len(),
+            "compressed chunk should be non-empty and smaller than input: {}",
+            chunk_size
+        );
+        // Decompress and verify roundtrip.
+        let decompressed = lz4_flex::block::decompress(&compressed[8..8 + chunk_size], data.len())
+            .expect("lz4 block decompress failed");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn lz4_legacy_compress_large_input_splits_chunks() {
+        // Input larger than LZ4_CHUNK_SIZE (8MB) must produce multiple chunks.
+        let data = vec![0xBBu8; LZ4_CHUNK_SIZE + 1024];
+        let compressed = lz4_legacy_compress(&data);
+        assert_eq!(&compressed[..4], &LZ4_LEGACY_MAGIC);
+        // Parse chunks: should be at least 2.
+        let mut pos = 4;
+        let mut chunk_count = 0;
+        let mut total_decompressed = Vec::new();
+        while pos + 4 <= compressed.len() {
+            let chunk_size =
+                u32::from_le_bytes(compressed[pos..pos + 4].try_into().unwrap()) as usize;
+            if chunk_size == 0 {
+                break;
+            }
+            pos += 4;
+            let remaining_uncompressed = data.len() - total_decompressed.len();
+            let expected_chunk_len = remaining_uncompressed.min(LZ4_CHUNK_SIZE);
+            let decompressed =
+                lz4_flex::block::decompress(&compressed[pos..pos + chunk_size], expected_chunk_len)
+                    .expect("lz4 block decompress failed");
+            total_decompressed.extend_from_slice(&decompressed);
+            pos += chunk_size;
+            chunk_count += 1;
+        }
+        assert!(
+            chunk_count >= 2,
+            "input > 8MB should produce >= 2 chunks, got {}",
+            chunk_count
+        );
+        assert_eq!(total_decompressed, data);
+    }
+
+    #[test]
+    fn lz4_legacy_compress_empty_input() {
+        let compressed = lz4_legacy_compress(&[]);
+        // Empty input: just the magic, no chunks.
+        assert_eq!(compressed, LZ4_LEGACY_MAGIC);
     }
 }
