@@ -230,6 +230,32 @@ pub fn build_param_names(
     map
 }
 
+/// (group_label, vec of (field_name, entry_decoded, exit_decoded_or_none)).
+type FieldGroup = (String, Vec<(String, String, Option<String>)>);
+
+/// Format a single field line with optional entry→exit diff.
+/// When `exit_val` is present and differs from `entry_val`, shows
+/// `field  entry_val  →  exit_val` with entry_val padded to `arrow_col`.
+/// When same or no exit, shows `field  entry_val`.
+fn format_field_line(
+    out: &mut String,
+    field: &str,
+    entry_val: &str,
+    exit_val: Option<&str>,
+    fw: usize,
+    arrow_col: usize,
+) {
+    match exit_val {
+        Some(ev) if ev != entry_val => {
+            let col = arrow_col.max(entry_val.len());
+            out.push_str(&format!("      {field:<fw$}  {entry_val:<col$}  →  {ev}\n"));
+        }
+        _ => {
+            out.push_str(&format!("      {field:<fw$}  {entry_val}\n"));
+        }
+    }
+}
+
 fn format_probe_events_inner(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)],
@@ -420,8 +446,32 @@ fn format_probe_events_inner(
             }
             let merged_cpumask_str = format_cpumask_display(&cpumask_words, nr_cpus);
 
+            // Build exit field lookup for paired display.
+            let mut exit_cpumask_words: [u64; 4] = [0; 4];
+            let exit_map: std::collections::HashMap<&str, u64> = event
+                .exit_fields
+                .iter()
+                .map(|(k, v)| {
+                    let (_, field) = k.split_once('.').unwrap_or((k, k));
+                    match field {
+                        "cpumask_0" => exit_cpumask_words[0] = *v,
+                        "cpumask_1" => exit_cpumask_words[1] = *v,
+                        "cpumask_2" => exit_cpumask_words[2] = *v,
+                        "cpumask_3" => exit_cpumask_words[3] = *v,
+                        _ => {}
+                    }
+                    (field, *v)
+                })
+                .collect();
+            let exit_cpumask_str = if !event.exit_fields.is_empty() {
+                Some(format_cpumask_display(&exit_cpumask_words, nr_cpus))
+            } else {
+                None
+            };
+            let has_exit = !event.exit_fields.is_empty();
+
             // Group fields by parameter, emit type headers for struct params.
-            let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
+            let mut groups: Vec<FieldGroup> = Vec::new();
             for (key, val) in &event.fields {
                 let (param_part, field) = key.split_once('.').unwrap_or((key, key));
                 // Skip cpumask_1..3 — merged into cpumask_0 display.
@@ -436,11 +486,21 @@ fn format_probe_events_inner(
                 } else {
                     pname.to_string()
                 };
-                let decoded = if field == "cpumask_0" {
-                    // Use merged multi-word cpumask.
+                let entry_decoded = if field == "cpumask_0" {
                     merged_cpumask_str.clone()
                 } else {
                     decode_named_value(field, &val.to_string())
+                };
+                let exit_decoded = if has_exit {
+                    if field == "cpumask_0" {
+                        exit_cpumask_str.clone()
+                    } else {
+                        exit_map
+                            .get(field)
+                            .map(|ev| decode_named_value(field, &ev.to_string()))
+                    }
+                } else {
+                    None
                 };
                 let display_field = if field == "cpumask_0" {
                     "cpus_ptr".to_string()
@@ -448,9 +508,9 @@ fn format_probe_events_inner(
                     field.to_string()
                 };
                 if let Some(grp) = groups.iter_mut().find(|(l, _)| l == &label) {
-                    grp.1.push((display_field, decoded));
+                    grp.1.push((display_field, entry_decoded, exit_decoded));
                 } else {
-                    groups.push((label, vec![(display_field, decoded)]));
+                    groups.push((label, vec![(display_field, entry_decoded, exit_decoded)]));
                 }
             }
 
@@ -458,22 +518,49 @@ fn format_probe_events_inner(
             let struct_field_vals: std::collections::HashSet<(&str, &str)> = groups
                 .iter()
                 .filter(|(l, _)| l.contains('*'))
-                .flat_map(|(_, fields)| fields.iter().map(|(f, v)| (f.as_str(), v.as_str())))
+                .flat_map(|(_, fields)| fields.iter().map(|(f, v, _)| (f.as_str(), v.as_str())))
                 .collect();
+
+            // Compute arrow column: max entry value length across
+            // changed fields (where exit differs from entry).
+            let arrow_col: usize = groups
+                .iter()
+                .flat_map(|(_, fields)| fields.iter())
+                .filter_map(|(_, ev, xv)| {
+                    xv.as_ref()
+                        .filter(|x| x.as_str() != ev.as_str())
+                        .map(|_| ev.len())
+                })
+                .max()
+                .unwrap_or(0);
 
             let fw = max_field_w;
             for (label, fields) in &groups {
                 if fields.len() == 1 && !label.contains('*') {
-                    let (fname, val) = &fields[0];
+                    let (fname, entry_val, exit_val) = &fields[0];
                     // Suppress scalar if identical name+value exists in a struct group.
-                    if struct_field_vals.contains(&(fname.as_str(), val.as_str())) {
+                    if struct_field_vals.contains(&(fname.as_str(), entry_val.as_str())) {
                         continue;
                     }
-                    out.push_str(&format!("      {:<fw$}  {val}\n", label));
+                    format_field_line(
+                        &mut out,
+                        label,
+                        entry_val,
+                        exit_val.as_deref(),
+                        fw,
+                        arrow_col,
+                    );
                 } else {
                     out.push_str(&format!("    {label}\n"));
-                    for (fname, val) in fields {
-                        out.push_str(&format!("      {:<fw$}  {val}\n", fname));
+                    for (fname, entry_val, exit_val) in fields {
+                        format_field_line(
+                            &mut out,
+                            fname,
+                            entry_val,
+                            exit_val.as_deref(),
+                            fw,
+                            arrow_col,
+                        );
                     }
                 }
             }
@@ -599,6 +686,7 @@ mod tests {
                 ],
                 kstack: vec![],
                 str_val: None,
+                ..Default::default()
             },
             ProbeEvent {
                 func_idx: 1,
@@ -608,6 +696,7 @@ mod tests {
                 fields: vec![],
                 kstack: vec![],
                 str_val: None,
+                ..Default::default()
             },
         ];
         let func_names = vec![
@@ -638,6 +727,7 @@ mod tests {
             fields: vec![],
             kstack: vec![],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "known_func".to_string())];
 
@@ -737,6 +827,7 @@ mod tests {
                 fields: vec![],
                 kstack: vec![],
                 str_val: None,
+                ..Default::default()
             },
             ProbeEvent {
                 func_idx: 0,
@@ -746,6 +837,7 @@ mod tests {
                 fields: vec![],
                 kstack: vec![],
                 str_val: None,
+                ..Default::default()
             },
         ];
         let func_names = vec![
@@ -772,6 +864,7 @@ mod tests {
             fields: vec![],
             kstack: vec![],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "test_func".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);
@@ -810,6 +903,7 @@ mod tests {
             fields: vec![],
             kstack: vec![0xffffffff81000100, 0xffffffff81000200],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "trigger_func".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);
@@ -842,6 +936,7 @@ mod tests {
             fields: vec![("p0:task_struct.pid".to_string(), 123)],
             kstack: vec![],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);
@@ -868,6 +963,7 @@ mod tests {
             ],
             kstack: vec![],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "do_enqueue".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);
@@ -921,6 +1017,7 @@ mod tests {
             ],
             kstack: vec![],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);
@@ -963,6 +1060,7 @@ mod tests {
             ],
             kstack: vec![],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);
@@ -992,6 +1090,7 @@ mod tests {
             fields: vec![],
             kstack: vec![],
             str_val: Some("error: task stuck".to_string()),
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "scx_exit".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);
@@ -1016,6 +1115,7 @@ mod tests {
             fields: vec![],
             kstack: vec![],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "mitosis_enqueue".to_string())];
         let mut locs = std::collections::HashMap::new();
@@ -1075,6 +1175,7 @@ mod tests {
             fields: vec![("rq:rq.cpu".to_string(), 2)],
             kstack: vec![],
             str_val: None,
+            ..Default::default()
         }];
         let func_names = vec![(0u32, "scx_tick".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);

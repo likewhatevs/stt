@@ -10,7 +10,10 @@
 #define FENTRY_BATCH 4
 #define MAX_STR_LEN 64
 
-/* Per-probe-hit captured data, stored in hash map keyed by (func_ip, task_ptr). */
+/* Per-probe-hit captured data, stored in hash map keyed by (func_ip, task_ptr).
+ * Entry fields are written by fentry/kprobe at function entry.
+ * Exit fields are written in-place by fexit at function exit
+ * via bpf_map_lookup_elem on the same key. */
 struct probe_entry {
 	unsigned long long ts;
 	unsigned long long args[MAX_ARGS];
@@ -19,6 +22,11 @@ struct probe_entry {
 	char str_val[MAX_STR_LEN];   /* string arg (char *), NUL-terminated */
 	unsigned char has_str;        /* nonzero if str_val is populated */
 	unsigned char str_param_idx;  /* which arg was the string source */
+	/* Exit-side capture (written by fexit). */
+	unsigned long long exit_ts;
+	unsigned long long exit_fields[MAX_FIELDS];
+	unsigned int nr_exit_fields;
+	unsigned char has_exit;       /* nonzero if fexit fired */
 };
 
 /* Field dereference spec: for a pointer param, read at base + offset.

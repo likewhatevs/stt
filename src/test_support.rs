@@ -3820,6 +3820,7 @@ mod tests {
                 fields: vec![("p:task_struct.pid".to_string(), 42)],
                 kstack: vec![],
                 str_val: None,
+                ..Default::default()
             }],
             func_names: vec![(0, "schedule".to_string())],
             bpf_source_locs: Default::default(),
@@ -3875,6 +3876,7 @@ mod tests {
                     ],
                     kstack: vec![],
                     str_val: None,
+                    ..Default::default()
                 },
                 ProbeEvent {
                     func_idx: 1,
@@ -3884,6 +3886,7 @@ mod tests {
                     fields: vec![("rq:rq.cpu".to_string(), 3)],
                     kstack: vec![],
                     str_val: None,
+                    ..Default::default()
                 },
             ],
             func_names: vec![

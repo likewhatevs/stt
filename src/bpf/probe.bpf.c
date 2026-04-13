@@ -28,6 +28,16 @@ struct {
 	__uint(max_entries, MAX_FUNCS * 1024);
 } probe_data SEC(".maps");
 
+/* Per-CPU scratch buffer for probe_entry construction. Avoids
+ * stack-allocating ~395 bytes (probe_entry with exit fields)
+ * which would exceed the 512-byte BPF stack limit. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct probe_entry);
+	__uint(max_entries, 1);
+} probe_scratch SEC(".maps");
+
 /* Ring buffer for events to userspace. */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -71,19 +81,24 @@ int ktstr_probe(struct pt_regs *ctx)
 		return 0;
 	}
 
-	struct probe_entry entry = {};
-	entry.ts = bpf_ktime_get_ns();
+	u32 zero = 0;
+	struct probe_entry *entry = bpf_map_lookup_elem(&probe_scratch, &zero);
+	if (!entry)
+		return 0;
+	__builtin_memset(entry, 0, sizeof(*entry));
+
+	entry->ts = bpf_ktime_get_ns();
 
 	/* Capture raw args (up to 6). */
-	entry.args[0] = PT_REGS_PARM1_CORE(ctx);
-	entry.args[1] = PT_REGS_PARM2_CORE(ctx);
-	entry.args[2] = PT_REGS_PARM3_CORE(ctx);
-	entry.args[3] = PT_REGS_PARM4_CORE(ctx);
-	entry.args[4] = PT_REGS_PARM5_CORE(ctx);
-	entry.args[5] = PT_REGS_PARM6_CORE(ctx);
+	entry->args[0] = PT_REGS_PARM1_CORE(ctx);
+	entry->args[1] = PT_REGS_PARM2_CORE(ctx);
+	entry->args[2] = PT_REGS_PARM3_CORE(ctx);
+	entry->args[3] = PT_REGS_PARM4_CORE(ctx);
+	entry->args[4] = PT_REGS_PARM5_CORE(ctx);
+	entry->args[5] = PT_REGS_PARM6_CORE(ctx);
 
 	/* Dereference struct fields via BTF-resolved offsets. */
-	entry.nr_fields = meta->nr_field_specs;
+	entry->nr_fields = meta->nr_field_specs;
 	for (int i = 0; i < MAX_FIELDS && i < meta->nr_field_specs; i++) {
 		struct field_spec *spec = &meta->specs[i];
 		u32 pidx = spec->param_idx;
@@ -92,7 +107,7 @@ int ktstr_probe(struct pt_regs *ctx)
 		if (pidx >= MAX_ARGS || fidx >= MAX_FIELDS || !spec->size)
 			continue;
 
-		u64 base = entry.args[pidx];
+		u64 base = entry->args[pidx];
 		if (!base)
 			continue;
 
@@ -114,23 +129,23 @@ int ktstr_probe(struct pt_regs *ctx)
 		int ret = bpf_probe_read_kernel(&val, sz,
 						(void *)(base + spec->offset));
 		if (ret == 0)
-			entry.fields[fidx] = val;
+			entry->fields[fidx] = val;
 	}
 
 	/* Read string arg if func_meta specifies one. */
 	if (meta->str_param_idx < MAX_ARGS) {
-		u64 str_ptr = entry.args[meta->str_param_idx];
+		u64 str_ptr = entry->args[meta->str_param_idx];
 		if (str_ptr) {
-			bpf_probe_read_kernel_str(entry.str_val,
-						  sizeof(entry.str_val),
+			bpf_probe_read_kernel_str(entry->str_val,
+						  sizeof(entry->str_val),
 						  (void *)str_ptr);
-			entry.has_str = 1;
-			entry.str_param_idx = meta->str_param_idx;
+			entry->has_str = 1;
+			entry->str_param_idx = meta->str_param_idx;
 		}
 	}
 
 	struct probe_key key = { .func_ip = ip, .task_ptr = task_ptr };
-	bpf_map_update_elem(&probe_data, &key, &entry, BPF_ANY);
+	bpf_map_update_elem(&probe_data, &key, entry, BPF_ANY);
 
 	return 0;
 }
