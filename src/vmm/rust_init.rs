@@ -28,6 +28,8 @@ use nix::unistd::mkdir;
 const COM2: &str = "/dev/ttyS1";
 /// COM1 device path for kernel console / trace output.
 const COM1: &str = "/dev/ttyS0";
+/// Virtio-console device path. Used for shell I/O when available.
+const HVC0: &str = "/dev/hvc0";
 
 /// Returns true when this process is PID 1 (running as /init in a VM).
 pub fn is_pid1() -> bool {
@@ -152,7 +154,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Shell mode: interactive busybox shell instead of test dispatch.
     if shell_mode_requested() {
         let _shell_span = tracing::debug_span!("shell_mode").entered();
-        redirect_all_stdio_to_com2();
+        let console_dev = shell_console_device();
+        redirect_all_stdio_to(console_dev);
 
         // Create busybox applet symlinks.
         {
@@ -330,24 +333,28 @@ fn shell_mode_requested() -> bool {
         .unwrap_or(false)
 }
 
-/// Redirect stdin, stdout, and stderr to COM2 with O_RDWR.
+/// Redirect stdin, stdout, and stderr to the given device with O_RDWR.
 ///
-/// Shell mode needs all three fds on COM2: stdin for reading input
-/// from the serial port, stdout/stderr for writing output. The
-/// existing `redirect_stdio_to_com2()` opens write-only and only
-/// redirects fd 1 and fd 2.
-fn redirect_all_stdio_to_com2() {
+/// Shell mode needs all three fds on the console device: stdin for
+/// reading input, stdout/stderr for writing output.
+fn redirect_all_stdio_to(path: &str) {
     use std::os::unix::io::AsRawFd;
 
-    let Ok(com2) = fs::OpenOptions::new().read(true).write(true).open(COM2) else {
+    let Ok(dev) = fs::OpenOptions::new().read(true).write(true).open(path) else {
         return;
     };
-    let fd = com2.as_raw_fd();
+    let fd = dev.as_raw_fd();
     unsafe {
         libc::dup2(fd, 0); // stdin
         libc::dup2(fd, 1); // stdout
         libc::dup2(fd, 2); // stderr
     }
+}
+
+/// Select the console device for shell mode.
+/// Prefers /dev/hvc0 (virtio-console) when available, falls back to COM2.
+fn shell_console_device() -> &'static str {
+    if Path::new(HVC0).exists() { HVC0 } else { COM2 }
 }
 
 /// Mount devpts at /dev/pts for PTY allocation.

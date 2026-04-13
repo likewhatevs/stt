@@ -4,6 +4,7 @@ pub mod initramfs;
 pub(crate) mod rust_init;
 pub mod shm_ring;
 pub mod topology;
+pub(crate) mod virtio_console;
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
@@ -1170,10 +1171,10 @@ impl KtstrVm {
         Ok(result)
     }
 
-    /// Boot the VM with bidirectional stdin/stdout forwarding via COM2.
+    /// Boot the VM with bidirectional stdin/stdout forwarding via virtio-console.
     ///
-    /// Sets the host terminal to raw mode, spawns threads for stdin->COM2
-    /// and COM2->stdout forwarding, and runs until the guest shuts down.
+    /// Sets the host terminal to raw mode, spawns threads for stdin->hvc0
+    /// and hvc0->stdout forwarding, and runs until the guest shuts down.
     /// Terminal state is restored on all exit paths including panic and
     /// process-killing signals (SIGINT, SIGTERM, SIGQUIT).
     ///
@@ -1201,6 +1202,11 @@ impl KtstrVm {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
+        // Virtio-console for shell I/O via /dev/hvc0.
+        let mut vc = virtio_console::VirtioConsole::new();
+        vc.set_mem(vm.guest_mem.clone());
+        let virtio_con = Arc::new(PiMutex::new(vc));
+
         #[cfg(target_arch = "x86_64")]
         if !vm.split_irqchip {
             vm.vm_fd
@@ -1209,6 +1215,9 @@ impl KtstrVm {
             vm.vm_fd
                 .register_irqfd(com2.lock().irq_evt(), console::COM2_IRQ)
                 .context("register COM2 irqfd")?;
+            vm.vm_fd
+                .register_irqfd(virtio_con.lock().irq_evt(), kvm::VIRTIO_CONSOLE_IRQ)
+                .context("register virtio-console irqfd")?;
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -1218,6 +1227,9 @@ impl KtstrVm {
             vm.vm_fd
                 .register_irqfd(com2.lock().irq_evt(), kvm::SERIAL2_IRQ)
                 .context("register serial2 irqfd")?;
+            vm.vm_fd
+                .register_irqfd(virtio_con.lock().irq_evt(), kvm::VIRTIO_CONSOLE_IRQ)
+                .context("register virtio-console irqfd")?;
         }
 
         // Pre-flight: verify stdin is a tty, enter raw mode, and create
@@ -1247,13 +1259,20 @@ impl KtstrVm {
         let mut bsp = vcpus.remove(0);
 
         let ap_pins = vec![None; vcpus.len()];
-        let ap_threads =
-            self.spawn_ap_threads(vcpus, has_immediate_exit, &com1, &com2, &kill, &ap_pins)?;
+        let ap_threads = self.spawn_ap_threads(
+            vcpus,
+            has_immediate_exit,
+            &com1,
+            &com2,
+            Some(&virtio_con),
+            &kill,
+            &ap_pins,
+        )?;
 
-        // Stdin reader thread: host stdin -> COM2 input.
+        // Stdin reader thread: host stdin -> virtio-console RX queue.
         // Uses poll() on both stdin and the wakeup pipe so the thread can
         // be cleanly joined on shutdown.
-        let com2_for_stdin = com2.clone();
+        let vc_for_stdin = virtio_con.clone();
         let kill_for_stdin = kill.clone();
         let stdin_thread = std::thread::Builder::new()
             .name("interactive-stdin".into())
@@ -1303,7 +1322,7 @@ impl KtstrVm {
                         match stdin.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                com2_for_stdin.lock().queue_input(&buf[..n]);
+                                vc_for_stdin.lock().queue_input(&buf[..n]);
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             Err(_) => break,
@@ -1313,31 +1332,55 @@ impl KtstrVm {
             })
             .context("spawn stdin reader thread")?;
 
-        // Stdout writer thread: COM2 output -> host stdout.
+        // Stdout writer thread: virtio-console TX -> host stdout.
+        // Polls tx_evt for zero-latency wakeup when guest writes data.
         // On write errors (including BrokenPipe), sets kill flag and exits
         // to stop the VM rather than polling a dead pipe until timeout.
-        let com2_for_stdout = com2.clone();
+        let vc_for_stdout = virtio_con.clone();
         let kill_for_stdout = kill.clone();
         let stdout_thread = std::thread::Builder::new()
             .name("interactive-stdout".into())
             .spawn(move || {
                 use std::io::Write;
+
+                // Cache the raw fd for poll. The eventfd lives as long as
+                // VirtioConsole which is behind Arc<PiMutex> — valid for
+                // the thread's lifetime.
+                let tx_evt_raw_fd = {
+                    let guard = vc_for_stdout.lock();
+                    std::os::unix::io::AsRawFd::as_raw_fd(guard.tx_evt())
+                };
                 let mut stdout = std::io::stdout().lock();
                 loop {
                     if kill_for_stdout.load(Ordering::Acquire) {
                         break;
                     }
-                    let data = com2_for_stdout.lock().drain_output();
+                    // SAFETY: tx_evt_raw_fd is valid for the Arc's lifetime.
+                    let borrowed =
+                        unsafe { std::os::unix::io::BorrowedFd::borrow_raw(tx_evt_raw_fd) };
+                    let mut fds = [nix::poll::PollFd::new(
+                        borrowed,
+                        nix::poll::PollFlags::POLLIN,
+                    )];
+                    match nix::poll::poll(&mut fds, 50u16) {
+                        Ok(0) => {}
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(_) => break,
+                        Ok(_) => {
+                            // Consume eventfd counter.
+                            let _ = vc_for_stdout.lock().tx_evt().read();
+                        }
+                    }
+                    let data = vc_for_stdout.lock().drain_output();
                     if !data.is_empty()
                         && (stdout.write_all(&data).is_err() || stdout.flush().is_err())
                     {
                         kill_for_stdout.store(true, Ordering::Release);
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(10));
                 }
                 // Final drain after kill.
-                let data = com2_for_stdout.lock().drain_output();
+                let data = vc_for_stdout.lock().drain_output();
                 if !data.is_empty() {
                     let _ = stdout.write_all(&data);
                     let _ = stdout.flush();
@@ -1355,6 +1398,7 @@ impl KtstrVm {
             &mut bsp,
             &com1,
             &com2,
+            Some(&virtio_con),
             &kill,
             has_immediate_exit,
             start,
@@ -1946,6 +1990,15 @@ impl KtstrVm {
         if self.init_binary.is_some() {
             cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
         }
+        // Virtio-console MMIO device on the kernel cmdline. The kernel's
+        // virtio_mmio_cmdline_devices driver parses this to register the
+        // MMIO transport at the given base address and IRQ.
+        cmdline.push_str(&format!(
+            " virtio_mmio.device={:#x}@{:#x}:{}",
+            virtio_console::VIRTIO_MMIO_SIZE,
+            kvm::VIRTIO_CONSOLE_MMIO_BASE,
+            kvm::VIRTIO_CONSOLE_IRQ,
+        ));
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;
             let shm_base = mem_size - self.shm_size;
@@ -2080,8 +2133,15 @@ impl KtstrVm {
             vec![None; vcpus.len()]
         };
 
-        let ap_threads =
-            self.spawn_ap_threads(vcpus, has_immediate_exit, &com1, &com2, &kill, &ap_pins)?;
+        let ap_threads = self.spawn_ap_threads(
+            vcpus,
+            has_immediate_exit,
+            &com1,
+            &com2,
+            None,
+            &kill,
+            &ap_pins,
+        )?;
 
         // Pin BSP (runs on current thread, pid=0 means calling thread).
         if let Some(Some(host_cpu)) = pin_targets.first() {
@@ -2216,6 +2276,7 @@ impl KtstrVm {
             &mut bsp,
             &com1,
             &com2,
+            None,
             &kill,
             has_immediate_exit,
             start,
@@ -2244,12 +2305,14 @@ impl KtstrVm {
 
     /// Spawn AP vCPU threads. Each thread optionally pins itself to a
     /// host CPU from `pin_targets` (indexed by AP order, 0-based).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_ap_threads(
         &self,
         vcpus: Vec<kvm_ioctls::VcpuFd>,
         has_immediate_exit: bool,
         com1: &Arc<PiMutex<console::Serial>>,
         com2: &Arc<PiMutex<console::Serial>>,
+        virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         kill: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
     ) -> Result<Vec<VcpuThread>> {
@@ -2263,6 +2326,7 @@ impl KtstrVm {
             let kill_clone = kill.clone();
             let com1_clone = com1.clone();
             let com2_clone = com2.clone();
+            let vc_clone = virtio_con.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
             let pin_cpu = pin_targets.get(i).copied().flatten();
@@ -2272,14 +2336,19 @@ impl KtstrVm {
                 .name(format!("vcpu-{}", i + 1))
                 .spawn(move || {
                     register_vcpu_signal_handler();
-                    // Pin inside the thread using pid=0 (calling thread).
                     if let Some(cpu) = pin_cpu {
                         pin_current_thread(cpu, &format!("vCPU {}", i + 1));
                     }
                     if rt {
                         set_rt_priority(1, &format!("vCPU {}", i + 1));
                     }
-                    vcpu_run_loop_unified(&mut vcpu, &com1_clone, &com2_clone, &kill_clone);
+                    vcpu_run_loop_unified(
+                        &mut vcpu,
+                        &com1_clone,
+                        &com2_clone,
+                        vc_clone.as_ref(),
+                        &kill_clone,
+                    );
                     exited_clone.store(true, Ordering::Release);
                     vcpu
                 })
@@ -2595,6 +2664,7 @@ impl KtstrVm {
         bsp: &mut kvm_ioctls::VcpuFd,
         com1: &Arc<PiMutex<console::Serial>>,
         com2: &Arc<PiMutex<console::Serial>>,
+        virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         kill: &Arc<AtomicBool>,
         has_immediate_exit: bool,
         start: Instant,
@@ -2628,7 +2698,7 @@ impl KtstrVm {
                             continue;
                         }
                     }
-                    match classify_exit(com1, com2, &mut exit) {
+                    match classify_exit(com1, com2, virtio_con.map(|a| a.as_ref()), &mut exit) {
                         Some(ExitAction::Continue) | None => {}
                         Some(ExitAction::Shutdown) => {
                             exit_code = 0;
@@ -3022,15 +3092,16 @@ impl KtstrVm {
 }
 
 // ---------------------------------------------------------------------------
-// aarch64 MMIO dispatch — serial over MMIO
+// aarch64 MMIO dispatch — serial and virtio over MMIO
 // ---------------------------------------------------------------------------
 
-/// Dispatch an MMIO write to serial devices.
+/// Dispatch an MMIO write to serial and virtio devices.
 /// Returns `true` if the caller should exit (shutdown detected).
 #[cfg(target_arch = "aarch64")]
 fn dispatch_mmio_write(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
+    virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
     addr: u64,
     data: &[u8],
 ) -> bool {
@@ -3042,15 +3113,21 @@ fn dispatch_mmio_write(
         && let Some(&byte) = data.first()
     {
         com2.lock().inner_write(offset, byte);
+    } else if let Some(vc) = virtio_con {
+        let base = kvm::VIRTIO_CONSOLE_MMIO_BASE;
+        if addr >= base && addr < base + virtio_console::VIRTIO_MMIO_SIZE {
+            vc.lock().mmio_write(addr - base, data);
+        }
     }
     false
 }
 
-/// Dispatch an MMIO read from serial devices.
+/// Dispatch an MMIO read from serial and virtio-console devices.
 #[cfg(target_arch = "aarch64")]
 fn dispatch_mmio_read(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
+    virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
     addr: u64,
     data: &mut [u8],
 ) {
@@ -3062,8 +3139,13 @@ fn dispatch_mmio_read(
         if let Some(first) = data.first_mut() {
             *first = com2.lock().inner_read(offset);
         }
+    } else if let Some(vc) = virtio_con
+        && addr >= kvm::VIRTIO_CONSOLE_MMIO_BASE
+        && addr < kvm::VIRTIO_CONSOLE_MMIO_BASE + virtio_console::VIRTIO_MMIO_SIZE
+    {
+        vc.lock()
+            .mmio_read(addr - kvm::VIRTIO_CONSOLE_MMIO_BASE, data);
     } else {
-        // Unknown MMIO: return 0xFF for reads (missing device).
         for b in data.iter_mut() {
             *b = 0xff;
         }
@@ -3090,6 +3172,7 @@ fn vcpu_run_loop_unified(
     vcpu: &mut kvm_ioctls::VcpuFd,
     com1: &Arc<PiMutex<console::Serial>>,
     com2: &Arc<PiMutex<console::Serial>>,
+    virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
     kill: &Arc<AtomicBool>,
 ) {
     loop {
@@ -3105,7 +3188,7 @@ fn vcpu_run_loop_unified(
                     }
                     continue;
                 }
-                match classify_exit(com1, com2, &mut exit) {
+                match classify_exit(com1, com2, virtio_con.map(|a| a.as_ref()), &mut exit) {
                     Some(ExitAction::Continue) | None => {}
                     Some(ExitAction::Shutdown) => {
                         kill.store(true, Ordering::Release);
@@ -3156,9 +3239,13 @@ enum ExitAction {
 /// Returns `None` for HLT (role-dependent) and unknown exits (continue).
 /// Takes the exit by mutable reference so IoIn/MmioRead data buffers
 /// can be written back.
+///
+/// On aarch64, serial and virtio-console are dispatched via MMIO.
+/// On x86_64, serial is dispatched via port I/O; virtio-console via MMIO.
 fn classify_exit(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
+    virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
     exit: &mut VcpuExit,
 ) -> Option<ExitAction> {
     match exit {
@@ -3177,7 +3264,7 @@ fn classify_exit(
         }
         #[cfg(target_arch = "aarch64")]
         VcpuExit::MmioWrite(addr, data) => {
-            if dispatch_mmio_write(com1, com2, *addr, data) {
+            if dispatch_mmio_write(com1, com2, virtio_con, *addr, data) {
                 Some(ExitAction::Shutdown)
             } else {
                 Some(ExitAction::Continue)
@@ -3185,7 +3272,7 @@ fn classify_exit(
         }
         #[cfg(target_arch = "aarch64")]
         VcpuExit::MmioRead(addr, data) => {
-            dispatch_mmio_read(com1, com2, *addr, data);
+            dispatch_mmio_read(com1, com2, virtio_con, *addr, data);
             Some(ExitAction::Continue)
         }
         VcpuExit::Hlt => None,
@@ -3200,14 +3287,30 @@ fn classify_exit(
         VcpuExit::FailEntry(reason, _cpu) => Some(ExitAction::Fatal(Some(*reason))),
         VcpuExit::InternalError => Some(ExitAction::Fatal(None)),
         #[cfg(target_arch = "x86_64")]
-        VcpuExit::MmioRead(_addr, data) => {
+        VcpuExit::MmioRead(addr, data) => {
+            if let Some(vc) = virtio_con {
+                let base = kvm::VIRTIO_CONSOLE_MMIO_BASE;
+                if *addr >= base && *addr < base + virtio_console::VIRTIO_MMIO_SIZE {
+                    vc.lock().mmio_read(*addr - base, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
             for b in data.iter_mut() {
                 *b = 0xff;
             }
             Some(ExitAction::Continue)
         }
         #[cfg(target_arch = "x86_64")]
-        VcpuExit::MmioWrite(_addr, _data) => Some(ExitAction::Continue),
+        VcpuExit::MmioWrite(addr, data) => {
+            if let Some(vc) = virtio_con {
+                let base = kvm::VIRTIO_CONSOLE_MMIO_BASE;
+                if *addr >= base && *addr < base + virtio_console::VIRTIO_MMIO_SIZE {
+                    vc.lock().mmio_write(*addr - base, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
+            Some(ExitAction::Continue)
+        }
         _ => None,
     }
 }

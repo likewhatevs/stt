@@ -56,6 +56,8 @@ vm-fdt = "0.3"
 vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
 cpio = "0.4.1"
+virtio-bindings = "0.2.7"
+virtio-queue = "0.17"
 vm-superio = "0.8.1"
 parking_lot = "0.12"
 zerocopy = { version = "0.8.48", features = ["derive"] }

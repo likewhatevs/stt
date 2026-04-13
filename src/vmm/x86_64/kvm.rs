@@ -37,6 +37,14 @@ pub(crate) const MMIO_GAP_START: u64 = 0xC000_0000;
 /// End of PCI MMIO gap (4 GB). Memory above this resumes as RAM.
 pub(crate) const MMIO_GAP_END: u64 = 0x1_0000_0000;
 
+/// Virtio-console MMIO base: start of the MMIO gap.
+pub(crate) const VIRTIO_CONSOLE_MMIO_BASE: u64 = MMIO_GAP_START;
+
+/// IRQ for virtio-console (GSI routed through IOAPIC/LAPIC).
+/// Uses IRQ 5 — available with full IRQ chip. With split IRQ chip
+/// (no IOAPIC), MSI would be needed; not supported for now.
+pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
+
 /// E820 memory type: usable RAM.
 pub(crate) const E820_RAM: u32 = 1;
 

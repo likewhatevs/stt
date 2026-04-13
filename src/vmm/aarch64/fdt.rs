@@ -5,8 +5,9 @@ use crate::vmm::aarch64::topology::mpidr_to_fdt_reg;
 use crate::vmm::kvm::{
     DRAM_START, FDT_MAX_SIZE, GIC_DIST_BASE, GIC_DIST_SIZE, GIC_REDIST_BASE,
     GIC_REDIST_SIZE_PER_CPU, SERIAL_IRQ, SERIAL_MMIO_BASE, SERIAL_MMIO_SIZE, SERIAL2_IRQ,
-    SERIAL2_MMIO_BASE,
+    SERIAL2_MMIO_BASE, VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_MMIO_BASE,
 };
+use crate::vmm::virtio_console;
 
 /// GIC phandle — unique identifier referenced by interrupt-parent properties.
 const GIC_PHANDLE: u32 = 1;
@@ -66,6 +67,14 @@ pub fn create_fdt(
     // /serial — two ns16550a UARTs with edge-triggered SPI interrupts via irqfd
     write_serial(&mut fdt, SERIAL_MMIO_BASE, "serial0", SERIAL_IRQ)?;
     write_serial(&mut fdt, SERIAL2_MMIO_BASE, "serial1", SERIAL2_IRQ)?;
+
+    // /virtio_mmio — virtio-console
+    write_virtio_mmio(
+        &mut fdt,
+        VIRTIO_CONSOLE_MMIO_BASE,
+        virtio_console::VIRTIO_MMIO_SIZE,
+        VIRTIO_CONSOLE_IRQ,
+    )?;
 
     // /timer — arm generic timer
     write_timer(&mut fdt)?;
@@ -235,6 +244,29 @@ fn write_serial(fdt: &mut FdtWriter, base: u64, alias: &str, irq: u32) -> Result
     fdt.property_u32("reg-io-width", 1)
         .context("serial reg-io-width")?;
     fdt.end_node(serial).context("end serial")?;
+    Ok(())
+}
+
+fn write_virtio_mmio(fdt: &mut FdtWriter, base: u64, size: u64, irq: u32) -> Result<()> {
+    let name = format!("virtio_mmio@{base:x}");
+    let node = fdt.begin_node(&name).context("begin virtio_mmio")?;
+    fdt.property_string("compatible", "virtio,mmio")
+        .context("virtio_mmio compatible")?;
+    fdt.property_array_u32(
+        "reg",
+        &[
+            (base >> 32) as u32,
+            base as u32,
+            (size >> 32) as u32,
+            size as u32,
+        ],
+    )
+    .context("virtio_mmio reg")?;
+    fdt.property_array_u32("interrupts", &[GIC_SPI, irq - 32, IRQ_TYPE_EDGE_RISING])
+        .context("virtio_mmio interrupts")?;
+    fdt.property_u32("interrupt-parent", GIC_PHANDLE)
+        .context("virtio_mmio interrupt-parent")?;
+    fdt.end_node(node).context("end virtio_mmio")?;
     Ok(())
 }
 

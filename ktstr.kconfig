@@ -35,12 +35,17 @@ CONFIG_DYNAMIC_FTRACE=y
 # /sys (sysfs for cgroups, tracing), and reads /dev/mem for
 # SHM dump polling.
 #
-# Serial: x86 VMM uses ISA 16550 (COM1/COM2), arm64 uses PL011.
+# Serial: x86 VMM uses ISA 16550 (COM1/COM2), arm64 uses ns16550a via MMIO.
 # Both drivers are included so the same fragment works on either arch.
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_SERIAL_AMBA_PL011=y
 CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+# Virtio-console: MMIO transport, creates /dev/hvc0 for shell mode.
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+CONFIG_VIRTIO_CONSOLE=y
 CONFIG_BLK_DEV_INITRD=y
 CONFIG_RD_LZ4=y
 CONFIG_TTY=y

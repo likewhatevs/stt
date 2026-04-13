@@ -40,6 +40,12 @@ pub(crate) const SERIAL_MMIO_SIZE: u64 = 0x1000;
 /// Second serial for application output. SPI 34.
 pub(crate) const SERIAL2_MMIO_BASE: u64 = SERIAL_MMIO_BASE + SERIAL_MMIO_SIZE;
 
+/// Virtio-console MMIO base. Placed after the two serial regions.
+pub(crate) const VIRTIO_CONSOLE_MMIO_BASE: u64 = SERIAL2_MMIO_BASE + SERIAL_MMIO_SIZE;
+
+/// SPI interrupt for virtio-console. SPI 35.
+pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 35;
+
 /// Kernel Image load address. 2 MB aligned per arm64 boot protocol.
 /// Relative to DRAM_START — the kernel is loaded at DRAM_START + text_offset,
 /// but the PE loader base address must be DRAM_START (2 MB aligned).
@@ -338,7 +344,7 @@ impl KtstrKvm {
     /// We must explicitly route GSI numbers to GIC SPI pins via
     /// KVM_SET_GSI_ROUTING before register_irqfd will deliver interrupts.
     fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
-        let irqs = [SERIAL_IRQ, SERIAL2_IRQ];
+        let irqs = [SERIAL_IRQ, SERIAL2_IRQ, VIRTIO_CONSOLE_IRQ];
         let mut routing = KvmIrqRouting::new(irqs.len()).context("create KvmIrqRouting")?;
         for (i, &irq) in irqs.iter().enumerate() {
             routing.as_mut_slice()[i] = kvm_irq_routing_entry {
@@ -464,5 +470,12 @@ mod tests {
         const { assert!(GIC_REDIST_BASE < DRAM_START) };
         const { assert!(SERIAL_MMIO_BASE < DRAM_START) };
         const { assert!(SERIAL2_MMIO_BASE < DRAM_START) };
+        const { assert!(VIRTIO_CONSOLE_MMIO_BASE < DRAM_START) };
+        const {
+            assert!(
+                VIRTIO_CONSOLE_MMIO_BASE + crate::vmm::virtio_console::VIRTIO_MMIO_SIZE
+                    <= DRAM_START
+            )
+        };
     }
 }
