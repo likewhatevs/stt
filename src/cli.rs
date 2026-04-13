@@ -883,10 +883,10 @@ pub fn success(msg: &str) {
     }
 }
 
-/// Print a yellow warning to stderr.
+/// Print a blue warning to stderr.
 pub fn warn(msg: &str) {
     if stderr_color() {
-        eprintln!("\x1b[33m{msg}\x1b[0m");
+        eprintln!("\x1b[34m{msg}\x1b[0m");
     } else {
         eprintln!("{msg}");
     }
