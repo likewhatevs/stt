@@ -246,64 +246,41 @@ pub fn make_kernel(kernel_dir: &Path) -> Result<()> {
     run_make(kernel_dir, &arg_refs)
 }
 
-/// Run make with output piped through a spinner. Stdout and stderr
-/// are read in background threads and serialized through a channel.
-/// A single consumer prints each line via `spinner.suspend()` to
-/// avoid racing with the spinner tick thread.
+/// Run make with merged stdout+stderr piped through a spinner.
+/// Uses `sh -c "make ... 2>&1"` for a single pipe — one reader,
+/// no threads, no channel, no pipe-buffer deadlock.
 ///
-/// When no spinner is active, pass `None` and output is captured
-/// silently (shown only on failure).
+/// When a spinner is active, each line is printed via `suspend()`
+/// so the spinner tick doesn't race with output. When no spinner,
+/// output is captured and shown only on failure.
 pub fn run_make_with_output(
     kernel_dir: &Path,
     args: &[&str],
     spinner: Option<&Spinner>,
 ) -> Result<()> {
-    let mut child = std::process::Command::new("make")
-        .args(args)
+    let make_cmd = format!("make {} 2>&1", args.join(" "));
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &make_cmd])
         .current_dir(kernel_dir)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-
-    let tx1 = tx.clone();
-    let stdout_thread = std::thread::spawn(move || {
-        if let Some(out) = stdout {
-            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                let _ = tx1.send(line);
-            }
-        }
-    });
-
-    let tx2 = tx;
-    let stderr_thread = std::thread::spawn(move || {
-        if let Some(err) = stderr {
-            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-                let _ = tx2.send(line);
-            }
-        }
-    });
-
-    // Single consumer: print each line through the spinner (if active)
-    // or collect for error reporting.
+    let stdout = child.stdout.take().expect("piped stdout");
     let mut captured = Vec::new();
-    for line in rx {
+    for line in std::io::BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+    {
         if let Some(sp) = spinner {
             sp.suspend(|| eprintln!("{line}"));
         }
         captured.push(line);
     }
 
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
     let status = child.wait()?;
-
     if !status.success() {
         if spinner.is_none() {
-            // Output wasn't printed live — dump it now.
             for line in &captured {
                 eprintln!("{line}");
             }
