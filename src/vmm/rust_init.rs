@@ -152,7 +152,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Set environment variables.
     // SAFETY: single-threaded context — PID 1 before any threads spawn.
     unsafe {
-        std::env::set_var("PATH", "/include-files:/bin");
+        std::env::set_var("PATH", build_include_path());
     }
 
     // Shell mode: interactive busybox shell instead of test dispatch.
@@ -372,6 +372,37 @@ fn cmdline_val(key: &str) -> Option<String> {
         .split_whitespace()
         .find_map(|s| s.strip_prefix(&prefix))
         .map(|s| s.to_string())
+}
+
+/// Build PATH with /include-files directories containing executables.
+///
+/// Walks /include-files recursively, collects directories that contain
+/// at least one executable file, prepends them all to PATH. This makes
+/// included binaries runnable by name regardless of subdirectory depth
+/// (e.g. `-i ../scx/target/release` → `scx_cake` works directly).
+fn build_include_path() -> String {
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
+    let include_dir = std::path::Path::new("/include-files");
+    let mut dirs = BTreeSet::new();
+
+    if include_dir.is_dir() {
+        for entry in walkdir::WalkDir::new(include_dir).follow_links(true) {
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_file()
+                && entry
+                    .metadata()
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                && let Some(parent) = entry.path().parent()
+            {
+                dirs.insert(parent.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let mut path_parts: Vec<String> = dirs.into_iter().collect();
+    path_parts.push("/bin".to_string());
+    path_parts.join(":")
 }
 
 /// Redirect stdin, stdout, and stderr to the given device with O_RDWR.
