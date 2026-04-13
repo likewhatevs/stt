@@ -1289,7 +1289,7 @@ impl KtstrVm {
 
     /// Join the initramfs thread and load the result into guest memory.
     ///
-    /// Compresses base+suffix with gzip. Attempts COW overlay from a
+    /// Compresses base+suffix with zstd. Attempts COW overlay from a
     /// compressed SHM segment to share physical pages across VMs.
     /// Falls back to write_slice if COW fails.
     #[cfg(target_arch = "x86_64")]
@@ -1341,17 +1341,17 @@ impl KtstrVm {
             );
         }
 
-        // Compress base and suffix as separate gzip streams. The kernel
-        // initramfs decompressor handles concatenated gzip natively.
+        // Compress base and suffix as separate zstd streams. The kernel
+        // initramfs decompressor handles concatenated zstd natively.
         // Keeping them separate lets us COW-map the base from SHM.
         let t0 = Instant::now();
         let gz_base = self.get_or_compress_base(base_bytes, &key)?;
         let gz_suffix = {
-            use flate2::write::GzEncoder;
             use std::io::Write;
-            let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            enc.write_all(&suffix).context("gzip suffix")?;
-            enc.finish().context("finish gzip suffix")?
+            let mut enc =
+                zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
+            enc.write_all(&suffix).context("zstd suffix")?;
+            enc.finish().context("finish zstd suffix")?
         };
         let total_compressed = gz_base.len() + gz_suffix.len();
         tracing::debug!(
@@ -1360,7 +1360,7 @@ impl KtstrVm {
             gz_base = gz_base.len(),
             gz_suffix = gz_suffix.len(),
             ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-            "gzip_initramfs",
+            "zstd_initramfs",
         );
 
         // Try COW overlay: mmap compressed base from SHM fd directly
@@ -1434,11 +1434,11 @@ impl KtstrVm {
         let t0 = Instant::now();
         let gz_base = self.get_or_compress_base(base_bytes, &key)?;
         let gz_suffix = {
-            use flate2::write::GzEncoder;
             use std::io::Write;
-            let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            enc.write_all(&suffix).context("gzip suffix")?;
-            enc.finish().context("finish gzip suffix")?
+            let mut enc =
+                zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
+            enc.write_all(&suffix).context("zstd suffix")?;
+            enc.finish().context("finish zstd suffix")?
         };
         let total_compressed = gz_base.len() + gz_suffix.len();
         tracing::debug!(
@@ -1447,7 +1447,7 @@ impl KtstrVm {
             gz_base = gz_base.len(),
             gz_suffix = gz_suffix.len(),
             ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-            "gzip_initramfs",
+            "zstd_initramfs",
         );
 
         let t0 = Instant::now();
@@ -1505,11 +1505,11 @@ impl KtstrVm {
         }
 
         // Compress and store.
-        use flate2::write::GzEncoder;
         use std::io::Write;
-        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        enc.write_all(base_bytes).context("gzip base")?;
-        let gz = enc.finish().context("finish gzip base")?;
+        let mut enc =
+            zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
+        enc.write_all(base_bytes).context("zstd base")?;
+        let gz = enc.finish().context("finish zstd base")?;
 
         if let Err(e) = initramfs::shm_store_gz(key.0, &gz) {
             tracing::warn!("shm_store_gz: {e:#}");
@@ -2556,12 +2556,12 @@ impl KtstrVm {
 
                 // Compress and load initramfs.
                 let compressed = {
-                    use flate2::write::GzEncoder;
                     use std::io::Write;
-                    let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
-                    enc.write_all(base_bytes).context("gzip initramfs base")?;
-                    enc.write_all(&suffix).context("gzip initramfs suffix")?;
-                    enc.finish().context("finish gzip initramfs")?
+                    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1)
+                        .context("create zstd encoder")?;
+                    enc.write_all(base_bytes).context("zstd initramfs base")?;
+                    enc.write_all(&suffix).context("zstd initramfs suffix")?;
+                    enc.finish().context("finish zstd initramfs")?
                 };
                 let total_size = compressed.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
@@ -2603,12 +2603,12 @@ impl KtstrVm {
                     &disable_refs,
                 )?;
                 let compressed = {
-                    use flate2::write::GzEncoder;
                     use std::io::Write;
-                    let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
-                    enc.write_all(base_bytes).context("gzip initramfs base")?;
-                    enc.write_all(&suffix).context("gzip initramfs suffix")?;
-                    enc.finish().context("finish gzip initramfs")?
+                    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1)
+                        .context("create zstd encoder")?;
+                    enc.write_all(base_bytes).context("zstd initramfs base")?;
+                    enc.write_all(&suffix).context("zstd initramfs suffix")?;
+                    enc.finish().context("finish zstd initramfs")?
                 };
                 let total_size = compressed.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);

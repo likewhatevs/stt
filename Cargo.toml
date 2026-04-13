@@ -33,7 +33,7 @@ tempfile = { version = "3", optional = true }
 xz2 = { version = "0.1", optional = true }
 opendal = { version = "0.55", default-features = false, features = ["services-ghac"], optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = "0.13"
 flate2 = "1"
 ctor = "0.8"
 libc = "0.2"
@@ -73,7 +73,7 @@ default = ["cli"]
 integration = []
 fetch = ["dep:gix", "dep:reqwest", "dep:tar", "dep:tempfile", "dep:xz2"]
 cli = ["fetch", "dep:clap", "dep:clap_complete"]
-gha-cache = ["dep:opendal", "dep:tokio", "dep:zstd", "dep:tar", "dep:tempfile"]
+gha-cache = ["dep:opendal", "dep:tokio", "dep:tar", "dep:tempfile"]
 full = ["cli", "gha-cache"]
 
 [lints.rust]

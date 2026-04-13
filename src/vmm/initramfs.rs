@@ -733,15 +733,20 @@ pub fn create_initramfs_base(
             );
         }
 
-        // Pack non-standard PT_INTERP (custom dynamic linker) into the
-        // initramfs so the guest kernel uses the same linker as the host.
-        if include_elf_paths.contains(path)
-            && let Some(ref interp) = result.interpreter
-            && !is_standard_interpreter(interp)
-        {
+        // Pack PT_INTERP (dynamic linker) into the initramfs. The
+        // interpreter is not a DT_NEEDED entry and won't appear in the
+        // resolved shared libs, so it must be added explicitly.
+        // For non-standard interpreters, also resolve their own deps.
+        if let Some(ref interp) = result.interpreter {
             let interp_path = Path::new(interp);
             if interp_path.is_file() {
-                let guest = interp.strip_prefix('/').unwrap_or(interp).to_string();
+                let canonical = std::fs::canonicalize(interp_path)
+                    .unwrap_or_else(|_| interp_path.to_path_buf());
+                let canon_str = canonical.to_string_lossy();
+                let guest = canon_str
+                    .strip_prefix('/')
+                    .unwrap_or(&canon_str)
+                    .to_string();
                 if let Some(parent) = Path::new(&guest).parent() {
                     let mut dir = PathBuf::new();
                     for component in parent.components() {
@@ -749,10 +754,26 @@ pub fn create_initramfs_base(
                         dirs.insert(dir.to_string_lossy().to_string());
                     }
                 }
-                shared_libs.push((guest, interp_path.to_path_buf()));
+                shared_libs.push((guest.clone(), canonical.clone()));
 
-                // Resolve the interpreter's own shared lib deps.
-                if let Ok(interp_result) = resolve_shared_libs(interp_path) {
+                // Also add the non-canonical path if it differs.
+                let orig_guest = interp.strip_prefix('/').unwrap_or(interp).to_string();
+                if orig_guest != guest {
+                    if let Some(parent) = Path::new(&orig_guest).parent() {
+                        let mut dir = PathBuf::new();
+                        for component in parent.components() {
+                            dir.push(component);
+                            dirs.insert(dir.to_string_lossy().to_string());
+                        }
+                    }
+                    shared_libs.push((orig_guest, canonical));
+                }
+
+                // Non-standard interpreters may have their own shared lib
+                // deps (custom toolchain linkers alongside their libs).
+                if !is_standard_interpreter(interp)
+                    && let Ok(interp_result) = resolve_shared_libs(interp_path)
+                {
                     for (g, h) in interp_result.found {
                         if let Some(parent) = Path::new(&g).parent() {
                             let mut dir = PathBuf::new();
@@ -1079,10 +1100,10 @@ pub fn shm_unlink_base(content_hash: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Compressed SHM cache — stores gzip'd base for COW overlay into guest RAM
+// Compressed SHM cache — stores zstd'd base for COW overlay into guest RAM
 // ---------------------------------------------------------------------------
 
-/// Segment name for the compressed (gzip) version of a base initramfs.
+/// Segment name for the compressed (zstd) version of a base initramfs.
 fn shm_gz_segment_name(content_hash: u64) -> String {
     format!("/ktstr-gz-{content_hash:016x}")
 }
