@@ -6,11 +6,13 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-/// Short hash of the embedded ktstr.kconfig fragment. Included in
-/// cache keys so kconfig changes produce distinct cache entries.
-fn kconfig_suffix() -> String {
-    let hash = crc32fast::hash(include_str!("../ktstr.kconfig").as_bytes());
-    format!("{hash:08x}")
+/// Cache key suffix combining the kconfig hash and ktstr build commit.
+/// Either changing the kconfig or rebuilding ktstr from a different
+/// commit invalidates cached kernels.
+fn ktstr_suffix() -> String {
+    let kc = crc32fast::hash(include_str!("../ktstr.kconfig").as_bytes());
+    let git = &crate::GIT_FULL_HASH[..7.min(crate::GIT_FULL_HASH.len())];
+    format!("{kc:08x}-{git}")
 }
 
 /// Downloaded/cloned kernel source ready for building.
@@ -166,7 +168,7 @@ pub fn download_tarball(version: &str, dest_dir: &Path) -> Result<AcquiredSource
 
     Ok(AcquiredSource {
         source_dir,
-        cache_key: format!("{version}-tarball-{arch}-kc{}", kconfig_suffix()),
+        cache_key: format!("{version}-tarball-{arch}-kc{}", ktstr_suffix()),
         version: Some(version.to_string()),
         git_hash: None,
         git_ref: None,
@@ -237,7 +239,7 @@ pub fn git_clone(url: &str, git_ref: &str, dest_dir: &Path) -> Result<AcquiredSo
     let head = repo.head_id().map_err(|e| format!("read HEAD: {e}"))?;
     let short_hash = format!("{}", head).chars().take(7).collect::<String>();
 
-    let cache_key = format!("{git_ref}-git-{short_hash}-{arch}-kc{}", kconfig_suffix());
+    let cache_key = format!("{git_ref}-git-{short_hash}-{arch}-kc{}", ktstr_suffix());
 
     Ok(AcquiredSource {
         source_dir: clone_dir,
@@ -295,7 +297,7 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource, String> {
         eprintln!("ktstr: warning: dirty tree detected, building without caching");
     }
 
-    let kc = kconfig_suffix();
+    let kc = ktstr_suffix();
     let cache_key = match &short_hash {
         Some(hash) => format!("local-{hash}-{arch}-kc{kc}"),
         None => format!("local-unknown-{arch}-kc{kc}"),
