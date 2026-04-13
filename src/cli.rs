@@ -838,9 +838,14 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
 /// Progress spinner for long-running CLI operations.
 ///
 /// Draws to stderr via indicatif. Automatically ticks in the background.
+/// Disables stdin echo while active to prevent keypress jank.
 /// Call `finish` with a completion message or `clear` to remove.
 #[derive(Clone)]
-pub struct Spinner(indicatif::ProgressBar);
+pub struct Spinner {
+    pb: indicatif::ProgressBar,
+    /// Saved termios for echo restore. None when stdin is not a tty.
+    saved_termios: Option<std::sync::Arc<std::sync::Mutex<libc::termios>>>,
+}
 
 impl Spinner {
     /// Start a spinner with the given message (e.g. "Building kernel...").
@@ -852,27 +857,60 @@ impl Spinner {
         );
         pb.set_message(msg);
         pb.enable_steady_tick(Duration::from_millis(80));
-        Spinner(pb)
+
+        // Disable stdin echo to prevent keypress jank.
+        let saved_termios = Self::disable_echo();
+
+        Spinner { pb, saved_termios }
+    }
+
+    fn disable_echo() -> Option<std::sync::Arc<std::sync::Mutex<libc::termios>>> {
+        unsafe {
+            let fd = libc::STDIN_FILENO;
+            if libc::isatty(fd) == 0 {
+                return None;
+            }
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut termios) != 0 {
+                return None;
+            }
+            let saved = termios;
+            termios.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(fd, libc::TCSANOW, &termios);
+            Some(std::sync::Arc::new(std::sync::Mutex::new(saved)))
+        }
+    }
+
+    fn restore_echo(&self) {
+        if let Some(ref saved) = self.saved_termios
+            && let Ok(termios) = saved.lock()
+        {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &*termios);
+            }
+        }
     }
 
     /// Update the spinner message.
     pub fn set_message(&self, msg: impl Into<std::borrow::Cow<'static, str>>) {
-        self.0.set_message(msg);
+        self.pb.set_message(msg);
     }
 
     /// Finish the spinner, replacing it with a completion message.
     pub fn finish(self, msg: impl Into<std::borrow::Cow<'static, str>>) {
-        self.0.finish_with_message(msg);
+        self.restore_echo();
+        self.pb.finish_with_message(msg);
     }
 
     /// Print a line above the spinner. The spinner redraws below.
     pub fn println(&self, msg: impl AsRef<str>) {
-        self.0.println(msg);
+        self.pb.println(msg);
     }
 
     /// Clear the spinner from the terminal.
     pub fn clear(self) {
-        self.0.finish_and_clear();
+        self.restore_echo();
+        self.pb.finish_and_clear();
     }
 }
 
