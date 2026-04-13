@@ -246,32 +246,53 @@ pub fn make_kernel(kernel_dir: &Path) -> Result<()> {
     run_make(kernel_dir, &arg_refs)
 }
 
-/// Run make with stdout/stderr captured. On failure, returns the
-/// build output in the error so callers can display it.
-pub fn run_make_quiet(kernel_dir: &Path, args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("make")
+/// Run make with output streamed through a spinner. Each line of
+/// stdout/stderr is printed above the spinner via `Spinner::println`.
+pub fn run_make_with_spinner(kernel_dir: &Path, args: &[&str], spinner: &Spinner) -> Result<()> {
+    let mut child = std::process::Command::new("make")
         .args(args)
         .current_dir(kernel_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!("make {} failed:\n{}{}", args.join(" "), stdout, stderr,);
-    }
+        .spawn()?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let sp1 = spinner.clone();
+    let stdout_thread = std::thread::spawn(move || {
+        if let Some(out) = stdout {
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                sp1.println(&line);
+            }
+        }
+    });
+
+    let sp2 = spinner.clone();
+    let stderr_thread = std::thread::spawn(move || {
+        if let Some(err) = stderr {
+            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                sp2.println(&line);
+            }
+        }
+    });
+
+    let status = child.wait()?;
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+
+    anyhow::ensure!(status.success(), "make {} failed", args.join(" "));
     Ok(())
 }
 
-/// Build the kernel with output captured (for spinner-clean display).
-/// On failure, the build output is included in the error.
-pub fn make_kernel_quiet(kernel_dir: &Path) -> Result<()> {
+/// Build the kernel with output streamed through a spinner.
+pub fn make_kernel_with_spinner(kernel_dir: &Path, spinner: &Spinner) -> Result<()> {
     let nproc = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let args = build_make_args(nproc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_make_quiet(kernel_dir, &arg_refs)
+    run_make_with_spinner(kernel_dir, &arg_refs, spinner)
 }
 
 /// Resolve flag names, erroring on unknown flags.
@@ -671,10 +692,9 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
     result?;
 
     let sp = Spinner::start("Building kernel...");
-    let result = make_kernel_quiet(source_dir);
-    if let Err(ref e) = result {
+    let result = make_kernel_with_spinner(source_dir, &sp);
+    if result.is_err() {
         sp.clear();
-        eprintln!("{e}");
     } else {
         sp.finish("Kernel built");
     }
@@ -758,10 +778,9 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     }
 
     let sp = Spinner::start("Building kernel...");
-    let result = make_kernel_quiet(path);
-    if let Err(ref e) = result {
+    let result = make_kernel_with_spinner(path, &sp);
+    if result.is_err() {
         sp.clear();
-        eprintln!("{e}");
     } else {
         sp.finish("Kernel built");
     }
@@ -817,6 +836,7 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
 ///
 /// Draws to stderr via indicatif. Automatically ticks in the background.
 /// Call `finish` with a completion message or `clear` to remove.
+#[derive(Clone)]
 pub struct Spinner(indicatif::ProgressBar);
 
 impl Spinner {
@@ -840,6 +860,11 @@ impl Spinner {
     /// Finish the spinner, replacing it with a completion message.
     pub fn finish(self, msg: impl Into<std::borrow::Cow<'static, str>>) {
         self.0.finish_with_message(msg);
+    }
+
+    /// Print a line above the spinner. The spinner redraws below.
+    pub fn println(&self, msg: impl AsRef<str>) {
+        self.0.println(msg);
     }
 
     /// Clear the spinner from the terminal.
