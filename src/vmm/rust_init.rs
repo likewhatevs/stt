@@ -21,6 +21,7 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::openpty;
 use nix::sys::reboot::{RebootMode, reboot};
 use nix::sys::stat::Mode;
+use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::mkdir;
 
 /// COM2 device path for sentinel and diagnostic output.
@@ -400,6 +401,16 @@ fn spawn_shell_with_pty() {
     };
 
     let child_pid = child.id();
+
+    // Set COM2 serial (fd 0) to raw mode so the kernel line discipline
+    // passes bytes through without processing. Without this, special
+    // characters like tab (0x09) are consumed by the line discipline
+    // instead of being forwarded through the proxy to the PTY.
+    let stdin_fd = unsafe { BorrowedFd::borrow_raw(0) };
+    if let Ok(mut termios) = tcgetattr(stdin_fd) {
+        cfmakeraw(&mut termios);
+        let _ = tcsetattr(stdin_fd, SetArg::TCSANOW, &termios);
+    }
 
     // Proxy between COM2 (fd 0 for input, fd 1 for output) and PTY master.
     proxy_serial_pty(&pty.master, child_pid);
