@@ -25,6 +25,18 @@ Parameterized variants have convenience constructors:
 `WorkType::cache_yield(32, 64)`, `WorkType::cache_pipe(32, 1024)`,
 `WorkType::futex_fan_out(4, 1024)`.
 
+## Choosing a work type
+
+| Scheduler behavior to test | Recommended work type |
+|---|---|
+| Basic load balancing / fairness | `CpuSpin` (default) |
+| Wake placement / sleep-wake cycles | `YieldHeavy`, `FutexPingPong` |
+| CPU borrowing / idle balance | `Bursty` |
+| Cross-CPU wake latency | `PipeIo`, `CachePipe` |
+| Cache-aware scheduling | `CachePressure`, `CacheYield` |
+| Fan-out wake storms | `FutexFanOut` |
+| Mixed real-world patterns | `Sequence` |
+
 ## Variants
 
 **`CpuSpin`** -- tight spin loop with `spin_loop()` hints. 1024
@@ -61,7 +73,7 @@ post-fork. `size_kb` controls buffer size, `stride` controls the byte
 step between accesses.
 
 **`CacheYield`** -- cache pressure followed by `sched_yield()`. Tests
-wake_affine placement after voluntary preemption.
+scheduler re-placement after voluntary yield with a cache-hot working set.
 
 **`CachePipe`** -- cache pressure burst then 1-byte pipe exchange with
 a partner worker. Combines cache-hot working set with cross-CPU wake
