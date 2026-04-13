@@ -121,7 +121,7 @@ ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] failed:
     task_struct *p
       pid         97
       cpus_ptr    0xf(0-3)
-      dsq_id      LOCAL
+      dsq_id      SCX_DSQ_LOCAL
       enq_flags   NONE
       slice       20000000
       vtime       0

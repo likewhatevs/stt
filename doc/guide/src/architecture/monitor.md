@@ -300,7 +300,7 @@ Callback signatures are resolved by:
 ### Field decoding
 
 The output formatter decodes field values based on their key name:
-- `dsq_id` -> `GLOBAL`, `LOCAL`, `LOCAL_ON|{cpu}`, `DSQ(0x{hex})`
+- `dsq_id` -> `0`, `SCX_DSQ_INVALID`, `SCX_DSQ_GLOBAL`, `SCX_DSQ_LOCAL`, `SCX_DSQ_BYPASS`, `SCX_DSQ_LOCAL_ON|{cpu}`, `BUILTIN({v})`, `DSQ(0x{hex})`
 - `cpumask_0..3` -> coalesced `cpus_ptr 0xf(0-3)`
 - `enq_flags` -> `WAKEUP|HEAD|PREEMPT`
 - `exit_kind` -> `ERROR`, `ERROR_BPF`, `ERROR_STALL`, etc.

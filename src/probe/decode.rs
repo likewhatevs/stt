@@ -3,8 +3,8 @@ use super::scx_defs::*;
 /// Decode a sched_ext dispatch queue ID into a human-readable name.
 ///
 /// Inspects bits \[63:62\] (`DSQ_TYPE_SHIFT`) to classify:
-/// - `DSQ_TYPE_LOCAL_ON` (0b11): `LOCAL_ON|{cpu}`
-/// - `DSQ_TYPE_BUILTIN` (0b10): `SCX_DSQ_INVALID`, `GLOBAL`, `LOCAL`, `BYPASS`
+/// - `DSQ_TYPE_LOCAL_ON` (0b11): `SCX_DSQ_LOCAL_ON|{cpu}`
+/// - `DSQ_TYPE_BUILTIN` (0b10): `SCX_DSQ_INVALID`, `SCX_DSQ_GLOBAL`, `SCX_DSQ_LOCAL`, `SCX_DSQ_BYPASS`
 /// - Otherwise: `DSQ(0x{id:x})`
 /// - Zero: `"0"`
 pub(crate) fn decode_dsq_id(id: u64) -> String {
@@ -12,12 +12,12 @@ pub(crate) fn decode_dsq_id(id: u64) -> String {
         return "0".into();
     }
     match id >> DSQ_TYPE_SHIFT {
-        DSQ_TYPE_LOCAL_ON => format!("LOCAL_ON|{}", id & 0xffffffff),
+        DSQ_TYPE_LOCAL_ON => format!("SCX_DSQ_LOCAL_ON|{}", id & 0xffffffff),
         DSQ_TYPE_BUILTIN => match (id & 0xffffffff) as u32 {
             DSQ_INVALID => "SCX_DSQ_INVALID".into(),
-            DSQ_GLOBAL => "GLOBAL".into(),
-            DSQ_LOCAL => "LOCAL".into(),
-            DSQ_BYPASS => "BYPASS".into(),
+            DSQ_GLOBAL => "SCX_DSQ_GLOBAL".into(),
+            DSQ_LOCAL => "SCX_DSQ_LOCAL".into(),
+            DSQ_BYPASS => "SCX_DSQ_BYPASS".into(),
             v => format!("BUILTIN({v})"),
         },
         _ => format!("DSQ(0x{id:x})"),
@@ -255,17 +255,17 @@ mod tests {
 
     #[test]
     fn decode_dsq_id_global() {
-        assert_eq!(decode_dsq_id((1u64 << 63) | 1), "GLOBAL");
+        assert_eq!(decode_dsq_id((1u64 << 63) | 1), "SCX_DSQ_GLOBAL");
     }
 
     #[test]
     fn decode_dsq_id_local() {
-        assert_eq!(decode_dsq_id((1u64 << 63) | 2), "LOCAL");
+        assert_eq!(decode_dsq_id((1u64 << 63) | 2), "SCX_DSQ_LOCAL");
     }
 
     #[test]
     fn decode_dsq_id_bypass() {
-        assert_eq!(decode_dsq_id((1u64 << 63) | 3), "BYPASS");
+        assert_eq!(decode_dsq_id((1u64 << 63) | 3), "SCX_DSQ_BYPASS");
     }
 
     #[test]
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn decode_dsq_id_local_on() {
         let id = (1u64 << 63) | (1u64 << 62) | 7;
-        assert_eq!(decode_dsq_id(id), "LOCAL_ON|7");
+        assert_eq!(decode_dsq_id(id), "SCX_DSQ_LOCAL_ON|7");
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
     fn format_raw_arg_dsq_id() {
         let v = (1u64 << 63) | 1;
         let out = format_raw_arg(v);
-        assert!(out.contains("GLOBAL"), "got: {out}");
+        assert!(out.contains("SCX_DSQ_GLOBAL"), "got: {out}");
     }
 
     // -- decode_named_value --
@@ -407,7 +407,10 @@ mod tests {
     #[test]
     fn decode_named_value_dsq_id() {
         let v = (1u64 << 63) | 2;
-        assert_eq!(decode_named_value("dsq_id", &v.to_string()), "LOCAL");
+        assert_eq!(
+            decode_named_value("dsq_id", &v.to_string()),
+            "SCX_DSQ_LOCAL"
+        );
     }
 
     #[test]
@@ -597,7 +600,7 @@ mod tests {
     fn decode_named_value_dsq_id_hex_prefix() {
         // hex-prefixed dsq_id value
         let hex_val = format!("0x{:x}", (DSQ_TYPE_BUILTIN << DSQ_TYPE_SHIFT) | 1);
-        assert_eq!(decode_named_value("dsq_id", &hex_val), "GLOBAL");
+        assert_eq!(decode_named_value("dsq_id", &hex_val), "SCX_DSQ_GLOBAL");
     }
 
     #[test]
