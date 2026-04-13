@@ -152,7 +152,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Set environment variables.
     // SAFETY: single-threaded context — PID 1 before any threads spawn.
     unsafe {
-        std::env::set_var("PATH", "/bin");
+        std::env::set_var("PATH", "/include-files:/bin");
     }
 
     // Shell mode: interactive busybox shell instead of test dispatch.
