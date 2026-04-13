@@ -172,7 +172,64 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // Mount devpts so PTY allocation works.
         mount_devpts();
 
-        // MOTD (printed to COM2 before PTY proxy takes over).
+        // --exec mode: run a command non-interactively instead of
+        // dropping into an interactive shell. Inherits stdio from init
+        // which redirect_all_stdio_to() already pointed at the console
+        // device (virtio-console /dev/hvc0 when available, COM2
+        // otherwise). The host stdout writer thread drains virtio TX.
+        // Checked before MOTD so exec output is not polluted.
+        if let Some(cmd) = shell_exec_cmd() {
+            tracing::debug!(cmd = %cmd, "shell exec mode");
+            // Disable OPOST on stdout so the tty layer does not
+            // convert \n to \r\n. Without this, every newline in
+            // command output gains a spurious \r visible to the host.
+            let stdout_fd = unsafe { BorrowedFd::borrow_raw(1) };
+            if let Ok(mut termios) = tcgetattr(stdout_fd) {
+                termios
+                    .output_flags
+                    .remove(nix::sys::termios::OutputFlags::OPOST);
+                let _ = tcsetattr(stdout_fd, SetArg::TCSANOW, &termios);
+            }
+            // Restore SIGCHLD so waitpid can reap the child and
+            // retrieve the real exit code. SIG_IGN (set at line 80)
+            // causes the kernel to auto-reap, making waitpid return
+            // ECHILD and losing the exit status. Safe: single-threaded
+            // PID 1 context, no other children running in exec mode.
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+            }
+            let status = Command::new("/bin/busybox")
+                .args(["sh", "-c", &cmd])
+                .status();
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+            }
+            let code = match status {
+                Ok(s) => s.code().unwrap_or(1),
+                Err(e) => {
+                    eprintln!("ktstr-init: exec failed: {e}");
+                    1
+                }
+            };
+            // Exit code on stderr so it does not pollute captured
+            // command output on stdout.
+            eprintln!("KTSTR_EXEC_EXIT={code}");
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            // Drain the tty and allow the host stdout thread time to
+            // read the virtio TX queue before reboot tears it down.
+            unsafe {
+                libc::tcdrain(1);
+            }
+            unsafe {
+                libc::tcdrain(2);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            force_reboot();
+        }
+
+        // MOTD (printed to console before PTY proxy takes over).
+        // Skipped in exec mode (handled above).
         let kernel_version = fs::read_to_string("/proc/version")
             .ok()
             .and_then(|v| v.split_whitespace().nth(2).map(|s| s.to_string()))
@@ -196,41 +253,6 @@ pub(crate) fn ktstr_guest_init() -> ! {
         println!("             /sys/kernel/debug /sys/kernel/tracing /dev/pts");
         println!("  type `exit` for clean shutdown, Ctrl+A X to force-kill");
         let _ = std::io::stdout().flush();
-
-        // --exec mode: run a command non-interactively instead of
-        // dropping into an interactive shell. Output goes to /dev/hvc0
-        // (virtio-console) so the host captures it on stdout. Without
-        // this redirect, output goes to /dev/console (COM1) which the
-        // host reads as kernel console, not command output.
-        if let Some(cmd) = shell_exec_cmd() {
-            tracing::debug!(cmd = %cmd, "shell exec mode");
-            use std::os::unix::io::OwnedFd;
-            let hvc0 = std::fs::OpenOptions::new().write(true).open("/dev/hvc0");
-            let mut child_cmd = Command::new("/bin/busybox");
-            child_cmd.args(["sh", "-c", &cmd]);
-            if let Ok(f) = hvc0 {
-                let fd: OwnedFd = f.into();
-                child_cmd
-                    .stdout(unsafe { Stdio::from(OwnedFd::from_raw_fd(fd.as_raw_fd())) })
-                    .stderr(unsafe {
-                        Stdio::from(OwnedFd::from_raw_fd(libc::dup(fd.as_raw_fd())))
-                    });
-                std::mem::forget(fd); // ownership transferred to Stdio
-            }
-            let status = child_cmd.status();
-            let code = match status {
-                Ok(s) => s.code().unwrap_or(1),
-                Err(e) => {
-                    eprintln!("ktstr-init: exec failed: {e}");
-                    1
-                }
-            };
-            // Write exit code to COM2 so the host can detect
-            // pass/fail without parsing output.
-            println!("KTSTR_EXEC_EXIT={code}");
-            let _ = std::io::stdout().flush();
-            force_reboot();
-        }
 
         // Allocate a PTY pair so busybox sh gets a controlling terminal
         // (required for job control: Ctrl+Z, bg, fg).
@@ -382,9 +404,13 @@ fn shell_mode_requested() -> bool {
         .unwrap_or(false)
 }
 
-/// Extract KTSTR_SHELL_EXEC=<cmd> from kernel cmdline if present.
+/// Read /exec_cmd from the initramfs if present.
+/// The host writes this file via build_suffix_full when --exec is used.
 fn shell_exec_cmd() -> Option<String> {
-    cmdline_val("KTSTR_SHELL_EXEC")
+    fs::read_to_string("/exec_cmd")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Extract a KEY=value pair from the kernel cmdline.

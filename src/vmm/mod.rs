@@ -1113,6 +1113,9 @@ pub struct KtstrVm {
     /// interactive shell mode. Useful for watching virtio probe and
     /// kernel messages alongside the shell session.
     dmesg: bool,
+    /// Command to execute non-interactively in shell mode (--exec).
+    /// Passed to the guest via /exec_cmd in the initramfs.
+    exec_cmd: Option<String>,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -1237,7 +1240,7 @@ impl KtstrVm {
         }
 
         // Non-interactive exec mode (--exec) does not need a TTY.
-        let exec_mode = self.cmdline_extra.contains("KTSTR_SHELL_EXEC=");
+        let exec_mode = self.exec_cmd.is_some();
 
         // Pre-flight: verify stdin is a tty, enter raw mode, and create
         // the wakeup pipe before spawning threads. Failing after thread
@@ -1575,7 +1578,9 @@ impl KtstrVm {
             }
         }
 
-        eprintln!("Connection to VM closed.");
+        if !exec_mode {
+            eprintln!("Connection to VM closed.");
+        }
         Ok(())
     }
 
@@ -1787,6 +1792,7 @@ impl KtstrVm {
             &self.sched_args,
             &enable_refs,
             &disable_refs,
+            self.exec_cmd.as_deref(),
         )?;
         let uncompressed_size = base_bytes.len() + suffix.len();
         tracing::debug!(
@@ -1859,6 +1865,7 @@ impl KtstrVm {
             &self.sched_args,
             &enable_refs,
             &disable_refs,
+            self.exec_cmd.as_deref(),
         )?;
         let uncompressed_size = base_bytes.len() + suffix.len();
         tracing::debug!(
@@ -3077,6 +3084,7 @@ impl KtstrVm {
                     &self.sched_args,
                     &enable_refs,
                     &disable_refs,
+                    self.exec_cmd.as_deref(),
                 )?;
                 let uncompressed_size = base_bytes.len() + suffix.len();
 
@@ -3142,6 +3150,7 @@ impl KtstrVm {
                     &self.sched_args,
                     &enable_refs,
                     &disable_refs,
+                    self.exec_cmd.as_deref(),
                 )?;
                 let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
                 full.extend_from_slice(base_bytes);
@@ -3645,6 +3654,7 @@ pub struct KtstrVmBuilder {
     include_files: Vec<(String, PathBuf)>,
     busybox: bool,
     dmesg: bool,
+    exec_cmd: Option<String>,
 }
 
 impl Default for KtstrVmBuilder {
@@ -3674,6 +3684,7 @@ impl Default for KtstrVmBuilder {
             include_files: Vec::new(),
             busybox: false,
             dmesg: false,
+            exec_cmd: None,
         }
     }
 }
@@ -3839,6 +3850,12 @@ impl KtstrVmBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn exec_cmd(mut self, cmd: String) -> Self {
+        self.exec_cmd = Some(cmd);
+        self
+    }
+
     pub fn build(mut self) -> Result<KtstrVm> {
         let (pinning_plan, mbind_nodes, cpu_locks) = if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
@@ -3901,6 +3918,7 @@ impl KtstrVmBuilder {
             include_files: self.include_files,
             busybox: self.busybox,
             dmesg: self.dmesg,
+            exec_cmd: self.exec_cmd,
         })
     }
 

@@ -539,9 +539,6 @@ pub fn run_shell(
     if dmesg {
         cmdline.push_str(" loglevel=7");
     }
-    if let Some(cmd) = exec {
-        cmdline.push_str(&format!(" KTSTR_SHELL_EXEC={cmd}"));
-    }
     if let Ok(val) = std::env::var("RUST_LOG") {
         cmdline.push_str(&format!(" RUST_LOG={val}"));
     }
@@ -576,6 +573,10 @@ pub fn run_shell(
         .include_files(owned_includes)
         .busybox(true)
         .dmesg(dmesg);
+
+    if let Some(cmd) = exec {
+        builder = builder.exec_cmd(cmd.to_string());
+    }
 
     builder = match memory_mb {
         Some(mb) => builder.memory_mb(mb),

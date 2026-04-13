@@ -951,7 +951,7 @@ pub(crate) fn build_suffix(
     args: &[String],
     sched_args: &[String],
 ) -> Result<Vec<u8>> {
-    build_suffix_full(base_len, args, sched_args, &[], &[])
+    build_suffix_full(base_len, args, sched_args, &[], &[], None)
 }
 
 /// Extended suffix builder that also writes /sched_enable and /sched_disable
@@ -962,6 +962,7 @@ pub fn build_suffix_full(
     sched_args: &[String],
     sched_enable: &[&str],
     sched_disable: &[&str],
+    exec_cmd: Option<&str>,
 ) -> Result<Vec<u8>> {
     let mut suffix = Vec::new();
 
@@ -988,6 +989,10 @@ pub fn build_suffix_full(
     if !sched_disable.is_empty() {
         let data = sched_disable.join("\n");
         write_entry(&mut suffix, "sched_disable", data.as_bytes(), 0o100755)?;
+    }
+
+    if let Some(cmd) = exec_cmd {
+        write_entry(&mut suffix, "exec_cmd", cmd.as_bytes(), 0o100644)?;
     }
 
     // Trailer
