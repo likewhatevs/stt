@@ -237,19 +237,19 @@ two BPF skeletons that share maps.
 ```text
 crash stack -> extract functions -> BTF resolve -> load skeletons -> poll
                                                          |
-                                    kprobe skeleton      |     fentry skeleton
-                                    (kernel funcs)       |     (BPF callbacks)
+                                    kprobe skeleton      |     fentry/fexit skeleton
+                                    (kernel entry)       |     (BPF + kernel exit)
                                          |               |          |
                                          v               v          v
                                     func_meta_map  <--shared-->  probe_data
-                                                         |
+                                                         |        (entry + exit fields)
                                               trigger fires (ring buffer)
                                                          |
                                               read probe_data entries
                                                          |
                                               stitch by tptr
                                                          |
-                                              format with field decoders
+                                              format with entry→exit diffs
 ```
 
 ### Kprobe skeleton (`probe.bpf.c`)
@@ -266,18 +266,24 @@ The trigger fires via `tp_btf/sched_ext_exit` (inside
 `scx_claim_exit()`) and sends an `EVENT_TRIGGER` via ring buffer
 with the current task pointer and kernel stack.
 
-### Fentry skeleton (`fentry_probe.bpf.c`)
+### Fentry/fexit skeleton (`fentry_probe.bpf.c`)
 
-Attaches to BPF struct_ops callbacks via `set_attach_target`. Loaded
-in batches of 4 to reduce verifier passes. Shares `probe_data` and
+Handles both BPF struct_ops callbacks and kernel function exit
+capture. Loaded in batches of 4 fentry + 4 fexit programs per
+skeleton instance via `set_attach_target`. Shares `probe_data` and
 `func_meta_map` with the kprobe skeleton via `reuse_fd`.
 
-For struct_ops programs, fentry receives one arg: `ctx[0]` is a void
-pointer to the real callback arguments packed contiguously. The handler
-dereferences through `ctx[0]` to read up to 6 args.
+A per-slot `is_kernel` rodata flag controls argument access:
+- **BPF callbacks** (`is_kernel=0`): `ctx[0]` is a void pointer to
+  the real callback arguments. The handler dereferences through it.
+  Uses sentinel IPs (`func_idx | (1<<63)`) in `func_meta_map`.
+- **Kernel functions** (`is_kernel=1`): args are directly in
+  `ctx[0..5]`. Uses `bpf_get_func_ip(ctx)` for the real IP,
+  matching the kprobe entry handler's key.
 
-Uses sentinel IPs (`func_idx | (1<<63)`) in `func_meta_map` to
-distinguish fentry events from kprobe events.
+Fexit handlers look up the existing `probe_data` entry (written by
+fentry or kprobe at function entry) and re-read struct fields into
+`exit_fields`. This captures post-mutation state for paired display.
 
 ### BTF resolution
 

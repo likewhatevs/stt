@@ -37,9 +37,11 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
 
 5. **Second VM** -- ktstr boots a new VM and reruns the scenario with
    BPF probes:
-   - Kprobe skeleton for kernel functions (uses `bpf_get_func_ip`)
-   - Fentry skeleton for BPF callbacks (batched in groups of 4,
-     shares maps via `reuse_fd`)
+   - Kprobe skeleton for kernel function entry (uses `bpf_get_func_ip`)
+   - Fentry/fexit skeleton for BPF callbacks and kernel function exit
+     (batched in groups of 4, shares maps via `reuse_fd`). Fexit
+     re-reads struct fields after the function executes, capturing
+     post-mutation state alongside the entry snapshot.
    - Tracepoint trigger (`tp_btf/sched_ext_exit`) fires inside
      `scx_claim_exit()` when the scheduler exits, in the context
      of the causal task
@@ -83,7 +85,9 @@ alive so BPF assertion probes can fire.
 
 The `demo_host_crash_auto_repro` test triggers a host-initiated crash
 via BPF map write and captures the scheduling path. Probe output shows
-each function with decoded struct fields and source locations:
+each function with decoded struct fields and source locations. When
+fexit captures post-mutation state, changed fields show an arrow
+(`→`) between entry and exit values:
 
 ```text
 ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] failed:
@@ -103,34 +107,19 @@ ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] failed:
       weight      100
       sticky_cpu  -1
       scx_flags   QUEUED|ENABLED
-  ktstr_dispatch                                                  main.bpf.c:28
-      cpu         0
-    task_struct *p
-      pid         97
-      cpus_ptr    0xf(0-3)
-      dsq_id      SCX_DSQ_INVALID
-      enq_flags   NONE
-      slice       19911318
-      vtime       0
-      weight      100
-      sticky_cpu  -1
-      scx_flags   RESET_RUNNABLE_AT|DEQD_FOR_SLEEP|ENABLED
   do_enqueue_task                                               kernel/sched/ext.c:1344
     rq *rq
       cpu         1
     task_struct *p
       pid         97
       cpus_ptr    0xf(0-3)
-      dsq_id      SCX_DSQ_LOCAL
+      dsq_id      SCX_DSQ_INVALID          →  SCX_DSQ_LOCAL
       enq_flags   NONE
       slice       20000000
       vtime       0
       weight      100
       sticky_cpu  -1
-      scx_flags   QUEUED|DEQD_FOR_SLEEP|ENABLED
-  pick_task_scx                                                 kernel/sched/ext.c:2511
-    rq *rq
-      cpu         1
+      scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED
 ```
 
 ## Demo test
