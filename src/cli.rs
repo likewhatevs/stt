@@ -780,15 +780,13 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     }
 
     let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let is_dirty = acquired.is_dirty;
 
     // Ensure kconfig fragment is applied (skips append if all
     // options already present in .config).
     configure_kernel(path, EMBEDDED_KCONFIG)?;
 
-    // Compute cache key from final .config CRC32. The config hash
-    // captures both the kconfig fragment and any user changes, so
-    // dirty detection is unnecessary — different configs produce
-    // different cache keys.
+    // Compute cache key from final .config CRC32.
     let (arch, image_name) = crate::fetch::arch_info();
     let git_short = &crate::GIT_FULL_HASH[..7.min(crate::GIT_FULL_HASH.len())];
     let config_path = path.join(".config");
@@ -801,8 +799,10 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         None => format!("local-unknown-{arch}-cfg{cfg_tag}-{git_short}"),
     };
 
-    // Cache lookup before build.
-    if let Ok(cache) = crate::cache::CacheDir::new()
+    // Clean trees: cache lookup before build.
+    // Dirty trees: skip cache, always build.
+    if !is_dirty
+        && let Ok(cache) = crate::cache::CacheDir::new()
         && let Some(entry) = cache.lookup(&cache_key)
         && let Some(ref meta) = entry.metadata
     {
@@ -830,8 +830,11 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         )
     })?;
 
-    // Cache the build.
-    if let Ok(cache) = crate::cache::CacheDir::new() {
+    // Cache the build (skip dirty trees).
+    if is_dirty {
+        warn("ktstr: dirty tree, build not cached");
+    }
+    if !is_dirty && let Ok(cache) = crate::cache::CacheDir::new() {
         let vmlinux_path = path.join("vmlinux");
         let vmlinux_ref = vmlinux_path.exists().then_some(vmlinux_path.as_path());
 

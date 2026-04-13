@@ -269,33 +269,31 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource, String> {
         .canonicalize()
         .map_err(|e| format!("canonicalize {}: {e}", source_path.display()))?;
 
-    // Try to open as a git repo for dirty detection and hash extraction.
-    let (short_hash, is_dirty) = match gix::discover(&canonical) {
+    // Git hash extraction via gix, dirty detection via git CLI.
+    // gix::is_dirty() produces false positives on kernel build trees
+    // (submodule state, stat timestamp mismatches from build artifacts).
+    // git diff-index --quiet HEAD is reliable and ignores untracked files.
+    let short_hash = match gix::discover(&canonical) {
         Ok(repo) => {
             let head = repo.head_id().map_err(|e| format!("read HEAD: {e}"))?;
-            let short_hash = format!("{}", head).chars().take(7).collect::<String>();
-
-            // Dirty detection via gix: checks HEAD-vs-index and
-            // index-vs-worktree. Untracked files do not affect the
-            // result.
-            let is_dirty = repo
-                .is_dirty()
-                .map_err(|e| format!("dirty detection: {e}"))?;
-
-            (Some(short_hash), is_dirty)
+            Some(format!("{}", head).chars().take(7).collect::<String>())
         }
-        Err(_) => {
-            eprintln!(
-                "ktstr: warning: {} is not a git repository, cannot detect dirty state",
-                source_path.display()
-            );
-            (None, true)
-        }
+        Err(_) => None,
     };
 
-    if is_dirty {
-        eprintln!("ktstr: warning: dirty tree detected, building without caching");
-    }
+    let is_dirty = std::process::Command::new("git")
+        .args([
+            "-C",
+            &canonical.to_string_lossy(),
+            "diff-index",
+            "--quiet",
+            "HEAD",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true); // not a git repo or git not found → treat as dirty
 
     let kc = ktstr_suffix();
     let cache_key = match &short_hash {
