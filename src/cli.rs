@@ -831,7 +831,16 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
             None
         };
 
+        // Cache key uses the final .config CRC32 (captures kconfig
+        // fragment + any user menuconfig changes) and ktstr git hash.
         let (arch, image_name) = crate::fetch::arch_info();
+        let git_short = &crate::GIT_FULL_HASH[..7.min(crate::GIT_FULL_HASH.len())];
+        let cfg_tag = config_hash.as_deref().unwrap_or("nocfg");
+        let cache_key = match &acquired.git_hash {
+            Some(h) => format!("local-{h}-{arch}-cfg{cfg_tag}-{git_short}"),
+            None => format!("local-unknown-{arch}-cfg{cfg_tag}-{git_short}"),
+        };
+
         let metadata = crate::cache::KernelMetadata::new(
             acquired.source_type.clone(),
             arch.to_string(),
@@ -844,8 +853,8 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         .with_git_hash(acquired.git_hash.clone())
         .with_source_tree_path(Some(acquired.source_dir.clone()));
 
-        match cache.store(&acquired.cache_key, &image, vmlinux_ref, &metadata) {
-            Ok(_) => eprintln!("ktstr: kernel cached as {}", acquired.cache_key),
+        match cache.store(&cache_key, &image, vmlinux_ref, &metadata) {
+            Ok(_) => eprintln!("ktstr: kernel cached as {cache_key}"),
             Err(e) => eprintln!("ktstr: warning: cache store failed: {e:#}"),
         }
     }
