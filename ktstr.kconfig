@@ -96,7 +96,9 @@ CONFIG_SCHED_MC=y
 # Symbols for monitor kallsyms resolution.
 CONFIG_KALLSYMS_ALL=y
 # Embedded .config for CONFIG_HZ detection by ktstr monitor.
+# IKCONFIG_PROC exposes /proc/config.gz for runtime inspection.
 CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
 
 # -- Disabled (would alter scheduler behavior) --
 # LOCKDEP: 10-100x lock overhead. Non-representative timing.
