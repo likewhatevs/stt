@@ -136,12 +136,14 @@ int ktstr_probe(struct pt_regs *ctx)
 }
 
 /*
- * Trigger kprobe. Attached to scx_disable_workfn (or user-specified function).
- * Sends an EVENT_TRIGGER event via ring buffer with the current task
- * pointer and kernel stack.
+ * Tracepoint trigger. Fires on sched_ext_exit inside scx_claim_exit()
+ * after the atomic cmpxchg succeeds — exactly once per scheduler
+ * lifetime, in the context of the task that caused the exit.
+ *
+ * Typed arg gives the exit kind directly.
  */
-SEC("kprobe/ktstr_trigger")
-int ktstr_trigger(struct pt_regs *ctx)
+SEC("tp_btf/sched_ext_exit")
+int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 {
 	__sync_fetch_and_add(&ktstr_trigger_count, 1);
 
@@ -158,13 +160,16 @@ int ktstr_trigger(struct pt_regs *ctx)
 	event->ts = bpf_ktime_get_ns();
 	event->nr_fields = 0;
 
-	/* Capture current task_struct pointer for tptr-based stitching. */
+	/* In scx_claim_exit(), current is the task that caused the exit. */
 	event->args[0] = (u64)bpf_get_current_task();
 
 	/* Capture kernel stack. */
 	int stack_sz = bpf_get_stack(ctx, event->kstack,
 				     sizeof(event->kstack), 0);
 	event->kstack_sz = stack_sz > 0 ? stack_sz / sizeof(u64) : 0;
+
+	/* Store exit kind in args[1] for diagnostics. */
+	event->args[1] = (u64)kind;
 
 	bpf_ringbuf_submit(event, 0);
 

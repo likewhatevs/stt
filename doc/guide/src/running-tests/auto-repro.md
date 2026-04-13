@@ -35,11 +35,14 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
    resolved to byte offsets. Unknown BPF-local types (e.g. task_ctx)
    have scalar and cpumask pointer fields auto-discovered.
 
-5. **Second VM** -- ktstr boots a new VM and reruns the scenario with two
-   BPF skeletons:
+5. **Second VM** -- ktstr boots a new VM and reruns the scenario with
+   BPF probes:
    - Kprobe skeleton for kernel functions (uses `bpf_get_func_ip`)
    - Fentry skeleton for BPF callbacks (batched in groups of 4,
      shares maps via `reuse_fd`)
+   - Tracepoint trigger (`tp_btf/sched_ext_exit`) fires inside
+     `scx_claim_exit()` when the scheduler exits, in the context
+     of the causal task
 
 6. **Stitching** -- the task_struct pointer is found from the last
    event (closest to trigger time) that has a non-zero task_struct
@@ -49,6 +52,13 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
    formatted with decoded field values (cpumask ranges, DSQ names,
    enqueue flags, etc.) and source locations (DWARF for kernel,
    line_info for BPF).
+
+## Requirements
+
+Auto-repro requires a kernel with the `sched_ext_exit` tracepoint
+(used as the probe trigger). Kernels built with `CONFIG_SCHED_CLASS_EXT`
+and tracepoint support include this. If the tracepoint is unavailable,
+auto-repro is skipped and the pipeline diagnostics report the cause.
 
 ## Enabling auto-repro
 

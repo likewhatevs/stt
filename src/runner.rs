@@ -216,7 +216,6 @@ impl Runner {
                         crate::probe::process::run_probe_skeleton(
                             &functions,
                             &btf_funcs,
-                            "scx_disable_workfn",
                             &stop_clone,
                             &bpf_fds,
                             &probes_ready_thread,

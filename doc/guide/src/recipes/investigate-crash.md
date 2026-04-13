@@ -17,7 +17,7 @@ only when relevant:
 | `--- scheduler log ---` | Scheduler process stdout+stderr (cycle-collapsed). |
 | `--- monitor ---` | Host-side monitor: sample count, max imbalance, max DSQ depth, stall flag, threshold verdict. |
 | `--- sched_ext dump ---` | `sched_ext_dump` trace lines from the guest kernel. |
-| `--- auto-repro ---` | BPF kprobe (kernel functions) and fentry probe (BPF callbacks) data from a second VM run. |
+| `--- auto-repro ---` | BPF probe data (kprobes, fentry, tp_btf trigger) from a second VM run. |
 
 `--- diagnostics ---` appears automatically when the scheduler died
 or when `RUST_BACKTRACE=1` is set.
@@ -29,7 +29,8 @@ crashes, ktstr automatically:
 
 1. Captures the crash stack trace from the scenario output.
 2. Boots a second VM with BPF kprobes (kernel functions) and fentry
-   probes (BPF callbacks) on each function in the crash chain.
+   probes (BPF callbacks) on each function in the crash chain, plus
+   a `tp_btf/sched_ext_exit` tracepoint trigger.
 3. Reruns the scenario to capture function arguments at each crash
    point.
 

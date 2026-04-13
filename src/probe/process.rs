@@ -6,7 +6,7 @@ use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
 
-/// Ring buffer event type for the trigger kprobe (matches `EVENT_TRIGGER`
+/// Ring buffer event type for the trigger (matches `EVENT_TRIGGER`
 /// in `intf.h`).
 const EVENT_TRIGGER: u32 = 2;
 
@@ -38,8 +38,14 @@ pub struct ProbeDiagnostics {
     pub events_before_stitch: u32,
     /// Events surviving tptr+time stitching.
     pub events_after_stitch: u32,
-    /// Whether the trigger kprobe fired.
+    /// Whether the trigger fired.
     pub trigger_fired: bool,
+    /// Which trigger mechanism attached ("tp_btf").
+    #[serde(default)]
+    pub trigger_type: String,
+    /// Error from tp_btf/sched_ext_exit attach failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_attach_error: Option<String>,
     /// BPF-side kprobe fire count (from BSS ktstr_probe_count).
     pub bpf_kprobe_fires: u64,
     /// BPF-side trigger fire count (from BSS ktstr_trigger_count).
@@ -184,21 +190,6 @@ fn detect_str_param(btf_func: &BtfFunc) -> u8 {
     0xff
 }
 
-/// Run the BPF probe skeleton for auto-repro.
-///
-/// Loads two BPF skeletons:
-/// - **Kprobe skeleton** (`probe.bpf.c`): attaches to kernel functions
-///   via `attach_kprobe`. Uses `bpf_get_func_ip` to identify the
-///   firing function and writes to the shared `probe_data` hash map.
-/// - **Fentry skeleton** (`fentry_probe.bpf.c`): attaches to BPF
-///   struct_ops callbacks in batches of 4 via `set_attach_target`.
-///   Shares `probe_data` and `func_meta_map` via `reuse_fd`.
-///
-/// Polls until the trigger kprobe fires (via ring buffer EVENT_TRIGGER)
-/// or `stop` is set. Then iterates `probe_data` entries, matches them
-/// to functions by IP, stitches events by `task_struct` arg value
-/// (using param indices from [`BPF_OP_CALLERS`](super::stack::BPF_OP_CALLERS)
-/// and BTF), and returns them sorted by timestamp.
 /// Pre-open BPF program FDs while the scheduler is alive.
 ///
 /// Returns a map from `bpf_prog_id` to owned fd. Holding these FDs
@@ -218,10 +209,31 @@ pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashM
     fds
 }
 
+/// Run the BPF probe skeleton for auto-repro.
+///
+/// Loads two BPF skeletons:
+/// - **Kprobe skeleton** (`probe.bpf.c`): attaches to kernel functions
+///   via `attach_kprobe`. Uses `bpf_get_func_ip` to identify the
+///   firing function and writes to the shared `probe_data` hash map.
+///   Also contains the trigger: `tp_btf/sched_ext_exit` tracepoint.
+/// - **Fentry skeleton** (`fentry_probe.bpf.c`): attaches to BPF
+///   struct_ops callbacks in batches of 4 via `set_attach_target`.
+///   Shares `probe_data` and `func_meta_map` via `reuse_fd`.
+///
+/// The trigger fires on `sched_ext_exit` inside `scx_claim_exit()`
+/// — exactly once per scheduler lifetime, in the context of the
+/// task that caused the exit. If the tracepoint is unavailable
+/// (kernel lacks CONFIG_SCHED_CLASS_EXT tracepoint support), auto-repro
+/// is skipped.
+///
+/// Polls until the trigger fires (via ring buffer EVENT_TRIGGER)
+/// or `stop` is set. Then iterates `probe_data` entries, matches them
+/// to functions by IP, stitches events by `task_struct` arg value
+/// (using param indices from [`BPF_OP_CALLERS`](super::stack::BPF_OP_CALLERS)
+/// and BTF), and returns them sorted by timestamp.
 pub fn run_probe_skeleton(
     functions: &[StackFunction],
     btf_funcs: &[BtfFunc],
-    trigger: &str,
     stop: &AtomicBool,
     bpf_prog_fds: &std::collections::HashMap<u32, i32>,
     ready: &AtomicBool,
@@ -230,7 +242,7 @@ pub fn run_probe_skeleton(
     use libbpf_rs::skel::{OpenSkel, SkelBuilder};
     use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder};
 
-    tracing::debug!(n = functions.len(), trigger, "run_probe_skeleton",);
+    tracing::debug!(n = functions.len(), "run_probe_skeleton");
 
     let mut diag = ProbeDiagnostics::default();
 
@@ -241,6 +253,7 @@ pub fn run_probe_skeleton(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "probe skeleton open failed");
+            ready.store(true, Ordering::Release);
             return (None, diag);
         }
     };
@@ -255,6 +268,7 @@ pub fn run_probe_skeleton(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "probe skeleton load failed");
+            ready.store(true, Ordering::Release);
             return (None, diag);
         }
     };
@@ -314,6 +328,7 @@ pub fn run_probe_skeleton(
 
     if func_ips.is_empty() && bpf_funcs.is_empty() {
         tracing::warn!("no kprobe IPs resolved and no BPF functions for fentry");
+        ready.store(true, Ordering::Release);
         return (None, diag);
     }
     if func_ips.is_empty() {
@@ -591,13 +606,19 @@ pub fn run_probe_skeleton(
         );
     }
 
-    // Attach trigger
-    match skel.progs.ktstr_trigger.attach_kprobe(false, trigger) {
+    // Attach trigger: tp_btf/sched_ext_exit fires inside
+    // scx_claim_exit() in the context of the causal task.
+    match skel.progs.ktstr_trigger_tp.attach_trace() {
         Ok(link) => {
-            links.push((link, trigger.to_string()));
+            tracing::debug!("trigger attached via tp_btf/sched_ext_exit");
+            diag.trigger_type = "tp_btf".to_string();
+            links.push((link, "tp_btf/sched_ext_exit".to_string()));
         }
         Err(e) => {
-            tracing::error!(%e, trigger, "trigger attach failed");
+            let msg = format!("auto-repro requires kernel with sched_ext_exit tracepoint: {e}");
+            tracing::error!(%msg, "trigger attach failed");
+            diag.trigger_attach_error = Some(msg);
+            ready.store(true, Ordering::Release);
             return (None, diag);
         }
     }
@@ -656,6 +677,7 @@ pub fn run_probe_skeleton(
         Ok(rb) => rb,
         Err(e) => {
             tracing::error!(%e, "failed to build ring buffer");
+            ready.store(true, Ordering::Release);
             return (None, diag);
         }
     };
@@ -668,7 +690,7 @@ pub fn run_probe_skeleton(
     tracing::debug!(
         funcs = func_ips.len(),
         links = links.len(),
-        trigger,
+        trigger_type = %diag.trigger_type,
         "polling for probe data",
     );
 
@@ -679,8 +701,7 @@ pub fn run_probe_skeleton(
 
     // Poll until trigger fires or stop requested.  When stop is
     // signaled, iterate all probe_data entries instead of waiting
-    // for the trigger — scx_disable_workfn runs asynchronously
-    // in a kthread and may not fire before the payload process exits.
+    // for the trigger.
     loop {
         let _ = rb.poll(Duration::from_millis(100));
 
