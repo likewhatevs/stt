@@ -133,7 +133,6 @@ static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
     func: scenario_fail_verify,
     scheduler: &FAIL_SCHED,
     extra_sched_args: &["--fail-verify"],
-    expect_err: true,
     duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 2,
     ..KtstrTestEntry::DEFAULT
@@ -148,6 +147,5 @@ static __KTSTR_ENTRY_VERIFY_REJECT: KtstrTestEntry = KtstrTestEntry {
     extra_sched_args: &["--verify-loop"],
     duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 2,
-    expect_err: true,
     ..KtstrTestEntry::DEFAULT
 };
