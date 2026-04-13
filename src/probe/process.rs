@@ -1070,15 +1070,14 @@ pub fn run_probe_skeleton(
             // Stitch by task_struct pointer. Build a map of func_idx ->
             // task_struct param index from BPF_OP_CALLERS and BTF, then
             // filter events to those referencing the same task_struct
-            // pointer as the task running when the exit fired.
+            // pointer as the causal task.
             //
-            // Source: the trigger event's bpf_get_current_task()
-            // (args[0]).
-            //
-            // Limitation: for stall exits (SCX_EXIT_ERROR_STALL) the
-            // current task at exit time is the watchdog kworker or timer
-            // interrupt context, not the stalled task. Stitching will
-            // select an arbitrary task in that case.
+            // The BPF trigger handler sets args[0] to
+            // bpf_get_current_task() only for ops callback errors
+            // (SCX_EXIT_ERROR, SCX_EXIT_ERROR_BPF) where current IS
+            // the causal task. For all other exit kinds (stalls,
+            // sysrq, unregistration), args[0] is 0 and stitching
+            // is skipped — events pass through unstitched.
             let task_param_idx: std::collections::HashMap<u32, usize> = func_ips
                 .iter()
                 .filter_map(|(idx, _, name)| {

@@ -175,8 +175,16 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	event->ts = bpf_ktime_get_ns();
 	event->nr_fields = 0;
 
-	/* current task at exit time (may differ from causal task for stalls). */
-	event->args[0] = (u64)bpf_get_current_task();
+	/*
+	 * Only use current as causal task for ops callback errors
+	 * (SCX_EXIT_ERROR, SCX_EXIT_ERROR_BPF). For stalls, sysrq,
+	 * unregistration, and other exit kinds, current is unrelated
+	 * to the exit cause — set 0 so stitching is skipped.
+	 */
+	if (kind >= 1024 && kind <= 1025)
+		event->args[0] = (u64)bpf_get_current_task();
+	else
+		event->args[0] = 0;
 
 	/* Capture kernel stack. */
 	int stack_sz = bpf_get_stack(ctx, event->kstack,
