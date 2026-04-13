@@ -546,6 +546,14 @@ pub fn run_shell(
         cmdline.push_str(&format!(" RUST_LOG={val}"));
     }
 
+    // Pass host terminal environment to guest.
+    if let Ok(term) = std::env::var("TERM") {
+        cmdline.push_str(&format!(" KTSTR_TERM={term}"));
+    }
+    if let Ok(ct) = std::env::var("COLORTERM") {
+        cmdline.push_str(&format!(" KTSTR_COLORTERM={ct}"));
+    }
+
     // Pass host terminal dimensions to guest for correct line wrapping.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();

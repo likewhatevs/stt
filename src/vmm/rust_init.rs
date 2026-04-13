@@ -452,11 +452,19 @@ fn spawn_shell_with_pty() {
         }
     }
 
+    // Set terminal type from host. Default to "linux" if not passed.
+    let term = cmdline_val("KTSTR_TERM").unwrap_or_else(|| "linux".to_string());
+    let colorterm = cmdline_val("KTSTR_COLORTERM");
+
     let child = unsafe {
-        Command::new("/bin/busybox")
-            .arg("sh")
-            .env("PS1", "\x1b[2m^Ax=quit\x1b[0m \\w # ")
-            .stdin(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
+        let mut cmd = Command::new("/bin/busybox");
+        cmd.arg("sh")
+            .env("TERM", &term)
+            .env("PS1", "\x1b[2m^Ax=quit\x1b[0m \\w # ");
+        if let Some(ref ct) = colorterm {
+            cmd.env("COLORTERM", ct);
+        }
+        cmd.stdin(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
             .stdout(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
             .stderr(Stdio::from(OwnedFd::from_raw_fd(libc::dup(slave_fd))))
             .pre_exec(move || {
