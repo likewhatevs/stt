@@ -1345,20 +1345,21 @@ impl KtstrVm {
         // initramfs decompressor handles concatenated zstd natively.
         // Keeping them separate lets us COW-map the base from SHM.
         let t0 = Instant::now();
-        let gz_base = self.get_or_compress_base(base_bytes, &key)?;
-        let gz_suffix = {
+        let zstd_base = self.get_or_compress_base(base_bytes, &key)?;
+        let zstd_suffix = {
             use std::io::Write;
             let mut enc =
                 zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
+            enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
             enc.write_all(&suffix).context("zstd suffix")?;
             enc.finish().context("finish zstd suffix")?
         };
-        let total_compressed = gz_base.len() + gz_suffix.len();
+        let total_compressed = zstd_base.len() + zstd_suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
             uncompressed = uncompressed_size,
-            gz_base = gz_base.len(),
-            gz_suffix = gz_suffix.len(),
+            zstd_base = zstd_base.len(),
+            zstd_suffix = zstd_suffix.len(),
             ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
             "zstd_initramfs",
         );
@@ -1366,16 +1367,19 @@ impl KtstrVm {
         // Try COW overlay: mmap compressed base from SHM fd directly
         // into guest memory, sharing physical pages across VMs.
         let t0 = Instant::now();
-        let cow_ok = self.try_cow_overlay(vm, &key, gz_base.len(), load_addr);
+        let cow_ok = self.try_cow_overlay(vm, &key, zstd_base.len(), load_addr);
         if cow_ok {
             // Base is COW-mapped. Write suffix after it.
             vm.guest_mem
-                .write_slice(&gz_suffix, GuestAddress(load_addr + gz_base.len() as u64))
-                .context("write gz suffix after COW base")?;
+                .write_slice(
+                    &zstd_suffix,
+                    GuestAddress(load_addr + zstd_base.len() as u64),
+                )
+                .context("write zstd suffix after COW base")?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cow_initramfs");
         } else {
             // Fallback: write both parts via write_slice.
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[&gz_base, &gz_suffix], load_addr)?;
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[&zstd_base, &zstd_suffix], load_addr)?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "copy_initramfs");
         }
 
@@ -1432,33 +1436,37 @@ impl KtstrVm {
 
         // Compress and load initramfs.
         let t0 = Instant::now();
-        let gz_base = self.get_or_compress_base(base_bytes, &key)?;
-        let gz_suffix = {
+        let zstd_base = self.get_or_compress_base(base_bytes, &key)?;
+        let zstd_suffix = {
             use std::io::Write;
             let mut enc =
                 zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
+            enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
             enc.write_all(&suffix).context("zstd suffix")?;
             enc.finish().context("finish zstd suffix")?
         };
-        let total_compressed = gz_base.len() + gz_suffix.len();
+        let total_compressed = zstd_base.len() + zstd_suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
             uncompressed = uncompressed_size,
-            gz_base = gz_base.len(),
-            gz_suffix = gz_suffix.len(),
+            zstd_base = zstd_base.len(),
+            zstd_suffix = zstd_suffix.len(),
             ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
             "zstd_initramfs",
         );
 
         let t0 = Instant::now();
-        let cow_ok = self.try_cow_overlay(vm, &key, gz_base.len(), load_addr);
+        let cow_ok = self.try_cow_overlay(vm, &key, zstd_base.len(), load_addr);
         if cow_ok {
             vm.guest_mem
-                .write_slice(&gz_suffix, GuestAddress(load_addr + gz_base.len() as u64))
-                .context("write gz suffix after COW base")?;
+                .write_slice(
+                    &zstd_suffix,
+                    GuestAddress(load_addr + zstd_base.len() as u64),
+                )
+                .context("write zstd suffix after COW base")?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cow_initramfs");
         } else {
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[&gz_base, &gz_suffix], load_addr)?;
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[&zstd_base, &zstd_suffix], load_addr)?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "copy_initramfs");
         }
 
@@ -1497,7 +1505,7 @@ impl KtstrVm {
                     std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
                     libc::munmap(ptr, len);
                     initramfs::shm_close_fd(fd);
-                    tracing::debug!(bytes = len, "gz_base cache hit (shm)");
+                    tracing::debug!(bytes = len, "zstd_base cache hit (shm)");
                     return Ok(buf);
                 }
             }
@@ -1508,6 +1516,7 @@ impl KtstrVm {
         use std::io::Write;
         let mut enc =
             zstd::stream::write::Encoder::new(Vec::new(), 1).context("create zstd encoder")?;
+        enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
         enc.write_all(base_bytes).context("zstd base")?;
         let gz = enc.finish().context("finish zstd base")?;
 
@@ -2559,6 +2568,9 @@ impl KtstrVm {
                     use std::io::Write;
                     let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1)
                         .context("create zstd encoder")?;
+                    enc.multithread(
+                        std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
+                    )?;
                     enc.write_all(base_bytes).context("zstd initramfs base")?;
                     enc.write_all(&suffix).context("zstd initramfs suffix")?;
                     enc.finish().context("finish zstd initramfs")?
@@ -2606,6 +2618,9 @@ impl KtstrVm {
                     use std::io::Write;
                     let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1)
                         .context("create zstd encoder")?;
+                    enc.multithread(
+                        std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
+                    )?;
                     enc.write_all(base_bytes).context("zstd initramfs base")?;
                     enc.write_all(&suffix).context("zstd initramfs suffix")?;
                     enc.finish().context("finish zstd initramfs")?

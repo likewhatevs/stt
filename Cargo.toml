@@ -33,7 +33,7 @@ tempfile = { version = "3", optional = true }
 xz2 = { version = "0.1", optional = true }
 opendal = { version = "0.55", default-features = false, features = ["services-ghac"], optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 flate2 = "1"
 ctor = "0.8"
 libc = "0.2"
