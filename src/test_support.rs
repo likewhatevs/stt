@@ -758,9 +758,15 @@ fn list_tests_all(ignored_only: bool) {
         let host_cpus = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1);
-        let host_llcs = crate::vmm::host_topology::HostTopology::from_sysfs()
+        let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
+        let host_llcs = host_topo
+            .as_ref()
             .map(|t| t.llc_groups.len() as u32)
             .unwrap_or(1);
+        let host_max_cpus_per_llc = host_topo
+            .as_ref()
+            .map(|t| t.max_cores_per_llc() as u32)
+            .unwrap_or(host_cpus);
         for preset in &presets {
             let t = &preset.topology;
             if t.sockets < entry.constraints.min_sockets
@@ -769,6 +775,7 @@ fn list_tests_all(ignored_only: bool) {
                 || t.total_cpus() < entry.constraints.min_cpus
                 || t.total_cpus() > host_cpus
                 || t.num_llcs() > host_llcs
+                || t.cores_per_socket * t.threads_per_core > host_max_cpus_per_llc
             {
                 continue;
             }
@@ -824,17 +831,25 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
         let host_cpus = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1);
+        let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
+        let host_llcs = host_topo
+            .as_ref()
+            .map(|t| t.llc_groups.len() as u32)
+            .unwrap_or(1);
+        let host_max_cpus_per_llc = host_topo
+            .as_ref()
+            .map(|t| t.max_cores_per_llc() as u32)
+            .unwrap_or(host_cpus);
         for preset in &presets {
             let t = &preset.topology;
             if t.sockets < entry.constraints.min_sockets
                 || t.num_llcs() < entry.constraints.min_llcs
                 || (entry.constraints.requires_smt && t.threads_per_core < 2)
                 || t.total_cpus() < entry.constraints.min_cpus
+                || t.total_cpus() > host_cpus
+                || t.num_llcs() > host_llcs
+                || t.cores_per_socket * t.threads_per_core > host_max_cpus_per_llc
             {
-                continue;
-            }
-            // Skip presets that exceed host CPU count.
-            if t.total_cpus() > host_cpus {
                 continue;
             }
             for profile in &profiles {
