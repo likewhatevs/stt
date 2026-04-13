@@ -670,7 +670,7 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
 /// kernel.org, configures with the embedded kconfig, builds, caches,
 /// and returns the image path.
 fn auto_download_kernel() -> Result<std::path::PathBuf> {
-    eprintln!("ktstr: no kernel found, downloading latest stable");
+    status("ktstr: no kernel found, downloading latest stable");
 
     let sp = Spinner::start("Fetching latest kernel version...");
     let ver = crate::fetch::fetch_latest_stable_version().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -753,10 +753,10 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
         match cache.store(&acquired.cache_key, &image, vmlinux_ref, &metadata) {
             Ok(entry) => {
                 let cached_image = entry.path.join(image_name);
-                eprintln!("ktstr: kernel cached as {}", acquired.cache_key);
+                success(&format!("ktstr: kernel cached as {}", acquired.cache_key));
                 return Ok(cached_image);
             }
-            Err(e) => eprintln!("ktstr: warning: cache store failed: {e:#}"),
+            Err(e) => warn(&format!("ktstr: cache store failed: {e:#}")),
         }
     }
 
@@ -808,14 +808,14 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     {
         let image = entry.path.join(&meta.image_name);
         if image.exists() {
-            eprintln!("ktstr: using cached kernel {cache_key}");
+            success(&format!("ktstr: using cached kernel {cache_key}"));
             return Ok(image);
         }
     }
 
     // Build.
     if is_dirty {
-        eprintln!("ktstr: dirty tree, building kernel");
+        warn("ktstr: dirty tree, building kernel");
     }
     let sp = Spinner::start("Building kernel...");
     let result = make_kernel_with_output(path, Some(&sp));
@@ -851,12 +851,54 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         .with_source_tree_path(Some(acquired.source_dir.clone()));
 
         match cache.store(&cache_key, &image, vmlinux_ref, &metadata) {
-            Ok(_) => eprintln!("ktstr: kernel cached as {cache_key}"),
-            Err(e) => eprintln!("ktstr: warning: cache store failed: {e:#}"),
+            Ok(_) => success(&format!("ktstr: kernel cached as {cache_key}")),
+            Err(e) => warn(&format!("ktstr: cache store failed: {e:#}")),
         }
     }
 
     Ok(image)
+}
+
+/// Whether stderr supports color (cached per process).
+fn stderr_color() -> bool {
+    static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COLOR.get_or_init(|| unsafe { libc::isatty(libc::STDERR_FILENO) } != 0)
+}
+
+/// Print a styled status message to stderr.
+pub fn status(msg: &str) {
+    if stderr_color() {
+        eprintln!("\x1b[1m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+/// Print a green success message to stderr.
+pub fn success(msg: &str) {
+    if stderr_color() {
+        eprintln!("\x1b[32m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+/// Print a yellow warning to stderr.
+pub fn warn(msg: &str) {
+    if stderr_color() {
+        eprintln!("\x1b[33m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+/// Print a dim message to stderr.
+pub fn dim(msg: &str) {
+    if stderr_color() {
+        eprintln!("\x1b[2m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
 }
 
 /// Progress spinner for long-running CLI operations.
