@@ -215,7 +215,7 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     }
 
     let sp = cli::Spinner::start("Building kernel...");
-    let result = cli::make_kernel_with_spinner(kernel_dir, &sp).map_err(|e| format!("{e:#}"));
+    let result = cli::make_kernel_quiet(kernel_dir).map_err(|e| format!("{e:#}"));
     if result.is_err() {
         sp.clear();
     } else {
@@ -224,8 +224,8 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     result?;
 
     let sp = cli::Spinner::start("Generating compile_commands.json...");
-    let result = cli::run_make_with_spinner(kernel_dir, &["compile_commands.json"], &sp)
-        .map_err(|e| format!("{e:#}"));
+    let result =
+        cli::run_make_quiet(kernel_dir, &["compile_commands.json"]).map_err(|e| format!("{e:#}"));
     if result.is_err() {
         sp.clear();
     } else {
@@ -386,7 +386,7 @@ fn kernel_build(
 
     // Build.
     let sp = cli::Spinner::start("Building kernel...");
-    let result = cli::make_kernel_with_spinner(source_dir, &sp).map_err(|e| format!("{e:#}"));
+    let result = cli::make_kernel_quiet(source_dir).map_err(|e| format!("{e:#}"));
     if result.is_err() {
         sp.clear();
     } else {
@@ -397,7 +397,7 @@ fn kernel_build(
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
         let sp = cli::Spinner::start("Generating compile_commands.json...");
-        let result = cli::run_make_with_spinner(source_dir, &["compile_commands.json"], &sp)
+        let result = cli::run_make_quiet(source_dir, &["compile_commands.json"])
             .map_err(|e| format!("{e:#}"));
         if result.is_err() {
             sp.clear();
