@@ -180,7 +180,7 @@ pub fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
 /// Workers in nested sub-cgroups.
 ///
 /// Creates a multi-level cgroup hierarchy (cg_0/sub_a, cg_0/sub_b,
-/// cg_1/sub_a, cg_1/sub_a/deep) with workers at the leaf level.
+/// cg_1/sub_b, cg_1/sub_a/deep) with workers at the leaf level.
 /// Tests scheduler handling of nested cgroup hierarchies.
 pub fn nested_steady(ctx: &Ctx) -> Result<AssertResult> {
     super::nested::custom_nested_cgroup_steady(ctx)
