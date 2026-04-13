@@ -117,10 +117,12 @@ int main(void) {{
     println!("cargo::rerun-if-changed=src/bpf/fentry_probe.bpf.c");
     println!("cargo::rerun-if-changed=src/bpf/intf.h");
 
-    // Git info for output directory keying.
+    // Git info for output directory keying and cache invalidation.
+    let mut commit_hash = String::from("unknown");
     if let Ok(repo) = gix::discover(".") {
         if let Ok(id) = repo.head_id() {
             let full = id.to_string();
+            commit_hash = full.clone();
             let short = &full[..full.len().min(7)];
             println!("cargo:rustc-env=KTSTR_GIT_HASH={short}");
         }
@@ -128,7 +130,9 @@ int main(void) {{
             println!("cargo:rustc-env=KTSTR_GIT_BRANCH={}", name.shorten());
         }
     }
+    println!("cargo:rustc-env=KTSTR_GIT_FULL_HASH={commit_hash}");
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs");
 
     // Build busybox from source for guest shell mode.
     // Cache: skip if $OUT_DIR/busybox exists. After build.rs config

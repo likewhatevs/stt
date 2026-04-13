@@ -122,7 +122,8 @@ See [Budget-based test selection](../running-tests.md#budget-based-test-selectio
 
 ## Memory allocation
 
-Each gauntlet VM gets `max(cpus * 64, 256, entry.memory_mb)` MB of RAM,
-where `cpus` is the preset's total CPU count and `entry.memory_mb` is
-the per-test minimum (default 2048). For `max-cpu` (252 CPUs) this
-yields at least 16128 MB.
+Each gauntlet VM gets `max(topology_mb, initramfs_floor)` MB of RAM,
+where `topology_mb = max(cpus * 64, 256, entry.memory_mb)` is the
+topology-requested minimum and `initramfs_floor` is computed from
+the actual initramfs size after build. For `max-cpu` (252 CPUs) the
+topology minimum is at least 16128 MB.

@@ -96,6 +96,10 @@ pub struct KtstrKvm {
     /// Whether hugepages were requested at construction time.
     /// Stored so deferred memory allocation uses the same backing.
     use_hugepages: bool,
+    /// Performance mode flag. Stored so deferred memory allocation
+    /// can check hugepage availability fresh when memory_mb was
+    /// unknown at construction time.
+    performance_mode: bool,
 }
 
 impl KtstrKvm {
@@ -130,10 +134,16 @@ impl KtstrKvm {
     ///
     /// Must be called exactly once on a VM created with `new_deferred`.
     /// Replaces the placeholder guest memory with a real allocation of
-    /// `memory_mb` megabytes.
+    /// `memory_mb` megabytes. Re-checks hugepage availability when
+    /// performance_mode is set, since memory_mb was unknown at
+    /// construction time and `use_hugepages` may have been false.
     pub fn allocate_and_register_memory(&mut self, memory_mb: u32) -> Result<()> {
         let mem_size = (memory_mb as u64) << 20;
-        let guest_mem = if self.use_hugepages {
+        let use_hugepages = self.use_hugepages
+            || (self.performance_mode
+                && crate::vmm::host_topology::hugepages_free()
+                    >= crate::vmm::host_topology::hugepages_needed(memory_mb));
+        let guest_mem = if use_hugepages {
             crate::vmm::allocate_hugepage_memory(mem_size as usize, GuestAddress(0))?
         } else {
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mem_size as usize)])
@@ -440,6 +450,7 @@ impl KtstrKvm {
             has_immediate_exit,
             split_irqchip,
             use_hugepages,
+            performance_mode,
         })
     }
 }

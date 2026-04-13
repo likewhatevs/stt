@@ -253,6 +253,8 @@ pub(crate) const BUSYBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busy
 
 /// Short git commit hash at build time.
 pub const GIT_HASH: &str = env!("KTSTR_GIT_HASH");
+/// Full git commit hash at build time.
+pub const GIT_FULL_HASH: &str = env!("KTSTR_GIT_FULL_HASH");
 /// Git branch name at build time.
 pub const GIT_BRANCH: &str = env!("KTSTR_GIT_BRANCH");
 
@@ -485,7 +487,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 /// `include_files`: `(archive_path, host_path)` pairs for files to
 ///   include in the guest.
 /// `memory_mb`: explicit guest memory override in MB. When `None`,
-///   memory is estimated from payload and include file sizes.
+///   memory is computed from actual initramfs size after build.
 pub fn run_shell(
     kernel: std::path::PathBuf,
     sockets: u32,

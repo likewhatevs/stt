@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 /// Result of shared library resolution for a binary.
 #[derive(Debug, Clone)]
-pub struct SharedLibs {
+pub(crate) struct SharedLibs {
     /// Resolved `(guest_path, host_path)` pairs.
     pub found: Vec<(String, PathBuf)>,
     /// Library sonames that could not be resolved to a host path.
@@ -25,7 +25,7 @@ pub struct SharedLibs {
 
 /// A shared library dependency that could not be resolved.
 #[derive(Debug, Clone)]
-pub struct MissingLib {
+pub(crate) struct MissingLib {
     /// The soname (e.g. `libssl.so.1.1`).
     pub soname: String,
     /// True if this soname appears in the root binary's DT_NEEDED.
@@ -196,14 +196,17 @@ fn glob_match(pattern: &str, s: &str) -> bool {
 /// Resolve shared library dependencies for a dynamically-linked ELF binary.
 /// Parses the ELF dynamic section to read DT_NEEDED entries, then resolves
 /// each soname to a host path matching the host dynamic linker's search
-/// order: LD_LIBRARY_PATH → DT_RUNPATH/DT_RPATH →
-/// /etc/ld.so.conf paths → default library paths. Recurses into resolved
-/// libraries to build the full transitive closure. Returns empty result
-/// for static binaries or non-ELF files.
+/// order: LD_LIBRARY_PATH → DT_RUNPATH/DT_RPATH → /etc/ld.so.cache →
+/// /etc/ld.so.conf paths → default library paths. When the binary uses
+/// a non-standard PT_INTERP, the interpreter's parent and sibling lib
+/// dirs are prepended to the search path (before RPATH/RUNPATH) and
+/// propagated to transitive deps. Walks transitive deps via
+/// level-parallel BFS. Returns empty result for static binaries or
+/// non-ELF files.
 #[tracing::instrument(skip_all, fields(binary = %binary.display()))]
-pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
+pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     // Cache results by canonical path — avoids re-resolving the same
-    // binary when called from both memory estimation and initramfs build.
+    // binary across concurrent initramfs builds (nextest parallelism).
     static CACHE: LazyLock<std::sync::Mutex<HashMap<PathBuf, SharedLibs>>> =
         LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
@@ -241,7 +244,38 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
 
     // Extract DT_NEEDED, DT_RUNPATH, and DT_RPATH from the root binary.
     let root_needed: Vec<String> = elf.libraries.iter().map(|s| s.to_string()).collect();
-    let root_search = elf_search_paths(&elf, binary);
+    let mut root_search = elf_search_paths(&elf, binary);
+
+    // When the binary uses a non-standard interpreter (custom toolchain),
+    // collect the interpreter's parent dir and sibling lib dirs. These
+    // are prepended to root search paths and propagated to transitive
+    // deps so the custom environment's libs are found BEFORE system libs.
+    // Without this, the system libc gets resolved first, causing version
+    // mismatches when the custom ld.so loads a libc that requires GLIBC
+    // symbols the custom ld.so doesn't provide.
+    let interp_search_dirs: Vec<PathBuf> = match interpreter {
+        Some(ref interp) if !is_standard_interpreter(interp) => {
+            let interp_path = Path::new(interp);
+            let mut dirs = Vec::new();
+            if let Some(parent) = interp_path.parent() {
+                dirs.push(parent.to_path_buf());
+                // Sibling lib dirs: e.g. for /opt/toolchain/lib64/ld.so,
+                // parent is lib64, so siblings are at parent.parent()/lib
+                // and parent.parent()/lib64.
+                if let Some(grandparent) = parent.parent() {
+                    dirs.push(grandparent.join("lib"));
+                    dirs.push(grandparent.join("lib64"));
+                }
+            }
+            dirs
+        }
+        _ => Vec::new(),
+    };
+    if !interp_search_dirs.is_empty() {
+        let mut combined = interp_search_dirs.clone();
+        combined.append(&mut root_search);
+        root_search = combined;
+    }
 
     // Resolve the full transitive closure via level-parallel BFS.
     // Each level's file reads (read + ELF parse) run in parallel via
@@ -304,7 +338,14 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
                 let Ok(lib_elf) = goblin::elf::Elf::parse(&lib_data) else {
                     return Vec::new();
                 };
-                let lib_search = elf_search_paths(&lib_elf, canonical);
+                let mut lib_search = elf_search_paths(&lib_elf, canonical);
+                // Propagate interpreter-relative dirs to transitive deps
+                // so custom-environment libs resolve consistently.
+                if !interp_search_dirs.is_empty() {
+                    let mut combined = interp_search_dirs.clone();
+                    combined.append(&mut lib_search);
+                    lib_search = combined;
+                }
                 lib_elf
                     .libraries
                     .iter()
@@ -319,40 +360,6 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
             .filter(|(soname, _)| !visited.contains(soname))
             .map(|(soname, search)| (soname, false, search))
             .collect();
-    }
-
-    // If there are unresolved libs and the binary has a non-standard
-    // interpreter, search directories relative to the interpreter's
-    // location. Custom toolchain linkers typically live alongside the
-    // libs they resolve.
-    if !missing.is_empty()
-        && let Some(ref interp) = interpreter
-        && !is_standard_interpreter(interp)
-    {
-        let interp_path = Path::new(interp);
-        let mut interp_dirs: Vec<PathBuf> = Vec::new();
-        if let Some(parent) = interp_path.parent() {
-            interp_dirs.push(parent.to_path_buf());
-            interp_dirs.push(parent.join("lib"));
-            interp_dirs.push(parent.join("lib64"));
-        }
-        missing.retain(|m| {
-            for dir in &interp_dirs {
-                let candidate = dir.join(&m.soname);
-                if candidate.is_file() {
-                    let canonical =
-                        std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-                    let canon_str = canonical.to_string_lossy();
-                    let canon_guest = canon_str
-                        .strip_prefix('/')
-                        .unwrap_or(&canon_str)
-                        .to_string();
-                    found.push((canon_guest, canonical));
-                    return false;
-                }
-            }
-            true
-        });
     }
 
     let result = SharedLibs {
@@ -424,7 +431,7 @@ const STANDARD_INTERPRETERS: &[&str] = &[
 /// canonicalized path against canonicalized well-known linker paths
 /// to catch symlinks (e.g. `/opt/toolchain/lib/ld-linux-x86-64.so.2`
 /// symlinking to `/lib64/ld-linux-x86-64.so.2`).
-pub fn is_standard_interpreter(interp: &str) -> bool {
+fn is_standard_interpreter(interp: &str) -> bool {
     let interp_path = Path::new(interp);
     // Direct match first (avoids syscalls for common case).
     if STANDARD_INTERPRETERS.contains(&interp) {
@@ -437,22 +444,6 @@ pub fn is_standard_interpreter(interp: &str) -> bool {
     STANDARD_INTERPRETERS.iter().any(|std_interp| {
         std::fs::canonicalize(std_interp).is_ok_and(|std_canon| std_canon == canon)
     })
-}
-
-/// Fast soname-to-path lookup using only the ld.so.cache and default
-/// paths. No transitive walk, no RPATH parsing. Used for memory
-/// estimation where speed matters more than completeness.
-pub fn resolve_soname_quick(soname: &str) -> Option<PathBuf> {
-    if let Some(cached_path) = LD_SO_CACHE.get(soname) {
-        return Some(cached_path.clone());
-    }
-    for dir in DEFAULT_LIB_PATHS {
-        let candidate = Path::new(dir).join(soname);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 /// Default library search paths used by the dynamic linker.
@@ -556,6 +547,19 @@ fn write_entry(archive: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) -> Res
     Ok(())
 }
 
+/// Write a cpio symlink entry. `name` is the symlink path, `target` is the
+/// absolute path it points to. Mode is S_IFLNK | 0777 = 0o120777.
+fn write_symlink_entry(archive: &mut Vec<u8>, name: &str, target: &str) -> Result<()> {
+    let target_bytes = target.as_bytes();
+    let builder = cpio::newc::Builder::new(name).mode(0o120777).nlink(1);
+    let mut writer = builder.write(archive as &mut dyn Write, target_bytes.len() as u32);
+    writer
+        .write_all(target_bytes)
+        .with_context(|| format!("write cpio symlink '{name}' -> '{target}'"))?;
+    writer.finish().context("finish cpio symlink entry")?;
+    Ok(())
+}
+
 /// Section names removed during debug stripping. These contain debug
 /// info, compiler metadata, and profiling data that inflate the binary
 /// but are not needed inside the VM.
@@ -640,7 +644,7 @@ fn is_deleted_self(path: &Path) -> bool {
 
 /// Build the base cpio archive: /init binary, extra binaries, and shared
 /// libraries. Does NOT include /args, trailer, or 512-byte padding. The
-/// returned bytes are a valid cpio prefix that `build_suffix` can complete
+/// returned bytes are a valid cpio prefix that `build_suffix_full` can complete
 /// with per-invocation args.
 ///
 /// The test binary is packed as `/init` (the kernel's rdinit entry point).
@@ -671,6 +675,13 @@ pub fn create_initramfs_base(
             .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             anyhow::bail!("include_files archive path contains '..': {}", archive_path);
+        }
+        // Reject paths that collide with internal sentinel files.
+        if archive_path.starts_with(".ktstr_") {
+            anyhow::bail!(
+                "include_files archive path must not start with '.ktstr_': {}",
+                archive_path
+            );
         }
         // Reject non-regular files (FIFOs, device nodes, sockets block or
         // produce garbage).
@@ -897,13 +908,32 @@ pub fn create_initramfs_base(
         write_entry(&mut archive, archive_path, &data, *mode)?;
     }
 
-    // Shared libraries
-    for (guest_path, host_path) in &shared_libs {
-        let data = std::fs::read(host_path).with_context(|| {
-            format!("read shared lib '{}': {}", guest_path, host_path.display())
-        })?;
-        write_entry(&mut archive, guest_path, &data, 0o100755)?;
+    // Shared libraries — write each canonical host file once as a regular
+    // file, then write subsequent guest paths that map to the same host
+    // file as cpio symlinks. This avoids duplicating large libraries in
+    // the initramfs (e.g. libc appearing under both lib64/ and usr/lib64/).
+    {
+        // canonical host path -> first guest_path written for this file
+        let mut written_files: HashMap<PathBuf, String> = HashMap::new();
+        for (guest_path, host_path) in &shared_libs {
+            let canonical = std::fs::canonicalize(host_path).unwrap_or_else(|_| host_path.clone());
+            if let Some(first_guest) = written_files.get(&canonical) {
+                // Already written — emit a symlink to the first guest path.
+                let target = format!("/{first_guest}");
+                write_symlink_entry(&mut archive, guest_path, &target)?;
+            } else {
+                let data = std::fs::read(host_path).with_context(|| {
+                    format!("read shared lib '{}': {}", guest_path, host_path.display())
+                })?;
+                write_entry(&mut archive, guest_path, &data, 0o100755)?;
+                written_files.insert(canonical, guest_path.clone());
+            }
+        }
     }
+
+    // Sentinel: last entry before the suffix. The guest init checks for
+    // this file to detect incomplete initramfs extraction.
+    write_entry(&mut archive, ".ktstr_init_ok", &[], 0o100644)?;
 
     drop(_s_write);
 
@@ -913,7 +943,12 @@ pub fn create_initramfs_base(
 /// Build the suffix that completes a base archive: /args and /sched_args
 /// entries, trailer, and 512-byte padding. `base_len` is needed to compute
 /// the padding. The returned Vec is typically ~200 bytes.
-pub fn build_suffix(base_len: usize, args: &[String], sched_args: &[String]) -> Result<Vec<u8>> {
+#[cfg(test)]
+pub(crate) fn build_suffix(
+    base_len: usize,
+    args: &[String],
+    sched_args: &[String],
+) -> Result<Vec<u8>> {
     build_suffix_full(base_len, args, sched_args, &[], &[])
 }
 
@@ -993,7 +1028,7 @@ pub(crate) fn shm_segment_name(content_hash: u64) -> String {
 /// Read-only mmap of a POSIX shared-memory segment. The mapping stays
 /// live until the struct is dropped, so callers can borrow the bytes
 /// without copying the entire base archive.
-pub struct MappedShm {
+pub(crate) struct MappedShm {
     ptr: *const u8,
     len: usize,
 }
@@ -1028,7 +1063,7 @@ impl Drop for MappedShm {
 /// finished populating the segment. The lock is released after mmap
 /// completes -- the mapped pages are stable after that since writers
 /// use the same content-hash segment name (idempotent writes).
-pub fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
+pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
     let name = std::ffi::CString::new(shm_segment_name(content_hash)).ok()?;
     unsafe {
         let fd = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
@@ -1123,7 +1158,7 @@ fn shm_store(name: &std::ffi::CStr, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
+pub(crate) fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
     let name =
         std::ffi::CString::new(shm_segment_name(content_hash)).context("shm segment name")?;
     shm_store(&name, data)
@@ -1131,7 +1166,7 @@ pub fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
 
 /// Remove the POSIX shared-memory segment identified by `content_hash`.
 #[allow(dead_code)]
-pub fn shm_unlink_base(content_hash: u64) {
+pub(crate) fn shm_unlink_base(content_hash: u64) {
     if let Ok(name) = std::ffi::CString::new(shm_segment_name(content_hash)) {
         unsafe {
             libc::shm_unlink(name.as_ptr());
@@ -1147,15 +1182,15 @@ pub fn shm_unlink_base(content_hash: u64) {
 /// Segment name for the LZ4-compressed version of a base initramfs.
 /// Uses `lz4` prefix to avoid collisions with segments written by
 /// previous compression formats (zstd, gzip).
-fn shm_gz_segment_name(content_hash: u64) -> String {
+fn shm_lz4_segment_name(content_hash: u64) -> String {
     format!("/ktstr-lz4-{content_hash:016x}")
 }
 
 /// Open the compressed SHM segment and return a held fd + size.
 /// The fd has a shared flock held — caller must close it when done.
 /// Returns `None` on miss or error.
-pub(crate) fn shm_open_gz(content_hash: u64) -> Option<(std::os::unix::io::RawFd, usize)> {
-    let name = std::ffi::CString::new(shm_gz_segment_name(content_hash)).ok()?;
+pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::unix::io::RawFd, usize)> {
+    let name = std::ffi::CString::new(shm_lz4_segment_name(content_hash)).ok()?;
     unsafe {
         let fd = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
         if fd < 0 {
@@ -1175,9 +1210,10 @@ pub(crate) fn shm_open_gz(content_hash: u64) -> Option<(std::os::unix::io::RawFd
     }
 }
 
-/// Store compressed initramfs data into a gz SHM segment.
-pub(crate) fn shm_store_gz(content_hash: u64, data: &[u8]) -> Result<()> {
-    let name = std::ffi::CString::new(shm_gz_segment_name(content_hash)).context("shm gz name")?;
+/// Store compressed initramfs data into an LZ4 SHM segment.
+pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
+    let name =
+        std::ffi::CString::new(shm_lz4_segment_name(content_hash)).context("shm lz4 name")?;
     shm_store(&name, data)
 }
 

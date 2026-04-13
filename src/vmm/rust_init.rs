@@ -83,6 +83,26 @@ pub(crate) fn ktstr_guest_init() -> ! {
     mount_filesystems();
     let t_mounts = t0.elapsed();
 
+    // Verify initramfs extraction completed. The sentinel file is the
+    // last entry written by create_initramfs_base — its absence means
+    // the kernel ran out of memory during cpio extraction. The memory
+    // formula should prevent this; hitting it indicates an estimation bug.
+    if !Path::new("/.ktstr_init_ok").exists() {
+        // Dump dmesg to serial so the host sees the kernel OOM messages.
+        if let Ok(raw) = rmesg::logs_raw(rmesg::Backend::Default, false) {
+            let _ = fs::write(COM2, &raw);
+            let _ = fs::write(COM1, &raw);
+        }
+        let msg = "FATAL: initramfs extraction incomplete — kernel ran out of \
+                   memory during cpio extraction. This indicates a bug in ktstr's \
+                   memory estimation. Please report this issue. As a workaround, \
+                   try `--memory N` with a larger value.";
+        let _ = fs::write(COM2, msg);
+        let _ = fs::write(COM1, msg);
+        eprintln!("{msg}");
+        force_reboot();
+    }
+
     // Enable per-program BPF runtime stats (cnt, nsecs). The kernel
     // only populates bpf_prog_stats when bpf_stats_enabled_key is set.
     let _ = fs::write("/proc/sys/kernel/bpf_stats_enabled", "1");
@@ -127,7 +147,6 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // SAFETY: single-threaded context — PID 1 before any threads spawn.
     unsafe {
         std::env::set_var("PATH", "/bin");
-        std::env::set_var("LD_LIBRARY_PATH", "/lib:/lib64:/usr/lib:/usr/lib64");
     }
 
     // Shell mode: interactive busybox shell instead of test dispatch.

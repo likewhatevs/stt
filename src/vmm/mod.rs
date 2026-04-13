@@ -211,9 +211,10 @@ impl<T> Drop for PiMutexGuard<'_, T> {
 // Initramfs cache — two-tier: POSIX shm (cross-process) + in-process HashMap
 // ---------------------------------------------------------------------------
 
-/// Cache key for base initramfs (payload + scheduler, no args).
-/// Derived from a content hash of the binary files so identical inputs
-/// produce the same key regardless of path or mtime.
+/// Cache key for base initramfs (payload + scheduler + ktstr commit hash, no args).
+/// Derived from a content hash of the binary files and the ktstr build
+/// commit hash so identical inputs produce the same key regardless of
+/// path or mtime.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(u64);
 
@@ -237,9 +238,12 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
 }
 
 impl BaseKey {
+    /// Hashes the ktstr commit hash, payload binary content, payload
+    /// shared libs, and optional scheduler binary content and shared libs.
     pub(crate) fn new(payload: &Path, scheduler: Option<&Path>) -> Result<Self> {
         let mut hasher = std::hash::DefaultHasher::new();
 
+        crate::GIT_FULL_HASH.hash(&mut hasher);
         hash_file(payload)?.hash(&mut hasher);
         Self::hash_shared_libs(payload, &mut hasher);
 
@@ -255,11 +259,11 @@ impl BaseKey {
         Ok(BaseKey(hasher.finish()))
     }
 
-    /// Shell mode key: hashes a sentinel, include files, and the
-    /// busybox flag so different shell configurations get distinct
-    /// cache keys. Include file archive paths and content are hashed
-    /// so the same payload + same includes = cache hit, while
-    /// different includes = cache miss.
+    /// Shell mode key: hashes the ktstr commit hash, a sentinel,
+    /// include files, and the busybox flag so different shell
+    /// configurations get distinct cache keys. Include file archive
+    /// paths and content are hashed so the same payload + same
+    /// includes = cache hit, while different includes = cache miss.
     pub(crate) fn new_shell(
         payload: &Path,
         scheduler: Option<&Path>,
@@ -268,6 +272,7 @@ impl BaseKey {
     ) -> Result<Self> {
         let mut hasher = std::hash::DefaultHasher::new();
 
+        crate::GIT_FULL_HASH.hash(&mut hasher);
         "ktstr-shell".hash(&mut hasher);
         busybox.hash(&mut hasher);
         hash_file(payload)?.hash(&mut hasher);
@@ -282,8 +287,9 @@ impl BaseKey {
             None => 0u8.hash(&mut hasher),
         }
 
-        // Hash include files: archive paths (sorted for determinism)
-        // and content hashes.
+        // Hash include files: archive paths (sorted for determinism),
+        // content hashes, and shared lib hashes for ELF includes (their
+        // shared libs are packed by create_initramfs_base).
         let mut sorted: Vec<(&str, &Path)> = include_files
             .iter()
             .map(|(a, p)| (a.as_str(), p.as_path()))
@@ -292,9 +298,8 @@ impl BaseKey {
         sorted.len().hash(&mut hasher);
         for (archive_path, host_path) in &sorted {
             archive_path.hash(&mut hasher);
-            if let Ok(h) = hash_file(host_path) {
-                h.hash(&mut hasher);
-            }
+            hash_file(host_path)?.hash(&mut hasher);
+            Self::hash_shared_libs(host_path, &mut hasher);
         }
 
         Ok(BaseKey(hasher.finish()))
@@ -317,8 +322,9 @@ impl BaseKey {
 }
 
 /// Process-global cache for base initramfs bytes. Keyed by content hash
-/// of payload + scheduler binaries. The lock is only held during map
-/// lookup/insert, never during the actual build.
+/// of commit hash, payload, scheduler, include files, and busybox flag.
+/// The lock is only held during map lookup/insert, never during the
+/// actual build.
 fn base_cache() -> &'static Mutex<HashMap<BaseKey, Arc<Vec<u8>>>> {
     static CACHE: OnceLock<Mutex<HashMap<BaseKey, Arc<Vec<u8>>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -348,6 +354,8 @@ impl AsRef<[u8]> for BaseRef {
 pub(crate) fn get_or_build_base(
     payload: &Path,
     extras: &[(&str, &Path)],
+    include_files: &[(&str, &Path)],
+    busybox: bool,
     key: &BaseKey,
 ) -> Result<BaseRef> {
     // Clean stale SHM segments from previous runs.
@@ -366,7 +374,7 @@ pub(crate) fn get_or_build_base(
             // We won the race — build, write, release.
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
-            let data = initramfs::create_initramfs_base(payload, extras, &[], false)?;
+            let data = initramfs::create_initramfs_base(payload, extras, include_files, busybox)?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
                 bytes = data.len(),
@@ -415,7 +423,7 @@ pub(crate) fn get_or_build_base(
 
     // 3. Fallback: build without SHM coordination.
     let t0 = std::time::Instant::now();
-    let data = initramfs::create_initramfs_base(payload, extras, &[], false)?;
+    let data = initramfs::create_initramfs_base(payload, extras, include_files, busybox)?;
     let arc = Arc::new(data);
     tracing::debug!(
         elapsed_us = t0.elapsed().as_micros(),
@@ -435,8 +443,14 @@ pub(crate) fn get_or_build_base(
 }
 
 /// Remove stale SHM segments from `/dev/shm` that don't match `current`.
-/// Scans for `ktstr-base-*` and `ktstr-gz-*` entries and unlinks any whose
-/// hash suffix differs from the current key.
+/// Scans for `ktstr-base-*`, `ktstr-lz4-*`, and legacy `ktstr-gz-*`
+/// entries and unlinks any whose hash suffix differs from the current key.
+///
+/// Only unlinks segments that are not held by another process. Tries
+/// `LOCK_EX | LOCK_NB` on each candidate — if the lock succeeds, no
+/// reader or writer holds it, so it's safe to unlink. If the lock
+/// fails (`EWOULDBLOCK`), another process is actively using the
+/// segment and it is skipped.
 fn cleanup_stale_shm(current: &BaseKey) {
     let current_suffix = format!("{:016x}", current.0);
     let shm_dir = match std::fs::read_dir("/dev/shm") {
@@ -450,7 +464,10 @@ fn cleanup_stale_shm(current: &BaseKey) {
         };
         let hash_suffix = if let Some(s) = name_str.strip_prefix("ktstr-base-") {
             s
+        } else if let Some(s) = name_str.strip_prefix("ktstr-lz4-") {
+            s
         } else if let Some(s) = name_str.strip_prefix("ktstr-gz-") {
+            // Legacy prefix from previous compression format.
             s
         } else {
             continue;
@@ -459,10 +476,21 @@ fn cleanup_stale_shm(current: &BaseKey) {
             continue;
         }
         let shm_name = format!("/{name_str}");
-        if let Ok(cname) = std::ffi::CString::new(shm_name) {
-            unsafe {
-                libc::shm_unlink(cname.as_ptr());
+        let Ok(cname) = std::ffi::CString::new(shm_name) else {
+            continue;
+        };
+        unsafe {
+            let fd = libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0);
+            if fd < 0 {
+                continue;
             }
+            // Try non-blocking exclusive lock. If another process holds
+            // LOCK_SH or LOCK_EX, this fails with EWOULDBLOCK and we skip.
+            if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 {
+                libc::shm_unlink(cname.as_ptr());
+                libc::flock(fd, libc::LOCK_UN);
+            }
+            libc::close(fd);
         }
     }
 }
@@ -554,58 +582,205 @@ fn shm_write_and_release(fd: std::os::unix::io::RawFd, data: &[u8], seg_name: &s
 // Initramfs memory floor
 // ---------------------------------------------------------------------------
 
-/// Minimum guest memory (in MB) needed to extract an initramfs.
-///
-/// During kernel boot the compressed cpio sits in the ramdisk region
-/// while the kernel decompresses it into tmpfs. Both coexist until
-/// free_initrd_mem() releases the compressed copy. The uncompressed
-/// content dominates: `2 * cpio_size` bounds the peak, plus 128 MB
-/// for kernel image, page tables, slab, and process execution.
-/// `shm_bytes` is the SHM region carved from the top of guest memory
-/// (E820 gap) — it reduces usable RAM.
-pub fn initramfs_min_memory_mb(initramfs_bytes: u64, shm_bytes: u64) -> u32 {
-    let initramfs_mb = ((initramfs_bytes + (1 << 20) - 1) >> 20) as u32;
-    let shm_mb = ((shm_bytes + (1 << 20) - 1) >> 20) as u32;
-    // The kernel decompresses the initrd into tmpfs (default 50% of
-    // RAM), then frees the compressed region. Peak memory is the
-    // uncompressed initramfs in tmpfs + kernel overhead (slab, page
-    // tables, kernel image). 256MB covers kernel overhead and leaves
-    // room for runtime use. Since tmpfs is 50% of RAM, we need 2x
-    // the initramfs size so that 50% of total >= initramfs.
-    2 * initramfs_mb + 256 + shm_mb
+/// Parameters for computing minimum guest memory.
+pub(crate) struct MemoryBudget {
+    /// Uncompressed initramfs size (base + suffix cpio) in bytes.
+    pub uncompressed_initramfs_bytes: u64,
+    /// LZ4-compressed initrd size in bytes. The compressed initrd
+    /// is memblock-reserved in guest physical memory from load until
+    /// free_initrd_mem() releases it after extraction.
+    pub compressed_initrd_bytes: u64,
+    /// Kernel `init_size` from bzImage setup_header (offset 0x260).
+    /// The kernel's declared contiguous memory requirement during
+    /// boot decompression. Includes compressed payload, decompressed
+    /// kernel, and decompression workspace. Overestimates resident
+    /// kernel (init sections and workspace are freed post-boot),
+    /// absorbing percpu and misc boot allocations.
+    pub kernel_init_size: u64,
+    /// SHM region carved from the top of guest memory (E820 gap).
+    pub shm_bytes: u64,
 }
 
-/// Estimate minimum guest memory from binary file sizes.
+/// Read the kernel's declared memory footprint from the image file.
 ///
-/// The uncompressed cpio is approximately the sum of the payload,
-/// scheduler, and shared library sizes plus cpio metadata (~5%).
-/// `shm_bytes` accounts for the SHM region carved from guest memory.
-pub fn estimate_min_memory_mb(
-    payload: &std::path::Path,
-    scheduler: Option<&std::path::Path>,
-    shm_bytes: u64,
-) -> u32 {
-    // Debug binaries are stripped before packing into the initramfs.
-    // Estimate stripped size as 1/2 of debug size. Actual ratios range
-    // from 4% to 30%, but polars-heavy binaries retain more data
-    // sections, so /2 avoids under-allocation at the cost of ~500MB
-    // over-estimate in the common case.
-    let payload_size = std::fs::metadata(payload).map(|m| m.len()).unwrap_or(0) / 2;
-    let sched_size = scheduler
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len() / 2)
-        .unwrap_or(0);
-    let lib_size: u64 = [Some(payload), scheduler]
-        .into_iter()
-        .flatten()
-        .filter_map(|p| initramfs::resolve_shared_libs(p).ok())
-        .flat_map(|result| result.found.into_iter().map(|(_, p)| p))
-        .filter_map(|p| std::fs::metadata(&p).ok())
-        .map(|m| m.len())
-        .sum();
-    // 5% overhead for cpio headers and alignment.
-    let uncompressed = ((payload_size + sched_size + lib_size) as f64 * 1.05) as u64;
-    initramfs_min_memory_mb(uncompressed, shm_bytes)
+/// x86_64 bzImage: reads `init_size` from setup_header at file offset
+/// 0x260 (setup_header starts at 0x1F1, `init_size` is at byte 111
+/// within it). This is the kernel's declared contiguous memory
+/// requirement during boot decompression.
+///
+/// aarch64 Image: reads `image_size` from the arm64 image header at
+/// file offset 16 (after code0 + code1 + text_offset). For gzip-
+/// compressed vmlinuz, falls back to file size * 4 as a conservative
+/// estimate of the decompressed Image size.
+pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(kernel_path)
+        .with_context(|| format!("open kernel for init_size: {}", kernel_path.display()))?;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // setup_header starts at 0x1F1, init_size at offset 111.
+        f.seek(SeekFrom::Start(0x260))
+            .context("seek to init_size in bzImage")?;
+        let mut buf = [0u8; 4];
+        f.read_exact(&mut buf)
+            .context("read init_size from bzImage")?;
+        Ok(u32::from_le_bytes(buf) as u64)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Check for gzip magic (0x1f 0x8b).
+        let mut magic = [0u8; 2];
+        f.read_exact(&mut magic).context("read kernel magic")?;
+        if magic == [0x1f, 0x8b] {
+            // Compressed vmlinuz — decompress header to read image_size.
+            f.seek(SeekFrom::Start(0))
+                .context("seek vmlinuz to start")?;
+            let mut decoder = flate2::read::GzDecoder::new(&mut f);
+            let mut header = [0u8; 24];
+            decoder
+                .read_exact(&mut header)
+                .context("decompress arm64 vmlinuz header for image_size")?;
+            return Ok(u64::from_le_bytes(header[16..24].try_into().unwrap()));
+        }
+        // Raw PE Image: image_size is a little-endian u64 at offset 16.
+        f.seek(SeekFrom::Start(16))
+            .context("seek to image_size in arm64 Image")?;
+        let mut buf = [0u8; 8];
+        f.read_exact(&mut buf)
+            .context("read image_size from arm64 Image")?;
+        Ok(u64::from_le_bytes(buf))
+    }
+}
+
+/// Minimum guest memory (in MB) needed to boot, extract the initramfs,
+/// and run the test workload.
+///
+/// ```text
+/// total = computed_boot_requirement + WORKLOAD_MB + shm
+/// ```
+///
+/// ## Computed boot requirement
+///
+/// Every term is derived from values known at allocation time. The model
+/// follows the kernel's boot memory layout.
+///
+/// **memblock-reserved regions** (excluded from `totalram_pages`):
+///
+/// - `kernel_init_size`: bzImage setup_header `init_size` field (offset
+///   0x260) — the kernel's declared contiguous memory requirement during
+///   boot decompression. Includes compressed payload, decompressed
+///   vmlinux, and decompression workspace. Overestimates resident kernel
+///   since init sections (`free_initmem`, `init/main.c`) and the
+///   decompression workspace are freed post-boot. The slack absorbs
+///   percpu allocations (`pcpu_embed_first_chunk` in `mm/percpu.c`
+///   reserves `static_size + reserved_size + dyn_size` per CPU via
+///   memblock, ~220KB/CPU with ktstr's kconfig which disables LOCKDEP)
+///   and misc boot allocations (page tables, slab bootstrap, hash tables).
+///
+/// - `compressed_initrd`: memblock-reserved by `reserve_initrd_mem()`
+///   (`init/initramfs.c:642`: `memblock_reserve(start, size)`) until
+///   `free_initrd_mem()` after `unpack_to_rootfs` completes.
+///
+/// - struct page array: `P / 64` bytes. Each 4KB page requires a
+///   `struct page` descriptor. On x86_64: base size = 56 bytes
+///   (flags:8 + 5-word union:40 + _mapcount:4 + _refcount:4), rounded
+///   to 64 by `CONFIG_HAVE_ALIGNED_STRUCT_PAGE` (16-byte alignment,
+///   `include/linux/mm_types.h`). Valid for x86_64 without `CONFIG_KMSAN`.
+///
+/// **tmpfs constraint** (the binding limit for initramfs extraction):
+///
+/// The rootfs tmpfs is mounted by `init_mount_tree()` (`fs/namespace.c`)
+/// via `vfs_kern_mount(&rootfs_fs_type, 0, ...)` — flags=0, NOT
+/// `SB_KERNMOUNT`. `alloc_super` (`fs/super.c`) sets `s->s_flags = flags`,
+/// so `SB_KERNMOUNT` is not set. In `shmem_fill_super` (`mm/shmem.c`),
+/// the `!(sb->s_flags & SB_KERNMOUNT)` branch runs, and since no
+/// `size=` mount option was parsed (`SHMEM_SEEN_BLOCKS` unset), it
+/// falls through to `ctx->blocks = shmem_default_max_blocks()` =
+/// `totalram_pages() / 2` (`mm/shmem.c:146`).
+///
+/// `initramfs_options=size=90%` on the cmdline is consumed by
+/// `init_mount_tree()` (`fs/namespace.c`) when mounting the rootfs
+/// tmpfs. This raises the tmpfs block limit from 50% to 90% of
+/// `totalram_pages`, preventing ENOSPC on large initramfs payloads.
+///
+/// Note: `rootflags=size=90%` would set `root_mount_data`
+/// (`init/do_mounts.c:109`), consumed only by `do_mount_root()` via
+/// `prepare_namespace()`. With `rdinit=`, `kernel_init_freeable`
+/// (`init/main.c`) skips `prepare_namespace()` when `init_eaccess`
+/// succeeds, so `rootflags=` is never applied to the rootfs.
+///
+/// The `SB_KERNMOUNT` (unlimited) tmpfs is the separate `shm_mnt`
+/// created by `shmem_init()` via `kern_mount()` — used for anonymous
+/// shared memory (`shmem_file_setup`), not the rootfs.
+///
+/// With `initramfs_options=size=90%`, the tmpfs limit is 90% of
+/// `totalram_pages` (not the default 50%):
+///
+/// ```text
+/// totalram_pages(P) = (P - init_size - compressed - P/64) / 4096
+/// tmpfs_max_pages = totalram_pages * 9 / 10
+/// constraint: tmpfs_max_pages >= uncompressed / 4096
+///
+/// Solving for P:
+/// (P - init_size - compressed - P/64) * 9/10 >= uncompressed
+/// P * 63/64 >= uncompressed * 10/9 + init_size + compressed
+/// P >= (uncompressed * 10/9 + init_size + compressed) * 64/63
+/// ```
+///
+/// In practice, `ceil(uncompressed * 10/9)` is used to ensure
+/// integer rounding does not underallocate.
+///
+/// ## Workload budget
+///
+/// 256 MB for scheduler execution, test scenarios, and runtime
+/// allocations (cgroup memory, BPF maps, process stacks, slab caches).
+/// This is a deliberate budget for post-boot workload, not a guess at
+/// kernel overhead.
+///
+/// ## SHM region
+///
+/// Carved from the top of guest physical memory via an E820 reserved
+/// gap. Not part of usable RAM, added directly.
+///
+/// ```text
+/// total = boot_requirement + 256 + shm
+/// ```
+///
+/// Workload budget (MB): scheduler execution, test scenarios, cgroup
+/// memory, BPF maps, and runtime allocations.
+const WORKLOAD_MB: u64 = 256;
+
+pub(crate) fn initramfs_min_memory_mb(budget: &MemoryBudget) -> u32 {
+    let ceil_mb = |bytes: u64| -> u64 { (bytes + (1 << 20) - 1) >> 20 };
+
+    let init_size_mb = ceil_mb(budget.kernel_init_size);
+    let compressed_mb = ceil_mb(budget.compressed_initrd_bytes);
+    let shm_mb = ceil_mb(budget.shm_bytes);
+    let uncompressed_mb = ceil_mb(budget.uncompressed_initramfs_bytes);
+
+    // Boot requirement: initramfs_options=size=90% sets the rootfs
+    // tmpfs limit to 90% of totalram_pages.
+    //
+    // Constraint: totalram_pages * 9/10 >= uncompressed_pages.
+    // totalram_pages = (P - reserved) / PAGE_SIZE.
+    // reserved = init_size + compressed + struct_page(P).
+    // struct_page(P) = P/64.
+    //
+    // Solving:
+    //   (P - init_size - compressed - P/64) * 9/10 >= uncompressed
+    //   P * 63/64 >= uncompressed * 10/9 + init_size + compressed
+    //   P >= (ceil(uncompressed * 10/9) + init_size + compressed) * 64/63
+    let uncompressed_scaled = (uncompressed_mb * 10).div_ceil(9);
+    let content_mb = uncompressed_scaled + init_size_mb + compressed_mb;
+
+    // struct page overhead: P/64 is part of reserved, creating a
+    // circular dependency. Solve: P = content * 64/63.
+    let boot_mb = (content_mb * 64).div_ceil(63);
+
+    // total = computed boot requirement + workload budget + SHM gap.
+    (boot_mb + WORKLOAD_MB + shm_mb) as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -891,6 +1066,10 @@ pub struct KtstrVm {
     /// Guest memory in MB. `None` = deferred: computed from actual
     /// initramfs size after the initramfs build completes.
     memory_mb: Option<u32>,
+    /// Minimum memory in MB for deferred allocation. When non-zero,
+    /// the deferred path uses `max(computed, memory_min_mb)` so topology
+    /// configs that need more memory than the initramfs floor are honored.
+    memory_min_mb: u32,
     cmdline_extra: String,
     timeout: Duration,
     /// Size of the SHM ring buffer region at the top of guest memory. 0 = disabled.
@@ -1295,33 +1474,113 @@ impl KtstrVm {
                     BaseKey::new(&payload, scheduler.as_deref())?
                 };
 
-                if shell_mode {
-                    // Shell mode: build directly with include_files and busybox.
-                    // No SHM caching — shell sessions are one-off.
-                    let include_refs: Vec<(&str, &std::path::Path)> = include_files
-                        .iter()
-                        .map(|(a, p)| (a.as_str(), p.as_path()))
-                        .collect();
-                    let data = initramfs::create_initramfs_base(
-                        &payload,
-                        &extras,
-                        &include_refs,
-                        busybox,
-                    )?;
-                    Ok((BaseRef::Owned(std::sync::Arc::new(data)), key))
-                } else {
-                    let base = get_or_build_base(&payload, &extras, &key)?;
-                    Ok((base, key))
-                }
+                let include_refs: Vec<(&str, &std::path::Path)> = include_files
+                    .iter()
+                    .map(|(a, p)| (a.as_str(), p.as_path()))
+                    .collect();
+                let base = get_or_build_base(&payload, &extras, &include_refs, busybox, &key)?;
+                Ok((base, key))
             })
             .ok()
     }
 
+    /// Compress base+suffix as separate LZ4 legacy streams, load into
+    /// guest memory via COW overlay (falling back to write_slice), and
+    /// verify the write. Returns `total_compressed_size`.
+    #[cfg(target_arch = "x86_64")]
+    fn compress_and_load_initrd(
+        &self,
+        guest_mem: &GuestMemoryMmap,
+        base_bytes: &[u8],
+        suffix: &[u8],
+        key: &BaseKey,
+        load_addr: u64,
+    ) -> Result<u32> {
+        let uncompressed_size = base_bytes.len() + suffix.len();
+
+        // Compress base and suffix as separate LZ4 legacy streams. The
+        // kernel initramfs decompressor handles concatenated LZ4 natively
+        // (re-encountering the magic mid-stream resets the decoder).
+        // Keeping them separate lets us COW-map the base from SHM.
+        let t0 = Instant::now();
+        let lz4_base = self.get_or_compress_base(base_bytes, key)?;
+        let lz4_suffix = initramfs::lz4_legacy_compress(suffix);
+        let total_compressed = lz4_base.len() + lz4_suffix.len();
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            uncompressed = uncompressed_size,
+            lz4_base = lz4_base.len(),
+            lz4_suffix = lz4_suffix.len(),
+            ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
+            "lz4_initramfs",
+        );
+
+        tracing::debug!(
+            base_magic = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                lz4_base[0], lz4_base[1], lz4_base[2], lz4_base[3]
+            ),
+            suffix_magic = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                lz4_suffix[0], lz4_suffix[1], lz4_suffix[2], lz4_suffix[3]
+            ),
+            base_len = lz4_base.len(),
+            suffix_len = lz4_suffix.len(),
+            total = total_compressed,
+            load_addr = format!("{:#x}", load_addr),
+            suffix_addr = format!("{:#x}", load_addr + lz4_base.len() as u64),
+            "initrd_load_debug",
+        );
+
+        // Try COW overlay: mmap compressed base from SHM fd directly
+        // into guest memory, sharing physical pages across VMs.
+        let t0 = Instant::now();
+        let cow_ok = self.try_cow_overlay(guest_mem, key, lz4_base.len(), load_addr);
+        if cow_ok {
+            guest_mem
+                .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
+                .context("write lz4 suffix after COW base")?;
+            tracing::debug!(
+                elapsed_us = t0.elapsed().as_micros(),
+                cow = true,
+                "initrd_write"
+            );
+        } else {
+            initramfs::load_initramfs_parts(guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
+            tracing::debug!(
+                elapsed_us = t0.elapsed().as_micros(),
+                cow = false,
+                "initrd_write"
+            );
+        }
+
+        // Read back first 8 bytes from guest memory to verify write.
+        let mut verify_buf = [0u8; 8];
+        guest_mem
+            .read_slice(&mut verify_buf, GuestAddress(load_addr))
+            .context("read-back initrd verify")?;
+        tracing::debug!(
+            first_8 = format!(
+                "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                verify_buf[0],
+                verify_buf[1],
+                verify_buf[2],
+                verify_buf[3],
+                verify_buf[4],
+                verify_buf[5],
+                verify_buf[6],
+                verify_buf[7]
+            ),
+            expected_magic = "02214c18",
+            "initrd_verify",
+        );
+
+        Ok(total_compressed as u32)
+    }
+
     /// Join the initramfs thread and load the result into guest memory.
-    ///
-    /// Compresses base+suffix with zstd. Attempts COW overlay from a
-    /// compressed SHM segment to share physical pages across VMs.
-    /// Falls back to write_slice if COW fails.
+    /// Memory must already be allocated (non-deferred path). Validates
+    /// that allocated memory is sufficient for the initramfs.
     #[cfg(target_arch = "x86_64")]
     fn join_and_load_initramfs(
         &self,
@@ -1360,104 +1619,34 @@ impl KtstrVm {
             "join_and_load_initramfs called in deferred mode; \
              use join_compute_memory_and_load instead",
         );
-        let min_mb = initramfs_min_memory_mb(uncompressed_size as u64, self.shm_size);
+        // Compress first to get actual compressed size for validation.
+        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
+        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let compressed_size = lz4_base.len() + lz4_suffix.len();
+        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: uncompressed_size as u64,
+            compressed_initrd_bytes: compressed_size as u64,
+            kernel_init_size,
+            shm_bytes: self.shm_size,
+        };
+        let min_mb = initramfs_min_memory_mb(&budget);
         if memory_mb < min_mb {
             anyhow::bail!(
                 "VM memory {}MB insufficient for initramfs \
-                 (uncompressed={}MB): need {}MB",
+                 (uncompressed={}MB, compressed={}MB, \
+                 init_size={}MB): need {}MB",
                 memory_mb,
                 uncompressed_size >> 20,
+                compressed_size >> 20,
+                kernel_init_size >> 20,
                 min_mb,
             );
         }
 
-        {
-            // Compress base and suffix as separate LZ4 legacy streams. The
-            // kernel initramfs decompressor handles concatenated LZ4 natively
-            // (re-encountering the magic mid-stream resets the decoder).
-            // Keeping them separate lets us COW-map the base from SHM.
-            let t0 = Instant::now();
-            let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-            let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
-            let total_compressed = lz4_base.len() + lz4_suffix.len();
-            tracing::debug!(
-                elapsed_us = t0.elapsed().as_micros(),
-                uncompressed = uncompressed_size,
-                lz4_base = lz4_base.len(),
-                lz4_suffix = lz4_suffix.len(),
-                ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-                "lz4_initramfs",
-            );
-
-            // Verify compressed data starts with LZ4 legacy magic.
-            tracing::debug!(
-                base_magic = format!(
-                    "{:02x}{:02x}{:02x}{:02x}",
-                    lz4_base[0], lz4_base[1], lz4_base[2], lz4_base[3]
-                ),
-                suffix_magic = format!(
-                    "{:02x}{:02x}{:02x}{:02x}",
-                    lz4_suffix[0], lz4_suffix[1], lz4_suffix[2], lz4_suffix[3]
-                ),
-                base_len = lz4_base.len(),
-                suffix_len = lz4_suffix.len(),
-                total = total_compressed,
-                load_addr = format!("{:#x}", load_addr),
-                suffix_addr = format!("{:#x}", load_addr + lz4_base.len() as u64),
-                "initrd_load_debug",
-            );
-
-            // Try COW overlay: mmap compressed base from SHM fd directly
-            // into guest memory, sharing physical pages across VMs.
-            let t0 = Instant::now();
-            let cow_ok = self.try_cow_overlay(vm, &key, lz4_base.len(), load_addr);
-            if cow_ok {
-                // Base is COW-mapped. Write suffix after it.
-                vm.guest_mem
-                    .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
-                    .context("write lz4 suffix after COW base")?;
-                tracing::debug!(
-                    elapsed_us = t0.elapsed().as_micros(),
-                    cow = true,
-                    "initrd_write"
-                );
-            } else {
-                // Fallback: write both parts via write_slice.
-                initramfs::load_initramfs_parts(
-                    &vm.guest_mem,
-                    &[&lz4_base, &lz4_suffix],
-                    load_addr,
-                )?;
-                tracing::debug!(
-                    elapsed_us = t0.elapsed().as_micros(),
-                    cow = false,
-                    "initrd_write"
-                );
-            }
-
-            // Read back first 8 bytes from guest memory to verify write.
-            let mut verify_buf = [0u8; 8];
-            vm.guest_mem
-                .read_slice(&mut verify_buf, GuestAddress(load_addr))
-                .context("read-back initrd verify")?;
-            tracing::debug!(
-                first_8 = format!(
-                    "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    verify_buf[0],
-                    verify_buf[1],
-                    verify_buf[2],
-                    verify_buf[3],
-                    verify_buf[4],
-                    verify_buf[5],
-                    verify_buf[6],
-                    verify_buf[7]
-                ),
-                expected_magic = "02214c18",
-                "initrd_verify",
-            );
-
-            Ok((Some(load_addr), Some(total_compressed as u32)))
-        }
+        let size =
+            self.compress_and_load_initrd(&vm.guest_mem, base_bytes, &suffix, &key, load_addr)?;
+        Ok((Some(load_addr), Some(size)))
     }
 
     /// Deferred memory path: join initramfs, compute memory from actual
@@ -1496,98 +1685,49 @@ impl KtstrVm {
             "build_suffix",
         );
 
-        // Compute memory from actual initramfs size.
-        let memory_mb = initramfs_min_memory_mb(uncompressed_size as u64, self.shm_size);
+        // Compress before computing memory so the formula uses actual
+        // compressed size instead of guessing.
+        let t0_compress = Instant::now();
+        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
+        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let compressed_size = lz4_base.len() + lz4_suffix.len();
+        tracing::debug!(
+            elapsed_us = t0_compress.elapsed().as_micros(),
+            uncompressed = uncompressed_size,
+            compressed = compressed_size,
+            ratio = format!("{:.1}x", uncompressed_size as f64 / compressed_size as f64),
+            "deferred_lz4_compress",
+        );
+
+        // Compute memory from actual sizes, honoring the
+        // topology-requested minimum when non-zero.
+        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: uncompressed_size as u64,
+            compressed_initrd_bytes: compressed_size as u64,
+            kernel_init_size,
+            shm_bytes: self.shm_size,
+        };
+        let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
         tracing::debug!(
             uncompressed_mb = uncompressed_size >> 20,
+            compressed_mb = compressed_size >> 20,
+            init_size_mb = kernel_init_size >> 20,
+            memory_min_mb = self.memory_min_mb,
             memory_mb,
             "deferred_memory_computed",
         );
 
         // Allocate and register guest memory.
         vm.allocate_and_register_memory(memory_mb)
-            .context("allocate deferred memory")?;
+            .with_context(|| format!("allocate deferred memory ({memory_mb}MB)"))?;
 
-        {
-            // Compress and load initramfs.
-            let t0 = Instant::now();
-            let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-            let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
-            let total_compressed = lz4_base.len() + lz4_suffix.len();
-            tracing::debug!(
-                elapsed_us = t0.elapsed().as_micros(),
-                uncompressed = uncompressed_size,
-                lz4_base = lz4_base.len(),
-                lz4_suffix = lz4_suffix.len(),
-                ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-                "lz4_initramfs",
-            );
-
-            // Verify compressed data starts with LZ4 legacy magic.
-            tracing::debug!(
-                base_magic = format!(
-                    "{:02x}{:02x}{:02x}{:02x}",
-                    lz4_base[0], lz4_base[1], lz4_base[2], lz4_base[3]
-                ),
-                suffix_magic = format!(
-                    "{:02x}{:02x}{:02x}{:02x}",
-                    lz4_suffix[0], lz4_suffix[1], lz4_suffix[2], lz4_suffix[3]
-                ),
-                base_len = lz4_base.len(),
-                suffix_len = lz4_suffix.len(),
-                total = total_compressed,
-                load_addr = format!("{:#x}", load_addr),
-                suffix_addr = format!("{:#x}", load_addr + lz4_base.len() as u64),
-                "initrd_load_debug",
-            );
-
-            let t0 = Instant::now();
-            let cow_ok = self.try_cow_overlay(vm, &key, lz4_base.len(), load_addr);
-            if cow_ok {
-                vm.guest_mem
-                    .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
-                    .context("write lz4 suffix after COW base")?;
-                tracing::debug!(
-                    elapsed_us = t0.elapsed().as_micros(),
-                    cow = true,
-                    "initrd_write"
-                );
-            } else {
-                initramfs::load_initramfs_parts(
-                    &vm.guest_mem,
-                    &[&lz4_base, &lz4_suffix],
-                    load_addr,
-                )?;
-                tracing::debug!(
-                    elapsed_us = t0.elapsed().as_micros(),
-                    cow = false,
-                    "initrd_write"
-                );
-            }
-
-            // Read back first 8 bytes from guest memory to verify write.
-            let mut verify_buf = [0u8; 8];
-            vm.guest_mem
-                .read_slice(&mut verify_buf, GuestAddress(load_addr))
-                .context("read-back initrd verify")?;
-            tracing::debug!(
-                first_8 = format!(
-                    "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    verify_buf[0],
-                    verify_buf[1],
-                    verify_buf[2],
-                    verify_buf[3],
-                    verify_buf[4],
-                    verify_buf[5],
-                    verify_buf[6],
-                    verify_buf[7]
-                ),
-                expected_magic = "02214c18",
-                "initrd_verify",
-            );
-
-            Ok((Some(load_addr), Some(total_compressed as u32), memory_mb))
-        }
+        // Load pre-compressed data into guest memory. The base is already
+        // in the LZ4 SHM cache from get_or_compress_base above, so
+        // compress_and_load_initrd will hit the cache.
+        let size =
+            self.compress_and_load_initrd(&vm.guest_mem, base_bytes, &suffix, &key, load_addr)?;
+        Ok((Some(load_addr), Some(size), memory_mb))
     }
 
     /// Resolve effective memory in MB from the actual guest memory allocation.
@@ -1602,12 +1742,12 @@ impl KtstrVm {
         }
     }
 
-    /// Get or build the compressed base. Checks gz SHM first, then
+    /// Get or build the compressed base. Checks LZ4 SHM first, then
     /// compresses and stores.
     #[cfg(target_arch = "x86_64")]
     fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
-        // Try loading compressed base from gz SHM.
-        if let Some((fd, len)) = initramfs::shm_open_gz(key.0) {
+        // Try loading compressed base from LZ4 SHM.
+        if let Some((fd, len)) = initramfs::shm_open_lz4(key.0) {
             let mut buf = vec![0u8; len];
             unsafe {
                 let ptr = libc::mmap(
@@ -1641,27 +1781,27 @@ impl KtstrVm {
         }
 
         // Compress with LZ4 legacy format.
-        let gz = initramfs::lz4_legacy_compress(base_bytes);
+        let lz4 = initramfs::lz4_legacy_compress(base_bytes);
 
-        if let Err(e) = initramfs::shm_store_gz(key.0, &gz) {
-            tracing::warn!("shm_store_gz: {e:#}");
+        if let Err(e) = initramfs::shm_store_lz4(key.0, &lz4) {
+            tracing::warn!("shm_store_lz4: {e:#}");
         }
-        Ok(gz)
+        Ok(lz4)
     }
 
-    /// Try to COW-overlay the compressed base from gz SHM into guest
+    /// Try to COW-overlay the compressed base from LZ4 SHM into guest
     /// memory. Returns true on success. Validates the segment starts
     /// with LZ4 legacy magic to reject stale data from a previous
     /// compression format.
     #[cfg(target_arch = "x86_64")]
     fn try_cow_overlay(
         &self,
-        vm: &kvm::KtstrKvm,
+        guest_mem: &GuestMemoryMmap,
         key: &BaseKey,
         expected_len: usize,
         load_addr: u64,
     ) -> bool {
-        let Some((fd, len)) = initramfs::shm_open_gz(key.0) else {
+        let Some((fd, len)) = initramfs::shm_open_lz4(key.0) else {
             return false;
         };
         if len != expected_len {
@@ -1697,7 +1837,7 @@ impl KtstrVm {
             initramfs::shm_close_fd(fd);
             return false;
         }
-        let Ok(host_addr) = vm.guest_mem.get_host_address(GuestAddress(load_addr)) else {
+        let Ok(host_addr) = guest_mem.get_host_address(GuestAddress(load_addr)) else {
             initramfs::shm_close_fd(fd);
             return false;
         };
@@ -1804,7 +1944,7 @@ impl KtstrVm {
             cmdline.push_str(" loglevel=0");
         }
         if self.init_binary.is_some() {
-            cmdline.push_str(" rdinit=/init rootflags=size=90%");
+            cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
         }
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;
@@ -2709,20 +2849,31 @@ impl KtstrVm {
                 )?;
                 let uncompressed_size = base_bytes.len() + suffix.len();
 
-                let memory_mb = initramfs_min_memory_mb(uncompressed_size as u64, self.shm_size);
-
-                vm.allocate_and_register_memory(memory_mb)
-                    .context("allocate deferred memory (aarch64)")?;
-
-                // Load kernel.
-                let kr = boot::load_kernel(&vm.guest_mem, &self.kernel)
-                    .context("load kernel (aarch64)")?;
-
+                // Compress before computing memory so the formula uses
+                // actual compressed size.
                 let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
                 full.extend_from_slice(base_bytes);
                 full.extend_from_slice(&suffix);
                 let initrd_data = initramfs::lz4_legacy_compress(&full);
                 let total_size = initrd_data.len() as u64;
+
+                let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0);
+                let budget = MemoryBudget {
+                    uncompressed_initramfs_bytes: uncompressed_size as u64,
+                    compressed_initrd_bytes: total_size,
+                    kernel_init_size,
+                    shm_bytes: self.shm_size,
+                };
+                let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
+
+                vm.allocate_and_register_memory(memory_mb)
+                    .with_context(|| {
+                        format!("allocate deferred memory ({memory_mb}MB, aarch64)")
+                    })?;
+
+                // Load kernel.
+                let kr = boot::load_kernel(&vm.guest_mem, &self.kernel)
+                    .context("load kernel (aarch64)")?;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
                 initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;
 
@@ -2806,7 +2957,7 @@ impl KtstrVm {
             cmdline.push_str(" loglevel=0");
         }
         if self.init_binary.is_some() {
-            cmdline.push_str(" rdinit=/init rootflags=size=90%");
+            cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
         }
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;
@@ -3217,6 +3368,7 @@ pub struct KtstrVmBuilder {
     sched_args: Vec<String>,
     topology: Topology,
     memory_mb: Option<u32>,
+    memory_min_mb: u32,
     cmdline_extra: String,
     timeout: Duration,
     shm_size: u64,
@@ -3244,6 +3396,7 @@ impl Default for KtstrVmBuilder {
                 threads_per_core: 1,
             },
             memory_mb: Some(256),
+            memory_min_mb: 0,
             cmdline_extra: String::new(),
             timeout: Duration::from_secs(60),
             shm_size: 0,
@@ -3311,6 +3464,7 @@ impl KtstrVmBuilder {
 
     pub fn memory_mb(mut self, mb: u32) -> Self {
         self.memory_mb = Some(mb);
+        self.memory_min_mb = 0;
         self
     }
 
@@ -3320,6 +3474,17 @@ impl KtstrVmBuilder {
     /// when no explicit `--memory` override is provided.
     pub fn memory_deferred(mut self) -> Self {
         self.memory_mb = None;
+        self.memory_min_mb = 0;
+        self
+    }
+
+    /// Defer memory allocation with a minimum floor. The deferred path
+    /// computes memory from actual initramfs size, then takes the max
+    /// of that and `min_mb`. Use when the topology needs more memory
+    /// than the initramfs alone requires (e.g. NUMA tests with 4096 MB).
+    pub fn memory_deferred_min(mut self, min_mb: u32) -> Self {
+        self.memory_mb = None;
+        self.memory_min_mb = min_mb;
         self
     }
 
@@ -3449,6 +3614,7 @@ impl KtstrVmBuilder {
             sched_args: self.sched_args,
             topology: self.topology,
             memory_mb: self.memory_mb,
+            memory_min_mb: self.memory_min_mb,
             cmdline_extra: self.cmdline_extra,
             timeout: self.timeout,
             shm_size: self.shm_size,

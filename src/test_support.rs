@@ -1294,16 +1294,11 @@ fn run_ktstr_test_inner(
         }
     };
 
-    // Enforce memory floor based on initramfs size estimate.
-    let initrd_floor =
-        vmm::estimate_min_memory_mb(&ktstr_bin, scheduler.as_deref(), KTSTR_TEST_SHM_SIZE);
-    let memory_mb = memory_mb.max(initrd_floor);
-
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&ktstr_bin)
         .topology(sockets, cores, threads)
-        .memory_mb(memory_mb)
+        .memory_deferred_min(memory_mb)
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
         .run_args(&guest_args)
@@ -1918,7 +1913,7 @@ fn attempt_auto_repro(
         .kernel(kernel)
         .init_binary(ktstr_bin)
         .topology(sockets, cores, threads)
-        .memory_mb(memory_mb)
+        .memory_deferred_min(memory_mb)
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
         .run_args(&guest_args)
@@ -2191,7 +2186,7 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
 
     for bin in binaries {
         let key = vmm::BaseKey::new(bin, None)?;
-        let _ = vmm::get_or_build_base(bin, &[], &key)?;
+        let _ = vmm::get_or_build_base(bin, &[], &[], false, &key)?;
     }
 
     Ok(())
