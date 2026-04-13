@@ -77,6 +77,13 @@ pub const KICK_IDLE: u64 = 1;
 pub const KICK_PREEMPT: u64 = 2;
 pub const KICK_WAIT: u64 = 4;
 
+/// All known kick flags with their names.
+pub const KICK_FLAG_NAMES: &[(u64, &str)] = &[
+    (KICK_IDLE, "IDLE"),
+    (KICK_PREEMPT, "PREEMPT"),
+    (KICK_WAIT, "WAIT"),
+];
+
 // ---- Ops state (scx.ops_state lower 8 bits) ----
 
 pub const OPS_NONE: u64 = 0;

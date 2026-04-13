@@ -209,22 +209,7 @@ pub(crate) fn decode_named_value(key: &str, val: &str) -> String {
 }
 
 pub(crate) fn decode_kick_flags(flags: u64) -> String {
-    use super::scx_defs::*;
-    let mut parts = Vec::new();
-    if flags & KICK_IDLE != 0 {
-        parts.push("IDLE");
-    }
-    if flags & KICK_PREEMPT != 0 {
-        parts.push("PREEMPT");
-    }
-    if flags & KICK_WAIT != 0 {
-        parts.push("WAIT");
-    }
-    if parts.is_empty() {
-        "NONE".into()
-    } else {
-        parts.join("|")
-    }
+    decode_bitflags(flags, KICK_FLAG_NAMES)
 }
 
 pub(crate) fn decode_ops_state(state: u64) -> String {
