@@ -215,7 +215,15 @@ pub(crate) fn decode_named_value(struct_name: &str, key: &str, val: &str) -> Str
             let v = as_u64();
             format!("0x{v:x}({cpus})", cpus = decode_cpumask(v))
         }
-        _ => val.to_string(),
+        _ => {
+            // Undecoded numeric values display as hex.
+            let v = as_u64();
+            if val.starts_with("0x") || val.parse::<u64>().is_ok() {
+                format!("0x{v:x}")
+            } else {
+                val.to_string()
+            }
+        }
     }
 }
 
@@ -806,8 +814,11 @@ mod tests {
 
     #[test]
     fn decode_named_value_flags_wrong_struct_passthrough() {
-        // "flags" on a non-task_struct should pass through raw, not decode as scx flags.
-        assert_eq!(decode_named_value("rq_flags", "flags", "42"), "42");
+        // "flags" on a non-task_struct should not decode as scx flags.
+        let out = decode_named_value("rq_flags", "flags", "42");
+        assert_ne!(out, "QUEUED", "should not apply scx decoder to rq_flags");
+        // Falls through to hex display for unrecognized numeric values.
+        assert_eq!(out, "0x2a");
     }
 
     #[test]
@@ -821,17 +832,18 @@ mod tests {
 
     #[test]
     fn decode_named_value_enq_flags_wrong_struct_passthrough() {
-        // "enq_flags" on a non-task_struct should pass through raw.
-        assert_eq!(decode_named_value("some_other", "enq_flags", "1"), "1");
+        // "enq_flags" on a non-task_struct should not decode as scx enqueue flags.
+        let out = decode_named_value("some_other", "enq_flags", "1");
+        assert_ne!(out, "WAKEUP", "should not apply scx decoder to some_other");
+        assert_eq!(out, "0x1");
     }
 
     #[test]
     fn decode_named_value_exit_kind_wrong_struct_passthrough() {
-        // "exit_kind" on a non-scx_exit_info struct should pass through raw.
-        assert_eq!(
-            decode_named_value("other_struct", "exit_kind", "1024"),
-            "1024"
-        );
+        // "exit_kind" on a non-scx_exit_info struct should not decode as scx exit kind.
+        let out = decode_named_value("other_struct", "exit_kind", "1024");
+        assert_ne!(out, "ERROR", "should not apply scx decoder to other_struct");
+        assert_eq!(out, "0x400");
     }
 
     #[test]
