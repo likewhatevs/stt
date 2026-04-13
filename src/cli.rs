@@ -566,10 +566,17 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
         match KernelId::parse(val) {
             KernelId::Path(p) => {
                 let path = std::path::PathBuf::from(&p);
-                if path.is_file() {
-                    Ok(path)
-                } else if path.is_dir() {
+                if path.is_dir() {
                     resolve_kernel_dir(&path)
+                } else if path.is_file() {
+                    // Raw kernel image file — reject. Use a source
+                    // directory or version string so kconfig validation
+                    // and caching work correctly.
+                    bail!(
+                        "--kernel {}: raw image files are not supported. \
+                         Pass a source directory, version, or cache key.",
+                        path.display()
+                    )
                 } else {
                     bail!("kernel path not found: {}", path.display())
                 }
@@ -582,13 +589,101 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
             }
         }
     } else {
-        crate::find_kernel()?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no kernel found. Provide --kernel or run \
-                 `kernel build` to download and cache one."
-            )
-        })
+        match crate::find_kernel()? {
+            Some(image) => Ok(image),
+            None => auto_download_kernel(),
+        }
     }
+}
+
+/// Auto-download, build, and cache the latest stable kernel.
+///
+/// Called when no --kernel is specified and no kernel is found via
+/// cache or filesystem. Downloads the latest stable tarball from
+/// kernel.org, configures with the embedded kconfig, builds, caches,
+/// and returns the image path.
+fn auto_download_kernel() -> Result<std::path::PathBuf> {
+    eprintln!("ktstr: no kernel found, downloading latest stable");
+
+    let sp = Spinner::start("Fetching latest kernel version...");
+    let ver = crate::fetch::fetch_latest_stable_version().map_err(|e| anyhow::anyhow!("{e}"))?;
+    sp.finish(format!("Latest stable: {ver}"));
+
+    let (arch, image_name) = crate::fetch::arch_info();
+    let cache_key = format!("{ver}-tarball-{arch}-kc{}", crate::cache_key_suffix());
+
+    // Check cache one more time with the resolved version.
+    if let Ok(cache) = crate::cache::CacheDir::new()
+        && let Some(entry) = cache.lookup(&cache_key)
+        && let Some(ref meta) = entry.metadata
+        && !entry.has_stale_kconfig(&embedded_kconfig_hash())
+    {
+        let image = entry.path.join(&meta.image_name);
+        if image.exists() {
+            return Ok(image);
+        }
+    }
+
+    let tmp_dir = tempfile::TempDir::new()?;
+
+    let sp = Spinner::start("Downloading kernel...");
+    let acquired =
+        crate::fetch::download_tarball(&ver, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    sp.finish("Downloaded");
+
+    let source_dir = &acquired.source_dir;
+
+    let sp = Spinner::start("Configuring kernel...");
+    configure_kernel(source_dir, EMBEDDED_KCONFIG)?;
+    sp.finish("Kernel configured");
+
+    let sp = Spinner::start("Building kernel...");
+    make_kernel(source_dir)?;
+    sp.finish("Kernel built");
+
+    let image = crate::kernel_path::find_image_in_dir(source_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "build succeeded but no image found in {}",
+            source_dir.display()
+        )
+    })?;
+
+    // Cache the build.
+    if let Ok(cache) = crate::cache::CacheDir::new() {
+        let vmlinux_path = source_dir.join("vmlinux");
+        let vmlinux_ref = vmlinux_path.exists().then_some(vmlinux_path.as_path());
+
+        let config_path = source_dir.join(".config");
+        let config_hash = if config_path.exists() {
+            std::fs::read(&config_path)
+                .ok()
+                .map(|data| format!("{:08x}", crc32fast::hash(&data)))
+        } else {
+            None
+        };
+
+        let metadata = crate::cache::KernelMetadata::new(
+            acquired.source_type.clone(),
+            arch.to_string(),
+            image_name.to_string(),
+            now_iso8601(),
+        )
+        .with_version(acquired.version.clone())
+        .with_config_hash(config_hash)
+        .with_ktstr_kconfig_hash(Some(embedded_kconfig_hash()))
+        .with_ktstr_git_hash(Some(crate::GIT_FULL_HASH.to_string()));
+
+        match cache.store(&acquired.cache_key, &image, vmlinux_ref, &metadata) {
+            Ok(entry) => {
+                let cached_image = entry.path.join(image_name);
+                eprintln!("ktstr: kernel cached as {}", acquired.cache_key);
+                return Ok(cached_image);
+            }
+            Err(e) => eprintln!("ktstr: warning: cache store failed: {e:#}"),
+        }
+    }
+
+    Ok(image)
 }
 
 /// Resolve a kernel directory: find an existing image or auto-build.
