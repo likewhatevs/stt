@@ -94,7 +94,7 @@ detects as a scheduler death and captures the sched_ext dump from
 dmesg.
 
 In repro mode, the watchdog is disabled to keep the scheduler alive
-for BPF kprobe assertions.
+for BPF probe assertions.
 
 ## RAII cleanup
 
