@@ -502,12 +502,49 @@ pub fn run_shell(
             .filter_map(|(_, p)| std::fs::metadata(p).ok())
             .map(|m| m.len())
             .sum();
-        // Shared lib resolution for include files happens in
-        // create_initramfs_base. Estimate lib overhead as 4x file size
-        // to avoid a duplicate resolve_shared_libs call per file.
-        // join_and_load_initramfs checks actual size and bails if
-        // memory is insufficient.
-        let include_mb = ((include_size * 5 + (1 << 20) - 1) >> 20) as u32;
+        // Quick size estimate: parse each include file's direct DT_NEEDED
+        // (one goblin parse, no transitive walk) and look up sizes via
+        // ld.so.cache. The full transitive resolution happens later in
+        // create_initramfs_base with caching. 256MB headroom covers
+        // transitive deps and runtime overhead.
+        let include_lib_size: u64 = include_files
+            .iter()
+            .filter_map(|(_, p)| {
+                let data = std::fs::read(p).ok()?;
+                let elf = goblin::elf::Elf::parse(&data).ok()?;
+                // If the binary has a custom PT_INTERP, also search
+                // dirs relative to the interpreter for libs not in
+                // ld.so.cache (custom toolchain layouts).
+                let interp_dirs: Vec<std::path::PathBuf> = elf
+                    .interpreter
+                    .filter(|i| !vmm::initramfs::is_standard_interpreter(i))
+                    .and_then(|i| std::path::Path::new(i).parent())
+                    .map(|parent| {
+                        vec![
+                            parent.to_path_buf(),
+                            parent.join("lib"),
+                            parent.join("lib64"),
+                        ]
+                    })
+                    .unwrap_or_default();
+                Some(
+                    elf.libraries
+                        .iter()
+                        .filter_map(|soname| {
+                            vmm::initramfs::resolve_soname_quick(soname).or_else(|| {
+                                interp_dirs.iter().find_map(|dir| {
+                                    let c = dir.join(soname);
+                                    c.is_file().then_some(c)
+                                })
+                            })
+                        })
+                        .filter_map(|p| std::fs::metadata(&p).ok())
+                        .map(|m| m.len())
+                        .sum::<u64>(),
+                )
+            })
+            .sum();
+        let include_mb = ((include_size + include_lib_size + (1 << 20) - 1) >> 20) as u32;
         base + 2 * include_mb + 256
     });
 

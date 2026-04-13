@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 /// Result of shared library resolution for a binary.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SharedLibs {
     /// Resolved `(guest_path, host_path)` pairs.
     pub found: Vec<(String, PathBuf)>,
@@ -24,7 +24,7 @@ pub struct SharedLibs {
 }
 
 /// A shared library dependency that could not be resolved.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MissingLib {
     /// The soname (e.g. `libssl.so.1.1`).
     pub soname: String,
@@ -201,6 +201,18 @@ fn glob_match(pattern: &str, s: &str) -> bool {
 /// libraries to build the full transitive closure. Returns empty result
 /// for static binaries or non-ELF files.
 pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
+    // Cache results by canonical path — avoids re-resolving the same
+    // binary when called from both memory estimation and initramfs build.
+    static CACHE: LazyLock<std::sync::Mutex<HashMap<PathBuf, SharedLibs>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    let canon = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
+    if let Ok(cache) = CACHE.lock()
+        && let Some(cached) = cache.get(&canon)
+    {
+        return Ok(cached.clone());
+    }
+
     let data =
         std::fs::read(binary).with_context(|| format!("read binary: {}", binary.display()))?;
     let elf = match goblin::elf::Elf::parse(&data) {
@@ -318,11 +330,17 @@ pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
         });
     }
 
-    Ok(SharedLibs {
+    let result = SharedLibs {
         found,
         missing,
         interpreter,
-    })
+    };
+
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(canon, result.clone());
+    }
+
+    Ok(result)
 }
 
 /// Extract search paths from DT_RUNPATH (preferred) or DT_RPATH, with
@@ -381,7 +399,7 @@ const STANDARD_INTERPRETERS: &[&str] = &[
 /// canonicalized path against canonicalized well-known linker paths
 /// to catch symlinks (e.g. `/opt/toolchain/lib/ld-linux-x86-64.so.2`
 /// symlinking to `/lib64/ld-linux-x86-64.so.2`).
-fn is_standard_interpreter(interp: &str) -> bool {
+pub fn is_standard_interpreter(interp: &str) -> bool {
     let interp_path = Path::new(interp);
     // Direct match first (avoids syscalls for common case).
     if STANDARD_INTERPRETERS.contains(&interp) {
@@ -394,6 +412,22 @@ fn is_standard_interpreter(interp: &str) -> bool {
     STANDARD_INTERPRETERS.iter().any(|std_interp| {
         std::fs::canonicalize(std_interp).is_ok_and(|std_canon| std_canon == canon)
     })
+}
+
+/// Fast soname-to-path lookup using only the ld.so.cache and default
+/// paths. No transitive walk, no RPATH parsing. Used for memory
+/// estimation where speed matters more than completeness.
+pub fn resolve_soname_quick(soname: &str) -> Option<PathBuf> {
+    if let Some(cached_path) = LD_SO_CACHE.get(soname) {
+        return Some(cached_path.clone());
+    }
+    for dir in DEFAULT_LIB_PATHS {
+        let candidate = Path::new(dir).join(soname);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Default library search paths used by the dynamic linker.
