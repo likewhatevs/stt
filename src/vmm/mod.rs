@@ -2736,10 +2736,32 @@ impl KtstrVm {
                     map_info.name, attempt,
                 );
 
-                // Phase 3: write the crash trigger and signal the guest.
-                // The guest blocks on wait_for(0, timeout) before starting
-                // the scenario. Signaling immediately after the BPF write
-                // ensures the crash is active when the scenario runs.
+                // Phase 3: wait for probes ready, write crash, signal guest.
+                //
+                // The guest signals slot 1 with SIGNAL_PROBES_READY after
+                // the probe pipeline attaches and the scenario is starting.
+                // Without this gate, the crash fires during scheduler load
+                // before probes capture any events.
+                if shm_size > 0 {
+                    let shm_base = mem.size() - shm_size;
+                    let ready_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        if kill_clone.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if std::time::Instant::now() >= ready_deadline {
+                            eprintln!("bpf_map_write: timed out waiting for probes ready");
+                            return;
+                        }
+                        let val = mem.read_u8(shm_base, shm_ring::SIGNAL_SLOT_BASE + 1);
+                        if val >= shm_ring::SIGNAL_PROBES_READY {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    eprintln!("bpf_map_write: guest probes ready, writing crash trigger");
+                }
 
                 // Log all maps for diagnostic visibility.
                 let all_maps = accessor.maps();

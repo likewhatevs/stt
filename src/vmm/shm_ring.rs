@@ -124,6 +124,12 @@ const SIGNAL_SLOT_COUNT: usize = 2;
 /// can differentiate.
 pub const SIGNAL_SHUTDOWN_REQ: u8 = 0xDD;
 
+/// Value written to slot 1 by the guest when probes are attached and the
+/// scenario is about to start. The `start_bpf_map_write` thread polls for
+/// this value before writing the crash trigger, ensuring probes capture
+/// the crash rather than missing it.
+pub const SIGNAL_PROBES_READY: u8 = 2;
+
 /// Guest-side: poll SHM slot until non-zero or timeout.
 /// Reads via AtomicU8 with Acquire ordering. The SHM mmap pointer
 /// is cached in a OnceLock, initialized from /proc/cmdline during

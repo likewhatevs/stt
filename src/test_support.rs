@@ -1946,12 +1946,13 @@ fn attempt_auto_repro(
         }
     }
 
-    // Do NOT forward bpf_map_write to the repro VM. The repro VM
-    // runs the same workload with probes attached while the scheduler
-    // is alive. Probes capture sched_ext events during normal
-    // scheduling. No crash needed — the interesting data is how the
-    // probed functions behave under the same workload that caused
-    // the crash in the first VM.
+    // Forward bpf_map_write and watchdog_timeout so the repro VM
+    // reproduces the same exit as the first VM with probes attached.
+    if let Some(bpf_write) = entry.bpf_map_write {
+        builder =
+            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
+    }
+    builder = builder.watchdog_timeout(entry.watchdog_timeout);
 
     let vm = match builder.build() {
         Ok(vm) => vm,

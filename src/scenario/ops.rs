@@ -746,9 +746,11 @@ pub fn execute_steps_with(
         w.write(shm_ring::MSG_TYPE_SCENARIO_START, &[]);
     }
 
-    // When a host-side BPF map write is configured, wait for the host
-    // to complete the write before starting the workload.
+    // When a host-side BPF map write is configured, signal the host that
+    // probes are attached and the scenario is starting, then wait for the
+    // host to complete the write before starting the workload.
     if ctx.wait_for_map_write {
+        shm_ring::signal_value(1, shm_ring::SIGNAL_PROBES_READY);
         match shm_ring::wait_for(0, std::time::Duration::from_secs(10)) {
             Ok(()) => {
                 // Brief delay for the crash trigger to propagate.
