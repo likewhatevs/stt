@@ -770,19 +770,30 @@ fn list_tests_all(ignored_only: bool) {
             .scheduler
             .generate_profiles(entry.required_flags, entry.excluded_flags);
 
-        // Gauntlet variants are always ignored.
+        // Gauntlet variants are always ignored — users opt in with
+        // --run-ignored. Presets that exceed the host's CPU count are
+        // filtered from the listing entirely so nextest never runs them
+        // (avoids false PASS from ResourceContention exit-0 fallback).
+        let host_cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        let host_llcs = crate::vmm::host_topology::HostTopology::from_sysfs()
+            .map(|t| t.llc_groups.len() as u32)
+            .unwrap_or(1);
         for preset in &presets {
             let t = &preset.topology;
             if t.sockets < entry.constraints.min_sockets
                 || t.num_llcs() < entry.constraints.min_llcs
                 || (entry.constraints.requires_smt && t.threads_per_core < 2)
                 || t.total_cpus() < entry.constraints.min_cpus
+                || t.total_cpus() > host_cpus
+                || t.num_llcs() > host_llcs
             {
                 continue;
             }
             for profile in &profiles {
                 let pname = profile.name();
-                println!("gauntlet/{}/{}/{}: test", entry.name, preset.name, pname,);
+                println!("gauntlet/{}/{}/{}: test", entry.name, preset.name, pname);
             }
         }
     }
@@ -821,6 +832,9 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             .scheduler
             .generate_profiles(entry.required_flags, entry.excluded_flags);
 
+        let host_cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
         for preset in &presets {
             let t = &preset.topology;
             if t.sockets < entry.constraints.min_sockets
@@ -828,6 +842,11 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
                 || (entry.constraints.requires_smt && t.threads_per_core < 2)
                 || t.total_cpus() < entry.constraints.min_cpus
             {
+                continue;
+            }
+            // Skip presets that exceed host CPU count — they can never
+            // run and would produce false PASS results.
+            if t.total_cpus() > host_cpus {
                 continue;
             }
             for profile in &profiles {
