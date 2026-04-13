@@ -495,6 +495,7 @@ pub fn run_shell(
     threads: u32,
     include_files: &[(&str, &std::path::Path)],
     memory_mb: Option<u32>,
+    dmesg: bool,
 ) -> anyhow::Result<()> {
     let payload = resolve_current_exe()?;
 
@@ -504,6 +505,9 @@ pub fn run_shell(
         .collect();
 
     let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={sockets},{cores},{threads}");
+    if dmesg {
+        cmdline.push_str(" loglevel=7");
+    }
     if let Ok(val) = std::env::var("RUST_LOG") {
         cmdline.push_str(&format!(" RUST_LOG={val}"));
     }
@@ -514,7 +518,8 @@ pub fn run_shell(
         .topology(sockets, cores, threads)
         .cmdline(&cmdline)
         .include_files(owned_includes)
-        .busybox(true);
+        .busybox(true)
+        .dmesg(dmesg);
 
     builder = match memory_mb {
         Some(mb) => builder.memory_mb(mb),

@@ -115,6 +115,10 @@ enum Command {
         /// from payload and include file sizes.
         #[arg(long, value_parser = clap::value_parser!(u32).range(128..))]
         memory: Option<u32>,
+        /// Forward kernel console (COM1/dmesg) to stderr in real-time.
+        /// Sets loglevel=7 for verbose kernel output.
+        #[arg(long)]
+        dmesg: bool,
     },
     /// Generate shell completions for ktstr.
     Completions {
@@ -475,6 +479,7 @@ fn main() -> Result<()> {
             topology,
             include_files,
             memory,
+            dmesg,
         } => {
             cli::check_kvm()?;
             let kernel_path = cli::resolve_kernel_image(kernel.as_deref())?;
@@ -506,7 +511,15 @@ fn main() -> Result<()> {
                 .map(|(a, p)| (a.as_str(), p.as_path()))
                 .collect();
 
-            ktstr::run_shell(kernel_path, sockets, cores, threads, &include_refs, memory)?;
+            ktstr::run_shell(
+                kernel_path,
+                sockets,
+                cores,
+                threads,
+                &include_refs,
+                memory,
+                dmesg,
+            )?;
         }
 
         Command::Completions { shell } => {

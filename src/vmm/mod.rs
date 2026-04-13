@@ -1109,6 +1109,10 @@ pub struct KtstrVm {
     include_files: Vec<(String, PathBuf)>,
     /// Embed busybox in the initramfs for shell mode.
     busybox: bool,
+    /// Forward COM1 (kernel console) to stderr in real-time during
+    /// interactive shell mode. Useful for watching virtio probe and
+    /// kernel messages alongside the shell session.
+    dmesg: bool,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -1444,6 +1448,42 @@ impl KtstrVm {
             })
             .context("spawn stdout writer thread")?;
 
+        // Optional dmesg thread: COM1 -> stderr in real-time.
+        // Only spawned when --dmesg is active. Gives the user kernel
+        // messages (including virtio probe results) alongside the shell.
+        let dmesg_thread = if self.dmesg {
+            let com1_for_dmesg = com1.clone();
+            let kill_for_dmesg = kill.clone();
+            Some(
+                std::thread::Builder::new()
+                    .name("interactive-dmesg".into())
+                    .spawn(move || {
+                        use std::io::Write;
+                        let mut stderr = std::io::stderr().lock();
+                        loop {
+                            if kill_for_dmesg.load(Ordering::Acquire) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            let data = com1_for_dmesg.lock().drain_output();
+                            if !data.is_empty() {
+                                let _ = stderr.write_all(&data);
+                                let _ = stderr.flush();
+                            }
+                        }
+                        // Final drain.
+                        let data = com1_for_dmesg.lock().drain_output();
+                        if !data.is_empty() {
+                            let _ = stderr.write_all(&data);
+                            let _ = stderr.flush();
+                        }
+                    })
+                    .context("spawn dmesg thread")?,
+            )
+        } else {
+            None
+        };
+
         // BSP run loop (same shutdown detection as run()).
         // Interactive sessions are user-controlled; the builder's timeout
         // (default 60s) must not kill the shell. Use 24 hours as a
@@ -1480,16 +1520,20 @@ impl KtstrVm {
 
         let _ = stdout_thread.join();
         let _ = stdin_thread.join();
+        if let Some(dt) = dmesg_thread {
+            let _ = dt.join();
+        }
 
         // _raw_guard drops here, restoring terminal and signal handlers.
         drop(_raw_guard);
 
         // Print kernel console output (COM1) to stderr if non-empty.
-        // Guest kernel panics go to COM1 which is not forwarded during
-        // the interactive session. This gives the user crash diagnostics.
-        let console_output = com1.lock().output();
-        if !console_output.is_empty() {
-            eprintln!("{console_output}");
+        // Skip when --dmesg was active (already streamed to stderr).
+        if !self.dmesg {
+            let console_output = com1.lock().output();
+            if !console_output.is_empty() {
+                eprintln!("{console_output}");
+            }
         }
 
         println!("Connection to VM closed.");
@@ -3539,6 +3583,7 @@ pub struct KtstrVmBuilder {
     sched_disable_cmds: Vec<String>,
     include_files: Vec<(String, PathBuf)>,
     busybox: bool,
+    dmesg: bool,
 }
 
 impl Default for KtstrVmBuilder {
@@ -3567,6 +3612,7 @@ impl Default for KtstrVmBuilder {
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
             busybox: false,
+            dmesg: false,
         }
     }
 }
@@ -3727,6 +3773,11 @@ impl KtstrVmBuilder {
         self
     }
 
+    pub fn dmesg(mut self, enabled: bool) -> Self {
+        self.dmesg = enabled;
+        self
+    }
+
     pub fn build(mut self) -> Result<KtstrVm> {
         let (pinning_plan, mbind_nodes, cpu_locks) = if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
@@ -3788,6 +3839,7 @@ impl KtstrVmBuilder {
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
             busybox: self.busybox,
+            dmesg: self.dmesg,
         })
     }
 

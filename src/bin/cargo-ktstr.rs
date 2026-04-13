@@ -140,6 +140,10 @@ enum KtstrCommand {
         /// from payload and include file sizes.
         #[arg(long, value_parser = clap::value_parser!(u32).range(128..))]
         memory: Option<u32>,
+        /// Forward kernel console (COM1/dmesg) to stderr in real-time.
+        /// Sets loglevel=7 for verbose kernel output.
+        #[arg(long)]
+        dmesg: bool,
     },
 }
 
@@ -531,6 +535,7 @@ fn run_shell(
     topology: String,
     include_files: Vec<PathBuf>,
     memory_mb: Option<u32>,
+    dmesg: bool,
 ) -> Result<(), String> {
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
@@ -572,6 +577,7 @@ fn run_shell(
         threads,
         &include_refs,
         memory_mb,
+        dmesg,
     )
     .map_err(|e| format!("{e:#}"))
 }
@@ -923,7 +929,8 @@ fn main() {
             topology,
             include_files,
             memory,
-        } => run_shell(kernel, topology, include_files, memory),
+            dmesg,
+        } => run_shell(kernel, topology, include_files, memory, dmesg),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             KernelCommand::Build {
