@@ -1,4 +1,4 @@
-//! Crash investigation via BPF kprobes, fentry, and tracepoints.
+//! Crash investigation via BPF kprobes, fentry/fexit, and tracepoints.
 //!
 //! Attaches kprobes and fentry probes to kernel and BPF functions from
 //! a crash stack trace, triggers on `sched_ext_exit` via tp_btf,

@@ -223,9 +223,11 @@ pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashM
 ///   via `attach_kprobe`. Uses `bpf_get_func_ip` to identify the
 ///   firing function and writes to the shared `probe_data` hash map.
 ///   Also contains the trigger: `tp_btf/sched_ext_exit` tracepoint.
-/// - **Fentry skeleton** (`fentry_probe.bpf.c`): attaches to BPF
-///   struct_ops callbacks in batches of 4 via `set_attach_target`.
-///   Shares `probe_data` and `func_meta_map` via `reuse_fd`.
+/// - **Fentry/fexit skeleton** (`fentry_probe.bpf.c`): attaches
+///   fentry+fexit to BPF struct_ops callbacks and kernel functions
+///   in batches of 4 via `set_attach_target`. Fexit re-reads struct
+///   fields into `exit_fields` for paired entry/exit display. Shares
+///   `probe_data` and `func_meta_map` via `reuse_fd`.
 ///
 /// The trigger fires on `sched_ext_exit` inside `scx_claim_exit()`
 /// — exactly once per scheduler lifetime, in the context of the
