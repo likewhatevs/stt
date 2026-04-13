@@ -200,6 +200,7 @@ fn glob_match(pattern: &str, s: &str) -> bool {
 /// /etc/ld.so.conf paths → default library paths. Recurses into resolved
 /// libraries to build the full transitive closure. Returns empty result
 /// for static binaries or non-ELF files.
+#[tracing::instrument(skip_all, fields(binary = %binary.display()))]
 pub fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     // Cache results by canonical path — avoids re-resolving the same
     // binary when called from both memory estimation and initramfs build.
@@ -653,6 +654,7 @@ fn is_deleted_self(path: &Path) -> bool {
 /// resolution; non-ELF files are copied as-is. Only regular files are
 /// accepted; FIFOs, device nodes, and sockets are rejected. Archive paths
 /// must not contain `..` components.
+#[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
 pub fn create_initramfs_base(
     payload: &Path,
     extra_binaries: &[(&str, &Path)],
@@ -689,8 +691,10 @@ pub fn create_initramfs_base(
         validated_includes.push((archive_path, host_path, meta.permissions().mode()));
     }
 
-    let binary = strip_debug(payload)
-        .with_context(|| format!("strip/read binary: {}", payload.display()))?;
+    let binary = {
+        let _s = tracing::debug_span!("strip_debug").entered();
+        strip_debug(payload).with_context(|| format!("strip/read binary: {}", payload.display()))?
+    };
     let mut archive = Vec::new();
 
     // Collect directory entries needed for shared libraries and includes.
@@ -711,9 +715,13 @@ pub fn create_initramfs_base(
         }
     }
 
+    let _s_resolve = tracing::debug_span!("resolve_all_libs", count = all_binaries.len()).entered();
     for path in &all_binaries {
+        let _s_one =
+            tracing::debug_span!("resolve_shared_libs", binary = %path.display()).entered();
         let result = resolve_shared_libs(path)
             .with_context(|| format!("resolve libs for {}", path.display()))?;
+        drop(_s_one);
 
         // Include-file ELFs must have all shared libs resolvable.
         if !result.missing.is_empty() && include_elf_paths.contains(path) {
@@ -790,6 +798,9 @@ pub fn create_initramfs_base(
         }
     }
 
+    drop(_s_resolve);
+
+    let _s_write = tracing::debug_span!("write_cpio").entered();
     // Directory entries
     for dir in &dirs {
         write_entry(&mut archive, dir, &[], 0o40755)?;
@@ -832,6 +843,8 @@ pub fn create_initramfs_base(
         })?;
         write_entry(&mut archive, guest_path, &data, 0o100755)?;
     }
+
+    drop(_s_write);
 
     Ok(archive)
 }
