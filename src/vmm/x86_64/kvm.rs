@@ -93,12 +93,15 @@ pub struct KtstrKvm {
     /// Split IRQ chip mode: LAPIC in kernel, PIC/IOAPIC emulated in userspace.
     /// Enabled when any APIC ID exceeds the 8-bit xAPIC limit (254).
     pub(crate) split_irqchip: bool,
+    /// Whether hugepages were requested at construction time.
+    /// Stored so deferred memory allocation uses the same backing.
+    use_hugepages: bool,
 }
 
 impl KtstrKvm {
     /// Create a new KVM VM with the given topology and memory size.
     pub fn new(topo: Topology, memory_mb: u32, performance_mode: bool) -> Result<Self> {
-        Self::new_inner(topo, memory_mb, false, performance_mode)
+        Self::new_inner(topo, Some(memory_mb), false, performance_mode)
     }
 
     /// Create a new KVM VM with hugepage-backed guest memory.
@@ -107,12 +110,59 @@ impl KtstrKvm {
         memory_mb: u32,
         performance_mode: bool,
     ) -> Result<Self> {
-        Self::new_inner(topo, memory_mb, true, performance_mode)
+        Self::new_inner(topo, Some(memory_mb), true, performance_mode)
+    }
+
+    /// Create a KVM VM without allocating guest memory.
+    ///
+    /// Sets up /dev/kvm, VM fd, TSS, identity map, IRQ chip, vCPUs, and
+    /// CPUID — none of which depend on guest memory size. Memory is
+    /// allocated later via [`allocate_and_register_memory`].
+    pub fn new_deferred(
+        topo: Topology,
+        use_hugepages: bool,
+        performance_mode: bool,
+    ) -> Result<Self> {
+        Self::new_inner(topo, None, use_hugepages, performance_mode)
+    }
+
+    /// Allocate guest memory and register it with KVM.
+    ///
+    /// Must be called exactly once on a VM created with `new_deferred`.
+    /// Replaces the placeholder guest memory with a real allocation of
+    /// `memory_mb` megabytes.
+    pub fn allocate_and_register_memory(&mut self, memory_mb: u32) -> Result<()> {
+        let mem_size = (memory_mb as u64) << 20;
+        let guest_mem = if self.use_hugepages {
+            crate::vmm::allocate_hugepage_memory(mem_size as usize, GuestAddress(0))?
+        } else {
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mem_size as usize)])
+                .context("allocate guest memory")?
+        };
+
+        let host_addr = guest_mem
+            .get_host_address(GuestAddress(0))
+            .context("get host address for guest memory")? as u64;
+        let mem_region = kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: 0,
+            memory_size: mem_size,
+            userspace_addr: host_addr,
+            flags: 0,
+        };
+        unsafe {
+            self.vm_fd
+                .set_user_memory_region(mem_region)
+                .context("set user memory region")?;
+        }
+
+        self.guest_mem = guest_mem;
+        Ok(())
     }
 
     fn new_inner(
         topo: Topology,
-        memory_mb: u32,
+        memory_mb: Option<u32>,
         use_hugepages: bool,
         performance_mode: bool,
     ) -> Result<Self> {
@@ -258,31 +308,43 @@ impl KtstrKvm {
             }
         }
 
-        // Allocate guest memory
-        let mem_size = (memory_mb as u64) << 20;
-        let guest_mem = if use_hugepages {
-            crate::vmm::allocate_hugepage_memory(mem_size as usize, GuestAddress(0))?
-        } else {
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mem_size as usize)])
-                .context("allocate guest memory")?
-        };
+        // Allocate guest memory. When memory_mb is None (deferred mode),
+        // use a 1-page placeholder — the real allocation happens later
+        // via allocate_and_register_memory() after initramfs size is known.
+        let guest_mem = match memory_mb {
+            Some(mb) => {
+                let mem_size = (mb as u64) << 20;
+                let mem = if use_hugepages {
+                    crate::vmm::allocate_hugepage_memory(mem_size as usize, GuestAddress(0))?
+                } else {
+                    GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mem_size as usize)])
+                        .context("allocate guest memory")?
+                };
 
-        // Register memory with KVM
-        let host_addr = guest_mem
-            .get_host_address(GuestAddress(0))
-            .context("get host address for guest memory")? as u64;
-        let mem_region = kvm_userspace_memory_region {
-            slot: 0,
-            guest_phys_addr: 0,
-            memory_size: mem_size,
-            userspace_addr: host_addr,
-            flags: 0,
+                let host_addr =
+                    mem.get_host_address(GuestAddress(0))
+                        .context("get host address for guest memory")? as u64;
+                let mem_region = kvm_userspace_memory_region {
+                    slot: 0,
+                    guest_phys_addr: 0,
+                    memory_size: mem_size,
+                    userspace_addr: host_addr,
+                    flags: 0,
+                };
+                unsafe {
+                    vm_fd
+                        .set_user_memory_region(mem_region)
+                        .context("set user memory region")?;
+                }
+                mem
+            }
+            None => {
+                // Placeholder: 1 page. Not registered with KVM — no guest
+                // code runs until allocate_and_register_memory() is called.
+                GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
+                    .context("allocate placeholder guest memory")?
+            }
         };
-        unsafe {
-            vm_fd
-                .set_user_memory_region(mem_region)
-                .context("set user memory region")?;
-        }
 
         // Fetch host CPUID once, reuse for all vCPUs (Firecracker pattern).
         let base_cpuid = kvm
@@ -377,6 +439,7 @@ impl KtstrKvm {
             topology: topo,
             has_immediate_exit,
             split_irqchip,
+            use_hugepages,
         })
     }
 }
