@@ -104,6 +104,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    tracing::debug!("tracing subscriber initialized, mounts completed");
+
     // Set environment variables.
     // SAFETY: single-threaded context — PID 1 before any threads spawn.
     unsafe {
@@ -113,12 +115,16 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
     // Shell mode: interactive busybox shell instead of test dispatch.
     if shell_mode_requested() {
+        let _shell_span = tracing::debug_span!("shell_mode").entered();
         redirect_all_stdio_to_com2();
 
         // Create busybox applet symlinks.
-        let _ = Command::new("/bin/busybox")
-            .args(["--install", "-s", "/bin"])
-            .status();
+        {
+            let _s = tracing::debug_span!("busybox_install").entered();
+            let _ = Command::new("/bin/busybox")
+                .args(["--install", "-s", "/bin"])
+                .status();
+        }
 
         // MOTD.
         let kernel_version = fs::read_to_string("/proc/version")
@@ -136,6 +142,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
         let _ = std::io::stdout().flush();
 
         // Spawn sh as child (not exec) so PID 1 can clean up.
+        tracing::debug!("spawning interactive shell");
         let status = Command::new("/bin/busybox")
             .arg("sh")
             .stdin(Stdio::inherit())
@@ -153,13 +160,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 3: Cgroup parent + Scheduler.
     // Create the cgroup parent directory before starting the scheduler
     // so it exists when the scheduler looks for it.
+    let _s_phase3 = tracing::debug_span!("phase3_scheduler_start").entered();
     create_cgroup_parent_from_sched_args();
     exec_shell_script("/sched_enable");
     let (mut sched_child, sched_log_path) = start_scheduler();
+    drop(_s_phase3);
 
     // Phase 4: SHM polling + trace pipe (background threads).
+    let _s_phase4 = tracing::debug_span!("phase4_shm_trace").entered();
     let (trace_stop, trace_handle) = start_trace_pipe();
     let shm_stop = start_shm_poll(trace_stop.clone());
+    drop(_s_phase4);
 
     // Signal the host that the scheduler is loaded and BPF programs
     // are ready for enumeration.
@@ -177,14 +188,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 5: Dispatch.
     // Read test args from /args in the initramfs. As PID 1, the kernel
     // passes cmdline args (console=ttyS0 etc.), not the test args.
+    let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
     let args: Vec<String> = {
         let content = fs::read_to_string("/args").unwrap_or_default();
         let mut a = vec!["/init".to_string()];
         a.extend(content.lines().map(|s| s.to_string()));
         a
     };
+    tracing::debug!(args = ?args, "dispatching test");
     write_com2("KTSTR_PAYLOAD_STARTING");
     let code = crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1);
+    drop(_s_phase5);
 
     // Flush test output before teardown. Rust's BufWriter on stdout
     // holds data until flushed; without this the host may not see the
@@ -194,6 +208,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     crate::test_support::try_flush_profraw();
 
     // Phase 6: Scheduler cleanup.
+    let _s_phase6 = tracing::debug_span!("phase6_cleanup").entered();
     if let Some(ref mut child) = sched_child {
         let _ = child.kill();
         let _ = child.wait();
@@ -461,6 +476,7 @@ fn write_com2(msg: &str) {
 /// Create the cgroup parent directory specified by `--cell-parent-cgroup`
 /// in `/sched_args`. The directory must exist before the scheduler starts
 /// because the scheduler expects it at startup.
+#[tracing::instrument]
 fn create_cgroup_parent_from_sched_args() {
     let sched_args = match fs::read_to_string("/sched_args") {
         Ok(s) => s,
@@ -486,6 +502,7 @@ fn create_cgroup_parent_from_sched_args() {
 
 /// Start the scheduler binary if it exists. Returns the child process
 /// and the path to its log file.
+#[tracing::instrument]
 fn start_scheduler() -> (Option<Child>, Option<String>) {
     if !Path::new("/scheduler").exists() {
         return (None, None);
@@ -798,6 +815,7 @@ fn start_sched_exit_monitor(
 /// - `echo VALUE > /path` (write VALUE to a file)
 /// - Lines starting with `#` are comments
 /// - Empty lines are ignored
+#[tracing::instrument]
 fn exec_shell_script(path: &str) {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,

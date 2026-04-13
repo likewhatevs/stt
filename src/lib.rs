@@ -501,13 +501,16 @@ pub fn run_shell(
         .map(|(a, p)| (a.to_string(), p.to_path_buf()))
         .collect();
 
+    let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={sockets},{cores},{threads}");
+    if let Ok(val) = std::env::var("RUST_LOG") {
+        cmdline.push_str(&format!(" RUST_LOG={val}"));
+    }
+
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&payload)
         .topology(sockets, cores, threads)
-        .cmdline(&format!(
-            "KTSTR_MODE=shell KTSTR_TOPO={sockets},{cores},{threads}"
-        ))
+        .cmdline(&cmdline)
         .include_files(owned_includes)
         .busybox(true);
 

@@ -737,8 +737,21 @@ pub fn create_initramfs_base(
         // interpreter is not a DT_NEEDED entry and won't appear in the
         // resolved shared libs, so it must be added explicitly.
         // For non-standard interpreters, also resolve their own deps.
+        tracing::debug!(
+            binary = %path.display(),
+            interpreter = ?result.interpreter,
+            is_include = include_elf_paths.contains(path),
+            "resolved interpreter for binary"
+        );
         if let Some(ref interp) = result.interpreter {
             let interp_path = Path::new(interp);
+            let is_standard = is_standard_interpreter(interp);
+            tracing::debug!(
+                interp = %interp_path.display(),
+                exists = interp_path.is_file(),
+                is_standard,
+                "interpreter details"
+            );
             if interp_path.is_file() {
                 let canonical = std::fs::canonicalize(interp_path)
                     .unwrap_or_else(|_| interp_path.to_path_buf());
@@ -754,11 +767,21 @@ pub fn create_initramfs_base(
                         dirs.insert(dir.to_string_lossy().to_string());
                     }
                 }
+                tracing::debug!(
+                    canonical_guest = %guest,
+                    canonical_host = %canonical.display(),
+                    "packing interpreter canonical path"
+                );
                 shared_libs.push((guest.clone(), canonical.clone()));
 
                 // Also add the non-canonical path if it differs.
                 let orig_guest = interp.strip_prefix('/').unwrap_or(interp).to_string();
                 if orig_guest != guest {
+                    tracing::debug!(
+                        orig_guest = %orig_guest,
+                        canonical_guest = %guest,
+                        "packing interpreter original (non-canonical) path"
+                    );
                     if let Some(parent) = Path::new(&orig_guest).parent() {
                         let mut dir = PathBuf::new();
                         for component in parent.components() {
@@ -767,6 +790,8 @@ pub fn create_initramfs_base(
                         }
                     }
                     shared_libs.push((orig_guest, canonical));
+                } else {
+                    tracing::debug!("interpreter original path matches canonical, no alias needed");
                 }
 
                 // Non-standard interpreters may have their own shared lib
@@ -799,8 +824,15 @@ pub fn create_initramfs_base(
             shared_libs.push((guest_path, host_path));
         }
     }
+    let pre_dedup_count = shared_libs.len();
     shared_libs.sort_by(|a, b| a.0.cmp(&b.0));
     shared_libs.dedup_by(|a, b| a.0 == b.0);
+    tracing::debug!(
+        pre_dedup = pre_dedup_count,
+        post_dedup = shared_libs.len(),
+        removed = pre_dedup_count - shared_libs.len(),
+        "shared_libs dedup"
+    );
 
     // Busybox needs bin/ directory.
     if busybox {
@@ -820,6 +852,14 @@ pub fn create_initramfs_base(
     }
 
     drop(_s_resolve);
+
+    tracing::debug!(
+        shared_libs_count = shared_libs.len(),
+        dirs_count = dirs.len(),
+        dirs = ?dirs,
+        shared_libs_guests = ?shared_libs.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>(),
+        "pre-write archive contents"
+    );
 
     let _s_write = tracing::debug_span!("write_cpio").entered();
     // Directory entries
