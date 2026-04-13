@@ -594,6 +594,41 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
     }
 }
 
+/// Progress spinner for long-running CLI operations.
+///
+/// Draws to stderr via indicatif. Automatically ticks in the background.
+/// Call `finish` with a completion message or `clear` to remove.
+pub struct Spinner(indicatif::ProgressBar);
+
+impl Spinner {
+    /// Start a spinner with the given message (e.g. "Building kernel...").
+    pub fn start(msg: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        let pb = indicatif::ProgressBar::new_spinner();
+        pb.set_style(
+            indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .expect("valid template"),
+        );
+        pb.set_message(msg);
+        pb.enable_steady_tick(Duration::from_millis(80));
+        Spinner(pb)
+    }
+
+    /// Update the spinner message.
+    pub fn set_message(&self, msg: impl Into<std::borrow::Cow<'static, str>>) {
+        self.0.set_message(msg);
+    }
+
+    /// Finish the spinner, replacing it with a completion message.
+    pub fn finish(self, msg: impl Into<std::borrow::Cow<'static, str>>) {
+        self.0.finish_with_message(msg);
+    }
+
+    /// Clear the spinner from the terminal.
+    pub fn clear(self) {
+        self.0.finish_and_clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

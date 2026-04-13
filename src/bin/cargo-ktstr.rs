@@ -195,12 +195,14 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     }
 
     if !cli::has_sched_ext(kernel_dir) {
-        eprintln!("cargo-ktstr: configuring kernel (sched_ext not found in .config)");
+        let sp = cli::Spinner::start("Configuring kernel...");
         cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"))?;
+        sp.finish("Kernel configured");
     }
 
-    eprintln!("cargo-ktstr: building kernel in {}", kernel_dir.display());
+    let sp = cli::Spinner::start("Building kernel...");
     cli::make_kernel(kernel_dir).map_err(|e| format!("{e:#}"))?;
+    sp.finish("Kernel built");
 
     eprintln!("cargo-ktstr: generating compile_commands.json");
     cli::run_make(kernel_dir, &["compile_commands.json"]).map_err(|e| format!("{e:#}"))?;
@@ -307,7 +309,10 @@ fn kernel_build(
                 return Ok(());
             }
         }
-        fetch::download_tarball(&ver, tmp_dir.path())?
+        let sp = cli::Spinner::start("Downloading kernel...");
+        let result = fetch::download_tarball(&ver, tmp_dir.path());
+        sp.clear();
+        result?
     };
 
     // Check cache for --source and --git (tarball already checked
@@ -342,13 +347,15 @@ fn kernel_build(
 
     // Configure.
     if !cli::has_sched_ext(source_dir) {
-        eprintln!("cargo-ktstr: configuring kernel (sched_ext not found in .config)");
+        let sp = cli::Spinner::start("Configuring kernel...");
         cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"))?;
+        sp.finish("Kernel configured");
     }
 
     // Build.
-    eprintln!("cargo-ktstr: building kernel in {}", source_dir.display());
+    let sp = cli::Spinner::start("Building kernel...");
     cli::make_kernel(source_dir).map_err(|e| format!("{e:#}"))?;
+    sp.finish("Kernel built");
 
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
