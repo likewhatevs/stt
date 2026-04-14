@@ -1385,4 +1385,187 @@ mod tests {
         let result = run_test_stats(Some(std::path::Path::new("/nonexistent/path")));
         assert!(result.is_empty());
     }
+
+    // -- days_to_ymd --
+
+    #[test]
+    fn days_to_ymd_epoch() {
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_known_date() {
+        // 2024-01-01 = 19723 days since epoch
+        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_leap_day() {
+        // 2024-02-29 = 19723 + 31 (jan) + 28 (feb 1-28) = 19782
+        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_end_of_year() {
+        // 2023-12-31 = 19722
+        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
+    }
+
+    // -- has_sched_ext --
+
+    #[test]
+    fn has_sched_ext_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".config"),
+            "CONFIG_BPF=y\nCONFIG_SCHED_CLASS_EXT=y\nCONFIG_DEBUG_INFO=y\n",
+        )
+        .unwrap();
+        assert!(has_sched_ext(dir.path()));
+    }
+
+    #[test]
+    fn has_sched_ext_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".config"),
+            "CONFIG_BPF=y\nCONFIG_DEBUG_INFO=y\n",
+        )
+        .unwrap();
+        assert!(!has_sched_ext(dir.path()));
+    }
+
+    #[test]
+    fn has_sched_ext_module() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".config"), "CONFIG_SCHED_CLASS_EXT=m\n").unwrap();
+        assert!(!has_sched_ext(dir.path()));
+    }
+
+    #[test]
+    fn has_sched_ext_no_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!has_sched_ext(dir.path()));
+    }
+
+    // -- validate_kernel_config --
+
+    #[test]
+    fn validate_kernel_config_all_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".config"),
+            "CONFIG_SCHED_CLASS_EXT=y\n\
+             CONFIG_DEBUG_INFO_BTF=y\n\
+             CONFIG_BPF_SYSCALL=y\n\
+             CONFIG_FTRACE=y\n\
+             CONFIG_KPROBE_EVENTS=y\n\
+             CONFIG_BPF_EVENTS=y\n",
+        )
+        .unwrap();
+        assert!(validate_kernel_config(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn validate_kernel_config_missing_btf() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".config"),
+            "CONFIG_SCHED_CLASS_EXT=y\n\
+             CONFIG_BPF_SYSCALL=y\n\
+             CONFIG_FTRACE=y\n\
+             CONFIG_KPROBE_EVENTS=y\n\
+             CONFIG_BPF_EVENTS=y\n",
+        )
+        .unwrap();
+        let err = validate_kernel_config(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("CONFIG_DEBUG_INFO_BTF"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_kernel_config_missing_multiple() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".config"), "CONFIG_BPF_SYSCALL=y\n").unwrap();
+        let err = validate_kernel_config(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("CONFIG_SCHED_CLASS_EXT"), "got: {msg}");
+        assert!(msg.contains("CONFIG_DEBUG_INFO_BTF"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_kernel_config_no_config_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(validate_kernel_config(dir.path()).is_err());
+    }
+
+    // -- configure_kernel --
+
+    #[test]
+    fn configure_kernel_appends_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".config"), "CONFIG_BPF=y\n").unwrap();
+        // Create minimal Makefile/Kconfig to avoid "not a source tree" errors
+        // (configure_kernel reads .config directly, doesn't need make).
+        let fragment = "CONFIG_EXTRA=y\n";
+        configure_kernel(dir.path(), fragment).unwrap();
+        let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
+        assert!(config.contains("CONFIG_EXTRA=y"));
+        assert!(config.contains("CONFIG_BPF=y"));
+    }
+
+    #[test]
+    fn configure_kernel_skips_when_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let initial = "CONFIG_BPF=y\nCONFIG_EXTRA=y\n";
+        std::fs::write(dir.path().join(".config"), initial).unwrap();
+        let fragment = "CONFIG_EXTRA=y\n";
+        configure_kernel(dir.path(), fragment).unwrap();
+        let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
+        // Should not have appended (mtime preserved behavior).
+        assert_eq!(config, initial);
+    }
+
+    // -- resolve_in_path --
+
+    #[test]
+    fn resolve_in_path_finds_sh() {
+        let result = resolve_in_path(std::path::Path::new("sh"));
+        assert!(result.is_some(), "sh should be in PATH");
+        assert!(result.unwrap().exists());
+    }
+
+    #[test]
+    fn resolve_in_path_nonexistent() {
+        let result = resolve_in_path(std::path::Path::new("nonexistent_binary_xyz_12345"));
+        assert!(result.is_none());
+    }
+
+    // -- resolve_include_files --
+
+    #[test]
+    fn resolve_include_files_single_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let result = resolve_include_files(&[file]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].0.contains("test.txt"));
+    }
+
+    #[test]
+    fn resolve_include_files_nonexistent() {
+        let result = resolve_include_files(&[std::path::PathBuf::from("/nonexistent/file.txt")]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_include_files_bare_name_in_path() {
+        // "sh" is in PATH on all systems.
+        let result = resolve_include_files(&[std::path::PathBuf::from("sh")]);
+        assert!(result.is_ok());
+        let entries = result.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].0.contains("sh"));
+    }
 }

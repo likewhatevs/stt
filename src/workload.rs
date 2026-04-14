@@ -3004,4 +3004,169 @@ mod tests {
         }
         drop(h);
     }
+
+    // -- worker_group_size --
+
+    #[test]
+    fn worker_group_size_paired() {
+        assert_eq!(WorkType::pipe_io(100).worker_group_size(), Some(2));
+        assert_eq!(WorkType::futex_ping_pong(100).worker_group_size(), Some(2));
+        assert_eq!(WorkType::cache_pipe(32, 100).worker_group_size(), Some(2));
+    }
+
+    #[test]
+    fn worker_group_size_fan_out() {
+        assert_eq!(WorkType::futex_fan_out(4, 100).worker_group_size(), Some(5));
+        assert_eq!(WorkType::futex_fan_out(1, 100).worker_group_size(), Some(2));
+    }
+
+    #[test]
+    fn worker_group_size_ungrouped() {
+        assert_eq!(WorkType::CpuSpin.worker_group_size(), None);
+        assert_eq!(WorkType::YieldHeavy.worker_group_size(), None);
+        assert_eq!(WorkType::Mixed.worker_group_size(), None);
+        assert_eq!(WorkType::IoSync.worker_group_size(), None);
+        assert_eq!(WorkType::bursty(50, 100).worker_group_size(), None);
+        assert_eq!(WorkType::cache_pressure(32, 64).worker_group_size(), None);
+        assert_eq!(WorkType::cache_yield(32, 64).worker_group_size(), None);
+    }
+
+    // -- needs_shared_mem --
+
+    #[test]
+    fn needs_shared_mem_futex_types() {
+        assert!(WorkType::futex_ping_pong(100).needs_shared_mem());
+        assert!(WorkType::futex_fan_out(4, 100).needs_shared_mem());
+    }
+
+    #[test]
+    fn needs_shared_mem_non_futex() {
+        assert!(!WorkType::CpuSpin.needs_shared_mem());
+        assert!(!WorkType::pipe_io(100).needs_shared_mem());
+        assert!(!WorkType::cache_pipe(32, 100).needs_shared_mem());
+        assert!(!WorkType::cache_pressure(32, 64).needs_shared_mem());
+    }
+
+    // -- needs_cache_buf --
+
+    #[test]
+    fn needs_cache_buf_cache_types() {
+        assert!(WorkType::cache_pressure(32, 64).needs_cache_buf());
+        assert!(WorkType::cache_yield(32, 64).needs_cache_buf());
+        assert!(WorkType::cache_pipe(32, 100).needs_cache_buf());
+    }
+
+    #[test]
+    fn needs_cache_buf_non_cache() {
+        assert!(!WorkType::CpuSpin.needs_cache_buf());
+        assert!(!WorkType::pipe_io(100).needs_cache_buf());
+        assert!(!WorkType::futex_ping_pong(100).needs_cache_buf());
+        assert!(!WorkType::futex_fan_out(4, 100).needs_cache_buf());
+    }
+
+    // -- from_name("Sequence") returns None --
+
+    #[test]
+    fn from_name_sequence_returns_none() {
+        assert!(WorkType::from_name("Sequence").is_none());
+    }
+
+    // -- resolve_work_type --
+
+    #[test]
+    fn resolve_work_type_not_swappable() {
+        let base = WorkType::CpuSpin;
+        let over = WorkType::YieldHeavy;
+        let result = resolve_work_type(&base, Some(&over), false, 4);
+        assert!(matches!(result, WorkType::CpuSpin));
+    }
+
+    #[test]
+    fn resolve_work_type_swappable_applies_override() {
+        let base = WorkType::CpuSpin;
+        let over = WorkType::YieldHeavy;
+        let result = resolve_work_type(&base, Some(&over), true, 4);
+        assert!(matches!(result, WorkType::YieldHeavy));
+    }
+
+    #[test]
+    fn resolve_work_type_swappable_no_override() {
+        let base = WorkType::CpuSpin;
+        let result = resolve_work_type(&base, None, true, 4);
+        assert!(matches!(result, WorkType::CpuSpin));
+    }
+
+    #[test]
+    fn resolve_work_type_group_size_mismatch() {
+        let base = WorkType::CpuSpin;
+        let over = WorkType::pipe_io(100); // group_size = 2
+        let result = resolve_work_type(&base, Some(&over), true, 3); // 3 not divisible by 2
+        assert!(matches!(result, WorkType::CpuSpin));
+    }
+
+    #[test]
+    fn resolve_work_type_group_size_match() {
+        let base = WorkType::CpuSpin;
+        let over = WorkType::pipe_io(100); // group_size = 2
+        let result = resolve_work_type(&base, Some(&over), true, 4); // 4 divisible by 2
+        assert!(matches!(result, WorkType::PipeIo { .. }));
+    }
+
+    #[test]
+    fn resolve_work_type_fan_out_group_size() {
+        let base = WorkType::CpuSpin;
+        let over = WorkType::futex_fan_out(3, 100); // group_size = 4
+        let result = resolve_work_type(&base, Some(&over), true, 8); // 8 divisible by 4
+        assert!(matches!(result, WorkType::FutexFanOut { .. }));
+        let fail = resolve_work_type(&base, Some(&over), true, 6); // 6 not divisible by 4
+        assert!(matches!(fail, WorkType::CpuSpin));
+    }
+
+    // -- Work builder --
+
+    #[test]
+    fn work_builder_chain() {
+        let w = Work::default()
+            .workers(8)
+            .work_type(WorkType::bursty(10, 20))
+            .sched_policy(SchedPolicy::Batch)
+            .affinity(AffinityKind::SingleCpu);
+        assert_eq!(w.num_workers, Some(8));
+        assert!(matches!(
+            w.work_type,
+            WorkType::Bursty {
+                burst_ms: 10,
+                sleep_ms: 20
+            }
+        ));
+        assert!(matches!(w.sched_policy, SchedPolicy::Batch));
+        assert!(matches!(w.affinity, AffinityKind::SingleCpu));
+    }
+
+    #[test]
+    fn work_default_values() {
+        let w = Work::default();
+        assert_eq!(w.num_workers, None);
+        assert!(matches!(w.work_type, WorkType::CpuSpin));
+        assert!(matches!(w.sched_policy, SchedPolicy::Normal));
+        assert!(matches!(w.affinity, AffinityKind::Inherit));
+    }
+
+    // -- SchedPolicy constructors --
+
+    #[test]
+    fn sched_policy_fifo_constructor() {
+        match SchedPolicy::fifo(50) {
+            SchedPolicy::Fifo(p) => assert_eq!(p, 50),
+            _ => panic!("expected Fifo"),
+        }
+    }
+
+    #[test]
+    fn sched_policy_rr_constructor() {
+        match SchedPolicy::round_robin(25) {
+            SchedPolicy::RoundRobin(p) => assert_eq!(p, 25),
+            _ => panic!("expected RoundRobin"),
+        }
+    }
 }

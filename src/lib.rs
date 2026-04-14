@@ -599,4 +599,26 @@ mod tests {
             assert_eq!(exe, std::path::PathBuf::from("/proc/self/exe"));
         }
     }
+
+    // -- errno_name --
+
+    #[test]
+    fn errno_name_known_values() {
+        assert_eq!(errno_name(libc::EPERM), Some("EPERM"));
+        assert_eq!(errno_name(libc::ENOENT), Some("ENOENT"));
+        assert_eq!(errno_name(libc::EINVAL), Some("EINVAL"));
+        assert_eq!(errno_name(libc::ENOMEM), Some("ENOMEM"));
+        assert_eq!(errno_name(libc::EBUSY), Some("EBUSY"));
+        assert_eq!(errno_name(libc::EACCES), Some("EACCES"));
+        assert_eq!(errno_name(libc::EAGAIN), Some("EAGAIN"));
+        assert_eq!(errno_name(libc::ENOSYS), Some("ENOSYS"));
+        assert_eq!(errno_name(libc::ETIMEDOUT), Some("ETIMEDOUT"));
+    }
+
+    #[test]
+    fn errno_name_unknown() {
+        assert_eq!(errno_name(9999), None);
+        assert_eq!(errno_name(0), None);
+        assert_eq!(errno_name(-1), None);
+    }
 }

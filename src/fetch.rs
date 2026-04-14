@@ -501,4 +501,77 @@ mod tests {
             "https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz"
         );
     }
+
+    // -- patch_level --
+
+    #[test]
+    fn fetch_patch_level_three_part() {
+        assert_eq!(patch_level("6.12.8"), Some(8));
+    }
+
+    #[test]
+    fn fetch_patch_level_two_part() {
+        assert_eq!(patch_level("7.0"), Some(0));
+    }
+
+    #[test]
+    fn fetch_patch_level_single_part() {
+        assert_eq!(patch_level("6"), None);
+    }
+
+    #[test]
+    fn fetch_patch_level_four_part() {
+        assert_eq!(patch_level("6.1.2.3"), None);
+    }
+
+    #[test]
+    fn fetch_patch_level_non_numeric_patch() {
+        assert_eq!(patch_level("6.1.rc3"), None);
+    }
+
+    #[test]
+    fn fetch_patch_level_zero() {
+        assert_eq!(patch_level("6.14.0"), Some(0));
+    }
+
+    #[test]
+    fn fetch_patch_level_large() {
+        assert_eq!(patch_level("6.12.99"), Some(99));
+    }
+
+    // -- proptest --
+
+    proptest::proptest! {
+        #[test]
+        fn prop_major_version_never_panics(s in "\\PC{0,20}") {
+            let _ = major_version(&s);
+        }
+
+        #[test]
+        fn prop_is_rc_contains_dash_rc(s in "\\PC{0,20}") {
+            assert_eq!(is_rc(&s), s.contains("-rc"));
+        }
+
+        #[test]
+        fn prop_patch_level_valid_three_part(
+            major in 1u32..100,
+            minor in 0u32..100,
+            patch in 0u32..100,
+        ) {
+            let v = format!("{major}.{minor}.{patch}");
+            assert_eq!(patch_level(&v), Some(patch));
+        }
+
+        #[test]
+        fn prop_patch_level_valid_two_part(major in 1u32..100, minor in 0u32..100) {
+            let v = format!("{major}.{minor}");
+            assert_eq!(patch_level(&v), Some(0));
+        }
+
+        #[test]
+        fn prop_major_version_valid(major in 1u32..100, minor in 0u32..100) {
+            let v = format!("{major}.{minor}");
+            assert_eq!(major_version(&v).unwrap(), major);
+        }
+    }
 }

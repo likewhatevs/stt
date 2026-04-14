@@ -178,3 +178,26 @@ fn shell_invalid_topology() {
         .failure()
         .stderr(predicate::str::contains("invalid topology"));
 }
+
+// -- test-stats --
+
+#[test]
+fn test_stats_no_data() {
+    cargo_ktstr().args(["test-stats"]).assert().success();
+}
+
+// -- kernel list --
+
+#[test]
+fn kernel_list_runs() {
+    cargo_ktstr().args(["kernel", "list"]).assert().success();
+}
+
+#[test]
+fn kernel_list_json() {
+    cargo_ktstr()
+        .args(["kernel", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("entries"));
+}

@@ -792,4 +792,59 @@ mod tests {
     fn cache_size_whitespace_only() {
         assert_eq!(parse_cache_size("   "), None);
     }
+
+    // -- proptest --
+
+    proptest::proptest! {
+        #[test]
+        fn prop_parse_cpu_list_never_panics(s in "\\PC{0,30}") {
+            let _ = parse_cpu_list(&s);
+        }
+
+        #[test]
+        fn prop_parse_cpu_list_single_cpu(cpu in 0usize..256) {
+            let result = parse_cpu_list(&cpu.to_string()).unwrap();
+            assert_eq!(result, vec![cpu]);
+        }
+
+        #[test]
+        fn prop_parse_cpu_list_range_sorted(lo in 0usize..128, span in 1usize..64) {
+            let hi = lo + span;
+            let result = parse_cpu_list(&format!("{lo}-{hi}")).unwrap();
+            assert_eq!(result.len(), span + 1);
+            assert_eq!(*result.first().unwrap(), lo);
+            assert_eq!(*result.last().unwrap(), hi);
+            // Must be sorted.
+            for w in result.windows(2) {
+                assert!(w[0] <= w[1]);
+            }
+        }
+
+        #[test]
+        fn prop_parse_cpu_list_lenient_never_panics(s in "\\PC{0,30}") {
+            let _ = parse_cpu_list_lenient(&s);
+        }
+
+        #[test]
+        fn prop_parse_cpu_list_lenient_superset_of_strict(
+            lo in 0usize..64,
+            hi in 64usize..128,
+        ) {
+            let s = format!("{lo}-{hi}");
+            let strict = parse_cpu_list(&s).unwrap();
+            let lenient = parse_cpu_list_lenient(&s);
+            assert_eq!(strict, lenient);
+        }
+
+        #[test]
+        fn prop_parse_cpu_list_roundtrip(
+            cpus in proptest::collection::btree_set(0usize..256, 1..16),
+        ) {
+            // Format as comma-separated list, parse back, compare.
+            let s: String = cpus.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
+            let parsed = parse_cpu_list(&s).unwrap();
+            let roundtrip: std::collections::BTreeSet<usize> = parsed.into_iter().collect();
+            assert_eq!(cpus, roundtrip);
+        }
+    }
 }

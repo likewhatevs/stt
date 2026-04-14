@@ -1,0 +1,9 @@
+---
+source: src/verifier.rs
+expression: "format_verifier_output(\"default\", &result, false)"
+---
+
+default
+  enqueue                                  verified_insns=500
+  dispatch                                 verified_insns=1200
+  init                                     verified_insns=300

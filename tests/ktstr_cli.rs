@@ -205,3 +205,84 @@ fn include_files_duplicate_archive_path_errors() {
     let err = format!("{}", result.unwrap_err());
     assert!(err.contains("duplicate"), "{err}");
 }
+
+// -- list scenarios --
+
+#[test]
+fn list_shows_scenarios() {
+    ktstr()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cgroup_steady"));
+}
+
+#[test]
+fn list_json() {
+    ktstr()
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\""));
+}
+
+#[test]
+fn list_filter() {
+    ktstr()
+        .args(["list", "--filter", "cpuset"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cpuset"));
+}
+
+#[test]
+fn list_filter_no_match() {
+    ktstr()
+        .args(["list", "--filter", "nonexistent_scenario_xyz"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 scenarios"));
+}
+
+// -- topo --
+
+#[test]
+fn topo_shows_cpus() {
+    ktstr()
+        .arg("topo")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+// -- completions (additional shells) --
+
+#[test]
+fn completions_fish() {
+    ktstr()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[test]
+fn completions_invalid_shell() {
+    ktstr().args(["completions", "noshell"]).assert().failure();
+}
+
+// -- kernel list --
+
+#[test]
+fn kernel_list_runs() {
+    ktstr().args(["kernel", "list"]).assert().success();
+}
+
+#[test]
+fn kernel_list_json() {
+    ktstr()
+        .args(["kernel", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("entries"));
+}

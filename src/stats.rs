@@ -1842,4 +1842,105 @@ mod tests {
         assert_eq!(row.fallback_count, 0);
         assert_eq!(row.keep_last_count, 0);
     }
+
+    // -- parse_label --
+
+    #[test]
+    fn parse_label_full() {
+        let (topo, scenario, flags, wt, replica) =
+            parse_label("tiny-2llc/cgroup_steady/llc+borrow/CpuSpin#3");
+        assert_eq!(topo, "tiny-2llc");
+        assert_eq!(scenario, "cgroup_steady");
+        assert_eq!(flags, "llc+borrow");
+        assert_eq!(wt, "CpuSpin");
+        assert_eq!(replica, 3);
+    }
+
+    #[test]
+    fn parse_label_no_replica() {
+        let (topo, scenario, flags, wt, replica) =
+            parse_label("tiny-2llc/cgroup_steady/default/Mixed");
+        assert_eq!(topo, "tiny-2llc");
+        assert_eq!(scenario, "cgroup_steady");
+        assert_eq!(flags, "default");
+        assert_eq!(wt, "Mixed");
+        assert_eq!(replica, 1);
+    }
+
+    #[test]
+    fn parse_label_no_work_type() {
+        let (topo, scenario, flags, wt, replica) = parse_label("tiny-2llc/cgroup_steady/default");
+        assert_eq!(topo, "tiny-2llc");
+        assert_eq!(scenario, "cgroup_steady");
+        assert_eq!(flags, "default");
+        assert_eq!(wt, "CpuSpin");
+        assert_eq!(replica, 1);
+    }
+
+    #[test]
+    fn parse_label_no_flags() {
+        let (topo, scenario, flags, wt, replica) = parse_label("tiny-2llc/cgroup_steady");
+        assert_eq!(topo, "tiny-2llc");
+        assert_eq!(scenario, "cgroup_steady");
+        assert_eq!(flags, "default");
+        assert_eq!(wt, "CpuSpin");
+        assert_eq!(replica, 1);
+    }
+
+    #[test]
+    fn parse_label_replica_non_numeric() {
+        let (_, _, _, _, replica) = parse_label("t/s/f/w#notanumber");
+        assert_eq!(replica, 1);
+    }
+
+    #[test]
+    fn parse_label_empty() {
+        let (topo, scenario, flags, wt, replica) = parse_label("");
+        assert_eq!(topo, "");
+        assert_eq!(scenario, "");
+        assert_eq!(flags, "default");
+        assert_eq!(wt, "CpuSpin");
+        assert_eq!(replica, 1);
+    }
+
+    #[test]
+    fn parse_label_only_topo() {
+        let (topo, scenario, flags, wt, replica) = parse_label("tiny-2llc");
+        assert_eq!(topo, "tiny-2llc");
+        assert_eq!(scenario, "");
+        assert_eq!(flags, "default");
+        assert_eq!(wt, "CpuSpin");
+        assert_eq!(replica, 1);
+    }
+
+    // -- proptest --
+
+    proptest::proptest! {
+        #[test]
+        fn prop_parse_label_never_panics(s in "\\PC{0,50}") {
+            let _ = parse_label(&s);
+        }
+
+        #[test]
+        fn prop_parse_label_replica_default_1(
+            topo in "[a-z0-9_-]{1,10}",
+            scenario in "[a-z0-9_]{1,10}",
+            flags in "[a-z+]{1,10}",
+        ) {
+            let label = format!("{topo}/{scenario}/{flags}");
+            let (_, _, _, _, replica) = parse_label(&label);
+            assert_eq!(replica, 1);
+        }
+
+        #[test]
+        fn prop_parse_label_replica_roundtrip(
+            topo in "[a-z]{1,5}",
+            scenario in "[a-z]{1,5}",
+            r in 1u32..1000,
+        ) {
+            let label = format!("{topo}/{scenario}/default/CpuSpin#{r}");
+            let (_, _, _, _, replica) = parse_label(&label);
+            assert_eq!(replica, r);
+        }
+    }
 }

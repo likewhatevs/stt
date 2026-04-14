@@ -589,4 +589,43 @@ mod tests {
         assert!(!_is_version_string("linux"));
         assert!(!_is_version_string(".6"));
     }
+
+    // -- proptest --
+
+    proptest::proptest! {
+        #[test]
+        fn prop_kernel_id_parse_never_panics(s in "\\PC{0,30}") {
+            let _ = KernelId::parse(&s);
+        }
+
+        #[test]
+        fn prop_kernel_id_path_on_slash(
+            prefix in "[a-z]{1,5}",
+            suffix in "[a-z]{1,5}",
+        ) {
+            let s = format!("{prefix}/{suffix}");
+            assert!(matches!(KernelId::parse(&s), KernelId::Path(_)));
+        }
+
+        #[test]
+        fn prop_kernel_id_path_on_dot_prefix(s in "\\.[a-z]{1,10}") {
+            assert!(matches!(KernelId::parse(&s), KernelId::Path(_)));
+        }
+
+        #[test]
+        fn prop_kernel_id_version_roundtrip(
+            major in 1u32..20,
+            minor in 0u32..50,
+            patch in 0u32..100,
+        ) {
+            let v = format!("{major}.{minor}.{patch}");
+            assert_eq!(KernelId::parse(&v), KernelId::Version(v.clone()));
+        }
+
+        #[test]
+        fn prop_kernel_id_version_rc(major in 1u32..20, minor in 0u32..50, rc in 1u32..10) {
+            let v = format!("{major}.{minor}-rc{rc}");
+            assert_eq!(KernelId::parse(&v), KernelId::Version(v.clone()));
+        }
+    }
 }

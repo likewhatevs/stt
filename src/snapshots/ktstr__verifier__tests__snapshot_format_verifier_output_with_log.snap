@@ -1,0 +1,15 @@
+---
+source: src/verifier.rs
+expression: "format_verifier_output(\"llc+steal\", &result, false)"
+---
+
+llc+steal
+  enqueue                                  verified_insns=42
+
+llc+steal --- verifier stats ---
+  processed=42  states=8/10
+
+llc+steal --- scheduler log ---
+func#0 @0
+0: R1=ctx() R10=fp0
+processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_states 8 mark_read 5

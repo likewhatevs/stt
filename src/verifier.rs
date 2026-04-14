@@ -1369,4 +1369,116 @@ libbpf: failed to load BPF skeleton 'ktstr_ops': -22
             "must not false-collapse distinct program logs"
         );
     }
+
+    // -- insta snapshot tests --
+
+    #[test]
+    fn snapshot_format_brief_line() {
+        insta::assert_snapshot!(format_brief_line("bpf_prog_enqueue", 1234));
+    }
+
+    #[test]
+    fn snapshot_format_brief_line_long_name() {
+        insta::assert_snapshot!(format_brief_line(
+            "bpf_struct_ops_sched_ext_ops_dispatch_very_long_name",
+            99999
+        ));
+    }
+
+    #[test]
+    fn snapshot_format_brief_line_zero() {
+        insta::assert_snapshot!(format_brief_line("bpf_prog_init", 0));
+    }
+
+    #[test]
+    fn snapshot_format_verifier_output_no_log() {
+        let result = VerifierVmResult {
+            stats: vec![
+                ProgStats {
+                    name: "enqueue".into(),
+                    verified_insns: 500,
+                },
+                ProgStats {
+                    name: "dispatch".into(),
+                    verified_insns: 1200,
+                },
+                ProgStats {
+                    name: "init".into(),
+                    verified_insns: 300,
+                },
+            ],
+            scheduler_log: String::new(),
+        };
+        insta::assert_snapshot!(format_verifier_output("default", &result, false));
+    }
+
+    #[test]
+    fn snapshot_format_verifier_output_with_log() {
+        let log = "\
+-- BEGIN PROG LOAD LOG --\n\
+func#0 @0\n\
+0: R1=ctx() R10=fp0\n\
+processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_states 8 mark_read 5\n\
+-- END PROG LOAD LOG --";
+        let result = VerifierVmResult {
+            stats: vec![ProgStats {
+                name: "enqueue".into(),
+                verified_insns: 42,
+            }],
+            scheduler_log: log.into(),
+        };
+        insta::assert_snapshot!(format_verifier_output("llc+steal", &result, false));
+    }
+
+    #[test]
+    fn snapshot_format_verifier_diff() {
+        let stats_a = vec![
+            ProgStats {
+                name: "enqueue".into(),
+                verified_insns: 500,
+            },
+            ProgStats {
+                name: "dispatch".into(),
+                verified_insns: 1200,
+            },
+            ProgStats {
+                name: "init".into(),
+                verified_insns: 300,
+            },
+        ];
+        let stats_b = vec![
+            ProgStats {
+                name: "enqueue".into(),
+                verified_insns: 480,
+            },
+            ProgStats {
+                name: "dispatch".into(),
+                verified_insns: 1350,
+            },
+            ProgStats {
+                name: "init".into(),
+                verified_insns: 300,
+            },
+        ];
+        insta::assert_snapshot!(format_verifier_diff("default", &stats_a, "llc", &stats_b));
+    }
+
+    #[test]
+    fn snapshot_format_verifier_diff_missing_program() {
+        let stats_a = vec![
+            ProgStats {
+                name: "enqueue".into(),
+                verified_insns: 500,
+            },
+            ProgStats {
+                name: "new_prog".into(),
+                verified_insns: 100,
+            },
+        ];
+        let stats_b = vec![ProgStats {
+            name: "enqueue".into(),
+            verified_insns: 500,
+        }];
+        insta::assert_snapshot!(format_verifier_diff("A", &stats_a, "B", &stats_b));
+    }
 }

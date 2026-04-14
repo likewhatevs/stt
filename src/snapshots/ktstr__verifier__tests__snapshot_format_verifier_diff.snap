@@ -1,0 +1,11 @@
+---
+source: src/verifier.rs
+expression: "format_verifier_diff(\"default\", &stats_a, \"llc\", &stats_b)"
+---
+
+delta A/B diff: default vs llc
+  program                                           A          B      delta
+  ------------------------------------------------------------------------
+  enqueue                                         500        480        +20
+  dispatch                                       1200       1350       -150
+  init                                            300        300         +0
