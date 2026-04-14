@@ -269,12 +269,15 @@ manual configuration.
 </details>
 
 <details>
-<summary><b>Performance mode</b> — host-side isolation for noise-free measurements</summary>
+<summary><b>Performance mode</b> — host-side isolation-ish and topology mirroring for maybe workable results</summary>
 
 vCPU pinning, 2MB hugepages with pre-fault allocation, NUMA mbind,
 RT scheduling (SCHED_FIFO), KVM exit suppression (PAUSE + HLT), and
 KVM_HINTS_REALTIME CPUID — isolates the VM from host noise for
-reproducible measurements.
+reproducible measurements. Topology mirroring maps the VM's LLC
+structure to match the host's physical layout, so cache-aware
+scheduling decisions in the guest reflect real hardware behavior
+rather than synthetic geometry. Kinda.
 See [Performance Mode](concepts/performance-mode.md).
 
 </details>
