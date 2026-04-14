@@ -114,11 +114,13 @@ jobs:
           restore-keys: ktstr-kernels-x64-
       - name: Build test kernel
         run: cargo run --bin cargo-ktstr --features gha-cache -- ktstr kernel build
-      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration
-      - uses: actions/upload-artifact@v7
+      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
         with:
-          name: lcov-x64
-          path: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          flags: x64
 
   coverage-arm64:
     runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]
@@ -141,30 +143,10 @@ jobs:
           restore-keys: ktstr-kernels-arm64-
       - name: Build test kernel
         run: cargo run --bin cargo-ktstr --features gha-cache -- ktstr kernel build
-      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration
-      - uses: actions/upload-artifact@v7
-        with:
-          name: lcov-arm64
-          path: lcov.info
-
-  coverage-upload:
-    runs-on: ubuntu-latest
-    needs: [coverage-x64, coverage-arm64]
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: lcov-x64
-          path: lcov-x64
-      - uses: actions/download-artifact@v8
-        with:
-          name: lcov-arm64
-          path: lcov-arm64
-      - name: Merge lcov files
-        run: |
-          sudo apt-get install -y lcov
-          lcov --add-tracefile lcov-x64/lcov.info --add-tracefile lcov-arm64/lcov.info --output-file merged.lcov
+      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: merged.lcov
+          files: lcov.info
+          flags: arm64
