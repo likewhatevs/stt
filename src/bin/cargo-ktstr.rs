@@ -418,16 +418,42 @@ fn kernel_build(
     let image_path = ktstr::kernel_path::find_image_in_dir(source_dir)
         .ok_or_else(|| format!("no kernel image found in {}", source_dir.display()))?;
     let vmlinux_path = source_dir.join("vmlinux");
+    // Strip DWARF debug sections from vmlinux before caching.
+    // The cached vmlinux is only used for .symtab and .BTF; DWARF
+    // sections (often >1GB on arm64) are dead weight in the cache.
+    let _stripped_dir; // kept alive so the temp file survives until store()
     let vmlinux_ref = if vmlinux_path.exists() {
         if let Ok(file_meta) = std::fs::metadata(&vmlinux_path) {
-            let mb = file_meta.len() as f64 / (1024.0 * 1024.0);
-            eprintln!("cargo-ktstr: caching vmlinux ({mb:.0} MB)");
+            let orig_mb = file_meta.len() as f64 / (1024.0 * 1024.0);
+            match ktstr::cache::strip_vmlinux_debug(&vmlinux_path) {
+                Ok((dir, stripped_path)) => {
+                    let stripped_mb = std::fs::metadata(&stripped_path)
+                        .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+                        .unwrap_or(0.0);
+                    eprintln!(
+                        "cargo-ktstr: caching vmlinux ({orig_mb:.0} MB -> {stripped_mb:.0} MB, debug stripped)"
+                    );
+                    _stripped_dir = Some(dir);
+                    Some(stripped_path)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "cargo-ktstr: warning: vmlinux strip failed ({e:#}), caching unstripped ({orig_mb:.0} MB)"
+                    );
+                    _stripped_dir = None;
+                    Some(vmlinux_path.clone())
+                }
+            }
+        } else {
+            _stripped_dir = None;
+            Some(vmlinux_path.clone())
         }
-        Some(vmlinux_path.as_path())
     } else {
         eprintln!("cargo-ktstr: warning: vmlinux not found, BTF will not be cached");
+        _stripped_dir = None;
         None
     };
+    let vmlinux_ref = vmlinux_ref.as_deref();
 
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
@@ -466,8 +492,15 @@ fn kernel_build(
         None
     });
 
+    let config_ref = config_path.exists().then_some(config_path.as_path());
     let entry = cache
-        .store(&acquired.cache_key, &image_path, vmlinux_ref, &metadata)
+        .store(
+            &acquired.cache_key,
+            &image_path,
+            vmlinux_ref,
+            config_ref,
+            &metadata,
+        )
         .map_err(|e| format!("cache store: {e:#}"))?;
 
     // Store to remote cache when enabled.
@@ -1535,7 +1568,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = src.path().join(&meta.image_name);
         std::fs::write(&image, b"fake kernel").unwrap();
-        cache.store(key, &image, None, meta).unwrap()
+        cache.store(key, &image, None, None, meta).unwrap()
     }
 
     /// Create a corrupt entry (directory exists but no valid metadata).

@@ -6,8 +6,9 @@
 //! both. Remote failures are non-fatal (logged as warnings).
 //!
 //! Cache entries are serialized as tar archives containing the kernel
-//! image, vmlinux (if present), and metadata.json, stored as a single
-//! blob per cache key in the GHA cache service.
+//! image, vmlinux (if present), .config (if present), and
+//! metadata.json, stored as a single blob per cache key in the GHA
+//! cache service.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -58,20 +59,19 @@ fn create_operator() -> Result<opendal::Operator, String> {
         .map(|b| b.finish())
 }
 
+/// Zstd magic number (first 4 bytes of any zstd frame).
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 /// Pack a cache entry directory into a tar archive in memory.
 ///
-/// The tar contains the kernel image, vmlinux (if present), and
-/// metadata.json from the cache entry directory. Paths inside the
-/// tar are relative filenames (no directory prefix).
+/// The tar contains the kernel image, vmlinux (if present), .config
+/// (if present), and metadata.json from the cache entry directory.
+/// Paths inside the tar are relative filenames (no directory prefix).
 ///
 /// The tar is then compressed with zstd before upload.
 /// [`unpack_and_store`] detects the zstd magic number on download
 /// and decompresses transparently, falling back to raw tar for
 /// entries stored before compression was added.
-
-/// Zstd magic number (first 4 bytes of any zstd frame).
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-
 fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, String> {
     let mut archive = tar::Builder::new(Vec::new());
 
@@ -124,6 +124,22 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
             .map_err(|e| format!("tar append vmlinux: {e}"))?;
     }
 
+    // Add .config if present (CONFIG_HZ resolution).
+    let config_path = entry_dir.join(".config");
+    if let Ok(mut config_file) = std::fs::File::open(&config_path) {
+        let config_size = config_file
+            .metadata()
+            .map_err(|e| format!(".config metadata: {e}"))?
+            .len();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(config_size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, ".config", &mut config_file)
+            .map_err(|e| format!("tar append .config: {e}"))?;
+    }
+
     let tar_bytes = archive
         .into_inner()
         .map_err(|e| format!("finalize tar: {e}"))?;
@@ -145,9 +161,9 @@ fn maybe_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Unpack a tar archive into a cache directory via CacheDir::store.
 ///
-/// Extracts metadata.json, the kernel image, and vmlinux (if present)
-/// from the tar blob, writes them to temp files, then stores via the
-/// local cache API for atomic placement.
+/// Extracts metadata.json, the kernel image, vmlinux (if present),
+/// and .config (if present) from the tar blob, writes them to temp
+/// files, then stores via the local cache API for atomic placement.
 fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<CacheEntry, String> {
     let tar_bytes = maybe_decompress(data)?;
     let mut archive = tar::Archive::new(tar_bytes.as_slice());
@@ -158,6 +174,7 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
     let mut metadata: Option<KernelMetadata> = None;
     let mut image_data: Option<(String, Vec<u8>)> = None;
     let mut vmlinux_data: Option<Vec<u8>> = None;
+    let mut config_data: Option<Vec<u8>> = None;
 
     for entry_result in entries {
         let mut entry = entry_result.map_err(|e| format!("tar entry: {e}"))?;
@@ -182,6 +199,12 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
                 .read_to_end(&mut data)
                 .map_err(|e| format!("read vmlinux from tar: {e}"))?;
             vmlinux_data = Some(data);
+        } else if path == ".config" {
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| format!("read .config from tar: {e}"))?;
+            config_data = Some(data);
         } else {
             let mut data = Vec::new();
             entry
@@ -195,7 +218,7 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
     let (_, img_bytes) =
         image_data.ok_or_else(|| "tar archive missing kernel image".to_string())?;
 
-    // Write image and vmlinux to temp files for CacheDir::store.
+    // Write image, vmlinux, and .config to temp files for CacheDir::store.
     let tmp_dir = tempfile::TempDir::new().map_err(|e| format!("create temp dir: {e}"))?;
     let tmp_image = tmp_dir.path().join(&meta.image_name);
     let mut f = std::fs::File::create(&tmp_image).map_err(|e| format!("create temp image: {e}"))?;
@@ -216,8 +239,21 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
         None
     };
 
+    let tmp_config_path;
+    let config_ref = if let Some(ref cfg_bytes) = config_data {
+        tmp_config_path = tmp_dir.path().join(".config");
+        let mut cf = std::fs::File::create(&tmp_config_path)
+            .map_err(|e| format!("create temp .config: {e}"))?;
+        cf.write_all(cfg_bytes)
+            .map_err(|e| format!("write temp .config: {e}"))?;
+        drop(cf);
+        Some(tmp_config_path.as_path())
+    } else {
+        None
+    };
+
     cache
-        .store(cache_key, &tmp_image, vmlinux_ref, &meta)
+        .store(cache_key, &tmp_image, vmlinux_ref, config_ref, &meta)
         .map_err(|e| format!("local cache store: {e}"))
 }
 
@@ -373,7 +409,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("test-key", &image, None, &meta).unwrap();
+        let entry = cache.store("test-key", &image, None, None, &meta).unwrap();
 
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
         assert!(!packed.is_empty());
@@ -396,6 +432,38 @@ mod tests {
     }
 
     #[test]
+    fn remote_cache_pack_unpack_roundtrip_with_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+
+        let src = tempfile::TempDir::new().unwrap();
+        let image = create_fake_image(src.path());
+        let config = src.path().join(".config");
+        let config_content = b"CONFIG_HZ=1000\nCONFIG_SCHED_CLASS_EXT=y\n";
+        std::fs::write(&config, config_content).unwrap();
+        let meta = test_metadata();
+        let entry = cache
+            .store("config-key", &image, None, Some(&config), &meta)
+            .unwrap();
+
+        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
+        let restored = unpack_and_store(&cache2, "config-key", &packed).unwrap();
+
+        assert_eq!(restored.key, "config-key");
+        // .config must exist in restored entry with original contents.
+        let restored_config = restored.path.join(".config");
+        assert!(
+            restored_config.exists(),
+            ".config missing from restored cache entry"
+        );
+        let restored_content = std::fs::read(&restored_config).unwrap();
+        assert_eq!(restored_content, config_content);
+    }
+
+    #[test]
     fn remote_cache_pack_produces_valid_tar() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
@@ -403,7 +471,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("valid-tar", &image, None, &meta).unwrap();
+        let entry = cache.store("valid-tar", &image, None, None, &meta).unwrap();
 
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
 
@@ -423,7 +491,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("zstd-key", &image, None, &meta).unwrap();
+        let entry = cache.store("zstd-key", &image, None, None, &meta).unwrap();
 
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
         assert!(
@@ -541,7 +609,9 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("test-entry", &image, None, &meta).unwrap();
+        let entry = cache
+            .store("test-entry", &image, None, None, &meta)
+            .unwrap();
 
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap());
         assert!(packed.is_ok());
@@ -565,7 +635,7 @@ mod tests {
         .with_git_hash(Some("a1b2c3d".to_string()))
         .with_git_ref(Some("v6.15-rc3".to_string()));
 
-        let entry = cache.store("git-key", &image, None, &meta).unwrap();
+        let entry = cache.store("git-key", &image, None, None, &meta).unwrap();
         let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
 
         let tmp2 = tempfile::TempDir::new().unwrap();

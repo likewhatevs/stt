@@ -2,8 +2,9 @@
 //!
 //! Manages a local cache of built kernel images under an XDG-compliant
 //! directory. Each cached kernel is a directory containing the boot
-//! image, optionally the uncompressed vmlinux ELF (for BTF), and a
-//! `metadata.json` descriptor.
+//! image, optionally a stripped vmlinux ELF (BTF + symbol table)
+//! and `.config` (for CONFIG_HZ resolution), plus a `metadata.json`
+//! descriptor.
 //!
 //! # Cache location
 //!
@@ -18,11 +19,13 @@
 //! $CACHE_ROOT/
 //!   6.14.2-tarball-x86_64/
 //!     bzImage           # kernel boot image
-//!     vmlinux           # uncompressed ELF (BTF source)
+//!     vmlinux           # stripped ELF (BTF + symbol table, optional)
+//!     .config           # kernel config (CONFIG_HZ, optional)
 //!     metadata.json     # KernelMetadata descriptor
 //!   local-deadbeef-x86_64/
 //!     bzImage
 //!     vmlinux
+//!     .config
 //!     metadata.json
 //! ```
 //!
@@ -88,7 +91,8 @@ pub struct KernelMetadata {
     /// Path to the source tree on disk (local builds only).
     #[serde(default)]
     pub source_tree_path: Option<PathBuf>,
-    /// Filename of the cached vmlinux ELF (BTF/DWARF source).
+    /// Filename of the cached vmlinux ELF (BTF + symbol table).
+    /// DWARF debug sections are stripped before caching.
     /// `None` when vmlinux was not available at cache time.
     #[serde(default)]
     pub vmlinux_name: Option<String>,
@@ -309,9 +313,14 @@ impl CacheDir {
     ///
     /// `image_path`: path to the kernel boot image to cache.
     ///
-    /// `vmlinux_path`: optional path to the uncompressed vmlinux ELF.
-    /// When present, vmlinux is copied alongside the boot image so
-    /// that build.rs can resolve BTF from the cache entry directory.
+    /// `vmlinux_path`: optional path to the vmlinux ELF (stripped of
+    /// DWARF debug sections). When present, vmlinux is copied alongside
+    /// the boot image for BTF and symbol table access.
+    ///
+    /// `config_path`: optional path to the kernel `.config`. When
+    /// present, cached alongside the image so `guest_kernel_hz` can
+    /// resolve CONFIG_HZ without IKCONFIG (which lives in `.rodata`
+    /// and is stripped from the cached vmlinux).
     ///
     /// `metadata`: descriptor to serialize as `metadata.json`.
     ///
@@ -323,6 +332,7 @@ impl CacheDir {
         cache_key: &str,
         image_path: &Path,
         vmlinux_path: Option<&Path>,
+        config_path: Option<&Path>,
         metadata: &KernelMetadata,
     ) -> anyhow::Result<CacheEntry> {
         validate_cache_key(cache_key)?;
@@ -347,7 +357,7 @@ impl CacheDir {
         fs::copy(image_path, &image_dest)
             .map_err(|e| anyhow::anyhow!("copy kernel image to cache: {e}"))?;
 
-        // Copy vmlinux (BTF source for build.rs and BPF map writes).
+        // Copy vmlinux (BTF + symbol table for monitor and probe).
         let has_vmlinux = if let Some(vmlinux) = vmlinux_path {
             fs::copy(vmlinux, tmp_dir.join("vmlinux"))
                 .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
@@ -355,6 +365,12 @@ impl CacheDir {
         } else {
             false
         };
+
+        // Copy .config (CONFIG_HZ resolution for stripped vmlinux).
+        if let Some(cfg) = config_path {
+            fs::copy(cfg, tmp_dir.join(".config"))
+                .map_err(|e| anyhow::anyhow!("copy .config to cache: {e}"))?;
+        }
 
         // Write metadata (record vmlinux_name if vmlinux was stored).
         let mut meta = metadata.clone();
@@ -487,6 +503,126 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
     let meta_path = dir.join("metadata.json");
     let contents = fs::read_to_string(meta_path).ok()?;
     serde_json::from_str(&contents).ok()
+}
+
+/// Sections kept when stripping vmlinux for cache. Everything else
+/// is deleted. Keep-list is safer than a remove-list: new debug or
+/// data sections added by future compiler/kernel versions are
+/// stripped automatically without updating this list.
+const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
+    b"",          // null section (index 0)
+    b".BTF",      // BPF Type Format — probe field resolution
+    b".BTF.ext",  // BTF extension data
+    b".symtab",   // symbol table — monitor address resolution
+    b".strtab",   // symbol string table
+    b".shstrtab", // section header string table (structural)
+];
+
+/// Strip vmlinux for caching: keep only BTF and symbol table.
+///
+/// Uses a keep-list ([`VMLINUX_KEEP_SECTIONS`]): all sections not
+/// in the list are deleted. This removes DWARF debug info,
+/// `.text`, `.data`, `.rodata`, `.bss`, and everything else the
+/// cache doesn't need. The cached vmlinux is read only for symbol
+/// addresses (`.symtab`) and BTF type info (`.BTF`).
+///
+/// DWARF from the build tree (not the cache) is used by blazesym
+/// for probe source locations — stripping the cached copy does not
+/// affect that path.
+///
+/// If the keep-list strip fails (e.g. `Builder::read` encounters
+/// an unsupported ELF feature), falls back to removing only
+/// `.debug_*` sections, which preserves all other sections
+/// including those the symbol table references.
+///
+/// Writes the stripped vmlinux to a temporary file and returns its
+/// path. The caller must keep the returned `TempDir` alive until
+/// `cache.store()` has copied the file.
+pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
+    let data =
+        fs::read(vmlinux_path).map_err(|e| anyhow::anyhow!("read vmlinux for stripping: {e}"))?;
+    let original_size = data.len();
+
+    let out = match strip_keep_list(&data) {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::warn!("keep-list strip failed ({e:#}), falling back to debug-only strip");
+            strip_debug_prefix(&data)?
+        }
+    };
+
+    let stripped_size = out.len();
+    let saved_mb = (original_size - stripped_size) as f64 / (1024.0 * 1024.0);
+    tracing::debug!(
+        original = original_size,
+        stripped = stripped_size,
+        saved_mb = format!("{saved_mb:.0}"),
+        "strip_vmlinux_debug",
+    );
+
+    let tmp_dir = tempfile::TempDir::new()
+        .map_err(|e| anyhow::anyhow!("create temp dir for stripped vmlinux: {e}"))?;
+    let stripped_path = tmp_dir.path().join("vmlinux");
+    fs::write(&stripped_path, &out).map_err(|e| anyhow::anyhow!("write stripped vmlinux: {e}"))?;
+    Ok((tmp_dir, stripped_path))
+}
+
+/// Keep-list strip: delete all sections not in VMLINUX_KEEP_SECTIONS.
+///
+/// After stripping, verifies the result has a non-empty symbol table.
+/// `object::build::elf::Builder` drops symbols whose sections are
+/// deleted, so if all symbols referenced deleted sections, the
+/// symtab would be empty — breaking the monitor. In that case,
+/// returns an error to trigger the fallback to `strip_debug_prefix`.
+fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut builder = object::build::elf::Builder::read(data)
+        .map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
+    for section in builder.sections.iter_mut() {
+        if !VMLINUX_KEEP_SECTIONS.contains(&section.name.as_slice()) {
+            section.delete = true;
+        }
+    }
+    let mut out = Vec::new();
+    builder
+        .write(&mut out)
+        .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux: {e}"))?;
+
+    // Verify symtab survived: Builder drops symbols whose sections
+    // were deleted. If all named symbols are gone, the fallback path
+    // (strip_debug_prefix) preserves sections that symbols reference.
+    // goblin always includes the null symbol (index 0), so check for
+    // at least one symbol with a non-empty name.
+    let elf =
+        goblin::elf::Elf::parse(&out).map_err(|e| anyhow::anyhow!("verify stripped ELF: {e}"))?;
+    let named_syms = elf
+        .syms
+        .iter()
+        .filter(|s| s.st_name != 0 && elf.strtab.get_at(s.st_name).is_some_and(|n| !n.is_empty()))
+        .count();
+    if named_syms == 0 {
+        anyhow::bail!(
+            "keep-list strip emptied symbol table (0 named symbols); \
+             Builder dropped symbols whose sections were deleted"
+        );
+    }
+    Ok(out)
+}
+
+/// Fallback strip: remove only .debug_* and .comment sections.
+fn strip_debug_prefix(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut builder = object::build::elf::Builder::read(data)
+        .map_err(|e| anyhow::anyhow!("parse vmlinux ELF (fallback): {e}"))?;
+    for section in builder.sections.iter_mut() {
+        let name = section.name.as_slice();
+        if name.starts_with(b".debug_") || name == b".comment" {
+            section.delete = true;
+        }
+    }
+    let mut out = Vec::new();
+    builder
+        .write(&mut out)
+        .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux (fallback): {e}"))?;
+    Ok(out)
 }
 
 /// Resolve the cache root directory path.
@@ -714,7 +850,7 @@ mod tests {
 
         // Store.
         let entry = cache
-            .store("6.14.2-tarball-x86_64", &image, None, &meta)
+            .store("6.14.2-tarball-x86_64", &image, None, None, &meta)
             .unwrap();
         assert_eq!(entry.key, "6.14.2-tarball-x86_64");
         assert!(entry.path.join("bzImage").exists());
@@ -782,7 +918,7 @@ mod tests {
             ..test_metadata("6.14.2")
         };
         cache
-            .store("6.14.2-tarball-x86_64", &image, None, &meta1)
+            .store("6.14.2-tarball-x86_64", &image, None, None, &meta1)
             .unwrap();
 
         let meta2 = KernelMetadata {
@@ -790,7 +926,7 @@ mod tests {
             ..test_metadata("6.14.2")
         };
         cache
-            .store("6.14.2-tarball-x86_64", &image, None, &meta2)
+            .store("6.14.2-tarball-x86_64", &image, None, None, &meta2)
             .unwrap();
 
         let found = cache.lookup("6.14.2-tarball-x86_64").unwrap();
@@ -819,9 +955,9 @@ mod tests {
         };
 
         // Store in non-chronological order.
-        cache.store("old", &image, None, &meta_old).unwrap();
-        cache.store("new", &image, None, &meta_new).unwrap();
-        cache.store("mid", &image, None, &meta_mid).unwrap();
+        cache.store("old", &image, None, None, &meta_old).unwrap();
+        cache.store("new", &image, None, None, &meta_new).unwrap();
+        cache.store("mid", &image, None, None, &meta_mid).unwrap();
 
         let entries = cache.list().unwrap();
         assert_eq!(entries.len(), 3);
@@ -839,7 +975,7 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
-        cache.store("valid", &image, None, &meta).unwrap();
+        cache.store("valid", &image, None, None, &meta).unwrap();
 
         // Create a corrupt entry (no metadata).
         let bad_dir = tmp.path().join("corrupt");
@@ -888,13 +1024,13 @@ mod tests {
         let image = create_fake_image(src_dir.path());
 
         cache
-            .store("a", &image, None, &test_metadata("6.14.0"))
+            .store("a", &image, None, None, &test_metadata("6.14.0"))
             .unwrap();
         cache
-            .store("b", &image, None, &test_metadata("6.14.1"))
+            .store("b", &image, None, None, &test_metadata("6.14.1"))
             .unwrap();
         cache
-            .store("c", &image, None, &test_metadata("6.14.2"))
+            .store("c", &image, None, None, &test_metadata("6.14.2"))
             .unwrap();
 
         let removed = cache.clean(None).unwrap();
@@ -922,9 +1058,9 @@ mod tests {
             ..test_metadata("6.14.0")
         };
 
-        cache.store("old", &image, None, &meta_old).unwrap();
-        cache.store("new", &image, None, &meta_new).unwrap();
-        cache.store("mid", &image, None, &meta_mid).unwrap();
+        cache.store("old", &image, None, None, &meta_old).unwrap();
+        cache.store("new", &image, None, None, &meta_new).unwrap();
+        cache.store("mid", &image, None, None, &meta_mid).unwrap();
 
         let removed = cache.clean(Some(1)).unwrap();
         assert_eq!(removed, 2);
@@ -942,7 +1078,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
 
         cache
-            .store("only", &image, None, &test_metadata("6.14.2"))
+            .store("only", &image, None, None, &test_metadata("6.14.2"))
             .unwrap();
 
         let removed = cache.clean(Some(5)).unwrap();
@@ -1124,7 +1260,9 @@ mod tests {
         let mut meta = test_metadata("6.14.2");
         meta.image_name = "../escape".to_string();
 
-        let err = cache.store("valid-key", &image, None, &meta).unwrap_err();
+        let err = cache
+            .store("valid-key", &image, None, None, &meta)
+            .unwrap_err();
         assert!(
             err.to_string().contains("image name"),
             "expected image_name rejection, got: {err}"
@@ -1141,7 +1279,9 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store(".tmp-sneaky", &image, None, &meta).unwrap_err();
+        let err = cache
+            .store(".tmp-sneaky", &image, None, None, &meta)
+            .unwrap_err();
         assert!(
             err.to_string().contains(".tmp-"),
             "expected .tmp- rejection, got: {err}"
@@ -1165,7 +1305,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("", &image, None, &meta).unwrap_err();
+        let err = cache.store("", &image, None, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains("empty"),
             "expected empty-key error, got: {err}"
@@ -1187,7 +1327,9 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("../escape", &image, None, &meta).unwrap_err();
+        let err = cache
+            .store("../escape", &image, None, None, &meta)
+            .unwrap_err();
         assert!(
             err.to_string().contains("path"),
             "expected path-traversal error, got: {err}"
@@ -1210,7 +1352,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("a/b", &image, None, &meta).unwrap_err();
+        let err = cache.store("a/b", &image, None, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains("path separator"),
             "expected path-separator error, got: {err}"
@@ -1225,7 +1367,7 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("   ", &image, None, &meta).unwrap_err();
+        let err = cache.store("   ", &image, None, None, &meta).unwrap_err();
         assert!(
             err.to_string().contains("empty"),
             "expected empty/whitespace error, got: {err}"
@@ -1250,8 +1392,8 @@ mod tests {
             built_at: "2026-04-10T10:00:00Z".to_string(),
             ..test_metadata("6.13.0")
         };
-        cache.store("new", &image, None, &meta_new).unwrap();
-        cache.store("old", &image, None, &meta_old).unwrap();
+        cache.store("new", &image, None, None, &meta_new).unwrap();
+        cache.store("old", &image, None, None, &meta_old).unwrap();
 
         // One corrupt entry (no metadata).
         let corrupt_dir = tmp.path().join("cache").join("corrupt");
@@ -1286,7 +1428,7 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         // Store should succeed despite stale tmp dir.
-        let entry = cache.store("mykey", &image, None, &meta).unwrap();
+        let entry = cache.store("mykey", &image, None, None, &meta).unwrap();
         assert!(entry.path.join("bzImage").exists());
         // Stale tmp dir should be gone.
         assert!(!stale_tmp.exists());
@@ -1303,7 +1445,7 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         let entry = cache
-            .store("with-vmlinux", &image, Some(&vmlinux), &meta)
+            .store("with-vmlinux", &image, Some(&vmlinux), None, &meta)
             .unwrap();
         assert!(entry.path.join("bzImage").exists());
         assert!(entry.path.join("vmlinux").exists());
@@ -1324,13 +1466,52 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let entry = cache.store("no-vmlinux", &image, None, &meta).unwrap();
+        let entry = cache
+            .store("no-vmlinux", &image, None, None, &meta)
+            .unwrap();
         assert!(entry.path.join("bzImage").exists());
         assert!(!entry.path.join("vmlinux").exists());
         assert!(entry.path.join("metadata.json").exists());
         // Metadata has no vmlinux_name.
         let entry_meta = entry.metadata.unwrap();
         assert!(entry_meta.vmlinux_name.is_none());
+    }
+
+    #[test]
+    fn cache_dir_store_with_config() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let config = src_dir.path().join(".config");
+        let config_content = b"CONFIG_HZ=1000\nCONFIG_SCHED_CLASS_EXT=y\n";
+        fs::write(&config, config_content).unwrap();
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache
+            .store("with-config", &image, None, Some(&config), &meta)
+            .unwrap();
+        assert!(entry.path.join("bzImage").exists());
+        assert!(entry.path.join(".config").exists());
+        assert!(entry.path.join("metadata.json").exists());
+        // Cached .config contents match original.
+        let cached = fs::read(entry.path.join(".config")).unwrap();
+        assert_eq!(cached, config_content);
+        // Original .config still exists (copy, not move).
+        assert!(config.exists());
+    }
+
+    #[test]
+    fn cache_dir_store_without_config() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache.store("no-config", &image, None, None, &meta).unwrap();
+        assert!(entry.path.join("bzImage").exists());
+        assert!(!entry.path.join(".config").exists());
     }
 
     #[test]
@@ -1341,10 +1522,136 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        cache.store("key", &image, None, &meta).unwrap();
+        cache.store("key", &image, None, None, &meta).unwrap();
 
         // Original image must still exist (copy, not move).
         assert!(image.exists());
+    }
+
+    // -- strip_vmlinux_debug --
+
+    /// Build a minimal ELF with .BTF, .text, .debug_*, and symtab.
+    fn create_elf_with_debug(dir: &Path) -> PathBuf {
+        use object::write;
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        // .text — loadable code (not in keep-list, stripped by keep-list path).
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        // Symbol so .symtab and .strtab are generated.
+        let sym_id = obj.add_symbol(write::Symbol {
+            name: b"test_symbol".to_vec(),
+            value: 0x1000,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        let _ = sym_id;
+        // .BTF — kept by both keep-list and fallback.
+        let btf_id = obj.add_section(Vec::new(), b".BTF".to_vec(), object::SectionKind::Metadata);
+        obj.append_section_data(btf_id, &[0xEB; 256], 1);
+        // .debug_info — always stripped.
+        let debug_id = obj.add_section(
+            Vec::new(),
+            b".debug_info".to_vec(),
+            object::SectionKind::Debug,
+        );
+        obj.append_section_data(debug_id, &[0xAA; 4096], 1);
+        // .debug_str — always stripped.
+        let debug_str_id = obj.add_section(
+            Vec::new(),
+            b".debug_str".to_vec(),
+            object::SectionKind::Debug,
+        );
+        obj.append_section_data(debug_str_id, &[0xBB; 2048], 1);
+
+        let data = obj.write().unwrap();
+        let path = dir.join("vmlinux");
+        fs::write(&path, &data).unwrap();
+        path
+    }
+
+    #[test]
+    fn strip_vmlinux_debug_removes_debug_keeps_btf_symtab() {
+        let src = TempDir::new().unwrap();
+        let vmlinux = create_elf_with_debug(src.path());
+        let original_size = fs::metadata(&vmlinux).unwrap().len();
+
+        let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
+        let stripped_size = fs::metadata(&stripped_path).unwrap().len();
+
+        assert!(
+            stripped_size < original_size,
+            "stripped ({stripped_size}) should be smaller than original ({original_size})"
+        );
+
+        let data = fs::read(&stripped_path).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let section_names: Vec<&str> = elf
+            .section_headers
+            .iter()
+            .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+        // Debug sections removed.
+        assert!(
+            !section_names.contains(&".debug_info"),
+            "should not contain .debug_info"
+        );
+        assert!(
+            !section_names.contains(&".debug_str"),
+            "should not contain .debug_str"
+        );
+        // .BTF preserved (in keep-list).
+        assert!(section_names.contains(&".BTF"), "should preserve .BTF");
+        // .symtab preserved (in keep-list).
+        assert!(
+            section_names.contains(&".symtab"),
+            "should preserve .symtab"
+        );
+        assert!(
+            section_names.contains(&".strtab"),
+            "should preserve .strtab"
+        );
+    }
+
+    #[test]
+    fn strip_vmlinux_debug_symtab_readable() {
+        let src = TempDir::new().unwrap();
+        let vmlinux = create_elf_with_debug(src.path());
+
+        let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
+        let data = fs::read(&stripped_path).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+
+        // Symbol table readable after stripping — the keep-list
+        // retains .symtab and .strtab. Symbol addresses survive
+        // even though .text (the referenced section) is deleted.
+        let found = elf
+            .syms
+            .iter()
+            .any(|s| elf.strtab.get_at(s.st_name) == Some("test_symbol"));
+        assert!(found, "stripped ELF should contain test_symbol in symtab");
+    }
+
+    #[test]
+    fn strip_vmlinux_debug_nonexistent_file() {
+        let result = strip_vmlinux_debug(Path::new("/nonexistent/vmlinux"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strip_vmlinux_debug_non_elf_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vmlinux");
+        fs::write(&path, b"not an ELF file").unwrap();
+        let result = strip_vmlinux_debug(&path);
+        assert!(result.is_err());
     }
 
     // -- EnvVarGuard for test isolation --

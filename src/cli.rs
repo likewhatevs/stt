@@ -787,12 +787,32 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
         )
     })?;
 
-    // Cache the build.
+    // Cache the build. Strip vmlinux before caching — the cached
+    // copy is only read for .symtab and .BTF. Also cache .config
+    // so guest_kernel_hz can resolve CONFIG_HZ without IKCONFIG.
     if let Ok(cache) = crate::cache::CacheDir::new() {
         let vmlinux_path = source_dir.join("vmlinux");
-        let vmlinux_ref = vmlinux_path.exists().then_some(vmlinux_path.as_path());
+        let stripped = if vmlinux_path.exists() {
+            match crate::cache::strip_vmlinux_debug(&vmlinux_path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn(&format!(
+                        "ktstr: vmlinux strip failed: {e:#}, caching unstripped"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let vmlinux_ref = match &stripped {
+            Some((_, path)) => Some(path.as_path()),
+            None if vmlinux_path.exists() => Some(vmlinux_path.as_path()),
+            None => None,
+        };
 
         let config_path = source_dir.join(".config");
+        let config_ref = config_path.exists().then_some(config_path.as_path());
         let config_hash = if config_path.exists() {
             std::fs::read(&config_path)
                 .ok()
@@ -812,7 +832,13 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
         .with_ktstr_kconfig_hash(Some(embedded_kconfig_hash()))
         .with_ktstr_git_hash(Some(crate::GIT_FULL_HASH.to_string()));
 
-        match cache.store(&acquired.cache_key, &image, vmlinux_ref, &metadata) {
+        match cache.store(
+            &acquired.cache_key,
+            &image,
+            vmlinux_ref,
+            config_ref,
+            &metadata,
+        ) {
             Ok(entry) => {
                 let cached_image = entry.path.join(image_name);
                 success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
@@ -898,7 +924,27 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     }
     if !is_dirty && let Ok(cache) = crate::cache::CacheDir::new() {
         let vmlinux_path = path.join("vmlinux");
-        let vmlinux_ref = vmlinux_path.exists().then_some(vmlinux_path.as_path());
+        let stripped = if vmlinux_path.exists() {
+            match crate::cache::strip_vmlinux_debug(&vmlinux_path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn(&format!(
+                        "ktstr: vmlinux strip failed: {e:#}, caching unstripped"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let vmlinux_ref = match &stripped {
+            Some((_, p)) => Some(p.as_path()),
+            None if vmlinux_path.exists() => Some(vmlinux_path.as_path()),
+            None => None,
+        };
+
+        let config_file = path.join(".config");
+        let config_ref = config_file.exists().then_some(config_file.as_path());
 
         let metadata = crate::cache::KernelMetadata::new(
             acquired.source_type.clone(),
@@ -912,7 +958,7 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         .with_git_hash(acquired.git_hash.clone())
         .with_source_tree_path(Some(acquired.source_dir.clone()));
 
-        match cache.store(&cache_key, &image, vmlinux_ref, &metadata) {
+        match cache.store(&cache_key, &image, vmlinux_ref, config_ref, &metadata) {
             Ok(_) => success(&format!("\u{2713} Kernel cached: {cache_key}")),
             Err(e) => warn(&format!("ktstr: cache store failed: {e:#}")),
         }
