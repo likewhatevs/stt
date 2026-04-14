@@ -22,6 +22,8 @@ scheduler.
 - **`#[ktstr_test]`** -- proc macro for integration tests that boot their own VMs.
 - **Auto-repro** -- reruns failures with BPF probes on the crash call chain.
 
+See the full [feature list](https://likewhatevs.github.io/ktstr/guide/features.html).
+
 ## Installation
 
 ```sh

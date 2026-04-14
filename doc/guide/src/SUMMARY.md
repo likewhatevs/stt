@@ -1,6 +1,7 @@
 # Summary
 
 [Overview](overview.md)
+[Features](features.md)
 
 # Guide
 
