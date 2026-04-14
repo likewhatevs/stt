@@ -1,5 +1,6 @@
 <style>
 :root { --content-max-width: 1000px; }
+details { margin-bottom: 0.75em; }
 </style>
 
 # Features
