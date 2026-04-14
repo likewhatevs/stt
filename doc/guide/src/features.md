@@ -341,7 +341,7 @@ shared memory mapped into both address spaces.
 </details>
 
 <details>
-<summary><b>High test coverage</b> — so it actually works, mostly <a href="https://codecov.io/gh/likewhatevs/ktstr"><img src="https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg" alt="codecov"></a></summary>
+<summary><b>High test coverage</b> — so it actually works, mostly <a href="https://codecov.io/gh/likewhatevs/ktstr"><img src="https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM" alt="codecov"></a></summary>
 
 </details>
 
