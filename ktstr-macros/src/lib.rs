@@ -1032,7 +1032,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
         /// Intercept `--ktstr-list-flags` before `main()` runs.
         /// Serializes this scheduler's flag declarations as JSON to
         /// stdout and exits, avoiding BPF program loading.
-        #[::ktstr::__ctor::ctor]
+        #[::ktstr::__ctor::ctor(crate_path = ::ktstr::__ctor)]
         fn #list_flags_ctor() {
             if !::std::env::args().any(|a| a == "--ktstr-list-flags") {
                 return;
