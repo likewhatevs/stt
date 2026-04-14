@@ -2490,6 +2490,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
                 details: vec![format!("{e:#}")],
                 stats: Default::default(),
             };
+            try_flush_profraw();
             print_assert_result(&r);
             collect_and_print_probe_data(probe_stop, probe_handle);
             return Some(1);
@@ -2497,6 +2498,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     };
 
     let exit_code = if result.passed { 0 } else { 1 };
+    try_flush_profraw();
     print_assert_result(&result);
     collect_and_print_probe_data(probe_stop, probe_handle);
     Some(exit_code)
@@ -2648,10 +2650,10 @@ fn collect_and_print_probe_data(
 
 /// Flush LLVM coverage profraw to the SHM ring buffer.
 ///
-/// Calls `__llvm_profile_set_filename` to set the output path, then
-/// `__llvm_profile_write_file` to write profraw to a tmpfs file inside
-/// the guest. Reads the file back and writes the contents to the SHM
-/// ring for host-side extraction.
+/// Sets `LLVM_PROFILE_FILE` and calls `__llvm_profile_initialize` to
+/// configure the output path, then `__llvm_profile_write_file` to write
+/// profraw to a tmpfs file inside the guest. Reads the file back and
+/// writes the contents to the SHM ring for host-side extraction.
 ///
 /// All symbols have hidden visibility in compiler-rt, so we resolve
 /// them via ELF .symtab parsing (dlsym cannot find hidden symbols).
@@ -2659,9 +2661,9 @@ fn collect_and_print_probe_data(
 /// No-op when built without `-C instrument-coverage` or when SHM
 /// parameters are absent from the kernel command line.
 pub(crate) fn try_flush_profraw() {
-    let Some((shm_base, shm_size)) = parse_shm_params() else {
+    if parse_shm_params().is_none() {
         return;
-    };
+    }
 
     let exe = match std::fs::read("/proc/self/exe") {
         Ok(data) => data,
@@ -2703,7 +2705,7 @@ pub(crate) fn try_flush_profraw() {
         Ok(d) if !d.is_empty() => d,
         _ => return,
     };
-    let _ = write_to_shm_ring(shm_base, shm_size, MSG_TYPE_PROFRAW, &data);
+    vmm::shm_ring::write_msg(MSG_TYPE_PROFRAW, &data);
 }
 
 /// Resolve multiple symbol virtual addresses in a single pass through
@@ -2770,43 +2772,6 @@ fn pie_load_bias(data: &[u8]) -> usize {
 fn parse_shm_params() -> Option<(u64, u64)> {
     let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
     vmm::shm_ring::parse_shm_params_from_str(&cmdline)
-}
-
-/// Write a TLV message to the SHM ring buffer via /dev/mem mmap.
-fn write_to_shm_ring(shm_base: u64, shm_size: u64, msg_type: u32, payload: &[u8]) -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let fd = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_SYNC)
-        .open("/dev/mem")
-        .context("open /dev/mem")?;
-
-    let m = vmm::shm_ring::mmap_devmem(
-        std::os::unix::io::AsRawFd::as_raw_fd(&fd),
-        shm_base,
-        shm_size,
-    )
-    .ok_or_else(|| anyhow::anyhow!("mmap /dev/mem failed"))?;
-
-    let shm_buf = unsafe { std::slice::from_raw_parts_mut(m.ptr, shm_size as usize) };
-
-    let written = vmm::shm_ring::shm_write(shm_buf, 0, msg_type, payload);
-
-    unsafe {
-        libc::munmap(m.map_base, m.map_size);
-    }
-
-    if written == 0 {
-        anyhow::bail!(
-            "SHM ring full: failed to write {} byte payload",
-            payload.len()
-        );
-    }
-
-    Ok(())
 }
 
 static PROFRAW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
