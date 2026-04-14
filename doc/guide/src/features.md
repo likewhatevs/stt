@@ -1,3 +1,7 @@
+<style>
+:root { --content-max-width: 1000px; }
+</style>
+
 # Features
 
 ktstr is a test framework for Linux process schedulers.
