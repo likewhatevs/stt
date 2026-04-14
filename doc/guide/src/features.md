@@ -7,7 +7,7 @@ examples.
 ## Testing
 
 <details>
-<summary><b>Real kernel, clean slate</b> — every VM test boots its own Linux kernel in KVM, fresh state each run</summary>
+<summary><b>Real kernel, clean slate, x86/arm parity</b> — every VM test boots its own Linux kernel in KVM, fresh state each run</summary>
 
 Tests boot a real Linux kernel in a KVM virtual machine with
 configurable topology: sockets, cores per socket, threads per core.
@@ -28,6 +28,16 @@ COW-map the cached base into guest memory, avoiding per-VM
 compression and copy. Per-test arguments are packed as a small
 suffix appended to the cached base. Result: VM
 boot time is dominated by kernel init, not initramfs preparation.
+
+</details>
+
+<details>
+<summary><b>Automatic shared library resolution</b> — recursive DT_NEEDED discovery, no need static</summary>
+
+Shared library dependencies for the test binary and any injected
+host files are resolved automatically by walking `DT_NEEDED` entries
+in ELF headers. The framework builds a complete closure of transitive
+dependencies — no manual `.so` lists or `LD_LIBRARY_PATH` hacks.
 
 </details>
 
