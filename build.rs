@@ -143,19 +143,24 @@ int main(void) {{
     println!("cargo::rerun-if-changed=src/bpf/intf.h");
 
     // Git info for output directory keying and cache invalidation.
-    let mut commit_hash = String::from("unknown");
+    // When installed from the registry there is no .git directory —
+    // all three vars fall back to "unknown".
+    let mut short_hash = String::from("unknown");
+    let mut full_hash = String::from("unknown");
+    let mut branch = String::from("unknown");
     if let Ok(repo) = gix::discover(".") {
         if let Ok(id) = repo.head_id() {
             let full = id.to_string();
-            commit_hash = full.clone();
-            let short = &full[..full.len().min(7)];
-            println!("cargo:rustc-env=KTSTR_GIT_HASH={short}");
+            short_hash = full[..full.len().min(7)].to_string();
+            full_hash = full;
         }
         if let Ok(Some(name)) = repo.head_name() {
-            println!("cargo:rustc-env=KTSTR_GIT_BRANCH={}", name.shorten());
+            branch = name.shorten().to_string();
         }
     }
-    println!("cargo:rustc-env=KTSTR_GIT_FULL_HASH={commit_hash}");
+    println!("cargo:rustc-env=KTSTR_GIT_HASH={short_hash}");
+    println!("cargo:rustc-env=KTSTR_GIT_FULL_HASH={full_hash}");
+    println!("cargo:rustc-env=KTSTR_GIT_BRANCH={branch}");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
 
