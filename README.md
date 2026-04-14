@@ -15,14 +15,14 @@ VMs with synthetic CPU topologies, runs workloads, and verifies
 scheduling correctness. Also tests under the kernel's default EEVDF
 scheduler.
 
-- **Real isolation** -- each test boots its own kernel. No host interference, no shared state.
-- **Any topology** -- 1 to 252 CPUs with arbitrary LLC structure via synthetic ACPI tables.
+- **Clean slate** -- each test boots its own kernel in KVM. Fresh state each run.
+- **Topology as code** -- `topology(2, 4, 2)` gives you 2 sockets, 4 cores, 2 threads with as real a NUMA domains as ur hw can support. x86_64 and aarch64.
 - **Data-driven** -- scenarios declare cgroups, cpusets, workloads, and verification as data.
-- **Gauntlet** -- all scenarios across 19 topology presets in parallel VMs. Baseline save/compare for A/B testing.
-- **`#[ktstr_test]`** -- proc macro for integration tests that boot their own VMs.
-- **Auto-repro** -- reruns failures with BPF probes on the crash call chain.
-
-See the full [feature list](https://likewhatevs.github.io/ktstr/guide/features.html).
+- **Gauntlet** -- one `#[ktstr_test]`, hundreds of topology x flag variants. Budget-aware CI selection and baseline A/B comparison.
+- **Host-side introspection** -- read/write kernel state and BPF maps from host memory. No guest instrumentation.
+- **Auto-repro** -- reruns failures with BPF probes on the crash call chain. Captures arguments and struct state at each call site. In kernel and BPF progs.
+- **`#[ktstr_test]`** -- proc macro for integration tests that boot their own VMs. No custom harness needed.
+- **[And more](https://likewhatevs.github.io/ktstr/guide/features.html)** -- 25 features across testing, observability, debugging, and infrastructure.
 
 ## Installation
 
