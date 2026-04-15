@@ -2433,27 +2433,17 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         Some((handle, func_names, pipe_diag, output_done, pnames, rhints))
     });
 
-    // Build a minimal Ctx for the test function.
-    // Prefer sysfs topology, but fall back to VM spec if sysfs fails or
-    // reports the wrong LLC count (e.g. unpatched CPUID cache leaves).
-    let spec_topo = crate::topology::TestTopology::from_spec(
-        entry.topology.sockets,
-        entry.topology.cores_per_socket,
-        entry.topology.threads_per_core,
-    );
+    // Sysfs is ground truth: CPUID, ACPI MADT, and MPTABLE all express
+    // the VM's actual topology. Only fall back to from_spec on error.
     let topo = match crate::topology::TestTopology::from_system() {
-        Ok(sys) if sys.num_llcs() == spec_topo.num_llcs() => sys,
-        Ok(sys) => {
-            eprintln!(
-                "ktstr_test: sysfs reports {} LLCs, VM spec expects {}; using spec fallback",
-                sys.num_llcs(),
-                spec_topo.num_llcs(),
-            );
-            spec_topo
-        }
+        Ok(sys) => sys,
         Err(e) => {
             eprintln!("ktstr_test: topology from sysfs failed ({e}), using VM spec fallback");
-            spec_topo
+            crate::topology::TestTopology::from_spec(
+                entry.topology.sockets,
+                entry.topology.cores_per_socket,
+                entry.topology.threads_per_core,
+            )
         }
     };
     let cgroup_root = resolve_cgroup_root(args);

@@ -528,3 +528,47 @@ fn derive_minimal_defaults() {
     assert!(MINIMAL.sched_args.is_empty());
     assert!(MINIMAL.cgroup_parent.is_none());
 }
+
+/// Topology validation: boot a multi-socket VM and verify the guest sees
+/// more than the 2-CPU default. The base test boots 2s2c1t (4 CPUs, 2
+/// LLCs); gauntlet variants boot larger topologies. Catches regressions
+/// where guest-side topology discovery falls back to incorrect defaults.
+#[ktstr_test(
+    sockets = 2,
+    cores = 2,
+    threads = 1,
+    memory_mb = 2048,
+    min_sockets = 2,
+    min_llcs = 2,
+    min_cpus = 4
+)]
+fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
+    let total = ctx.topo.total_cpus();
+    let llcs = ctx.topo.num_llcs();
+    let mut details = Vec::new();
+    let mut passed = true;
+    // The VM must have more than the 2-CPU / 1-LLC default. Any
+    // regression that replaces sysfs with the entry default will fail.
+    if total < 4 {
+        details.push(format!("expected >= 4 CPUs, got {total}"));
+        passed = false;
+    }
+    if llcs < 2 {
+        details.push(format!("expected >= 2 LLCs, got {llcs}"));
+        passed = false;
+    }
+    // LLCs cannot exceed CPU count.
+    if llcs > total {
+        details.push(format!("LLCs ({llcs}) > CPUs ({total})"));
+        passed = false;
+    }
+    if passed {
+        Ok(AssertResult::pass())
+    } else {
+        Ok(AssertResult {
+            passed: false,
+            details,
+            stats: Default::default(),
+        })
+    }
+}
