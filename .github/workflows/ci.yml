@@ -47,7 +47,7 @@ jobs:
           key: ktstr-kernels-x64-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-x64-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr --features gha-cache -- ktstr kernel build
+        run: cargo run --bin cargo-ktstr -- ktstr kernel build
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
@@ -80,7 +80,7 @@ jobs:
           key: ktstr-kernels-arm64-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-arm64-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr --features gha-cache -- ktstr kernel build
+        run: cargo run --bin cargo-ktstr -- ktstr kernel build
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
@@ -113,7 +113,7 @@ jobs:
           key: ktstr-kernels-x64-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-x64-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr --features gha-cache -- ktstr kernel build
+        run: cargo run --bin cargo-ktstr -- ktstr kernel build
       - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
@@ -142,7 +142,7 @@ jobs:
           key: ktstr-kernels-arm64-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-arm64-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr --features gha-cache -- ktstr kernel build
+        run: cargo run --bin cargo-ktstr -- ktstr kernel build
       - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6

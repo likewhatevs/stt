@@ -93,8 +93,8 @@ scenario with BPF probes attached to the crash-path functions. See
 |---|---|
 | `ktstr` (lib) | Core library |
 | `ktstr-macros` | `#[ktstr_test]` and `#[derive(Scheduler)]` proc macros |
-| `ktstr` (bin) | Host-side CLI (behind the `cli` feature) |
-| `cargo-ktstr` (bin) | Dev workflow plugin: kernel build + nextest (same crate as `ktstr`, behind the `cli` feature) |
+| `ktstr` (bin) | Host-side CLI |
+| `cargo-ktstr` (bin) | Dev workflow plugin: kernel build + nextest (same crate as `ktstr`) |
 | `scx-ktstr` | Minimal BPF scheduler for testing |
 
 ## Kernel config

@@ -137,8 +137,7 @@ See [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md).
 <details>
 <summary><b>Library-first</b> — add as a dev-dependency, write tests in your own crate</summary>
 
-Add `ktstr` as a dev-dependency with `default-features = false` for
-the test library only (no CLI binaries). `ktstr::prelude` re-exports
+Add `ktstr` as a dev-dependency. `ktstr::prelude` re-exports
 all test-authoring types.
 See [Getting Started](getting-started.md) for setup.
 

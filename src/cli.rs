@@ -623,9 +623,8 @@ pub fn resolve_include_files(
 
 /// Resolve the cache entry directory from a Version or CacheKey identifier.
 ///
-/// Checks local cache first. When the `gha-cache` feature is enabled
-/// and `remote_cache::is_enabled()` returns true, falls back to the
-/// remote GHA cache on local miss.
+/// Checks local cache first. When `remote_cache::is_enabled()` returns
+/// true, falls back to the remote GHA cache on local miss.
 pub fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
     match id {
@@ -639,14 +638,13 @@ pub fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::p
                 })?;
                 return Ok(entry.path);
             }
-            #[cfg(feature = "gha-cache")]
-            if crate::remote_cache::is_enabled() {
-                if let Some(entry) = crate::remote_cache::remote_lookup(&cache, &cache_key) {
-                    entry.metadata.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("cached entry {cache_key} has corrupt metadata")
-                    })?;
-                    return Ok(entry.path);
-                }
+            if crate::remote_cache::is_enabled()
+                && let Some(entry) = crate::remote_cache::remote_lookup(&cache, &cache_key)
+            {
+                entry.metadata.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("cached entry {cache_key} has corrupt metadata")
+                })?;
+                return Ok(entry.path);
             }
             bail!(
                 "kernel version {ver} not found in cache. \
@@ -662,14 +660,14 @@ pub fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::p
                     .ok_or_else(|| anyhow::anyhow!("cached entry {key} has corrupt metadata"))?;
                 return Ok(entry.path);
             }
-            #[cfg(feature = "gha-cache")]
-            if crate::remote_cache::is_enabled() {
-                if let Some(entry) = crate::remote_cache::remote_lookup(&cache, key) {
-                    entry.metadata.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("cached entry {key} has corrupt metadata")
-                    })?;
-                    return Ok(entry.path);
-                }
+            if crate::remote_cache::is_enabled()
+                && let Some(entry) = crate::remote_cache::remote_lookup(&cache, key)
+            {
+                entry
+                    .metadata
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("cached entry {key} has corrupt metadata"))?;
+                return Ok(entry.path);
             }
             bail!(
                 "cache key {key} not found. \

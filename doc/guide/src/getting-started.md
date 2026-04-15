@@ -28,8 +28,7 @@ cargo install ktstr                   # both binaries: ktstr + cargo-ktstr (opti
 
 `cargo-nextest` is the test runner. `cargo install ktstr` installs
 both the host-side CLI (`ktstr`) and the dev workflow plugin
-(`cargo-ktstr`). Library consumers should add `default-features = false`
-in their `[dev-dependencies]`.
+(`cargo-ktstr`).
 
 ## Add the dependency
 
@@ -37,7 +36,7 @@ Add ktstr as a dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.1", default-features = false }
+ktstr = { version = "0.1" }
 ```
 
 ## Write a test

@@ -111,18 +111,13 @@
 //!
 //! # Library usage
 //!
-//! Library consumers should disable the default `cli` feature:
-//!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.1", default-features = false }
+//! ktstr = { version = "0.1" }
 //! ```
 //!
-//! Feature flags:
-//! - `cli` (default) -- enables `ktstr` and `cargo-ktstr` binaries, implies `fetch`
-//! - `fetch` -- kernel source download via git clone and tarball fetch
-//! - `gha-cache` -- GitHub Actions cache integration
-//! - `full` -- all features
+//! The only feature flag is `integration`, which gates
+//! [`resolve_func_ip`] visibility for integration tests.
 //!
 //! # Crate organization
 //!
@@ -136,8 +131,8 @@
 //! - [`kernel_path`] -- kernel ID parsing and filesystem image discovery
 //! - [`verifier`] -- BPF verifier log parsing, cycle detection, and output formatting
 //! - [`test_support`] -- `#[ktstr_test]` runtime and registration
-//! - [`fetch`] -- kernel tarball and git source acquisition (`fetch` feature)
-//! - [`remote_cache`] -- GitHub Actions cache integration (`gha-cache` feature)
+//! - [`fetch`] -- kernel tarball and git source acquisition
+//! - [`remote_cache`] -- GitHub Actions cache integration
 
 #[allow(
     clippy::all,
@@ -213,23 +208,14 @@ pub(crate) fn read_kmsg() -> String {
 
 pub mod assert;
 pub(crate) mod budget;
-#[cfg(feature = "cli")]
 pub mod cli;
-#[cfg(not(feature = "cli"))]
-#[allow(dead_code)]
-pub(crate) mod cli;
-#[cfg(feature = "fetch")]
 pub mod fetch;
 pub mod kernel_path;
 #[allow(dead_code)]
 pub(crate) mod monitor;
 #[allow(dead_code)]
 pub(crate) mod probe;
-#[cfg(feature = "cli")]
 pub mod runner;
-#[cfg(not(feature = "cli"))]
-#[allow(dead_code)]
-pub(crate) mod runner;
 pub mod scenario;
 #[allow(dead_code)]
 pub(crate) mod stats;
@@ -238,7 +224,6 @@ pub mod test_support;
 pub(crate) mod timeline;
 pub mod topology;
 
-#[cfg(feature = "gha-cache")]
 pub mod remote_cache;
 pub mod verifier;
 #[allow(dead_code)]

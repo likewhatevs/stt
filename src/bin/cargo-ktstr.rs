@@ -7,7 +7,6 @@ use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
 use ktstr::cli;
 
 use ktstr::fetch;
-#[cfg(feature = "gha-cache")]
 use ktstr::remote_cache;
 
 #[derive(Parser)]
@@ -504,7 +503,6 @@ fn kernel_build(
         .map_err(|e| format!("cache store: {e:#}"))?;
 
     // Store to remote cache when enabled.
-    #[cfg(feature = "gha-cache")]
     if remote_cache::is_enabled() {
         remote_cache::remote_store(&entry);
     }
@@ -524,7 +522,6 @@ fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
         return Some(entry);
     }
 
-    #[cfg(feature = "gha-cache")]
     if remote_cache::is_enabled() {
         return remote_cache::remote_lookup(cache, cache_key);
     }
@@ -962,17 +959,6 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
 }
 
 fn main() {
-    #[cfg(not(feature = "gha-cache"))]
-    if std::env::var("KTSTR_GHA_CACHE")
-        .ok()
-        .is_some_and(|v| v == "1")
-    {
-        eprintln!(
-            "cargo-ktstr: warning: KTSTR_GHA_CACHE=1 but binary compiled without gha-cache feature. \
-             Rebuild with: cargo install ktstr --features gha-cache"
-        );
-    }
-
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
     } = Cargo::parse();

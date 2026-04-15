@@ -28,7 +28,6 @@ scheduler.
 
 ```sh
 cargo install ktstr                   # both binaries (ktstr + cargo-ktstr)
-cargo install ktstr --features full   # both binaries + GHA remote cache
 cargo install cargo-nextest           # required test runner
 ```
 
@@ -36,9 +35,7 @@ cargo install cargo-nextest           # required test runner
 kernel images (outside VMs). `cargo-ktstr` (included in the same crate)
 automates kernel configuration, building, and test execution in one
 command. `scx-ktstr` (the test fixture scheduler) is built automatically
-by the workspace and does not need a separate install. Library consumers
-should use `default-features = false` to avoid pulling in CLI
-dependencies.
+by the workspace and does not need a separate install.
 
 ## Setup
 
@@ -53,7 +50,7 @@ sudo apt install clang pkg-config
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.1", default-features = false }
+ktstr = { version = "0.1" }
 ```
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
