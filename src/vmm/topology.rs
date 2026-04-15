@@ -14,6 +14,17 @@ pub struct Topology {
     pub numa_nodes: u32,
 }
 
+/// Formats as `NsNlNcNt` — e.g. `1s2l4c2t` (1 NUMA node, 2 LLCs, 4 cores, 2 threads).
+impl std::fmt::Display for Topology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}s{}l{}c{}t",
+            self.numa_nodes, self.llcs, self.cores_per_llc, self.threads_per_core,
+        )
+    }
+}
+
 impl Topology {
     /// Validated const constructor. Panics on invalid values.
     ///
@@ -387,5 +398,27 @@ mod tests {
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("overflows"), "got: {err}");
+    }
+
+    #[test]
+    fn display_format() {
+        let t = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 2,
+            numa_nodes: 1,
+        };
+        assert_eq!(t.to_string(), "1s2l4c2t");
+    }
+
+    #[test]
+    fn display_format_multi_numa() {
+        let t = Topology {
+            llcs: 4,
+            cores_per_llc: 8,
+            threads_per_core: 2,
+            numa_nodes: 2,
+        };
+        assert_eq!(t.to_string(), "2s4l8c2t");
     }
 }
