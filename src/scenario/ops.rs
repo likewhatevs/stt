@@ -1615,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn cpusetspec_llc_two_sockets_disjoint() {
+    fn cpusetspec_llc_two_llcs_disjoint() {
         let (cg, topo) = make_ctx(2, 4, 1);
         let ctx = ctx_from(&cg, &topo);
         let llc0 = CpusetSpec::Llc(0).resolve(&ctx);
