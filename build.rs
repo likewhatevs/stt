@@ -193,40 +193,82 @@ int main(void) {{
             std::fs::remove_dir_all(&busybox_src).expect("remove incomplete busybox-src");
         }
 
-        // Download and extract busybox source tarball.
+        // Download busybox source: try tarball first, fall back to git clone.
         if !busybox_src.join("Makefile").exists() {
-            let url = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("build http client");
-            let resp = client
-                .get(url)
-                .send()
-                .and_then(|r| r.error_for_status())
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "failed to download busybox tarball from {url} (10s timeout). \
-                         Check network connectivity or retry. First build requires \
-                         internet access: {e}"
+            let tarball_url = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
+            let tarball_err = (|| -> Result<(), String> {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .map_err(|e| format!("http client: {e}"))?;
+                let resp = client
+                    .get(tarball_url)
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .map_err(|e| format!("download: {e}"))?;
+                let gz = flate2::read::GzDecoder::new(resp);
+                let mut archive = tar::Archive::new(gz);
+                let extract_dir = out_dir.join("busybox-extract");
+                archive
+                    .unpack(&extract_dir)
+                    .map_err(|e| format!("extract: {e}"))?;
+                let inner = extract_dir.join("busybox-1_36_1");
+                std::fs::rename(&inner, &busybox_src).map_err(|e| {
+                    format!(
+                        "expected extracted directory {} — tarball layout may have changed: {e}",
+                        inner.display()
                     )
-                });
-            let gz = flate2::read::GzDecoder::new(resp);
-            let mut archive = tar::Archive::new(gz);
-            let extract_dir = out_dir.join("busybox-extract");
-            archive
-                .unpack(&extract_dir)
-                .expect("extract busybox tarball");
+                })?;
+                std::fs::remove_dir_all(&extract_dir).ok();
+                Ok(())
+            })()
+            .err();
 
-            // GitHub tarballs extract to busybox-1_36_1/ inside the archive.
-            let inner = extract_dir.join("busybox-1_36_1");
-            std::fs::rename(&inner, &busybox_src).unwrap_or_else(|e| {
-                panic!(
-                    "expected extracted directory {} — tarball layout may have changed: {e}",
-                    inner.display()
-                )
-            });
-            std::fs::remove_dir_all(&extract_dir).ok();
+            // Fall back to shallow git clone if tarball failed.
+            if !busybox_src.join("Makefile").exists() {
+                let tarball_err = tarball_err.unwrap_or_else(|| "unknown".to_string());
+                println!(
+                    "cargo:warning=tarball download failed ({tarball_err}), \
+                     trying git clone..."
+                );
+
+                // Clean up any partial state from failed tarball extraction.
+                if busybox_src.exists() {
+                    std::fs::remove_dir_all(&busybox_src).expect("remove partial busybox-src");
+                }
+                let extract_dir = out_dir.join("busybox-extract");
+                if extract_dir.exists() {
+                    std::fs::remove_dir_all(&extract_dir).ok();
+                }
+
+                let git_url = "https://github.com/mirror/busybox.git";
+                let interrupt = std::sync::atomic::AtomicBool::new(false);
+                let clone_err = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    let mut prep = gix::prepare_clone(git_url, &busybox_src)?
+                        .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+                            1.try_into().expect("non-zero"),
+                        ))
+                        .with_ref_name(Some("1_36_1"))?;
+                    let (mut checkout, _) =
+                        prep.fetch_then_checkout(gix::progress::Discard, &interrupt)?;
+                    let (_repo, _) = checkout.main_worktree(gix::progress::Discard, &interrupt)?;
+                    println!("cargo:warning=busybox source cloned via git");
+                    Ok(())
+                })()
+                .err();
+
+                if !busybox_src.join("Makefile").exists() {
+                    let clone_err = clone_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "checkout missing Makefile".to_string());
+                    panic!(
+                        "failed to obtain busybox source.\n\
+                         tarball ({tarball_url}): {tarball_err}\n\
+                         git clone ({git_url}): {clone_err}\n\
+                         Check network connectivity. First build requires internet access."
+                    );
+                }
+            }
         }
 
         // Configure busybox.
