@@ -220,8 +220,10 @@ pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
 /// Checks each non-comment CONFIG line from the fragment against
 /// the current .config. If all are present, .config is not touched
 /// (preserving mtime for make's dependency tracking). If any are
-/// missing, appends the full fragment — kconfig last-value-wins
-/// makes this idempotent.
+/// missing, appends the full fragment and runs `make olddefconfig`
+/// to resolve new options with defaults — without this, the
+/// subsequent `make` launches interactive `conf` prompts that hang
+/// when stdout/stderr are piped.
 pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
     let config_path = kernel_dir.join(".config");
     if !config_path.exists() {
@@ -245,6 +247,8 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
         .append(true)
         .open(&config_path)?;
     std::io::Write::write_all(&mut config, fragment.as_bytes())?;
+
+    run_make(kernel_dir, &["olddefconfig"])?;
 
     Ok(())
 }
@@ -1534,8 +1538,10 @@ mod tests {
     fn configure_kernel_appends_missing() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(".config"), "CONFIG_BPF=y\n").unwrap();
-        // Create minimal Makefile/Kconfig to avoid "not a source tree" errors
-        // (configure_kernel reads .config directly, doesn't need make).
+        // configure_kernel runs `make olddefconfig` after appending.
+        // Provide a stub Makefile so `make` succeeds without a real
+        // kernel tree.
+        std::fs::write(dir.path().join("Makefile"), "olddefconfig:\n\t@true\n").unwrap();
         let fragment = "CONFIG_EXTRA=y\n";
         configure_kernel(dir.path(), fragment).unwrap();
         let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
