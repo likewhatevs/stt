@@ -1648,7 +1648,13 @@ fn evaluate_vm_result(
         })
         .unwrap_or_default();
     let fingerprint_line = sched_log_fingerprint(output)
-        .map(|fp| format!("\x1b[1;31m{fp}\x1b[0m\n"))
+        .map(|fp| {
+            if crate::cli::stderr_color() {
+                format!("\x1b[1;31m{fp}\x1b[0m\n")
+            } else {
+                format!("{fp}\n")
+            }
+        })
         .unwrap_or_default();
 
     let topo = Topology {

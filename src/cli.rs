@@ -970,29 +970,45 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
 }
 
 /// Whether stderr supports color (cached per process).
-fn stderr_color() -> bool {
+pub fn stderr_color() -> bool {
     static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *COLOR.get_or_init(|| unsafe { libc::isatty(libc::STDERR_FILENO) } != 0)
 }
 
 /// Print a styled status message to stderr.
 pub fn status(msg: &str) {
-    eprintln!("\x1b[1m{msg}\x1b[0m");
+    if stderr_color() {
+        eprintln!("\x1b[1m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
 }
 
 /// Print a green success message to stderr.
 pub fn success(msg: &str) {
-    eprintln!("\x1b[32m{msg}\x1b[0m");
+    if stderr_color() {
+        eprintln!("\x1b[32m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
 }
 
 /// Print a blue warning to stderr.
 pub fn warn(msg: &str) {
-    eprintln!("\x1b[34m{msg}\x1b[0m");
+    if stderr_color() {
+        eprintln!("\x1b[34m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
 }
 
 /// Print a dim message to stderr.
 pub fn dim(msg: &str) {
-    eprintln!("\x1b[2m{msg}\x1b[0m");
+    if stderr_color() {
+        eprintln!("\x1b[2m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
 }
 
 /// Progress spinner for long-running CLI operations.
