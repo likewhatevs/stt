@@ -36,7 +36,7 @@ Add ktstr as a dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.1" }
+ktstr = { version = "0.2" }
 ```
 
 ## Write a test

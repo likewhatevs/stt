@@ -263,8 +263,8 @@ pub fn make_kernel(kernel_dir: &Path) -> Result<()> {
 /// Uses `sh -c "make ... 2>&1"` for a single pipe — one reader,
 /// no threads, no channel, no pipe-buffer deadlock.
 ///
-/// When a spinner is active, each line is printed via `suspend()`
-/// so the spinner tick doesn't race with output. When no spinner,
+/// When a spinner is active, each line is printed via `println()`
+/// so the spinner redraws below the output. When no spinner,
 /// output is captured and shown only on failure.
 pub fn run_make_with_output(
     kernel_dir: &Path,
@@ -973,55 +973,53 @@ fn stderr_color() -> bool {
 
 /// Print a styled status message to stderr.
 pub fn status(msg: &str) {
-    if stderr_color() {
-        eprintln!("\x1b[1m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
+    eprintln!("\x1b[1m{msg}\x1b[0m");
 }
 
 /// Print a green success message to stderr.
 pub fn success(msg: &str) {
-    if stderr_color() {
-        eprintln!("\x1b[32m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
+    eprintln!("\x1b[32m{msg}\x1b[0m");
 }
 
 /// Print a blue warning to stderr.
 pub fn warn(msg: &str) {
-    if stderr_color() {
-        eprintln!("\x1b[34m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
+    eprintln!("\x1b[34m{msg}\x1b[0m");
 }
 
 /// Print a dim message to stderr.
 pub fn dim(msg: &str) {
-    if stderr_color() {
-        eprintln!("\x1b[2m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
+    eprintln!("\x1b[2m{msg}\x1b[0m");
 }
 
 /// Progress spinner for long-running CLI operations.
 ///
-/// Draws to stderr via indicatif. Automatically ticks in the background.
-/// Disables stdin echo while active to prevent keypress jank.
+/// When stderr is a TTY, draws an animated spinner via indicatif,
+/// ticks in the background, and disables stdin echo to prevent
+/// keypress jank. When stderr is not a TTY, skips all indicatif
+/// machinery and falls back to plain stderr writes.
 /// Call `finish` with a completion message or `clear` to remove.
 #[derive(Clone)]
 pub struct Spinner {
-    pb: indicatif::ProgressBar,
-    /// Saved termios for echo restore. None when stdin is not a tty.
+    /// None when stderr is not a TTY — no indicatif overhead.
+    pb: Option<indicatif::ProgressBar>,
+    /// Saved termios for echo restore. None when stdin is not a tty
+    /// or when the spinner is inactive (non-TTY stderr).
     saved_termios: Option<std::sync::Arc<std::sync::Mutex<libc::termios>>>,
 }
 
 impl Spinner {
     /// Start a spinner with the given message (e.g. "Building kernel...").
+    ///
+    /// When stderr is not a TTY, no ProgressBar or ticker thread is
+    /// created — all output methods fall back to plain `eprintln!`.
     pub fn start(msg: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        if !stderr_color() {
+            return Spinner {
+                pb: None,
+                saved_termios: None,
+            };
+        }
+
         let pb = indicatif::ProgressBar::new_spinner();
         pb.set_style(
             indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -1030,10 +1028,22 @@ impl Spinner {
         pb.set_message(msg);
         pb.enable_steady_tick(Duration::from_millis(80));
 
-        // Disable stdin echo to prevent keypress jank.
+        // indicatif hides the bar when NO_COLOR is set or TERM is
+        // dumb, even on a real TTY. Downgrade to the non-TTY path
+        // so println/finish output is not silently dropped.
+        if pb.is_hidden() {
+            return Spinner {
+                pb: None,
+                saved_termios: None,
+            };
+        }
+
         let saved_termios = Self::disable_echo();
 
-        Spinner { pb, saved_termios }
+        Spinner {
+            pb: Some(pb),
+            saved_termios,
+        }
     }
 
     fn disable_echo() -> Option<std::sync::Arc<std::sync::Mutex<libc::termios>>> {
@@ -1065,30 +1075,51 @@ impl Spinner {
 
     /// Update the spinner message.
     pub fn set_message(&self, msg: impl Into<std::borrow::Cow<'static, str>>) {
-        self.pb.set_message(msg);
+        if let Some(ref pb) = self.pb {
+            pb.set_message(msg);
+        }
     }
 
     /// Finish the spinner, replacing it with a completion message.
+    ///
+    /// In non-TTY mode, prints the message to stderr directly.
     pub fn finish(self, msg: impl Into<std::borrow::Cow<'static, str>>) {
         self.restore_echo();
-        self.pb.finish_with_message(msg);
+        match self.pb {
+            Some(pb) => pb.finish_with_message(msg),
+            None => eprintln!("{}", msg.into()),
+        }
     }
 
     /// Print a line above the spinner. The spinner redraws below.
+    ///
+    /// In non-TTY mode, prints directly to stderr.
     pub fn println(&self, msg: impl AsRef<str>) {
-        self.pb.println(msg);
+        match self.pb {
+            Some(ref pb) => pb.println(msg),
+            None => eprintln!("{}", msg.as_ref()),
+        }
     }
 
     /// Suspend the spinner tick, execute a closure, then resume.
     /// Use for terminal output that must not race with the spinner.
+    ///
+    /// In non-TTY mode, calls `f` directly (no spinner to suspend).
     pub fn suspend<F: FnOnce() -> R, R>(&self, f: F) -> R {
-        self.pb.suspend(f)
+        match self.pb {
+            Some(ref pb) => pb.suspend(f),
+            None => f(),
+        }
     }
 
     /// Clear the spinner from the terminal.
+    ///
+    /// In non-TTY mode, this is a no-op.
     pub fn clear(self) {
         self.restore_echo();
-        self.pb.finish_and_clear();
+        if let Some(pb) = self.pb {
+            pb.finish_and_clear();
+        }
     }
 }
 
