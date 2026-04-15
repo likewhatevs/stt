@@ -3690,9 +3690,10 @@ impl Default for KtstrVmBuilder {
             run_args: Vec::new(),
             sched_args: Vec::new(),
             topology: Topology {
-                sockets: 1,
-                cores_per_socket: 1,
+                llcs: 1,
+                cores_per_llc: 1,
                 threads_per_core: 1,
+                numa_nodes: 1,
             },
             memory_mb: Some(256),
             memory_min_mb: 0,
@@ -3754,11 +3755,12 @@ impl KtstrVmBuilder {
         self
     }
 
-    pub fn topology(mut self, sockets: u32, cores: u32, threads: u32) -> Self {
+    pub fn topology(mut self, llcs: u32, cores: u32, threads: u32) -> Self {
         self.topology = Topology {
-            sockets,
-            cores_per_socket: cores,
+            llcs,
+            cores_per_llc: cores,
             threads_per_core: threads,
+            numa_nodes: 1,
         };
         self
     }
@@ -3902,8 +3904,8 @@ impl KtstrVmBuilder {
         let kernel = self.kernel.context("kernel path required")?;
         anyhow::ensure!(kernel.exists(), "kernel not found: {}", kernel.display());
         let t = &self.topology;
-        anyhow::ensure!(t.sockets > 0, "sockets must be > 0");
-        anyhow::ensure!(t.cores_per_socket > 0, "cores_per_socket must be > 0");
+        anyhow::ensure!(t.llcs > 0, "llcs must be > 0");
+        anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
         anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
         if let Some(ref bin) = self.init_binary
             && !bin.starts_with("/proc/")
@@ -3960,10 +3962,10 @@ impl KtstrVmBuilder {
         let t = &self.topology;
         let total_vcpus = t.total_cpus();
 
-        // Validate LLC exclusivity: each virtual socket should map to
+        // Validate LLC exclusivity: each virtual LLC should map to
         // its own physical LLC group. Sum actual per-group CPU counts
         // to handle asymmetric LLCs.
-        let llcs_needed = t.sockets as usize;
+        let llcs_needed = t.llcs as usize;
         let reserved: usize = host_topo
             .llc_groups
             .iter()
@@ -3984,12 +3986,8 @@ impl KtstrVmBuilder {
             }));
         }
 
-        let plan = acquire_slot_with_locks(
-            &host_topo,
-            t.sockets,
-            t.cores_per_socket,
-            t.threads_per_core,
-        )?;
+        let plan =
+            acquire_slot_with_locks(&host_topo, t.llcs, t.cores_per_llc, t.threads_per_core)?;
 
         // WARN: hugepages (only when memory is known upfront).
         if let Some(mb) = self.memory_mb {
@@ -4031,24 +4029,21 @@ impl KtstrVmBuilder {
 /// rely on nextest retry backoff for contention resolution.
 fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
-    sockets: u32,
-    cores_per_socket: u32,
+    llcs: u32,
+    cores_per_llc: u32,
     threads_per_core: u32,
 ) -> Result<host_topology::PinningPlan> {
     let num_llcs = host_topo.llc_groups.len();
-    let sockets_needed = sockets as usize;
-    let max_slots = num_llcs
-        .checked_div(sockets_needed)
-        .unwrap_or(num_llcs)
-        .max(1);
+    let llcs_needed = llcs as usize;
+    let max_slots = num_llcs.checked_div(llcs_needed).unwrap_or(num_llcs).max(1);
     let llc_mode = host_topology::LlcLockMode::Exclusive;
 
     for slot in 0..max_slots {
-        let offset = slot * sockets_needed;
-        let llc_indices: Vec<usize> = (offset..offset + sockets_needed).collect();
+        let offset = slot * llcs_needed;
+        let llc_indices: Vec<usize> = (offset..offset + llcs_needed).collect();
 
         let candidate = host_topo
-            .compute_pinning(sockets, cores_per_socket, threads_per_core, true, offset)
+            .compute_pinning(llcs, cores_per_llc, threads_per_core, true, offset)
             .context("performance_mode: topology mapping")?;
 
         match host_topology::acquire_resource_locks(&candidate, &llc_indices, llc_mode)? {
@@ -4216,7 +4211,7 @@ mod tests {
     fn builder_topology() {
         let b = KtstrVmBuilder::default().topology(2, 4, 2);
         assert_eq!(b.topology.total_cpus(), 16);
-        assert_eq!(b.topology.sockets, 2);
+        assert_eq!(b.topology.llcs, 2);
     }
 
     #[test]
@@ -4359,9 +4354,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn ap_mp_state_set_correctly() {
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = kvm::KtstrKvm::new(topo, 128, false).unwrap();
         for vcpu in &vm.vcpus[1..] {
@@ -4456,13 +4452,11 @@ mod tests {
             return;
         };
 
-        for (label, sockets, cores, threads, mem) in
-            [("1cpu", 1, 1, 1, 256), ("4cpu", 2, 2, 1, 512)]
-        {
+        for (label, llcs, cores, threads, mem) in [("1cpu", 1, 1, 1, 256), ("4cpu", 2, 2, 1, 512)] {
             let start = Instant::now();
             let vm = match KtstrVm::builder()
                 .kernel(&kernel)
-                .topology(sockets, cores, threads)
+                .topology(llcs, cores, threads)
                 .memory_mb(mem)
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -4505,9 +4499,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn kvm_has_immediate_exit_cap() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT has been available since Linux 4.12.
@@ -4521,9 +4516,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn immediate_exit_handle_set_clear() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let handle = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -4556,9 +4552,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn immediate_exit_handle_cross_vcpu() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let h0 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -4587,9 +4584,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn vcpu_thread_kick_sets_immediate_exit() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -4658,13 +4656,13 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_zero_sockets() {
+    fn builder_rejects_zero_llcs() {
         let exe = crate::resolve_current_exe().unwrap();
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
             .topology(0, 2, 2)
             .build();
-        assert!(result.is_err(), "sockets=0 should fail validation");
+        assert!(result.is_err(), "llcs=0 should fail validation");
     }
 
     #[test]
@@ -5092,18 +5090,21 @@ mod tests {
     }
 
     #[test]
-    fn builder_performance_mode_too_many_sockets_fails() {
+    fn builder_performance_mode_too_many_llcs_fails() {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
-        let too_many_sockets = host_topo.llc_groups.len() as u32 + 1;
+        let too_many_llcs = host_topo.llc_groups.len() as u32 + 1;
         // Need total vCPUs + 1 service CPU to fit without oversubscription.
-        if (too_many_sockets as usize + 1) <= host_topo.total_cpus() {
+        if (too_many_llcs as usize + 1) <= host_topo.total_cpus() {
             let result = KtstrVmBuilder::default()
                 .kernel(&exe)
-                .topology(too_many_sockets, 1, 1)
+                .topology(too_many_llcs, 1, 1)
                 .performance_mode(true)
                 .build();
-            assert!(result.is_err(), "more sockets than LLCs should fail",);
+            assert!(
+                result.is_err(),
+                "more virtual LLCs than host LLCs should fail",
+            );
         }
     }
 
@@ -5360,9 +5361,10 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn aarch64_kvm_has_immediate_exit() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         assert!(

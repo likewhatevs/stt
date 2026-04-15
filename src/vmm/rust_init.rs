@@ -678,13 +678,13 @@ fn proxy_serial_pty(master: &OwnedFd, child_pid: u32) {
 
 /// Print the topology line for the shell MOTD.
 ///
-/// Parses KTSTR_TOPO=S,C,T from /proc/cmdline (passed by the host).
+/// Parses KTSTR_TOPO=L,C,T from /proc/cmdline (passed by the host).
 /// Falls back to counting online CPUs via /sys/devices/system/cpu/online.
 fn print_topology_line() {
     if let Some((s, c, t)) = parse_topo_from_cmdline() {
         let total = s * c * t;
         println!(
-            "  topology:  {s} socket{}, {c} core{}, {t} thread{} ({total} vCPU{})",
+            "  topology:  {s} LLC{}, {c} core{}, {t} thread{} ({total} vCPU{})",
             if s == 1 { "" } else { "s" },
             if c == 1 { "" } else { "s" },
             if t == 1 { "" } else { "s" },
@@ -698,7 +698,7 @@ fn print_topology_line() {
     }
 }
 
-/// Parse KTSTR_TOPO=S,C,T from /proc/cmdline.
+/// Parse KTSTR_TOPO=L,C,T from /proc/cmdline.
 fn parse_topo_from_cmdline() -> Option<(u32, u32, u32)> {
     let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
     let val = cmdline

@@ -9,7 +9,7 @@ use ktstr::scenario::Ctx;
 ///
 /// The generated `#[test]` wrapper calls `run_ktstr_test`, which requires
 /// KVM and a kernel image — it errors if either is unavailable.
-#[ktstr_test(sockets = 1, cores = 2, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 2048)]
 fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();
     if total == 0 {
@@ -32,7 +32,7 @@ fn default_attrs_compile(ctx: &Ctx) -> Result<AssertResult> {
 /// Verify resolve_func_ip returns a real nonzero address inside the VM.
 /// On the host, kptr_restrict or kernel lockdown hides addresses.
 #[cfg(feature = "integration")]
-#[ktstr_test(sockets = 1, cores = 1, threads = 1)]
+#[ktstr_test(llcs = 1, cores = 1, threads = 1)]
 fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     let ip = ktstr::resolve_func_ip("schedule");
@@ -65,8 +65,8 @@ fn find_registered_tests() {
 #[test]
 fn entry_fields_match_attrs() {
     let entry = ktstr::test_support::find_test("basic_topology_check").unwrap();
-    assert_eq!(entry.topology.sockets, 1);
-    assert_eq!(entry.topology.cores_per_socket, 2);
+    assert_eq!(entry.topology.llcs, 1);
+    assert_eq!(entry.topology.cores_per_llc, 2);
     assert_eq!(entry.topology.threads_per_core, 1);
     assert_eq!(entry.memory_mb, 2048);
 }
@@ -75,13 +75,13 @@ fn entry_fields_match_attrs() {
 #[test]
 fn entry_default_fields() {
     let entry = ktstr::test_support::find_test("default_attrs_compile").unwrap();
-    assert_eq!(entry.topology.sockets, 1);
-    assert_eq!(entry.topology.cores_per_socket, 2);
+    assert_eq!(entry.topology.llcs, 1);
+    assert_eq!(entry.topology.cores_per_llc, 2);
     assert_eq!(entry.topology.threads_per_core, 1);
     assert_eq!(entry.memory_mb, 2048);
     assert!(entry.required_flags.is_empty());
     assert!(entry.excluded_flags.is_empty());
-    assert_eq!(entry.constraints.min_sockets, 1);
+    assert_eq!(entry.constraints.min_numa_nodes, 1);
     assert_eq!(entry.constraints.min_llcs, 1);
     assert!(!entry.constraints.requires_smt);
     assert_eq!(entry.constraints.min_cpus, 1);
@@ -118,10 +118,10 @@ fn entry_flags_match_attrs() {
 
 /// Test with topology constraint attributes.
 #[ktstr_test(
-    sockets = 2,
+    llcs = 2,
     cores = 4,
     threads = 2,
-    min_sockets = 2,
+    min_numa_nodes = 2,
     min_llcs = 4,
     requires_smt = true,
     min_cpus = 8
@@ -135,7 +135,7 @@ fn topo_constraints_compile(ctx: &Ctx) -> Result<AssertResult> {
 #[test]
 fn entry_topo_constraints_match_attrs() {
     let entry = ktstr::test_support::find_test("topo_constraints_compile").unwrap();
-    assert_eq!(entry.constraints.min_sockets, 2);
+    assert_eq!(entry.constraints.min_numa_nodes, 2);
     assert_eq!(entry.constraints.min_llcs, 4);
     assert!(entry.constraints.requires_smt);
     assert_eq!(entry.constraints.min_cpus, 8);
@@ -154,7 +154,7 @@ fn topo_inherit_full(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Partial topology inheritance: threads overridden, sockets and cores
+/// Partial topology inheritance: threads overridden, LLCs and cores
 /// inherited from TOPO_SCHED.
 #[ktstr_test(scheduler = TOPO_SCHED, threads = 2)]
 fn topo_inherit_partial(ctx: &Ctx) -> Result<AssertResult> {
@@ -166,8 +166,8 @@ fn topo_inherit_partial(ctx: &Ctx) -> Result<AssertResult> {
 #[test]
 fn entry_topo_inherit_full() {
     let entry = ktstr::test_support::find_test("topo_inherit_full").unwrap();
-    assert_eq!(entry.topology.sockets, 2);
-    assert_eq!(entry.topology.cores_per_socket, 3);
+    assert_eq!(entry.topology.llcs, 2);
+    assert_eq!(entry.topology.cores_per_llc, 3);
     assert_eq!(entry.topology.threads_per_core, 1);
 }
 
@@ -175,13 +175,13 @@ fn entry_topo_inherit_full() {
 #[test]
 fn entry_topo_inherit_partial() {
     let entry = ktstr::test_support::find_test("topo_inherit_partial").unwrap();
-    assert_eq!(entry.topology.sockets, 2);
-    assert_eq!(entry.topology.cores_per_socket, 3);
+    assert_eq!(entry.topology.llcs, 2);
+    assert_eq!(entry.topology.cores_per_llc, 3);
     assert_eq!(entry.topology.threads_per_core, 2);
 }
 
 /// Test with performance_mode — verifies macro sets the field.
-#[ktstr_test(sockets = 1, cores = 2, threads = 1, performance_mode = true)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, performance_mode = true)]
 fn performance_mode_compile(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -238,8 +238,8 @@ fn derive_scheduler_binary() {
 /// Verify scheduler topology.
 #[test]
 fn derive_scheduler_topology() {
-    assert_eq!(TEST_DERIVE.topology.sockets, 2);
-    assert_eq!(TEST_DERIVE.topology.cores_per_socket, 4);
+    assert_eq!(TEST_DERIVE.topology.llcs, 2);
+    assert_eq!(TEST_DERIVE.topology.cores_per_llc, 4);
     assert_eq!(TEST_DERIVE.topology.threads_per_core, 1);
 }
 
@@ -354,8 +354,8 @@ fn derive_topo_inherit(ctx: &Ctx) -> Result<AssertResult> {
 #[test]
 fn entry_derive_topo_inherit() {
     let entry = ktstr::test_support::find_test("derive_topo_inherit").unwrap();
-    assert_eq!(entry.topology.sockets, 2);
-    assert_eq!(entry.topology.cores_per_socket, 4);
+    assert_eq!(entry.topology.llcs, 2);
+    assert_eq!(entry.topology.cores_per_llc, 4);
     assert_eq!(entry.topology.threads_per_core, 1);
 }
 
@@ -521,24 +521,24 @@ fn derive_minimal_defaults() {
         MINIMAL.binary,
         ktstr::test_support::SchedulerSpec::None
     ));
-    assert_eq!(MINIMAL.topology.sockets, 1);
-    assert_eq!(MINIMAL.topology.cores_per_socket, 2);
+    assert_eq!(MINIMAL.topology.llcs, 1);
+    assert_eq!(MINIMAL.topology.cores_per_llc, 2);
     assert_eq!(MINIMAL.topology.threads_per_core, 1);
     assert!(MINIMAL.flags.is_empty());
     assert!(MINIMAL.sched_args.is_empty());
     assert!(MINIMAL.cgroup_parent.is_none());
 }
 
-/// Topology validation: boot a multi-socket VM and verify the guest sees
-/// more than the 2-CPU default. The base test boots 2s2c1t (4 CPUs, 2
+/// Topology validation: boot a multi-LLC VM and verify the guest sees
+/// more than the 2-CPU default. The base test boots 2l2c1t (4 CPUs, 2
 /// LLCs); gauntlet variants boot larger topologies. Catches regressions
 /// where guest-side topology discovery falls back to incorrect defaults.
 #[ktstr_test(
-    sockets = 2,
+    llcs = 2,
     cores = 2,
     threads = 1,
     memory_mb = 2048,
-    min_sockets = 2,
+    min_numa_nodes = 2,
     min_llcs = 2,
     min_cpus = 4
 )]

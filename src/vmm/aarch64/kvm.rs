@@ -385,9 +385,10 @@ mod tests {
     #[test]
     fn create_vm_basic() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
@@ -396,18 +397,15 @@ mod tests {
     }
 
     #[test]
-    fn create_vm_multi_socket() {
+    fn create_vm_multi_llc() {
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 256, false);
-        assert!(
-            vm.is_ok(),
-            "multi-socket VM creation failed: {:?}",
-            vm.err()
-        );
+        assert!(vm.is_ok(), "multi-LLC VM creation failed: {:?}", vm.err());
         let vm = vm.unwrap();
         assert_eq!(vm.vcpus.len(), 8);
     }
@@ -415,9 +413,10 @@ mod tests {
     #[test]
     fn create_vm_single_cpu() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false);
         assert!(vm.is_ok());
@@ -428,9 +427,10 @@ mod tests {
     fn memory_size_correct() {
         use vm_memory::GuestMemoryRegion;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
@@ -441,9 +441,10 @@ mod tests {
     fn memory_starts_at_dram() {
         use vm_memory::GuestMemoryRegion;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let region = vm.guest_mem.iter().next().unwrap();
@@ -457,9 +458,10 @@ mod tests {
     #[test]
     fn immediate_exit_cap_detected() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         assert!(vm.has_immediate_exit);

@@ -103,7 +103,7 @@ enum Command {
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,
-        /// Virtual topology as "sockets,cores,threads" (default: "1,1,1").
+        /// Virtual topology as "llcs,cores,threads" (default: "1,1,1").
         #[arg(long, default_value = "1,1,1")]
         topology: String,
         /// Files or directories to include in the guest at /include-files/<name>.
@@ -534,15 +534,15 @@ fn main() -> Result<()> {
             cli::check_kvm()?;
             let kernel_path = cli::resolve_kernel_image(kernel.as_deref())?;
 
-            // Parse topology "S,C,T".
+            // Parse topology "L,C,T".
             let parts: Vec<&str> = topology.split(',').collect();
             anyhow::ensure!(
                 parts.len() == 3,
-                "invalid topology '{topology}': expected 'sockets,cores,threads' (e.g. '2,4,1')"
+                "invalid topology '{topology}': expected 'llcs,cores,threads' (e.g. '2,4,1')"
             );
-            let sockets: u32 = parts[0]
+            let llcs: u32 = parts[0]
                 .parse()
-                .map_err(|_| anyhow::anyhow!("invalid sockets value: '{}'", parts[0]))?;
+                .map_err(|_| anyhow::anyhow!("invalid llcs value: '{}'", parts[0]))?;
             let cores: u32 = parts[1]
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid cores value: '{}'", parts[1]))?;
@@ -550,8 +550,8 @@ fn main() -> Result<()> {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid threads value: '{}'", parts[2]))?;
             anyhow::ensure!(
-                sockets > 0 && cores > 0 && threads > 0,
-                "invalid topology '{topology}': sockets, cores, and threads must all be >= 1"
+                llcs > 0 && cores > 0 && threads > 0,
+                "invalid topology '{topology}': llcs, cores, and threads must all be >= 1"
             );
 
             let resolved_includes = cli::resolve_include_files(&include_files)?;
@@ -563,7 +563,7 @@ fn main() -> Result<()> {
 
             ktstr::run_shell(
                 kernel_path,
-                sockets,
+                llcs,
                 cores,
                 threads,
                 &include_refs,

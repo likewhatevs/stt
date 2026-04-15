@@ -45,13 +45,13 @@ pub fn mpidr_to_fdt_reg(mpidr: u64) -> u64 {
 }
 
 /// Compute MPIDR affinity encoding from topology decomposition.
-/// Aff0 = thread, Aff1 = core, Aff2 = socket.
+/// Aff0 = thread, Aff1 = core, Aff2 = LLC.
 /// This matches KVM's default MPIDR assignment for linearly-created vCPUs.
 pub fn mpidr_from_topology(topo: &Topology, cpu_id: u32) -> u64 {
-    let (socket, core, thread) = topo.decompose(cpu_id);
+    let (llc, core, thread) = topo.decompose(cpu_id);
     let aff0 = thread as u64;
     let aff1 = core as u64;
-    let aff2 = socket as u64;
+    let aff2 = llc as u64;
     (1u64 << 31) | (aff2 << 16) | (aff1 << 8) | aff0
 }
 
@@ -73,9 +73,10 @@ mod tests {
     #[test]
     fn mpidr_from_topology_single() {
         let t = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let mpidr = mpidr_from_topology(&t, 0);
         assert_eq!(mpidr & MPIDR_AFF_MASK, 0);
@@ -85,31 +86,32 @@ mod tests {
     #[test]
     fn mpidr_from_topology_multi() {
         let t = Topology {
-            sockets: 2,
-            cores_per_socket: 4,
+            llcs: 2,
+            cores_per_llc: 4,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
-        // cpu 0: socket 0, core 0, thread 0
+        // cpu 0: LLC 0, core 0, thread 0
         let m0 = mpidr_from_topology(&t, 0);
         assert_eq!(m0 & 0xFF, 0, "aff0 (thread) = 0");
         assert_eq!((m0 >> 8) & 0xFF, 0, "aff1 (core) = 0");
-        assert_eq!((m0 >> 16) & 0xFF, 0, "aff2 (socket) = 0");
+        assert_eq!((m0 >> 16) & 0xFF, 0, "aff2 (LLC) = 0");
 
-        // cpu 1: socket 0, core 0, thread 1
+        // cpu 1: LLC 0, core 0, thread 1
         let m1 = mpidr_from_topology(&t, 1);
         assert_eq!(m1 & 0xFF, 1, "aff0 (thread) = 1");
         assert_eq!((m1 >> 8) & 0xFF, 0, "aff1 (core) = 0");
 
-        // cpu 2: socket 0, core 1, thread 0
+        // cpu 2: LLC 0, core 1, thread 0
         let m2 = mpidr_from_topology(&t, 2);
         assert_eq!(m2 & 0xFF, 0, "aff0 (thread) = 0");
         assert_eq!((m2 >> 8) & 0xFF, 1, "aff1 (core) = 1");
 
-        // cpu 8: socket 1, core 0, thread 0
+        // cpu 8: LLC 1, core 0, thread 0
         let m8 = mpidr_from_topology(&t, 8);
         assert_eq!(m8 & 0xFF, 0, "aff0 (thread) = 0");
         assert_eq!((m8 >> 8) & 0xFF, 0, "aff1 (core) = 0");
-        assert_eq!((m8 >> 16) & 0xFF, 1, "aff2 (socket) = 1");
+        assert_eq!((m8 >> 16) & 0xFF, 1, "aff2 (LLC) = 1");
     }
 
     #[test]
@@ -124,22 +126,23 @@ mod tests {
     fn mpidr_unique_representative_topologies() {
         let topos = [
             (1, 1, 1),   // degenerate single CPU
-            (2, 1, 1),   // minimal multi-socket
+            (2, 1, 1),   // minimal multi-LLC
             (3, 3, 1),   // odd non-power-of-2
             (1, 1, 2),   // minimal SMT
-            (2, 4, 2),   // standard multi-socket with SMT
+            (2, 4, 2),   // standard multi-LLC with SMT
             (7, 5, 3),   // all dimensions non-power-of-2
             (15, 16, 1), // large scale no SMT
             (14, 9, 2),  // large with SMT
-            (255, 1, 1), // max sockets before Aff2 overflow
+            (255, 1, 1), // max LLCs before Aff2 overflow
             (1, 255, 1), // max cores before Aff1 overflow
-            (4, 32, 1),  // many cores, multi-socket
+            (4, 32, 1),  // many cores, multi-LLC
         ];
-        for (sockets, cores, threads) in topos {
+        for (llcs, cores, threads) in topos {
             let t = Topology {
-                sockets,
-                cores_per_socket: cores,
+                llcs,
+                cores_per_llc: cores,
                 threads_per_core: threads,
+                numa_nodes: 1,
             };
             let mpidrs: Vec<u64> = (0..t.total_cpus())
                 .map(|i| mpidr_from_topology(&t, i))
@@ -148,7 +151,7 @@ mod tests {
             assert_eq!(
                 mpidrs.len(),
                 unique.len(),
-                "topology {sockets}s/{cores}c/{threads}t: MPIDRs not unique"
+                "topology {llcs}l/{cores}c/{threads}t: MPIDRs not unique"
             );
         }
     }
@@ -156,9 +159,10 @@ mod tests {
     #[test]
     fn mpidr_bit31_always_set() {
         let t = Topology {
-            sockets: 2,
-            cores_per_socket: 4,
+            llcs: 2,
+            cores_per_llc: 4,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         for cpu in 0..t.total_cpus() {
             let mpidr = mpidr_from_topology(&t, cpu);
@@ -177,20 +181,17 @@ mod tests {
     #[test]
     fn decompose_matches_mpidr_fields() {
         let t = Topology {
-            sockets: 3,
-            cores_per_socket: 5,
+            llcs: 3,
+            cores_per_llc: 5,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         for cpu in 0..t.total_cpus() {
-            let (socket, core, thread) = t.decompose(cpu);
+            let (llc, core, thread) = t.decompose(cpu);
             let mpidr = mpidr_from_topology(&t, cpu);
             assert_eq!(mpidr & 0xFF, thread as u64, "cpu {cpu}: aff0 = thread");
             assert_eq!((mpidr >> 8) & 0xFF, core as u64, "cpu {cpu}: aff1 = core");
-            assert_eq!(
-                (mpidr >> 16) & 0xFF,
-                socket as u64,
-                "cpu {cpu}: aff2 = socket"
-            );
+            assert_eq!((mpidr >> 16) & 0xFF, llc as u64, "cpu {cpu}: aff2 = LLC");
         }
     }
 }

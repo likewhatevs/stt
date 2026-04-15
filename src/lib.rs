@@ -14,7 +14,7 @@
 //! ```rust
 //! use ktstr::prelude::*;
 //!
-//! #[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+//! #[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 //! fn my_scheduler_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     execute_defs(ctx, vec![
 //!         CgroupDef::named("cg_0").workers(2),
@@ -30,7 +30,7 @@
 //! ```rust
 //! use ktstr::prelude::*;
 //!
-//! #[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+//! #[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 //! fn my_dynamic_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     let steps = vec![
 //!         Step::with_defs(
@@ -81,7 +81,7 @@
 //! ```rust
 //! use ktstr::prelude::*;
 //!
-//! #[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+//! #[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 //! fn my_low_level_test(ctx: &Ctx) -> Result<AssertResult> {
 //!     let mut group = CgroupGroup::new(ctx.cgroups);
 //!     group.add_cgroup_no_cpuset("workers")?;
@@ -288,7 +288,7 @@ pub use crate::probe::process::resolve_func_ip;
 /// ```rust
 /// use ktstr::prelude::*;
 ///
-/// #[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+/// #[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 /// fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 ///     Ok(AssertResult::pass())
 /// }
@@ -499,7 +499,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 /// `/include-files/<name>`.
 ///
 /// `kernel`: path to the kernel image (bzImage/Image).
-/// `sockets`, `cores`, `threads`: guest CPU topology.
+/// `llcs`, `cores`, `threads`: guest CPU topology.
 /// `include_files`: `(archive_path, host_path)` pairs for files to
 ///   include in the guest.
 /// `memory_mb`: explicit guest memory override in MB. When `None`,
@@ -507,7 +507,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 #[allow(clippy::too_many_arguments)]
 pub fn run_shell(
     kernel: std::path::PathBuf,
-    sockets: u32,
+    llcs: u32,
     cores: u32,
     threads: u32,
     include_files: &[(&str, &std::path::Path)],
@@ -522,7 +522,7 @@ pub fn run_shell(
         .map(|(a, p)| (a.to_string(), p.to_path_buf()))
         .collect();
 
-    let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={sockets},{cores},{threads}");
+    let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={llcs},{cores},{threads}");
     if dmesg {
         cmdline.push_str(" loglevel=7");
     }
@@ -555,7 +555,7 @@ pub fn run_shell(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&payload)
-        .topology(sockets, cores, threads)
+        .topology(llcs, cores, threads)
         .cmdline(&cmdline)
         .include_files(owned_includes)
         .busybox(true)

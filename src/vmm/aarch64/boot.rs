@@ -188,9 +188,10 @@ mod tests {
     fn setup_regs_on_real_vcpu() {
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = crate::vmm::kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let result = setup_regs(&vm.vcpus[0], 0x28_0000, 0x4000_0000);

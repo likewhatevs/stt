@@ -624,9 +624,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
@@ -642,9 +643,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
@@ -660,9 +662,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_fpu(&vm.vcpus[0]).unwrap();
@@ -675,9 +678,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_msrs(&vm.vcpus[0], None).unwrap();
@@ -702,9 +706,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         // Override MISC_ENABLE to disable FAST_STRING
@@ -733,9 +738,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         // Append a new MSR (IA32_EFER = 0xC0000080)
@@ -759,9 +765,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_lapic(&vm.vcpus[0], true).unwrap();
@@ -785,9 +792,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_lapic(&vm.vcpus[1], false).unwrap();
@@ -865,9 +873,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
@@ -894,9 +903,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
@@ -913,9 +923,10 @@ mod tests {
         use crate::vmm::kvm::KtstrKvm;
         use crate::vmm::topology::Topology;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], true).unwrap();

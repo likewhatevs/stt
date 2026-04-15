@@ -204,9 +204,10 @@ mod tests {
     #[test]
     fn stats_fd_returns_some_on_modern_kernel() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vm_fd) {
@@ -217,9 +218,10 @@ mod tests {
     #[test]
     fn vcpu_stats_fd_returns_some() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
@@ -230,9 +232,10 @@ mod tests {
     #[test]
     fn parse_meta_from_vcpu() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
@@ -246,9 +249,10 @@ mod tests {
     #[test]
     fn pread_data_after_initial_read() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
@@ -263,9 +267,10 @@ mod tests {
     #[test]
     fn vcpu_reader_opens_and_reads() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(reader) = VcpuStatsReader::open(&vm.vcpus[0]) {
@@ -277,9 +282,10 @@ mod tests {
     #[test]
     fn stats_context_opens_and_reads() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(ctx) = open_stats_context(&vm.vcpus) {

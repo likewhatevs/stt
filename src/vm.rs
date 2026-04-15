@@ -29,9 +29,10 @@ impl Default for VmConfig {
         Self {
             kernel: None,
             topology: Topology {
-                sockets: 2,
-                cores_per_socket: 2,
+                llcs: 2,
+                cores_per_llc: 2,
                 threads_per_core: 1,
+                numa_nodes: 1,
             },
             memory_mb: 4096,
             timeout: None,
@@ -87,7 +88,7 @@ pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&ktstr_bin)
-        .topology(t.sockets, t.cores_per_socket, t.threads_per_core)
+        .topology(t.llcs, t.cores_per_llc, t.threads_per_core)
         .memory_mb(u32::try_from(cfg.memory_mb).context("memory_mb exceeds u32::MAX")?)
         .run_args(&guest_args);
 
@@ -215,9 +216,10 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             name: n,
             description: d,
             topology: Topology {
-                sockets: s,
-                cores_per_socket: c,
+                llcs: s,
+                cores_per_llc: c,
                 threads_per_core: t,
+                numa_nodes: 1,
             },
             memory_mb: m,
         })
@@ -419,12 +421,8 @@ mod tests {
     #[test]
     fn gauntlet_presets_topology_valid() {
         for p in &gauntlet_presets() {
-            assert!(p.topology.sockets > 0, "{}: sockets=0", p.name);
-            assert!(
-                p.topology.cores_per_socket > 0,
-                "{}: cores_per_socket=0",
-                p.name
-            );
+            assert!(p.topology.llcs > 0, "{}: llcs=0", p.name);
+            assert!(p.topology.cores_per_llc > 0, "{}: cores_per_llc=0", p.name);
             assert!(
                 p.topology.threads_per_core > 0,
                 "{}: threads_per_core=0",
@@ -466,9 +464,10 @@ mod tests {
         let c = VmConfig {
             kernel: Some("/boot/custom".into()),
             topology: Topology {
-                sockets: 4,
-                cores_per_socket: 8,
+                llcs: 4,
+                cores_per_llc: 8,
                 threads_per_core: 1,
+                numa_nodes: 1,
             },
             memory_mb: 8192,
             timeout: Some(Duration::from_secs(300)),
@@ -483,9 +482,10 @@ mod tests {
     #[test]
     fn topology_single_cpu() {
         let t = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         assert_eq!(t.total_cpus(), 1);
         assert_eq!(t.num_llcs(), 1);
@@ -512,10 +512,10 @@ mod tests {
         for p in &presets {
             if p.name.starts_with("odd-") {
                 assert!(
-                    p.topology.sockets % 2 != 0,
-                    "{}: odd-* presets must have odd LLC count, got {} sockets",
+                    p.topology.llcs % 2 != 0,
+                    "{}: odd-* presets must have odd LLC count, got {} LLCs",
                     p.name,
-                    p.topology.sockets
+                    p.topology.llcs
                 );
             }
         }

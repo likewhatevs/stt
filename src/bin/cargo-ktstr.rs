@@ -127,7 +127,7 @@ enum KtstrCommand {
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,
-        /// Virtual topology as "sockets,cores,threads" (default: "1,1,1").
+        /// Virtual topology as "llcs,cores,threads" (default: "1,1,1").
         #[arg(long, default_value = "1,1,1")]
         topology: String,
         /// Files or directories to include in the guest at /include-files/<name>.
@@ -619,25 +619,25 @@ fn run_shell(
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 
-    // Parse topology "S,C,T".
+    // Parse topology "L,C,T".
     let parts: Vec<&str> = topology.split(',').collect();
     if parts.len() != 3 {
         return Err(format!(
-            "invalid topology '{topology}': expected 'sockets,cores,threads' (e.g. '2,4,1')"
+            "invalid topology '{topology}': expected 'llcs,cores,threads' (e.g. '2,4,1')"
         ));
     }
-    let sockets: u32 = parts[0]
+    let llcs: u32 = parts[0]
         .parse()
-        .map_err(|_| format!("invalid sockets value: '{}'", parts[0]))?;
+        .map_err(|_| format!("invalid llcs value: '{}'", parts[0]))?;
     let cores: u32 = parts[1]
         .parse()
         .map_err(|_| format!("invalid cores value: '{}'", parts[1]))?;
     let threads: u32 = parts[2]
         .parse()
         .map_err(|_| format!("invalid threads value: '{}'", parts[2]))?;
-    if sockets == 0 || cores == 0 || threads == 0 {
+    if llcs == 0 || cores == 0 || threads == 0 {
         return Err(format!(
-            "invalid topology '{topology}': sockets, cores, and threads must all be >= 1"
+            "invalid topology '{topology}': llcs, cores, and threads must all be >= 1"
         ));
     }
 
@@ -651,7 +651,7 @@ fn run_shell(
 
     ktstr::run_shell(
         kernel_path,
-        sockets,
+        llcs,
         cores,
         threads,
         &include_refs,

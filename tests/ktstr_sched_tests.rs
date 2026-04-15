@@ -8,7 +8,7 @@ use ktstr::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
 
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 2, threads = 1, sustained_samples = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15)]
 fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
@@ -22,7 +22,7 @@ fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 4, threads = 1, sustained_samples = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, sustained_samples = 15)]
 fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
@@ -36,7 +36,7 @@ fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 2, threads = 1, sustained_samples = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15)]
 fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
@@ -89,7 +89,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
 /// min_iteration_rate and max_gap_ms gates.
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
-    sockets = 1,
+    llcs = 1,
     cores = 2,
     threads = 1,
     performance_mode = true,
@@ -160,9 +160,10 @@ static __KTSTR_ENTRY_SCATTER: ktstr::test_support::KtstrTestEntry =
         name: "demo_scattershot_migration",
         func: scenario_scattershot,
         topology: ktstr::test_support::Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         },
         scheduler: &SCATTER_SCHED,
         extra_sched_args: &["--scattershot"],
@@ -269,7 +270,7 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
 
 /// Minimal scheduler test that exercises host-side BPF program enumeration.
 /// The framework warns when verifier_stats is empty for scheduler tests.
-#[ktstr_test(scheduler = KTSTR_SCHED, sockets = 1, cores = 2, threads = 1, duration_s = 3)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, duration_s = 3)]
 fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),

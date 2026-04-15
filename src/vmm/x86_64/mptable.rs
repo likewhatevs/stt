@@ -1,6 +1,6 @@
 /// MP table setup for SMP boot.
 /// The kernel reads this to discover CPUs and their APIC IDs.
-/// Uses topology-aware APIC IDs for multi-socket support.
+/// Uses topology-aware APIC IDs for multi-LLC support.
 use anyhow::{Context, Result};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -31,7 +31,7 @@ const IO_APIC_ADDR: u32 = 0xfec0_0000;
 
 /// Write an MP table describing the given topology into guest memory.
 /// Each CPU entry uses the topology-computed APIC ID so the kernel
-/// sees the correct socket/core/thread structure.
+/// sees the correct LLC/core/thread structure.
 pub fn setup_mptable(mem: &GuestMemoryMmap, topo: &Topology) -> Result<()> {
     let num_cpus = topo.total_cpus();
     let mut addr = GuestAddress(MPTABLE_START);
@@ -187,9 +187,10 @@ mod tests {
     fn mptable_single_cpu() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         setup_mptable(&mem, &topo).unwrap();
         // Verify MP floating pointer magic
@@ -200,12 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn mptable_multi_socket() {
+    fn mptable_multi_llc() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         setup_mptable(&mem, &topo).unwrap();
         let mut magic = [0u8; 4];
@@ -224,9 +226,10 @@ mod tests {
     fn mptable_mpf_checksum() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         setup_mptable(&mem, &topo).unwrap();
         let mut mpf = [0u8; 16];
@@ -240,9 +243,10 @@ mod tests {
     fn mptable_header_checksum() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 4,
+            llcs: 1,
+            cores_per_llc: 4,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -264,9 +268,10 @@ mod tests {
     fn mptable_cpu_apic_ids_match_topology() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -287,9 +292,10 @@ mod tests {
     fn mptable_bsp_flagged() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -312,9 +318,10 @@ mod tests {
     fn mptable_large_topology_240_cpus() {
         let mem = test_mem(2048);
         let topo = Topology {
-            sockets: 15,
-            cores_per_socket: 8,
+            llcs: 15,
+            cores_per_llc: 8,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         assert_eq!(topo.total_cpus(), 240);
         // Should succeed — MP table uses u8 APIC IDs but max here is < 255
@@ -325,9 +332,10 @@ mod tests {
     fn mptable_large_topology() {
         let mem = test_mem(4096);
         let topo = Topology {
-            sockets: 14,
-            cores_per_socket: 9,
+            llcs: 14,
+            cores_per_llc: 9,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         assert_eq!(topo.total_cpus(), 252);
         assert!(setup_mptable(&mem, &topo).is_ok());

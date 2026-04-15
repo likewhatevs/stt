@@ -1386,12 +1386,12 @@ mod tests {
     // -- CpusetSpec resolution helpers --
 
     fn make_ctx(
-        sockets: u32,
+        llcs: u32,
         cores: u32,
         threads: u32,
     ) -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
         let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
-        let topo = crate::topology::TestTopology::from_spec(sockets, cores, threads);
+        let topo = crate::topology::TestTopology::from_spec(llcs, cores, threads);
         (cgroups, topo)
     }
 
@@ -1881,7 +1881,7 @@ mod tests {
 
     #[test]
     fn cpusetspec_validate_too_few_cpus_for_partitions() {
-        // 1 socket, 2 cores, 1 thread => 2 total cpus, 2 usable
+        // 1 LLC, 2 cores, 1 thread => 2 total cpus, 2 usable
         let (cg, topo) = make_ctx(1, 2, 1);
         let ctx = ctx_from(&cg, &topo);
         let spec = CpusetSpec::Disjoint { index: 0, of: 5 };

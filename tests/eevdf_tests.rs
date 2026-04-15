@@ -16,7 +16,7 @@ use ktstr::workload::{WorkType, WorkloadConfig, WorkloadHandle};
 /// scheduling gaps stay small. With aggressive preemption of short-burst
 /// workers, max_gap_ms rises and spread increases.
 #[ktstr_test(
-    sockets = 1,
+    llcs = 1,
     cores = 4,
     threads = 2,
     memory_mb = 2048,

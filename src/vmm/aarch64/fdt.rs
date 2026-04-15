@@ -378,9 +378,10 @@ mod tests {
 
     fn default_topo() -> Topology {
         Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         }
     }
 
@@ -425,9 +426,10 @@ mod tests {
     #[test]
     fn create_fdt_smp() {
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 4,
+            llcs: 2,
+            cores_per_llc: 4,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(&mpidrs, 1024, "console=ttyS0", None, None, 0);

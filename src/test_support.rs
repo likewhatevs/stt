@@ -170,18 +170,18 @@ fn maybe_dispatch_host_test() -> Option<i32> {
         }
     };
 
-    let (sockets, cores, threads) = match parse_topo_string(&topo_str) {
+    let (llcs, cores, threads) = match parse_topo_string(&topo_str) {
         Some(t) => t,
         None => {
-            eprintln!("ktstr_test: invalid --ktstr-topo format '{topo_str}' (expected NsNcNt)");
+            eprintln!("ktstr_test: invalid --ktstr-topo format '{topo_str}' (expected NlNcNt)");
             return Some(1);
         }
     };
 
-    let cpus = sockets * cores * threads;
+    let cpus = llcs * cores * threads;
     let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
     let topo = TopoOverride {
-        sockets,
+        llcs,
         cores,
         threads,
         memory_mb,
@@ -250,7 +250,7 @@ pub struct Scheduler {
     /// Scheduler CLI args, prepended before per-test `extra_sched_args`.
     pub sched_args: &'static [&'static str],
     /// Default VM topology for tests using this scheduler. Tests inherit
-    /// this topology unless they override `sockets`, `cores`, or
+    /// this topology unless they override `llcs`, `cores`, or
     /// `threads` explicitly in `#[ktstr_test]`.
     pub topology: Topology,
 }
@@ -266,9 +266,10 @@ impl Scheduler {
         cgroup_parent: None,
         sched_args: &[],
         topology: Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         },
     };
 
@@ -284,9 +285,10 @@ impl Scheduler {
             cgroup_parent: None,
             sched_args: &[],
             topology: Topology {
-                sockets: 1,
-                cores_per_socket: 2,
+                llcs: 1,
+                cores_per_llc: 2,
                 threads_per_core: 1,
+                numa_nodes: 1,
             },
         }
     }
@@ -337,13 +339,14 @@ impl Scheduler {
     }
 
     /// Set the default VM topology for tests using this scheduler.
-    /// Tests inherit this unless they override `sockets`, `cores`, or
+    /// Tests inherit this unless they override `llcs`, `cores`, or
     /// `threads` explicitly in `#[ktstr_test]`.
-    pub const fn topology(mut self, sockets: u32, cores: u32, threads: u32) -> Self {
+    pub const fn topology(mut self, llcs: u32, cores: u32, threads: u32) -> Self {
         self.topology = Topology {
-            sockets,
-            cores_per_socket: cores,
+            llcs,
+            cores_per_llc: cores,
             threads_per_core: threads,
+            numa_nodes: 1,
         };
         self
     }
@@ -431,8 +434,8 @@ pub use crate::vmm::topology::Topology;
 /// Presets that don't meet all constraints are skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopologyConstraints {
-    /// Minimum number of sockets.
-    pub min_sockets: u32,
+    /// Minimum number of NUMA nodes.
+    pub min_numa_nodes: u32,
     /// Minimum number of LLCs.
     pub min_llcs: u32,
     /// Whether the test requires SMT (threads_per_core > 1).
@@ -443,7 +446,7 @@ pub struct TopologyConstraints {
 
 impl TopologyConstraints {
     pub const DEFAULT: TopologyConstraints = TopologyConstraints {
-        min_sockets: 1,
+        min_numa_nodes: 1,
         min_llcs: 1,
         requires_smt: false,
         min_cpus: 1,
@@ -514,9 +517,10 @@ impl KtstrTestEntry {
         name: "",
         func: default_test_func,
         topology: Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         },
         constraints: TopologyConstraints::DEFAULT,
         memory_mb: 2048,
@@ -595,28 +599,55 @@ fn validate_entry_flags(entry: &KtstrTestEntry) {
 
 /// Optional topology override for `run_ktstr_test`.
 pub(crate) struct TopoOverride {
-    pub sockets: u32,
+    pub llcs: u32,
     pub cores: u32,
     pub threads: u32,
     pub memory_mb: u32,
 }
 
-/// Parse a topology string in "NsNcNt" format (e.g. "2s4c2t").
+/// Parse a topology string in "NsNlNcNt" format (e.g. "1s2l4c2t").
+/// `s` = NUMA nodes, `l` = LLCs, `c` = cores/LLC, `t` = threads/core.
 /// Returns None if the string doesn't match the expected format.
 pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
+    // Try new format: NsNlNcNt (e.g. "1s2l4c2t")
+    if let Some(result) = parse_topo_string_new(s) {
+        return Some(result);
+    }
+    // Legacy format: NsNcNt (treated as 1 NUMA node, N LLCs, N cores, N threads)
     let s_pos = s.find('s')?;
     let c_pos = s.find('c')?;
     let t_pos = s.find('t')?;
     if s_pos >= c_pos || c_pos >= t_pos {
         return None;
     }
-    let sockets: u32 = s[..s_pos].parse().ok()?;
+    let llcs: u32 = s[..s_pos].parse().ok()?;
     let cores: u32 = s[s_pos + 1..c_pos].parse().ok()?;
     let threads: u32 = s[c_pos + 1..t_pos].parse().ok()?;
-    if sockets == 0 || cores == 0 || threads == 0 {
+    if llcs == 0 || cores == 0 || threads == 0 {
         return None;
     }
-    Some((sockets, cores, threads))
+    Some((llcs, cores, threads))
+}
+
+/// Parse new-format topology string "NsNlNcNt" (e.g. "1s2l4c2t").
+/// Returns (llcs, cores, threads). NUMA nodes are currently discarded
+/// (the caller constructs TopoOverride which has no numa_nodes field yet).
+fn parse_topo_string_new(s: &str) -> Option<(u32, u32, u32)> {
+    let s_pos = s.find('s')?;
+    let l_pos = s.find('l')?;
+    let c_pos = s.find('c')?;
+    let t_pos = s.find('t')?;
+    if s_pos >= l_pos || l_pos >= c_pos || c_pos >= t_pos {
+        return None;
+    }
+    let _numa_nodes: u32 = s[..s_pos].parse().ok()?;
+    let llcs: u32 = s[s_pos + 1..l_pos].parse().ok()?;
+    let cores: u32 = s[l_pos + 1..c_pos].parse().ok()?;
+    let threads: u32 = s[c_pos + 1..t_pos].parse().ok()?;
+    if llcs == 0 || cores == 0 || threads == 0 {
+        return None;
+    }
+    Some((llcs, cores, threads))
 }
 
 /// Host-side entry point: build a VM, boot it with `--ktstr-test-fn=NAME`,
@@ -769,13 +800,13 @@ fn list_tests_all(ignored_only: bool) {
             .unwrap_or(host_cpus);
         for preset in &presets {
             let t = &preset.topology;
-            if t.sockets < entry.constraints.min_sockets
+            if t.num_numa_nodes() < entry.constraints.min_numa_nodes
                 || t.num_llcs() < entry.constraints.min_llcs
                 || (entry.constraints.requires_smt && t.threads_per_core < 2)
                 || t.total_cpus() < entry.constraints.min_cpus
                 || t.total_cpus() > host_cpus
                 || t.num_llcs() > host_llcs
-                || t.cores_per_socket * t.threads_per_core > host_max_cpus_per_llc
+                || t.cores_per_llc * t.threads_per_core > host_max_cpus_per_llc
             {
                 continue;
             }
@@ -842,13 +873,13 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             .unwrap_or(host_cpus);
         for preset in &presets {
             let t = &preset.topology;
-            if t.sockets < entry.constraints.min_sockets
+            if t.num_numa_nodes() < entry.constraints.min_numa_nodes
                 || t.num_llcs() < entry.constraints.min_llcs
                 || (entry.constraints.requires_smt && t.threads_per_core < 2)
                 || t.total_cpus() < entry.constraints.min_cpus
                 || t.total_cpus() > host_cpus
                 || t.num_llcs() > host_llcs
-                || t.cores_per_socket * t.threads_per_core > host_max_cpus_per_llc
+                || t.cores_per_llc * t.threads_per_core > host_max_cpus_per_llc
             {
                 continue;
             }
@@ -927,8 +958,8 @@ fn run_host_only_test(entry: &KtstrTestEntry) -> i32 {
 /// Used for tests that need host tools (cargo, nested VMs).
 fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
     let topo = crate::topology::TestTopology::from_spec(
-        entry.topology.sockets,
-        entry.topology.cores_per_socket,
+        entry.topology.llcs,
+        entry.topology.cores_per_llc,
         entry.topology.threads_per_core,
     );
     let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/ktstr");
@@ -982,8 +1013,8 @@ fn run_gauntlet_test(rest: &str) -> i32 {
 
     let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
     let topo = TopoOverride {
-        sockets: t.sockets,
-        cores: t.cores_per_socket,
+        llcs: t.llcs,
+        cores: t.cores_per_llc,
         threads: t.threads_per_core,
         memory_mb,
     };
@@ -1303,14 +1334,14 @@ fn run_ktstr_test_inner(
     }
     let cmdline_extra = cmdline_parts.join(" ");
 
-    let (sockets, cores, threads, memory_mb) = match topo {
-        Some(t) => (t.sockets, t.cores, t.threads, t.memory_mb),
+    let (llcs, cores, threads, memory_mb) = match topo {
+        Some(t) => (t.llcs, t.cores, t.threads, t.memory_mb),
         None => {
             let cpus = entry.topology.total_cpus();
             let mem = (cpus * 64).max(256).max(entry.memory_mb);
             (
-                entry.topology.sockets,
-                entry.topology.cores_per_socket,
+                entry.topology.llcs,
+                entry.topology.cores_per_llc,
                 entry.topology.threads_per_core,
                 mem,
             )
@@ -1320,7 +1351,7 @@ fn run_ktstr_test_inner(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&ktstr_bin)
-        .topology(sockets, cores, threads)
+        .topology(llcs, cores, threads)
         .memory_deferred_min(memory_mb)
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
@@ -1482,7 +1513,7 @@ fn run_ktstr_test_inner(
         &result,
         &merged_assert,
         &stimulus_events,
-        sockets,
+        llcs,
         cores,
         threads,
         &repro_fn,
@@ -1501,7 +1532,7 @@ fn evaluate_vm_result(
     result: &vmm::VmResult,
     merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
-    sockets: u32,
+    llcs: u32,
     cores: u32,
     threads: u32,
     repro_fn: &dyn Fn(&str) -> Option<String>,
@@ -1530,11 +1561,11 @@ fn evaluate_vm_result(
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
         topology: Some(format!(
-            "{}s{}c{}t ({} cpus)",
-            sockets,
+            "{}l{}c{}t ({} cpus)",
+            llcs,
             cores,
             threads,
-            sockets * cores * threads,
+            llcs * cores * threads,
         )),
         scheduler: Some(entry.scheduler.name.to_string()),
         scenario: Some(entry.name.to_string()),
@@ -1941,14 +1972,14 @@ fn attempt_auto_repro(
     }
     let cmdline_extra = cmdline_parts.join(" ");
 
-    let (sockets, cores, threads, memory_mb) = match topo {
-        Some(t) => (t.sockets, t.cores, t.threads, t.memory_mb),
+    let (llcs, cores, threads, memory_mb) = match topo {
+        Some(t) => (t.llcs, t.cores, t.threads, t.memory_mb),
         None => {
             let cpus = entry.topology.total_cpus();
             let mem = (cpus * 64).max(256).max(entry.memory_mb);
             (
-                entry.topology.sockets,
-                entry.topology.cores_per_socket,
+                entry.topology.llcs,
+                entry.topology.cores_per_llc,
                 entry.topology.threads_per_core,
                 mem,
             )
@@ -1958,7 +1989,7 @@ fn attempt_auto_repro(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
-        .topology(sockets, cores, threads)
+        .topology(llcs, cores, threads)
         .memory_deferred_min(memory_mb)
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
@@ -2440,8 +2471,8 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         Err(e) => {
             eprintln!("ktstr_test: topology from sysfs failed ({e}), using VM spec fallback");
             crate::topology::TestTopology::from_spec(
-                entry.topology.sockets,
-                entry.topology.cores_per_socket,
+                entry.topology.llcs,
+                entry.topology.cores_per_llc,
                 entry.topology.threads_per_core,
             )
         }
@@ -3231,8 +3262,11 @@ fn write_sidecar(
 ) {
     let dir = sidecar_dir();
     let topo = format!(
-        "{}s{}c{}t",
-        entry.topology.sockets, entry.topology.cores_per_socket, entry.topology.threads_per_core,
+        "{}s{}l{}c{}t",
+        entry.topology.numa_nodes,
+        entry.topology.llcs,
+        entry.topology.cores_per_llc,
+        entry.topology.threads_per_core,
     );
     let sched_name = match &entry.scheduler.binary {
         SchedulerSpec::None => "eevdf",
@@ -3287,8 +3321,8 @@ mod tests {
         assert!(entry.is_some(), "registered entry should be found");
         let entry = entry.unwrap();
         assert_eq!(entry.name, "__unit_test_dummy__");
-        assert_eq!(entry.topology.sockets, 1);
-        assert_eq!(entry.topology.cores_per_socket, 2);
+        assert_eq!(entry.topology.llcs, 1);
+        assert_eq!(entry.topology.cores_per_llc, 2);
     }
 
     #[test]
@@ -4642,12 +4676,12 @@ mod tests {
     #[test]
     fn topo_override_fields() {
         let t = TopoOverride {
-            sockets: 2,
+            llcs: 2,
             cores: 4,
             threads: 2,
             memory_mb: 8192,
         };
-        assert_eq!(t.sockets, 2);
+        assert_eq!(t.llcs, 2);
         assert_eq!(t.cores, 4);
         assert_eq!(t.threads, 2);
         assert_eq!(t.memory_mb, 8192);
@@ -4678,9 +4712,10 @@ mod tests {
         cgroup_parent: None,
         sched_args: &[],
         topology: crate::vmm::topology::Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         },
     };
 

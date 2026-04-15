@@ -470,9 +470,10 @@ mod tests {
     #[test]
     fn create_vm_basic() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
@@ -481,18 +482,15 @@ mod tests {
     }
 
     #[test]
-    fn create_vm_multi_socket() {
+    fn create_vm_multi_llc() {
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 256, false);
-        assert!(
-            vm.is_ok(),
-            "multi-socket VM creation failed: {:?}",
-            vm.err()
-        );
+        assert!(vm.is_ok(), "multi-LLC VM creation failed: {:?}", vm.err());
         let vm = vm.unwrap();
         assert_eq!(vm.vcpus.len(), 8);
     }
@@ -500,9 +498,10 @@ mod tests {
     #[test]
     fn create_vm_single_cpu() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false);
         assert!(vm.is_ok());
@@ -512,9 +511,10 @@ mod tests {
     #[test]
     fn create_vm_large_topology() {
         let topo = Topology {
-            sockets: 4,
-            cores_per_socket: 4,
+            llcs: 4,
+            cores_per_llc: 4,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 512, false);
         assert!(vm.is_ok(), "large topology failed: {:?}", vm.err());
@@ -524,9 +524,10 @@ mod tests {
     #[test]
     fn create_vm_odd_topology() {
         let topo = Topology {
-            sockets: 3,
-            cores_per_socket: 3,
+            llcs: 3,
+            cores_per_llc: 3,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "odd topology failed: {:?}", vm.err());
@@ -537,9 +538,10 @@ mod tests {
     fn memory_size_correct() {
         use vm_memory::GuestMemoryRegion;
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
@@ -566,9 +568,10 @@ mod tests {
     #[test]
     fn small_topology_uses_full_irqchip() {
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 4,
+            llcs: 2,
+            cores_per_llc: 4,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         // max APIC ID = apic_id(15) = 1<<3 | 3<<1 | 1 = 15, well under 254
         assert!(max_apic_id(&topo) <= MAX_XAPIC_ID);
@@ -578,15 +581,16 @@ mod tests {
 
     #[test]
     fn large_topology_uses_split_irqchip() {
-        // 15 sockets x 8 cores x 2 threads = 240 vCPUs
+        // 15 LLCs x 8 cores x 2 threads = 240 vCPUs
         // max APIC ID = apic_id(239) = 14<<4 | 7<<1 | 1 = 239, under 254
-        // So try bigger: 14 sockets x 9 cores x 2 threads = 252 vCPUs
+        // So try bigger: 14 LLCs x 9 cores x 2 threads = 252 vCPUs
         // core_bits = bits_needed(9) = 4, thread_bits = 1, core_shift = 5
         // max APIC ID = apic_id(251) = 13<<5 | 8<<1 | 1 = 433
         let topo = Topology {
-            sockets: 14,
-            cores_per_socket: 9,
+            llcs: 14,
+            cores_per_llc: 9,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         assert!(
             max_apic_id(&topo) > MAX_XAPIC_ID,
@@ -613,29 +617,31 @@ mod tests {
     #[test]
     fn split_irqchip_boundary() {
         // Find a topology that is exactly at the boundary.
-        // 8 sockets x 8 cores x 2 threads: core_shift = 4, max APIC ID = 7<<4 | 7<<1 | 1 = 127
+        // 8 LLCs x 8 cores x 2 threads: core_shift = 4, max APIC ID = 7<<4 | 7<<1 | 1 = 127
         let small = Topology {
-            sockets: 8,
-            cores_per_socket: 8,
+            llcs: 8,
+            cores_per_llc: 8,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         assert!(
             max_apic_id(&small) <= MAX_XAPIC_ID,
-            "8s/8c/2t max APIC ID {} should be <= 254",
+            "8l/8c/2t max APIC ID {} should be <= 254",
             max_apic_id(&small),
         );
         let vm = KtstrKvm::new(small, 2048, false).unwrap();
         assert!(!vm.split_irqchip);
 
-        // 15 sockets x 8 cores x 2 threads: core_shift = 4, max APIC ID = 14<<4 | 7<<1 | 1 = 239
+        // 15 LLCs x 8 cores x 2 threads: core_shift = 4, max APIC ID = 14<<4 | 7<<1 | 1 = 239
         let still_small = Topology {
-            sockets: 15,
-            cores_per_socket: 8,
+            llcs: 15,
+            cores_per_llc: 8,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         assert!(
             max_apic_id(&still_small) <= MAX_XAPIC_ID,
-            "15s/8c/2t max APIC ID {} should be <= 254",
+            "15l/8c/2t max APIC ID {} should be <= 254",
             max_apic_id(&still_small),
         );
         let vm = KtstrKvm::new(still_small, 4096, false).unwrap();
@@ -645,9 +651,10 @@ mod tests {
     #[test]
     fn immediate_exit_cap_detected() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT is available since Linux 4.12.
@@ -657,9 +664,10 @@ mod tests {
     #[test]
     fn performance_mode_succeeds() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 128, true);
         assert!(
@@ -672,9 +680,10 @@ mod tests {
     #[test]
     fn performance_mode_does_not_affect_vcpu_count() {
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let vm_normal = KtstrKvm::new(topo, 256, false).unwrap();
         let vm_perf = KtstrKvm::new(topo, 256, true).unwrap();
@@ -689,9 +698,10 @@ mod tests {
     #[test]
     fn non_perf_mode_succeeds_with_halt_poll() {
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(
@@ -725,9 +735,10 @@ mod tests {
         // Verify the get→set→get roundtrip succeeds with
         // performance_mode=true (which enables the TSC check).
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 64, true).unwrap();
         let clock = vm.vm_fd.get_clock().unwrap();
@@ -748,9 +759,10 @@ mod tests {
         // PAUSE (always succeeds) then HLT (may be rejected by
         // mitigate_smt_rsb). Either way, VM creation must succeed.
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 2,
+            llcs: 1,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let vm = KtstrKvm::new(topo, 128, true);
         assert!(

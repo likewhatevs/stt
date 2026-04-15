@@ -239,7 +239,7 @@ fn set_sdt_checksum(buf: &mut [u8]) {
 /// Tables are packed contiguously starting after the RSDP (which is at a
 /// fixed address). Order: DSDT, MADT, FADT, SRAT, SLIT, RSDT, XSDT, RSDP.
 ///
-/// When `shm_size > 0`, SRAT memory affinity for the last socket is reduced
+/// When `shm_size > 0`, SRAT memory affinity for the last NUMA node is reduced
 /// so the SHM region at the top of guest physical memory is excluded.
 pub fn setup_acpi(
     mem: &GuestMemoryMmap,
@@ -248,7 +248,7 @@ pub fn setup_acpi(
     shm_size: u64,
 ) -> Result<AcpiLayout> {
     let num_cpus = topo.total_cpus();
-    let num_sockets = topo.sockets;
+    let num_numa_nodes = topo.numa_nodes;
 
     // Compute table sizes.
     let dsdt_size: u64 = 36;
@@ -257,11 +257,13 @@ pub fn setup_acpi(
 
     let fadt_size: u64 = 276;
 
+    // SRAT: one CPU affinity entry per vCPU, one memory affinity entry per NUMA node.
     let srat_size: u64 =
         (48 + std::mem::size_of::<SratCpuAffinity>() as u32 * num_cpus
-            + std::mem::size_of::<SratMemAffinity>() as u32 * num_sockets) as u64;
+            + std::mem::size_of::<SratMemAffinity>() as u32 * num_numa_nodes) as u64;
 
-    let n = num_sockets as u64;
+    // SLIT: NxN distance matrix where N = NUMA node count.
+    let n = num_numa_nodes as u64;
     let slit_size: u64 = 36 + 8 + n * n;
 
     // RSDT: 36-byte header + 4 x 32-bit pointers
@@ -410,11 +412,11 @@ fn write_srat(
     addr: u64,
 ) -> Result<()> {
     let num_cpus = topo.total_cpus();
-    let num_sockets = topo.sockets;
+    let num_numa_nodes = topo.numa_nodes;
 
     let len = 48
         + std::mem::size_of::<SratCpuAffinity>() as u32 * num_cpus
-        + std::mem::size_of::<SratMemAffinity>() as u32 * num_sockets;
+        + std::mem::size_of::<SratMemAffinity>() as u32 * num_numa_nodes;
     let mut buf = vec![0u8; len as usize];
 
     let hdr = SdtHeader::new(b"SRAT", len, 3);
@@ -423,12 +425,14 @@ fn write_srat(
 
     let mut offset = 48;
 
+    // CPU affinity: each vCPU maps to the NUMA node that owns its LLC.
     for cpu_id in 0..num_cpus {
-        let (socket_id, _, _) = topo.decompose(cpu_id);
+        let (llc_id, _, _) = topo.decompose(cpu_id);
+        let node_id = topo.numa_node_of(llc_id);
         let entry = SratCpuAffinity {
             entry_type: 2,
             length: std::mem::size_of::<SratCpuAffinity>() as u8,
-            proximity_domain: socket_id,
+            proximity_domain: node_id,
             x2apic_id: apic_id(topo, cpu_id),
             flags: 1,
             ..Default::default()
@@ -438,21 +442,22 @@ fn write_srat(
         offset += bytes.len();
     }
 
+    // Memory affinity: one entry per NUMA node, memory split evenly.
     let mem_bytes = (memory_mb as u64) << 20;
     let usable_bytes = mem_bytes - shm_size;
-    let per_socket = usable_bytes / num_sockets as u64;
-    for socket in 0..num_sockets {
-        let base = socket as u64 * per_socket;
-        let length = if socket == num_sockets - 1 {
+    let per_node = usable_bytes / num_numa_nodes as u64;
+    for node in 0..num_numa_nodes {
+        let base = node as u64 * per_node;
+        let length = if node == num_numa_nodes - 1 {
             usable_bytes - base
         } else {
-            per_socket
+            per_node
         };
         let entry = SratMemAffinity {
             entry_type: 1,
             length: std::mem::size_of::<SratMemAffinity>() as u8,
-            proximity_domain_lo: socket as u16,
-            proximity_domain_hi: (socket >> 16) as u16,
+            proximity_domain_lo: node as u16,
+            proximity_domain_hi: (node >> 16) as u16,
             base_address: base,
             address_length: length,
             flags: 1,
@@ -470,7 +475,7 @@ fn write_srat(
 }
 
 fn write_slit(mem: &GuestMemoryMmap, topo: &Topology, addr: u64) -> Result<()> {
-    let n = topo.sockets as u64;
+    let n = topo.numa_nodes as u64;
     let len = 36 + 8 + n * n;
     let mut buf = vec![0u8; len as usize];
 
@@ -696,9 +701,10 @@ mod tests {
     fn rsdp_signature_and_checksum() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut rsdp = [0u8; 20];
@@ -713,9 +719,10 @@ mod tests {
     fn rsdt_signature_and_checksum() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let rsdt = read_table(&mem, l.rsdt_addr);
@@ -728,9 +735,10 @@ mod tests {
     fn madt_signature_and_checksum() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -743,9 +751,10 @@ mod tests {
     fn madt_has_correct_cpu_count() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 4,
+            llcs: 2,
+            cores_per_llc: 4,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -761,9 +770,10 @@ mod tests {
     fn madt_apic_ids_match_topology() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -791,9 +801,10 @@ mod tests {
     fn madt_has_ioapic() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -811,9 +822,10 @@ mod tests {
     fn rsdp_points_to_rsdt() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut rsdp = [0u8; 20];
@@ -829,9 +841,10 @@ mod tests {
     fn rsdt_points_to_fadt_and_madt() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut entry = [0u8; 4];
@@ -847,9 +860,10 @@ mod tests {
     fn madt_has_iso_irq0_gsi2() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -863,9 +877,10 @@ mod tests {
     fn madt_has_nmi() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -877,9 +892,10 @@ mod tests {
     fn small_topology_uses_lapic_entries() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 4,
+            llcs: 2,
+            cores_per_llc: 4,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -894,9 +910,10 @@ mod tests {
     fn large_topology_uses_mixed_entries() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 14,
-            cores_per_socket: 9,
+            llcs: 14,
+            cores_per_llc: 9,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let mut has_low = false;
         let mut has_high = false;
@@ -925,9 +942,10 @@ mod tests {
     fn x2apic_nmi_fields_correct() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 14,
-            cores_per_socket: 9,
+            llcs: 14,
+            cores_per_llc: 9,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -946,9 +964,10 @@ mod tests {
     fn lapic_nmi_fields_correct() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -964,29 +983,30 @@ mod tests {
     fn madt_checksum_representative_topologies() {
         let topos = [
             (1, 1, 1),   // degenerate single CPU
-            (2, 1, 1),   // minimal multi-socket
+            (2, 1, 1),   // minimal multi-LLC
             (3, 3, 1),   // odd non-power-of-2
             (1, 1, 2),   // minimal SMT
-            (2, 4, 2),   // standard multi-socket with SMT
+            (2, 4, 2),   // standard multi-LLC with SMT
             (7, 5, 3),   // all dimensions non-power-of-2
             (15, 16, 1), // large scale no SMT
             (14, 9, 2),  // large with SMT, mixed LAPIC/x2APIC
             (2, 128, 1), // x2APIC boundary (max APIC ID = 255)
             (14, 18, 1), // large no SMT, mixed LAPIC/x2APIC
         ];
-        for (sockets, cores, threads) in topos {
+        for (llcs, cores, threads) in topos {
             let mem = test_mem(16);
             let topo = Topology {
-                sockets,
-                cores_per_socket: cores,
+                llcs,
+                cores_per_llc: cores,
                 threads_per_core: threads,
+                numa_nodes: 1,
             };
             let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
             let madt = read_madt(&mem, &l);
             let sum: u8 = madt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
             assert_eq!(
                 sum, 0,
-                "MADT checksum failed for {sockets}s/{cores}c/{threads}t"
+                "MADT checksum failed for {llcs}l/{cores}c/{threads}t"
             );
             let entries = walk_madt_entries(&madt);
             let cpu_count = entries
@@ -1000,12 +1020,13 @@ mod tests {
 
     #[test]
     fn cpu_entry_type_matches_apic_id() {
-        for (sockets, cores, threads) in [(1, 4, 1), (2, 2, 2), (15, 8, 2), (14, 9, 2)] {
+        for (llcs, cores, threads) in [(1, 4, 1), (2, 2, 2), (15, 8, 2), (14, 9, 2)] {
             let mem = test_mem(16);
             let topo = Topology {
-                sockets,
-                cores_per_socket: cores,
+                llcs,
+                cores_per_llc: cores,
                 threads_per_core: threads,
+                numa_nodes: 1,
             };
             let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
             let madt = read_madt(&mem, &l);
@@ -1035,9 +1056,10 @@ mod tests {
     fn madt_entry_lengths_valid() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 14,
-            cores_per_socket: 9,
+            llcs: 14,
+            cores_per_llc: 9,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -1060,9 +1082,10 @@ mod tests {
     fn madt_total_length_matches_entries() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 14,
-            cores_per_socket: 9,
+            llcs: 14,
+            cores_per_llc: 9,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -1080,9 +1103,10 @@ mod tests {
     fn cpu_flags_enabled() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 2,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -1100,9 +1124,10 @@ mod tests {
     fn rsdp_rev2_structure() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut rsdp = [0u8; 36];
@@ -1129,9 +1154,10 @@ mod tests {
     fn xsdt_signature_and_checksum() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let xsdt = read_table(&mem, l.xsdt_addr);
@@ -1145,9 +1171,10 @@ mod tests {
     fn xsdt_points_to_fadt_and_madt() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut entry = [0u8; 8];
@@ -1163,9 +1190,10 @@ mod tests {
     fn fadt_signature_and_checksum() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut fadt = [0u8; 276];
@@ -1182,9 +1210,10 @@ mod tests {
     fn fadt_hw_reduced_flags() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut fadt = [0u8; 276];
@@ -1200,9 +1229,10 @@ mod tests {
     fn fadt_minor_version() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut fadt = [0u8; 276];
@@ -1215,9 +1245,10 @@ mod tests {
     fn fadt_dsdt_pointers() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut fadt = [0u8; 276];
@@ -1237,9 +1268,10 @@ mod tests {
     fn dsdt_signature_and_checksum() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut dsdt = [0u8; 36];
@@ -1255,9 +1287,10 @@ mod tests {
     fn rsdp_points_to_xsdt() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 1,
-            cores_per_socket: 1,
+            llcs: 1,
+            cores_per_llc: 1,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut rsdp = [0u8; 36];
@@ -1270,12 +1303,13 @@ mod tests {
     }
 
     #[test]
-    fn srat_shm_reduces_last_socket_memory() {
+    fn srat_shm_reduces_last_node_memory() {
         let mem = test_mem(16);
         let topo = Topology {
-            sockets: 2,
-            cores_per_socket: 2,
+            llcs: 2,
+            cores_per_llc: 2,
             threads_per_core: 1,
+            numa_nodes: 1,
         };
         let shm_size: u64 = 64 * 1024;
         let l = setup_acpi(&mem, &topo, 256, shm_size).unwrap();

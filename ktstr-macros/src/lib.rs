@@ -13,7 +13,7 @@ fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenStream {
 }
 
 /// Default topology and memory for ktstr_test-annotated functions.
-const DEFAULT_SOCKETS: u32 = 1;
+const DEFAULT_LLCS: u32 = 1;
 const DEFAULT_CORES: u32 = 2;
 const DEFAULT_THREADS: u32 = 1;
 const DEFAULT_MEMORY_MB: u32 = 2048;
@@ -29,7 +29,7 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///    inside it.
 ///
 /// Optional attributes (all with defaults):
-///   - `sockets = N` (default: inherited from scheduler, or 1)
+///   - `llcs = N` / `sockets = N` (default: inherited from scheduler, or 1)
 ///   - `cores = N` (default: inherited from scheduler, or 2)
 ///   - `threads = N` (default: inherited from scheduler, or 1)
 ///   - `memory_mb = N` (default: 2048)
@@ -49,10 +49,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let name_str = orig_name.to_string();
 
     // Parse attributes
-    let mut sockets = DEFAULT_SOCKETS;
+    let mut llcs = DEFAULT_LLCS;
     let mut cores = DEFAULT_CORES;
     let mut threads = DEFAULT_THREADS;
-    let mut sockets_set = false;
+    let mut llcs_set = false;
     let mut cores_set = false;
     let mut threads_set = false;
     let mut memory_mb = DEFAULT_MEMORY_MB;
@@ -78,7 +78,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut extra_sched_args: Vec<String> = Vec::new();
     let mut required_flags: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut excluded_flags: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut min_sockets: u32 = 1;
+    let mut min_numa_nodes: u32 = 1;
     let mut min_llcs: u32 = 1;
     let mut requires_smt: bool = false;
     let mut min_cpus: u32 = 1;
@@ -163,6 +163,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     }
                     "sockets"
+                    | "llcs"
                     | "cores"
                     | "threads"
                     | "memory_mb"
@@ -174,6 +175,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "workers_per_cgroup"
                     | "max_local_dsq_depth"
                     | "min_sockets"
+                    | "min_numa_nodes"
                     | "min_llcs"
                     | "min_cpus"
                     | "max_p99_wake_latency_ns" => {
@@ -189,11 +191,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         };
                         match ident.as_str() {
-                            "sockets" => {
-                                sockets = lit_int
+                            "sockets" | "llcs" => {
+                                llcs = lit_int
                                     .base10_parse::<u32>()
                                     .unwrap_or_else(|e| panic!("{e}"));
-                                sockets_set = true;
+                                llcs_set = true;
                             }
                             "cores" => {
                                 cores = lit_int
@@ -253,8 +255,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         .unwrap_or_else(|e| panic!("{e}")),
                                 )
                             }
-                            "min_sockets" => {
-                                min_sockets = lit_int
+                            "min_sockets" | "min_numa_nodes" => {
+                                min_numa_nodes = lit_int
                                     .base10_parse::<u32>()
                                     .unwrap_or_else(|e| panic!("{e}"))
                             }
@@ -391,7 +393,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
+                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
                         )
                         .to_compile_error()
                         .into();
@@ -407,8 +409,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Reject zero values at compile time (only for explicitly set values).
-    if sockets_set && sockets == 0 {
-        return syn::Error::new(proc_macro2::Span::call_site(), "sockets must be > 0")
+    if llcs_set && llcs == 0 {
+        return syn::Error::new(proc_macro2::Span::call_site(), "llcs must be > 0")
             .to_compile_error()
             .into();
     }
@@ -447,20 +449,20 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // the scheduler's topology when not explicitly set. Scheduler
     // topology fields are const, so field access is valid in static
     // initializers.
-    let sockets_tokens = if sockets_set {
-        let s = sockets;
-        quote! { #s }
+    let llcs_tokens = if llcs_set {
+        let l = llcs;
+        quote! { #l }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology.sockets }
+        quote! { #p.topology.llcs }
     } else {
-        let s = sockets;
-        quote! { #s }
+        let l = llcs;
+        quote! { #l }
     };
     let cores_tokens = if cores_set {
         let c = cores;
         quote! { #c }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology.cores_per_socket }
+        quote! { #p.topology.cores_per_llc }
     } else {
         let c = cores;
         quote! { #c }
@@ -476,9 +478,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let topology_tokens = quote! {
         ::ktstr::test_support::Topology {
-            sockets: #sockets_tokens,
-            cores_per_socket: #cores_tokens,
+            llcs: #llcs_tokens,
+            cores_per_llc: #cores_tokens,
             threads_per_core: #threads_tokens,
+            numa_nodes: 1,
         }
     };
 
@@ -540,7 +543,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             func: #inner_name,
             topology: #topology_tokens,
             constraints: ::ktstr::test_support::TopologyConstraints {
-                min_sockets: #min_sockets,
+                min_numa_nodes: #min_numa_nodes,
                 min_llcs: #min_llcs,
                 requires_smt: #requires_smt,
                 min_cpus: #min_cpus,
@@ -647,7 +650,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// |---|---|---|
 /// | `name = "..."` | yes | Scheduler name passed to `Scheduler::new()` |
 /// | `binary = "..."` | no | Binary name for `SchedulerSpec::Name(...)`. Omit for EEVDF. |
-/// | `topology(S, C, T)` | no | Default VM topology `(sockets, cores, threads)`. Defaults to `(1, 2, 1)`. |
+/// | `topology(L, C, T)` | no | Default VM topology `(llcs, cores, threads)`. Defaults to `(1, 2, 1)`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path. |
 /// | `sched_args = [...]` | no | Default scheduler CLI args. |
 ///
@@ -738,13 +741,13 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
             } else if meta.path.is_ident("topology") {
                 let content;
                 syn::parenthesized!(content in meta.input);
-                let sockets: syn::LitInt = content.parse()?;
+                let llcs_lit: syn::LitInt = content.parse()?;
                 let _: syn::Token![,] = content.parse()?;
                 let cores: syn::LitInt = content.parse()?;
                 let _: syn::Token![,] = content.parse()?;
                 let threads: syn::LitInt = content.parse()?;
                 sched_topology = Some((
-                    sockets.base10_parse()?,
+                    llcs_lit.base10_parse()?,
                     cores.base10_parse()?,
                     threads.base10_parse()?,
                 ));

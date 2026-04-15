@@ -353,19 +353,19 @@ impl TestTopology {
         ranges.join(",")
     }
 
-    /// Build a topology from a VM spec (sockets x cores x threads).
+    /// Build a topology from a VM spec (LLCs x cores x threads).
     ///
-    /// One LLC per socket, one NUMA node per socket, CPUs numbered
+    /// One LLC per group, one NUMA node per LLC, CPUs numbered
     /// sequentially. Used as a fallback when sysfs is incomplete
     /// inside a guest VM.
-    pub fn from_spec(sockets: u32, cores: u32, threads: u32) -> Self {
-        let total = (sockets * cores * threads) as usize;
-        let cpus_per_socket = (cores * threads) as usize;
+    pub fn from_spec(llcs: u32, cores: u32, threads: u32) -> Self {
+        let total = (llcs * cores * threads) as usize;
+        let cpus_per_llc = (cores * threads) as usize;
         let cpus: Vec<usize> = (0..total).collect();
-        let llcs: Vec<LlcInfo> = (0..sockets as usize)
-            .map(|s| {
-                let start = s * cpus_per_socket;
-                let end = start + cpus_per_socket;
+        let llc_infos: Vec<LlcInfo> = (0..llcs as usize)
+            .map(|l| {
+                let start = l * cpus_per_llc;
+                let end = start + cpus_per_llc;
                 let mut core_map = BTreeMap::new();
                 for c in 0..cores as usize {
                     let base = start + c * threads as usize;
@@ -374,16 +374,16 @@ impl TestTopology {
                 }
                 LlcInfo {
                     cpus: (start..end).collect(),
-                    numa_node: s,
+                    numa_node: l,
                     cache_size_kb: None,
                     cores: core_map,
                 }
             })
             .collect();
-        let numa_nodes = (0..sockets as usize).collect();
+        let numa_nodes = (0..llcs as usize).collect();
         Self {
             cpus,
-            llcs,
+            llcs: llc_infos,
             numa_nodes,
         }
     }
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_single_socket() {
+    fn from_spec_single_llc() {
         let t = TestTopology::from_spec(1, 4, 2);
         assert_eq!(t.total_cpus(), 8);
         assert_eq!(t.num_llcs(), 1);
@@ -504,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_multi_socket() {
+    fn from_spec_multi_llc() {
         let t = TestTopology::from_spec(2, 4, 2);
         assert_eq!(t.total_cpus(), 16);
         assert_eq!(t.num_llcs(), 2);
@@ -598,13 +598,13 @@ mod tests {
     /// 0x8000001D was not patched, and the test panicked indexing
     /// llc_sets[1].
     #[test]
-    fn split_by_llc_two_socket_regression() {
+    fn split_by_llc_two_llc_regression() {
         let t = TestTopology::from_spec(2, 4, 1);
         assert_eq!(t.total_cpus(), 8);
         assert_eq!(t.num_llcs(), 2);
 
         let splits = t.split_by_llc();
-        assert_eq!(splits.len(), 2, "2-socket topology must produce 2 LLC sets");
+        assert_eq!(splits.len(), 2, "2-LLC topology must produce 2 LLC sets");
 
         // Sets must be disjoint
         let overlap: BTreeSet<usize> = splits[0].intersection(&splits[1]).copied().collect();
@@ -617,7 +617,7 @@ mod tests {
         let union: BTreeSet<usize> = splits[0].union(&splits[1]).copied().collect();
         assert_eq!(union, t.all_cpuset(), "LLC sets must cover all CPUs");
 
-        // Each set has 4 CPUs (4 cores per socket, 1 thread)
+        // Each set has 4 CPUs (4 cores per LLC, 1 thread)
         assert_eq!(splits[0].len(), 4);
         assert_eq!(splits[1].len(), 4);
 
