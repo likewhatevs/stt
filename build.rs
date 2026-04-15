@@ -196,12 +196,19 @@ int main(void) {{
         // Download and extract busybox source tarball.
         if !busybox_src.join("Makefile").exists() {
             let url = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
-            let resp = reqwest::blocking::get(url)
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("build http client");
+            let resp = client
+                .get(url)
+                .send()
                 .and_then(|r| r.error_for_status())
                 .unwrap_or_else(|e| {
                     panic!(
-                        "failed to download busybox tarball from {url} — \
-                         check network connectivity. First build requires internet access: {e}"
+                        "failed to download busybox tarball from {url} (10s timeout). \
+                         Check network connectivity or retry. First build requires \
+                         internet access: {e}"
                     )
                 });
             let gz = flate2::read::GzDecoder::new(resp);
