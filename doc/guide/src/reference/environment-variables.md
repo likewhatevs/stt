@@ -16,7 +16,6 @@ Environment variables that control ktstr behavior.
 | `KTSTR_VERBOSE` | Set to `"1"` for verbose VM console output (`earlyprintk`, `loglevel=7`). | None |
 | `RUST_BACKTRACE` | Gates verbose diagnostic output on failure. Also enables verbose VM console output (same as `KTSTR_VERBOSE=1`) when set to `"1"` or `"full"`. Propagated to the guest. | None |
 | `RUST_LOG` | Controls tracing filter for guest-side logging. Propagated to the VM kernel command line and parsed by the guest tracing subscriber. | None |
-| `LINUX_ROOT` | Path to a Linux source tree containing `vmlinux` for BTF monitor tests. | None |
 
 ## LLVM coverage
 

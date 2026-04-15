@@ -158,37 +158,19 @@ pub fn sample_looks_valid(sample: &MonitorSample) -> bool {
 
 /// Find a vmlinux for tests.
 ///
-/// Resolution order (first match wins):
-/// 1. `LINUX_ROOT` env var — joined with `/vmlinux`, or used directly if
-///    the path itself is a file named `vmlinux`.
-/// 2. `./linux/vmlinux` (workspace-local kernel).
-/// 3. `../linux/vmlinux` (sibling directory).
-/// 4. `/sys/kernel/btf/vmlinux` (host kernel raw BTF — no ELF symbols).
+/// Delegates to [`crate::kernel_path::resolve_btf`] so tests use the
+/// same kernel resolution as the rest of ktstr.
+///
+/// Resolution order (first directory with a `vmlinux` wins):
+/// 1. `KTSTR_KERNEL` env var
+/// 2. `./linux`
+/// 3. `../linux`
+/// 4. `/lib/modules/{release}/build`
+/// 5. `/sys/kernel/btf/vmlinux` (host kernel raw BTF — no ELF symbols)
 #[cfg(test)]
 pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
-    if let Ok(root) = std::env::var("LINUX_ROOT") {
-        let p = std::path::Path::new(&root).join("vmlinux");
-        if p.exists() {
-            return Some(p);
-        }
-        let p = std::path::PathBuf::from(&root);
-        if p.exists() && p.file_name().is_some_and(|n| n == "vmlinux") {
-            return Some(p);
-        }
-    }
-    let p = std::path::Path::new("linux/vmlinux");
-    if p.exists() {
-        return Some(p.to_path_buf());
-    }
-    let p = std::path::Path::new("../linux/vmlinux");
-    if p.exists() {
-        return Some(p.to_path_buf());
-    }
-    let p = std::path::Path::new("/sys/kernel/btf/vmlinux");
-    if p.exists() {
-        return Some(p.to_path_buf());
-    }
-    None
+    let kernel_dir = std::env::var("KTSTR_KERNEL").ok();
+    crate::kernel_path::resolve_btf(kernel_dir.as_deref())
 }
 
 /// Collected monitor data from a VM run.
