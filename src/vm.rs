@@ -126,7 +126,9 @@ pub struct TopoPreset {
 /// Topology presets used by gauntlet mode.
 ///
 /// Ranges from `tiny-1llc` (4 CPUs) to `max-cpu` (252 CPUs, near
-/// the KVM vCPU limit). On aarch64, presets with SMT
+/// the KVM vCPU limit). Includes multi-NUMA presets (`numa2-*`,
+/// `numa4-*`) for cross-node scheduling; filtered by default
+/// (`max_numa_nodes: Some(1)`). On aarch64, presets with SMT
 /// (`threads_per_core > 1`) are excluded because ARM64 CPUs do not
 /// have SMT. Non-SMT medium/large/max presets ensure ARM64 still
 /// gets full topology scale coverage.
@@ -222,7 +224,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
         ),
         (
             "numa2-8llc",
-            "128 CPUs, 2 NUMA nodes, 8 LLCs with SMT",
+            "128 CPUs, 2 NUMA nodes, 8 LLCs",
             2,
             8,
             8,
@@ -249,7 +251,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
         ),
         (
             "numa4-12llc",
-            "192 CPUs, 4 NUMA nodes, 12 LLCs with SMT",
+            "192 CPUs, 4 NUMA nodes, 12 LLCs",
             4,
             12,
             8,
@@ -463,6 +465,11 @@ mod tests {
             ("numa4-12llc", 12, 192),
         ];
         let presets = gauntlet_presets();
+        assert_eq!(
+            expected.len(),
+            presets.len(),
+            "pinned list and preset list have different lengths"
+        );
         for &(name, llcs, cpus) in expected {
             let p = presets.iter().find(|p| p.name == name).unwrap();
             assert_eq!(
@@ -578,6 +585,25 @@ mod tests {
                     "{}: odd-* presets must have odd LLC count, got {} LLCs",
                     p.name,
                     p.topology.llcs
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gauntlet_presets_numa_presets_have_correct_nodes() {
+        for p in &gauntlet_presets() {
+            if p.name.starts_with("numa2") {
+                assert_eq!(
+                    p.topology.numa_nodes, 2,
+                    "{}: expected 2 NUMA nodes",
+                    p.name
+                );
+            } else if p.name.starts_with("numa4") {
+                assert_eq!(
+                    p.topology.numa_nodes, 4,
+                    "{}: expected 4 NUMA nodes",
+                    p.name
                 );
             }
         }
