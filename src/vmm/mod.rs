@@ -3988,8 +3988,7 @@ impl KtstrVmBuilder {
             }));
         }
 
-        let plan =
-            acquire_slot_with_locks(&host_topo, t.llcs, t.cores_per_llc, t.threads_per_core)?;
+        let plan = acquire_slot_with_locks(&host_topo, t)?;
 
         // WARN: hugepages (only when memory is known upfront).
         if let Some(mb) = self.memory_mb {
@@ -4031,24 +4030,21 @@ impl KtstrVmBuilder {
 /// rely on nextest retry backoff for contention resolution.
 fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
-    llcs: u32,
-    cores_per_llc: u32,
-    threads_per_core: u32,
+    topo: &topology::Topology,
 ) -> Result<host_topology::PinningPlan> {
     let num_llcs = host_topo.llc_groups.len();
-    let llcs_needed = llcs as usize;
+    let llcs_needed = topo.llcs as usize;
     let max_slots = num_llcs.checked_div(llcs_needed).unwrap_or(num_llcs).max(1);
     let llc_mode = host_topology::LlcLockMode::Exclusive;
 
     for slot in 0..max_slots {
         let offset = slot * llcs_needed;
-        let llc_indices: Vec<usize> = (offset..offset + llcs_needed).collect();
 
         let candidate = host_topo
-            .compute_pinning(llcs, cores_per_llc, threads_per_core, true, offset)
+            .compute_pinning(topo, true, offset)
             .context("performance_mode: topology mapping")?;
 
-        match host_topology::acquire_resource_locks(&candidate, &llc_indices, llc_mode)? {
+        match host_topology::acquire_resource_locks(&candidate, &candidate.llc_indices, llc_mode)? {
             host_topology::LockOutcome::Acquired { locks, .. } => {
                 let mut plan = candidate;
                 plan.locks = locks;

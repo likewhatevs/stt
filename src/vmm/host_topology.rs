@@ -49,6 +49,8 @@ pub struct PinningPlan {
     /// Dedicated host CPU for monitor/watchdog threads. Set when
     /// `reserve_service_cpu` is true in `compute_pinning`.
     pub service_cpu: Option<usize>,
+    /// Host LLC group indices used by this plan, sorted.
+    pub llc_indices: Vec<usize>,
     /// Held flock fds for resource reservation. Dropped when the plan
     /// (and the KtstrVm holding it) is dropped, releasing all locks.
     #[allow(dead_code)]
@@ -101,6 +103,23 @@ impl HostTopology {
         self.online_cpus.len()
     }
 
+    /// NUMA node for a host LLC group, determined by majority vote of
+    /// its CPUs' NUMA assignments. Returns 0 when the map is empty
+    /// (single-node systems).
+    pub fn llc_numa_node(&self, llc_idx: usize) -> usize {
+        let group = &self.llc_groups[llc_idx];
+        let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for &cpu in &group.cpus {
+            let node = self.cpu_to_node.get(&cpu).copied().unwrap_or(0);
+            *counts.entry(node).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(_, count)| count)
+            .map(|(node, _)| node)
+            .unwrap_or(0)
+    }
+
     /// Compute a pinning plan that maps virtual LLCs to physical LLC groups.
     ///
     /// Each virtual LLC's vCPUs are assigned to cores within a single physical LLC.
@@ -108,15 +127,21 @@ impl HostTopology {
     /// different physical cores. When `reserve_service_cpu` is true, one
     /// additional host CPU is reserved for service threads (monitor, watchdog).
     ///
+    /// When `topo.numa_nodes > 1`, virtual LLCs are grouped by guest NUMA
+    /// node and each group is placed on host LLCs within the same physical
+    /// NUMA node. Falls back to sequential placement when the host lacks
+    /// enough NUMA-aligned LLCs.
+    ///
     /// Returns an error if the host cannot satisfy the topology.
     pub fn compute_pinning(
         &self,
-        llcs: u32,
-        cores: u32,
-        threads: u32,
+        topo: &super::topology::Topology,
         reserve_service_cpu: bool,
         llc_offset: usize,
     ) -> Result<PinningPlan> {
+        let cores = topo.cores_per_llc;
+        let threads = topo.threads_per_core;
+        let llcs = topo.llcs;
         let vcpus_per_llc = cores * threads;
         let total_vcpus = llcs * vcpus_per_llc;
         let total_needed = total_vcpus as usize + if reserve_service_cpu { 1 } else { 0 };
@@ -141,11 +166,16 @@ impl HostTopology {
             num_llcs,
         );
 
+        // Build the virtual-to-host LLC index mapping. When numa_nodes > 1,
+        // try to place each guest NUMA node's LLCs on host LLCs within
+        // the same physical NUMA node.
+        let llc_order = self.numa_aware_llc_order(topo.numa_nodes, llcs, llc_offset);
+
         let mut assignments = Vec::with_capacity(total_vcpus as usize);
         let mut used_cpus = std::collections::HashSet::new();
 
         for llc in 0..llcs {
-            let llc_idx = (llc as usize + llc_offset) % num_llcs;
+            let llc_idx = llc_order[llc as usize];
             let group = &self.llc_groups[llc_idx];
             let available: Vec<usize> = group
                 .cpus
@@ -189,11 +219,80 @@ impl HostTopology {
             None
         };
 
+        // Deduplicate LLC indices (multiple virtual LLCs may map to the
+        // same host LLC at different offsets, but that's prevented by the
+        // used_cpus check above — each virtual LLC consumes distinct CPUs).
+        let mut llc_indices = llc_order;
+        llc_indices.sort_unstable();
+        llc_indices.dedup();
+
         Ok(PinningPlan {
             assignments,
             service_cpu,
+            llc_indices,
             locks: Vec::new(),
         })
+    }
+
+    /// Build the virtual LLC to host LLC index mapping.
+    ///
+    /// When `numa_nodes <= 1`, falls back to sequential offset mapping
+    /// (original behavior). When `numa_nodes > 1`, groups host LLCs by
+    /// their physical NUMA node and assigns each guest NUMA node's LLCs
+    /// to host LLCs on the same physical node. Falls back to sequential
+    /// mapping when the host lacks enough NUMA-aligned LLCs.
+    fn numa_aware_llc_order(&self, numa_nodes: u32, llcs: u32, llc_offset: usize) -> Vec<usize> {
+        let num_host_llcs = self.llc_groups.len();
+
+        if numa_nodes <= 1 || self.cpu_to_node.is_empty() {
+            // Sequential offset mapping (original behavior).
+            return (0..llcs as usize)
+                .map(|i| (i + llc_offset) % num_host_llcs)
+                .collect();
+        }
+
+        let llcs_per_node = llcs / numa_nodes;
+
+        // Group host LLC indices by their physical NUMA node.
+        let mut host_node_llcs: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for idx in 0..num_host_llcs {
+            let node = self.llc_numa_node(idx);
+            host_node_llcs.entry(node).or_default().push(idx);
+        }
+
+        // Collect host NUMA nodes that have enough LLCs for one guest
+        // NUMA node's worth.
+        let eligible_nodes: Vec<(usize, &Vec<usize>)> = host_node_llcs
+            .iter()
+            .filter(|(_, llcs_vec)| llcs_vec.len() >= llcs_per_node as usize)
+            .map(|(&node, llcs_vec)| (node, llcs_vec))
+            .collect();
+
+        // Need at least numa_nodes distinct host NUMA nodes with enough
+        // LLCs each.
+        if eligible_nodes.len() < numa_nodes as usize {
+            // Fall back to sequential offset mapping.
+            return (0..llcs as usize)
+                .map(|i| (i + llc_offset) % num_host_llcs)
+                .collect();
+        }
+
+        // Assign guest NUMA nodes to host NUMA nodes, rotating by
+        // llc_offset to spread concurrent VMs.
+        let mut order = Vec::with_capacity(llcs as usize);
+        let node_offset = llc_offset / llcs_per_node.max(1) as usize;
+        for guest_node in 0..numa_nodes {
+            let host_idx = (guest_node as usize + node_offset) % eligible_nodes.len();
+            let (_, host_llcs) = &eligible_nodes[host_idx];
+            let within_offset = llc_offset % host_llcs.len();
+            for i in 0..llcs_per_node as usize {
+                let llc_idx = host_llcs[(i + within_offset) % host_llcs.len()];
+                order.push(llc_idx);
+            }
+        }
+
+        order
     }
 }
 
@@ -449,7 +548,7 @@ fn discover_cpu_numa_nodes(online_cpus: &[usize]) -> std::collections::HashMap<u
 }
 
 /// Bind a memory region to specific NUMA nodes using `mbind(MPOL_BIND)`.
-/// `nodes` is the set of NUMA node IDs. Falls back silently on error
+/// `nodes` is the set of NUMA node IDs. Logs a warning on error
 /// (single-node systems, missing capabilities).
 pub fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
     if nodes.is_empty() || len == 0 {
@@ -473,7 +572,7 @@ pub fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
             MPOL_BIND,
             nodemask.as_ptr(),
             mask_bits as libc::c_ulong,
-            0u32, // flags: 0 = apply to future allocations
+            0u32, // flags: 0 = policy applies to future allocations only, existing pages not moved
         )
     };
     if rc == 0 {
@@ -527,6 +626,7 @@ pub fn host_load_estimate() -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmm::topology::Topology;
 
     #[test]
     fn parse_cpu_list_range() {
@@ -571,7 +671,7 @@ mod tests {
         if topo.total_cpus() < 2 {
             return; // skip on single-CPU hosts
         }
-        let plan = topo.compute_pinning(1, 2, 1, false, 0);
+        let plan = topo.compute_pinning(&Topology::new(1, 1, 2, 1), false, 0);
         assert!(plan.is_ok(), "pinning should succeed: {:?}", plan.err());
         let plan = plan.unwrap();
         assert_eq!(plan.assignments.len(), 2);
@@ -585,7 +685,7 @@ mod tests {
     fn pinning_plan_oversubscribed() {
         let topo = HostTopology::from_sysfs().unwrap();
         let too_many = topo.total_cpus() as u32 + 1;
-        let plan = topo.compute_pinning(1, too_many, 1, false, 0);
+        let plan = topo.compute_pinning(&Topology::new(1, 1, too_many, 1), false, 0);
         assert!(plan.is_err());
     }
 
@@ -672,7 +772,9 @@ mod tests {
     fn mapping_single_llc() {
         // 1 LLC with 4 CPUs, request 1 LLC x 2 cores x 1 thread.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
-        let plan = topo.compute_pinning(1, 2, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 2, 1), false, 0)
+            .unwrap();
         assert_eq!(plan.assignments.len(), 2);
         assert_eq!(plan.assignments[0], (0, 0));
         assert_eq!(plan.assignments[1], (1, 1));
@@ -682,7 +784,9 @@ mod tests {
     fn mapping_two_llcs() {
         // 2 LLCs, each with 4 CPUs. Request 2l2c1t.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
-        let plan = topo.compute_pinning(2, 2, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), false, 0)
+            .unwrap();
         assert_eq!(plan.assignments.len(), 4);
         // LLC 0 vCPUs (0,1) should map to LLC group 0 CPUs (0,1).
         assert_eq!(plan.assignments[0], (0, 0));
@@ -696,7 +800,9 @@ mod tests {
     fn mapping_with_smt() {
         // 1 LLC with 8 CPUs, request 1l2c2t = 4 vCPUs.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]);
-        let plan = topo.compute_pinning(1, 2, 2, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 2, 2), false, 0)
+            .unwrap();
         assert_eq!(plan.assignments.len(), 4);
         // All 4 vCPUs map to distinct CPUs within the same LLC.
         let cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
@@ -708,7 +814,9 @@ mod tests {
     fn mapping_exact_fit() {
         // 2 LLCs with exactly 2 CPUs each, request 2l2c1t = 4 total.
         let topo = synthetic_topo(vec![vec![0, 1], vec![2, 3]]);
-        let plan = topo.compute_pinning(2, 2, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), false, 0)
+            .unwrap();
         assert_eq!(plan.assignments.len(), 4);
     }
 
@@ -716,7 +824,9 @@ mod tests {
     fn mapping_error_too_many_vcpus() {
         // 1 LLC with 2 CPUs, request 4 vCPUs.
         let topo = synthetic_topo(vec![vec![0, 1]]);
-        let err = topo.compute_pinning(1, 4, 1, false, 0).unwrap_err();
+        let err = topo
+            .compute_pinning(&Topology::new(1, 1, 4, 1), false, 0)
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("4 vCPUs") && msg.contains("2 host CPUs"),
@@ -728,7 +838,9 @@ mod tests {
     fn mapping_error_too_many_llcs() {
         // 1 LLC, request 2 LLCs.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
-        let err = topo.compute_pinning(2, 1, 1, false, 0).unwrap_err();
+        let err = topo
+            .compute_pinning(&Topology::new(1, 2, 1, 1), false, 0)
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("2 LLCs") && msg.contains("1 LLC groups"),
@@ -740,7 +852,9 @@ mod tests {
     fn mapping_error_llc_too_small() {
         // 2 LLCs: first has 4 CPUs, second has only 1. Request 2l2c1t.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4]]);
-        let err = topo.compute_pinning(2, 2, 1, false, 0).unwrap_err();
+        let err = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), false, 0)
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("LLC group 1") && msg.contains("1 available"),
@@ -752,7 +866,9 @@ mod tests {
     fn mapping_no_cross_llc_sharing() {
         // Verify vCPUs in different LLCs never share an LLC's CPUs.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]]);
-        let plan = topo.compute_pinning(3, 2, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 3, 2, 1), false, 0)
+            .unwrap();
         // LLC 0 should only use CPUs 0-3, LLC 1 only 4-7, LLC 2 only 8-11.
         for (vcpu_id, host_cpu) in &plan.assignments {
             let llc_idx = vcpu_id / 2; // 2 vCPUs per LLC
@@ -769,7 +885,9 @@ mod tests {
     #[test]
     fn mapping_all_assignments_unique() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
-        let plan = topo.compute_pinning(2, 4, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 4, 1), false, 0)
+            .unwrap();
         let cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
         let unique: std::collections::HashSet<usize> = cpus.iter().copied().collect();
         assert_eq!(
@@ -783,7 +901,9 @@ mod tests {
     #[test]
     fn mapping_vcpu_ids_sequential() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
-        let plan = topo.compute_pinning(1, 4, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 4, 1), false, 0)
+            .unwrap();
         let vcpu_ids: Vec<u32> = plan.assignments.iter().map(|a| a.0).collect();
         assert_eq!(vcpu_ids, vec![0, 1, 2, 3]);
     }
@@ -791,7 +911,9 @@ mod tests {
     #[test]
     fn mapping_single_vcpu() {
         let topo = synthetic_topo(vec![vec![42]]);
-        let plan = topo.compute_pinning(1, 1, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 1, 1), false, 0)
+            .unwrap();
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.assignments[0], (0, 42));
     }
@@ -843,7 +965,9 @@ mod tests {
         if min_llc_size < 2 {
             return;
         }
-        let plan = topo.compute_pinning(2, 2, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), false, 0)
+            .unwrap();
         // LLC 0 vCPUs should be in LLC group 0.
         for (vcpu_id, host_cpu) in &plan.assignments {
             let llc_idx = vcpu_id / 2;
@@ -877,7 +1001,9 @@ mod tests {
     fn reserve_service_cpu_picks_unpinned() {
         // 4 CPUs in one LLC, request 2 vCPUs + service CPU.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
-        let plan = topo.compute_pinning(1, 2, 1, true, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 2, 1), true, 0)
+            .unwrap();
         assert_eq!(plan.assignments.len(), 2);
         let service = plan.service_cpu.expect("service_cpu should be set");
         // Service CPU must not overlap with any vCPU assignment.
@@ -892,7 +1018,9 @@ mod tests {
     #[test]
     fn reserve_service_cpu_false_returns_none() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
-        let plan = topo.compute_pinning(1, 2, 1, false, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 2, 1), false, 0)
+            .unwrap();
         assert!(plan.service_cpu.is_none());
     }
 
@@ -900,7 +1028,9 @@ mod tests {
     fn reserve_service_cpu_exact_fit() {
         // 3 CPUs total, request 2 vCPUs + 1 service = exact fit.
         let topo = synthetic_topo(vec![vec![0, 1, 2]]);
-        let plan = topo.compute_pinning(1, 2, 1, true, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 2, 1), true, 0)
+            .unwrap();
         assert!(plan.service_cpu.is_some());
     }
 
@@ -908,7 +1038,9 @@ mod tests {
     fn reserve_service_cpu_insufficient_fails() {
         // 2 CPUs, request 2 vCPUs + 1 service = 3 needed, only 2 available.
         let topo = synthetic_topo(vec![vec![0, 1]]);
-        let err = topo.compute_pinning(1, 2, 1, true, 0).unwrap_err();
+        let err = topo
+            .compute_pinning(&Topology::new(1, 1, 2, 1), true, 0)
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("3 CPUs") && msg.contains("2 host CPUs"),
@@ -920,7 +1052,9 @@ mod tests {
     fn reserve_service_cpu_multi_llc() {
         // 2 LLCs with 3 CPUs each, request 2l2c1t + service = 5 CPUs needed.
         let topo = synthetic_topo(vec![vec![0, 1, 2], vec![3, 4, 5]]);
-        let plan = topo.compute_pinning(2, 2, 1, true, 0).unwrap();
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), true, 0)
+            .unwrap();
         let service = plan.service_cpu.unwrap();
         let vcpu_cpus: std::collections::HashSet<usize> =
             plan.assignments.iter().map(|a| a.1).collect();
@@ -979,5 +1113,207 @@ mod tests {
         // Should not panic.
         mbind_to_nodes(std::ptr::null_mut(), 0, &[]);
         mbind_to_nodes(std::ptr::null_mut(), 4096, &[]);
+    }
+
+    // -- NUMA-aware pinning tests --
+
+    /// Build a synthetic topology with explicit NUMA node assignment.
+    /// `groups` is a list of (numa_node, cpus) pairs.
+    fn synthetic_topo_numa(groups: Vec<(usize, Vec<usize>)>) -> HostTopology {
+        let all_cpus: Vec<usize> = groups
+            .iter()
+            .flat_map(|(_, cpus)| cpus.iter().copied())
+            .collect();
+        let mut cpu_to_node = std::collections::HashMap::new();
+        for (node, cpus) in &groups {
+            for &cpu in cpus {
+                cpu_to_node.insert(cpu, *node);
+            }
+        }
+        let llc_groups = groups
+            .into_iter()
+            .map(|(_, cpus)| LlcGroup { cpus })
+            .collect();
+        HostTopology {
+            llc_groups,
+            online_cpus: all_cpus,
+            cpu_to_node,
+        }
+    }
+
+    #[test]
+    fn llc_numa_node_synthetic() {
+        // 4 LLCs: 0,1 on node 0; 2,3 on node 1.
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1]),
+            (0, vec![2, 3]),
+            (1, vec![4, 5]),
+            (1, vec![6, 7]),
+        ]);
+        assert_eq!(topo.llc_numa_node(0), 0);
+        assert_eq!(topo.llc_numa_node(1), 0);
+        assert_eq!(topo.llc_numa_node(2), 1);
+        assert_eq!(topo.llc_numa_node(3), 1);
+    }
+
+    #[test]
+    fn numa_pinning_two_nodes() {
+        // Host: 4 LLCs, 2 per NUMA node. LLCs 0,1 on node 0; LLCs 2,3 on node 1.
+        // Guest: 2 NUMA nodes, 4 LLCs (2 per node), 2 cores each.
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1, 2, 3]),
+            (0, vec![4, 5, 6, 7]),
+            (1, vec![8, 9, 10, 11]),
+            (1, vec![12, 13, 14, 15]),
+        ]);
+        let plan = topo
+            .compute_pinning(&Topology::new(2, 4, 2, 1), false, 0)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 8);
+
+        // Guest NUMA node 0 (vLLCs 0,1) should map to host LLCs on the
+        // same physical NUMA node.
+        let node_0_cpus: Vec<usize> = plan
+            .assignments
+            .iter()
+            .filter(|(vcpu, _)| *vcpu < 4) // vLLC 0,1 = vCPUs 0-3
+            .map(|(_, cpu)| *cpu)
+            .collect();
+        let node_0_host_nodes = topo.numa_nodes_for_cpus(&node_0_cpus);
+        assert_eq!(
+            node_0_host_nodes.len(),
+            1,
+            "guest NUMA 0 LLCs should all be on one host NUMA node, got {:?}",
+            node_0_host_nodes,
+        );
+
+        // Guest NUMA node 1 (vLLCs 2,3) should map to host LLCs on the
+        // same physical NUMA node.
+        let node_1_cpus: Vec<usize> = plan
+            .assignments
+            .iter()
+            .filter(|(vcpu, _)| *vcpu >= 4) // vLLC 2,3 = vCPUs 4-7
+            .map(|(_, cpu)| *cpu)
+            .collect();
+        let node_1_host_nodes = topo.numa_nodes_for_cpus(&node_1_cpus);
+        assert_eq!(
+            node_1_host_nodes.len(),
+            1,
+            "guest NUMA 1 LLCs should all be on one host NUMA node, got {:?}",
+            node_1_host_nodes,
+        );
+
+        // The two guest NUMA nodes should map to different host NUMA nodes.
+        assert_ne!(
+            node_0_host_nodes[0], node_1_host_nodes[0],
+            "guest NUMA nodes should map to different host NUMA nodes",
+        );
+    }
+
+    #[test]
+    fn numa_pinning_fallback_insufficient_nodes() {
+        // Host: 4 LLCs all on NUMA node 0. Guest wants 2 NUMA nodes.
+        // Should fall back to sequential mapping.
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1]),
+            (0, vec![2, 3]),
+            (0, vec![4, 5]),
+            (0, vec![6, 7]),
+        ]);
+        let plan = topo
+            .compute_pinning(&Topology::new(2, 4, 2, 1), false, 0)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 8);
+        // All assignments should be valid (sequential fallback).
+        let cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
+        let unique: std::collections::HashSet<usize> = cpus.iter().copied().collect();
+        assert_eq!(cpus.len(), unique.len());
+    }
+
+    #[test]
+    fn numa_pinning_single_node_unchanged() {
+        // numa_nodes=1 should behave identically to the original sequential
+        // mapping regardless of host NUMA layout.
+        let topo = synthetic_topo_numa(vec![(0, vec![0, 1, 2, 3]), (1, vec![4, 5, 6, 7])]);
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), false, 0)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 4);
+        // Sequential: vLLC 0 -> host LLC 0, vLLC 1 -> host LLC 1.
+        assert_eq!(plan.assignments[0], (0, 0));
+        assert_eq!(plan.assignments[1], (1, 1));
+        assert_eq!(plan.assignments[2], (2, 4));
+        assert_eq!(plan.assignments[3], (3, 5));
+    }
+
+    #[test]
+    fn numa_pinning_three_nodes() {
+        // Host: 6 LLCs, 2 per NUMA node (nodes 0,1,2).
+        // Guest: 3 NUMA nodes, 6 LLCs.
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1]),
+            (0, vec![2, 3]),
+            (1, vec![4, 5]),
+            (1, vec![6, 7]),
+            (2, vec![8, 9]),
+            (2, vec![10, 11]),
+        ]);
+        let plan = topo
+            .compute_pinning(&Topology::new(3, 6, 1, 1), false, 0)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 6);
+
+        // Each guest NUMA node's vCPUs should be on one host NUMA node.
+        for guest_node in 0..3u32 {
+            let start = guest_node * 2;
+            let end = start + 2;
+            let cpus: Vec<usize> = plan
+                .assignments
+                .iter()
+                .filter(|(vcpu, _)| *vcpu >= start && *vcpu < end)
+                .map(|(_, cpu)| *cpu)
+                .collect();
+            let nodes = topo.numa_nodes_for_cpus(&cpus);
+            assert_eq!(
+                nodes.len(),
+                1,
+                "guest NUMA {} should be on one host NUMA node, got {:?}",
+                guest_node,
+                nodes,
+            );
+        }
+    }
+
+    #[test]
+    fn numa_pinning_with_service_cpu() {
+        // 2 NUMA nodes, 4 LLCs, request 2 NUMA nodes + service CPU.
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1, 2, 3]),
+            (0, vec![4, 5, 6, 7]),
+            (1, vec![8, 9, 10, 11]),
+            (1, vec![12, 13, 14, 15]),
+        ]);
+        let plan = topo
+            .compute_pinning(&Topology::new(2, 4, 2, 1), true, 0)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 8);
+        let service = plan.service_cpu.expect("service_cpu should be set");
+        let vcpu_cpus: std::collections::HashSet<usize> =
+            plan.assignments.iter().map(|a| a.1).collect();
+        assert!(
+            !vcpu_cpus.contains(&service),
+            "service CPU {service} must not overlap vCPU assignments",
+        );
+    }
+
+    #[test]
+    fn llc_numa_node_empty_map() {
+        // Empty cpu_to_node should default to node 0.
+        let topo = HostTopology {
+            llc_groups: vec![LlcGroup { cpus: vec![0, 1] }],
+            online_cpus: vec![0, 1],
+            cpu_to_node: std::collections::HashMap::new(),
+        };
+        assert_eq!(topo.llc_numa_node(0), 0);
     }
 }
