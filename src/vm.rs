@@ -421,13 +421,9 @@ mod tests {
     #[test]
     fn gauntlet_presets_topology_valid() {
         for p in &gauntlet_presets() {
-            assert!(p.topology.llcs > 0, "{}: llcs=0", p.name);
-            assert!(p.topology.cores_per_llc > 0, "{}: cores_per_llc=0", p.name);
-            assert!(
-                p.topology.threads_per_core > 0,
-                "{}: threads_per_core=0",
-                p.name
-            );
+            p.topology
+                .validate()
+                .unwrap_or_else(|e| panic!("{}: {e}", p.name));
         }
     }
 
