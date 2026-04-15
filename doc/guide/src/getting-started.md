@@ -201,8 +201,8 @@ See [cargo-ktstr](running-tests/cargo-ktstr.md) for details.
 `cargo ktstr shell` boots a VM with busybox for manual exploration:
 
 ```sh
-cargo ktstr shell                              # default 1,1,1 topology
-cargo ktstr shell --topology 2,4,1             # custom CPU topology
+cargo ktstr shell                              # default 1,1,1,1 topology
+cargo ktstr shell --topology 1,2,4,1           # custom CPU topology
 cargo ktstr shell -i ./my-scheduler            # include a file in the guest
 cargo ktstr shell -i ./test-data/              # include a directory recursively
 ```

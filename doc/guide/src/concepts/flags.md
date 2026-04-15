@@ -22,7 +22,7 @@ variants.
 use ktstr::prelude::*;
 
 #[derive(Scheduler)]
-#[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
+#[scheduler(name = "my_sched", binary = "scx_my_sched", topology(1, 2, 4, 1))]
 #[allow(dead_code)]
 enum MySchedFlag {
     #[flag(args = ["--enable-llc-awareness"])]

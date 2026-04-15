@@ -9,7 +9,7 @@ Linux kernels in KVM for testing.
 let result = vmm::KtstrVm::builder()
     .kernel(&kernel_path)
     .init_binary(&ktstr_binary)
-    .topology(sockets, cores_per_socket, threads_per_core)
+    .topology(numa_nodes, llcs, cores_per_llc, threads_per_core)
     .memory_mb(4096)
     .run_args(&["run".into(), "--ktstr-test-fn".into(), "my_test".into()])
     .build()?
@@ -18,16 +18,17 @@ let result = vmm::KtstrVm::builder()
 
 ## Topology
 
-The VM topology is specified as `(sockets, cores_per_socket,
+The VM topology is specified as `(numa_nodes, llcs, cores_per_llc,
 threads_per_core)`. On x86_64, the VMM creates ACPI tables (MADT,
 SRAT) and MP tables. On aarch64, topology is expressed via FDT cpu
 nodes with MPIDR-derived `reg` properties.
 
 ```rust,ignore
 pub struct Topology {
-    pub sockets: u32,
-    pub cores_per_socket: u32,
+    pub llcs: u32,
+    pub cores_per_llc: u32,
     pub threads_per_core: u32,
+    pub numa_nodes: u32,
 }
 ```
 

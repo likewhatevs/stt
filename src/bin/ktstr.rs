@@ -103,8 +103,8 @@ enum Command {
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,
-        /// Virtual topology as "llcs,cores,threads" (default: "1,1,1").
-        #[arg(long, default_value = "1,1,1")]
+        /// Virtual topology as "numa_nodes,llcs,cores,threads" (default: "1,1,1,1").
+        #[arg(long, default_value = "1,1,1,1")]
         topology: String,
         /// Files or directories to include in the guest at /include-files/<name>.
         /// Directories are walked recursively, preserving structure.
@@ -534,24 +534,27 @@ fn main() -> Result<()> {
             cli::check_kvm()?;
             let kernel_path = cli::resolve_kernel_image(kernel.as_deref())?;
 
-            // Parse topology "L,C,T".
+            // Parse topology "N,L,C,T" (numa_nodes,llcs,cores,threads).
             let parts: Vec<&str> = topology.split(',').collect();
             anyhow::ensure!(
-                parts.len() == 3,
-                "invalid topology '{topology}': expected 'llcs,cores,threads' (e.g. '2,4,1')"
+                parts.len() == 4,
+                "invalid topology '{topology}': expected 'numa_nodes,llcs,cores,threads' (e.g. '1,2,4,1')"
             );
-            let llcs: u32 = parts[0]
+            let numa_nodes: u32 = parts[0]
                 .parse()
-                .map_err(|_| anyhow::anyhow!("invalid llcs value: '{}'", parts[0]))?;
-            let cores: u32 = parts[1]
+                .map_err(|_| anyhow::anyhow!("invalid numa_nodes value: '{}'", parts[0]))?;
+            let llcs: u32 = parts[1]
                 .parse()
-                .map_err(|_| anyhow::anyhow!("invalid cores value: '{}'", parts[1]))?;
-            let threads: u32 = parts[2]
+                .map_err(|_| anyhow::anyhow!("invalid llcs value: '{}'", parts[1]))?;
+            let cores: u32 = parts[2]
                 .parse()
-                .map_err(|_| anyhow::anyhow!("invalid threads value: '{}'", parts[2]))?;
+                .map_err(|_| anyhow::anyhow!("invalid cores value: '{}'", parts[2]))?;
+            let threads: u32 = parts[3]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid threads value: '{}'", parts[3]))?;
             anyhow::ensure!(
-                llcs > 0 && cores > 0 && threads > 0,
-                "invalid topology '{topology}': llcs, cores, and threads must all be >= 1"
+                numa_nodes > 0 && llcs > 0 && cores > 0 && threads > 0,
+                "invalid topology '{topology}': all values must be >= 1"
             );
 
             let resolved_includes = cli::resolve_include_files(&include_files)?;
@@ -563,6 +566,7 @@ fn main() -> Result<()> {
 
             ktstr::run_shell(
                 kernel_path,
+                numa_nodes,
                 llcs,
                 cores,
                 threads,

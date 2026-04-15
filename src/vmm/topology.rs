@@ -27,10 +27,10 @@ impl Topology {
     ///
     /// See [`validate`](Self::validate) for a non-panicking alternative.
     pub const fn new(
+        numa_nodes: u32,
         llcs: u32,
         cores_per_llc: u32,
         threads_per_core: u32,
-        numa_nodes: u32,
     ) -> Self {
         assert!(llcs > 0, "invalid Topology: llcs must be > 0");
         assert!(
@@ -257,11 +257,11 @@ mod tests {
 
     #[test]
     fn new_valid() {
-        let t = Topology::new(4, 2, 2, 2);
+        let t = Topology::new(2, 4, 2, 2);
+        assert_eq!(t.numa_nodes, 2);
         assert_eq!(t.llcs, 4);
         assert_eq!(t.cores_per_llc, 2);
         assert_eq!(t.threads_per_core, 2);
-        assert_eq!(t.numa_nodes, 2);
     }
 
     #[test]
@@ -343,38 +343,38 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "invalid Topology")]
-    fn new_panics_zero_llcs() {
+    fn new_panics_zero_numa() {
         Topology::new(0, 2, 1, 1);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology")]
+    fn new_panics_zero_llcs() {
+        Topology::new(1, 0, 2, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Topology")]
     fn new_panics_zero_cores() {
-        Topology::new(1, 0, 1, 1);
+        Topology::new(1, 1, 0, 1);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology")]
     fn new_panics_zero_threads() {
-        Topology::new(1, 2, 0, 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "invalid Topology")]
-    fn new_panics_zero_numa() {
-        Topology::new(1, 2, 1, 0);
+        Topology::new(1, 1, 2, 0);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology")]
     fn new_panics_indivisible() {
-        Topology::new(3, 2, 1, 2);
+        Topology::new(2, 3, 2, 1);
     }
 
     #[test]
     #[should_panic(expected = "invalid Topology")]
     fn new_panics_overflow() {
-        Topology::new(65536, 65536, 2, 1);
+        Topology::new(1, 65536, 65536, 2);
     }
 
     #[test]

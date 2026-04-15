@@ -127,8 +127,8 @@ enum KtstrCommand {
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,
-        /// Virtual topology as "llcs,cores,threads" (default: "1,1,1").
-        #[arg(long, default_value = "1,1,1")]
+        /// Virtual topology as "numa_nodes,llcs,cores,threads" (default: "1,1,1,1").
+        #[arg(long, default_value = "1,1,1,1")]
         topology: String,
         /// Files or directories to include in the guest at /include-files/<name>.
         /// Directories are walked recursively, preserving structure.
@@ -619,25 +619,28 @@ fn run_shell(
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 
-    // Parse topology "L,C,T".
+    // Parse topology "N,L,C,T" (numa_nodes,llcs,cores,threads).
     let parts: Vec<&str> = topology.split(',').collect();
-    if parts.len() != 3 {
+    if parts.len() != 4 {
         return Err(format!(
-            "invalid topology '{topology}': expected 'llcs,cores,threads' (e.g. '2,4,1')"
+            "invalid topology '{topology}': expected 'numa_nodes,llcs,cores,threads' (e.g. '1,2,4,1')"
         ));
     }
-    let llcs: u32 = parts[0]
+    let numa_nodes: u32 = parts[0]
         .parse()
-        .map_err(|_| format!("invalid llcs value: '{}'", parts[0]))?;
-    let cores: u32 = parts[1]
+        .map_err(|_| format!("invalid numa_nodes value: '{}'", parts[0]))?;
+    let llcs: u32 = parts[1]
         .parse()
-        .map_err(|_| format!("invalid cores value: '{}'", parts[1]))?;
-    let threads: u32 = parts[2]
+        .map_err(|_| format!("invalid llcs value: '{}'", parts[1]))?;
+    let cores: u32 = parts[2]
         .parse()
-        .map_err(|_| format!("invalid threads value: '{}'", parts[2]))?;
-    if llcs == 0 || cores == 0 || threads == 0 {
+        .map_err(|_| format!("invalid cores value: '{}'", parts[2]))?;
+    let threads: u32 = parts[3]
+        .parse()
+        .map_err(|_| format!("invalid threads value: '{}'", parts[3]))?;
+    if numa_nodes == 0 || llcs == 0 || cores == 0 || threads == 0 {
         return Err(format!(
-            "invalid topology '{topology}': llcs, cores, and threads must all be >= 1"
+            "invalid topology '{topology}': all values must be >= 1"
         ));
     }
 
@@ -651,6 +654,7 @@ fn run_shell(
 
     ktstr::run_shell(
         kernel_path,
+        numa_nodes,
         llcs,
         cores,
         threads,
@@ -1123,11 +1127,11 @@ mod tests {
     fn parse_shell_with_topology() {
         let Cargo {
             command: CargoSub::Ktstr(k),
-        } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--topology", "2,4,1"])
+        } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--topology", "1,2,4,1"])
             .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::Shell { topology, .. } => {
-                assert_eq!(topology, "2,4,1");
+                assert_eq!(topology, "1,2,4,1");
             }
             _ => panic!("expected Shell"),
         }
@@ -1140,7 +1144,7 @@ mod tests {
         } = Cargo::try_parse_from(["cargo", "ktstr", "shell"]).unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::Shell { topology, .. } => {
-                assert_eq!(topology, "1,1,1");
+                assert_eq!(topology, "1,1,1,1");
             }
             _ => panic!("expected Shell"),
         }
@@ -1368,37 +1372,38 @@ mod tests {
 
     #[test]
     fn topology_valid() {
-        let parts: Vec<&str> = "2,4,1".split(',').collect();
-        assert_eq!(parts.len(), 3);
+        let parts: Vec<&str> = "1,2,4,1".split(',').collect();
+        assert_eq!(parts.len(), 4);
         assert!(parts[0].parse::<u32>().is_ok());
         assert!(parts[1].parse::<u32>().is_ok());
         assert!(parts[2].parse::<u32>().is_ok());
+        assert!(parts[3].parse::<u32>().is_ok());
     }
 
     #[test]
     fn topology_invalid_one_component() {
         let parts: Vec<&str> = "abc".split(',').collect();
-        assert_ne!(parts.len(), 3);
+        assert_ne!(parts.len(), 4);
     }
 
     #[test]
     fn topology_invalid_non_numeric() {
-        let parts: Vec<&str> = "a,b,c".split(',').collect();
-        assert_eq!(parts.len(), 3);
+        let parts: Vec<&str> = "a,b,c,d".split(',').collect();
+        assert_eq!(parts.len(), 4);
         assert!(parts[0].parse::<u32>().is_err());
     }
 
     #[test]
-    fn topology_invalid_two_components() {
-        let parts: Vec<&str> = "1,2".split(',').collect();
-        assert_ne!(parts.len(), 3);
+    fn topology_invalid_three_components() {
+        let parts: Vec<&str> = "1,2,1".split(',').collect();
+        assert_ne!(parts.len(), 4);
     }
 
     #[test]
     fn topology_invalid_zero_component() {
         // run_shell rejects zero values.
-        let parts: Vec<&str> = "0,1,1".split(',').collect();
-        assert_eq!(parts.len(), 3);
+        let parts: Vec<&str> = "0,1,1,1".split(',').collect();
+        assert_eq!(parts.len(), 4);
         let val: u32 = parts[0].parse().unwrap();
         assert_eq!(val, 0);
     }

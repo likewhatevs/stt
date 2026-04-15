@@ -62,7 +62,7 @@ use ktstr::prelude::*;
 #[scheduler(
     name = "my_sched",
     binary = "scx_my_sched",
-    topology(2, 4, 1),
+    topology(1, 2, 4, 1),
     sched_args = ["--exit-dump-len", "1048576"]
 )]
 #[allow(dead_code)]
@@ -112,7 +112,7 @@ static MY_STEAL: FlagDecl = FlagDecl {
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
     .flags(&[&MY_LLC, &MY_STEAL])
-    .topology(2, 4, 1)
+    .topology(1, 2, 4, 1)
     .assert(Assert::NONE.max_imbalance_ratio(2.0));
 ```
 
@@ -134,7 +134,7 @@ Or manually:
 ```rust,ignore
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
-    .topology(2, 4, 1)
+    .topology(1, 2, 4, 1)
     .cgroup_parent("/ktstr");
 ```
 
@@ -158,7 +158,7 @@ Or manually:
 ```rust,ignore
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
     .binary(SchedulerSpec::Name("scx_mitosis"))
-    .topology(2, 4, 1)
+    .topology(1, 2, 4, 1)
     .cgroup_parent("/ktstr")
     .sched_args(&["--exit-dump-len", "1048576"]);
 ```
@@ -176,7 +176,7 @@ this scheduler. When `#[ktstr_test]` omits `sockets`, `cores`, and
 In the derive:
 
 ```rust,ignore
-#[scheduler(topology(2, 4, 1))]
+#[scheduler(topology(1, 2, 4, 1))]
 ```
 
 Arguments are `(sockets, cores_per_socket, threads_per_core)`.

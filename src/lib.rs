@@ -57,7 +57,7 @@
 //! use ktstr::prelude::*;
 //!
 //! #[derive(Scheduler)]
-//! #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
+//! #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(1, 2, 4, 1))]
 //! #[allow(dead_code)]
 //! enum MySchedFlag {
 //!     #[flag(args = ["--enable-llc"])]
@@ -499,7 +499,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 /// `/include-files/<name>`.
 ///
 /// `kernel`: path to the kernel image (bzImage/Image).
-/// `llcs`, `cores`, `threads`: guest CPU topology.
+/// `numa_nodes`, `llcs`, `cores`, `threads`: guest CPU topology.
 /// `include_files`: `(archive_path, host_path)` pairs for files to
 ///   include in the guest.
 /// `memory_mb`: explicit guest memory override in MB. When `None`,
@@ -507,6 +507,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 #[allow(clippy::too_many_arguments)]
 pub fn run_shell(
     kernel: std::path::PathBuf,
+    numa_nodes: u32,
     llcs: u32,
     cores: u32,
     threads: u32,
@@ -555,7 +556,7 @@ pub fn run_shell(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&payload)
-        .topology(llcs, cores, threads)
+        .topology(numa_nodes, llcs, cores, threads)
         .cmdline(&cmdline)
         .include_files(owned_includes)
         .busybox(true)

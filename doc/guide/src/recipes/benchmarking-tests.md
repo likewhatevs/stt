@@ -31,7 +31,7 @@ use ktstr::prelude::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
-    .topology(1, 2, 1);
+    .topology(1, 1, 2, 1);
 
 #[ktstr_test(
     scheduler = MY_SCHED,
@@ -75,7 +75,7 @@ use ktstr::prelude::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
-    .topology(1, 2, 1);
+    .topology(1, 1, 2, 1);
 
 #[ktstr_test(
     scheduler = MY_SCHED,

@@ -15,8 +15,8 @@ examples.
 <summary><b>Real kernel, clean slate, x86/arm parity</b> — every VM test boots its own Linux kernel in KVM, fresh state each run</summary>
 
 Tests boot a real Linux kernel in a KVM virtual machine with
-configurable topology: sockets, cores per socket, threads per core.
-Multi-socket topologies produce NUMA domains via ACPI SRAT/SLIT
+configurable topology: NUMA nodes, LLCs, cores per LLC, threads per core.
+Multi-NUMA topologies produce NUMA domains via ACPI SRAT/SLIT
 tables on x86_64. On aarch64, CPU topology is described via FDT cpu
 nodes with MPIDR affinity. Both architectures are supported (19
 topology presets on x86_64, 11 on aarch64).
@@ -71,7 +71,7 @@ you test combinations you'd never write by hand.
 ```rust
 #[derive(Scheduler)]
 #[scheduler(name = "mitosis", binary = "scx_mitosis",
-            topology(2, 4, 1),
+            topology(1, 2, 4, 1),
             sched_args = ["--exit-dump-len", "1048576"])]
 enum MitosisFlag {
     #[flag(args = ["--enable-llc-awareness"])]

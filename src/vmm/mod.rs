@@ -3755,12 +3755,12 @@ impl KtstrVmBuilder {
         self
     }
 
-    pub fn topology(mut self, llcs: u32, cores: u32, threads: u32) -> Self {
+    pub fn topology(mut self, numa_nodes: u32, llcs: u32, cores: u32, threads: u32) -> Self {
         self.topology = Topology {
             llcs,
             cores_per_llc: cores,
             threads_per_core: threads,
-            numa_nodes: 1,
+            numa_nodes,
         };
         self
     }
@@ -3907,6 +3907,7 @@ impl KtstrVmBuilder {
         anyhow::ensure!(t.llcs > 0, "llcs must be > 0");
         anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
         anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
+        anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
         if let Some(ref bin) = self.init_binary
             && !bin.starts_with("/proc/")
         {
@@ -4209,7 +4210,7 @@ mod tests {
 
     #[test]
     fn builder_topology() {
-        let b = KtstrVmBuilder::default().topology(2, 4, 2);
+        let b = KtstrVmBuilder::default().topology(1, 2, 4, 2);
         assert_eq!(b.topology.total_cpus(), 16);
         assert_eq!(b.topology.llcs, 2);
     }
@@ -4231,7 +4232,7 @@ mod tests {
     #[test]
     fn builder_chain() {
         let b = KtstrVmBuilder::default()
-            .topology(2, 2, 2)
+            .topology(1, 2, 2, 2)
             .memory_mb(4096)
             .cmdline("root=/dev/sda")
             .timeout(Duration::from_secs(300));
@@ -4389,7 +4390,7 @@ mod tests {
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
-            .topology(1, 1, 1)
+            .topology(1, 1, 1, 1)
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .cmdline("loglevel=7")
@@ -4421,7 +4422,7 @@ mod tests {
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
-            .topology(2, 2, 1) // 4 CPUs
+            .topology(1, 2, 2, 1) // 4 CPUs
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .cmdline("loglevel=7")
@@ -4456,7 +4457,7 @@ mod tests {
             let start = Instant::now();
             let vm = match KtstrVm::builder()
                 .kernel(&kernel)
-                .topology(llcs, cores, threads)
+                .topology(1, llcs, cores, threads)
                 .memory_mb(mem)
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -4660,7 +4661,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(0, 2, 2)
+            .topology(1, 0, 2, 2)
             .build();
         assert!(result.is_err(), "llcs=0 should fail validation");
     }
@@ -4670,7 +4671,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(2, 0, 2)
+            .topology(1, 2, 0, 2)
             .build();
         assert!(result.is_err(), "cores=0 should fail validation");
     }
@@ -4680,7 +4681,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(2, 2, 0)
+            .topology(1, 2, 2, 0)
             .build();
         assert!(result.is_err(), "threads=0 should fail validation");
     }
@@ -4775,7 +4776,7 @@ mod tests {
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
-            .topology(1, 2, 1)
+            .topology(1, 1, 2, 1)
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .build()
@@ -5052,7 +5053,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 1, 1)
+            .topology(1, 1, 1, 1)
             .performance_mode(false)
             .build();
         match result {
@@ -5074,7 +5075,7 @@ mod tests {
         let too_many = host_topo.total_cpus() as u32 + 1;
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, too_many, 1)
+            .topology(1, 1, too_many, 1)
             .performance_mode(true)
             .build();
         match result {
@@ -5098,7 +5099,7 @@ mod tests {
         if (too_many_llcs as usize + 1) <= host_topo.total_cpus() {
             let result = KtstrVmBuilder::default()
                 .kernel(&exe)
-                .topology(too_many_llcs, 1, 1)
+                .topology(1, too_many_llcs, 1, 1)
                 .performance_mode(true)
                 .build();
             assert!(
@@ -5119,7 +5120,7 @@ mod tests {
         }
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 2, 1)
+            .topology(1, 1, 2, 1)
             .performance_mode(true)
             .build();
         match result {
@@ -5145,7 +5146,7 @@ mod tests {
         }
         let vm = match KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 2, 1)
+            .topology(1, 1, 2, 1)
             .performance_mode(true)
             .build()
         {
@@ -5166,7 +5167,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let vm = match KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 1, 1)
+            .topology(1, 1, 1, 1)
             .performance_mode(false)
             .build()
         {
@@ -5191,7 +5192,7 @@ mod tests {
         }
         let vm = KtstrVmBuilder::default()
             .kernel(&exe)
-            .topology(1, 2, 1)
+            .topology(1, 1, 2, 1)
             .performance_mode(true)
             .build();
         if let Ok(vm) = vm {
@@ -5305,7 +5306,7 @@ mod tests {
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
-            .topology(1, 1, 1)
+            .topology(1, 1, 1, 1)
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .cmdline("loglevel=7")
@@ -5338,7 +5339,7 @@ mod tests {
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
-            .topology(2, 2, 1) // 4 CPUs
+            .topology(1, 2, 2, 1) // 4 CPUs
             .memory_mb(256)
             .timeout(Duration::from_secs(10))
             .cmdline("loglevel=7")

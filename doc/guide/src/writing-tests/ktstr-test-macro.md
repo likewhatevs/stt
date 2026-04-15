@@ -21,11 +21,11 @@ can be omitted:
 ```rust,ignore
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
-    .topology(2, 4, 1);
+    .topology(1, 2, 4, 1);
 
 #[ktstr_test(scheduler = MY_SCHED)]
 fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
-    // VM boots with 2 sockets, 4 cores, 1 thread (from MY_SCHED)
+    // VM boots with 1 NUMA node, 2 LLCs, 4 cores, 1 thread (from MY_SCHED)
     Ok(AssertResult::pass())
 }
 ```
@@ -172,7 +172,7 @@ use ktstr::prelude::*;
 #[scheduler(
     name = "my_sched",
     binary = "scx_my_sched",
-    topology(2, 4, 1),
+    topology(1, 2, 4, 1),
 )]
 #[allow(dead_code)]
 enum MySchedFlag {

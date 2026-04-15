@@ -108,10 +108,10 @@ fn shell_invalid_topology() {
 #[test]
 fn shell_zero_topology() {
     ktstr()
-        .args(["shell", "--topology", "0,1,1"])
+        .args(["shell", "--topology", "0,1,1,1"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("must all be >= 1"));
+        .stderr(predicate::str::contains("must be >= 1"));
 }
 
 // -- completions --

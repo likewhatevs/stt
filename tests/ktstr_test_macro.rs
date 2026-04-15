@@ -92,7 +92,7 @@ fn entry_default_fields() {
 
 /// Scheduler with the flags referenced by flags_attrs_compile.
 #[derive(ktstr::Scheduler)]
-#[scheduler(name = "flag_attrs_test", topology(1, 2, 1))]
+#[scheduler(name = "flag_attrs_test", topology(1, 1, 2, 1))]
 #[allow(dead_code)]
 enum FlagAttrsTestFlag {
     Borrow,
@@ -172,7 +172,7 @@ fn entry_max_constraints_match_attrs() {
 #[derive(ktstr::Scheduler)]
 #[scheduler(
     name = "constrained_sched",
-    topology(2, 4, 1),
+    topology(1, 2, 4, 1),
     max_llcs = 8,
     max_cpus = 64
 )]
@@ -219,7 +219,7 @@ fn entry_override_sched_constraint() {
 /// Uses EEVDF (no binary) — the test validates topology inheritance,
 /// not scheduler behavior.
 const TOPO_SCHED: ktstr::test_support::Scheduler =
-    ktstr::test_support::Scheduler::new("topo_test").topology(2, 3, 1);
+    ktstr::test_support::Scheduler::new("topo_test").topology(1, 2, 3, 1);
 
 /// Full topology inheritance: all three dimensions from TOPO_SCHED.
 #[ktstr_test(scheduler = TOPO_SCHED)]
@@ -279,7 +279,7 @@ fn entry_performance_mode_set() {
 #[scheduler(
     name = "test_derive",
     binary = "scx-ktstr",
-    topology(2, 4, 1),
+    topology(1, 2, 4, 1),
     cgroup_parent = "/test",
     sched_args = ["--arg1", "--arg2"]
 )]
@@ -438,7 +438,7 @@ fn entry_derive_topo_inherit() {
 // ---------------------------------------------------------------------------
 
 #[derive(ktstr::Scheduler)]
-#[scheduler(name = "empty_sched", binary = "empty-binary", topology(1, 2, 1))]
+#[scheduler(name = "empty_sched", binary = "empty-binary", topology(1, 1, 2, 1))]
 #[allow(dead_code)]
 enum EmptySchedFlag {}
 
@@ -478,7 +478,7 @@ fn derive_empty_enum_profiles() {
 // ---------------------------------------------------------------------------
 
 #[derive(ktstr::Scheduler)]
-#[scheduler(name = "test_flags", topology(1, 2, 1))]
+#[scheduler(name = "test_flags", topology(1, 1, 2, 1))]
 #[allow(dead_code)]
 enum TestFlags {
     #[flag(args = ["--x"])]
@@ -499,7 +499,7 @@ fn derive_flags_suffix_stripping() {
 // ---------------------------------------------------------------------------
 
 #[derive(ktstr::Scheduler)]
-#[scheduler(name = "plain", topology(1, 2, 1))]
+#[scheduler(name = "plain", topology(1, 1, 2, 1))]
 #[allow(dead_code)]
 enum PlainSched {
     #[flag(args = ["--y"])]
@@ -519,7 +519,7 @@ fn derive_no_suffix_const_name() {
 // ---------------------------------------------------------------------------
 
 #[derive(ktstr::Scheduler)]
-#[scheduler(name = "bare_variant", topology(1, 2, 1))]
+#[scheduler(name = "bare_variant", topology(1, 1, 2, 1))]
 #[allow(dead_code)]
 enum BareVariantFlag {
     NakedVariant,
@@ -550,7 +550,7 @@ fn derive_bare_variant_other_has_args() {
 // ---------------------------------------------------------------------------
 
 #[derive(ktstr::Scheduler)]
-#[scheduler(name = "acronym_test", topology(1, 2, 1))]
+#[scheduler(name = "acronym_test", topology(1, 1, 2, 1))]
 #[allow(dead_code, clippy::upper_case_acronyms)]
 enum AcronymFlag {
     #[flag(args = ["--llc"])]

@@ -192,7 +192,7 @@ with busybox and drops into a shell.
 ```sh
 cargo ktstr shell
 cargo ktstr shell --kernel 6.14.2
-cargo ktstr shell --topology 2,4,1
+cargo ktstr shell --topology 1,2,4,1
 cargo ktstr shell -i ./my-binary -i strace
 ```
 
@@ -211,7 +211,7 @@ on all exit paths.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--kernel ID` | auto | Kernel identifier (path, version, or cache key). |
-| `--topology S,C,T` | `1,1,1` | Virtual CPU topology as `sockets,cores,threads`. All values must be >= 1. |
+| `--topology N,L,C,T` | `1,1,1,1` | Virtual CPU topology as `numa_nodes,llcs,cores,threads`. All values must be >= 1. |
 | `-i, --include-files PATH` | -- | Files or directories to include in the guest. Repeatable. Directories are walked recursively. |
 | `--memory-mb MB` | auto | Guest memory in MB (minimum 128). When absent, computed from actual initramfs size after build. |
 

@@ -13,7 +13,7 @@ use ktstr::prelude::*;
 #[scheduler(
     name = "my_sched",
     binary = "scx_my_sched",
-    topology(2, 4, 1),
+    topology(1, 2, 4, 1),
 )]
 #[allow(dead_code)]
 enum MySchedFlag {

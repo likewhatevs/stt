@@ -32,6 +32,7 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `llcs = N` / `sockets = N` (default: inherited from scheduler, or 1)
 ///   - `cores = N` (default: inherited from scheduler, or 2)
 ///   - `threads = N` (default: inherited from scheduler, or 1)
+///   - `numa_nodes = N` (default: inherited from scheduler, or 1)
 ///   - `memory_mb = N` (default: 2048)
 ///   - `performance_mode = bool` (default: false) -- vCPU pinning, hugepages
 ///   - `duration_s = N`, `workers_per_cgroup = N` -- workload overrides
@@ -53,9 +54,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut llcs = DEFAULT_LLCS;
     let mut cores = DEFAULT_CORES;
     let mut threads = DEFAULT_THREADS;
+    let mut numa_nodes: u32 = 1;
     let mut llcs_set = false;
     let mut cores_set = false;
     let mut threads_set = false;
+    let mut numa_nodes_set = false;
     let mut memory_mb = DEFAULT_MEMORY_MB;
     let mut scheduler: Option<syn::Path> = None;
     let mut auto_repro = true;
@@ -180,6 +183,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "llcs"
                     | "cores"
                     | "threads"
+                    | "numa_nodes"
                     | "memory_mb"
                     | "replicas"
                     | "sustained_samples"
@@ -213,6 +217,12 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .base10_parse::<u32>()
                                     .unwrap_or_else(|e| panic!("{e}"));
                                 llcs_set = true;
+                            }
+                            "numa_nodes" => {
+                                numa_nodes = lit_int
+                                    .base10_parse::<u32>()
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                numa_nodes_set = true;
                             }
                             "cores" => {
                                 cores = lit_int
@@ -437,7 +447,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
+                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
                         )
                         .to_compile_error()
                         .into();
@@ -467,6 +477,19 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         return syn::Error::new(proc_macro2::Span::call_site(), "threads must be > 0")
             .to_compile_error()
             .into();
+    }
+    if numa_nodes_set && numa_nodes == 0 {
+        return syn::Error::new(proc_macro2::Span::call_site(), "numa_nodes must be > 0")
+            .to_compile_error()
+            .into();
+    }
+    if llcs_set && numa_nodes_set && !llcs.is_multiple_of(numa_nodes) {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("llcs ({llcs}) must be divisible by numa_nodes ({numa_nodes})"),
+        )
+        .to_compile_error()
+        .into();
     }
     if memory_mb == 0 {
         return syn::Error::new(proc_macro2::Span::call_site(), "memory_mb must be > 0")
@@ -570,12 +593,21 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = threads;
         quote! { #t }
     };
+    let numa_nodes_tokens = if numa_nodes_set {
+        let n = numa_nodes;
+        quote! { #n }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.topology.numa_nodes }
+    } else {
+        let n = numa_nodes;
+        quote! { #n }
+    };
     let topology_tokens = quote! {
         ::ktstr::test_support::Topology {
             llcs: #llcs_tokens,
             cores_per_llc: #cores_tokens,
             threads_per_core: #threads_tokens,
-            numa_nodes: 1,
+            numa_nodes: #numa_nodes_tokens,
         }
     };
 
@@ -812,7 +844,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// |---|---|---|
 /// | `name = "..."` | yes | Scheduler name passed to `Scheduler::new()` |
 /// | `binary = "..."` | no | Binary name for `SchedulerSpec::Name(...)`. Omit for EEVDF. |
-/// | `topology(L, C, T)` | no | Default VM topology `(llcs, cores, threads)`. Defaults to `(1, 2, 1)`. |
+/// | `topology(N, L, C, T)` | no | Default VM topology `(numa_nodes, llcs, cores, threads)`. Defaults to `(1, 1, 2, 1)`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path. |
 /// | `sched_args = [...]` | no | Default scheduler CLI args. |
 /// | `min_numa_nodes = N` | no | Minimum NUMA nodes for gauntlet filtering. |
@@ -863,7 +895,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// use ktstr::prelude::*;
 ///
 /// #[derive(Scheduler)]
-/// #[scheduler(name = "mitosis", binary = "scx_mitosis", topology(2, 4, 1),
+/// #[scheduler(name = "mitosis", binary = "scx_mitosis", topology(1, 2, 4, 1),
 ///             cgroup_parent = "/ktstr", sched_args = ["--exit-dump-len", "1048576"])]
 /// #[allow(dead_code)]
 /// enum MitosisFlag {
@@ -888,7 +920,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     // Parse #[scheduler(...)] attributes
     let mut sched_name: Option<String> = None;
     let mut sched_binary: Option<String> = None;
-    let mut sched_topology: Option<(u32, u32, u32)> = None;
+    let mut sched_topology: Option<(u32, u32, u32, u32)> = None;
     let mut sched_cgroup_parent: Option<String> = None;
     let mut sched_args: Vec<String> = Vec::new();
     let mut sched_min_numa_nodes: Option<u32> = None;
@@ -917,12 +949,15 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
             } else if meta.path.is_ident("topology") {
                 let content;
                 syn::parenthesized!(content in meta.input);
+                let numa_nodes_lit: syn::LitInt = content.parse()?;
+                let _: syn::Token![,] = content.parse()?;
                 let llcs_lit: syn::LitInt = content.parse()?;
                 let _: syn::Token![,] = content.parse()?;
                 let cores: syn::LitInt = content.parse()?;
                 let _: syn::Token![,] = content.parse()?;
                 let threads: syn::LitInt = content.parse()?;
                 sched_topology = Some((
+                    numa_nodes_lit.base10_parse()?,
                     llcs_lit.base10_parse()?,
                     cores.base10_parse()?,
                     threads.base10_parse()?,
@@ -1000,6 +1035,22 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     let sched_name = sched_name
         .ok_or_else(|| syn::Error::new_spanned(enum_name, "missing `name` in #[scheduler(...)]"))?;
+
+    // Validate topology values at compile time.
+    if let Some((n, l, c, t)) = sched_topology {
+        if n == 0 || l == 0 || c == 0 || t == 0 {
+            return Err(syn::Error::new_spanned(
+                enum_name,
+                "topology values must all be > 0",
+            ));
+        }
+        if l % n != 0 {
+            return Err(syn::Error::new_spanned(
+                enum_name,
+                format!("topology: llcs ({l}) must be divisible by numa_nodes ({n})"),
+            ));
+        }
+    }
 
     // Extract enum variants
     let variants = match &input.data {
@@ -1211,9 +1262,9 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
         #builder_chain.flags(#flags_array_ident)
     };
 
-    if let Some((s, c, t)) = sched_topology {
+    if let Some((n, s, c, t)) = sched_topology {
         builder_chain = quote! {
-            #builder_chain.topology(#s, #c, #t)
+            #builder_chain.topology(#n, #s, #c, #t)
         };
     }
 

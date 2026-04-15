@@ -466,7 +466,7 @@ pub fn collect_verifier_output(
         .init_binary(ktstr_bin)
         .scheduler_binary(sched_bin)
         .sched_args(&sched_args)
-        .topology(1, 1, 1)
+        .topology(1, 1, 1, 1)
         .memory_mb(2048)
         .timeout(std::time::Duration::from_secs(120))
         .build()

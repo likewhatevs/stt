@@ -96,7 +96,7 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
 /// `ktstr_guest_init()` which handles the full init lifecycle and never
 /// returns.
 ///
-/// - `--ktstr-test-fn=NAME --ktstr-topo=NsNcNt`: host-side dispatch —
+/// - `--ktstr-test-fn=NAME --ktstr-topo=NsNlNcNt`: host-side dispatch —
 ///   boots a VM with the specified topology and runs the test inside it.
 /// - `--ktstr-test-fn=NAME` (without `--ktstr-topo`): guest-side dispatch —
 ///   runs the test function directly (inside a VM that was already booted).
@@ -170,10 +170,12 @@ fn maybe_dispatch_host_test() -> Option<i32> {
         }
     };
 
-    let (llcs, cores, threads) = match parse_topo_string(&topo_str) {
+    let (numa_nodes, llcs, cores, threads) = match parse_topo_string(&topo_str) {
         Some(t) => t,
         None => {
-            eprintln!("ktstr_test: invalid --ktstr-topo format '{topo_str}' (expected NlNcNt)");
+            eprintln!(
+                "ktstr_test: invalid --ktstr-topo format '{topo_str}' (expected NsNlNcNt or NsNcNt)"
+            );
             return Some(1);
         }
     };
@@ -181,6 +183,7 @@ fn maybe_dispatch_host_test() -> Option<i32> {
     let cpus = llcs * cores * threads;
     let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
     let topo = TopoOverride {
+        numa_nodes,
         llcs,
         cores,
         threads,
@@ -250,8 +253,8 @@ pub struct Scheduler {
     /// Scheduler CLI args, prepended before per-test `extra_sched_args`.
     pub sched_args: &'static [&'static str],
     /// Default VM topology for tests using this scheduler. Tests inherit
-    /// this topology unless they override `llcs`, `cores`, or
-    /// `threads` explicitly in `#[ktstr_test]`.
+    /// this topology unless they override `numa_nodes`, `llcs`, `cores`,
+    /// or `threads` explicitly in `#[ktstr_test]`.
     pub topology: Topology,
     /// Gauntlet topology constraints. Tests inherit these unless they
     /// override specific fields in `#[ktstr_test]`.
@@ -344,14 +347,14 @@ impl Scheduler {
     }
 
     /// Set the default VM topology for tests using this scheduler.
-    /// Tests inherit this unless they override `llcs`, `cores`, or
-    /// `threads` explicitly in `#[ktstr_test]`.
-    pub const fn topology(mut self, llcs: u32, cores: u32, threads: u32) -> Self {
+    /// Tests inherit this unless they override individual dimensions
+    /// explicitly in `#[ktstr_test]`.
+    pub const fn topology(mut self, numa_nodes: u32, llcs: u32, cores: u32, threads: u32) -> Self {
         self.topology = Topology {
             llcs,
             cores_per_llc: cores,
             threads_per_core: threads,
-            numa_nodes: 1,
+            numa_nodes,
         };
         self
     }
@@ -685,16 +688,17 @@ fn validate_entry_flags(entry: &KtstrTestEntry) {
 
 /// Optional topology override for `run_ktstr_test`.
 pub(crate) struct TopoOverride {
+    pub numa_nodes: u32,
     pub llcs: u32,
     pub cores: u32,
     pub threads: u32,
     pub memory_mb: u32,
 }
 
-/// Parse a topology string in "NsNlNcNt" format (e.g. "1s2l4c2t").
+/// Parse a topology string in "NsNlNcNt" or legacy "NsNcNt" format.
 /// `s` = NUMA nodes, `l` = LLCs, `c` = cores/LLC, `t` = threads/core.
-/// Returns None if the string doesn't match the expected format.
-pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
+/// Returns `(numa_nodes, llcs, cores, threads)` or None on parse failure.
+pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32, u32)> {
     // Try new format: NsNlNcNt (e.g. "1s2l4c2t")
     if let Some(result) = parse_topo_string_new(s) {
         return Some(result);
@@ -712,13 +716,12 @@ pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32)> {
     if llcs == 0 || cores == 0 || threads == 0 {
         return None;
     }
-    Some((llcs, cores, threads))
+    Some((1, llcs, cores, threads))
 }
 
 /// Parse new-format topology string "NsNlNcNt" (e.g. "1s2l4c2t").
-/// Returns (llcs, cores, threads). NUMA nodes are currently discarded
-/// (the caller constructs TopoOverride which has no numa_nodes field yet).
-fn parse_topo_string_new(s: &str) -> Option<(u32, u32, u32)> {
+/// Returns `(numa_nodes, llcs, cores, threads)`.
+fn parse_topo_string_new(s: &str) -> Option<(u32, u32, u32, u32)> {
     let s_pos = s.find('s')?;
     let l_pos = s.find('l')?;
     let c_pos = s.find('c')?;
@@ -726,14 +729,14 @@ fn parse_topo_string_new(s: &str) -> Option<(u32, u32, u32)> {
     if s_pos >= l_pos || l_pos >= c_pos || c_pos >= t_pos {
         return None;
     }
-    let _numa_nodes: u32 = s[..s_pos].parse().ok()?;
+    let numa_nodes: u32 = s[..s_pos].parse().ok()?;
     let llcs: u32 = s[s_pos + 1..l_pos].parse().ok()?;
     let cores: u32 = s[l_pos + 1..c_pos].parse().ok()?;
     let threads: u32 = s[c_pos + 1..t_pos].parse().ok()?;
-    if llcs == 0 || cores == 0 || threads == 0 {
+    if numa_nodes == 0 || llcs == 0 || cores == 0 || threads == 0 {
         return None;
     }
-    Some((llcs, cores, threads))
+    Some((numa_nodes, llcs, cores, threads))
 }
 
 /// Host-side entry point: build a VM, boot it with `--ktstr-test-fn=NAME`,
@@ -1099,6 +1102,7 @@ fn run_gauntlet_test(rest: &str) -> i32 {
 
     let memory_mb = (cpus * 64).max(256).max(entry.memory_mb);
     let topo = TopoOverride {
+        numa_nodes: t.numa_nodes,
         llcs: t.llcs,
         cores: t.cores_per_llc,
         threads: t.threads_per_core,
@@ -1420,12 +1424,13 @@ fn run_ktstr_test_inner(
     }
     let cmdline_extra = cmdline_parts.join(" ");
 
-    let (llcs, cores, threads, memory_mb) = match topo {
-        Some(t) => (t.llcs, t.cores, t.threads, t.memory_mb),
+    let (numa_nodes, llcs, cores, threads, memory_mb) = match topo {
+        Some(t) => (t.numa_nodes, t.llcs, t.cores, t.threads, t.memory_mb),
         None => {
             let cpus = entry.topology.total_cpus();
             let mem = (cpus * 64).max(256).max(entry.memory_mb);
             (
+                entry.topology.numa_nodes,
                 entry.topology.llcs,
                 entry.topology.cores_per_llc,
                 entry.topology.threads_per_core,
@@ -1437,7 +1442,7 @@ fn run_ktstr_test_inner(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&ktstr_bin)
-        .topology(llcs, cores, threads)
+        .topology(numa_nodes, llcs, cores, threads)
         .memory_deferred_min(memory_mb)
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
@@ -2058,12 +2063,13 @@ fn attempt_auto_repro(
     }
     let cmdline_extra = cmdline_parts.join(" ");
 
-    let (llcs, cores, threads, memory_mb) = match topo {
-        Some(t) => (t.llcs, t.cores, t.threads, t.memory_mb),
+    let (numa_nodes, llcs, cores, threads, memory_mb) = match topo {
+        Some(t) => (t.numa_nodes, t.llcs, t.cores, t.threads, t.memory_mb),
         None => {
             let cpus = entry.topology.total_cpus();
             let mem = (cpus * 64).max(256).max(entry.memory_mb);
             (
+                entry.topology.numa_nodes,
                 entry.topology.llcs,
                 entry.topology.cores_per_llc,
                 entry.topology.threads_per_core,
@@ -2075,7 +2081,7 @@ fn attempt_auto_repro(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
-        .topology(llcs, cores, threads)
+        .topology(numa_nodes, llcs, cores, threads)
         .memory_deferred_min(memory_mb)
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
@@ -3252,7 +3258,7 @@ fn extract_probe_stack_arg(args: &[String]) -> Option<String> {
     None
 }
 
-/// Extract `--ktstr-topo=NsNcNt` from the argument list.
+/// Extract `--ktstr-topo=NsNlNcNt` (or legacy `NsNcNt`) from the argument list.
 fn extract_topo_arg(args: &[String]) -> Option<String> {
     for a in args {
         if let Some(val) = a.strip_prefix("--ktstr-topo=")
@@ -4357,17 +4363,17 @@ mod tests {
 
     #[test]
     fn parse_topo_valid() {
-        assert_eq!(parse_topo_string("2s4c2t"), Some((2, 4, 2)));
+        assert_eq!(parse_topo_string("2s4c2t"), Some((1, 2, 4, 2)));
     }
 
     #[test]
     fn parse_topo_single_digits() {
-        assert_eq!(parse_topo_string("1s1c1t"), Some((1, 1, 1)));
+        assert_eq!(parse_topo_string("1s1c1t"), Some((1, 1, 1, 1)));
     }
 
     #[test]
     fn parse_topo_large() {
-        assert_eq!(parse_topo_string("14s9c2t"), Some((14, 9, 2)));
+        assert_eq!(parse_topo_string("14s9c2t"), Some((1, 14, 9, 2)));
     }
 
     #[test]
@@ -4403,6 +4409,53 @@ mod tests {
     #[test]
     fn parse_topo_wrong_order() {
         assert!(parse_topo_string("2c4s2t").is_none());
+    }
+
+    // -- NsNlNcNt format tests --
+
+    #[test]
+    fn parse_topo_new_format_basic() {
+        assert_eq!(parse_topo_string("1s2l4c2t"), Some((1, 2, 4, 2)));
+    }
+
+    #[test]
+    fn parse_topo_new_format_multi_numa() {
+        assert_eq!(parse_topo_string("2s4l8c2t"), Some((2, 4, 8, 2)));
+    }
+
+    #[test]
+    fn parse_topo_new_format_single() {
+        assert_eq!(parse_topo_string("1s1l1c1t"), Some((1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn parse_topo_new_format_large() {
+        assert_eq!(parse_topo_string("4s16l8c2t"), Some((4, 16, 8, 2)));
+    }
+
+    #[test]
+    fn parse_topo_new_format_zero_numa() {
+        assert!(parse_topo_string("0s2l4c2t").is_none());
+    }
+
+    #[test]
+    fn parse_topo_new_format_zero_llcs() {
+        assert!(parse_topo_string("1s0l4c2t").is_none());
+    }
+
+    #[test]
+    fn parse_topo_new_format_zero_cores() {
+        assert!(parse_topo_string("1s2l0c2t").is_none());
+    }
+
+    #[test]
+    fn parse_topo_new_format_zero_threads() {
+        assert!(parse_topo_string("1s2l4c0t").is_none());
+    }
+
+    #[test]
+    fn parse_topo_new_format_wrong_order() {
+        assert!(parse_topo_string("2l1s4c2t").is_none());
     }
 
     // -- extract_topo_arg tests --
@@ -4750,7 +4803,7 @@ mod tests {
 
     #[test]
     fn parse_topo_double_digit_threads() {
-        assert_eq!(parse_topo_string("1s1c12t"), Some((1, 1, 12)));
+        assert_eq!(parse_topo_string("1s1c12t"), Some((1, 1, 1, 12)));
     }
 
     #[test]
@@ -4762,11 +4815,13 @@ mod tests {
     #[test]
     fn topo_override_fields() {
         let t = TopoOverride {
+            numa_nodes: 1,
             llcs: 2,
             cores: 4,
             threads: 2,
             memory_mb: 8192,
         };
+        assert_eq!(t.numa_nodes, 1);
         assert_eq!(t.llcs, 2);
         assert_eq!(t.cores, 4);
         assert_eq!(t.threads, 2);
@@ -5766,16 +5821,16 @@ mod tests {
     #[test]
     fn accepts_default_allows_within_limits() {
         let c = TopologyConstraints::DEFAULT;
-        // 8 LLCs, 4 cores, 2 threads, 1 NUMA = 64 CPUs
-        let t = Topology::new(8, 4, 2, 1);
+        // 1 NUMA, 8 LLCs, 4 cores, 2 threads = 64 CPUs
+        let t = Topology::new(1, 8, 4, 2);
         assert!(c.accepts(&t, 128, 16, 32));
     }
 
     #[test]
     fn accepts_default_rejects_multi_numa() {
         let c = TopologyConstraints::DEFAULT;
-        // 8 LLCs, 4 cores, 2 threads, 2 NUMA = 64 CPUs
-        let t = Topology::new(8, 4, 2, 2);
+        // 2 NUMA, 8 LLCs, 4 cores, 2 threads = 64 CPUs
+        let t = Topology::new(2, 8, 4, 2);
         assert!(!c.accepts(&t, 128, 16, 32));
     }
 
@@ -5783,7 +5838,7 @@ mod tests {
     fn accepts_default_rejects_too_many_llcs() {
         let c = TopologyConstraints::DEFAULT;
         // 16 LLCs exceeds max_llcs=12
-        let t = Topology::new(16, 2, 1, 1);
+        let t = Topology::new(1, 16, 2, 1);
         assert!(!c.accepts(&t, 128, 32, 32));
     }
 
@@ -5795,8 +5850,8 @@ mod tests {
             max_cpus: None,
             ..TopologyConstraints::DEFAULT
         };
-        // 16 LLCs, 8 cores, 2 threads, 4 NUMA = 256 CPUs
-        let t = Topology::new(16, 8, 2, 4);
+        // 4 NUMA, 16 LLCs, 8 cores, 2 threads = 256 CPUs
+        let t = Topology::new(4, 16, 8, 2);
         assert!(c.accepts(&t, 512, 32, 32));
     }
 
@@ -5806,7 +5861,7 @@ mod tests {
             max_llcs: Some(4),
             ..TopologyConstraints::DEFAULT
         };
-        let t = Topology::new(8, 2, 1, 1);
+        let t = Topology::new(1, 8, 2, 1);
         assert!(!c.accepts(&t, 128, 16, 32));
     }
 
@@ -5816,7 +5871,7 @@ mod tests {
             max_llcs: Some(4),
             ..TopologyConstraints::DEFAULT
         };
-        let t = Topology::new(4, 2, 1, 1);
+        let t = Topology::new(1, 4, 2, 1);
         assert!(c.accepts(&t, 128, 16, 32));
     }
 
@@ -5826,7 +5881,7 @@ mod tests {
             max_numa_nodes: Some(2),
             ..TopologyConstraints::DEFAULT
         };
-        let t = Topology::new(4, 2, 1, 4);
+        let t = Topology::new(4, 4, 2, 1);
         assert!(!c.accepts(&t, 128, 16, 32));
     }
 
@@ -5836,7 +5891,7 @@ mod tests {
             max_numa_nodes: Some(2),
             ..TopologyConstraints::DEFAULT
         };
-        let t = Topology::new(4, 2, 1, 2);
+        let t = Topology::new(2, 4, 2, 1);
         assert!(c.accepts(&t, 128, 16, 32));
     }
 
@@ -5847,7 +5902,7 @@ mod tests {
             ..TopologyConstraints::DEFAULT
         };
         // 4 LLCs * 4 cores * 2 threads = 32 CPUs
-        let t = Topology::new(4, 4, 2, 1);
+        let t = Topology::new(1, 4, 4, 2);
         assert!(!c.accepts(&t, 128, 16, 32));
     }
 
@@ -5858,7 +5913,7 @@ mod tests {
             ..TopologyConstraints::DEFAULT
         };
         // 2 LLCs * 4 cores * 2 threads = 16 CPUs
-        let t = Topology::new(2, 4, 2, 1);
+        let t = Topology::new(1, 2, 4, 2);
         assert!(c.accepts(&t, 128, 16, 32));
     }
 
@@ -5868,21 +5923,21 @@ mod tests {
             min_llcs: 4,
             ..TopologyConstraints::DEFAULT
         };
-        let t = Topology::new(2, 4, 1, 1);
+        let t = Topology::new(1, 2, 4, 1);
         assert!(!c.accepts(&t, 128, 16, 32));
     }
 
     #[test]
     fn accepts_rejects_exceeding_host_cpus() {
         let c = TopologyConstraints::DEFAULT;
-        let t = Topology::new(4, 4, 2, 1); // 32 CPUs
+        let t = Topology::new(1, 4, 4, 2); // 32 CPUs
         assert!(!c.accepts(&t, 16, 16, 32)); // host has only 16
     }
 
     #[test]
     fn accepts_rejects_exceeding_host_llcs() {
         let c = TopologyConstraints::DEFAULT;
-        let t = Topology::new(8, 2, 1, 1);
+        let t = Topology::new(1, 8, 2, 1);
         assert!(!c.accepts(&t, 128, 4, 32)); // host has only 4 LLCs
     }
 
@@ -5896,13 +5951,13 @@ mod tests {
             ..TopologyConstraints::DEFAULT
         };
         // 1 LLC, 4 CPUs -- rejected (min_llcs=2)
-        assert!(!c.accepts(&Topology::new(1, 4, 1, 1), 128, 16, 32));
+        assert!(!c.accepts(&Topology::new(1, 1, 4, 1), 128, 16, 32));
         // 2 LLCs, 4 CPUs -- accepted
-        assert!(c.accepts(&Topology::new(2, 2, 1, 1), 128, 16, 32));
+        assert!(c.accepts(&Topology::new(1, 2, 2, 1), 128, 16, 32));
         // 16 LLCs, 32 CPUs -- rejected (max_llcs=8)
-        assert!(!c.accepts(&Topology::new(16, 2, 1, 1), 128, 16, 32));
+        assert!(!c.accepts(&Topology::new(1, 16, 2, 1), 128, 16, 32));
         // 8 LLCs, 16 CPUs -- accepted
-        assert!(c.accepts(&Topology::new(8, 2, 1, 1), 128, 16, 32));
+        assert!(c.accepts(&Topology::new(1, 8, 2, 1), 128, 16, 32));
     }
 
     #[test]
@@ -5911,8 +5966,8 @@ mod tests {
             requires_smt: true,
             ..TopologyConstraints::DEFAULT
         };
-        let no_smt = Topology::new(2, 4, 1, 1);
-        let with_smt = Topology::new(2, 4, 2, 1);
+        let no_smt = Topology::new(1, 2, 4, 1);
+        let with_smt = Topology::new(1, 2, 4, 2);
         assert!(!c.accepts(&no_smt, 128, 16, 32));
         assert!(c.accepts(&with_smt, 128, 16, 32));
     }

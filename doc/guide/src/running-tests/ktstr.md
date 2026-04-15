@@ -120,7 +120,7 @@ Boot an interactive shell in a KVM virtual machine:
 ktstr shell
 ktstr shell --kernel ../linux
 ktstr shell --kernel 6.14.2
-ktstr shell --topology 2,4,1
+ktstr shell --topology 1,2,4,1
 ktstr shell -i /path/to/binary
 ktstr shell -i my_tool -i another_tool
 ```
@@ -130,8 +130,8 @@ flag accepts the same identifiers as other subcommands (path, version,
 cache key). Without `--kernel`, resolves automatically via cache then
 filesystem.
 
-`--topology` sets the guest CPU topology as `sockets,cores,threads`
-(default: `1,1,1`).
+`--topology` sets the guest CPU topology as `numa_nodes,llcs,cores,threads`
+(default: `1,1,1,1`).
 
 Files and directories passed via `-i`/`--include-files` are available
 at `/include-files/<name>` inside the guest. Directories are walked

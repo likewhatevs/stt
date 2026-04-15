@@ -20,10 +20,9 @@ pub struct TestTopology {
 (`/sys/devices/system/cpu/`) to discover the live topology. Reads LLC
 IDs, NUMA node IDs, core IDs, and cache sizes for each online CPU.
 
-**`from_spec(sockets, cores, threads) -> Self`** -- builds a topology
-from a VM spec. One LLC per socket, one NUMA node per socket, CPUs
-numbered sequentially. Used as a fallback when sysfs is incomplete
-inside a guest VM.
+**`from_spec(llcs, cores, threads) -> Self`** -- builds a topology
+from a VM spec. One NUMA node, CPUs numbered sequentially. Used as a
+fallback when sysfs is incomplete inside a guest VM.
 
 **`synthetic(num_cpus, num_llcs) -> Self`** (test-only) -- creates a
 topology with evenly distributed CPUs across LLCs. Used in unit tests.

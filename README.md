@@ -16,7 +16,7 @@ scheduling correctness. Also tests under the kernel's default EEVDF
 scheduler.
 
 - **Clean slate** -- each test boots its own kernel in KVM. Fresh state each run.
-- **Topology as code** -- `topology(2, 4, 2)` gives you 2 sockets, 4 cores, 2 threads with as real a NUMA domains as ur hw can support. x86_64 and aarch64.
+- **Topology as code** -- `topology(1, 2, 4, 2)` gives you 1 NUMA node, 2 LLCs, 4 cores, 2 threads with real NUMA domains when ur hw can support it. x86_64 and aarch64.
 - **Data-driven** -- scenarios declare cgroups, cpusets, workloads, and verification as data.
 - **Gauntlet** -- one `#[ktstr_test]`, hundreds of topology x flag variants. Budget-aware CI selection and baseline A/B comparison.
 - **Host-side introspection** -- read/write kernel state and BPF maps from host memory. No guest instrumentation.
@@ -68,7 +68,7 @@ topology, and feature flags:
 use ktstr::prelude::*;
 
 #[derive(Scheduler)]
-#[scheduler(name = "my_sched", binary = "scx_my_sched", topology(2, 4, 1))]
+#[scheduler(name = "my_sched", binary = "scx_my_sched", topology(1, 2, 4, 1))]
 #[allow(dead_code)]
 enum MySchedFlag {
     #[flag(args = ["--enable-feature-a"])]

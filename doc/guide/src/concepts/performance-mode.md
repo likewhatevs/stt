@@ -139,7 +139,7 @@ Via the builder API:
 let vm = vmm::KtstrVm::builder()
     .kernel(&kernel_path)
     .init_binary(&ktstr_binary)
-    .topology(2, 4, 2)
+    .topology(1, 2, 4, 2)
     .memory_mb(4096)
     .performance_mode(true)
     .build()?

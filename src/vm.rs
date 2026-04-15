@@ -88,7 +88,7 @@ pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&ktstr_bin)
-        .topology(t.llcs, t.cores_per_llc, t.threads_per_core)
+        .topology(t.numa_nodes, t.llcs, t.cores_per_llc, t.threads_per_core)
         .memory_mb(u32::try_from(cfg.memory_mb).context("memory_mb exceeds u32::MAX")?)
         .run_args(&guest_args);
 
