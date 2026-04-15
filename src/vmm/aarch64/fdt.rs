@@ -7,6 +7,7 @@ use crate::vmm::kvm::{
     GIC_REDIST_SIZE_PER_CPU, SERIAL_IRQ, SERIAL_MMIO_BASE, SERIAL_MMIO_SIZE, SERIAL2_IRQ,
     SERIAL2_MMIO_BASE, VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_MMIO_BASE,
 };
+use crate::vmm::topology::Topology;
 use crate::vmm::virtio_console;
 
 /// GIC phandle — unique identifier referenced by interrupt-parent properties.
@@ -31,7 +32,13 @@ const IRQ_TYPE_LEVEL_LOW: u32 = 8;
 /// `mpidrs` contains the MPIDR_EL1 values read from KVM for each vCPU.
 /// The FDT cpu node `reg` properties use the affinity fields from these
 /// values, ensuring the FDT matches KVM's actual MPIDR assignment.
+///
+/// When `topo.numa_nodes > 1`, NUMA topology is described via:
+/// - `numa-node-id` properties on cpu and memory nodes
+/// - per-NUMA-node memory nodes with disjoint address ranges
+/// - a `distance-map` node with `numa-distance-map-v1` compatible
 pub fn create_fdt(
+    topo: &Topology,
     mpidrs: &[u64],
     memory_mb: u32,
     cmdline: &str,
@@ -71,20 +78,21 @@ pub fn create_fdt(
     // /chosen — bootargs, stdout, initrd
     write_chosen(&mut fdt, cmdline, initrd_addr, initrd_size)?;
 
-    // /memory — guest physical RAM
-    write_memory(&mut fdt, memory_mb)?;
+    // /memory — guest physical RAM. When numa_nodes > 1, one memory
+    // node per NUMA node with disjoint address ranges and numa-node-id.
+    write_memory(&mut fdt, topo, memory_mb, shm_size)?;
 
     // /reserved-memory — SHM region marked reserved (no kernel
     // allocation) but kept in memblock.memory so /dev/mem maps it
-    // with Normal cacheable attributes. The /memory node above
-    // covers full DRAM including SHM — that is what makes
+    // with Normal cacheable attributes. The /memory node(s) above
+    // cover full DRAM including SHM — that is what makes
     // pfn_is_map_memory() return true for SHM pages.
     if let Some(base) = shm_base {
         write_reserved_memory(&mut fdt, base, shm_size)?;
     }
 
     // /cpus — one node per vCPU with MPIDR from KVM
-    write_cpus(&mut fdt, mpidrs)?;
+    write_cpus(&mut fdt, topo, mpidrs)?;
 
     // /intc — GICv3
     let num_cpus = mpidrs.len() as u32;
@@ -107,6 +115,11 @@ pub fn create_fdt(
 
     // /psci — power state coordination interface
     write_psci(&mut fdt)?;
+
+    // /distance-map — NUMA distance matrix (only for multi-NUMA)
+    if topo.numa_nodes > 1 {
+        write_distance_map(&mut fdt, topo)?;
+    }
 
     fdt.end_node(root).context("end root node")?;
     let dtb = fdt.finish().context("finish FDT")?;
@@ -155,30 +168,71 @@ fn write_chosen(
     Ok(())
 }
 
-fn write_memory(fdt: &mut FdtWriter, memory_mb: u32) -> Result<()> {
-    // Full DRAM range including SHM. arm64 phys_mem_access_prot()
-    // maps addresses outside memblock.memory as Device-nGnRnE, which
-    // faults on paired loads (memcpy STP). Including SHM here puts
-    // its pages in memblock.memory so /dev/mem maps them cacheable.
-    // /reserved-memory prevents kernel allocation from the SHM region.
+fn write_memory(fdt: &mut FdtWriter, topo: &Topology, memory_mb: u32, shm_size: u64) -> Result<()> {
     let mem_size = (memory_mb as u64) << 20;
 
-    let name = format!("memory@{DRAM_START:x}");
-    let mem = fdt.begin_node(&name).context("begin memory")?;
-    fdt.property_string("device_type", "memory")
-        .context("memory device_type")?;
-    // reg = <addr_hi addr_lo size_hi size_lo>
-    fdt.property_array_u32(
-        "reg",
-        &[
-            (DRAM_START >> 32) as u32,
-            DRAM_START as u32,
-            (mem_size >> 32) as u32,
-            mem_size as u32,
-        ],
-    )
-    .context("memory reg")?;
-    fdt.end_node(mem).context("end memory")?;
+    if topo.numa_nodes <= 1 {
+        // Single-NUMA: one memory node covering full DRAM including SHM.
+        // arm64 phys_mem_access_prot() maps addresses outside
+        // memblock.memory as Device-nGnRnE, which faults on paired
+        // loads (memcpy STP). Including SHM here puts its pages in
+        // memblock.memory so /dev/mem maps them cacheable.
+        // /reserved-memory prevents kernel allocation from the SHM region.
+        let name = format!("memory@{DRAM_START:x}");
+        let mem = fdt.begin_node(&name).context("begin memory")?;
+        fdt.property_string("device_type", "memory")
+            .context("memory device_type")?;
+        fdt.property_array_u32(
+            "reg",
+            &[
+                (DRAM_START >> 32) as u32,
+                DRAM_START as u32,
+                (mem_size >> 32) as u32,
+                mem_size as u32,
+            ],
+        )
+        .context("memory reg")?;
+        fdt.end_node(mem).context("end memory")?;
+    } else {
+        // Multi-NUMA: one memory node per NUMA node, each with
+        // numa-node-id. Usable memory is split evenly; the last
+        // node absorbs rounding remainder AND extends to cover
+        // the SHM region. SHM must be in memblock.memory so
+        // arm64 phys_mem_access_prot() maps it cacheable via
+        // /dev/mem. /reserved-memory prevents kernel allocation
+        // from SHM while keeping it in the linear map.
+        let usable_bytes = mem_size - shm_size;
+        let n = topo.numa_nodes as u64;
+        let per_node = (usable_bytes / n) & !0xFFF; // page-align down (4 KiB)
+
+        for node in 0..topo.numa_nodes {
+            let base = DRAM_START + node as u64 * per_node;
+            let length = if node == topo.numa_nodes - 1 {
+                // Last node: cover remainder of usable memory + SHM.
+                mem_size - node as u64 * per_node
+            } else {
+                per_node
+            };
+            let name = format!("memory@{base:x}");
+            let mem = fdt.begin_node(&name).context("begin memory")?;
+            fdt.property_string("device_type", "memory")
+                .context("memory device_type")?;
+            fdt.property_array_u32(
+                "reg",
+                &[
+                    (base >> 32) as u32,
+                    base as u32,
+                    (length >> 32) as u32,
+                    length as u32,
+                ],
+            )
+            .context("memory reg")?;
+            fdt.property_u32("numa-node-id", node)
+                .context("memory numa-node-id")?;
+            fdt.end_node(mem).context("end memory")?;
+        }
+    }
+
     Ok(())
 }
 
@@ -214,7 +268,7 @@ fn write_reserved_memory(fdt: &mut FdtWriter, shm_base: u64, shm_size: u64) -> R
     Ok(())
 }
 
-fn write_cpus(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<()> {
+fn write_cpus(fdt: &mut FdtWriter, topo: &Topology, mpidrs: &[u64]) -> Result<()> {
     let cpus = fdt.begin_node("cpus").context("begin cpus")?;
     fdt.property_u32("#address-cells", 1)
         .context("cpus #address-cells")?;
@@ -232,6 +286,12 @@ fn write_cpus(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<()> {
         fdt.property_string("enable-method", "psci")
             .context("cpu enable-method")?;
         fdt.property_u32("reg", reg).context("cpu reg")?;
+        if topo.numa_nodes > 1 {
+            let (llc_id, _, _) = topo.decompose(cpu_id as u32);
+            let node_id = topo.numa_node_of(llc_id);
+            fdt.property_u32("numa-node-id", node_id)
+                .context("cpu numa-node-id")?;
+        }
         fdt.end_node(cpu).context("end cpu")?;
     }
 
@@ -371,10 +431,38 @@ fn write_psci(fdt: &mut FdtWriter) -> Result<()> {
     Ok(())
 }
 
+/// Write a `distance-map` node with `numa-distance-map-v1` compatible.
+///
+/// The kernel parses `distance-matrix` as a flat array of (nodea, nodeb,
+/// distance) triples. Distance 10 = local (LOCAL_DISTANCE), 20 = remote.
+/// Matches the x86_64 SLIT values.
+fn write_distance_map(fdt: &mut FdtWriter, topo: &Topology) -> Result<()> {
+    let dm = fdt
+        .begin_node("distance-map")
+        .context("begin distance-map")?;
+    fdt.property_string("compatible", "numa-distance-map-v1")
+        .context("distance-map compatible")?;
+
+    // Build flat (nodea, nodeb, distance) triples for the full NxN matrix.
+    let n = topo.numa_nodes;
+    let mut matrix = Vec::with_capacity((n * n * 3) as usize);
+    for i in 0..n {
+        for j in 0..n {
+            matrix.push(i);
+            matrix.push(j);
+            matrix.push(if i == j { 10 } else { 20 });
+        }
+    }
+    fdt.property_array_u32("distance-matrix", &matrix)
+        .context("distance-matrix")?;
+
+    fdt.end_node(dm).context("end distance-map")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vmm::topology::Topology;
 
     fn default_topo() -> Topology {
         Topology {
@@ -394,7 +482,7 @@ mod tests {
     fn create_fdt_minimal() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(&mpidrs, 256, "console=ttyS0", None, None, 0);
+        let dtb = create_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0);
         assert!(dtb.is_ok(), "FDT creation failed: {:?}", dtb.err());
         let dtb = dtb.unwrap();
         assert_eq!(&dtb[..4], &[0xd0, 0x0d, 0xfe, 0xed]);
@@ -405,6 +493,7 @@ mod tests {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
+            &topo,
             &mpidrs,
             256,
             "console=ttyS0",
@@ -419,7 +508,7 @@ mod tests {
     fn create_fdt_with_shm() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(&mpidrs, 256, "console=ttyS0", None, None, 0x10_0000);
+        let dtb = create_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0x10_0000);
         assert!(dtb.is_ok());
     }
 
@@ -432,7 +521,46 @@ mod tests {
             numa_nodes: 1,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(&mpidrs, 1024, "console=ttyS0", None, None, 0);
+        let dtb = create_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 0);
+        assert!(dtb.is_ok());
+    }
+
+    #[test]
+    fn create_fdt_multi_numa() {
+        let topo = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 2,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = create_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 0);
+        assert!(dtb.is_ok(), "FDT creation failed: {:?}", dtb.err());
+    }
+
+    #[test]
+    fn create_fdt_multi_numa_with_shm() {
+        let topo = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 2,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = create_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 0x10_0000);
+        assert!(dtb.is_ok());
+    }
+
+    #[test]
+    fn create_fdt_three_numa_nodes() {
+        let topo = Topology {
+            llcs: 6,
+            cores_per_llc: 4,
+            threads_per_core: 2,
+            numa_nodes: 3,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = create_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 0);
         assert!(dtb.is_ok());
     }
 

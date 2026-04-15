@@ -3242,6 +3242,7 @@ impl KtstrVm {
         let mpidrs =
             aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
         let dtb = aarch64::fdt::create_fdt(
+            &self.topology,
             &mpidrs,
             memory_mb,
             &cmdline,
