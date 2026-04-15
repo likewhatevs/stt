@@ -39,6 +39,7 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `max_gap_ms`, `max_spread_pct`, `max_imbalance_ratio` -- assertion thresholds
 ///   - `max_p99_wake_latency_ns`, `max_wake_latency_cv`, `min_iteration_rate` -- benchmarking
 ///   - `required_flags`, `excluded_flags` -- flag profile filtering
+///   - `max_llcs = N`, `max_numa_nodes = N`, `max_cpus = N` -- upper bound constraints
 ///   - See KtstrTestEntry and Assert for the full field list.
 #[proc_macro_attribute]
 pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -79,9 +80,19 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut required_flags: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut excluded_flags: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut min_numa_nodes: u32 = 1;
+    let mut min_numa_nodes_set = false;
     let mut min_llcs: u32 = 1;
+    let mut min_llcs_set = false;
     let mut requires_smt: bool = false;
+    let mut requires_smt_set = false;
     let mut min_cpus: u32 = 1;
+    let mut min_cpus_set = false;
+    let mut max_llcs: Option<u32> = Some(12);
+    let mut max_llcs_set = false;
+    let mut max_numa_nodes: Option<u32> = Some(1);
+    let mut max_numa_nodes_set = false;
+    let mut max_cpus: Option<u32> = Some(192);
+    let mut max_cpus_set = false;
     let mut watchdog_timeout_s: u64 = 4;
     let mut performance_mode: bool = false;
     let mut duration_s: u64 = 2;
@@ -156,7 +167,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "not_starved" => not_starved = Some(lit_bool.value()),
                             "isolation" => isolation = Some(lit_bool.value()),
                             "performance_mode" => performance_mode = lit_bool.value(),
-                            "requires_smt" => requires_smt = lit_bool.value(),
+                            "requires_smt" => {
+                                requires_smt = lit_bool.value();
+                                requires_smt_set = true;
+                            }
                             "expect_err" => expect_err = lit_bool.value(),
                             "fail_on_stall" => fail_on_stall = Some(lit_bool.value()),
                             _ => unreachable!(),
@@ -178,6 +192,9 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "min_numa_nodes"
                     | "min_llcs"
                     | "min_cpus"
+                    | "max_llcs"
+                    | "max_numa_nodes"
+                    | "max_cpus"
                     | "max_p99_wake_latency_ns" => {
                         let lit_int = match value {
                             syn::Expr::Lit(syn::ExprLit {
@@ -258,17 +275,44 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "min_sockets" | "min_numa_nodes" => {
                                 min_numa_nodes = lit_int
                                     .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                min_numa_nodes_set = true;
                             }
                             "min_llcs" => {
                                 min_llcs = lit_int
                                     .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                min_llcs_set = true;
                             }
                             "min_cpus" => {
                                 min_cpus = lit_int
                                     .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                min_cpus_set = true;
+                            }
+                            "max_llcs" => {
+                                max_llcs = Some(
+                                    lit_int
+                                        .base10_parse::<u32>()
+                                        .unwrap_or_else(|e| panic!("{e}")),
+                                );
+                                max_llcs_set = true;
+                            }
+                            "max_numa_nodes" => {
+                                max_numa_nodes = Some(
+                                    lit_int
+                                        .base10_parse::<u32>()
+                                        .unwrap_or_else(|e| panic!("{e}")),
+                                );
+                                max_numa_nodes_set = true;
+                            }
+                            "max_cpus" => {
+                                max_cpus = Some(
+                                    lit_int
+                                        .base10_parse::<u32>()
+                                        .unwrap_or_else(|e| panic!("{e}")),
+                                );
+                                max_cpus_set = true;
                             }
                             "max_p99_wake_latency_ns" => {
                                 max_p99_wake_latency_ns = Some(
@@ -393,7 +437,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
+                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err"),
                         )
                         .to_compile_error()
                         .into();
@@ -433,6 +477,56 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         return syn::Error::new(proc_macro2::Span::call_site(), "replicas must be > 0")
             .to_compile_error()
             .into();
+    }
+    // Validate explicitly set constraint values. When a field is
+    // inherited from the scheduler, the proc macro doesn't know the
+    // value so cross-field validation is deferred to runtime.
+    if max_llcs_set && max_llcs == Some(0) {
+        return syn::Error::new(proc_macro2::Span::call_site(), "max_llcs must be > 0")
+            .to_compile_error()
+            .into();
+    }
+    if max_numa_nodes_set && max_numa_nodes == Some(0) {
+        return syn::Error::new(proc_macro2::Span::call_site(), "max_numa_nodes must be > 0")
+            .to_compile_error()
+            .into();
+    }
+    if max_cpus_set && max_cpus == Some(0) {
+        return syn::Error::new(proc_macro2::Span::call_site(), "max_cpus must be > 0")
+            .to_compile_error()
+            .into();
+    }
+    if min_llcs_set && max_llcs_set && matches!(max_llcs, Some(m) if m < min_llcs) {
+        let m = max_llcs.unwrap();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("min_llcs ({min_llcs}) exceeds max_llcs ({m}). Set max_llcs explicitly."),
+        )
+        .to_compile_error()
+        .into();
+    }
+    if min_numa_nodes_set
+        && max_numa_nodes_set
+        && matches!(max_numa_nodes, Some(m) if m < min_numa_nodes)
+    {
+        let m = max_numa_nodes.unwrap();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "min_numa_nodes ({min_numa_nodes}) exceeds max_numa_nodes ({m}). Set max_numa_nodes explicitly."
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
+    if min_cpus_set && max_cpus_set && matches!(max_cpus, Some(m) if m < min_cpus) {
+        let m = max_cpus.unwrap();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("min_cpus ({min_cpus}) exceeds max_cpus ({m}). Set max_cpus explicitly."),
+        )
+        .to_compile_error()
+        .into();
     }
 
     // Build the scheduler reference token
@@ -532,6 +626,71 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Build constraint tokens. Each field independently inherits from
+    // the scheduler's constraints when not explicitly set, following
+    // the same pattern as topology inheritance.
+    let min_numa_nodes_tokens = if min_numa_nodes_set {
+        let v = min_numa_nodes;
+        quote! { #v }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.constraints.min_numa_nodes }
+    } else {
+        let v = min_numa_nodes;
+        quote! { #v }
+    };
+    let max_numa_nodes_tokens = if max_numa_nodes_set {
+        let t = option_tokens(&max_numa_nodes);
+        quote! { #t }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.constraints.max_numa_nodes }
+    } else {
+        let t = option_tokens(&max_numa_nodes);
+        quote! { #t }
+    };
+    let min_llcs_tokens = if min_llcs_set {
+        let v = min_llcs;
+        quote! { #v }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.constraints.min_llcs }
+    } else {
+        let v = min_llcs;
+        quote! { #v }
+    };
+    let max_llcs_tokens = if max_llcs_set {
+        let t = option_tokens(&max_llcs);
+        quote! { #t }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.constraints.max_llcs }
+    } else {
+        let t = option_tokens(&max_llcs);
+        quote! { #t }
+    };
+    let requires_smt_tokens = if requires_smt_set {
+        quote! { #requires_smt }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.constraints.requires_smt }
+    } else {
+        quote! { #requires_smt }
+    };
+    let min_cpus_tokens = if min_cpus_set {
+        let v = min_cpus;
+        quote! { #v }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.constraints.min_cpus }
+    } else {
+        let v = min_cpus;
+        quote! { #v }
+    };
+    let max_cpus_tokens = if max_cpus_set {
+        let t = option_tokens(&max_cpus);
+        quote! { #t }
+    } else if let Some(ref p) = scheduler {
+        quote! { #p.constraints.max_cpus }
+    } else {
+        let t = option_tokens(&max_cpus);
+        quote! { #t }
+    };
+
     let expanded = quote! {
         #(#attrs)*
         #vis #inner_sig #block
@@ -543,10 +702,13 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             func: #inner_name,
             topology: #topology_tokens,
             constraints: ::ktstr::test_support::TopologyConstraints {
-                min_numa_nodes: #min_numa_nodes,
-                min_llcs: #min_llcs,
-                requires_smt: #requires_smt,
-                min_cpus: #min_cpus,
+                min_numa_nodes: #min_numa_nodes_tokens,
+                max_numa_nodes: #max_numa_nodes_tokens,
+                min_llcs: #min_llcs_tokens,
+                max_llcs: #max_llcs_tokens,
+                requires_smt: #requires_smt_tokens,
+                min_cpus: #min_cpus_tokens,
+                max_cpus: #max_cpus_tokens,
             },
             memory_mb: #memory_mb,
             scheduler: #scheduler_tokens,
@@ -653,6 +815,13 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | `topology(L, C, T)` | no | Default VM topology `(llcs, cores, threads)`. Defaults to `(1, 2, 1)`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path. |
 /// | `sched_args = [...]` | no | Default scheduler CLI args. |
+/// | `min_numa_nodes = N` | no | Minimum NUMA nodes for gauntlet filtering. |
+/// | `max_numa_nodes = N` | no | Maximum NUMA nodes for gauntlet filtering. |
+/// | `min_llcs = N` | no | Minimum LLCs for gauntlet filtering. |
+/// | `max_llcs = N` | no | Maximum LLCs for gauntlet filtering. |
+/// | `min_cpus = N` | no | Minimum total CPUs for gauntlet filtering. |
+/// | `max_cpus = N` | no | Maximum total CPUs for gauntlet filtering. |
+/// | `requires_smt = bool` | no | Require SMT (threads_per_core > 1). |
 ///
 /// # Flag attributes (`#[flag(...)]`)
 ///
@@ -722,6 +891,13 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     let mut sched_topology: Option<(u32, u32, u32)> = None;
     let mut sched_cgroup_parent: Option<String> = None;
     let mut sched_args: Vec<String> = Vec::new();
+    let mut sched_min_numa_nodes: Option<u32> = None;
+    let mut sched_max_numa_nodes: Option<u32> = None;
+    let mut sched_min_llcs: Option<u32> = None;
+    let mut sched_max_llcs: Option<u32> = None;
+    let mut sched_min_cpus: Option<u32> = None;
+    let mut sched_max_cpus: Option<u32> = None;
+    let mut sched_requires_smt: Option<bool> = None;
 
     for attr in &input.attrs {
         if !attr.path().is_ident("scheduler") {
@@ -774,6 +950,41 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
                         }
                     }
                 }
+                Ok(())
+            } else if meta.path.is_ident("min_numa_nodes") {
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                sched_min_numa_nodes = Some(lit.base10_parse()?);
+                Ok(())
+            } else if meta.path.is_ident("max_numa_nodes") {
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                sched_max_numa_nodes = Some(lit.base10_parse()?);
+                Ok(())
+            } else if meta.path.is_ident("min_llcs") {
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                sched_min_llcs = Some(lit.base10_parse()?);
+                Ok(())
+            } else if meta.path.is_ident("max_llcs") {
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                sched_max_llcs = Some(lit.base10_parse()?);
+                Ok(())
+            } else if meta.path.is_ident("min_cpus") {
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                sched_min_cpus = Some(lit.base10_parse()?);
+                Ok(())
+            } else if meta.path.is_ident("max_cpus") {
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                sched_max_cpus = Some(lit.base10_parse()?);
+                Ok(())
+            } else if meta.path.is_ident("requires_smt") {
+                let value = meta.value()?;
+                let lit: syn::LitBool = value.parse()?;
+                sched_requires_smt = Some(lit.value());
                 Ok(())
             } else {
                 Err(meta.error(format!(
@@ -1016,6 +1227,30 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
         builder_chain = quote! {
             #builder_chain.sched_args(&[#(#sched_args),*])
         };
+    }
+
+    // Chain individual constraint builder calls for each explicitly set
+    // attribute. Unset fields inherit from TopologyConstraints::DEFAULT.
+    if let Some(v) = sched_min_numa_nodes {
+        builder_chain = quote! { #builder_chain.min_numa_nodes(#v) };
+    }
+    if let Some(v) = sched_max_numa_nodes {
+        builder_chain = quote! { #builder_chain.max_numa_nodes(#v) };
+    }
+    if let Some(v) = sched_min_llcs {
+        builder_chain = quote! { #builder_chain.min_llcs(#v) };
+    }
+    if let Some(v) = sched_max_llcs {
+        builder_chain = quote! { #builder_chain.max_llcs(#v) };
+    }
+    if let Some(v) = sched_requires_smt {
+        builder_chain = quote! { #builder_chain.requires_smt(#v) };
+    }
+    if let Some(v) = sched_min_cpus {
+        builder_chain = quote! { #builder_chain.min_cpus(#v) };
+    }
+    if let Some(v) = sched_max_cpus {
+        builder_chain = quote! { #builder_chain.max_cpus(#v) };
     }
 
     // Generate the ctor function name for --ktstr-list-flags interception.

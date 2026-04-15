@@ -85,6 +85,9 @@ fn entry_default_fields() {
     assert_eq!(entry.constraints.min_llcs, 1);
     assert!(!entry.constraints.requires_smt);
     assert_eq!(entry.constraints.min_cpus, 1);
+    assert_eq!(entry.constraints.max_llcs, Some(12));
+    assert_eq!(entry.constraints.max_numa_nodes, Some(1));
+    assert_eq!(entry.constraints.max_cpus, Some(192));
 }
 
 /// Scheduler with the flags referenced by flags_attrs_compile.
@@ -122,6 +125,7 @@ fn entry_flags_match_attrs() {
     cores = 4,
     threads = 2,
     min_numa_nodes = 2,
+    max_numa_nodes = 4,
     min_llcs = 4,
     requires_smt = true,
     min_cpus = 8
@@ -139,6 +143,76 @@ fn entry_topo_constraints_match_attrs() {
     assert_eq!(entry.constraints.min_llcs, 4);
     assert!(entry.constraints.requires_smt);
     assert_eq!(entry.constraints.min_cpus, 8);
+    assert_eq!(entry.constraints.max_numa_nodes, Some(4));
+    assert_eq!(entry.constraints.max_llcs, Some(12));
+    assert_eq!(entry.constraints.max_cpus, Some(192));
+}
+
+/// Test with max constraint attributes.
+#[ktstr_test(max_llcs = 4, max_numa_nodes = 2, max_cpus = 32)]
+fn max_constraints_compile(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Verify max constraint attributes propagate to the entry.
+#[test]
+fn entry_max_constraints_match_attrs() {
+    let entry = ktstr::test_support::find_test("max_constraints_compile").unwrap();
+    assert_eq!(entry.constraints.max_llcs, Some(4));
+    assert_eq!(entry.constraints.max_numa_nodes, Some(2));
+    assert_eq!(entry.constraints.max_cpus, Some(32));
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler-level constraint inheritance
+// ---------------------------------------------------------------------------
+
+/// Scheduler with constraint attributes for inheritance tests.
+#[derive(ktstr::Scheduler)]
+#[scheduler(
+    name = "constrained_sched",
+    topology(2, 4, 1),
+    max_llcs = 8,
+    max_cpus = 64
+)]
+#[allow(dead_code)]
+enum ConstrainedSchedFlag {}
+
+/// Inherits constraints from CONSTRAINED_SCHED without overriding.
+#[ktstr_test(scheduler = CONSTRAINED_SCHED)]
+fn inherit_sched_constraints(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Verify inherited constraint values match the scheduler definition.
+#[test]
+fn entry_inherit_sched_constraints() {
+    let entry = ktstr::test_support::find_test("inherit_sched_constraints").unwrap();
+    assert_eq!(entry.constraints.max_llcs, Some(8));
+    assert_eq!(entry.constraints.max_cpus, Some(64));
+    // Not set on scheduler — inherits from TopologyConstraints::DEFAULT.
+    assert_eq!(entry.constraints.max_numa_nodes, Some(1));
+    assert_eq!(entry.constraints.min_llcs, 1);
+    assert_eq!(entry.constraints.min_cpus, 1);
+    assert!(!entry.constraints.requires_smt);
+}
+
+/// Overrides max_llcs from the scheduler while inheriting everything else.
+#[ktstr_test(scheduler = CONSTRAINED_SCHED, max_llcs = 16)]
+fn override_sched_constraint(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Verify the override applies while other fields are still inherited.
+#[test]
+fn entry_override_sched_constraint() {
+    let entry = ktstr::test_support::find_test("override_sched_constraint").unwrap();
+    assert_eq!(entry.constraints.max_llcs, Some(16)); // overridden
+    assert_eq!(entry.constraints.max_cpus, Some(64)); // inherited from scheduler
+    assert_eq!(entry.constraints.max_numa_nodes, Some(1)); // inherited from DEFAULT
 }
 
 /// Scheduler with a distinctive topology for inheritance tests.
@@ -539,6 +613,7 @@ fn derive_minimal_defaults() {
     threads = 1,
     memory_mb = 2048,
     min_numa_nodes = 2,
+    max_numa_nodes = 4,
     min_llcs = 2,
     min_cpus = 4
 )]

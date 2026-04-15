@@ -235,7 +235,7 @@ pub use crate::scenario::flags::FlagDecl;
 ///
 /// Captures everything the framework needs to know about a scheduler:
 /// its binary, flag declarations, sysctls, kernel args, cgroup parent,
-/// scheduler args, and monitor thresholds.
+/// scheduler args, topology constraints, and monitor thresholds.
 pub struct Scheduler {
     pub name: &'static str,
     pub binary: SchedulerSpec,
@@ -253,6 +253,9 @@ pub struct Scheduler {
     /// this topology unless they override `llcs`, `cores`, or
     /// `threads` explicitly in `#[ktstr_test]`.
     pub topology: Topology,
+    /// Gauntlet topology constraints. Tests inherit these unless they
+    /// override specific fields in `#[ktstr_test]`.
+    pub constraints: TopologyConstraints,
 }
 
 impl Scheduler {
@@ -271,6 +274,7 @@ impl Scheduler {
             threads_per_core: 1,
             numa_nodes: 1,
         },
+        constraints: TopologyConstraints::DEFAULT,
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -290,6 +294,7 @@ impl Scheduler {
                 threads_per_core: 1,
                 numa_nodes: 1,
             },
+            constraints: TopologyConstraints::DEFAULT,
         }
     }
 
@@ -348,6 +353,55 @@ impl Scheduler {
             threads_per_core: threads,
             numa_nodes: 1,
         };
+        self
+    }
+
+    /// Set gauntlet topology constraints. Tests inherit these unless
+    /// they override specific fields in `#[ktstr_test]`.
+    pub const fn constraints(mut self, constraints: TopologyConstraints) -> Self {
+        self.constraints = constraints;
+        self
+    }
+
+    /// Set minimum number of NUMA nodes.
+    pub const fn min_numa_nodes(mut self, n: u32) -> Self {
+        self.constraints.min_numa_nodes = n;
+        self
+    }
+
+    /// Set maximum number of NUMA nodes.
+    pub const fn max_numa_nodes(mut self, n: u32) -> Self {
+        self.constraints.max_numa_nodes = Some(n);
+        self
+    }
+
+    /// Set minimum number of LLCs.
+    pub const fn min_llcs(mut self, n: u32) -> Self {
+        self.constraints.min_llcs = n;
+        self
+    }
+
+    /// Set maximum number of LLCs.
+    pub const fn max_llcs(mut self, n: u32) -> Self {
+        self.constraints.max_llcs = Some(n);
+        self
+    }
+
+    /// Set whether the scheduler requires SMT.
+    pub const fn requires_smt(mut self, v: bool) -> Self {
+        self.constraints.requires_smt = v;
+        self
+    }
+
+    /// Set minimum total CPU count.
+    pub const fn min_cpus(mut self, n: u32) -> Self {
+        self.constraints.min_cpus = n;
+        self
+    }
+
+    /// Set maximum total CPU count.
+    pub const fn max_cpus(mut self, n: u32) -> Self {
+        self.constraints.max_cpus = Some(n);
         self
     }
 
@@ -436,21 +490,53 @@ pub use crate::vmm::topology::Topology;
 pub struct TopologyConstraints {
     /// Minimum number of NUMA nodes.
     pub min_numa_nodes: u32,
+    /// Maximum number of NUMA nodes.
+    pub max_numa_nodes: Option<u32>,
     /// Minimum number of LLCs.
     pub min_llcs: u32,
+    /// Maximum number of LLCs.
+    pub max_llcs: Option<u32>,
     /// Whether the test requires SMT (threads_per_core > 1).
     pub requires_smt: bool,
     /// Minimum total CPU count.
     pub min_cpus: u32,
+    /// Maximum total CPU count.
+    pub max_cpus: Option<u32>,
 }
 
 impl TopologyConstraints {
     pub const DEFAULT: TopologyConstraints = TopologyConstraints {
         min_numa_nodes: 1,
+        max_numa_nodes: Some(1),
         min_llcs: 1,
+        max_llcs: Some(12),
         requires_smt: false,
         min_cpus: 1,
+        max_cpus: Some(192),
     };
+
+    /// Whether a topology preset is eligible under these constraints
+    /// and the host's physical limits.
+    pub fn accepts(
+        &self,
+        topo: &Topology,
+        host_cpus: u32,
+        host_llcs: u32,
+        host_max_cpus_per_llc: u32,
+    ) -> bool {
+        topo.num_numa_nodes() >= self.min_numa_nodes
+            && self
+                .max_numa_nodes
+                .is_none_or(|max| topo.num_numa_nodes() <= max)
+            && topo.num_llcs() >= self.min_llcs
+            && self.max_llcs.is_none_or(|max| topo.num_llcs() <= max)
+            && (!self.requires_smt || topo.threads_per_core >= 2)
+            && topo.total_cpus() >= self.min_cpus
+            && self.max_cpus.is_none_or(|max| topo.total_cpus() <= max)
+            && topo.total_cpus() <= host_cpus
+            && topo.num_llcs() <= host_llcs
+            && topo.cores_per_llc * topo.threads_per_core <= host_max_cpus_per_llc
+    }
 }
 
 /// Registration entry for an `#[ktstr_test]`-annotated function.
@@ -799,15 +885,12 @@ fn list_tests_all(ignored_only: bool) {
             .map(|t| t.max_cores_per_llc() as u32)
             .unwrap_or(host_cpus);
         for preset in &presets {
-            let t = &preset.topology;
-            if t.num_numa_nodes() < entry.constraints.min_numa_nodes
-                || t.num_llcs() < entry.constraints.min_llcs
-                || (entry.constraints.requires_smt && t.threads_per_core < 2)
-                || t.total_cpus() < entry.constraints.min_cpus
-                || t.total_cpus() > host_cpus
-                || t.num_llcs() > host_llcs
-                || t.cores_per_llc * t.threads_per_core > host_max_cpus_per_llc
-            {
+            if !entry.constraints.accepts(
+                &preset.topology,
+                host_cpus,
+                host_llcs,
+                host_max_cpus_per_llc,
+            ) {
                 continue;
             }
             for profile in &profiles {
@@ -872,15 +955,12 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             .map(|t| t.max_cores_per_llc() as u32)
             .unwrap_or(host_cpus);
         for preset in &presets {
-            let t = &preset.topology;
-            if t.num_numa_nodes() < entry.constraints.min_numa_nodes
-                || t.num_llcs() < entry.constraints.min_llcs
-                || (entry.constraints.requires_smt && t.threads_per_core < 2)
-                || t.total_cpus() < entry.constraints.min_cpus
-                || t.total_cpus() > host_cpus
-                || t.num_llcs() > host_llcs
-                || t.cores_per_llc * t.threads_per_core > host_max_cpus_per_llc
-            {
+            if !entry.constraints.accepts(
+                &preset.topology,
+                host_cpus,
+                host_llcs,
+                host_max_cpus_per_llc,
+            ) {
                 continue;
             }
             for profile in &profiles {
@@ -888,8 +968,14 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
                 let test_name = format!("gauntlet/{}/{}/{}", entry.name, preset.name, pname);
                 candidates.push(TestCandidate {
                     name: format!("{}: test", test_name),
-                    features: extract_features(entry, t, &profile.flags, true, &test_name),
-                    estimated_secs: estimate_duration(entry, t),
+                    features: extract_features(
+                        entry,
+                        &preset.topology,
+                        &profile.flags,
+                        true,
+                        &test_name,
+                    ),
+                    estimated_secs: estimate_duration(entry, &preset.topology),
                 });
             }
         }
@@ -4717,6 +4803,7 @@ mod tests {
             threads_per_core: 1,
             numa_nodes: 1,
         },
+        constraints: TopologyConstraints::DEFAULT,
     };
 
     fn sched_entry(name: &'static str) -> KtstrTestEntry {
@@ -5635,5 +5722,198 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].is_some(), "main should resolve");
         assert!(results[1].is_none(), "nonexistent should not resolve");
+    }
+
+    // -- TopologyConstraints tests --
+
+    #[test]
+    fn topology_constraints_default_has_max_values() {
+        let c = TopologyConstraints::DEFAULT;
+        assert_eq!(c.max_llcs, Some(12));
+        assert_eq!(c.max_numa_nodes, Some(1));
+        assert_eq!(c.max_cpus, Some(192));
+    }
+
+    #[test]
+    fn topology_constraints_max_fields_set() {
+        let c = TopologyConstraints {
+            max_llcs: Some(16),
+            max_numa_nodes: Some(4),
+            max_cpus: Some(128),
+            ..TopologyConstraints::DEFAULT
+        };
+        assert_eq!(c.max_llcs, Some(16));
+        assert_eq!(c.max_numa_nodes, Some(4));
+        assert_eq!(c.max_cpus, Some(128));
+        assert_eq!(c.min_numa_nodes, 1);
+        assert_eq!(c.min_llcs, 1);
+        assert_eq!(c.min_cpus, 1);
+    }
+
+    #[test]
+    fn topology_constraints_equality() {
+        let a = TopologyConstraints::DEFAULT;
+        let b = TopologyConstraints::DEFAULT;
+        assert_eq!(a, b);
+
+        let c = TopologyConstraints {
+            max_llcs: Some(8),
+            ..TopologyConstraints::DEFAULT
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn accepts_default_allows_within_limits() {
+        let c = TopologyConstraints::DEFAULT;
+        // 8 LLCs, 4 cores, 2 threads, 1 NUMA = 64 CPUs
+        let t = Topology::new(8, 4, 2, 1);
+        assert!(c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_default_rejects_multi_numa() {
+        let c = TopologyConstraints::DEFAULT;
+        // 8 LLCs, 4 cores, 2 threads, 2 NUMA = 64 CPUs
+        let t = Topology::new(8, 4, 2, 2);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_default_rejects_too_many_llcs() {
+        let c = TopologyConstraints::DEFAULT;
+        // 16 LLCs exceeds max_llcs=12
+        let t = Topology::new(16, 2, 1, 1);
+        assert!(!c.accepts(&t, 128, 32, 32));
+    }
+
+    #[test]
+    fn accepts_none_means_no_limit() {
+        let c = TopologyConstraints {
+            max_llcs: None,
+            max_numa_nodes: None,
+            max_cpus: None,
+            ..TopologyConstraints::DEFAULT
+        };
+        // 16 LLCs, 8 cores, 2 threads, 4 NUMA = 256 CPUs
+        let t = Topology::new(16, 8, 2, 4);
+        assert!(c.accepts(&t, 512, 32, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_many_llcs() {
+        let c = TopologyConstraints {
+            max_llcs: Some(4),
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(8, 2, 1, 1);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_allows_llcs_at_max() {
+        let c = TopologyConstraints {
+            max_llcs: Some(4),
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(4, 2, 1, 1);
+        assert!(c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_many_numa_nodes() {
+        let c = TopologyConstraints {
+            max_numa_nodes: Some(2),
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(4, 2, 1, 4);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_allows_numa_at_max() {
+        let c = TopologyConstraints {
+            max_numa_nodes: Some(2),
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(4, 2, 1, 2);
+        assert!(c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_many_cpus() {
+        let c = TopologyConstraints {
+            max_cpus: Some(16),
+            ..TopologyConstraints::DEFAULT
+        };
+        // 4 LLCs * 4 cores * 2 threads = 32 CPUs
+        let t = Topology::new(4, 4, 2, 1);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_allows_cpus_at_max() {
+        let c = TopologyConstraints {
+            max_cpus: Some(16),
+            ..TopologyConstraints::DEFAULT
+        };
+        // 2 LLCs * 4 cores * 2 threads = 16 CPUs
+        let t = Topology::new(2, 4, 2, 1);
+        assert!(c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_few_llcs() {
+        let c = TopologyConstraints {
+            min_llcs: 4,
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(2, 4, 1, 1);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_exceeding_host_cpus() {
+        let c = TopologyConstraints::DEFAULT;
+        let t = Topology::new(4, 4, 2, 1); // 32 CPUs
+        assert!(!c.accepts(&t, 16, 16, 32)); // host has only 16
+    }
+
+    #[test]
+    fn accepts_rejects_exceeding_host_llcs() {
+        let c = TopologyConstraints::DEFAULT;
+        let t = Topology::new(8, 2, 1, 1);
+        assert!(!c.accepts(&t, 128, 4, 32)); // host has only 4 LLCs
+    }
+
+    #[test]
+    fn accepts_combined_min_and_max() {
+        let c = TopologyConstraints {
+            min_llcs: 2,
+            max_llcs: Some(8),
+            min_cpus: 4,
+            max_cpus: Some(32),
+            ..TopologyConstraints::DEFAULT
+        };
+        // 1 LLC, 4 CPUs -- rejected (min_llcs=2)
+        assert!(!c.accepts(&Topology::new(1, 4, 1, 1), 128, 16, 32));
+        // 2 LLCs, 4 CPUs -- accepted
+        assert!(c.accepts(&Topology::new(2, 2, 1, 1), 128, 16, 32));
+        // 16 LLCs, 32 CPUs -- rejected (max_llcs=8)
+        assert!(!c.accepts(&Topology::new(16, 2, 1, 1), 128, 16, 32));
+        // 8 LLCs, 16 CPUs -- accepted
+        assert!(c.accepts(&Topology::new(8, 2, 1, 1), 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_requires_smt() {
+        let c = TopologyConstraints {
+            requires_smt: true,
+            ..TopologyConstraints::DEFAULT
+        };
+        let no_smt = Topology::new(2, 4, 1, 1);
+        let with_smt = Topology::new(2, 4, 2, 1);
+        assert!(!c.accepts(&no_smt, 128, 16, 32));
+        assert!(c.accepts(&with_smt, 128, 16, 32));
     }
 }
