@@ -103,7 +103,7 @@ pub fn generate_cpuid(
     let apic = apic_id(topo, cpu_id);
     let smt = smt_shift(topo);
     let core = core_shift(topo);
-    let threads_per_pkg = topo.cores_per_llc * topo.threads_per_core;
+    let threads_per_llc = topo.cores_per_llc * topo.threads_per_core;
 
     for entry in entries.iter_mut() {
         match entry.function {
@@ -112,11 +112,11 @@ pub fn generate_cpuid(
                 // EBX[31:24] = initial APIC ID (8-bit)
                 entry.ebx = (entry.ebx & 0x00ffffff) | ((apic & 0xff) << 24);
                 // EBX[23:16] = max addressable logical processors per package
-                entry.ebx = (entry.ebx & 0xff00ffff) | ((threads_per_pkg.min(255)) << 16);
+                entry.ebx = (entry.ebx & 0xff00ffff) | ((threads_per_llc.min(255)) << 16);
                 // EBX[15:8] = CLFLUSH line size — preserved from KVM
                 // ECX.31 = hypervisor — preserved from KVM
                 // EDX bit 28 = HTT
-                if threads_per_pkg > 1 {
+                if threads_per_llc > 1 {
                     entry.edx |= 1 << 28;
                 }
             }
@@ -126,51 +126,29 @@ pub fn generate_cpuid(
                 patch_cache_topology_eax(entry, smt, core, topo.cores_per_llc);
             }
 
-            // Leaf 0xB: Extended Topology Enumeration (Intel + AMD Zen)
-            0xb => {
-                match entry.index {
-                    // Subleaf 0: SMT level
-                    0 => {
-                        entry.eax = smt;
-                        entry.ebx = topo.threads_per_core & 0xffff;
-                        entry.ecx = (1 << 8) | (entry.index & 0xff); // type=SMT, level=0
-                        entry.edx = apic;
-                    }
-                    // Subleaf 1: Core level
-                    1 => {
-                        entry.eax = core;
-                        entry.ebx = threads_per_pkg & 0xffff;
-                        entry.ecx = (2 << 8) | (entry.index & 0xff); // type=Core, level=1
-                        entry.edx = apic;
-                    }
-                    // Subleaf 2+: invalid level (terminate enumeration)
-                    _ => {
-                        entry.eax = 0;
-                        entry.ebx = 0;
-                        entry.ecx = entry.index & 0xff; // level number only, type=0 (invalid)
-                        entry.edx = apic;
-                    }
-                }
-            }
-
-            // Leaf 0x1F: V2 Extended Topology (Intel + AMD, superset of 0xB)
-            0x1f => match entry.index {
+            // Leaves 0xB and 0x1F: Extended Topology Enumeration.
+            // 0x1F is a superset of 0xB; both enumerate identical
+            // SMT and Core levels in this topology model.
+            0xb | 0x1f => match entry.index {
+                // Subleaf 0: SMT level
                 0 => {
                     entry.eax = smt;
                     entry.ebx = topo.threads_per_core & 0xffff;
                     entry.ecx = (1 << 8) | (entry.index & 0xff); // type=SMT
                     entry.edx = apic;
                 }
+                // Subleaf 1: Core level (threads within one LLC)
                 1 => {
                     entry.eax = core;
-                    entry.ebx = threads_per_pkg & 0xffff;
+                    entry.ebx = threads_per_llc & 0xffff;
                     entry.ecx = (2 << 8) | (entry.index & 0xff); // type=Core
                     entry.edx = apic;
                 }
+                // Subleaf 2+: invalid level (terminate enumeration)
                 _ => {
                     entry.eax = 0;
                     entry.ebx = 0;
-                    entry.ecx = entry.index & 0xff;
+                    entry.ecx = entry.index & 0xff; // type=0 (invalid)
                     entry.edx = apic;
                 }
             },
@@ -193,7 +171,7 @@ pub fn generate_cpuid(
             }
 
             // Leaf 0x80000001: AMD extended feature identification (AMD only)
-            0x8000_0001 if vendor == CpuVendor::Amd && threads_per_pkg > 1 => {
+            0x8000_0001 if vendor == CpuVendor::Amd && threads_per_llc > 1 => {
                 // ECX bit 1 = CmpLegacy: multi-core chip
                 // ECX bit 22 = TopologyExtensions: enables leaves 0x8000001D/1E
                 entry.ecx |= (1 << 1) | (1 << 22);
@@ -203,9 +181,9 @@ pub fn generate_cpuid(
             // ECX[7:0] = number of physical threads - 1
             // ECX[15:12] = APIC ID size (bits needed for thread IDs in package)
             0x8000_0008 => {
-                if threads_per_pkg > 1 {
+                if threads_per_llc > 1 {
                     let apic_id_size = core;
-                    entry.ecx = (apic_id_size << 12) | (threads_per_pkg - 1);
+                    entry.ecx = (apic_id_size << 12) | (threads_per_llc - 1);
                 } else {
                     entry.ecx = 0;
                 }
@@ -217,11 +195,12 @@ pub fn generate_cpuid(
                 entry.eax = apic;
                 // EBX[7:0] = Compute Unit (core) ID
                 // EBX[15:8] = Threads per compute unit - 1
-                let (_, core_id, _) = topo.decompose(cpu_id);
+                let (llc_id, core_id, _) = topo.decompose(cpu_id);
                 entry.ebx = ((topo.threads_per_core - 1) << 8) | (core_id & 0xff);
-                // ECX[7:0] = Node ID (0 = all in one node)
-                // ECX[10:8] = Nodes per processor - 1 (0 = 1 node)
-                entry.ecx = 0;
+                // ECX[7:0] = Node ID
+                // ECX[10:8] = Nodes per processor - 1
+                let node_id = topo.numa_node_of(llc_id);
+                entry.ecx = node_id | ((topo.numa_nodes - 1) << 8);
                 // EDX = reserved
                 entry.edx = 0;
             }
@@ -1088,7 +1067,13 @@ mod tests {
                 1,
                 "threads per core - 1 should be 1"
             );
-            assert_eq!(entry.ecx, 0, "single node, node ID 0");
+            // Single NUMA: node_id=0, nodes_per_processor-1=0
+            assert_eq!(entry.ecx & 0xff, 0, "single node: node ID = 0");
+            assert_eq!(
+                (entry.ecx >> 8) & 0x7,
+                0,
+                "single node: nodes per proc - 1 = 0"
+            );
             assert_eq!(entry.edx, 0, "EDX reserved");
         }
 
@@ -1105,6 +1090,46 @@ mod tests {
         if let Some(entry) = leaf3 {
             assert_eq!(entry.eax, apic_id(&topo, 3), "EAX = extended APIC ID");
             assert_eq!(entry.ebx & 0xff, 1, "core ID for cpu 3 should be 1");
+        }
+    }
+
+    #[test]
+    fn leaf_8000001e_multi_numa_node_id() {
+        let kvm = match kvm_ioctls::Kvm::new() {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        // 4 LLCs, 2 NUMA nodes -> LLCs 0,1 in node 0; LLCs 2,3 in node 1
+        let topo = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 2,
+            numa_nodes: 2,
+        };
+        let base = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .unwrap();
+        let vendor = detect_vendor(base.as_slice());
+        if vendor != CpuVendor::Amd {
+            return;
+        }
+
+        let cpus_per_llc = topo.cores_per_llc * topo.threads_per_core;
+        // CPU 0: LLC 0, NUMA node 0
+        let cpuid0 = generate_cpuid(base.as_slice(), &topo, 0, false);
+        let leaf0 = cpuid0.iter().find(|e| e.function == 0x8000_001e);
+        if let Some(entry) = leaf0 {
+            assert_eq!(entry.ecx & 0xff, 0, "cpu 0: node ID = 0");
+            assert_eq!((entry.ecx >> 8) & 0x7, 1, "nodes per processor - 1 = 1");
+        }
+
+        // First CPU in LLC 2: NUMA node 1
+        let cpu_in_node1 = 2 * cpus_per_llc;
+        let cpuid1 = generate_cpuid(base.as_slice(), &topo, cpu_in_node1, false);
+        let leaf1 = cpuid1.iter().find(|e| e.function == 0x8000_001e);
+        if let Some(entry) = leaf1 {
+            assert_eq!(entry.ecx & 0xff, 1, "cpu {cpu_in_node1}: node ID = 1");
+            assert_eq!((entry.ecx >> 8) & 0x7, 1, "nodes per processor - 1 = 1");
         }
     }
 
@@ -1295,7 +1320,7 @@ mod tests {
             (15, 16, 1), // large scale no SMT
             (14, 9, 2),  // large with SMT, max APIC > 255
             (1, 64, 1),  // EAX[31:26] boundary (bits_needed(64)=6)
-            (1, 18, 1),  // non-power-of-2 large threads_per_pkg
+            (1, 18, 1),  // non-power-of-2 large threads_per_llc
         ];
         for (llcs, cores, threads) in topos {
             let topo = Topology {
@@ -1314,21 +1339,21 @@ mod tests {
             );
             let leaf = cpuid.iter().find(|e| e.function == 0x8000_0008);
             if let Some(entry) = leaf {
-                let threads_per_pkg = cores * threads;
+                let threads_per_llc = cores * threads;
                 let apic_id_size = (entry.ecx >> 12) & 0xf;
                 let nc = entry.ecx & 0xff;
 
-                if threads_per_pkg > 1 {
+                if threads_per_llc > 1 {
                     assert!(
-                        (1u32 << apic_id_size) >= threads_per_pkg,
+                        (1u32 << apic_id_size) >= threads_per_llc,
                         "{llcs}l/{cores}c/{threads}t: ApicIdSize {apic_id_size} too small \
-                         for {threads_per_pkg} threads (2^{apic_id_size} = {})",
+                         for {threads_per_llc} threads (2^{apic_id_size} = {})",
                         1u32 << apic_id_size
                     );
                     assert_eq!(
                         nc,
-                        threads_per_pkg - 1,
-                        "{llcs}l/{cores}c/{threads}t: NC should be threads_per_pkg - 1"
+                        threads_per_llc - 1,
+                        "{llcs}l/{cores}c/{threads}t: NC should be threads_per_llc - 1"
                     );
                 } else {
                     assert_eq!(
