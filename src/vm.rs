@@ -210,6 +210,54 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             4096,
         ),
     ];
+    let numa_defs: &[(&str, &str, u32, u32, u32, u32, usize)] = &[
+        (
+            "numa2-4llc",
+            "16 CPUs, 2 NUMA nodes, 4 LLCs",
+            2,
+            4,
+            4,
+            1,
+            2048,
+        ),
+        (
+            "numa2-8llc",
+            "128 CPUs, 2 NUMA nodes, 8 LLCs with SMT",
+            2,
+            8,
+            8,
+            2,
+            2048,
+        ),
+        (
+            "numa2-8llc-nosmt",
+            "128 CPUs, 2 NUMA nodes, 8 LLCs (no SMT)",
+            2,
+            8,
+            16,
+            1,
+            2048,
+        ),
+        (
+            "numa4-8llc",
+            "32 CPUs, 4 NUMA nodes, 8 LLCs",
+            4,
+            8,
+            4,
+            1,
+            2048,
+        ),
+        (
+            "numa4-12llc",
+            "192 CPUs, 4 NUMA nodes, 12 LLCs with SMT",
+            4,
+            12,
+            8,
+            2,
+            4096,
+        ),
+    ];
+
     let mut presets: Vec<TopoPreset> = defs
         .iter()
         .map(|&(n, d, s, c, t, m)| TopoPreset {
@@ -223,6 +271,17 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             },
             memory_mb: m,
         })
+        .chain(numa_defs.iter().map(|&(n, d, nn, s, c, t, m)| TopoPreset {
+            name: n,
+            description: d,
+            topology: Topology {
+                llcs: s,
+                cores_per_llc: c,
+                threads_per_core: t,
+                numa_nodes: nn,
+            },
+            memory_mb: m,
+        }))
         .collect();
 
     // ARM64 has no SMT -- exclude presets with threads_per_core > 1.
@@ -395,6 +454,13 @@ mod tests {
             ("large-8llc-nosmt", 8, 128),
             ("near-max-llc-nosmt", 15, 240),
             ("max-cpu-nosmt", 14, 252),
+            ("numa2-4llc", 4, 16),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("numa2-8llc", 8, 128),
+            ("numa2-8llc-nosmt", 8, 128),
+            ("numa4-8llc", 8, 32),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("numa4-12llc", 12, 192),
         ];
         let presets = gauntlet_presets();
         for &(name, llcs, cpus) in expected {
