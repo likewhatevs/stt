@@ -532,8 +532,8 @@ pub fn extract_verifier_log(scheduler_log: &str) -> Option<&str> {
     Some(content.trim_end_matches('\n'))
 }
 
-/// Format verifier results as text: brief lines per program, collapsed
-/// logs, and optional A/B diff table.
+/// Format verifier results as text: brief lines per program and collapsed
+/// logs.
 pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!("\n{label}\n"));

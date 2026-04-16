@@ -181,6 +181,10 @@ pub fn format_probe_events(
 /// labels: `vec![(name, type_label)]`. When present and an event has
 /// no struct field specs, parameters are printed with their real names
 /// (e.g. `prev (task_struct *)`) instead of `arg0`.
+///
+/// `render_hints` maps struct field names to [`RenderHint`](super::btf::RenderHint)
+/// values that control numeric display format (hex, decimal, bool, signed)
+/// for BTF-discovered fields.
 pub fn format_probe_events_with_bpf_locs(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)],
