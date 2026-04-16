@@ -236,22 +236,15 @@ pub mod workload;
 #[allow(dead_code)]
 pub(crate) const BUSYBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
 
-/// Short git commit hash at build time. Falls back to the crate
-/// version when installed from the registry (no .git directory).
-pub const GIT_HASH: &str = match option_env!("KTSTR_GIT_HASH") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
-/// Full git commit hash at build time.
-pub const GIT_FULL_HASH: &str = match option_env!("KTSTR_GIT_FULL_HASH") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
-/// Git branch name at build time.
-pub const GIT_BRANCH: &str = match option_env!("KTSTR_GIT_BRANCH") {
-    Some(v) => v,
-    None => "release",
-};
+/// Short git commit hash at ktstr build time, or "unknown" when
+/// built without `.git` in the manifest dir (see build.rs).
+pub const GIT_HASH: &str = env!("KTSTR_GIT_HASH");
+/// Full git commit hash at ktstr build time, or "unknown" when
+/// built without `.git` in the manifest dir (see build.rs).
+pub const GIT_FULL_HASH: &str = env!("KTSTR_GIT_FULL_HASH");
+/// Git branch name at ktstr build time, or "unknown" when built
+/// without `.git` in the manifest dir (see build.rs).
+pub const GIT_BRANCH: &str = env!("KTSTR_GIT_BRANCH");
 
 /// Embedded ktstr.kconfig fragment.
 pub const EMBEDDED_KCONFIG: &str = include_str!("../ktstr.kconfig");

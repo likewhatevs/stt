@@ -913,7 +913,6 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
     if let Ok(cache) = crate::cache::CacheDir::new()
         && let Some(entry) = cache.lookup(&cache_key)
         && let Some(ref meta) = entry.metadata
-        && !entry.has_stale_kconfig(&embedded_kconfig_hash())
     {
         let image = entry.path.join(&meta.image_name);
         if image.exists() {

@@ -333,13 +333,9 @@ fn kernel_build(
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}-kc{}", ktstr::cache_key_suffix());
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
-            if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
-                eprintln!("cargo-ktstr: cached kernel is stale, rebuilding");
-            } else {
-                eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
-                eprintln!("cargo-ktstr: use --force to rebuild");
-                return Ok(());
-            }
+            eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
+            eprintln!("cargo-ktstr: use --force to rebuild");
+            return Ok(());
         }
         let sp = cli::Spinner::start("Downloading kernel...");
         let result = fetch::download_tarball(&ver, tmp_dir.path());
@@ -354,13 +350,9 @@ fn kernel_build(
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
-        if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
-            eprintln!("cargo-ktstr: cached kernel is stale, rebuilding");
-        } else {
-            eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
-            eprintln!("cargo-ktstr: use --force to rebuild");
-            return Ok(());
-        }
+        eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
+        eprintln!("cargo-ktstr: use --force to rebuild");
+        return Ok(());
     }
 
     let result =
