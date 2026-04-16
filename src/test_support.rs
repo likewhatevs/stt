@@ -2005,6 +2005,17 @@ fn trim_settle_samples(report: &crate::monitor::MonitorReport) -> crate::monitor
 /// programs. `filter_traceable` drops it (not in kallsyms).
 const DISCOVER_SENTINEL: &str = "__discover__";
 
+/// Format the last `n` lines of `text` under a `--- header ---` delimiter.
+/// Returns `None` if `text` is empty.
+fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let start = lines.len().saturating_sub(n);
+    Some(format!("--- {header} ---\n{}", lines[start..].join("\n")))
+}
+
 /// Attempt auto-repro: extract stack functions from COM2 scheduler output
 /// or COM1 kernel console (fallback), boot a second VM with BPF probes
 /// attached, and return formatted probe data. When no stack functions are
@@ -2196,7 +2207,69 @@ fn attempt_auto_repro(
         })
         .map(|s| s.to_string());
     let kernel_dir_str = kernel_dir.as_deref();
-    extract_probe_output(&repro_result.output, kernel_dir_str)
+    let probe_section = extract_probe_output(&repro_result.output, kernel_dir_str);
+
+    // Build diagnostic tails from the repro VM's output.
+    const REPRO_TAIL_LINES: usize = 40;
+
+    let sched_log_tail = parse_sched_output(&repro_result.output).and_then(|log| {
+        let collapsed = crate::verifier::collapse_cycles(log);
+        format_tail(&collapsed, REPRO_TAIL_LINES, "repro VM scheduler log")
+    });
+
+    let dump_tail = extract_sched_ext_dump(&repro_result.stderr)
+        .and_then(|dump| format_tail(&dump, REPRO_TAIL_LINES, "repro VM sched_ext dump"));
+
+    let dmesg_tail = format_tail(&repro_result.stderr, REPRO_TAIL_LINES, "repro VM dmesg");
+
+    let tails: Vec<String> = [sched_log_tail, dump_tail, dmesg_tail]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if probe_section.is_none() && tails.is_empty() {
+        return None;
+    }
+
+    let has_probe = probe_section.is_some();
+    let mut out = probe_section.unwrap_or_default();
+
+    // Crash reproduction status when probe data is absent.
+    if !has_probe {
+        let status = if repro_result.timed_out {
+            "repro VM: timed out".to_string()
+        } else if repro_result.crash_message.is_some()
+            || repro_result.output.contains("SCHEDULER_DIED")
+        {
+            format!(
+                "repro VM: scheduler crashed (exit code {})",
+                repro_result.exit_code,
+            )
+        } else if repro_result.exit_code != 0 {
+            format!(
+                "repro VM: exited abnormally (exit code {})",
+                repro_result.exit_code,
+            )
+        } else {
+            "repro VM: scheduler ran normally (crash did not reproduce)".to_string()
+        };
+        out.push_str(&status);
+    }
+
+    // Duration line before tails.
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "repro VM duration: {:.1}s",
+        repro_result.duration.as_secs_f64(),
+    ));
+
+    for tail in &tails {
+        out.push_str("\n\n");
+        out.push_str(tail);
+    }
+    Some(out)
 }
 
 /// Delimiters for probe output in guest COM2 (written by emit_probe_payload).

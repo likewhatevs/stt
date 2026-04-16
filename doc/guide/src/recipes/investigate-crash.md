@@ -17,7 +17,7 @@ only when relevant:
 | `--- scheduler log ---` | Scheduler process stdout+stderr (cycle-collapsed). |
 | `--- monitor ---` | Host-side monitor: sample count, max imbalance, max DSQ depth, stall flag, threshold verdict. |
 | `--- sched_ext dump ---` | `sched_ext_dump` trace lines from the guest kernel. |
-| `--- auto-repro ---` | BPF probe data (kprobes, fentry, tp_btf trigger) from a second VM run. |
+| `--- auto-repro ---` | BPF probe data from a second VM run, plus repro VM duration, scheduler log, sched_ext dump, and dmesg tails. |
 
 `--- diagnostics ---` appears automatically when the scheduler died
 or when `RUST_BACKTRACE=1` is set.
@@ -41,6 +41,12 @@ The probe output shows each function in the crash chain with:
 - Function signature and argument values during execution of the same workload
 - Source file and line number
 - Call chain context
+
+After the probe data, the auto-repro section includes the repro VM
+duration and the last 40 lines of the repro VM's scheduler log
+(cycle-collapsed), sched_ext dump, and kernel console (dmesg). These
+supplement probe data when the crash produces sparse or no probe events.
+When probe data is absent, a crash reproduction status line replaces it.
 
 See [Auto-Repro](../running-tests/auto-repro.md) for details on how
 the two-VM repro cycle works.

@@ -57,6 +57,13 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
    enqueue flags, etc.) and source locations (DWARF for kernel,
    line_info for BPF).
 
+7. **Diagnostic tails** -- the last 40 lines of the repro VM's
+   scheduler log (COM2, cycle-collapsed), sched_ext dump (COM1), and
+   kernel console (COM1) are appended after the probe output when
+   non-empty. A duration line reports total repro VM wall time. When
+   probe data is absent, a crash reproduction status line indicates
+   whether the crash reproduced.
+
 ## Requirements
 
 Auto-repro requires a kernel with the `sched_ext_exit` tracepoint
@@ -122,6 +129,10 @@ ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] failed:
       sticky_cpu  -1
       scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED
 ```
+
+After the probe data, the auto-repro section includes the repro VM
+duration and the last 40 lines of the repro VM's scheduler log,
+sched_ext dump, and dmesg (each only when non-empty).
 
 ## Demo test
 
