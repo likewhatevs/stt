@@ -876,18 +876,12 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     // options already present in .config).
     configure_kernel(path, EMBEDDED_KCONFIG)?;
 
-    // Compute cache key from final .config CRC32.
     let (arch, image_name) = crate::fetch::arch_info();
-    let git_short = &crate::GIT_FULL_HASH[..7.min(crate::GIT_FULL_HASH.len())];
     let config_path = path.join(".config");
     let config_hash = std::fs::read(&config_path)
         .ok()
         .map(|data| format!("{:08x}", crc32fast::hash(&data)));
-    let cfg_tag = config_hash.as_deref().unwrap_or("nocfg");
-    let cache_key = match &acquired.git_hash {
-        Some(h) => format!("local-{h}-{arch}-cfg{cfg_tag}-{git_short}"),
-        None => format!("local-unknown-{arch}-cfg{cfg_tag}-{git_short}"),
-    };
+    let cache_key = acquired.cache_key.clone();
 
     // Clean trees: cache lookup before build.
     // Dirty trees: skip cache, always build.
