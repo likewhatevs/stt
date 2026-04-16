@@ -2788,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr-macros"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "proc-macro2",
  "quote",
