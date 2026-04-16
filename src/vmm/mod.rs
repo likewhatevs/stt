@@ -4865,14 +4865,19 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
-    /// Boot a kernel with vmlinux available and verify the monitor produces samples.
+    /// Boot a kernel with vmlinux available and verify the monitor
+    /// produces samples with meaningful runqueue data and degrades
+    /// gracefully for scx_root-gated paths.
+    ///
+    /// No scheduler is loaded, so scx_root dereferences to NULL on
+    /// all kernel versions. watchdog_observation and event_counters
+    /// must be None.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
         let Some(kernel) = crate::find_kernel().unwrap() else {
             return;
         };
-        // Monitor needs vmlinux — skip if not present.
         let Some(_vmlinux) = find_vmlinux(&kernel) else {
             return;
         };
@@ -4894,13 +4899,36 @@ mod tests {
             Err(e) => panic!("{e:#}"),
         };
         let result = vm.run().unwrap();
-        if let Some(ref report) = result.monitor {
+        let Some(ref report) = result.monitor else {
+            return;
+        };
+        assert!(
+            report.summary.total_samples > 0,
+            "monitor should have collected at least one sample"
+        );
+        let last = report.samples.last().unwrap();
+        assert_eq!(
+            last.cpus.len(),
+            2,
+            "topology requested 2 CPUs but monitor saw {}",
+            last.cpus.len()
+        );
+        assert!(
+            last.cpus.iter().any(|c| c.rq_clock > 1_000_000),
+            "at least one CPU must have rq_clock > 1ms (ns) — \
+             got {:?}",
+            last.cpus.iter().map(|c| c.rq_clock).collect::<Vec<_>>()
+        );
+        assert!(
+            report.watchdog_observation.is_none(),
+            "watchdog_observation must be None when no scheduler is loaded"
+        );
+        for (i, cpu) in last.cpus.iter().enumerate() {
             assert!(
-                report.summary.total_samples > 0,
-                "monitor should have collected at least one sample"
+                cpu.event_counters.is_none(),
+                "cpu {i}: event_counters must be None when no scheduler is loaded"
             );
         }
-        // If monitor is None, the kernel/BTF wasn't compatible — not a failure.
     }
 
     /// Regression guard for the `scx_sched.watchdog_timeout` host-write
@@ -4990,6 +5018,167 @@ mod tests {
             obs.observed_jiffies, obs.expected_jiffies,
             "host wrote {} jiffies to scx_sched.watchdog_timeout but guest memory holds {} — host-write mechanism broken",
             obs.expected_jiffies, obs.observed_jiffies,
+        );
+    }
+
+    /// Validate that the core monitoring path reads meaningful
+    /// runqueue data when a scheduler is loaded.
+    ///
+    /// Boots a VM with scx-ktstr, then asserts per-CPU snapshots
+    /// contain plausible values. When schedstat data is present
+    /// (CONFIG_SCHEDSTATS enabled), asserts sched_count is in a
+    /// plausible range.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn monitor_reads_runqueue_data_with_scheduler() {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
+            return;
+        };
+        let Some(_vmlinux) = find_vmlinux(&kernel) else {
+            return;
+        };
+
+        let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let vm = match KtstrVm::builder()
+            .kernel(&kernel)
+            .topology(1, 1, 2, 1)
+            .memory_mb(256)
+            .timeout(Duration::from_secs(15))
+            .scheduler_binary(&sched_bin)
+            .build()
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
+        let result = vm.run().unwrap();
+        let Some(ref report) = result.monitor else {
+            return;
+        };
+
+        assert!(
+            report.summary.total_samples >= 2,
+            "need at least 2 monitor samples, got {}",
+            report.summary.total_samples
+        );
+
+        let last = report.samples.last().unwrap();
+        assert!(
+            last.cpus.iter().any(|c| c.rq_clock > 1_000_000),
+            "at least one CPU must have rq_clock > 1ms (ns) after running a scheduler — \
+             got {:?}",
+            last.cpus.iter().map(|c| c.rq_clock).collect::<Vec<_>>()
+        );
+
+        if let Some(ss) = last.cpus.iter().find_map(|c| c.schedstat.as_ref()) {
+            assert!(
+                ss.sched_count < 100_000_000,
+                "sched_count {} exceeds plausible range — offset may be wrong",
+                ss.sched_count
+            );
+        }
+    }
+
+    /// Validate that scx event counters are populated on kernels
+    /// with post-refactor sched_ext (scx_sched_pcpu with embedded
+    /// event_stats).
+    ///
+    /// Gates on scx_root symbol presence and event_offsets BTF
+    /// resolution. On pre-refactor kernels where scx_sched lacks
+    /// the pcpu field, event_offsets is None and this test skips.
+    ///
+    /// Event PA resolution happens once at monitor start. If the
+    /// scheduler hasn't loaded by then (scx_root dereferences to
+    /// NULL), the monitor skips event counters for the entire run.
+    /// The test skips in that case rather than asserting, matching
+    /// the watchdog test's approach to scheduler-attach timing.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn event_counters_populated_with_scheduler() {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
+            return;
+        };
+        let Some(vmlinux) = find_vmlinux(&kernel) else {
+            return;
+        };
+
+        let Ok(syms) = crate::monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux) else {
+            return;
+        };
+        if syms.scx_root.is_none() {
+            return;
+        }
+        let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
+            return;
+        };
+        if offsets.event_offsets.is_none() {
+            return;
+        }
+
+        let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let vm = match KtstrVm::builder()
+            .kernel(&kernel)
+            .topology(1, 1, 2, 1)
+            .memory_mb(256)
+            .timeout(Duration::from_secs(15))
+            .scheduler_binary(&sched_bin)
+            .build()
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
+        let result = vm.run().unwrap();
+        let Some(ref report) = result.monitor else {
+            return;
+        };
+
+        assert!(
+            report.summary.total_samples > 0,
+            "monitor should have collected at least one sample"
+        );
+
+        let last = report.samples.last().unwrap();
+        let has_event_data = last.cpus.iter().any(|c| c.event_counters.is_some());
+        if !has_event_data {
+            eprintln!(
+                "SKIP: event counters None despite resolved offsets — \
+                 scheduler may not have attached before monitor resolved PAs"
+            );
+            return;
+        }
+
+        let any_nonzero = last.cpus.iter().any(|c| {
+            c.event_counters.as_ref().is_some_and(|ev| {
+                ev.select_cpu_fallback != 0
+                    || ev.dispatch_local_dsq_offline != 0
+                    || ev.dispatch_keep_last != 0
+                    || ev.enq_skip_exiting != 0
+                    || ev.enq_skip_migration_disabled != 0
+            })
+        });
+        assert!(
+            any_nonzero,
+            "event counters present but all zero — offset resolution may \
+             have produced addresses that read uninitialized memory"
         );
     }
 

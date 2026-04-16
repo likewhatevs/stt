@@ -1039,6 +1039,51 @@ mod tests {
         assert!(offsets.aux_name > 0);
     }
 
+    /// Validate that optional BTF offsets (watchdog, event, pcpu) are
+    /// internally consistent and co-resolve.
+    ///
+    /// `watchdog_offsets` and `event_offsets` both depend on the
+    /// post-refactor `struct scx_sched` layout. They must both
+    /// resolve or both be absent.
+    ///
+    /// Assertions that overlap with parse_rq_offsets_from_vmlinux and
+    /// parse_event_offsets_from_vmlinux are intentionally omitted.
+    #[test]
+    fn btf_optional_offsets_consistent() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        let offsets = match KernelOffsets::from_vmlinux(&path) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        assert_ne!(
+            offsets.rq_nr_running, offsets.rq_scx,
+            "rq_nr_running and rq_scx offsets must be distinct"
+        );
+
+        if let Some(ref ev) = offsets.event_offsets {
+            assert!(ev.scx_sched_pcpu_off > 0);
+        }
+
+        if let Some(ref wd) = offsets.watchdog_offsets {
+            assert!(
+                wd.scx_sched_watchdog_timeout_off > 0,
+                "watchdog_timeout offset must be nonzero within scx_sched"
+            );
+        }
+
+        let has_watchdog = offsets.watchdog_offsets.is_some();
+        let has_events = offsets.event_offsets.is_some();
+        assert_eq!(
+            has_watchdog, has_events,
+            "watchdog_offsets ({has_watchdog}) and event_offsets ({has_events}) \
+             must resolve together — both depend on the scx_sched refactor"
+        );
+    }
+
     #[test]
     fn from_vmlinux_nonexistent() {
         let path = std::path::Path::new("/nonexistent/vmlinux");
