@@ -1170,11 +1170,13 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
 /// Monitor the scheduler child process for unexpected exit.
 ///
 /// Polls `/proc/{pid}` every 200ms. When the directory disappears, the
-/// scheduler has exited. Writes MSG_TYPE_SCHED_EXIT to SHM with exit
-/// code 1, then dumps the scheduler log to COM2 (unless `suppress_com2`
-/// is set, which prevents interleaving with probe output). The host monitor thread
-/// detects this message via mid-flight SHM drain and can terminate the
-/// VM early.
+/// scheduler has exited. When `suppress_com2` is false (normal mode),
+/// writes MSG_TYPE_SCHED_EXIT to SHM and dumps the scheduler log to
+/// COM2. The host detects the SHM message and can terminate the VM
+/// early. When `suppress_com2` is true (probes active), both the SHM
+/// signal and COM2 dump are suppressed — the probe pipeline handles
+/// crash detection via tp_btf/sched_ext_exit instead, and the VM
+/// must stay alive for the probe thread to emit output.
 ///
 /// Uses procfs instead of waitpid because SIGCHLD is SIG_IGN (the kernel
 /// auto-reaps children, making waitpid return ECHILD).

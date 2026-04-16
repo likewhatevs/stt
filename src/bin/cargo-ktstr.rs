@@ -245,7 +245,7 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
     if let Some(ref val) = kernel {
         match KernelId::parse(val) {
             KernelId::Path(p) => {
-                let dir = PathBuf::from(&p);
+                let dir = std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p));
                 build_kernel(&dir, false)?;
                 cmd.env("KTSTR_KERNEL", &dir);
             }
@@ -274,7 +274,7 @@ fn run_coverage(kernel: Option<String>, args: Vec<String>) -> Result<(), String>
     if let Some(ref val) = kernel {
         match KernelId::parse(val) {
             KernelId::Path(p) => {
-                let dir = PathBuf::from(&p);
+                let dir = std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p));
                 build_kernel(&dir, false)?;
                 cmd.env("KTSTR_KERNEL", &dir);
             }
