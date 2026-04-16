@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 pub struct AcquiredSource {
     /// Path to the kernel source directory.
     pub source_dir: PathBuf,
-    /// Cache key for this source (e.g. "6.14.2-tarball-x86_64-kc{hash}-{commit}").
+    /// Cache key for this source (e.g. "6.14.2-tarball-x86_64-kc{kconfig_hash}").
     pub cache_key: String,
     /// Version string if known (e.g. "6.14.2", "6.15-rc3").
     pub version: Option<String>,

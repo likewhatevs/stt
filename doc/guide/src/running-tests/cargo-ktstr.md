@@ -97,8 +97,7 @@ cargo ktstr kernel list --json       # JSON output for CI scripting
 
 Human-readable output shows key, version, source type, arch, and
 build timestamp. Entries built with a different `ktstr.kconfig` are
-marked `(stale kconfig)`. Entries built with a different ktstr version
-are marked `(stale ktstr)`.
+marked `(stale kconfig)`.
 
 | Flag | Description |
 |------|-------------|

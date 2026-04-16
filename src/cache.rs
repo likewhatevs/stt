@@ -17,12 +17,12 @@
 //!
 //! ```text
 //! $CACHE_ROOT/
-//!   6.14.2-tarball-x86_64-kc{hash}-{commit}/
+//!   6.14.2-tarball-x86_64-kc{kconfig_hash}/
 //!     bzImage           # kernel boot image
 //!     vmlinux           # stripped ELF (BTF + symbol table, optional)
 //!     .config           # kernel config (CONFIG_HZ, optional)
 //!     metadata.json     # KernelMetadata descriptor
-//!   local-deadbee-x86_64-kc{hash}-{commit}/
+//!   local-deadbee-x86_64-kc{kconfig_hash}/
 //!     bzImage
 //!     vmlinux
 //!     .config
@@ -96,9 +96,6 @@ pub struct KernelMetadata {
     /// `None` when vmlinux was not available at cache time.
     #[serde(default)]
     pub vmlinux_name: Option<String>,
-    /// Git commit hash of the ktstr build that cached this kernel.
-    #[serde(default)]
-    pub ktstr_git_hash: Option<String>,
 }
 
 impl KernelMetadata {
@@ -119,7 +116,6 @@ impl KernelMetadata {
             git_ref: None,
             source_tree_path: None,
             vmlinux_name: None,
-            ktstr_git_hash: None,
         }
     }
 
@@ -138,12 +134,6 @@ impl KernelMetadata {
     /// Set the ktstr.kconfig CRC32 hash.
     pub fn with_ktstr_kconfig_hash(mut self, hash: Option<String>) -> Self {
         self.ktstr_kconfig_hash = hash;
-        self
-    }
-
-    /// Set the ktstr build commit hash.
-    pub fn with_ktstr_git_hash(mut self, hash: Option<String>) -> Self {
-        self.ktstr_git_hash = hash;
         self
     }
 
@@ -191,17 +181,6 @@ impl CacheEntry {
         self.metadata
             .as_ref()
             .and_then(|m| m.ktstr_kconfig_hash.as_deref())
-            .is_some_and(|h| h != current_hash)
-    }
-
-    /// Check if this entry was built with a different ktstr version than `current_hash`.
-    ///
-    /// Returns `false` when metadata is missing or the entry has no
-    /// recorded ktstr git hash (pre-version-tracking entries).
-    pub fn has_stale_ktstr(&self, current_hash: &str) -> bool {
-        self.metadata
-            .as_ref()
-            .and_then(|m| m.ktstr_git_hash.as_deref())
             .is_some_and(|h| h != current_hash)
     }
 }
@@ -320,7 +299,7 @@ impl CacheDir {
     /// Store a kernel image in the cache.
     ///
     /// `cache_key`: directory name for the entry (e.g.
-    /// `6.14.2-tarball-x86_64-kc{hash}-{commit}`).
+    /// `6.14.2-tarball-x86_64-kc{kconfig_hash}`).
     ///
     /// `image_path`: path to the kernel boot image to cache.
     ///
@@ -693,7 +672,6 @@ mod tests {
             git_ref: None,
             source_tree_path: None,
             vmlinux_name: None,
-            ktstr_git_hash: None,
         }
     }
 
@@ -736,7 +714,6 @@ mod tests {
             git_ref: Some("v6.15-rc3".to_string()),
             source_tree_path: None,
             vmlinux_name: None,
-            ktstr_git_hash: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -759,7 +736,6 @@ mod tests {
             git_ref: None,
             source_tree_path: Some(PathBuf::from("/tmp/linux")),
             vmlinux_name: None,
-            ktstr_git_hash: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -825,6 +801,24 @@ mod tests {
         assert!(parsed.source_tree_path.is_none());
         assert_eq!(parsed.source, SourceType::Tarball);
         assert_eq!(parsed.arch, "x86_64");
+    }
+
+    #[test]
+    fn cache_metadata_deserialize_legacy_ktstr_git_hash() {
+        // Pre-existing metadata.json files may carry a ktstr_git_hash
+        // key from an older build. serde_json ignores unknown fields
+        // by default (no deny_unknown_fields), so legacy entries
+        // remain readable.
+        let json = r#"{
+            "source": "tarball",
+            "arch": "x86_64",
+            "image_name": "bzImage",
+            "built_at": "2026-04-12T10:00:00Z",
+            "ktstr_git_hash": "deadbeefcafef00d"
+        }"#;
+        let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.source, SourceType::Tarball);
+        assert_eq!(parsed.image_name, "bzImage");
     }
 
     #[test]

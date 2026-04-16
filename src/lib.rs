@@ -113,7 +113,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.3" }
+//! ktstr = { version = "0.4" }
 //! ```
 //!
 //! The only feature flag is `integration`, which gates
@@ -261,12 +261,12 @@ pub fn kconfig_hash() -> String {
     format!("{:08x}", crc32fast::hash(EMBEDDED_KCONFIG.as_bytes()))
 }
 
-/// Cache key suffix combining kconfig hash and ktstr build commit.
-/// Used in kernel cache keys so either a kconfig change or a ktstr
-/// rebuild produces a distinct cache entry.
+/// Cache key suffix derived from the embedded kconfig fragment.
+/// Used in kernel cache keys so a kconfig change produces a distinct
+/// cache entry. The kernel binary is independent of ktstr userspace
+/// source, so no ktstr or consumer build identity feeds this suffix.
 pub fn cache_key_suffix() -> String {
-    let git = &GIT_FULL_HASH[..7.min(GIT_FULL_HASH.len())];
-    format!("{}-{git}", kconfig_hash())
+    kconfig_hash()
 }
 
 pub use ktstr_macros::Scheduler;
@@ -408,11 +408,10 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
         && let Ok(entries) = cache.list()
     {
         let kc_hash = kconfig_hash();
-        let git_hash = GIT_FULL_HASH;
         for entry in &entries {
             if let Some(ref meta) = entry.metadata {
-                // Skip entries built with a different kconfig or ktstr version.
-                if entry.has_stale_kconfig(&kc_hash) || entry.has_stale_ktstr(git_hash) {
+                // Skip entries built with a different kconfig.
+                if entry.has_stale_kconfig(&kc_hash) {
                     continue;
                 }
                 let image = entry.path.join(&meta.image_name);

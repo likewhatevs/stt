@@ -242,26 +242,6 @@ Rebuilds happen automatically on the next `cargo ktstr kernel build`
 for stale entries. Use `--force` to override the cache for other
 reasons.
 
-## Stale ktstr version
-
-```text
-warning: entries marked (stale ktstr) were built with a different ktstr version.
-Rebuild with: kernel build --force VERSION
-```
-
-`cargo ktstr kernel list` marks entries whose stored `ktstr_git_hash`
-differs from the running ktstr binary. Cached kernels built by an
-older ktstr may have different vmlinux stripping or init behavior.
-
-**Fix:**
-
-Remove stale entries and rebuild:
-
-```sh
-cargo ktstr kernel clean
-cargo ktstr kernel build --force VERSION
-```
-
 ## Kernel download failures
 
 ```text
