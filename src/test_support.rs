@@ -2737,12 +2737,16 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     Some(exit_code)
 }
 
+/// Result returned by the probe thread: collected events, skeleton
+/// diagnostics, and accumulated function names from both phases.
+type ProbeThreadResult = (
+    Option<Vec<crate::probe::process::ProbeEvent>>,
+    crate::probe::process::ProbeDiagnostics,
+    Vec<(u32, String)>,
+);
+
 type ProbeHandle = (
-    std::thread::JoinHandle<(
-        Option<Vec<crate::probe::process::ProbeEvent>>,
-        crate::probe::process::ProbeDiagnostics,
-        Vec<(u32, String)>,
-    )>,
+    std::thread::JoinHandle<ProbeThreadResult>,
     Vec<(u32, String)>,
     PipelineDiagnostics,
     std::sync::Arc<std::sync::atomic::AtomicBool>, // output_done
@@ -2769,12 +2773,7 @@ pub(crate) struct PipelineDiagnostics {
 /// the channel to send Phase B input (BPF fentry targets), and metadata
 /// needed by the readout phase.
 pub(crate) struct ProbePhaseAState {
-    #[allow(clippy::type_complexity)]
-    pub handle: std::thread::JoinHandle<(
-        Option<Vec<crate::probe::process::ProbeEvent>>,
-        crate::probe::process::ProbeDiagnostics,
-        Vec<(u32, String)>,
-    )>,
+    pub handle: std::thread::JoinHandle<ProbeThreadResult>,
     pub phase_b_tx: std::sync::mpsc::Sender<crate::probe::process::PhaseBInput>,
     pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub kernel_func_names: Vec<(u32, String)>,
