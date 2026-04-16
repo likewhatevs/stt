@@ -3032,7 +3032,11 @@ impl KtstrVm {
 
         let (monitor_report, mid_flight_drain) =
             match run.monitor_handle.and_then(|h| h.join().ok()) {
-                Some((samples, drain, watchdog_observation)) => {
+                Some(monitor::reader::MonitorLoopResult {
+                    samples,
+                    drain,
+                    watchdog_observation,
+                }) => {
                     let preemption_threshold_ns =
                         monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
                     let summary = monitor::MonitorSummary::from_samples_with_threshold(

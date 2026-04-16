@@ -604,11 +604,11 @@ pub(crate) struct ProgStatsCtx {
 
 /// Samples, SHM drain, and optional watchdog observation returned by
 /// [`monitor_loop`].
-pub(crate) type MonitorLoopResult = (
-    Vec<MonitorSample>,
-    crate::vmm::shm_ring::ShmDrainResult,
-    Option<super::WatchdogObservation>,
-);
+pub(crate) struct MonitorLoopResult {
+    pub(crate) samples: Vec<MonitorSample>,
+    pub(crate) drain: crate::vmm::shm_ring::ShmDrainResult,
+    pub(crate) watchdog_observation: Option<super::WatchdogObservation>,
+}
 
 /// Configuration for the monitor sampling loop.
 ///
@@ -845,7 +845,11 @@ pub(crate) fn monitor_loop(
         entries: shm_entries,
         drops: shm_drops,
     };
-    (samples, shm_result, watchdog_observation)
+    MonitorLoopResult {
+        samples,
+        drain: shm_result,
+        watchdog_observation,
+    }
 }
 
 #[cfg(test)]
@@ -979,7 +983,7 @@ mod tests {
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let kill = AtomicBool::new(true);
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1006,7 +1010,7 @@ mod tests {
             })
         };
 
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1093,7 +1097,7 @@ mod tests {
             })
         };
 
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -1132,7 +1136,7 @@ mod tests {
             })
         };
 
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1324,7 +1328,7 @@ mod tests {
             event_pcpu_pas: Some(&ev_pas),
             ..test_config()
         };
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[rq_pa],
             &offsets,
@@ -1359,7 +1363,7 @@ mod tests {
             })
         };
 
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1427,7 +1431,11 @@ mod tests {
             watchdog_override: Some(&wd),
             ..test_config()
         };
-        let (samples, _, watchdog_observation) = monitor_loop(
+        let MonitorLoopResult {
+            samples,
+            watchdog_observation,
+            ..
+        } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1481,7 +1489,10 @@ mod tests {
             watchdog_override: Some(&wd),
             ..test_config()
         };
-        let (_, _, watchdog_observation) = monitor_loop(
+        let MonitorLoopResult {
+            watchdog_observation,
+            ..
+        } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1542,7 +1553,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -1604,7 +1615,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1667,7 +1678,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1742,7 +1753,7 @@ mod tests {
             preemption_threshold_ns: 10_000_000,
             ..test_config()
         };
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1820,7 +1831,7 @@ mod tests {
             preemption_threshold_ns: 10_000_000,
             ..test_config()
         };
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1892,7 +1903,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -1974,7 +1985,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -2128,7 +2139,7 @@ mod tests {
             })
         };
 
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -2163,7 +2174,7 @@ mod tests {
             })
         };
 
-        let (samples, _, _) = monitor_loop(
+        let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
