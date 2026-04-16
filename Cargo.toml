@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -63,7 +63,7 @@ parking_lot = "0.12"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.3.1", path = "ktstr-macros" }
+ktstr-macros = { version = "0.3.2", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 rayon = "1"
 object = { version = "0.36", default-features = false, features = ["build", "std", "elf"] }
