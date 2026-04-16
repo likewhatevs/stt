@@ -50,7 +50,7 @@ The simplest test uses a canned scenario:
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]  // llcs = last-level caches
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     scenarios::steady(ctx)
 }
@@ -202,7 +202,7 @@ See [cargo-ktstr](running-tests/cargo-ktstr.md) for details.
 
 ```sh
 cargo ktstr shell                              # default 1,1,1,1 topology
-cargo ktstr shell --topology 1,2,4,1           # custom CPU topology
+cargo ktstr shell --topology 1,2,4,1           # 1 NUMA node, 2 LLCs, 4 cores/LLC, 1 thread/core
 cargo ktstr shell -i ./my-scheduler            # include a file in the guest
 cargo ktstr shell -i ./test-data/              # include a directory recursively
 ```

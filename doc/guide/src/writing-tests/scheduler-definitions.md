@@ -177,10 +177,12 @@ this scheduler. When `#[ktstr_test]` omits `llcs`, `cores`, and
 In the derive:
 
 ```rust,ignore
+//              numa_nodes, llcs, cores_per_llc, threads_per_core
 #[scheduler(topology(1, 2, 4, 1))]
 ```
 
 Arguments are `(numa_nodes, llcs, cores_per_llc, threads_per_core)`.
+Most schedulers use `numa_nodes = 1` (single NUMA node).
 `Scheduler::new()` defaults to `(1, 1, 2, 1)`.
 
 Tests that need a different topology (e.g. SMT) override individual

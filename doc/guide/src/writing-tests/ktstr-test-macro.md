@@ -21,6 +21,7 @@ can be omitted:
 ```rust,ignore
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Name("scx_my_sched"))
+    //            numa, llcs, cores/llc, threads/core
     .topology(1, 2, 4, 1);
 
 #[ktstr_test(scheduler = MY_SCHED)]
@@ -59,7 +60,8 @@ All attributes are optional with defaults.
 Each dimension independently inherits from `Scheduler.topology` when
 a `scheduler` is specified and that dimension is not explicitly set.
 Without a scheduler, unset dimensions use macro defaults (numa_nodes=1,
-llcs=1, cores=2, threads=1). See
+llcs=1, cores=2, threads=1). The default is a single-NUMA topology,
+so most tests do not need to set `numa_nodes`. See
 [Default topology](scheduler-definitions.md#default-topology).
 
 ### Scheduler

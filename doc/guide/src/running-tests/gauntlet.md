@@ -63,9 +63,12 @@ cargo nextest run --run-ignored ignored-only \
 | `numa4-8llc` | 4s8l4c1t | 32 | 8 | 4 | Multi-NUMA, 4 nodes |
 | `numa4-12llc` | 4s12l8c2t | 192 | 12 | 4 | Multi-NUMA, 4 nodes, SMT |
 
-Topology format: `{numa_nodes}s{llcs}l{cores_per_llc}c{threads_per_core}t`.
-Presets are defined in `gauntlet_presets()`. Multi-NUMA presets are
-excluded by default (`max_numa_nodes: Some(1)` in `TopologyConstraints::DEFAULT`).
+Topology format: `{numa_nodes}s{llcs}l{cores_per_llc}c{threads_per_core}t`
+(e.g. `1s2l4c2t` = 1 NUMA node, 2 LLCs, 4 cores per LLC, 2 threads
+per core = 16 CPUs). Presets are defined in `gauntlet_presets()`.
+Multi-NUMA presets are excluded by default
+(`max_numa_nodes: Some(1)` in `TopologyConstraints::DEFAULT`), so
+tests opt in to NUMA testing by raising `max_numa_nodes`.
 
 > **aarch64:** ARM64 CPUs do not have SMT. Presets with
 > `threads_per_core > 1` are excluded on aarch64, leaving 14 presets

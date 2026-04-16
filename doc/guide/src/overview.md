@@ -1,7 +1,8 @@
 # ktstr
 
 ktstr is a test harness for Linux process schedulers, with a focus on
-sched_ext. It boots Linux kernels in KVM virtual machines with
+sched_ext (BPF-extensible process scheduling). It boots Linux kernels
+in KVM virtual machines with
 controlled CPU topologies, runs workloads, and verifies scheduling
 correctness. Also tests under the kernel's default EEVDF scheduler.
 

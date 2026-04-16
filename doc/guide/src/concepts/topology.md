@@ -4,6 +4,34 @@
 configuration. It discovers CPUs, last-level caches (LLCs), and NUMA
 nodes, and generates cpuset partitions for scenarios.
 
+## CPU topology hierarchy
+
+ktstr models four levels of CPU topology, from largest to smallest:
+
+- **NUMA node** -- a memory-proximity domain. Each node is a group of
+  CPUs with fast access to a local memory bank. Cross-node memory
+  access is slower.
+- **LLC** (last-level cache) -- the largest cache shared by a group of
+  cores. LLCs are the key scheduling boundary: tasks sharing an LLC
+  benefit from shared cache lines.
+- **Core** -- a physical execution unit with its own pipeline and L1/L2
+  caches.
+- **Thread** -- an SMT (simultaneous multithreading) sibling. Multiple
+  threads share a single core's execution resources.
+
+Containment: threads belong to a core, cores belong to an LLC, LLCs
+belong to a NUMA node. For example, `2s4l4c2t` describes 2 NUMA
+nodes, each with 2 LLCs, each LLC with 4 cores, each core with 2
+threads = 32 CPUs total.
+
+Most tests use a single NUMA node (the default). NUMA matters when a
+scheduler makes placement decisions based on memory locality.
+Single-NUMA topologies (`numa_nodes = 1`) test scheduling without
+memory-locality effects. Multi-NUMA topologies test whether a
+scheduler keeps tasks close to their memory. See the
+[gauntlet NUMA presets](../running-tests/gauntlet.md#topology-presets)
+for multi-NUMA configurations.
+
 ```rust,ignore
 use ktstr::prelude::*;
 
@@ -21,7 +49,8 @@ pub struct TestTopology {
 IDs, NUMA node IDs, core IDs, and cache sizes for each online CPU.
 
 **`from_spec(numa_nodes, llcs, cores, threads) -> Self`** -- builds a
-topology from a VM spec. Parameters are big-to-little. Multiple LLCs
+topology from a VM spec. Parameters are big-to-little: NUMA nodes,
+last-level caches, cores per LLC, threads per core. Multiple LLCs
 can share a NUMA node when `numa_nodes < llcs`. CPUs numbered
 sequentially. Used as a fallback when sysfs is incomplete inside a
 guest VM.
