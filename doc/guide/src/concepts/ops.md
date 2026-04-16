@@ -93,7 +93,7 @@ In contrast, the `Scenario`-level override (in `run_scenario()`) only
 replaces `CpuSpin` work types. The two mechanisms serve different
 scopes:
 
-- **Scenario-level**: replaces `CpuSpin` in `CgroupWork.work_type`
+- **Scenario-level**: replaces `CpuSpin` in `Work.work_type`
 - **CgroupDef-level**: replaces the work type when `swappable = true`
 
 Both skip overrides to grouped work types when `num_workers` is not

@@ -17,7 +17,7 @@
 //! The [`scenarios`] submodule provides curated canned scenarios.
 //!
 //! For data-driven test cases (used by the internal catalog), see
-//! [`Scenario`], [`CpusetMode`], [`Action`], and [`CgroupWork`].
+//! [`Scenario`], [`CpusetMode`], and [`Action`].
 //!
 //! See the [Scenarios](https://likewhatevs.github.io/ktstr/guide/concepts/scenarios.html)
 //! and [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
@@ -314,36 +314,6 @@ impl std::fmt::Debug for Action {
     }
 }
 
-/// Per-cgroup workload definition.
-///
-/// Specifies the number of workers, their [`WorkType`], scheduling
-/// policy, and affinity for a single cgroup in a [`Scenario`].
-///
-/// When a scenario has fewer `CgroupWork` entries than `num_cgroups`,
-/// the first entry is reused for remaining cgroups.
-#[derive(Clone, Debug)]
-pub struct CgroupWork {
-    /// Number of workers. `None` means use `Ctx::workers_per_cgroup`.
-    pub num_workers: Option<usize>,
-    /// What each worker process does.
-    pub work_type: WorkType,
-    /// Linux scheduling policy for workers.
-    pub policy: SchedPolicy,
-    /// How to set worker CPU affinity.
-    pub affinity: AffinityKind,
-}
-
-impl Default for CgroupWork {
-    fn default() -> Self {
-        Self {
-            num_workers: None,
-            work_type: WorkType::CpuSpin,
-            policy: SchedPolicy::Normal,
-            affinity: AffinityKind::Inherit,
-        }
-    }
-}
-
 /// A data-driven test case.
 ///
 /// Declares the cgroup topology, CPU partitioning, workloads, and
@@ -386,7 +356,7 @@ pub struct Scenario {
     /// How to partition CPUs across cgroups.
     pub cpuset_mode: CpusetMode,
     /// Per-cgroup workload definitions.
-    pub cgroup_works: Vec<CgroupWork>,
+    pub cgroup_works: Vec<Work>,
     /// Execution mode: steady-state or custom logic.
     pub action: Action,
 }
@@ -564,7 +534,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
             num_workers: n,
             affinity,
             work_type: effective_work_type,
-            sched_policy: cw.policy,
+            sched_policy: cw.sched_policy,
         };
         let h = WorkloadHandle::spawn(&wl)?;
         tracing::debug!(cgroup = %name, workers = n, tids = h.tids().len(), "spawned workers");
@@ -1144,10 +1114,10 @@ mod tests {
 
     #[test]
     fn cgroup_work_default() {
-        let cw = CgroupWork::default();
+        let cw = Work::default();
         assert_eq!(cw.num_workers, None);
         assert!(matches!(cw.work_type, WorkType::CpuSpin));
-        assert!(matches!(cw.policy, SchedPolicy::Normal));
+        assert!(matches!(cw.sched_policy, SchedPolicy::Normal));
         assert!(matches!(cw.affinity, AffinityKind::Inherit));
     }
 

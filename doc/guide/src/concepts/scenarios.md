@@ -86,7 +86,7 @@ pub struct Scenario {
     pub excluded_flags: &'static [&'static flags::FlagDecl],
     pub num_cgroups: usize,
     pub cpuset_mode: CpusetMode,
-    pub cgroup_works: Vec<CgroupWork>,
+    pub cgroup_works: Vec<Work>,
     pub action: Action,
 }
 ```
@@ -109,16 +109,9 @@ internal type; external tests use
 [`usable_cpus()`](topology.md#topology-queries).
 `Holdback` operates on `all_cpus()` (no reservation).
 
-**`cgroup_works`** -- per-cgroup workload definition:
-
-```rust,ignore
-pub struct CgroupWork {
-    pub num_workers: Option<usize>, // None = use ctx.workers_per_cgroup
-    pub work_type: WorkType,
-    pub policy: SchedPolicy,
-    pub affinity: AffinityKind,
-}
-```
+**`cgroup_works`** -- per-cgroup workload definition using
+[`Work`](../api/ktstr/workload/struct.Work.html) from the workload
+module (same type used by `CgroupDef` and `Op::Spawn`).
 
 **`action`** -- `Steady` (run workers for the duration) or
 `Custom(fn(&Ctx) -> Result<AssertResult>)` for scenarios with custom
