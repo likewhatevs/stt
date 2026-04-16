@@ -1195,6 +1195,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_hz_commented_out() {
+        let config = "# CONFIG_HZ=1000\nCONFIG_HZ_1000=y\n";
+        assert_eq!(parse_config_hz(config), None);
+    }
+
+    #[test]
     fn vcpu_threshold_reasonable_range() {
         // With no kernel path, falls back to host config or DEFAULT_HZ=250.
         // Threshold should be between 10ms (HZ=1000) and 100ms (HZ=100).
@@ -2767,6 +2773,37 @@ mod tests {
             cpus: vec![],
         };
         assert!(sample_looks_valid(&s));
+    }
+
+    #[test]
+    fn sample_looks_valid_zero_initialized() {
+        let s = MonitorSample {
+            prog_stats: None,
+            elapsed_ms: 0,
+            cpus: vec![CpuSnapshot::default(), CpuSnapshot::default()],
+        };
+        // All fields zero, local_dsq_depth=0 <= DSQ_PLAUSIBILITY_CEILING.
+        assert!(sample_looks_valid(&s));
+    }
+
+    #[test]
+    fn sample_looks_valid_multiple_cpus_one_over() {
+        let s = MonitorSample {
+            prog_stats: None,
+            elapsed_ms: 100,
+            cpus: vec![
+                CpuSnapshot {
+                    local_dsq_depth: 5,
+                    ..Default::default()
+                },
+                CpuSnapshot {
+                    local_dsq_depth: DSQ_PLAUSIBILITY_CEILING + 1,
+                    ..Default::default()
+                },
+            ],
+        };
+        // One CPU over ceiling invalidates the entire sample.
+        assert!(!sample_looks_valid(&s));
     }
 
     // -- MonitorSummary field value assertions --

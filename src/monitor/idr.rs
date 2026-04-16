@@ -93,3 +93,45 @@ pub(crate) fn xa_node_shift(
     let pa = kva_to_pa(node_kva, page_offset);
     mem.read_u8(pa, shift_off) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+
+    #[test]
+    fn xa_node_shift_reads_shift_byte() {
+        // Place an xa_node at PA 0x100 with shift=12 at byte offset 2.
+        let mut buf = [0u8; 0x200];
+        let shift_off = 2;
+        buf[0x100 + shift_off] = 12;
+
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let node_kva = DEFAULT_PAGE_OFFSET + 0x100;
+        assert_eq!(
+            xa_node_shift(&mem, DEFAULT_PAGE_OFFSET, node_kva, shift_off),
+            12
+        );
+    }
+
+    #[test]
+    fn xa_node_shift_zero() {
+        let mut buf = [0u8; 0x200];
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let node_kva = DEFAULT_PAGE_OFFSET;
+        // shift_off=0, buf[0]=0 -> shift=0.
+        assert_eq!(xa_node_shift(&mem, DEFAULT_PAGE_OFFSET, node_kva, 0), 0);
+    }
+
+    #[test]
+    fn xa_node_shift_max_u8() {
+        let mut buf = [0u8; 0x100];
+        buf[0x10] = 255;
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let node_kva = DEFAULT_PAGE_OFFSET;
+        assert_eq!(
+            xa_node_shift(&mem, DEFAULT_PAGE_OFFSET, node_kva, 0x10),
+            255
+        );
+    }
+}
