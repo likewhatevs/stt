@@ -56,8 +56,8 @@ Convenience constructors accept parameters directly:
 `CpusetSpec::exact([0, 1, 2])`, `CpusetSpec::llc(0)`,
 `CpusetSpec::numa(0)`, `CpusetSpec::overlap(0, 2, 0.5)`.
 
-All fractional specs operate on `usable_cpus()`, which reserves the
-last CPU for the root cgroup when the topology has more than 2 CPUs.
+All fractional specs operate on
+[`usable_cpus()`](topology.md#topology-queries).
 
 ## CgroupDef
 

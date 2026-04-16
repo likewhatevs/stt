@@ -106,8 +106,7 @@ internal type; external tests use
 | `Holdback(f64)` | Reserve a fraction of CPUs, split the rest |
 
 **CPU pools**: `SplitHalf`, `Uneven`, and `SplitMisaligned` partition
-[`usable_cpus()`](topology.md#topology-queries), which reserves the
-last CPU for the root cgroup when the topology has more than 2 CPUs.
+[`usable_cpus()`](topology.md#topology-queries).
 `Holdback` operates on `all_cpus()` (no reservation).
 
 **`cgroup_works`** -- per-cgroup workload definition:
