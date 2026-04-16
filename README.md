@@ -105,7 +105,7 @@ For multi-step scenarios with dynamic topology changes, use
 ```rust
 use ktstr::prelude::*;
 
-#[ktstr_test(scheduler = MY_SCHED, sockets = 1, cores = 4, threads = 1)]
+#[ktstr_test(scheduler = MY_SCHED, llcs = 1, cores = 4, threads = 1)]
 fn cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
