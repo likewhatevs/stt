@@ -43,6 +43,7 @@ managed cgroups.
 ```rust,ignore
 pub enum CpusetSpec {
     Llc(usize),                          // All CPUs in an LLC
+    Numa(usize),                         // All CPUs in a NUMA node
     Range { start_frac: f64, end_frac: f64 }, // Fraction of usable CPUs
     Disjoint { index: usize, of: usize },     // Equal disjoint partitions
     Overlap { index: usize, of: usize, frac: f64 }, // Overlapping partitions
@@ -53,7 +54,7 @@ pub enum CpusetSpec {
 Convenience constructors accept parameters directly:
 `CpusetSpec::disjoint(0, 2)`, `CpusetSpec::range(0.0, 0.5)`,
 `CpusetSpec::exact([0, 1, 2])`, `CpusetSpec::llc(0)`,
-`CpusetSpec::overlap(0, 2, 0.5)`.
+`CpusetSpec::numa(0)`, `CpusetSpec::overlap(0, 2, 0.5)`.
 
 All fractional specs operate on `usable_cpus()`, which reserves the
 last CPU for the root cgroup when the topology has more than 2 CPUs.

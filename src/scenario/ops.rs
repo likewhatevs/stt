@@ -86,6 +86,8 @@ pub enum Op {
 pub enum CpusetSpec {
     /// All CPUs in a given LLC index.
     Llc(usize),
+    /// All CPUs in a given NUMA node index.
+    Numa(usize),
     /// Fractional range of usable CPUs [start_frac..end_frac).
     Range { start_frac: f64, end_frac: f64 },
     /// Partition usable CPUs into `of` equal disjoint sets; take the `index`-th.
@@ -125,6 +127,11 @@ impl CpusetSpec {
     /// All CPUs in a given LLC index.
     pub fn llc(index: usize) -> Self {
         CpusetSpec::Llc(index)
+    }
+
+    /// All CPUs in a given NUMA node index.
+    pub fn numa(index: usize) -> Self {
+        CpusetSpec::Numa(index)
     }
 }
 
@@ -603,6 +610,10 @@ impl CpusetSpec {
                 "Llc({idx}) out of range: topology has {} LLCs",
                 ctx.topo.num_llcs()
             )),
+            CpusetSpec::Numa(node) if *node >= ctx.topo.num_numa_nodes() => Err(format!(
+                "Numa({node}) out of range: topology has {} NUMA nodes",
+                ctx.topo.num_numa_nodes()
+            )),
             CpusetSpec::Disjoint { of, .. } | CpusetSpec::Overlap { of, .. } if *of == 0 => {
                 Err("partition count (of) must be > 0".into())
             }
@@ -647,6 +658,20 @@ impl CpusetSpec {
                     ctx.topo.llc_aligned_cpuset(clamped)
                 } else {
                     ctx.topo.llc_aligned_cpuset(*idx)
+                }
+            }
+            CpusetSpec::Numa(idx) => {
+                if *idx >= ctx.topo.num_numa_nodes() {
+                    let clamped = ctx.topo.num_numa_nodes().saturating_sub(1);
+                    tracing::warn!(
+                        numa_node = idx,
+                        num_numa_nodes = ctx.topo.num_numa_nodes(),
+                        clamped,
+                        "CpusetSpec::Numa index out of range, clamping",
+                    );
+                    ctx.topo.numa_aligned_cpuset(clamped)
+                } else {
+                    ctx.topo.numa_aligned_cpuset(*idx)
                 }
             }
             CpusetSpec::Range {
@@ -1621,6 +1646,86 @@ mod tests {
         let llc0 = CpusetSpec::Llc(0).resolve(&ctx);
         let llc1 = CpusetSpec::Llc(1).resolve(&ctx);
         assert!(llc0.is_disjoint(&llc1), "LLCs should be disjoint");
+    }
+
+    // -- CpusetSpec::Numa --
+
+    fn make_numa_ctx(
+        numa_nodes: u32,
+        llcs: u32,
+        cores: u32,
+        threads: u32,
+    ) -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
+        let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::from_spec(numa_nodes, llcs, cores, threads);
+        (cgroups, topo)
+    }
+
+    #[test]
+    fn cpusetspec_numa_node_zero() {
+        // 2 NUMA nodes, 4 LLCs (2 per NUMA), 4 cores, 1 thread
+        // LLCs 0,1 -> NUMA 0 (CPUs 0-7), LLCs 2,3 -> NUMA 1 (CPUs 8-15)
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Numa(0).resolve(&ctx);
+        let expected: BTreeSet<usize> = (0..8).collect();
+        assert_eq!(cpus, expected);
+    }
+
+    #[test]
+    fn cpusetspec_numa_node_one() {
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Numa(1).resolve(&ctx);
+        let expected: BTreeSet<usize> = (8..16).collect();
+        assert_eq!(cpus, expected);
+    }
+
+    #[test]
+    fn cpusetspec_numa_disjoint() {
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let node0 = CpusetSpec::Numa(0).resolve(&ctx);
+        let node1 = CpusetSpec::Numa(1).resolve(&ctx);
+        assert!(
+            node0.is_disjoint(&node1),
+            "NUMA nodes should be disjoint: {:?} vs {:?}",
+            node0,
+            node1
+        );
+        let union: BTreeSet<usize> = node0.union(&node1).copied().collect();
+        assert_eq!(union, ctx.topo.all_cpuset());
+    }
+
+    #[test]
+    fn cpusetspec_numa_single_node_returns_all() {
+        let (cg, topo) = make_numa_ctx(1, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Numa(0).resolve(&ctx);
+        assert_eq!(cpus, ctx.topo.all_cpuset());
+    }
+
+    #[test]
+    fn cpusetspec_numa_validate_out_of_range() {
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Numa(5);
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_numa_validate_valid() {
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        assert!(CpusetSpec::Numa(0).validate(&ctx).is_ok());
+        assert!(CpusetSpec::Numa(1).validate(&ctx).is_ok());
+    }
+
+    #[test]
+    fn cpusetspec_numa_convenience_constructor() {
+        let spec = CpusetSpec::numa(0);
+        assert!(matches!(spec, CpusetSpec::Numa(0)));
     }
 
     // -- Traverse::generate --

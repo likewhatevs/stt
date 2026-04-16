@@ -364,6 +364,13 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "Shrink then grow cpusets on live cgroups",
             custom_cgroup_cpuset_resize
         ),
+        // NUMA cpusets
+        custom!(
+            "cgroup_cpuset_numa_swap",
+            "cpuset",
+            "NUMA-scoped cpusets, swap mid-run",
+            custom_cgroup_cpuset_numa_swap
+        ),
         // Stress
         custom!(
             "host_cgroup_contention",

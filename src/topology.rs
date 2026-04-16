@@ -296,6 +296,15 @@ impl TestTopology {
     pub fn llc_aligned_cpuset(&self, idx: usize) -> BTreeSet<usize> {
         self.llcs[idx].cpus.iter().copied().collect()
     }
+    /// CPUs in all LLCs belonging to NUMA node `node` as a `BTreeSet`.
+    pub fn numa_aligned_cpuset(&self, node: usize) -> BTreeSet<usize> {
+        self.llcs
+            .iter()
+            .filter(|llc| llc.numa_node() == node)
+            .flat_map(|llc| llc.cpus())
+            .copied()
+            .collect()
+    }
 
     /// One `BTreeSet` of CPUs per LLC.
     pub fn split_by_llc(&self) -> Vec<BTreeSet<usize>> {
