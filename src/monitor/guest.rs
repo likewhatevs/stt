@@ -470,7 +470,7 @@ mod tests {
             Ok(k) => k,
             Err(e) => {
                 // init_top_pgt missing in some kernel configs.
-                eprintln!("skipping: GuestKernel::new failed: {e}");
+                eprintln!("ktstr: SKIP: GuestKernel::new failed: {e}");
                 return;
             }
         };

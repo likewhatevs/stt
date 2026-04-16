@@ -799,7 +799,7 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                 .unwrap()
                 .reason
                 .clone();
-            eprintln!("SKIP: resource contention: {reason}");
+            eprintln!("ktstr: SKIP: resource contention: {reason}");
             0
         }
         Err(_) if expect_err => 0,
