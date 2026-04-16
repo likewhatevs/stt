@@ -319,7 +319,9 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
     }
 }
 
-/// Read scx event counters from one CPU's `scx_sched_pcpu` at the given PA.
+/// Read scx event counters from one CPU's per-CPU event stats struct.
+/// On 7.1+, `pcpu_pa` points to `scx_sched_pcpu`; on 6.16, it points
+/// directly to `scx_event_stats` (`event_stats_off` = 0).
 pub(crate) fn read_event_stats(
     mem: &GuestMem,
     pcpu_pa: u64,
@@ -495,11 +497,13 @@ pub(crate) fn read_sched_domain_tree(
     Some(domains)
 }
 
-/// Resolve per-CPU physical addresses for `scx_sched_pcpu`.
+/// Resolve per-CPU physical addresses for event counter reads.
 ///
-/// Reads the `scx_root` pointer from guest memory, then reads the
-/// `pcpu` percpu pointer from the `scx_sched` struct, then computes
-/// each CPU's `scx_sched_pcpu` PA via `__per_cpu_offset`.
+/// Reads `*scx_root` to find the active `scx_sched` struct, then reads
+/// the percpu pointer at `scx_sched_pcpu_off` within it. On 7.1+ this
+/// is `scx_sched.pcpu` (pointing to `scx_sched_pcpu`); on 6.16 it is
+/// `scx_sched.event_stats_cpu` (pointing directly to `scx_event_stats`).
+/// Computes each CPU's PA via `__per_cpu_offset`.
 ///
 /// Returns None if `scx_root` is null (no scheduler loaded).
 pub(crate) fn resolve_event_pcpu_pas(

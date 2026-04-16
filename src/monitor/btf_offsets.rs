@@ -3,11 +3,13 @@
 //! Parses BTF from a vmlinux ELF (or raw `/sys/kernel/btf/vmlinux`)
 //! to resolve byte offsets of kernel struct fields needed for
 //! host-side memory reads: runqueue monitoring ([`KernelOffsets`]),
-//! scx event counters ([`ScxEventOffsets`]), schedstat fields
-//! ([`SchedstatOffsets`]), sched domain tree walking
-//! ([`SchedDomainOffsets`]), BPF map discovery ([`BpfMapOffsets`]),
-//! BPF hash map iteration ([`HtabOffsets`]), and BPF program
-//! enumeration ([`BpfProgOffsets`]).
+//! scx event counters ([`ScxEventOffsets`]), watchdog timeout override
+//! ([`ScxWatchdogOffsets`]), schedstat fields ([`SchedstatOffsets`]),
+//! sched domain tree walking ([`SchedDomainOffsets`]) with optional
+//! load balancing stats ([`SchedDomainStatsOffsets`]), BPF map
+//! discovery ([`BpfMapOffsets`]), BPF hash map iteration
+//! ([`HtabOffsets`]), and BPF program enumeration
+//! ([`BpfProgOffsets`]).
 
 use std::path::Path;
 
@@ -60,7 +62,9 @@ pub struct KernelOffsets {
     pub scx_rq_flags: usize,
     /// Offset of `nr` within `struct scx_dispatch_q`.
     pub dsq_nr: usize,
-    /// Offsets for scx event counters. None if BTF lacks the required types.
+    /// Offsets for scx event counters. Resolved via `scx_sched.pcpu`
+    /// (7.1+) or `scx_sched.event_stats_cpu` (6.16) fallback. None if
+    /// BTF lacks both paths.
     pub event_offsets: Option<ScxEventOffsets>,
     /// Offsets for struct rq schedstat fields. None if CONFIG_SCHEDSTATS
     /// is not enabled (BTF lacks the required fields).
@@ -86,14 +90,23 @@ pub struct ScxWatchdogOffsets {
 
 /// Byte offsets for reading scx event counters from guest memory.
 ///
-/// Event counters live in `scx_sched_pcpu.event_stats` (per-CPU).
-/// The host resolves per-CPU addresses via `scx_root -> scx_sched.pcpu`
+/// Two kernel layouts are supported:
+/// - 7.1+: `scx_sched.pcpu` -> `scx_sched_pcpu.event_stats` (percpu
+///   pointer to an intermediate struct containing the stats).
+/// - 6.16: `scx_sched.event_stats_cpu` -> `scx_event_stats` directly
+///   (percpu pointer to the stats struct, `event_stats_off` = 0).
+///
+/// The host resolves per-CPU addresses via `scx_root -> scx_sched`
 /// plus `__per_cpu_offset[cpu]`.
 #[derive(Debug, Clone)]
 pub struct ScxEventOffsets {
-    /// Offset of `pcpu` within `struct scx_sched`.
+    /// Offset of the percpu pointer within `struct scx_sched`.
+    /// On 7.1+: offset of `pcpu` (`__percpu *scx_sched_pcpu`).
+    /// On 6.16: offset of `event_stats_cpu` (`__percpu *scx_event_stats`).
     pub scx_sched_pcpu_off: usize,
-    /// Offset of `event_stats` within `struct scx_sched_pcpu`.
+    /// Offset of `event_stats` within the per-CPU struct.
+    /// On 7.1+: offset within `struct scx_sched_pcpu`.
+    /// On 6.16: 0 (the percpu pointer points directly to the stats).
     pub event_stats_off: usize,
     /// Offset of `SCX_EV_SELECT_CPU_FALLBACK` within `struct scx_event_stats`.
     pub ev_select_cpu_fallback: usize,
@@ -154,17 +167,39 @@ impl KernelOffsets {
 }
 
 /// Resolve BTF offsets for scx event counters.
-/// Returns Err if any required type/field is missing (old kernel).
+///
+/// Tries the 7.1+ layout first (`scx_sched.pcpu` ->
+/// `scx_sched_pcpu.event_stats`), then falls back to the 6.16 layout
+/// (`scx_sched.event_stats_cpu` -> `scx_event_stats` directly with
+/// `event_stats_off` = 0).
+///
+/// Returns Err if both paths fail.
 fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
     let (scx_sched_struct, _) = find_struct(btf, "scx_sched")?;
-    let scx_sched_pcpu_off = member_byte_offset(btf, &scx_sched_struct, "pcpu")?;
 
-    let (pcpu_struct, _) = find_struct(btf, "scx_sched_pcpu")?;
-    let (event_stats_off, event_stats_member) =
-        member_byte_offset_with_member(btf, &pcpu_struct, "event_stats")?;
+    // Try 7.1+ path: scx_sched.pcpu -> scx_sched_pcpu.event_stats.
+    let pcpu_path = member_byte_offset(btf, &scx_sched_struct, "pcpu")
+        .ok()
+        .and_then(|pcpu_off| {
+            let (pcpu_struct, _) = find_struct(btf, "scx_sched_pcpu").ok()?;
+            let (stats_off, stats_member) =
+                member_byte_offset_with_member(btf, &pcpu_struct, "event_stats").ok()?;
+            let stats_struct = resolve_member_struct(btf, &stats_member).ok()?;
+            Some((pcpu_off, stats_off, stats_struct))
+        });
 
-    let event_stats_struct = resolve_member_struct(btf, &event_stats_member)
-        .context("btf: resolve type of scx_sched_pcpu.event_stats")?;
+    // Try 6.16 path: scx_sched.event_stats_cpu -> scx_event_stats directly.
+    let (scx_sched_pcpu_off, event_stats_off, event_stats_struct) = match pcpu_path {
+        Some(resolved) => resolved,
+        None => {
+            let (esc_off, esc_member) =
+                member_byte_offset_with_member(btf, &scx_sched_struct, "event_stats_cpu")
+                    .context("btf: neither scx_sched.pcpu nor scx_sched.event_stats_cpu found")?;
+            let stats_struct = resolve_member_struct(btf, &esc_member)
+                .context("btf: resolve type of scx_sched.event_stats_cpu")?;
+            (esc_off, 0, stats_struct)
+        }
+    };
 
     let ev_select_cpu_fallback =
         member_byte_offset(btf, &event_stats_struct, "SCX_EV_SELECT_CPU_FALLBACK")?;
@@ -1064,12 +1099,14 @@ mod tests {
         assert!(offsets.aux_name > 0);
     }
 
-    /// Validate that optional BTF offsets (watchdog, event, pcpu) are
-    /// internally consistent and co-resolve.
+    /// Validate that optional BTF offsets (watchdog, event) are
+    /// internally consistent.
     ///
-    /// `watchdog_offsets` and `event_offsets` both depend on the
-    /// post-refactor `struct scx_sched` layout. They must both
-    /// resolve or both be absent.
+    /// `watchdog_offsets` requires the post-refactor `scx_sched` layout
+    /// (with `watchdog_timeout` field). `event_offsets` can resolve via
+    /// either path (7.1+ `pcpu` or 6.16 `event_stats_cpu`).
+    /// `watchdog_offsets` being present implies `event_offsets` is also
+    /// present, but not vice versa.
     ///
     /// Assertions that overlap with parse_rq_offsets_from_vmlinux and
     /// parse_event_offsets_from_vmlinux are intentionally omitted.
@@ -1098,15 +1135,11 @@ mod tests {
                 wd.scx_sched_watchdog_timeout_off > 0,
                 "watchdog_timeout offset must be nonzero within scx_sched"
             );
+            assert!(
+                offsets.event_offsets.is_some(),
+                "watchdog_offsets present implies event_offsets must also resolve"
+            );
         }
-
-        let has_watchdog = offsets.watchdog_offsets.is_some();
-        let has_events = offsets.event_offsets.is_some();
-        assert_eq!(
-            has_watchdog, has_events,
-            "watchdog_offsets ({has_watchdog}) and event_offsets ({has_events}) \
-             must resolve together — both depend on the scx_sched refactor"
-        );
     }
 
     #[test]
