@@ -295,10 +295,10 @@ impl<T> Drop for PiMutexGuard<'_, T> {
 // Initramfs cache — two-tier: POSIX shm (cross-process) + in-process HashMap
 // ---------------------------------------------------------------------------
 
-/// Cache key for base initramfs (payload + scheduler + ktstr commit hash, no args).
-/// Derived from a content hash of the binary files and the ktstr build
-/// commit hash so identical inputs produce the same key regardless of
-/// path or mtime.
+/// Cache key for base initramfs (payload + scheduler + optional
+/// include files). Derived from content hashes of the binary files
+/// and their shared libs so identical inputs produce the same key
+/// regardless of path or mtime.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(u64);
 
@@ -322,12 +322,11 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
 }
 
 impl BaseKey {
-    /// Hashes the ktstr commit hash, payload binary content, payload
-    /// shared libs, and optional scheduler binary content and shared libs.
+    /// Hashes the payload binary content, payload shared libs, and
+    /// optional scheduler binary content and shared libs.
     pub(crate) fn new(payload: &Path, scheduler: Option<&Path>) -> Result<Self> {
         let mut hasher = std::hash::DefaultHasher::new();
 
-        crate::GIT_FULL_HASH.hash(&mut hasher);
         hash_file(payload)?.hash(&mut hasher);
         Self::hash_shared_libs(payload, &mut hasher);
 
@@ -343,11 +342,11 @@ impl BaseKey {
         Ok(BaseKey(hasher.finish()))
     }
 
-    /// Shell mode key: hashes the ktstr commit hash, a sentinel,
-    /// include files, and the busybox flag so different shell
-    /// configurations get distinct cache keys. Include file archive
-    /// paths and content are hashed so the same payload + same
-    /// includes = cache hit, while different includes = cache miss.
+    /// Shell mode key: hashes a sentinel, include files, and the
+    /// busybox flag so different shell configurations get distinct
+    /// cache keys. Include file archive paths and content are hashed
+    /// so the same payload + same includes = cache hit, while
+    /// different includes = cache miss.
     pub(crate) fn new_shell(
         payload: &Path,
         scheduler: Option<&Path>,
@@ -356,7 +355,6 @@ impl BaseKey {
     ) -> Result<Self> {
         let mut hasher = std::hash::DefaultHasher::new();
 
-        crate::GIT_FULL_HASH.hash(&mut hasher);
         "ktstr-shell".hash(&mut hasher);
         busybox.hash(&mut hasher);
         hash_file(payload)?.hash(&mut hasher);
