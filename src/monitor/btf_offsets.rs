@@ -374,7 +374,9 @@ fn resolve_schedstat_offsets(btf: &Btf) -> Result<SchedstatOffsets> {
 /// sched_domain` is absent from BTF.
 ///
 /// Runtime fields (`balance_interval`, `nr_balance_failed`,
-/// `newidle_call`, etc.) are always present on `struct sched_domain`.
+/// `max_newidle_lb_cost`) are always present on `struct sched_domain`.
+/// `newidle_call`, `newidle_success`, and `newidle_ratio` were removed
+/// in 6.16 and are resolved as optional.
 /// Load balancing stats (`lb_count`, `alb_pushed`, `ttwu_wake_remote`,
 /// etc.) are guarded by `CONFIG_SCHEDSTATS` and resolved separately
 /// into an optional [`SchedDomainStatsOffsets`].
@@ -393,17 +395,20 @@ pub struct SchedDomainOffsets {
     /// Offset of `span_weight` (unsigned int) within `struct sched_domain`.
     pub sd_span_weight: usize,
 
-    // -- Runtime fields (always present) --
+    // -- Runtime fields --
     /// Offset of `balance_interval` (unsigned int) within `struct sched_domain`.
     pub sd_balance_interval: usize,
     /// Offset of `nr_balance_failed` (unsigned int) within `struct sched_domain`.
     pub sd_nr_balance_failed: usize,
     /// Offset of `newidle_call` (unsigned int) within `struct sched_domain`.
-    pub sd_newidle_call: usize,
+    /// None on 6.16+ where this field was removed.
+    pub sd_newidle_call: Option<usize>,
     /// Offset of `newidle_success` (unsigned int) within `struct sched_domain`.
-    pub sd_newidle_success: usize,
+    /// None on 6.16+ where this field was removed.
+    pub sd_newidle_success: Option<usize>,
     /// Offset of `newidle_ratio` (unsigned int) within `struct sched_domain`.
-    pub sd_newidle_ratio: usize,
+    /// None on 6.16+ where this field was removed.
+    pub sd_newidle_ratio: Option<usize>,
     /// Offset of `max_newidle_lb_cost` (u64) within `struct sched_domain`.
     pub sd_max_newidle_lb_cost: usize,
 
@@ -491,13 +496,21 @@ fn resolve_sched_domain_offsets(
     let sd_flags = member_byte_offset(btf, &sd_struct, "flags")?;
     let sd_span_weight = member_byte_offset(btf, &sd_struct, "span_weight")?;
 
-    // Runtime fields (always present).
+    // Runtime fields.
     let sd_balance_interval = member_byte_offset(btf, &sd_struct, "balance_interval")?;
     let sd_nr_balance_failed = member_byte_offset(btf, &sd_struct, "nr_balance_failed")?;
-    let sd_newidle_call = member_byte_offset(btf, &sd_struct, "newidle_call")?;
-    let sd_newidle_success = member_byte_offset(btf, &sd_struct, "newidle_success")?;
-    let sd_newidle_ratio = member_byte_offset(btf, &sd_struct, "newidle_ratio")?;
     let sd_max_newidle_lb_cost = member_byte_offset(btf, &sd_struct, "max_newidle_lb_cost")?;
+
+    // newidle_call/newidle_success/newidle_ratio were removed together
+    // in 6.16. Resolve all-or-nothing: if any is missing, set all to None.
+    let (sd_newidle_call, sd_newidle_success, sd_newidle_ratio) = match (
+        member_byte_offset(btf, &sd_struct, "newidle_call").ok(),
+        member_byte_offset(btf, &sd_struct, "newidle_success").ok(),
+        member_byte_offset(btf, &sd_struct, "newidle_ratio").ok(),
+    ) {
+        (Some(c), Some(s), Some(r)) => (Some(c), Some(s), Some(r)),
+        _ => (None, None, None),
+    };
 
     // CONFIG_SCHEDSTATS fields (optional).
     let stats_offsets = resolve_sched_domain_stats_offsets(btf, &sd_struct).ok();
@@ -942,17 +955,29 @@ mod tests {
                 sd.sd_name, sd.sd_parent,
                 "name and parent offsets must be distinct"
             );
-            // Runtime fields must be at distinct nonzero offsets.
-            let runtime_fields = [
+            // Runtime fields that are always present must be at nonzero offsets.
+            let always_present = [
                 sd.sd_balance_interval,
                 sd.sd_nr_balance_failed,
+                sd.sd_max_newidle_lb_cost,
+            ];
+            for &off in &always_present {
+                assert!(off > 0, "sched_domain runtime field offset must be nonzero");
+            }
+            // newidle_call/newidle_success/newidle_ratio are optional (removed in 6.16).
+            // When present, they must be at nonzero offsets.
+            for off in [
                 sd.sd_newidle_call,
                 sd.sd_newidle_success,
                 sd.sd_newidle_ratio,
-                sd.sd_max_newidle_lb_cost,
-            ];
-            for &off in &runtime_fields {
-                assert!(off > 0, "sched_domain runtime field offset must be nonzero");
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(
+                    off > 0,
+                    "optional newidle field offset must be nonzero when present"
+                );
             }
             // Stats offsets are optional (CONFIG_SCHEDSTATS).
             if let Some(so) = &sd.stats_offsets {

@@ -359,8 +359,10 @@ pub struct RqSchedstat {
 ///
 /// Domains are ordered from lowest (e.g. SMT, level 0) to highest
 /// (e.g. NUMA, level N) following the kernel's `sd->parent` chain.
-/// Runtime fields are always present. CONFIG_SCHEDSTATS load balancing
-/// stats are in the optional `stats` field.
+/// `newidle_call`, `newidle_success`, and `newidle_ratio` are `None`
+/// on 6.16+ where the kernel removed these fields.
+/// CONFIG_SCHEDSTATS load balancing stats are in the optional `stats`
+/// field.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SchedDomainSnapshot {
     /// Domain level number (`sd->level`). 0 = innermost (e.g. SMT).
@@ -372,17 +374,23 @@ pub struct SchedDomainSnapshot {
     /// Number of CPUs in this domain's span (`sd->span_weight`).
     pub span_weight: u32,
 
-    // -- Runtime fields (always present) --
+    // -- Runtime fields --
     /// Current balance interval in ms (`sd->balance_interval`).
     pub balance_interval: u32,
     /// Consecutive load balance failures (`sd->nr_balance_failed`).
     pub nr_balance_failed: u32,
     /// Number of newidle balance calls (`sd->newidle_call`).
-    pub newidle_call: u32,
+    /// None on 6.16+ where this field was removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newidle_call: Option<u32>,
     /// Successful newidle balance calls (`sd->newidle_success`).
-    pub newidle_success: u32,
+    /// None on 6.16+ where this field was removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newidle_success: Option<u32>,
     /// Newidle balance ratio (`sd->newidle_ratio`).
-    pub newidle_ratio: u32,
+    /// None on 6.16+ where this field was removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newidle_ratio: Option<u32>,
     /// Max cost of newidle load balancing in ns (`sd->max_newidle_lb_cost`).
     pub max_newidle_lb_cost: u64,
 

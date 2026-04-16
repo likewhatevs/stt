@@ -26,8 +26,9 @@ contains `rq->sd` and `struct sched_domain` — no `CONFIG_SCHEDSTATS`
 required. Domain tree walking starts at `rq->sd` (lowest level) and
 follows `sd->parent` pointers up to the root. Each domain level
 provides topology metadata (level, name, flags, span_weight) and
-runtime fields (balance_interval, nr_balance_failed, newidle_call,
-newidle_success, newidle_ratio, max_newidle_lb_cost). When
+runtime fields (balance_interval, nr_balance_failed,
+max_newidle_lb_cost) and optional fields (newidle_call,
+newidle_success, newidle_ratio — removed in 6.16). When
 `CONFIG_SCHEDSTATS` is also enabled, each
 domain additionally provides load balancing stats: `lb_count`,
 `lb_failed`, `lb_balanced`, `alb_pushed`, `ttwu_wake_remote`, and

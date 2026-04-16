@@ -473,9 +473,15 @@ pub(crate) fn read_sched_domain_tree(
             span_weight,
             balance_interval: mem.read_u32(sd_pa, sd_offsets.sd_balance_interval),
             nr_balance_failed: mem.read_u32(sd_pa, sd_offsets.sd_nr_balance_failed),
-            newidle_call: mem.read_u32(sd_pa, sd_offsets.sd_newidle_call),
-            newidle_success: mem.read_u32(sd_pa, sd_offsets.sd_newidle_success),
-            newidle_ratio: mem.read_u32(sd_pa, sd_offsets.sd_newidle_ratio),
+            newidle_call: sd_offsets
+                .sd_newidle_call
+                .map(|off| mem.read_u32(sd_pa, off)),
+            newidle_success: sd_offsets
+                .sd_newidle_success
+                .map(|off| mem.read_u32(sd_pa, off)),
+            newidle_ratio: sd_offsets
+                .sd_newidle_ratio
+                .map(|off| mem.read_u32(sd_pa, off)),
             max_newidle_lb_cost: mem.read_u64(sd_pa, sd_offsets.sd_max_newidle_lb_cost),
             stats,
         };
@@ -2205,9 +2211,9 @@ mod tests {
             sd_span_weight: 24,
             sd_balance_interval: 28,
             sd_nr_balance_failed: 32,
-            sd_newidle_call: 36,
-            sd_newidle_success: 40,
-            sd_newidle_ratio: 44,
+            sd_newidle_call: Some(36),
+            sd_newidle_success: Some(40),
+            sd_newidle_ratio: Some(44),
             sd_max_newidle_lb_cost: 48,
             stats_offsets: Some(test_sd_stats_offsets()),
         }
@@ -2271,8 +2277,9 @@ mod tests {
         buf[sd.sd_span_weight..sd.sd_span_weight + 4].copy_from_slice(&span_weight.to_ne_bytes());
         buf[sd.sd_balance_interval..sd.sd_balance_interval + 4]
             .copy_from_slice(&balance_interval.to_ne_bytes());
-        buf[sd.sd_newidle_call..sd.sd_newidle_call + 4]
-            .copy_from_slice(&newidle_call.to_ne_bytes());
+        if let Some(off) = sd.sd_newidle_call {
+            buf[off..off + 4].copy_from_slice(&newidle_call.to_ne_bytes());
+        }
         buf[so.sd_lb_count..so.sd_lb_count + 4].copy_from_slice(&lb_count_0.to_ne_bytes());
         buf[so.sd_alb_pushed..so.sd_alb_pushed + 4].copy_from_slice(&alb_pushed.to_ne_bytes());
         buf[so.sd_ttwu_wake_remote..so.sd_ttwu_wake_remote + 4]
@@ -2325,7 +2332,7 @@ mod tests {
         assert_eq!(domains[0].flags, 0x42);
         assert_eq!(domains[0].span_weight, 4);
         assert_eq!(domains[0].balance_interval, 64);
-        assert_eq!(domains[0].newidle_call, 15);
+        assert_eq!(domains[0].newidle_call, Some(15));
         let stats = domains[0].stats.as_ref().unwrap();
         assert_eq!(stats.lb_count[0], 10);
         assert_eq!(stats.alb_pushed, 3);
@@ -2366,7 +2373,7 @@ mod tests {
         assert_eq!(domains[0].name, "SMT");
         assert_eq!(domains[0].span_weight, 2);
         assert_eq!(domains[0].balance_interval, 32);
-        assert_eq!(domains[0].newidle_call, 8);
+        assert_eq!(domains[0].newidle_call, Some(8));
         let s0 = domains[0].stats.as_ref().unwrap();
         assert_eq!(s0.lb_count[0], 5);
         // Second = higher level (MC).
@@ -2374,7 +2381,7 @@ mod tests {
         assert_eq!(domains[1].name, "MC");
         assert_eq!(domains[1].span_weight, 8);
         assert_eq!(domains[1].balance_interval, 128);
-        assert_eq!(domains[1].newidle_call, 22);
+        assert_eq!(domains[1].newidle_call, Some(22));
         let s1 = domains[1].stats.as_ref().unwrap();
         assert_eq!(s1.lb_count[0], 20);
         assert_eq!(s1.alb_pushed, 4);
@@ -2419,6 +2426,47 @@ mod tests {
         // Should return Some(empty vec) — non-null sd but untranslatable.
         assert!(domains.is_some());
         assert!(domains.unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_sched_domain_tree_newidle_none() {
+        // 6.16 kernel: newidle_call/success/ratio are absent.
+        // Other fields (level, name, span_weight, balance_interval) must
+        // still populate correctly.
+        let mut sd_off = test_sched_domain_offsets();
+        sd_off.sd_newidle_call = None;
+        sd_off.sd_newidle_success = None;
+        sd_off.sd_newidle_ratio = None;
+
+        let sd_pa: u64 = 1024;
+        let name_pa: u64 = 2048;
+
+        let sd_buf = make_sd_buffer(&sd_off, 0, 0, 0x42, name_pa, 4, 64, 0, 10, 3, 7);
+        let name_bytes = b"SMT\0";
+
+        let total_size = (name_pa as usize) + 16;
+        let mut buf = vec![0u8; total_size];
+
+        buf[sd_off.rq_sd..sd_off.rq_sd + 8].copy_from_slice(&sd_pa.to_ne_bytes());
+        buf[sd_pa as usize..sd_pa as usize + sd_buf.len()].copy_from_slice(&sd_buf);
+        buf[name_pa as usize..name_pa as usize + name_bytes.len()].copy_from_slice(name_bytes);
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].level, 0);
+        assert_eq!(domains[0].name, "SMT");
+        assert_eq!(domains[0].flags, 0x42);
+        assert_eq!(domains[0].span_weight, 4);
+        assert_eq!(domains[0].balance_interval, 64);
+        assert_eq!(domains[0].newidle_call, None);
+        assert_eq!(domains[0].newidle_success, None);
+        assert_eq!(domains[0].newidle_ratio, None);
+        let stats = domains[0].stats.as_ref().unwrap();
+        assert_eq!(stats.lb_count[0], 10);
+        assert_eq!(stats.alb_pushed, 3);
+        assert_eq!(stats.ttwu_wake_remote, 7);
     }
 
     #[test]
