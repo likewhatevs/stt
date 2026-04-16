@@ -3241,6 +3241,8 @@ impl KtstrVm {
         let fdt_addr = aarch64::fdt::fdt_address(memory_mb, self.shm_size);
         let mpidrs =
             aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
+        let hw_cache_level = aarch64::topology::host_cache_levels();
+        let guest_l1_unified = aarch64::topology::host_l1_is_unified();
         let dtb = aarch64::fdt::create_fdt(
             &self.topology,
             &mpidrs,
@@ -3249,6 +3251,8 @@ impl KtstrVm {
             initrd_addr,
             initrd_size,
             self.shm_size,
+            hw_cache_level,
+            guest_l1_unified,
         )
         .context("create FDT")?;
         vm.guest_mem

@@ -260,6 +260,12 @@ impl KtstrKvm {
             vcpus.push(vcpu);
         }
 
+        // Override CLIDR_EL1 on each vCPU to match the host's real
+        // cache topology. Must happen after vcpu_init and before FDT
+        // creation so CLIDR and DT cache nodes agree on leaf counts.
+        super::topology::override_clidr(&vcpus)
+            .context("override CLIDR_EL1 to match host cache topology")?;
+
         // Create GICv3 via KVM_CREATE_DEVICE.
         let gic_fd = Self::create_gic(&vm_fd, total)?;
 

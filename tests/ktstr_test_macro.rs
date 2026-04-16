@@ -622,6 +622,7 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
     let llcs = ctx.topo.num_llcs();
     let mut details = Vec::new();
     let mut passed = true;
+
     // The VM must have more than the 2-CPU / 1-LLC default. Any
     // regression that replaces sysfs with the entry default will fail.
     if total < 4 {

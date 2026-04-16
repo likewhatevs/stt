@@ -3240,7 +3240,12 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
         "no kernel found\n  \
          hint: run `cargo ktstr kernel build` to download and build the latest stable kernel\n  \
          hint: or set KTSTR_KERNEL=/path/to/linux\n  \
-         hint: or set KTSTR_TEST_KERNEL=/path/to/bzImage"
+         hint: or set KTSTR_TEST_KERNEL=/path/to/{image_name}",
+        image_name = if cfg!(target_arch = "aarch64") {
+            "Image"
+        } else {
+            "bzImage"
+        }
     )
 }
 

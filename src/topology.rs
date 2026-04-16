@@ -134,11 +134,31 @@ fn find_llc_index(cpu: usize) -> Result<usize> {
 }
 
 /// Read the LLC cache ID for a CPU from sysfs.
+///
+/// Prefers the `id` file when available (x86_64 always has it).
+/// Falls back to the lowest CPU in the LLC's `shared_cpu_list`,
+/// which is unique per LLC group. The previous fallback used the
+/// cache index number, which is the same for every CPU and
+/// collapsed all LLCs into one group.
 fn read_llc_id(cpu: usize) -> Result<usize> {
     let llc_index = find_llc_index(cpu)?;
     let id_path = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{llc_index}/id");
-    let id_str = fs::read_to_string(&id_path).unwrap_or_else(|_| llc_index.to_string());
-    Ok(id_str.trim().parse().unwrap_or(0))
+    if let Ok(id_str) = fs::read_to_string(&id_path)
+        && let Ok(id) = id_str.trim().parse::<usize>()
+    {
+        return Ok(id);
+    }
+    // Fallback: use the lowest CPU in shared_cpu_list as a stable
+    // group identifier. Each LLC group has a unique minimum CPU.
+    let shared_path =
+        format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{llc_index}/shared_cpu_list");
+    if let Ok(shared_str) = fs::read_to_string(&shared_path) {
+        let siblings = parse_cpu_list_lenient(shared_str.trim());
+        if let Some(&min_cpu) = siblings.iter().min() {
+            return Ok(min_cpu);
+        }
+    }
+    Ok(0)
 }
 
 /// Read the NUMA node ID for a CPU from sysfs.

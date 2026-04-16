@@ -1559,13 +1559,14 @@ mod tests {
     #[test]
     fn format_stimulus_crosstab_flag_x_topo_values() {
         // borrow on tiny-1llc (<=8cpu bucket) with imbalance_delta=3.0.
-        // borrow on medium-4llc (9-32cpu bucket) with imbalance_delta=7.0.
+        // borrow on medium-4llc-nosmt (9-32cpu bucket) with imbalance_delta=7.0.
+        // Use nosmt preset so the topology exists on aarch64 (which filters SMT presets).
         // The flag x topo table should show +3.0 for <=8cpu and +7.0 for 9-32cpu.
         let mut r1 = make_row("a", "borrow", "tiny-1llc", true, 5.0);
         r1.worst_degradation_op = "SetCpuset".into();
         r1.worst_imbalance_delta = 3.0;
         r1.degradation_count = 1;
-        let mut r2 = make_row("a", "borrow", "medium-4llc", true, 5.0);
+        let mut r2 = make_row("a", "borrow", "medium-4llc-nosmt", true, 5.0);
         r2.worst_degradation_op = "SetCpuset".into();
         r2.worst_imbalance_delta = 7.0;
         r2.degradation_count = 1;
