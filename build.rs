@@ -142,13 +142,15 @@ int main(void) {{
     println!("cargo::rerun-if-changed=src/bpf/fentry_probe.bpf.c");
     println!("cargo::rerun-if-changed=src/bpf/intf.h");
 
-    // Git info for output directory keying and cache invalidation.
-    // When installed from the registry there is no .git directory —
-    // all three vars fall back to "unknown".
+    // Git info for output directory keying and display. Bounded to
+    // ktstr's own manifest dir — never walks upward into a consuming
+    // project's repository. When ktstr is consumed as a path-dep or
+    // registry crate without its own .git, all three vars fall back
+    // to "unknown".
     let mut short_hash = String::from("unknown");
     let mut full_hash = String::from("unknown");
     let mut branch = String::from("unknown");
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = gix::open(env!("CARGO_MANIFEST_DIR")) {
         if let Ok(id) = repo.head_id() {
             let full = id.to_string();
             short_hash = full[..full.len().min(7)].to_string();
