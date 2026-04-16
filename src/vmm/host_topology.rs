@@ -300,17 +300,18 @@ impl HostTopology {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlcLockMode {
     /// Exclusive access to the entire LLC (performance_mode tests).
-    /// Blocks while any shared or exclusive holder exists.
+    /// Returns unavailable when any shared or exclusive holder exists.
     Exclusive,
     /// Shared access to the LLC (non-perf pinned tests).
-    /// Multiple shared holders coexist; blocked by exclusive.
+    /// Multiple shared holders coexist; returns unavailable when
+    /// exclusive holder exists.
     Shared,
 }
 
 /// Resource lock acquisition outcome.
 #[derive(Debug)]
 pub enum LockOutcome {
-    /// Locks acquired; PinningPlan.locks holds the fds.
+    /// All locks acquired successfully.
     Acquired {
         llc_offset: usize,
         locks: Vec<std::os::fd::OwnedFd>,
@@ -378,7 +379,7 @@ pub fn acquire_resource_locks(
     }
 }
 
-/// Try to acquire all resource locks atomically (all-or-nothing).
+/// Try to acquire all resource locks (all-or-nothing).
 /// Returns the held fds on success, or an error string describing
 /// which resource was busy.
 fn try_acquire_all(
@@ -1315,5 +1316,572 @@ mod tests {
             cpu_to_node: std::collections::HashMap::new(),
         };
         assert_eq!(topo.llc_numa_node(0), 0);
+    }
+
+    // -- resource lock tests --
+
+    /// Clean up a lock file. Best-effort; ignores errors.
+    fn cleanup_lock(path: &str) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resource_lock_exclusive_acquires() {
+        let path = "/tmp/ktstr-test-flock-excl-acquires.lock";
+        cleanup_lock(path);
+        let fd = try_flock(path, libc::LOCK_EX).expect("open should succeed");
+        assert!(fd.is_some(), "exclusive lock on fresh file should succeed");
+        cleanup_lock(path);
+    }
+
+    #[test]
+    fn resource_lock_shared_acquires() {
+        let path = "/tmp/ktstr-test-flock-shared-acquires.lock";
+        cleanup_lock(path);
+        let fd = try_flock(path, libc::LOCK_SH).expect("open should succeed");
+        assert!(fd.is_some(), "shared lock on fresh file should succeed");
+        cleanup_lock(path);
+    }
+
+    #[test]
+    fn resource_lock_exclusive_contention() {
+        let path = "/tmp/ktstr-test-flock-excl-contention.lock";
+        cleanup_lock(path);
+        let holder = try_flock(path, libc::LOCK_EX)
+            .expect("open should succeed")
+            .expect("first lock should succeed");
+        let second = try_flock(path, libc::LOCK_EX).expect("open should succeed");
+        assert!(
+            second.is_none(),
+            "second exclusive lock while held should return None",
+        );
+        drop(holder);
+        cleanup_lock(path);
+    }
+
+    #[test]
+    fn resource_lock_shared_coexist() {
+        let path = "/tmp/ktstr-test-flock-shared-coexist.lock";
+        cleanup_lock(path);
+        let h1 = try_flock(path, libc::LOCK_SH)
+            .expect("open should succeed")
+            .expect("first shared lock should succeed");
+        let h2 = try_flock(path, libc::LOCK_SH)
+            .expect("open should succeed")
+            .expect("second shared lock should succeed");
+        // Both held simultaneously.
+        drop(h1);
+        drop(h2);
+        cleanup_lock(path);
+    }
+
+    #[test]
+    fn resource_lock_exclusive_blocks_shared() {
+        let path = "/tmp/ktstr-test-flock-excl-blocks-sh.lock";
+        cleanup_lock(path);
+        let holder = try_flock(path, libc::LOCK_EX)
+            .expect("open should succeed")
+            .expect("exclusive lock should succeed");
+        let shared = try_flock(path, libc::LOCK_SH).expect("open should succeed");
+        assert!(
+            shared.is_none(),
+            "shared lock should fail while exclusive is held",
+        );
+        drop(holder);
+        cleanup_lock(path);
+    }
+
+    #[test]
+    fn resource_lock_shared_blocks_exclusive() {
+        let path = "/tmp/ktstr-test-flock-sh-blocks-excl.lock";
+        cleanup_lock(path);
+        let holder = try_flock(path, libc::LOCK_SH)
+            .expect("open should succeed")
+            .expect("shared lock should succeed");
+        let excl = try_flock(path, libc::LOCK_EX).expect("open should succeed");
+        assert!(
+            excl.is_none(),
+            "exclusive lock should fail while shared is held",
+        );
+        drop(holder);
+        cleanup_lock(path);
+    }
+
+    #[test]
+    fn resource_lock_release_on_drop() {
+        let path = "/tmp/ktstr-test-flock-release-drop.lock";
+        cleanup_lock(path);
+        {
+            let _holder = try_flock(path, libc::LOCK_EX)
+                .expect("open should succeed")
+                .expect("lock should succeed");
+        }
+        // After drop, the lock should be available again.
+        let fd = try_flock(path, libc::LOCK_EX)
+            .expect("open should succeed")
+            .expect("lock should be available after drop");
+        drop(fd);
+        cleanup_lock(path);
+    }
+
+    #[test]
+    fn resource_lock_exclusive_success() {
+        // Use high LLC indices to avoid collision with real locks.
+        let plan = PinningPlan {
+            assignments: vec![(0, 90100), (1, 90101)],
+            service_cpu: None,
+            llc_indices: vec![90100],
+            locks: Vec::new(),
+        };
+        let llc_indices = &[90100usize];
+        cleanup_lock("/tmp/ktstr-llc-90100.lock");
+        let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
+        match outcome {
+            LockOutcome::Acquired { llc_offset, locks } => {
+                assert_eq!(llc_offset, 90100);
+                // Exclusive mode: only LLC locks, no per-CPU locks.
+                assert_eq!(locks.len(), 1);
+            }
+            LockOutcome::Unavailable(reason) => {
+                panic!("expected Acquired, got Unavailable: {reason}");
+            }
+        }
+        cleanup_lock("/tmp/ktstr-llc-90100.lock");
+    }
+
+    #[test]
+    fn resource_lock_shared_includes_cpu_locks() {
+        let plan = PinningPlan {
+            assignments: vec![(0, 90200), (1, 90201)],
+            service_cpu: None,
+            llc_indices: vec![90200],
+            locks: Vec::new(),
+        };
+        let llc_indices = &[90200usize];
+        cleanup_lock("/tmp/ktstr-llc-90200.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90200.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90201.lock");
+
+        let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
+        match outcome {
+            LockOutcome::Acquired { locks, .. } => {
+                // Shared mode: 1 LLC lock + 2 CPU locks = 3 total.
+                assert_eq!(locks.len(), 3);
+            }
+            LockOutcome::Unavailable(reason) => {
+                panic!("expected Acquired, got Unavailable: {reason}");
+            }
+        }
+        cleanup_lock("/tmp/ktstr-llc-90200.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90200.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90201.lock");
+    }
+
+    #[test]
+    fn resource_lock_shared_with_service_cpu() {
+        let plan = PinningPlan {
+            assignments: vec![(0, 90300)],
+            service_cpu: Some(90301),
+            llc_indices: vec![90300],
+            locks: Vec::new(),
+        };
+        let llc_indices = &[90300usize];
+        cleanup_lock("/tmp/ktstr-llc-90300.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90300.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90301.lock");
+
+        let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
+        match outcome {
+            LockOutcome::Acquired { locks, .. } => {
+                // 1 LLC lock + 1 assignment CPU lock + 1 service CPU lock = 3.
+                assert_eq!(locks.len(), 3);
+            }
+            LockOutcome::Unavailable(reason) => {
+                panic!("expected Acquired, got Unavailable: {reason}");
+            }
+        }
+        cleanup_lock("/tmp/ktstr-llc-90300.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90300.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90301.lock");
+    }
+
+    #[test]
+    fn resource_lock_exclusive_skips_cpu_locks() {
+        // Exclusive LLC mode should NOT acquire per-CPU locks.
+        let plan = PinningPlan {
+            assignments: vec![(0, 90400), (1, 90401)],
+            service_cpu: Some(90402),
+            llc_indices: vec![90400],
+            locks: Vec::new(),
+        };
+        let llc_indices = &[90400usize];
+        cleanup_lock("/tmp/ktstr-llc-90400.lock");
+
+        let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
+        match outcome {
+            LockOutcome::Acquired { locks, .. } => {
+                // Exclusive: only 1 LLC lock, no CPU locks.
+                assert_eq!(locks.len(), 1);
+            }
+            LockOutcome::Unavailable(reason) => {
+                panic!("expected Acquired, got Unavailable: {reason}");
+            }
+        }
+        cleanup_lock("/tmp/ktstr-llc-90400.lock");
+    }
+
+    #[test]
+    fn resource_lock_contention_returns_unavailable() {
+        // Hold an exclusive lock, then try to acquire the same LLC.
+        let plan = PinningPlan {
+            assignments: vec![(0, 90500)],
+            service_cpu: None,
+            llc_indices: vec![90500],
+            locks: Vec::new(),
+        };
+        let llc_indices = &[90500usize];
+        cleanup_lock("/tmp/ktstr-llc-90500.lock");
+
+        let holder = try_flock("/tmp/ktstr-llc-90500.lock", libc::LOCK_EX)
+            .unwrap()
+            .unwrap();
+
+        let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
+        match outcome {
+            LockOutcome::Unavailable(reason) => {
+                assert!(
+                    reason.contains("90500"),
+                    "reason should identify the busy LLC: {reason}",
+                );
+            }
+            LockOutcome::Acquired { .. } => {
+                panic!("expected Unavailable while lock is held");
+            }
+        }
+        drop(holder);
+        cleanup_lock("/tmp/ktstr-llc-90500.lock");
+    }
+
+    #[test]
+    fn resource_lock_all_or_nothing() {
+        // Two LLC indices: hold the second one, verify the first is
+        // released when the second fails (all-or-nothing semantics).
+        let plan = PinningPlan {
+            assignments: vec![(0, 90600), (1, 90601)],
+            service_cpu: None,
+            llc_indices: vec![90600, 90601],
+            locks: Vec::new(),
+        };
+        let llc_indices = &[90600usize, 90601];
+        cleanup_lock("/tmp/ktstr-llc-90600.lock");
+        cleanup_lock("/tmp/ktstr-llc-90601.lock");
+
+        let holder = try_flock("/tmp/ktstr-llc-90601.lock", libc::LOCK_EX)
+            .unwrap()
+            .unwrap();
+
+        let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
+        assert!(
+            matches!(outcome, LockOutcome::Unavailable(_)),
+            "should fail when second LLC is busy",
+        );
+
+        // LLC 90600 should be released (all-or-nothing). Verify by
+        // acquiring it successfully.
+        let reacquire = try_flock("/tmp/ktstr-llc-90600.lock", libc::LOCK_EX)
+            .unwrap()
+            .expect("LLC 90600 should be released after all-or-nothing failure");
+        drop(reacquire);
+        drop(holder);
+        cleanup_lock("/tmp/ktstr-llc-90600.lock");
+        cleanup_lock("/tmp/ktstr-llc-90601.lock");
+    }
+
+    #[test]
+    fn resource_lock_shared_cpu_contention() {
+        // Shared LLC mode: hold a CPU lock, verify acquire fails.
+        let plan = PinningPlan {
+            assignments: vec![(0, 90700)],
+            service_cpu: None,
+            llc_indices: vec![90700],
+            locks: Vec::new(),
+        };
+        let llc_indices = &[90700usize];
+        cleanup_lock("/tmp/ktstr-llc-90700.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90700.lock");
+
+        let holder = try_flock("/tmp/ktstr-cpu-90700.lock", libc::LOCK_EX)
+            .unwrap()
+            .unwrap();
+
+        let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
+        assert!(
+            matches!(outcome, LockOutcome::Unavailable(_)),
+            "should fail when CPU lock is held",
+        );
+
+        // LLC lock should be released (all-or-nothing).
+        let reacquire = try_flock("/tmp/ktstr-llc-90700.lock", libc::LOCK_SH)
+            .unwrap()
+            .expect("LLC 90700 should be released after CPU contention");
+        drop(reacquire);
+        drop(holder);
+        cleanup_lock("/tmp/ktstr-llc-90700.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90700.lock");
+    }
+
+    #[test]
+    fn resource_lock_empty_llc_indices() {
+        // Empty llc_indices: LLC lock loop iterates zero times.
+        // Exclusive mode skips CPU locks. Result: Acquired with
+        // llc_offset 0 and empty locks vec.
+        let plan = PinningPlan {
+            assignments: vec![(0, 90800)],
+            service_cpu: None,
+            llc_indices: vec![],
+            locks: Vec::new(),
+        };
+        let outcome = acquire_resource_locks(&plan, &[], LlcLockMode::Exclusive).unwrap();
+        match outcome {
+            LockOutcome::Acquired { llc_offset, locks } => {
+                assert_eq!(llc_offset, 0);
+                assert!(locks.is_empty());
+            }
+            LockOutcome::Unavailable(reason) => {
+                panic!("expected Acquired, got Unavailable: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn resource_lock_service_cpu_contention() {
+        // Shared mode: LLC and assignment CPU locks succeed, but
+        // service CPU is held → Unavailable. All prior locks released.
+        let plan = PinningPlan {
+            assignments: vec![(0, 90900)],
+            service_cpu: Some(90901),
+            llc_indices: vec![90850],
+            locks: Vec::new(),
+        };
+        let llc_indices = &[90850usize];
+        cleanup_lock("/tmp/ktstr-llc-90850.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90900.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90901.lock");
+
+        // Hold the service CPU lock.
+        let holder = try_flock("/tmp/ktstr-cpu-90901.lock", libc::LOCK_EX)
+            .unwrap()
+            .unwrap();
+
+        let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
+        match &outcome {
+            LockOutcome::Unavailable(reason) => {
+                assert!(
+                    reason.contains("service CPU") && reason.contains("90901"),
+                    "reason should mention service CPU 90901: {reason}",
+                );
+            }
+            LockOutcome::Acquired { .. } => {
+                panic!("expected Unavailable when service CPU is held");
+            }
+        }
+
+        // All prior locks should be released (all-or-nothing).
+        let reacquire_llc = try_flock("/tmp/ktstr-llc-90850.lock", libc::LOCK_SH)
+            .unwrap()
+            .expect("LLC 90850 should be released after service CPU contention");
+        let reacquire_cpu = try_flock("/tmp/ktstr-cpu-90900.lock", libc::LOCK_EX)
+            .unwrap()
+            .expect("CPU 90900 should be released after service CPU contention");
+        drop(reacquire_llc);
+        drop(reacquire_cpu);
+        drop(holder);
+        cleanup_lock("/tmp/ktstr-llc-90850.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90900.lock");
+        cleanup_lock("/tmp/ktstr-cpu-90901.lock");
+    }
+
+    #[test]
+    fn cpu_lock_window_success() {
+        for c in 91300..91303 {
+            cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
+        }
+        let locks = try_acquire_cpu_window(91300, 3).unwrap();
+        assert_eq!(locks.len(), 3);
+        for c in 91300..91303 {
+            cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
+        }
+    }
+
+    #[test]
+    fn cpu_lock_window_contention_all_or_nothing() {
+        cleanup_lock("/tmp/ktstr-cpu-91400.lock");
+        cleanup_lock("/tmp/ktstr-cpu-91401.lock");
+
+        let holder = try_flock("/tmp/ktstr-cpu-91400.lock", libc::LOCK_EX)
+            .unwrap()
+            .unwrap();
+
+        let result = try_acquire_cpu_window(91400, 2);
+        assert!(result.is_err(), "should fail when first CPU is held");
+
+        // Hold 91401 instead — 91400 acquires then drops on failure.
+        drop(holder);
+
+        let holder2 = try_flock("/tmp/ktstr-cpu-91401.lock", libc::LOCK_EX)
+            .unwrap()
+            .unwrap();
+        let result2 = try_acquire_cpu_window(91400, 2);
+        assert!(result2.is_err(), "should fail when second CPU is held");
+
+        // 91400 was acquired then dropped (all-or-nothing). Verify
+        // it's available.
+        let reacquire = try_flock("/tmp/ktstr-cpu-91400.lock", libc::LOCK_EX)
+            .unwrap()
+            .expect("CPU 91400 should be released after all-or-nothing");
+        drop(reacquire);
+        drop(holder2);
+        cleanup_lock("/tmp/ktstr-cpu-91400.lock");
+        cleanup_lock("/tmp/ktstr-cpu-91401.lock");
+    }
+
+    #[test]
+    fn cpu_lock_zero_count() {
+        let locks = acquire_cpu_locks(0, 4, None).unwrap();
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn cpu_lock_contention_slides_window() {
+        // Hold CPU at offset 91500, verify next window succeeds
+        // via try_acquire_cpu_window (unit-level sliding test).
+        for c in 91500..91503 {
+            cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
+        }
+
+        let holder = try_flock("/tmp/ktstr-cpu-91500.lock", libc::LOCK_EX)
+            .unwrap()
+            .unwrap();
+
+        let result = try_acquire_cpu_window(91500, 2);
+        assert!(result.is_err(), "window starting at held CPU should fail");
+
+        let locks = try_acquire_cpu_window(91501, 2).unwrap();
+        assert_eq!(locks.len(), 2);
+
+        drop(locks);
+        drop(holder);
+        for c in 91500..91503 {
+            cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
+        }
+    }
+
+    #[test]
+    fn cpu_lock_acquire_success() {
+        // acquire_cpu_locks starts at offset 0. Use total_host_cpus
+        // large enough that a free 3-CPU window always exists even
+        // when other parallel tests hold some low-index CPU locks.
+        let locks = acquire_cpu_locks(3, 100, None).unwrap();
+        assert_eq!(locks.len(), 3);
+    }
+
+    #[test]
+    fn cpu_lock_acquire_slides_past_held() {
+        // Hold CPU 0. acquire_cpu_locks(count=2, total=100) slides
+        // past window [0,1] and finds a free window. Headroom of
+        // 100 CPUs absorbs parallel test interference.
+        cleanup_lock("/tmp/ktstr-cpu-0.lock");
+        let holder = try_flock("/tmp/ktstr-cpu-0.lock", libc::LOCK_EX)
+            .unwrap()
+            .unwrap();
+
+        let locks = acquire_cpu_locks(2, 100, None).unwrap();
+        assert_eq!(locks.len(), 2);
+
+        drop(locks);
+        drop(holder);
+        cleanup_lock("/tmp/ktstr-cpu-0.lock");
+    }
+
+    #[test]
+    fn cpu_lock_acquire_no_windows_fit() {
+        // count > total_host_cpus: loop condition never satisfied,
+        // returns ResourceContention without touching any files.
+        let err = acquire_cpu_locks(2, 0, None).unwrap_err();
+        assert!(
+            err.downcast_ref::<ResourceContention>().is_some(),
+            "error should be ResourceContention: {err}",
+        );
+    }
+
+    #[test]
+    fn cpu_lock_acquire_with_llc_shared() {
+        // Place the LLC group at Vec index 92000 so the lock file
+        // is /tmp/ktstr-llc-92000.lock, avoiding collision with
+        // production LLC lock files at low indices.
+        let mut llc_groups: Vec<LlcGroup> =
+            (0..92000).map(|_| LlcGroup { cpus: Vec::new() }).collect();
+        llc_groups.push(LlcGroup {
+            cpus: (0..100).collect(),
+        });
+        let topo = HostTopology {
+            llc_groups,
+            online_cpus: (0..100).collect(),
+            cpu_to_node: std::collections::HashMap::new(),
+        };
+        cleanup_lock("/tmp/ktstr-llc-92000.lock");
+
+        let locks = acquire_cpu_locks(2, 100, Some(&topo)).unwrap();
+        // 2 CPU locks + 1 shared LLC lock = 3.
+        assert_eq!(locks.len(), 3);
+
+        // The LLC lock is shared — another shared should coexist.
+        let shared2 = try_flock("/tmp/ktstr-llc-92000.lock", libc::LOCK_SH)
+            .unwrap()
+            .expect("second shared LLC should coexist");
+        // Exclusive should fail while shared is held.
+        let excl = try_flock("/tmp/ktstr-llc-92000.lock", libc::LOCK_EX).unwrap();
+        assert!(
+            excl.is_none(),
+            "exclusive LLC should fail while shared is held",
+        );
+
+        drop(shared2);
+        drop(locks);
+        cleanup_lock("/tmp/ktstr-llc-92000.lock");
+    }
+
+    #[test]
+    fn cpu_lock_llc_shared_protection() {
+        // Tests acquire_llc_shared_locks directly: verifies shared lock
+        // acquired, shared coexistence, and exclusive blocking.
+        let mut llc_groups: Vec<LlcGroup> =
+            (0..92100).map(|_| LlcGroup { cpus: Vec::new() }).collect();
+        llc_groups.push(LlcGroup {
+            cpus: vec![91200, 91201],
+        });
+        let topo = HostTopology {
+            llc_groups,
+            online_cpus: vec![91200, 91201],
+            cpu_to_node: std::collections::HashMap::new(),
+        };
+        cleanup_lock("/tmp/ktstr-llc-92100.lock");
+
+        let cpus = vec![91200usize, 91201];
+        let llc_locks = acquire_llc_shared_locks(&topo, &cpus).unwrap();
+        assert_eq!(llc_locks.len(), 1);
+
+        let shared2 = try_flock("/tmp/ktstr-llc-92100.lock", libc::LOCK_SH)
+            .unwrap()
+            .expect("second shared LLC should coexist");
+        let excl = try_flock("/tmp/ktstr-llc-92100.lock", libc::LOCK_EX).unwrap();
+        assert!(
+            excl.is_none(),
+            "exclusive LLC should fail while shared is held",
+        );
+
+        drop(shared2);
+        drop(llc_locks);
+        cleanup_lock("/tmp/ktstr-llc-92100.lock");
     }
 }
