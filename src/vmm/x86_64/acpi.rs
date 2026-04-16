@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn rsdt_points_to_fadt_and_madt() {
+    fn rsdt_table_pointers() {
         let mem = test_mem(16);
         let topo = Topology {
             llcs: 1,
@@ -854,6 +854,12 @@ mod tests {
         mem.read_slice(&mut entry, GuestAddress(l.rsdt_addr + 40))
             .unwrap();
         assert_eq!(u32::from_le_bytes(entry), l.madt_addr as u32);
+        mem.read_slice(&mut entry, GuestAddress(l.rsdt_addr + 44))
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(entry), l.srat_addr as u32);
+        mem.read_slice(&mut entry, GuestAddress(l.rsdt_addr + 48))
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(entry), l.slit_addr as u32);
     }
 
     #[test]
@@ -1168,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn xsdt_points_to_fadt_and_madt() {
+    fn xsdt_table_pointers() {
         let mem = test_mem(16);
         let topo = Topology {
             llcs: 1,
@@ -1184,6 +1190,12 @@ mod tests {
         mem.read_slice(&mut entry, GuestAddress(l.xsdt_addr + 44))
             .unwrap();
         assert_eq!(u64::from_le_bytes(entry), l.madt_addr);
+        mem.read_slice(&mut entry, GuestAddress(l.xsdt_addr + 52))
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(entry), l.srat_addr);
+        mem.read_slice(&mut entry, GuestAddress(l.xsdt_addr + 60))
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(entry), l.slit_addr);
     }
 
     #[test]
@@ -1302,6 +1314,238 @@ mod tests {
         );
     }
 
+    fn walk_srat_entries(srat: &[u8]) -> Vec<(u8, u8, &[u8])> {
+        let hdr_size = 48; // 36-byte SDT + 12-byte SRAT-specific
+        let mut entries = Vec::new();
+        let mut offset = hdr_size;
+        while offset < srat.len() {
+            let entry_type = srat[offset];
+            let entry_len = srat[offset + 1] as usize;
+            entries.push((
+                entry_type,
+                entry_len as u8,
+                &srat[offset..offset + entry_len],
+            ));
+            offset += entry_len;
+        }
+        entries
+    }
+
+    #[test]
+    fn srat_cpu_affinity_multi_numa() {
+        for (numa_nodes, llcs, cores, threads) in
+            [(2, 4, 2, 1), (2, 4, 2, 2), (4, 8, 1, 1), (3, 6, 2, 2)]
+        {
+            let mem = test_mem(16);
+            let topo = Topology {
+                llcs,
+                cores_per_llc: cores,
+                threads_per_core: threads,
+                numa_nodes,
+            };
+            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let srat = read_table(&mem, l.srat_addr);
+            let entries = walk_srat_entries(&srat);
+            let mut cpu_idx = 0u32;
+            for (entry_type, _, data) in &entries {
+                if *entry_type == 2 {
+                    let prox_domain = u32::from_le_bytes(data[4..8].try_into().unwrap());
+                    let (llc_id, _, _) = topo.decompose(cpu_idx);
+                    let expected_node = topo.numa_node_of(llc_id);
+                    assert_eq!(
+                        prox_domain, expected_node,
+                        "cpu {cpu_idx}: proximity_domain {prox_domain} != expected {expected_node} \
+                         (topo: {numa_nodes}n/{llcs}l/{cores}c/{threads}t)"
+                    );
+                    let x2apic = u32::from_le_bytes(data[8..12].try_into().unwrap());
+                    assert_eq!(
+                        x2apic,
+                        apic_id(&topo, cpu_idx),
+                        "cpu {cpu_idx}: x2apic_id mismatch"
+                    );
+                    cpu_idx += 1;
+                }
+            }
+            assert_eq!(cpu_idx, topo.total_cpus());
+        }
+    }
+
+    #[test]
+    fn srat_memory_split_multi_numa() {
+        for (numa_nodes, llcs) in [(2, 4), (3, 6), (4, 8)] {
+            let mem = test_mem(16);
+            let topo = Topology {
+                llcs,
+                cores_per_llc: 2,
+                threads_per_core: 1,
+                numa_nodes,
+            };
+            let mem_bytes = 256u64 << 20;
+            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let srat = read_table(&mem, l.srat_addr);
+            let entries = walk_srat_entries(&srat);
+            let mem_entries: Vec<_> = entries.iter().filter(|(t, _, _)| *t == 1).collect();
+            assert_eq!(mem_entries.len(), numa_nodes as usize);
+
+            let mut prev_end: u64 = 0;
+            let mut total: u64 = 0;
+            for (i, (_, _, data)) in mem_entries.iter().enumerate() {
+                let prox_lo = u16::from_le_bytes(data[2..4].try_into().unwrap()) as u32;
+                let prox_hi = u16::from_le_bytes(data[4..6].try_into().unwrap()) as u32;
+                let prox_domain = (prox_hi << 16) | prox_lo;
+                assert_eq!(
+                    prox_domain, i as u32,
+                    "node {i}: proximity_domain {prox_domain} != {i} \
+                     (topo: {numa_nodes}n/{llcs}l)"
+                );
+                let base = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                let length = u64::from_le_bytes(data[16..24].try_into().unwrap());
+                assert_eq!(
+                    base, prev_end,
+                    "node {i}: base {base:#x} != prev_end {prev_end:#x} \
+                     (topo: {numa_nodes}n/{llcs}l)"
+                );
+                assert!(length > 0, "node {i}: zero-length memory region");
+                prev_end = base + length;
+                total += length;
+            }
+            assert_eq!(
+                total, mem_bytes,
+                "total memory mismatch for {numa_nodes}n/{llcs}l"
+            );
+        }
+    }
+
+    #[test]
+    fn srat_memory_split_with_shm_multi_numa() {
+        for (numa_nodes, llcs, shm_size) in
+            [(2, 4, 64 * 1024u64), (3, 6, 1 << 20), (4, 8, 512 * 1024)]
+        {
+            let mem = test_mem(16);
+            let topo = Topology {
+                llcs,
+                cores_per_llc: 2,
+                threads_per_core: 1,
+                numa_nodes,
+            };
+            let mem_bytes = 256u64 << 20;
+            let expected_usable = mem_bytes - shm_size;
+            let l = setup_acpi(&mem, &topo, 256, shm_size).unwrap();
+            let srat = read_table(&mem, l.srat_addr);
+            let entries = walk_srat_entries(&srat);
+            let total: u64 = entries
+                .iter()
+                .filter(|(t, _, _)| *t == 1)
+                .map(|(_, _, data)| u64::from_le_bytes(data[16..24].try_into().unwrap()))
+                .sum();
+            assert_eq!(
+                total, expected_usable,
+                "shm_size={shm_size}: total {total} != expected {expected_usable} \
+                 (topo: {numa_nodes}n/{llcs}l)"
+            );
+        }
+    }
+
+    #[test]
+    fn slit_distance_matrix_multi_numa() {
+        for (numa_nodes, llcs) in [(2, 2), (3, 3), (4, 4), (2, 4), (2, 6), (3, 9)] {
+            let mem = test_mem(16);
+            let topo = Topology {
+                llcs,
+                cores_per_llc: 1,
+                threads_per_core: 1,
+                numa_nodes,
+            };
+            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let slit = read_table(&mem, l.slit_addr);
+            assert_eq!(&slit[..4], b"SLIT", "SLIT signature mismatch");
+            let n = u64::from_le_bytes(slit[36..44].try_into().unwrap());
+            assert_eq!(n, numa_nodes as u64);
+            let matrix_start = 44;
+            for i in 0..n {
+                for j in 0..n {
+                    let dist = slit[matrix_start + (i * n + j) as usize];
+                    if i == j {
+                        assert_eq!(dist, 10, "diagonal ({i},{j}) != 10");
+                    } else {
+                        assert_eq!(dist, 20, "off-diagonal ({i},{j}) != 20");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn srat_slit_checksum_multi_numa() {
+        for (numa_nodes, llcs, cores, threads) in
+            [(2, 2, 2, 1), (2, 4, 2, 2), (3, 3, 1, 1), (4, 8, 4, 2)]
+        {
+            let mem = test_mem(16);
+            let topo = Topology {
+                llcs,
+                cores_per_llc: cores,
+                threads_per_core: threads,
+                numa_nodes,
+            };
+            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let srat = read_table(&mem, l.srat_addr);
+            let srat_sum: u8 = srat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+            assert_eq!(
+                srat_sum, 0,
+                "SRAT checksum failed for {numa_nodes}n/{llcs}l/{cores}c/{threads}t"
+            );
+            let slit = read_table(&mem, l.slit_addr);
+            let slit_sum: u8 = slit.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+            assert_eq!(
+                slit_sum, 0,
+                "SLIT checksum failed for {numa_nodes}n/{llcs}l/{cores}c/{threads}t"
+            );
+        }
+    }
+
+    #[test]
+    fn srat_memory_split_remainder() {
+        // 257 MB / 3 nodes: per_node = floor(269_484_032 / 3) = 89_828_010.
+        // Last node absorbs remainder: 269_484_032 - 2*89_828_010 = 89_828_012.
+        let memory_mb = 257u32;
+        let mem = test_mem(memory_mb);
+        let topo = Topology {
+            llcs: 3,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 3,
+        };
+        let mem_bytes = (memory_mb as u64) << 20;
+        let per_node = mem_bytes / 3;
+        let l = setup_acpi(&mem, &topo, memory_mb, 0).unwrap();
+        let srat = read_table(&mem, l.srat_addr);
+        let entries = walk_srat_entries(&srat);
+        let mem_entries: Vec<_> = entries.iter().filter(|(t, _, _)| *t == 1).collect();
+        assert_eq!(mem_entries.len(), 3);
+        let mut total: u64 = 0;
+        for (i, (_, _, data)) in mem_entries.iter().enumerate() {
+            let length = u64::from_le_bytes(data[16..24].try_into().unwrap());
+            if i < 2 {
+                assert_eq!(
+                    length, per_node,
+                    "node {i}: expected {per_node}, got {length}"
+                );
+            } else {
+                let expected_last = mem_bytes - 2 * per_node;
+                assert_eq!(
+                    length, expected_last,
+                    "last node: expected {expected_last}, got {length}"
+                );
+                assert!(
+                    length > per_node,
+                    "last node should be larger due to remainder"
+                );
+            }
+            total += length;
+        }
+        assert_eq!(total, mem_bytes);
+    }
+
     #[test]
     fn srat_shm_reduces_last_node_memory() {
         let mem = test_mem(16);
@@ -1314,18 +1558,12 @@ mod tests {
         let shm_size: u64 = 64 * 1024;
         let l = setup_acpi(&mem, &topo, 256, shm_size).unwrap();
         let srat = read_table(&mem, l.srat_addr);
-        let mut offset = 48;
-        let mut total_mem: u64 = 0;
-        while offset < srat.len() {
-            let entry_type = srat[offset];
-            let entry_len = srat[offset + 1] as usize;
-            if entry_type == 1 {
-                let addr_len =
-                    u64::from_le_bytes(srat[offset + 16..offset + 24].try_into().unwrap());
-                total_mem += addr_len;
-            }
-            offset += entry_len;
-        }
+        let entries = walk_srat_entries(&srat);
+        let total_mem: u64 = entries
+            .iter()
+            .filter(|(t, _, _)| *t == 1)
+            .map(|(_, _, data)| u64::from_le_bytes(data[16..24].try_into().unwrap()))
+            .sum();
         let expected = (256u64 << 20) - shm_size;
         assert_eq!(total_mem, expected);
     }
