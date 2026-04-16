@@ -415,9 +415,27 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                     continue;
                 }
                 let image = entry.path.join(&meta.image_name);
-                if image.exists() {
-                    return Ok(Some(image));
+                if !image.exists() {
+                    continue;
                 }
+                // Guard: if a cached vmlinux is present but is missing
+                // the symbols monitor code requires, skip the entry so
+                // the caller falls through to a source tree. Older
+                // caches built by a strip pipeline that dropped data
+                // sections would pass the image-exists check but fail
+                // downstream when the monitor initializes.
+                let vmlinux = entry.path.join("vmlinux");
+                if vmlinux.exists()
+                    && let Err(e) = monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux)
+                {
+                    tracing::info!(
+                        entry = %entry.path.display(),
+                        error = %e,
+                        "skipping cached kernel with unusable vmlinux"
+                    );
+                    continue;
+                }
+                return Ok(Some(image));
             }
         }
     }

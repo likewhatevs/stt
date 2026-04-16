@@ -499,22 +499,38 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
 /// is deleted. Keep-list is safer than a remove-list: new debug or
 /// data sections added by future compiler/kernel versions are
 /// stripped automatically without updating this list.
+///
+/// Data sections must be kept because monitor symbols (runqueues,
+/// __per_cpu_offset, map_idr, prog_idr, init_top_pgt, scx_root, etc.)
+/// reference them via `st_shndx`. Deleting the referenced section
+/// drops the symbol from the output even when the section's bytes
+/// themselves are unused at read time — monitor reads symbol
+/// addresses, not the data bytes.
 const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
-    b"",          // null section (index 0)
-    b".BTF",      // BPF Type Format — probe field resolution
-    b".BTF.ext",  // BTF extension data
-    b".symtab",   // symbol table — monitor address resolution
-    b".strtab",   // symbol string table
-    b".shstrtab", // section header string table (structural)
+    b"",              // null section (index 0)
+    b".BTF",          // BPF Type Format — probe field resolution
+    b".BTF.ext",      // BTF extension data
+    b".symtab",       // symbol table — monitor address resolution
+    b".strtab",       // symbol string table
+    b".shstrtab",     // section header string table (structural)
+    b".rodata",       // holds page_offset_base, __per_cpu_offset, __pgtable_l5_enabled
+    b".data",         // holds init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
+    b".bss",          // holds swapper_pg_dir, scx_root (uninitialized globals)
+    b".data..percpu", // holds runqueues (per-CPU runqueue template)
+    b".init.data",    // holds init-time data some kernels use for page tables
 ];
 
-/// Strip vmlinux for caching: keep only BTF and symbol table.
+/// Strip vmlinux for caching: drop code and debug sections, keep
+/// symbol table, BTF, and the data sections monitor symbols
+/// reference.
 ///
 /// Uses a keep-list ([`VMLINUX_KEEP_SECTIONS`]): all sections not
-/// in the list are deleted. This removes DWARF debug info,
-/// `.text`, `.data`, `.rodata`, `.bss`, and everything else the
-/// cache doesn't need. The cached vmlinux is read only for symbol
-/// addresses (`.symtab`) and BTF type info (`.BTF`).
+/// in the list are deleted. This removes DWARF debug info, `.text`,
+/// and other sections unused by the monitor. The cached vmlinux is
+/// read for symbol addresses (`.symtab`) and BTF type info (`.BTF`);
+/// the data sections themselves are kept because the object-crate
+/// ELF builder drops symbols whose referenced section has been
+/// deleted.
 ///
 /// DWARF from the build tree (not the cache) is used by blazesym
 /// for probe source locations — stripping the cached copy does not
@@ -559,9 +575,11 @@ pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<(tempfile::Tem
 
 /// Keep-list strip: delete all sections not in VMLINUX_KEEP_SECTIONS.
 ///
-/// Symbols referencing deleted sections are detached (set to SHN_ABS)
-/// so `Builder::write` preserves them. The monitor only needs symbol
-/// addresses, not section associations.
+/// Data-bearing sections that hold monitor-referenced symbols
+/// (`.rodata`, `.data`, `.bss`, `.data..percpu`, `.init.data`) must
+/// be kept so the symbol table entries pointing at them survive the
+/// rewrite. Only debug sections, code sections, and sections unused
+/// by monitor lookups are dropped.
 ///
 /// After stripping, verifies the result has a non-empty symbol table.
 /// Returns an error to trigger the fallback to `strip_debug_prefix`
@@ -572,18 +590,6 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     for section in builder.sections.iter_mut() {
         if !VMLINUX_KEEP_SECTIONS.contains(&section.name.as_slice()) {
             section.delete = true;
-        }
-    }
-    // Detach symbols from deleted sections so Builder::write does
-    // not drop them. The monitor only needs symbol addresses
-    // (st_value), not section associations. Mark them SHN_ABS to
-    // preserve the address.
-    for symbol in builder.symbols.iter_mut() {
-        if let Some(section_id) = symbol.section
-            && builder.sections.get(section_id).delete
-        {
-            symbol.section = None;
-            symbol.st_shndx = object::elf::SHN_ABS;
         }
     }
     let mut out = Vec::new();
@@ -1666,6 +1672,60 @@ mod tests {
         fs::write(&path, b"not an ELF file").unwrap();
         let result = strip_vmlinux_debug(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn strip_vmlinux_debug_preserves_monitor_symbols() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
+        // not an ELF), which strip_vmlinux_debug cannot parse.
+        if path.starts_with("/sys/") {
+            return;
+        }
+        let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
+        let syms = crate::monitor::symbols::KernelSymbols::from_vmlinux(&stripped_path).unwrap();
+        assert_ne!(
+            syms.runqueues, 0,
+            "runqueues symbol missing from stripped vmlinux"
+        );
+        assert_ne!(
+            syms.per_cpu_offset, 0,
+            "__per_cpu_offset symbol missing from stripped vmlinux"
+        );
+        assert!(
+            syms.init_top_pgt.is_some(),
+            "init_top_pgt/swapper_pg_dir symbol missing from stripped vmlinux"
+        );
+    }
+
+    #[test]
+    fn strip_vmlinux_debug_preserves_bpf_idr_symbols() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+        let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
+        let data = fs::read(&stripped_path).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let has = |name: &str| {
+            elf.syms
+                .iter()
+                .any(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
+        };
+        assert!(
+            has("map_idr"),
+            "map_idr symbol missing from stripped vmlinux"
+        );
+        assert!(
+            has("prog_idr"),
+            "prog_idr symbol missing from stripped vmlinux"
+        );
     }
 
     // -- EnvVarGuard for test isolation --
