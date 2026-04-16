@@ -17,12 +17,12 @@
 //!
 //! ```text
 //! $CACHE_ROOT/
-//!   6.14.2-tarball-x86_64/
+//!   6.14.2-tarball-x86_64-kc{hash}-{commit}/
 //!     bzImage           # kernel boot image
 //!     vmlinux           # stripped ELF (BTF + symbol table, optional)
 //!     .config           # kernel config (CONFIG_HZ, optional)
 //!     metadata.json     # KernelMetadata descriptor
-//!   local-deadbeef-x86_64/
+//!   local-deadbee-x86_64-kc{hash}-{commit}/
 //!     bzImage
 //!     vmlinux
 //!     .config
@@ -309,7 +309,7 @@ impl CacheDir {
     /// Store a kernel image in the cache.
     ///
     /// `cache_key`: directory name for the entry (e.g.
-    /// `6.14.2-tarball-x86_64`).
+    /// `6.14.2-tarball-x86_64-kc{hash}-{commit}`).
     ///
     /// `image_path`: path to the kernel boot image to cache.
     ///

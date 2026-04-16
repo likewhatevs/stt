@@ -43,7 +43,7 @@ enum KtstrCommand {
     /// Build the kernel (if needed) and run tests via cargo nextest.
     Test {
         /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).
+        /// or cache key (see `cargo ktstr kernel list`).
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,
@@ -54,7 +54,7 @@ enum KtstrCommand {
     /// Build the kernel (if needed) and run tests with coverage via cargo llvm-cov nextest.
     Coverage {
         /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).
+        /// or cache key (see `cargo ktstr kernel list`).
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,
@@ -87,7 +87,7 @@ enum KtstrCommand {
         #[arg(long, conflicts_with = "scheduler")]
         scheduler_bin: Option<PathBuf>,
         /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).
+        /// or cache key (see `cargo ktstr kernel list`).
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,
@@ -123,7 +123,7 @@ enum KtstrCommand {
     /// library resolution via ELF DT_NEEDED parsing.
     Shell {
         /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (`6.14.2-tarball-x86_64`, see `cargo ktstr kernel list`).
+        /// or cache key (see `cargo ktstr kernel list`).
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,

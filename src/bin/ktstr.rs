@@ -99,7 +99,7 @@ enum Command {
     /// library resolution via ELF DT_NEEDED parsing.
     Shell {
         /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (`6.14.2-tarball-x86_64`, see `ktstr kernel list`).
+        /// or cache key (see `ktstr kernel list`).
         /// When absent, resolves automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,

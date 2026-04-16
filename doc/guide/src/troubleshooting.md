@@ -194,7 +194,7 @@ Grouped work types (`PipeIo`, `FutexPingPong`, `CachePipe`,
 ## Cache corruption
 
 ```text
-cached entry 6.14.2-tarball-x86_64 has corrupt metadata
+cached entry 6.14.2-tarball-x86_64-kc... has corrupt metadata
 ```
 
 A cached kernel entry has missing or unparseable `metadata.json`.

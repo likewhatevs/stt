@@ -16,7 +16,7 @@ pub enum KernelId {
     Path(std::path::PathBuf),
     /// Kernel version string (e.g. "6.14.2", "6.15-rc3").
     Version(String),
-    /// Cache key (e.g. "6.14.2-tarball-x86_64").
+    /// Cache key (e.g. "6.14.2-tarball-x86_64-kc...").
     CacheKey(String),
 }
 
@@ -47,7 +47,7 @@ impl std::fmt::Display for KernelId {
 ///
 /// Matches: `6.14`, `6.14.2`, `6.15-rc3`, `6.14.2-rc1`.
 /// Does not match: `v6.14` (git tag prefix), `6` (no minor),
-/// `6.14.2-tarball-x86_64` (cache key with extra segments).
+/// `6.14.2-tarball-x86_64-kc...` (cache key with extra segments).
 fn _is_version_string(s: &str) -> bool {
     let (version_part, rc_part) = match s.split_once("-rc") {
         Some((v, rc)) => (v, Some(rc)),
