@@ -108,11 +108,12 @@ for gauntlet expansion and budget-driven test selection.
 Tests require a bootable Linux kernel. ktstr searches (in order):
 
 1. `KTSTR_TEST_KERNEL` environment variable (direct image path)
-2. `KTSTR_KERNEL` environment variable, parsed as a `KernelId`:
+2. `KTSTR_KERNEL` environment variable, parsed as one of three forms:
    - Path: search that directory for `arch/<arch>/boot/<image>`
    - Version (e.g. `6.14.2`): look up the version in XDG cache
    - Cache key (from `cargo ktstr kernel list`): exact cache lookup
-3. XDG cache: most recent cached image (newest first). Skipped when
+3. XDG cache: most recent cached image (newest first); entries built
+   with a different kconfig fragment are skipped. Skipped entirely when
    `KTSTR_KERNEL` was an explicit version or cache key that missed.
 4. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
 5. `../linux/arch/<arch>/boot/<image>` (sibling directory)
@@ -137,6 +138,7 @@ and caches the result:
 ```sh
 cargo ktstr kernel build               # latest stable
 cargo ktstr kernel build 6.14.2        # specific version
+cargo ktstr kernel build 6.12          # latest 6.12.x patch release
 ```
 
 Subsequent runs of `cargo ktstr test` or `cargo nextest run` will
