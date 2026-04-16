@@ -44,9 +44,6 @@ pub(crate) struct KernelSymbols {
     /// Kernel virtual address of `scx_root` (pointer to active scx_sched).
     /// None if the symbol is absent (kernel without sched_ext).
     pub scx_root: Option<u64>,
-    /// Kernel virtual address of `scx_watchdog_timeout`.
-    /// None if the symbol is absent (kernel without sched_ext).
-    pub scx_watchdog_timeout: Option<u64>,
     /// Kernel virtual address of the top-level page table.
     /// `init_top_pgt` (older kernels) or `swapper_pg_dir` (newer kernels).
     /// Used to derive CR3 for page table walks when KVM SREGS are unavailable.
@@ -87,7 +84,6 @@ impl KernelSymbols {
         let page_offset_base_kva = sym_addr("page_offset_base");
 
         let scx_root = sym_addr("scx_root");
-        let scx_watchdog_timeout = sym_addr("scx_watchdog_timeout");
 
         let init_top_pgt = sym_addr("init_top_pgt").or_else(|| sym_addr("swapper_pg_dir"));
 
@@ -100,7 +96,6 @@ impl KernelSymbols {
             per_cpu_offset,
             page_offset_base_kva,
             scx_root,
-            scx_watchdog_timeout,
             init_top_pgt,
             pgtable_l5_enabled,
             prog_idr,
@@ -217,27 +212,6 @@ pub(crate) fn compute_rq_pas(
         .collect()
 }
 
-/// Write `scx_watchdog_timeout` in guest memory.
-///
-/// `scx_watchdog_timeout` is a kernel data symbol (static unsigned long),
-/// so its PA is derived via `__START_KERNEL_map`, not PAGE_OFFSET.
-///
-/// Returns `true` if the write succeeded, `false` if the symbol address
-/// was absent.
-#[allow(dead_code)]
-pub(crate) fn write_watchdog_timeout(
-    mem: &super::reader::GuestMem,
-    symbols: &KernelSymbols,
-    val: u64,
-) -> bool {
-    let Some(kva) = symbols.scx_watchdog_timeout else {
-        return false;
-    };
-    let pa = text_kva_to_pa(kva);
-    mem.write_u64(pa, 0, val);
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,54 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn write_watchdog_timeout_writes_value() {
-        use crate::monitor::reader::GuestMem;
-
-        // scx_watchdog_timeout is a kernel data symbol: PA via text mapping.
-        let watchdog_kva = START_KERNEL_MAP + 0x1000;
-        let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            scx_root: None,
-            scx_watchdog_timeout: Some(watchdog_kva),
-
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-        };
-
-        let mut buf = [0u8; 0x2000];
-        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
-
-        assert!(write_watchdog_timeout(&mem, &symbols, 30_000));
-        // PA = watchdog_kva - START_KERNEL_MAP = 0x1000
-        assert_eq!(mem.read_u64(0x1000, 0), 30_000);
-    }
-
-    #[test]
-    fn write_watchdog_timeout_returns_false_when_absent() {
-        use crate::monitor::reader::GuestMem;
-
-        let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            scx_root: None,
-            scx_watchdog_timeout: None,
-
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-        };
-
-        let buf = [0u8; 64];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
-
-        assert!(!write_watchdog_timeout(&mem, &symbols, 30_000));
-    }
-
-    #[test]
     fn resolve_page_offset_with_symbol() {
         use crate::monitor::reader::GuestMem;
 
@@ -417,8 +343,6 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
-            scx_watchdog_timeout: None,
-
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
@@ -438,8 +362,6 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
-            scx_watchdog_timeout: None,
-
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
@@ -461,8 +383,6 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
-            scx_watchdog_timeout: None,
-
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
@@ -487,8 +407,6 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
-            scx_watchdog_timeout: None,
-
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
@@ -516,8 +434,6 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
-            scx_watchdog_timeout: None,
-
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
@@ -541,8 +457,6 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
-            scx_watchdog_timeout: None,
-
             init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
             prog_idr: None,
@@ -566,8 +480,6 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
-            scx_watchdog_timeout: None,
-
             init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
             prog_idr: None,
@@ -587,8 +499,6 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
-            scx_watchdog_timeout: None,
-
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,

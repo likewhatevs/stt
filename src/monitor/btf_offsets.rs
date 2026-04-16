@@ -68,6 +68,20 @@ pub struct KernelOffsets {
     /// Offsets for sched_domain tree walking and stats. None if BTF
     /// lacks the `sd` field on `struct rq` or `struct sched_domain`.
     pub sched_domain_offsets: Option<SchedDomainOffsets>,
+    /// Offsets for runtime `scx_sched.watchdog_timeout` override. None
+    /// if BTF lacks `struct scx_sched` or its `watchdog_timeout` field.
+    pub watchdog_offsets: Option<ScxWatchdogOffsets>,
+}
+
+/// Byte offsets for overriding `scx_sched.watchdog_timeout` from the host.
+///
+/// The watchdog timeout lives inside the runtime-allocated `scx_sched`
+/// struct pointed to by the `scx_root` global. The host reads
+/// `*scx_root` to find the struct, then writes jiffies at this offset.
+#[derive(Debug, Clone)]
+pub struct ScxWatchdogOffsets {
+    /// Offset of `watchdog_timeout` within `struct scx_sched`.
+    pub scx_sched_watchdog_timeout_off: usize,
 }
 
 /// Byte offsets for reading scx event counters from guest memory.
@@ -121,6 +135,7 @@ impl KernelOffsets {
         let event_offsets = resolve_event_offsets(&btf).ok();
         let schedstat_offsets = resolve_schedstat_offsets(&btf).ok();
         let sched_domain_offsets = resolve_sched_domain_offsets(&btf, &rq_struct).ok();
+        let watchdog_offsets = resolve_watchdog_offsets(&btf).ok();
 
         Ok(Self {
             rq_nr_running,
@@ -133,6 +148,7 @@ impl KernelOffsets {
             event_offsets,
             schedstat_offsets,
             sched_domain_offsets,
+            watchdog_offsets,
         })
     }
 }
@@ -175,6 +191,17 @@ fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
         ev_dispatch_keep_last,
         ev_enq_skip_exiting,
         ev_enq_skip_migration_disabled,
+    })
+}
+
+/// Resolve BTF offsets for `scx_sched.watchdog_timeout`.
+/// Returns Err if the struct or field is missing (kernel without sched_ext).
+fn resolve_watchdog_offsets(btf: &Btf) -> Result<ScxWatchdogOffsets> {
+    let (scx_sched_struct, _) = find_struct(btf, "scx_sched")?;
+    let scx_sched_watchdog_timeout_off =
+        member_byte_offset(btf, &scx_sched_struct, "watchdog_timeout")?;
+    Ok(ScxWatchdogOffsets {
+        scx_sched_watchdog_timeout_off,
     })
 }
 

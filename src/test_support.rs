@@ -554,7 +554,7 @@ pub struct KtstrTestEntry {
     pub replicas: u32,
     pub assert: crate::assert::Assert,
     pub extra_sched_args: &'static [&'static str],
-    /// scx_watchdog_timeout in the guest kernel.
+    /// `scx_sched.watchdog_timeout` override applied to the guest kernel.
     pub watchdog_timeout: Duration,
     /// Host-side BPF map write to perform during VM execution.
     pub bpf_map_write: Option<&'static BpfMapWrite>,

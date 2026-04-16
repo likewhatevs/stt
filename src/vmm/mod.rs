@@ -1161,8 +1161,9 @@ pub struct KtstrVm {
     /// Thresholds for reactive SysRq-D dump. When set and the monitor
     /// detects a sustained violation, it writes the dump flag to guest SHM.
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
-    /// Override for `scx_watchdog_timeout` in the guest kernel.
-    /// Converted to jiffies via CONFIG_HZ at monitor start time.
+    /// Override for `scx_sched.watchdog_timeout` in the guest kernel.
+    /// Converted to jiffies via CONFIG_HZ at monitor start time and
+    /// written at each monitor iteration after the scheduler attaches.
     watchdog_timeout: Option<Duration>,
     /// Host-side BPF map write parameters. When set, a thread polls for
     /// BPF map discoverability, waits for scenario start via SHM ring,
@@ -2695,13 +2696,24 @@ impl KtstrVm {
                     monitor::symbols::compute_rq_pas(symbols.runqueues, &offsets_arr, page_offset);
 
                 let watchdog_override = watchdog_jiffies.and_then(|jiffies| {
-                    symbols.scx_watchdog_timeout.map(|kva| {
-                        let pa = monitor::symbols::text_kva_to_pa(kva);
-                        monitor::reader::WatchdogOverride { pa, jiffies }
-                    })
+                    symbols
+                        .scx_root
+                        .zip(offsets.watchdog_offsets.as_ref())
+                        .map(|(scx_root_kva, wd_offs)| {
+                            // scx_root is a kernel data symbol: text mapping.
+                            let scx_root_pa = monitor::symbols::text_kva_to_pa(scx_root_kva);
+                            monitor::reader::WatchdogOverride {
+                                scx_root_pa,
+                                watchdog_offset: wd_offs.scx_sched_watchdog_timeout_off,
+                                jiffies,
+                                page_offset,
+                            }
+                        })
                 });
                 if watchdog_jiffies.is_some() && watchdog_override.is_none() {
-                    tracing::warn!("scx_watchdog_timeout symbol not found in vmlinux",);
+                    tracing::warn!(
+                        "scx_root symbol or scx_sched.watchdog_timeout BTF field not found — watchdog_timeout override ignored"
+                    );
                 }
 
                 let event_pcpu_pas = symbols

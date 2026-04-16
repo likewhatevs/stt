@@ -570,14 +570,28 @@ pub(crate) struct DumpTrigger {
     pub thresholds: super::MonitorThresholds,
 }
 
-/// Override for scx_watchdog_timeout written every monitor iteration.
+/// Override for `scx_sched.watchdog_timeout` written every monitor
+/// iteration.
 ///
-/// The kernel sets scx_watchdog_timeout during scheduler attach, so a
-/// one-time write before the scheduler starts is overwritten. Writing
-/// every iteration ensures the override takes effect after attachment.
+/// The watchdog timeout lives inside the `scx_sched` struct that
+/// `scx_root` points to. `scx_root` is null before scheduler attach
+/// and during unload, and the struct itself is reallocated on each
+/// (re)load, so the host cannot resolve the address once up front —
+/// it must deref `*scx_root` every iteration and write the override
+/// into whichever struct is currently live.
 pub(crate) struct WatchdogOverride {
-    pub pa: u64,
+    /// Physical address of the `scx_root` global pointer (text
+    /// mapping, not direct). `*scx_root_pa` is the KVA of the active
+    /// `scx_sched` struct or 0 when no scheduler is loaded.
+    pub scx_root_pa: u64,
+    /// Byte offset of `watchdog_timeout` within `struct scx_sched`,
+    /// resolved from BTF.
+    pub watchdog_offset: usize,
+    /// Jiffies to write at `scx_sched + watchdog_offset`.
     pub jiffies: u64,
+    /// Runtime `PAGE_OFFSET` used to translate the `scx_sched` KVA
+    /// (which lives in the direct mapping) to a DRAM-relative PA.
+    pub page_offset: u64,
 }
 
 /// Pre-resolved BPF program stats context for the monitor loop.
@@ -654,7 +668,11 @@ pub(crate) fn monitor_loop(
             break;
         }
         if let Some(wd) = watchdog_override {
-            mem.write_u64(wd.pa, 0, wd.jiffies);
+            let sch_kva = mem.read_u64(wd.scx_root_pa, 0);
+            if sch_kva != 0 {
+                let sch_pa = super::symbols::kva_to_pa(sch_kva, wd.page_offset);
+                mem.write_u64(sch_pa, wd.watchdog_offset, wd.jiffies);
+            }
         }
         cpus.clear();
         cpus.extend(rq_pas.iter().map(|&pa| read_rq_stats(mem, pa, offsets)));
@@ -845,6 +863,7 @@ mod tests {
             event_offsets: None,
             schedstat_offsets: None,
             sched_domain_offsets: None,
+            watchdog_offsets: None,
         }
     }
 
@@ -1353,18 +1372,32 @@ mod tests {
     #[test]
     fn monitor_loop_with_watchdog_override() {
         let offsets = test_offsets();
-        // Buffer: rq data + 8 bytes for watchdog value.
+        // Layout:
+        //   [rq_buf]
+        //   [scx_root pointer slot @ scx_root_pa] (holds scx_sched KVA)
+        //   [scx_sched struct @ sch_pa, with watchdog_timeout at watchdog_offset]
+        // The monitor derefs *scx_root_pa -> KVA, translates via PAGE_OFFSET -> PA,
+        // then writes jiffies at sch_pa + watchdog_offset.
         let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let wd_pa = rq_buf.len() as u64;
+        let scx_root_pa = rq_buf.len() as u64;
+        let sch_pa = scx_root_pa + 8;
+        let watchdog_offset: usize = 16;
+        let page_offset = super::super::symbols::DEFAULT_PAGE_OFFSET;
+        let scx_sched_kva = page_offset.wrapping_add(sch_pa);
+
+        // Buffer = rq_buf | 8 bytes (scx_root slot) | 64 bytes (scx_sched stub).
         let mut combined = rq_buf;
-        combined.extend_from_slice(&[0u8; 8]);
+        combined.extend_from_slice(&scx_sched_kva.to_ne_bytes());
+        combined.extend_from_slice(&[0u8; 64]);
 
         let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let wd = WatchdogOverride {
-            pa: wd_pa,
+            scx_root_pa,
+            watchdog_offset,
             jiffies: 99999,
+            page_offset,
         };
 
         let handle = {
@@ -1391,13 +1424,60 @@ mod tests {
         handle.join().unwrap();
 
         assert!(!samples.is_empty());
-        // Verify the watchdog value was written.
-        let written = u64::from_ne_bytes(
-            combined[wd_pa as usize..wd_pa as usize + 8]
-                .try_into()
-                .unwrap(),
-        );
+        // Verify the watchdog value was written at sch_pa + watchdog_offset.
+        let write_pa = sch_pa as usize + watchdog_offset;
+        let written = u64::from_ne_bytes(combined[write_pa..write_pa + 8].try_into().unwrap());
         assert_eq!(written, 99999);
+    }
+
+    #[test]
+    fn monitor_loop_watchdog_override_skipped_when_scx_root_null() {
+        let offsets = test_offsets();
+        // Layout: rq_buf | scx_root slot = 0 (no scheduler loaded).
+        let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        let scx_root_pa = rq_buf.len() as u64;
+        let mut combined = rq_buf;
+        combined.extend_from_slice(&[0u8; 8]); // scx_root = null
+        // Extra space in case of accidental write via garbage deref.
+        combined.extend_from_slice(&[0u8; 128]);
+
+        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let wd = WatchdogOverride {
+            scx_root_pa,
+            watchdog_offset: 16,
+            jiffies: 0xDEADBEEF,
+            page_offset: super::super::symbols::DEFAULT_PAGE_OFFSET,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            watchdog_override: Some(&wd),
+            ..test_config()
+        };
+        let _ = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        // No write should have happened: buffer is all zeros past rq_buf.
+        assert!(
+            combined[scx_root_pa as usize..].iter().all(|&b| b == 0),
+            "no write should occur when scx_root is null"
+        );
     }
 
     #[test]

@@ -514,7 +514,7 @@ const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
     b".strtab",       // symbol string table
     b".shstrtab",     // section header string table (structural)
     b".rodata",       // holds page_offset_base, __per_cpu_offset, __pgtable_l5_enabled
-    b".data",         // holds init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
+    b".data",         // holds init_top_pgt, map_idr, prog_idr
     b".bss",          // holds swapper_pg_dir, scx_root (uninitialized globals)
     b".data..percpu", // holds runqueues (per-CPU runqueue template)
     b".init.data",    // holds init-time data some kernels use for page tables
@@ -1714,11 +1714,6 @@ mod tests {
             source_syms.scx_root.is_some(),
             syms.scx_root.is_some(),
             "strip changed scx_root presence"
-        );
-        assert_eq!(
-            source_syms.scx_watchdog_timeout.is_some(),
-            syms.scx_watchdog_timeout.is_some(),
-            "strip changed scx_watchdog_timeout presence"
         );
         assert_eq!(
             source_syms.pgtable_l5_enabled.is_some(),
