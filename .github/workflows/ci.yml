@@ -30,6 +30,10 @@ jobs:
 
   test-x64:
     runs-on: [self-hosted, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel-version: ['6.16', '7.1']
     env:
       KTSTR_GHA_CACHE: "1"
     steps:
@@ -44,14 +48,18 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cache/ktstr/kernels
-          key: ktstr-kernels-x64-${{ hashFiles('ktstr.kconfig') }}
-          restore-keys: ktstr-kernels-x64-
+          key: ktstr-kernels-x64-${{ matrix.kernel-version }}-${{ hashFiles('ktstr.kconfig') }}
+          restore-keys: ktstr-kernels-x64-${{ matrix.kernel-version }}-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr -- ktstr kernel build
+        run: cargo run --bin cargo-ktstr -- ktstr kernel build ${{ matrix.kernel-version }}
       - run: cargo nextest run --workspace --profile ci --features integration
+        env:
+          KTSTR_KERNEL: ${{ matrix.kernel-version }}
       - name: Test statistics
         if: ${{ !cancelled() }}
         run: cargo run --bin cargo-ktstr -- ktstr test-stats
+        env:
+          KTSTR_KERNEL: ${{ matrix.kernel-version }}
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
