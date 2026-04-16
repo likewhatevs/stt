@@ -3185,4 +3185,104 @@ mod tests {
             _ => panic!("expected RoundRobin(1)"),
         }
     }
+
+    #[test]
+    fn spawn_futex_ping_pong_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            affinity: AffinityMode::None,
+            work_type: WorkType::FutexPingPong { spin_iters: 1024 },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(
+                r.work_units > 0,
+                "FutexPingPong worker {} did no work",
+                r.tid
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_cache_pressure_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            affinity: AffinityMode::None,
+            work_type: WorkType::CachePressure {
+                size_kb: 32,
+                stride: 64,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].work_units > 0);
+    }
+
+    #[test]
+    fn spawn_cache_yield_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            affinity: AffinityMode::None,
+            work_type: WorkType::CacheYield {
+                size_kb: 32,
+                stride: 64,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].work_units > 0);
+    }
+
+    #[test]
+    fn spawn_cache_pipe_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            affinity: AffinityMode::None,
+            work_type: WorkType::CachePipe {
+                size_kb: 32,
+                burst_iters: 1024,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.work_units > 0, "CachePipe worker {} did no work", r.tid);
+        }
+    }
+
+    #[test]
+    fn spawn_sequence_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            affinity: AffinityMode::None,
+            work_type: WorkType::Sequence {
+                first: Phase::Spin(Duration::from_millis(10)),
+                rest: vec![Phase::Yield(Duration::from_millis(10))],
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].work_units > 0);
+    }
 }
