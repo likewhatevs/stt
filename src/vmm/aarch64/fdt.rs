@@ -576,4 +576,354 @@ mod tests {
         let addr_with_shm = fdt_address(256, 0x10_0000);
         assert!(addr_with_shm < addr_no_shm);
     }
+
+    // -----------------------------------------------------------------------
+    // Minimal DTB parser for content validation tests.
+    //
+    // FDT binary format (big-endian):
+    //   Header: magic (0xd00dfeed), totalsize, off_dt_struct, off_dt_strings, ...
+    //   Structure block: stream of tokens:
+    //     FDT_BEGIN_NODE (1): u32 token, null-terminated name, pad to 4-byte
+    //     FDT_END_NODE   (2): u32 token
+    //     FDT_PROP       (3): u32 token, u32 len, u32 nameoff, [len bytes data], pad
+    //     FDT_NOP        (4): u32 token
+    //     FDT_END        (9): u32 token
+    // -----------------------------------------------------------------------
+
+    const FDT_MAGIC: u32 = 0xd00dfeed;
+    const FDT_BEGIN_NODE: u32 = 1;
+    const FDT_END_NODE: u32 = 2;
+    const FDT_PROP: u32 = 3;
+    const FDT_END: u32 = 9;
+
+    fn read_be32(dtb: &[u8], off: usize) -> u32 {
+        u32::from_be_bytes(dtb[off..off + 4].try_into().unwrap())
+    }
+
+    /// Walk the DTB structure block and collect (node_path, prop_name, prop_data)
+    /// tuples. Only descends into nodes; does not interpret property values.
+    fn parse_dtb_props(dtb: &[u8]) -> Vec<(String, String, Vec<u8>)> {
+        assert_eq!(read_be32(dtb, 0), FDT_MAGIC, "not a valid DTB");
+        let off_struct = read_be32(dtb, 8) as usize;
+        let off_strings = read_be32(dtb, 12) as usize;
+
+        let mut pos = off_struct;
+        let mut path_stack: Vec<String> = Vec::new();
+        let mut results = Vec::new();
+
+        loop {
+            let token = read_be32(dtb, pos);
+            pos += 4;
+            match token {
+                FDT_BEGIN_NODE => {
+                    // Read null-terminated node name.
+                    let name_start = pos;
+                    while dtb[pos] != 0 {
+                        pos += 1;
+                    }
+                    let name = std::str::from_utf8(&dtb[name_start..pos])
+                        .unwrap()
+                        .to_string();
+                    pos += 1; // skip null
+                    pos = (pos + 3) & !3; // align to 4
+                    // Skip the root node (empty name) to avoid a leading
+                    // "/" separator in join()-ed paths.
+                    if !name.is_empty() {
+                        path_stack.push(name);
+                    }
+                }
+                FDT_END_NODE => {
+                    path_stack.pop();
+                }
+                FDT_PROP => {
+                    let len = read_be32(dtb, pos) as usize;
+                    pos += 4;
+                    let nameoff = read_be32(dtb, pos) as usize;
+                    pos += 4;
+                    let data = dtb[pos..pos + len].to_vec();
+                    pos += len;
+                    pos = (pos + 3) & !3; // align to 4
+
+                    // Read property name from strings table.
+                    let str_start = off_strings + nameoff;
+                    let mut str_end = str_start;
+                    while dtb[str_end] != 0 {
+                        str_end += 1;
+                    }
+                    let prop_name = std::str::from_utf8(&dtb[str_start..str_end])
+                        .unwrap()
+                        .to_string();
+
+                    let node_path = path_stack.join("/");
+                    results.push((node_path, prop_name, data));
+                }
+                FDT_END => break,
+                _ => {} // FDT_NOP or unknown — skip
+            }
+        }
+        results
+    }
+
+    /// Extract a u32 property value from parsed props.
+    fn prop_u32(props: &[(String, String, Vec<u8>)], node: &str, name: &str) -> Option<u32> {
+        props.iter().find_map(|(n, p, d)| {
+            if n == node && p == name && d.len() == 4 {
+                Some(u32::from_be_bytes(d[..4].try_into().unwrap()))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Extract a u32-array property from parsed props.
+    fn prop_u32_array(
+        props: &[(String, String, Vec<u8>)],
+        node: &str,
+        name: &str,
+    ) -> Option<Vec<u32>> {
+        props.iter().find_map(|(n, p, d)| {
+            if n == node && p == name && d.len() % 4 == 0 {
+                Some(
+                    d.chunks_exact(4)
+                        .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn parse_dtb_props_paths_no_leading_slash() {
+        let topo = default_topo();
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = create_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0).unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        // Top-level node paths must not start with "/".
+        let cpus_prop = props
+            .iter()
+            .find(|(n, p, _)| n == "cpus" && p == "#address-cells");
+        assert!(cpus_prop.is_some(), "expected path 'cpus', not '/cpus'");
+
+        // Nested node paths use "/" as separator without leading slash.
+        let cpu0_prop = props
+            .iter()
+            .find(|(n, p, _)| n == "cpus/cpu@0" && p == "device_type");
+        assert!(
+            cpu0_prop.is_some(),
+            "expected path 'cpus/cpu@0', not '/cpus/cpu@0'"
+        );
+
+        // No path should start with "/".
+        for (path, _, _) in &props {
+            assert!(
+                !path.starts_with('/'),
+                "path {path:?} must not start with '/'"
+            );
+        }
+    }
+
+    fn verify_cpu_numa_node_ids(topo: &Topology, props: &[(String, String, Vec<u8>)]) {
+        for cpu_id in 0..topo.total_cpus() {
+            let node_path = format!("cpus/cpu@{cpu_id}");
+            let numa_id = prop_u32(props, &node_path, "numa-node-id")
+                .unwrap_or_else(|| panic!("cpu {cpu_id}: missing numa-node-id"));
+            let (llc_id, _, _) = topo.decompose(cpu_id);
+            let expected = topo.numa_node_of(llc_id);
+            assert_eq!(
+                numa_id, expected,
+                "cpu {cpu_id}: numa-node-id {numa_id} != expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn fdt_cpu_numa_node_ids() {
+        // No-SMT variant: 4 LLCs, 2 cores/LLC, 1 thread, 2 NUMA nodes.
+        let topo = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 2,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = create_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 0).unwrap();
+        verify_cpu_numa_node_ids(&topo, &parse_dtb_props(&dtb));
+
+        // SMT variant: sibling threads share the same LLC and must get
+        // the same numa-node-id.
+        let topo_smt = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 2,
+            numa_nodes: 2,
+        };
+        let mpidrs_smt = fake_mpidrs(topo_smt.total_cpus());
+        let dtb_smt =
+            create_fdt(&topo_smt, &mpidrs_smt, 512, "console=ttyS0", None, None, 0).unwrap();
+        verify_cpu_numa_node_ids(&topo_smt, &parse_dtb_props(&dtb_smt));
+    }
+
+    #[test]
+    fn fdt_single_numa_no_numa_props() {
+        let topo = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 2,
+            numa_nodes: 1,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = create_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0).unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        // CPU nodes must NOT have numa-node-id when numa_nodes == 1.
+        for cpu_id in 0..topo.total_cpus() {
+            let node_path = format!("cpus/cpu@{cpu_id}");
+            assert!(
+                prop_u32(&props, &node_path, "numa-node-id").is_none(),
+                "cpu {cpu_id}: numa-node-id must be absent for single-NUMA"
+            );
+        }
+
+        // distance-map node must not exist.
+        let has_distance_map = props
+            .iter()
+            .any(|(n, _, _)| n == "distance-map" || n.starts_with("distance-map/"));
+        assert!(
+            !has_distance_map,
+            "distance-map node must not exist for single-NUMA"
+        );
+    }
+
+    /// Verify multi-NUMA memory nodes: numa-node-id, reg, contiguity, total size.
+    fn verify_memory_nodes(
+        topo: &Topology,
+        props: &[(String, String, Vec<u8>)],
+        memory_mb: u32,
+        shm_size: u64,
+    ) {
+        let mem_size = (memory_mb as u64) << 20;
+        let usable_bytes = mem_size - shm_size;
+        let n = topo.numa_nodes as u64;
+        let per_node = (usable_bytes / n) & !0xFFF;
+
+        let mut prev_end: Option<u64> = None;
+        let mut total_size: u64 = 0;
+
+        for node in 0..topo.numa_nodes {
+            let base = DRAM_START + node as u64 * per_node;
+            let node_name = format!("memory@{base:x}");
+
+            // Verify numa-node-id.
+            let numa_id = prop_u32(props, &node_name, "numa-node-id")
+                .unwrap_or_else(|| panic!("memory node {node}: missing numa-node-id"));
+            assert_eq!(numa_id, node, "memory node {node}: wrong numa-node-id");
+
+            // Verify reg property: [base_hi, base_lo, size_hi, size_lo].
+            let reg = prop_u32_array(props, &node_name, "reg")
+                .unwrap_or_else(|| panic!("memory node {node}: missing reg"));
+            assert_eq!(reg.len(), 4, "memory node {node}: reg must have 4 cells");
+
+            let reg_base = ((reg[0] as u64) << 32) | reg[1] as u64;
+            assert_eq!(reg_base, base, "memory node {node}: wrong base address");
+
+            let reg_size = ((reg[2] as u64) << 32) | reg[3] as u64;
+            let expected_size = if node == topo.numa_nodes - 1 {
+                mem_size - node as u64 * per_node
+            } else {
+                per_node
+            };
+            assert_eq!(reg_size, expected_size, "memory node {node}: wrong size");
+
+            // F4: contiguity — node N+1 base == node N base + node N size.
+            if let Some(prev) = prev_end {
+                assert_eq!(
+                    reg_base, prev,
+                    "memory node {node}: not contiguous (base {reg_base:#x} != prev end {prev:#x})"
+                );
+            }
+            prev_end = Some(reg_base + reg_size);
+
+            total_size += reg_size;
+        }
+
+        // F5: total memory across all nodes == mem_size.
+        assert_eq!(
+            total_size, mem_size,
+            "total memory {total_size:#x} != mem_size {mem_size:#x}"
+        );
+    }
+
+    #[test]
+    fn fdt_memory_nodes_multi_numa() {
+        let topo = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 2,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+
+        // No-SHM case.
+        let memory_mb: u32 = 512;
+        let dtb = create_fdt(&topo, &mpidrs, memory_mb, "console=ttyS0", None, None, 0).unwrap();
+        verify_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mb, 0);
+
+        // F3: with-SHM case — last node absorbs SHM region.
+        let shm_size: u64 = 0x10_0000;
+        let dtb_shm = create_fdt(
+            &topo,
+            &mpidrs,
+            memory_mb,
+            "console=ttyS0",
+            None,
+            None,
+            shm_size,
+        )
+        .unwrap();
+        verify_memory_nodes(&topo, &parse_dtb_props(&dtb_shm), memory_mb, shm_size);
+    }
+
+    #[test]
+    fn fdt_distance_map() {
+        let topo = Topology {
+            llcs: 6,
+            cores_per_llc: 4,
+            threads_per_core: 2,
+            numa_nodes: 3,
+        };
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = create_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 0).unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        let matrix = prop_u32_array(&props, "distance-map", "distance-matrix")
+            .expect("missing distance-matrix property");
+
+        let n = topo.numa_nodes;
+        // NxN matrix of (nodea, nodeb, distance) triples.
+        assert_eq!(
+            matrix.len(),
+            (n * n * 3) as usize,
+            "distance-matrix length: expected {} triples",
+            n * n,
+        );
+
+        let mut idx = 0;
+        for i in 0..n {
+            for j in 0..n {
+                assert_eq!(matrix[idx], i, "triple ({i},{j}): wrong nodea");
+                assert_eq!(matrix[idx + 1], j, "triple ({i},{j}): wrong nodeb");
+                let expected_dist = if i == j { 10 } else { 20 };
+                assert_eq!(
+                    matrix[idx + 2],
+                    expected_dist,
+                    "triple ({i},{j}): distance {} != expected {expected_dist}",
+                    matrix[idx + 2],
+                );
+                idx += 3;
+            }
+        }
+    }
 }
