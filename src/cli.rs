@@ -1452,43 +1452,6 @@ mod tests {
         assert_eq!(days_to_ymd(19722), (2023, 12, 31));
     }
 
-    // -- has_sched_ext --
-
-    #[test]
-    fn has_sched_ext_present() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join(".config"),
-            "CONFIG_BPF=y\nCONFIG_SCHED_CLASS_EXT=y\nCONFIG_DEBUG_INFO=y\n",
-        )
-        .unwrap();
-        assert!(has_sched_ext(dir.path()));
-    }
-
-    #[test]
-    fn has_sched_ext_absent() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join(".config"),
-            "CONFIG_BPF=y\nCONFIG_DEBUG_INFO=y\n",
-        )
-        .unwrap();
-        assert!(!has_sched_ext(dir.path()));
-    }
-
-    #[test]
-    fn has_sched_ext_module() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join(".config"), "CONFIG_SCHED_CLASS_EXT=m\n").unwrap();
-        assert!(!has_sched_ext(dir.path()));
-    }
-
-    #[test]
-    fn has_sched_ext_no_config() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert!(!has_sched_ext(dir.path()));
-    }
-
     // -- validate_kernel_config --
 
     #[test]

@@ -1409,32 +1409,6 @@ mod tests {
         assert_eq!(val, 0);
     }
 
-    // -- days_to_ymd --
-
-    #[test]
-    fn days_to_ymd_epoch() {
-        // Day 0 = 1970-01-01.
-        assert_eq!(cli::days_to_ymd(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn days_to_ymd_known_date() {
-        // 2026-04-12 = 20555 days since epoch.
-        assert_eq!(cli::days_to_ymd(20555), (2026, 4, 12));
-    }
-
-    #[test]
-    fn days_to_ymd_leap_year_feb29() {
-        // 2024-02-29 = 19782 days since epoch.
-        assert_eq!(cli::days_to_ymd(19782), (2024, 2, 29));
-    }
-
-    #[test]
-    fn days_to_ymd_end_of_year() {
-        // 2023-12-31 = 19722 days since epoch.
-        assert_eq!(cli::days_to_ymd(19722), (2023, 12, 31));
-    }
-
     // -- completions --
 
     #[test]
