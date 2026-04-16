@@ -70,7 +70,11 @@ impl HostTopology {
                 cpus: llc.cpus().to_vec(),
             })
             .collect();
-        let cpu_to_node = discover_cpu_numa_nodes(&online_cpus);
+        let cpu_to_node: std::collections::HashMap<usize, usize> = topo
+            .llcs()
+            .iter()
+            .flat_map(|llc| llc.cpus().iter().map(|&cpu| (cpu, llc.numa_node())))
+            .collect();
         Ok(Self {
             llc_groups,
             online_cpus,
@@ -520,32 +524,6 @@ fn try_acquire_cpu_window(
         }
     }
     Ok(locks)
-}
-
-/// Discover the NUMA node for each CPU by reading
-/// `/sys/devices/system/cpu/cpuN/node*` symlinks.
-/// Returns a map from CPU ID to NUMA node ID. On single-node systems
-/// or when sysfs is unavailable, returns an empty map (callers default
-/// to node 0).
-fn discover_cpu_numa_nodes(online_cpus: &[usize]) -> std::collections::HashMap<usize, usize> {
-    let mut map = std::collections::HashMap::new();
-    for &cpu in online_cpus {
-        let cpu_dir = format!("/sys/devices/system/cpu/cpu{cpu}");
-        let Ok(entries) = std::fs::read_dir(&cpu_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if let Some(node_str) = name_str.strip_prefix("node")
-                && let Ok(node_id) = node_str.parse::<usize>()
-            {
-                map.insert(cpu, node_id);
-                break;
-            }
-        }
-    }
-    map
 }
 
 /// Bind a memory region to specific NUMA nodes using `mbind(MPOL_BIND)`.
