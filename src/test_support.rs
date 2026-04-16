@@ -2220,7 +2220,15 @@ fn attempt_auto_repro(
     let dump_tail = extract_sched_ext_dump(&repro_result.stderr)
         .and_then(|dump| format_tail(&dump, REPRO_TAIL_LINES, "repro VM sched_ext dump"));
 
-    let dmesg_tail = format_tail(&repro_result.stderr, REPRO_TAIL_LINES, "repro VM dmesg");
+    // Filter sched_ext_dump lines from dmesg tail to avoid duplicating
+    // the dump section. Only non-dump kernel console lines are shown.
+    let dmesg_filtered: String = repro_result
+        .stderr
+        .lines()
+        .filter(|l| !l.contains("sched_ext_dump"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dmesg_tail = format_tail(&dmesg_filtered, REPRO_TAIL_LINES, "repro VM dmesg");
 
     let tails: Vec<String> = [sched_log_tail, dump_tail, dmesg_tail]
         .into_iter()
