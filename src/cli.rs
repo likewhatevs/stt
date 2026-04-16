@@ -33,12 +33,12 @@ pub fn format_entry_row(entry: &CacheEntry, kconfig_hash: &str) -> String {
                 _ => "",
             };
             format!(
-                "  {:<36} {:<12} {:<8} {:<7} {}{}",
+                "  {:<48} {:<12} {:<8} {:<7} {}{}",
                 entry.key, version, source, meta.arch, meta.built_at, stale,
             )
         }
         None => {
-            format!("  {:<36} (corrupt metadata)", entry.key)
+            format!("  {:<48} (corrupt metadata)", entry.key)
         }
     }
 }
@@ -125,7 +125,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
     }
 
     println!(
-        "  {:<36} {:<12} {:<8} {:<7} BUILT",
+        "  {:<48} {:<12} {:<8} {:<7} BUILT",
         "KEY", "VERSION", "SOURCE", "ARCH"
     );
     let mut has_stale = false;
