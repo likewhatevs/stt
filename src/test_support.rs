@@ -5991,4 +5991,34 @@ mod tests {
         assert!(!c.accepts(&no_smt, 128, 16, 32));
         assert!(c.accepts(&with_smt, 128, 16, 32));
     }
+
+    #[test]
+    fn accepts_rejects_too_few_numa_nodes() {
+        let c = TopologyConstraints {
+            min_numa_nodes: 2,
+            max_numa_nodes: None,
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(1, 4, 4, 1);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_few_cpus() {
+        let c = TopologyConstraints {
+            min_cpus: 32,
+            ..TopologyConstraints::DEFAULT
+        };
+        // 2 LLCs * 4 cores * 2 threads = 16 CPUs
+        let t = Topology::new(1, 2, 4, 2);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_exceeding_host_cpus_per_llc() {
+        let c = TopologyConstraints::DEFAULT;
+        // cores_per_llc=8, threads_per_core=2 → 16 CPUs/LLC
+        let t = Topology::new(1, 2, 8, 2);
+        assert!(!c.accepts(&t, 128, 16, 8));
+    }
 }
