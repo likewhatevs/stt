@@ -1196,21 +1196,24 @@ fn start_sched_exit_monitor(
         .spawn(move || {
             while !stop_clone.load(Ordering::Acquire) {
                 if !Path::new(&proc_path).exists() {
-                    // Scheduler process is gone. Signal the host.
-                    let exit_code: i32 = 1;
-                    crate::vmm::shm_ring::write_msg(
-                        crate::vmm::shm_ring::MSG_TYPE_SCHED_EXIT,
-                        &exit_code.to_ne_bytes(),
-                    );
-
-                    // Dump scheduler log to COM2 for diagnostics.
-                    // Skip when probes are active to avoid interleaving
-                    // with probe JSON output on the same serial port.
-                    // The SHM signal above is the important part.
-                    if !suppress_com2.load(Ordering::Acquire)
-                        && let Some(ref path) = log_path
-                    {
-                        dump_sched_output(path);
+                    // Scheduler process is gone.
+                    //
+                    // When probes are active (repro VM), suppress
+                    // both the SHM signal and COM2 dump. The SHM
+                    // MSG_TYPE_SCHED_EXIT tells the host to kill
+                    // the VM early — but the probe thread needs
+                    // time to read probe_data and emit JSON. The
+                    // probe pipeline handles crash detection via
+                    // tp_btf/sched_ext_exit instead.
+                    if !suppress_com2.load(Ordering::Acquire) {
+                        let exit_code: i32 = 1;
+                        crate::vmm::shm_ring::write_msg(
+                            crate::vmm::shm_ring::MSG_TYPE_SCHED_EXIT,
+                            &exit_code.to_ne_bytes(),
+                        );
+                        if let Some(ref path) = log_path {
+                            dump_sched_output(path);
+                        }
                     }
                     return;
                 }

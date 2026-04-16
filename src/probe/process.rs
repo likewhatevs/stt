@@ -297,6 +297,7 @@ pub fn run_probe_skeleton(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "probe skeleton open failed");
+            diag.trigger_attach_error = Some(format!("skeleton open: {e}"));
             ready.store(true, Ordering::Release);
             return (None, diag, Vec::new());
         }
@@ -312,6 +313,7 @@ pub fn run_probe_skeleton(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "probe skeleton load failed");
+            diag.trigger_attach_error = Some(format!("skeleton load: {e}"));
             ready.store(true, Ordering::Release);
             return (None, diag, Vec::new());
         }
@@ -372,6 +374,8 @@ pub fn run_probe_skeleton(
 
     if func_ips.is_empty() && bpf_funcs.is_empty() && phase_b_rx.is_none() {
         tracing::warn!("no kprobe IPs resolved and no BPF functions for fentry");
+        diag.trigger_attach_error =
+            Some("no functions resolved — kprobes and trigger skipped".to_string());
         ready.store(true, Ordering::Release);
         return (None, diag, Vec::new());
     }
