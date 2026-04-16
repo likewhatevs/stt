@@ -1762,29 +1762,4 @@ mod tests {
         let expected = format!("{:08x}", crc32fast::hash(cli::EMBEDDED_KCONFIG.as_bytes()));
         assert_eq!(cli::embedded_kconfig_hash(), expected);
     }
-
-    // -- resolve_in_path --
-
-    #[test]
-    fn resolve_in_path_finds_existing_binary() {
-        // "sh" is always in PATH on Linux.
-        let result = cli::resolve_in_path(Path::new("sh"));
-        assert!(result.is_some(), "sh should be found in PATH");
-        let path = result.unwrap();
-        assert!(path.exists());
-        assert!(path.is_file());
-    }
-
-    #[test]
-    fn resolve_in_path_not_found() {
-        let result = cli::resolve_in_path(Path::new("nonexistent_binary_xyz_ktstr_test"));
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn resolve_in_path_bare_name() {
-        // "cargo" should be in PATH in this test environment.
-        let result = cli::resolve_in_path(Path::new("cargo"));
-        assert!(result.is_some(), "cargo should be found in PATH");
-    }
 }

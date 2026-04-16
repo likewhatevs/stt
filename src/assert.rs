@@ -2534,4 +2534,33 @@ mod tests {
         a.merge(b);
         assert_eq!(a.stats.ext_metrics["x"], 50.0);
     }
+
+    // -- Assert::merge worker + benchmark + monitor fields --
+
+    #[test]
+    fn assert_merge_all_field_categories() {
+        // Layer 1: defaults (worker + monitor fields).
+        let defaults = Assert::default_checks();
+
+        // Layer 2: scheduler sets worker and benchmark fields.
+        let sched = Assert::NONE
+            .max_spread_pct(50.0)
+            .max_p99_wake_latency_ns(100_000)
+            .max_migration_ratio(0.5);
+
+        // Layer 3: test overrides a worker field and sets isolation.
+        let test = Assert::NONE.check_isolation().max_spread_pct(80.0);
+
+        let merged = defaults.merge(&sched).merge(&test);
+
+        // test overrides sched's spread.
+        assert_eq!(merged.max_spread_pct, Some(80.0));
+        // sched's benchmark fields survive (test didn't set them).
+        assert_eq!(merged.max_p99_wake_latency_ns, Some(100_000));
+        assert_eq!(merged.max_migration_ratio, Some(0.5));
+        // test sets isolation.
+        assert_eq!(merged.isolation, Some(true));
+        // defaults: monitor fields survive all layers.
+        assert_eq!(merged.fail_on_stall, Some(true));
+    }
 }

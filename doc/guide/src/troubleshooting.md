@@ -64,14 +64,14 @@ binary in:
 - Set `KTSTR_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path in `#[ktstr_test]`.
 
-## Scheduler died
+## Scheduler crashed
 
 ```text
-scheduler died between step 2 and step 3 (of 5), 12.3s into scenario
+scheduler crashed after completing step 2 of 5 (12.3s into test)
 ```
 
 The scheduler process exited while the scenario was running. This
-is usually a crash. The exact message varies by when the death was
+is usually a crash. The exact message varies by when the crash was
 detected (between steps, during workload, after completion).
 
 The failure output contains diagnostic sections (each present only
@@ -226,7 +226,7 @@ is set.
 
 ```text
 warning: entries marked (stale kconfig) were built with a different ktstr.kconfig.
-Rebuild with: cargo ktstr kernel build --force VERSION
+Rebuild with: kernel build --force VERSION
 ```
 
 `cargo ktstr kernel list` marks entries whose stored `ktstr_kconfig_hash`
@@ -238,6 +238,26 @@ happens after updating ktstr (which may change the kconfig fragment).
 Rebuilds happen automatically on the next `cargo ktstr kernel build`
 for stale entries. Use `--force` to override the cache for other
 reasons.
+
+## Stale ktstr version
+
+```text
+warning: entries marked (stale ktstr) were built with a different ktstr version.
+Rebuild with: kernel build --force VERSION
+```
+
+`cargo ktstr kernel list` marks entries whose stored `ktstr_git_hash`
+differs from the running ktstr binary. Cached kernels built by an
+older ktstr may have different vmlinux stripping or init behavior.
+
+**Fix:**
+
+Remove stale entries and rebuild:
+
+```sh
+cargo ktstr kernel clean
+cargo ktstr kernel build --force VERSION
+```
 
 ## Kernel download failures
 

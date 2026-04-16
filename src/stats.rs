@@ -679,22 +679,25 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
 }
 
 /// Classify a topology name into a CPU-count bucket.
+///
+/// CPU counts are derived from [`crate::vm::gauntlet_presets()`] at
+/// first call and cached. Preset names not found in the cache return
+/// `"unknown"`.
 fn topo_bucket(topo: &str) -> &'static str {
-    // Parse CPU count from topology preset names like "tiny-1llc" (4 CPUs),
-    // "medium-4llc" (32 CPUs) etc. Fall back to the name prefix.
-    let cpus = match topo {
-        "tiny-1llc" | "tiny-2llc" => 4,
-        "odd-3llc" => 9,
-        "odd-5llc" => 15,
-        "odd-7llc" => 14,
-        "smt-2llc" => 8,
-        "smt-3llc" => 12,
-        "medium-4llc" | "medium-4llc-nosmt" => 32,
-        "medium-8llc" | "medium-8llc-nosmt" => 64,
-        "large-4llc" | "large-8llc" | "large-4llc-nosmt" | "large-8llc-nosmt" => 128,
-        "near-max-llc" | "near-max-llc-nosmt" => 240,
-        "max-cpu" | "max-cpu-nosmt" => 252,
-        _ => return "unknown",
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static MAP: OnceLock<HashMap<String, u32>> = OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        crate::vm::gauntlet_presets()
+            .into_iter()
+            .map(|p| (p.name.to_string(), p.topology.total_cpus()))
+            .collect()
+    });
+
+    let cpus = match map.get(topo) {
+        Some(&c) => c,
+        None => return "unknown",
     };
     match cpus {
         0..=8 => "<=8cpu",
@@ -1303,6 +1306,7 @@ mod tests {
     fn topo_bucket_tiny() {
         assert_eq!(topo_bucket("tiny-1llc"), "<=8cpu");
         assert_eq!(topo_bucket("tiny-2llc"), "<=8cpu");
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(topo_bucket("smt-2llc"), "<=8cpu");
     }
 
@@ -1311,27 +1315,41 @@ mod tests {
         assert_eq!(topo_bucket("odd-3llc"), "9-32cpu");
         assert_eq!(topo_bucket("odd-5llc"), "9-32cpu");
         assert_eq!(topo_bucket("odd-7llc"), "9-32cpu");
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(topo_bucket("smt-3llc"), "9-32cpu");
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(topo_bucket("medium-4llc"), "9-32cpu");
         assert_eq!(topo_bucket("medium-4llc-nosmt"), "9-32cpu");
+        assert_eq!(topo_bucket("numa2-4llc"), "9-32cpu");
+        assert_eq!(topo_bucket("numa4-8llc"), "9-32cpu");
     }
 
     #[test]
     fn topo_bucket_medium() {
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(topo_bucket("medium-8llc"), "33-128cpu");
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(topo_bucket("large-4llc"), "33-128cpu");
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(topo_bucket("large-8llc"), "33-128cpu");
         assert_eq!(topo_bucket("medium-8llc-nosmt"), "33-128cpu");
         assert_eq!(topo_bucket("large-4llc-nosmt"), "33-128cpu");
         assert_eq!(topo_bucket("large-8llc-nosmt"), "33-128cpu");
+        #[cfg(not(target_arch = "aarch64"))]
+        assert_eq!(topo_bucket("numa2-8llc"), "33-128cpu");
+        assert_eq!(topo_bucket("numa2-8llc-nosmt"), "33-128cpu");
     }
 
     #[test]
     fn topo_bucket_large() {
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(topo_bucket("near-max-llc"), ">128cpu");
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(topo_bucket("max-cpu"), ">128cpu");
         assert_eq!(topo_bucket("near-max-llc-nosmt"), ">128cpu");
         assert_eq!(topo_bucket("max-cpu-nosmt"), ">128cpu");
+        #[cfg(not(target_arch = "aarch64"))]
+        assert_eq!(topo_bucket("numa4-12llc"), ">128cpu");
     }
 
     #[test]

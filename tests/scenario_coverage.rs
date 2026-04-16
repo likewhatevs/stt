@@ -472,6 +472,65 @@ fn cover_monitor_evaluation(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
 
+// -- ops coverage --
+
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_op_move_all_tasks(ctx: &Ctx) -> Result<AssertResult> {
+    use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+    let steps = vec![
+        Step::with_defs(
+            vec![
+                CgroupDef::named("cg_src").workers(2),
+                CgroupDef::named("cg_dst"),
+            ],
+            HoldSpec::Fixed(std::time::Duration::from_secs(2)),
+        )
+        .with_ops(vec![Op::add_cgroup("cg_dst")]),
+        Step::new(
+            vec![Op::move_all_tasks("cg_src", "cg_dst")],
+            HoldSpec::Fixed(std::time::Duration::from_secs(3)),
+        ),
+    ];
+    execute_steps(ctx, steps)
+}
+
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
+    use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+    use ktstr::workload::{Work, WorkType};
+    let steps = vec![
+        Step::with_defs(
+            vec![CgroupDef::named("cg_0").workers(2)],
+            HoldSpec::Fixed(ctx.settle + ctx.duration),
+        )
+        .with_ops(vec![Op::spawn_host(
+            Work::default().workers(2).work_type(WorkType::CpuSpin),
+        )]),
+    ];
+    execute_steps(ctx, steps)
+}
+
+// -- workload coverage --
+
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_work_type_sequence(ctx: &Ctx) -> Result<AssertResult> {
+    use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+    use ktstr::workload::{Phase, WorkType};
+    use std::time::Duration;
+    let seq = WorkType::Sequence {
+        first: Phase::Spin(Duration::from_millis(50)),
+        rest: vec![
+            Phase::Yield(Duration::from_millis(20)),
+            Phase::Sleep(Duration::from_millis(30)),
+        ],
+    };
+    let steps = vec![Step::with_defs(
+        vec![CgroupDef::named("cg_seq").workers(2).work_type(seq)],
+        HoldSpec::Fixed(ctx.settle + ctx.duration),
+    )];
+    execute_steps(ctx, steps)
+}
+
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_execute_defs_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{CgroupDef, execute_defs};
