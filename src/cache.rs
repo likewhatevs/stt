@@ -569,11 +569,13 @@ pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<(tempfile::Tem
 
 /// Keep-list strip: delete all sections not in VMLINUX_KEEP_SECTIONS.
 ///
+/// Symbols referencing deleted sections are detached (set to SHN_ABS)
+/// so `Builder::write` preserves them. The monitor only needs symbol
+/// addresses, not section associations.
+///
 /// After stripping, verifies the result has a non-empty symbol table.
-/// `object::build::elf::Builder` drops symbols whose sections are
-/// deleted, so if all symbols referenced deleted sections, the
-/// symtab would be empty — breaking the monitor. In that case,
-/// returns an error to trigger the fallback to `strip_debug_prefix`.
+/// Returns an error to trigger the fallback to `strip_debug_prefix`
+/// if the symbol table is empty.
 fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut builder = object::build::elf::Builder::read(data)
         .map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
@@ -582,16 +584,26 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
             section.delete = true;
         }
     }
+    // Detach symbols from deleted sections so Builder::write does
+    // not drop them. The monitor only needs symbol addresses
+    // (st_value), not section associations. Mark them SHN_ABS to
+    // preserve the address.
+    for symbol in builder.symbols.iter_mut() {
+        if let Some(section_id) = symbol.section
+            && builder.sections.get(section_id).delete
+        {
+            symbol.section = None;
+            symbol.st_shndx = object::elf::SHN_ABS;
+        }
+    }
     let mut out = Vec::new();
     builder
         .write(&mut out)
         .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux: {e}"))?;
 
-    // Verify symtab survived: Builder drops symbols whose sections
-    // were deleted. If all named symbols are gone, the fallback path
-    // (strip_debug_prefix) preserves sections that symbols reference.
-    // goblin always includes the null symbol (index 0), so check for
-    // at least one symbol with a non-empty name.
+    // Verify symtab survived. goblin always includes the null
+    // symbol (index 0), so check for at least one symbol with a
+    // non-empty name.
     let elf =
         goblin::elf::Elf::parse(&out).map_err(|e| anyhow::anyhow!("verify stripped ELF: {e}"))?;
     let named_syms = elf
@@ -600,10 +612,7 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
         .filter(|s| s.st_name != 0 && elf.strtab.get_at(s.st_name).is_some_and(|n| !n.is_empty()))
         .count();
     if named_syms == 0 {
-        anyhow::bail!(
-            "keep-list strip emptied symbol table (0 named symbols); \
-             Builder dropped symbols whose sections were deleted"
-        );
+        anyhow::bail!("keep-list strip emptied symbol table (0 named symbols)");
     }
     Ok(out)
 }
