@@ -26,7 +26,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
 
 #[ktstr_test(scheduler = MY_SCHED)]
 fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1s2l4c1t from MY_SCHED
+    // Inherits 1n2l4c1t from MY_SCHED
     Ok(AssertResult::pass())
 }
 ```
@@ -195,7 +195,7 @@ enum MySchedFlag {
     required_flags = [MySchedFlag::LLC],
 )]
 fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1s2l4c1t from MY_SCHED
+    // Inherits 1n2l4c1t from MY_SCHED
     Ok(AssertResult::pass())
 }
 ```

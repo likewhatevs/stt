@@ -14,12 +14,12 @@ pub struct Topology {
     pub numa_nodes: u32,
 }
 
-/// Formats as `NsNlNcNt` — e.g. `1s2l4c2t` (1 NUMA node, 2 LLCs, 4 cores, 2 threads).
+/// Formats as `NnNlNcNt` — e.g. `1n2l4c2t` (1 NUMA node, 2 LLCs, 4 cores, 2 threads).
 impl std::fmt::Display for Topology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}s{}l{}c{}t",
+            "{}n{}l{}c{}t",
             self.numa_nodes, self.llcs, self.cores_per_llc, self.threads_per_core,
         )
     }
@@ -408,7 +408,7 @@ mod tests {
             threads_per_core: 2,
             numa_nodes: 1,
         };
-        assert_eq!(t.to_string(), "1s2l4c2t");
+        assert_eq!(t.to_string(), "1n2l4c2t");
     }
 
     #[test]
@@ -419,6 +419,6 @@ mod tests {
             threads_per_core: 2,
             numa_nodes: 2,
         };
-        assert_eq!(t.to_string(), "2s4l8c2t");
+        assert_eq!(t.to_string(), "2n4l8c2t");
     }
 }

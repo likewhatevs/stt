@@ -681,20 +681,20 @@ fn proxy_serial_pty(master: &OwnedFd, child_pid: u32) {
 /// Parses KTSTR_TOPO=N,L,C,T from /proc/cmdline (passed by the host).
 /// Falls back to counting online CPUs via /sys/devices/system/cpu/online.
 fn print_topology_line() {
-    if let Some((n, s, c, t)) = parse_topo_from_cmdline() {
-        let total = s * c * t;
+    if let Some((n, l, c, t)) = parse_topo_from_cmdline() {
+        let total = l * c * t;
         if n > 1 {
             println!(
-                "  topology:  {n} NUMA nodes, {s} LLC{}, {c} core{}, {t} thread{} ({total} vCPU{})",
-                if s == 1 { "" } else { "s" },
+                "  topology:  {n} NUMA nodes, {l} LLC{}, {c} core{}, {t} thread{} ({total} vCPU{})",
+                if l == 1 { "" } else { "s" },
                 if c == 1 { "" } else { "s" },
                 if t == 1 { "" } else { "s" },
                 if total == 1 { "" } else { "s" },
             );
         } else {
             println!(
-                "  topology:  {s} LLC{}, {c} core{}, {t} thread{} ({total} vCPU{})",
-                if s == 1 { "" } else { "s" },
+                "  topology:  {l} LLC{}, {c} core{}, {t} thread{} ({total} vCPU{})",
+                if l == 1 { "" } else { "s" },
                 if c == 1 { "" } else { "s" },
                 if t == 1 { "" } else { "s" },
                 if total == 1 { "" } else { "s" },
@@ -716,10 +716,10 @@ fn parse_topo_from_cmdline() -> Option<(u32, u32, u32, u32)> {
         return None;
     }
     let n: u32 = parts[0].parse().ok()?;
-    let s: u32 = parts[1].parse().ok()?;
+    let l: u32 = parts[1].parse().ok()?;
     let c: u32 = parts[2].parse().ok()?;
     let t: u32 = parts[3].parse().ok()?;
-    Some((n, s, c, t))
+    Some((n, l, c, t))
 }
 
 /// Count online CPUs from /sys/devices/system/cpu/online.

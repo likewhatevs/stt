@@ -37,7 +37,7 @@ use ktstr::prelude::*;
 
 #[ktstr_test(scheduler = MY_SCHED)]
 fn basic_steady(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1s2l4c1t from MY_SCHED
+    // Inherits 1n2l4c1t from MY_SCHED
     scenarios::steady(ctx)
 }
 

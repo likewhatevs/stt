@@ -17,7 +17,7 @@ use crate::monitor::{MonitorSample, sample_looks_valid};
 pub struct TimelineContext {
     /// Kernel version string (e.g. "6.14.0-rc3+").
     pub kernel: Option<String>,
-    /// Topology description (e.g. "2s4c2t (16 cpus)").
+    /// Topology description (e.g. "2n4l4c2t (16 cpus)").
     pub topology: Option<String>,
     /// Scheduler name (e.g. "scx_mitosis").
     pub scheduler: Option<String>,
@@ -1033,7 +1033,7 @@ mod tests {
         let t = Timeline::build(&events, &samples);
         let ctx = TimelineContext {
             kernel: Some("6.14.0-rc3+".to_string()),
-            topology: Some("2s4c2t (16 cpus)".to_string()),
+            topology: Some("2n4l4c2t (16 cpus)".to_string()),
             scheduler: Some("scx_mitosis".to_string()),
             scenario: Some("proportional".to_string()),
             duration_s: Some(20.5),
@@ -1041,7 +1041,7 @@ mod tests {
         let formatted = t.format_with_context(&ctx);
         assert!(formatted.contains("--- timeline ---"));
         assert!(formatted.contains("kernel: 6.14.0-rc3+"));
-        assert!(formatted.contains("topology: 2s4c2t (16 cpus)"));
+        assert!(formatted.contains("topology: 2n4l4c2t (16 cpus)"));
         assert!(formatted.contains("scheduler: scx_mitosis"));
         assert!(formatted.contains("scenario: proportional"));
         assert!(formatted.contains("duration: 20.5s"));
@@ -1055,13 +1055,13 @@ mod tests {
         let t = Timeline::build(&events, &samples);
         let ctx = TimelineContext {
             kernel: None,
-            topology: Some("1s1c1t (1 cpus)".to_string()),
+            topology: Some("1n1l1c1t (1 cpus)".to_string()),
             scheduler: None,
             scenario: Some("basic".to_string()),
             duration_s: None,
         };
         let formatted = t.format_with_context(&ctx);
-        assert!(formatted.contains("topology: 1s1c1t"));
+        assert!(formatted.contains("topology: 1n1l1c1t"));
         assert!(formatted.contains("scenario: basic"));
         assert!(!formatted.contains("kernel:"));
         assert!(!formatted.contains("scheduler:"));

@@ -20,7 +20,7 @@ ktstr models four levels of CPU topology, from largest to smallest:
   threads share a single core's execution resources.
 
 Containment: threads belong to a core, cores belong to an LLC, LLCs
-belong to a NUMA node. For example, `2s4l4c2t` describes 2 NUMA
+belong to a NUMA node. For example, `2n4l4c2t` describes 2 NUMA
 nodes, each with 2 LLCs, each LLC with 4 cores, each core with 2
 threads = 32 CPUs total.
 

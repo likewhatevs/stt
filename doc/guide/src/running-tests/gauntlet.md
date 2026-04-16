@@ -38,33 +38,33 @@ cargo nextest run --run-ignored ignored-only \
 
 | Preset | Topology | CPUs | LLCs | NUMA | Description |
 |---|---|---|---|---|---|
-| `tiny-1llc` | 1s1l4c1t | 4 | 1 | 1 | Single LLC |
-| `tiny-2llc` | 1s2l2c1t | 4 | 2 | 1 | Minimal multi-LLC |
-| `odd-3llc` | 1s3l3c1t | 9 | 3 | 1 | Odd CPU count |
-| `odd-5llc` | 1s5l3c1t | 15 | 5 | 1 | Prime LLC count |
-| `odd-7llc` | 1s7l2c1t | 14 | 7 | 1 | Prime LLC count |
-| `smt-2llc` | 1s2l2c2t | 8 | 2 | 1 | SMT enabled |
-| `smt-3llc` | 1s3l2c2t | 12 | 3 | 1 | SMT, 3 LLCs |
-| `medium-4llc` | 1s4l4c2t | 32 | 4 | 1 | Medium topology |
-| `medium-8llc` | 1s8l4c2t | 64 | 8 | 1 | Medium, many LLCs |
-| `large-4llc` | 1s4l16c2t | 128 | 4 | 1 | Large, few LLCs |
-| `large-8llc` | 1s8l8c2t | 128 | 8 | 1 | Large, many LLCs |
-| `near-max-llc` | 1s15l8c2t | 240 | 15 | 1 | Near maximum |
-| `max-cpu` | 1s14l9c2t | 252 | 14 | 1 | Near KVM vCPU limit |
-| `medium-4llc-nosmt` | 1s4l8c1t | 32 | 4 | 1 | Medium, no SMT |
-| `medium-8llc-nosmt` | 1s8l8c1t | 64 | 8 | 1 | Medium, many LLCs, no SMT |
-| `large-4llc-nosmt` | 1s4l32c1t | 128 | 4 | 1 | Large, no SMT |
-| `large-8llc-nosmt` | 1s8l16c1t | 128 | 8 | 1 | Large, many LLCs, no SMT |
-| `near-max-llc-nosmt` | 1s15l16c1t | 240 | 15 | 1 | Near maximum, no SMT |
-| `max-cpu-nosmt` | 1s14l18c1t | 252 | 14 | 1 | Near KVM vCPU limit, no SMT |
-| `numa2-4llc` | 2s4l4c1t | 16 | 4 | 2 | Multi-NUMA, 2 nodes |
-| `numa2-8llc` | 2s8l8c2t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, SMT |
-| `numa2-8llc-nosmt` | 2s8l16c1t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, no SMT |
-| `numa4-8llc` | 4s8l4c1t | 32 | 8 | 4 | Multi-NUMA, 4 nodes |
-| `numa4-12llc` | 4s12l8c2t | 192 | 12 | 4 | Multi-NUMA, 4 nodes, SMT |
+| `tiny-1llc` | 1n1l4c1t | 4 | 1 | 1 | Single LLC |
+| `tiny-2llc` | 1n2l2c1t | 4 | 2 | 1 | Minimal multi-LLC |
+| `odd-3llc` | 1n3l3c1t | 9 | 3 | 1 | Odd CPU count |
+| `odd-5llc` | 1n5l3c1t | 15 | 5 | 1 | Prime LLC count |
+| `odd-7llc` | 1n7l2c1t | 14 | 7 | 1 | Prime LLC count |
+| `smt-2llc` | 1n2l2c2t | 8 | 2 | 1 | SMT enabled |
+| `smt-3llc` | 1n3l2c2t | 12 | 3 | 1 | SMT, 3 LLCs |
+| `medium-4llc` | 1n4l4c2t | 32 | 4 | 1 | Medium topology |
+| `medium-8llc` | 1n8l4c2t | 64 | 8 | 1 | Medium, many LLCs |
+| `large-4llc` | 1n4l16c2t | 128 | 4 | 1 | Large, few LLCs |
+| `large-8llc` | 1n8l8c2t | 128 | 8 | 1 | Large, many LLCs |
+| `near-max-llc` | 1n15l8c2t | 240 | 15 | 1 | Near maximum |
+| `max-cpu` | 1n14l9c2t | 252 | 14 | 1 | Near KVM vCPU limit |
+| `medium-4llc-nosmt` | 1n4l8c1t | 32 | 4 | 1 | Medium, no SMT |
+| `medium-8llc-nosmt` | 1n8l8c1t | 64 | 8 | 1 | Medium, many LLCs, no SMT |
+| `large-4llc-nosmt` | 1n4l32c1t | 128 | 4 | 1 | Large, no SMT |
+| `large-8llc-nosmt` | 1n8l16c1t | 128 | 8 | 1 | Large, many LLCs, no SMT |
+| `near-max-llc-nosmt` | 1n15l16c1t | 240 | 15 | 1 | Near maximum, no SMT |
+| `max-cpu-nosmt` | 1n14l18c1t | 252 | 14 | 1 | Near KVM vCPU limit, no SMT |
+| `numa2-4llc` | 2n4l4c1t | 16 | 4 | 2 | Multi-NUMA, 2 nodes |
+| `numa2-8llc` | 2n8l8c2t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, SMT |
+| `numa2-8llc-nosmt` | 2n8l16c1t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, no SMT |
+| `numa4-8llc` | 4n8l4c1t | 32 | 8 | 4 | Multi-NUMA, 4 nodes |
+| `numa4-12llc` | 4n12l8c2t | 192 | 12 | 4 | Multi-NUMA, 4 nodes, SMT |
 
-Topology format: `{numa_nodes}s{llcs}l{cores_per_llc}c{threads_per_core}t`
-(e.g. `1s2l4c2t` = 1 NUMA node, 2 LLCs, 4 cores per LLC, 2 threads
+Topology format: `{numa_nodes}n{llcs}l{cores_per_llc}c{threads_per_core}t`
+(e.g. `1n2l4c2t` = 1 NUMA node, 2 LLCs, 4 cores per LLC, 2 threads
 per core = 16 CPUs). Presets are defined in `gauntlet_presets()`.
 Multi-NUMA presets are excluded by default
 (`max_numa_nodes: Some(1)` in `TopologyConstraints::DEFAULT`), so
