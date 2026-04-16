@@ -853,12 +853,10 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
     Ok(image)
 }
 
-/// Resolve a kernel directory: find an existing image or auto-build.
+/// Resolve a kernel directory: auto-build from source tree.
 ///
-/// If the directory contains a built kernel image, returns it directly.
-/// If it's a kernel source tree (Makefile + Kconfig) without a built
-/// image, configures and builds the kernel automatically, caches the
-/// result, and returns the image path.
+/// Requires Makefile + Kconfig. Applies kconfig fragment, checks cache,
+/// builds on miss, caches clean builds.
 fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
     if !is_source_tree {

@@ -361,10 +361,10 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 None => anyhow::bail!("KTSTR_KERNEL={val} does not contain a kernel image"),
             },
             KernelId::Version(ref ver) => {
-                // Only tarball keys use the {ver}-tarball-{arch} pattern.
-                // Git keys are {ref}-git-{hash}-{arch} and local keys are
-                // local-{hash}-{arch} — neither contains the version as a
-                // prefix, so only tarball lookup is valid here.
+                // Only tarball keys use the {ver}-tarball-{arch}-kc{suffix} pattern.
+                // Git keys are {ref}-git-{hash}-{arch}-kc{suffix} and local keys
+                // are local-{hash}-{arch}-kc{suffix} — neither contains the
+                // version as a prefix, so only tarball lookup is valid here.
                 let cache = cache::CacheDir::new().map_err(|e| {
                     anyhow::anyhow!(
                         "KTSTR_KERNEL={val} requires cache access, \
