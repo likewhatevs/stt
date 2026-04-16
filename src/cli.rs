@@ -484,16 +484,19 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
 /// post-processing (e.g. remote cache store) with the entry.
 #[non_exhaustive]
 pub struct KernelBuildResult {
-    /// Cache entry, if the build was cached. `None` for dirty trees.
+    /// Cache entry, if the build was cached. `None` for dirty trees
+    /// or when cache store fails.
     pub entry: Option<crate::cache::CacheEntry>,
+    /// Path to the built kernel image.
+    pub image_path: std::path::PathBuf,
 }
 
-/// Post-acquisition kernel build pipeline shared by both binaries.
+/// Post-acquisition kernel build pipeline.
 ///
 /// Handles: clean, configure, build, validate config, generate
 /// compile_commands.json for local trees, find image, strip vmlinux,
 /// compute metadata, and cache store. Callers handle source
-/// acquisition and any remote cache operations.
+/// acquisition; some callers also handle remote cache operations.
 ///
 /// `label` is the binary name used as a prefix for diagnostic messages
 /// to stderr (e.g. "ktstr" or "cargo-ktstr").
@@ -598,7 +601,10 @@ pub fn kernel_build_pipeline(
     if acquired.is_dirty {
         eprintln!("{label}: kernel built at {}", image_path.display());
         eprintln!("{label}: skipping cache (dirty tree)");
-        return Ok(KernelBuildResult { entry: None });
+        return Ok(KernelBuildResult {
+            entry: None,
+            image_path,
+        });
     }
 
     // Compute config hash.
@@ -631,18 +637,25 @@ pub fn kernel_build_pipeline(
     });
 
     let config_ref = config_path.exists().then_some(config_path.as_path());
-    let entry = cache.store(
+    let entry = match cache.store(
         &acquired.cache_key,
         &image_path,
         vmlinux_ref,
         config_ref,
         &metadata,
-    )?;
+    ) {
+        Ok(entry) => {
+            success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
+            eprintln!("{label}: image: {}", entry.path.join(image_name).display());
+            Some(entry)
+        }
+        Err(e) => {
+            warn(&format!("{label}: cache store failed: {e:#}"));
+            None
+        }
+    };
 
-    success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
-    eprintln!("{label}: image: {}", entry.path.join(image_name).display());
-
-    Ok(KernelBuildResult { entry: Some(entry) })
+    Ok(KernelBuildResult { entry, image_path })
 }
 
 /// Build the make arguments for a kernel build.
@@ -913,8 +926,8 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
 ///
 /// Called when no --kernel is specified and no kernel is found via
 /// cache or filesystem. Downloads the latest stable tarball from
-/// kernel.org, configures with the embedded kconfig, builds, caches,
-/// and returns the image path.
+/// kernel.org and delegates to [`kernel_build_pipeline`] for
+/// configure, build, validate, and cache.
 fn auto_download_kernel() -> Result<std::path::PathBuf> {
     status("ktstr: no kernel found, downloading latest stable");
 
@@ -945,104 +958,21 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
         crate::fetch::download_tarball(&ver, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"))?;
     sp.finish("Downloaded");
 
-    let source_dir = &acquired.source_dir;
+    let cache = crate::cache::CacheDir::new()?;
+    let result = kernel_build_pipeline(&acquired, &cache, "ktstr", false, false)?;
 
-    let sp = Spinner::start("Configuring kernel...");
-    let result = configure_kernel(source_dir, EMBEDDED_KCONFIG);
-    if result.is_err() {
-        sp.clear();
-    } else {
-        sp.finish("Kernel configured");
+    match result.entry {
+        Some(entry) => Ok(entry.path.join(image_name)),
+        None => bail!(
+            "kernel built but cache store failed — cannot return image from temporary directory"
+        ),
     }
-    result?;
-
-    let sp = Spinner::start("Building kernel...");
-    let result = make_kernel_with_output(source_dir, Some(&sp));
-    if result.is_err() {
-        sp.clear();
-    } else {
-        sp.finish("Kernel built");
-    }
-    result?;
-
-    // Validate critical config options were not silently disabled.
-    validate_kernel_config(source_dir)?;
-
-    let image = crate::kernel_path::find_image_in_dir(source_dir).ok_or_else(|| {
-        anyhow::anyhow!(
-            "build succeeded but no image found in {}",
-            source_dir.display()
-        )
-    })?;
-
-    // Cache the build. Strip vmlinux before caching — the cached
-    // copy is only read for .symtab and .BTF. Also cache .config
-    // so guest_kernel_hz can resolve CONFIG_HZ without IKCONFIG.
-    if let Ok(cache) = crate::cache::CacheDir::new() {
-        let vmlinux_path = source_dir.join("vmlinux");
-        let stripped = if vmlinux_path.exists() {
-            match crate::cache::strip_vmlinux_debug(&vmlinux_path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    warn(&format!(
-                        "ktstr: vmlinux strip failed: {e:#}, caching unstripped"
-                    ));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let vmlinux_ref = match &stripped {
-            Some((_, path)) => Some(path.as_path()),
-            None if vmlinux_path.exists() => Some(vmlinux_path.as_path()),
-            None => None,
-        };
-
-        let config_path = source_dir.join(".config");
-        let config_ref = config_path.exists().then_some(config_path.as_path());
-        let config_hash = if config_path.exists() {
-            std::fs::read(&config_path)
-                .ok()
-                .map(|data| format!("{:08x}", crc32fast::hash(&data)))
-        } else {
-            None
-        };
-
-        let metadata = crate::cache::KernelMetadata::new(
-            acquired.source_type.clone(),
-            arch.to_string(),
-            image_name.to_string(),
-            now_iso8601(),
-        )
-        .with_version(acquired.version.clone())
-        .with_config_hash(config_hash)
-        .with_ktstr_kconfig_hash(Some(embedded_kconfig_hash()))
-        .with_ktstr_git_hash(Some(crate::GIT_FULL_HASH.to_string()));
-
-        match cache.store(
-            &acquired.cache_key,
-            &image,
-            vmlinux_ref,
-            config_ref,
-            &metadata,
-        ) {
-            Ok(entry) => {
-                let cached_image = entry.path.join(image_name);
-                success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
-                return Ok(cached_image);
-            }
-            Err(e) => warn(&format!("ktstr: cache store failed: {e:#}")),
-        }
-    }
-
-    Ok(image)
 }
 
 /// Resolve a kernel directory: auto-build from source tree.
 ///
-/// Requires Makefile + Kconfig. Applies kconfig fragment, checks cache,
-/// builds on miss, caches clean builds.
+/// Requires Makefile + Kconfig. Checks cache for clean trees,
+/// delegates to [`kernel_build_pipeline`] on miss.
 fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
     if !is_source_tree {
@@ -1054,22 +984,12 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     }
 
     let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let is_dirty = acquired.is_dirty;
-
-    // Ensure kconfig fragment is applied (skips append if all
-    // options already present in .config).
-    configure_kernel(path, EMBEDDED_KCONFIG)?;
-
-    let (arch, image_name) = crate::fetch::arch_info();
-    let config_path = path.join(".config");
-    let config_hash = std::fs::read(&config_path)
-        .ok()
-        .map(|data| format!("{:08x}", crc32fast::hash(&data)));
+    let (_, image_name) = crate::fetch::arch_info();
     let cache_key = acquired.cache_key.clone();
 
     // Clean trees: cache lookup before build.
     // Dirty trees: skip cache, always build.
-    if !is_dirty
+    if !acquired.is_dirty
         && let Ok(cache) = crate::cache::CacheDir::new()
         && let Some(entry) = cache.lookup(&cache_key)
         && let Some(ref meta) = entry.metadata
@@ -1081,70 +1001,14 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
         }
     }
 
-    // Build.
-    let sp = Spinner::start("Building kernel...");
-    let result = make_kernel_with_output(path, Some(&sp));
-    if result.is_err() {
-        sp.clear();
-    } else {
-        sp.finish("Kernel built");
+    let cache = crate::cache::CacheDir::new()?;
+    let result = kernel_build_pipeline(&acquired, &cache, "ktstr", false, true)?;
+
+    // Prefer the cached image path (stable across rebuilds).
+    match result.entry {
+        Some(entry) => Ok(entry.path.join(image_name)),
+        None => Ok(result.image_path),
     }
-    result?;
-
-    let image = crate::kernel_path::find_image_in_dir(path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "kernel build succeeded but no image found in {}",
-            path.display()
-        )
-    })?;
-
-    // Cache the build (skip dirty trees).
-    if is_dirty {
-        warn("ktstr: dirty tree, build not cached");
-    }
-    if !is_dirty && let Ok(cache) = crate::cache::CacheDir::new() {
-        let vmlinux_path = path.join("vmlinux");
-        let stripped = if vmlinux_path.exists() {
-            match crate::cache::strip_vmlinux_debug(&vmlinux_path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    warn(&format!(
-                        "ktstr: vmlinux strip failed: {e:#}, caching unstripped"
-                    ));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let vmlinux_ref = match &stripped {
-            Some((_, p)) => Some(p.as_path()),
-            None if vmlinux_path.exists() => Some(vmlinux_path.as_path()),
-            None => None,
-        };
-
-        let config_file = path.join(".config");
-        let config_ref = config_file.exists().then_some(config_file.as_path());
-
-        let metadata = crate::cache::KernelMetadata::new(
-            acquired.source_type.clone(),
-            arch.to_string(),
-            image_name.to_string(),
-            now_iso8601(),
-        )
-        .with_config_hash(config_hash)
-        .with_ktstr_kconfig_hash(Some(embedded_kconfig_hash()))
-        .with_ktstr_git_hash(Some(crate::GIT_FULL_HASH.to_string()))
-        .with_git_hash(acquired.git_hash.clone())
-        .with_source_tree_path(Some(acquired.source_dir.clone()));
-
-        match cache.store(&cache_key, &image, vmlinux_ref, config_ref, &metadata) {
-            Ok(_) => success(&format!("\u{2713} Kernel cached: {cache_key}")),
-            Err(e) => warn(&format!("ktstr: cache store failed: {e:#}")),
-        }
-    }
-
-    Ok(image)
 }
 
 /// Whether stderr supports color (cached per process).
