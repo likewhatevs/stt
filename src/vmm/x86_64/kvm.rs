@@ -3,10 +3,10 @@ use kvm_bindings::{
     KVM_CAP_HALT_POLL, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS,
     KVM_CLOCK_TSC_STABLE, KVM_PIT_SPEAKER_DUMMY, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK,
     KVM_X2APIC_API_USE_32BIT_IDS, KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE,
-    kvm_enable_cap, kvm_pit_config, kvm_userspace_memory_region,
+    kvm_enable_cap, kvm_pit_config,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::topology::{generate_cpuid, max_apic_id};
 use crate::vmm::topology::Topology;
@@ -146,35 +146,13 @@ impl KtstrKvm {
     /// performance_mode is set, since memory_mb was unknown at
     /// construction time and `use_hugepages` may have been false.
     pub fn allocate_and_register_memory(&mut self, memory_mb: u32) -> Result<()> {
-        let mem_size = (memory_mb as u64) << 20;
-        let use_hugepages = self.use_hugepages
-            || (self.performance_mode
-                && crate::vmm::host_topology::hugepages_free()
-                    >= crate::vmm::host_topology::hugepages_needed(memory_mb));
-        let guest_mem = if use_hugepages {
-            crate::vmm::allocate_hugepage_memory(mem_size as usize, GuestAddress(0))?
-        } else {
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mem_size as usize)])
-                .context("allocate guest memory")?
-        };
-
-        let host_addr = guest_mem
-            .get_host_address(GuestAddress(0))
-            .context("get host address for guest memory")? as u64;
-        let mem_region = kvm_userspace_memory_region {
-            slot: 0,
-            guest_phys_addr: 0,
-            memory_size: mem_size,
-            userspace_addr: host_addr,
-            flags: 0,
-        };
-        unsafe {
-            self.vm_fd
-                .set_user_memory_region(mem_region)
-                .context("set user memory region")?;
-        }
-
-        self.guest_mem = guest_mem;
+        self.guest_mem = crate::vmm::allocate_and_register_guest_memory(
+            &self.vm_fd,
+            memory_mb,
+            GuestAddress(0),
+            self.use_hugepages,
+            self.performance_mode,
+        )?;
         Ok(())
     }
 
@@ -197,20 +175,7 @@ impl KtstrKvm {
 
         let has_immediate_exit = kvm.check_extension(Cap::ImmediateExit);
 
-        // Create VM with EINTR retry (Firecracker: up to 5 attempts, exponential backoff)
-        let vm_fd = {
-            let mut attempts = 0;
-            loop {
-                match kvm.create_vm() {
-                    Ok(fd) => break fd,
-                    Err(e) if e.errno() == libc::EINTR && attempts < 5 => {
-                        attempts += 1;
-                        std::thread::sleep(std::time::Duration::from_micros(1 << attempts));
-                    }
-                    Err(e) => return Err(e).context("create VM"),
-                }
-            }
-        };
+        let vm_fd = crate::vmm::create_vm_with_retry(&kvm)?;
 
         // TSS (required on x86_64 before creating vCPUs)
         vm_fd
@@ -326,43 +291,13 @@ impl KtstrKvm {
             }
         }
 
-        // Allocate guest memory. When memory_mb is None (deferred mode),
-        // use a 1-page placeholder — the real allocation happens later
-        // via allocate_and_register_memory() after initramfs size is known.
-        let guest_mem = match memory_mb {
-            Some(mb) => {
-                let mem_size = (mb as u64) << 20;
-                let mem = if use_hugepages {
-                    crate::vmm::allocate_hugepage_memory(mem_size as usize, GuestAddress(0))?
-                } else {
-                    GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mem_size as usize)])
-                        .context("allocate guest memory")?
-                };
-
-                let host_addr =
-                    mem.get_host_address(GuestAddress(0))
-                        .context("get host address for guest memory")? as u64;
-                let mem_region = kvm_userspace_memory_region {
-                    slot: 0,
-                    guest_phys_addr: 0,
-                    memory_size: mem_size,
-                    userspace_addr: host_addr,
-                    flags: 0,
-                };
-                unsafe {
-                    vm_fd
-                        .set_user_memory_region(mem_region)
-                        .context("set user memory region")?;
-                }
-                mem
-            }
-            None => {
-                // Placeholder: 1 page. Not registered with KVM — no guest
-                // code runs until allocate_and_register_memory() is called.
-                GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
-                    .context("allocate placeholder guest memory")?
-            }
-        };
+        let guest_mem = crate::vmm::allocate_initial_guest_memory(
+            &vm_fd,
+            memory_mb,
+            GuestAddress(0),
+            use_hugepages,
+            performance_mode,
+        )?;
 
         // Fetch host CPUID once, reuse for all vCPUs (Firecracker pattern).
         let base_cpuid = kvm
@@ -466,6 +401,7 @@ impl KtstrKvm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vm_memory::GuestMemory;
 
     #[test]
     fn create_vm_basic() {

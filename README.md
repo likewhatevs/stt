@@ -50,7 +50,7 @@ sudo apt install clang pkg-config
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.2" }
+ktstr = { version = "0.3" }
 ```
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.

@@ -123,6 +123,89 @@ pub(crate) fn allocate_hugepage_memory(size: usize, base: GuestAddress) -> Resul
     }
 }
 
+/// Create a KVM VM with EINTR retry (up to 5 attempts, exponential backoff).
+///
+/// KVM_CREATE_VM can return EINTR when a signal arrives mid-ioctl.
+/// Retrying with backoff matches the Firecracker pattern.
+pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::VmFd> {
+    let mut attempts = 0;
+    loop {
+        match kvm.create_vm() {
+            Ok(fd) => break Ok(fd),
+            Err(e) if e.errno() == libc::EINTR && attempts < 5 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_micros(1 << attempts));
+            }
+            Err(e) => break Err(e).context("create VM"),
+        }
+    }
+}
+
+/// Allocate guest memory (hugepage or regular) and register it with KVM.
+///
+/// Shared between aarch64 and x86_64 `allocate_and_register_memory`
+/// implementations. `base` is the guest physical address where memory
+/// starts (DRAM_START on aarch64, 0 on x86_64).
+pub(crate) fn allocate_and_register_guest_memory(
+    vm_fd: &kvm_ioctls::VmFd,
+    memory_mb: u32,
+    base: GuestAddress,
+    use_hugepages: bool,
+    performance_mode: bool,
+) -> Result<GuestMemoryMmap> {
+    let mem_size = (memory_mb as u64) << 20;
+    let use_hugepages = use_hugepages
+        || (performance_mode
+            && host_topology::hugepages_free() >= host_topology::hugepages_needed(memory_mb));
+    let guest_mem = if use_hugepages {
+        allocate_hugepage_memory(mem_size as usize, base)?
+    } else {
+        GuestMemoryMmap::<()>::from_ranges(&[(base, mem_size as usize)])
+            .context("allocate guest memory")?
+    };
+
+    let host_addr = guest_mem
+        .get_host_address(base)
+        .context("get host address for guest memory")? as u64;
+    let mem_region = kvm_bindings::kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: base.0,
+        memory_size: mem_size,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    unsafe {
+        vm_fd
+            .set_user_memory_region(mem_region)
+            .context("set user memory region")?;
+    }
+
+    Ok(guest_mem)
+}
+
+/// Allocate guest memory for `new_inner`. When `memory_mb` is `None`
+/// (deferred mode), returns a 1-page placeholder not registered with
+/// KVM. When `Some`, allocates and registers the full memory region.
+pub(crate) fn allocate_initial_guest_memory(
+    vm_fd: &kvm_ioctls::VmFd,
+    memory_mb: Option<u32>,
+    base: GuestAddress,
+    use_hugepages: bool,
+    performance_mode: bool,
+) -> Result<GuestMemoryMmap> {
+    match memory_mb {
+        Some(mb) => {
+            allocate_and_register_guest_memory(vm_fd, mb, base, use_hugepages, performance_mode)
+        }
+        None => {
+            // Placeholder: 1 page. Not registered with KVM — no guest
+            // code runs until allocate_and_register_memory() is called.
+            GuestMemoryMmap::<()>::from_ranges(&[(base, 4096)])
+                .context("allocate placeholder guest memory")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PiMutex — priority-inheritance mutex via pthread_mutex + PTHREAD_PRIO_INHERIT
 // ---------------------------------------------------------------------------
@@ -1086,11 +1169,14 @@ pub struct KtstrVm {
     /// BPF map discoverability, waits for scenario start via SHM ring,
     /// then writes a u32 value at the specified offset.
     bpf_map_write: Option<BpfMapWriteParams>,
-    /// Performance mode: vCPU pinning to host LLCs, hugepage-backed guest
-    /// memory, KVM_HINTS_REALTIME CPUID hint, PAUSE and HLT VM exit
-    /// disabling via KVM_CAP_X86_DISABLE_EXITS, and oversubscription
-    /// validation. KVM_CAP_HALT_POLL is skipped (guest haltpoll cpuidle
-    /// disables host halt polling via MSR_KVM_POLL_CONTROL).
+    /// Performance mode: vCPU pinning to host LLCs, hugepage-backed
+    /// guest memory, NUMA mbind, and RT scheduling on both
+    /// architectures. On x86_64, additionally: KVM_HINTS_REALTIME
+    /// CPUID hint, PAUSE and HLT VM exit disabling via
+    /// KVM_CAP_X86_DISABLE_EXITS, and KVM_CAP_HALT_POLL skipped
+    /// (guest haltpoll cpuidle disables host halt polling via
+    /// MSR_KVM_POLL_CONTROL). Oversubscription validation at build
+    /// time on both architectures.
     performance_mode: bool,
     /// Pinning plan computed during build() when performance_mode is enabled.
     /// Stored so topology is read once and the plan is reused at VM start.
@@ -3836,14 +3922,16 @@ impl KtstrVmBuilder {
     }
 
     /// Enable performance mode: vCPU pinning to host LLCs,
-    /// hugepage-backed guest memory, KVM_HINTS_REALTIME CPUID
-    /// hint (disables PV spinlocks, PV TLB flush, PV sched_yield;
-    /// enables haltpoll cpuidle), and PAUSE + HLT VM exit disabling
-    /// via KVM_CAP_X86_DISABLE_EXITS. HLT disable falls back to
-    /// PAUSE-only when mitigate_smt_rsb is active on the host.
-    /// KVM_CAP_HALT_POLL is skipped (guest haltpoll cpuidle disables
-    /// host halt polling via MSR_KVM_POLL_CONTROL). Validated at
-    /// build time -- oversubscription returns `ResourceContention`,
+    /// hugepage-backed guest memory, NUMA mbind, and RT scheduling
+    /// on both architectures. On x86_64, additionally:
+    /// KVM_HINTS_REALTIME CPUID hint (disables PV spinlocks, PV TLB
+    /// flush, PV sched_yield; enables haltpoll cpuidle), PAUSE + HLT
+    /// VM exit disabling via KVM_CAP_X86_DISABLE_EXITS (HLT falls
+    /// back to PAUSE-only when mitigate_smt_rsb is active), and
+    /// KVM_CAP_HALT_POLL skipped (guest haltpoll cpuidle disables
+    /// host halt polling via MSR_KVM_POLL_CONTROL). On aarch64, KVM
+    /// exit suppression and CPUID hints are not available. Validated
+    /// at build time -- oversubscription returns `ResourceContention`,
     /// insufficient hugepages is a warning.
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {

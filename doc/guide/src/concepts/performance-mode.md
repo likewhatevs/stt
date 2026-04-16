@@ -2,15 +2,23 @@
 
 Performance mode reduces noise during VM execution by applying
 host-side isolation (vCPU pinning, hugepages, NUMA mbind, RT
-scheduling), a guest-visible CPUID hint (KVM_HINTS_REALTIME), and
-KVM exit suppression (PAUSE and HLT VM exits disabled).
+scheduling). On x86_64, additionally: a guest-visible CPUID hint
+(KVM_HINTS_REALTIME) and KVM exit suppression (PAUSE and HLT VM
+exits disabled). On aarch64, the four host-side optimizations apply
+(vCPU pinning, hugepages, NUMA mbind, RT scheduling); KVM exit
+suppression and CPUID hints are not available.
 
 ## What it does
 
-Seven optimizations are applied when `performance_mode` is enabled
-(six host-side, one guest-visible via CPUID). Host-side
-`KVM_CAP_HALT_POLL` is explicitly skipped — the guest haltpoll
-cpuidle driver disables it via `MSR_KVM_POLL_CONTROL` (see below):
+On x86_64, seven optimizations are applied when `performance_mode`
+is enabled (six host-side, one guest-visible via CPUID). On aarch64,
+four of these apply (vCPU pinning, hugepages, NUMA mbind, RT
+scheduling); the x86-specific items (PAUSE/HLT exit disabling,
+KVM_HINTS_REALTIME CPUID, halt poll) are not available.
+
+Host-side `KVM_CAP_HALT_POLL` is explicitly skipped on x86_64 —
+the guest haltpoll cpuidle driver disables it via
+`MSR_KVM_POLL_CONTROL` (see below):
 
 **vCPU pinning** -- each virtual LLC is mapped to a physical LLC
 group on the host. vCPU threads are pinned to cores within their
@@ -34,7 +42,7 @@ timeout/sampling without competing for vCPU cores. The serial console
 mutex uses `PTHREAD_PRIO_INHERIT` to avoid priority inversion between
 RT vCPU threads and service threads.
 
-**Disable PAUSE VM exits** -- `KVM_CAP_X86_DISABLE_EXITS` with
+**Disable PAUSE VM exits** (x86_64 only) -- `KVM_CAP_X86_DISABLE_EXITS` with
 `KVM_X86_DISABLE_EXITS_PAUSE` suppresses VM exits on PAUSE
 instructions. Guest spinlocks execute PAUSE in tight loops; each
 PAUSE normally causes a vmexit so the hypervisor can schedule other
@@ -42,7 +50,7 @@ vCPUs. With dedicated cores (vCPU pinning), this reschedule is
 unnecessary overhead. The capability is optional --
 if unsupported, a warning is logged and the VM proceeds without it.
 
-**Disable HLT VM exits** -- `KVM_X86_DISABLE_EXITS_HLT` suppresses
+**Disable HLT VM exits** (x86_64 only) -- `KVM_X86_DISABLE_EXITS_HLT` suppresses
 VM exits on HLT instructions, the most frequent exit type during
 boot and idle. BSP shutdown detection uses I8042 reset (port 0x64,
 value 0xFE via `reboot=k`) and `VcpuExit::Shutdown` instead of
@@ -50,7 +58,7 @@ value 0xFE via `reboot=k`) and `VcpuExit::Shutdown` instead of
 active (host has `X86_BUG_SMT_RSB` and `cpu_smt_possible()`); in that case,
 only PAUSE exits are disabled.
 
-**KVM_HINTS_REALTIME CPUID** -- sets bit 0 of CPUID leaf 0x40000001
+**KVM_HINTS_REALTIME CPUID** (x86_64 only) -- sets bit 0 of CPUID leaf 0x40000001
 EDX, telling the guest kernel that vCPUs are pinned to dedicated host
 cores. The guest disables PV spinlocks, PV TLB flush, and PV
 sched_yield (all add hypercall overhead unnecessary on dedicated
@@ -59,7 +67,7 @@ reducing wakeup latency). PV spinlocks require
 CONFIG_PARAVIRT_SPINLOCKS, which is not in ktstr.kconfig, so that
 disable is a no-op for ktstr guests.
 
-**Skip host-side halt poll** -- when a guest vCPU halts (executes
+**Skip host-side halt poll** (x86_64 only) -- when a guest vCPU halts (executes
 HLT with nothing to do), KVM can busy-wait briefly on the host
 before putting the vCPU thread to sleep, reducing wakeup latency at
 the cost of host CPU time. `KVM_CAP_HALT_POLL` controls this
@@ -111,7 +119,7 @@ levels of checks:
 - Insufficient free hugepages -- regular page allocation is used.
 - Host load is high -- `procs_running` from `/proc/stat` exceeds
   half the vCPU count, results may be noisy.
-- TSC not stable (checked at VM creation time) --
+- TSC not stable (x86_64 only, checked at VM creation time) --
   `KVM_CLOCK_TSC_STABLE` not set after `KVM_GET_CLOCK`, kvmclock
   falls back to per-vCPU timekeeping. Timing measurements may have
   higher variance. Common in nested virtualization.
@@ -162,10 +170,10 @@ topology matrix.
 
 Performance mode serves two purposes:
 
-**Noise reduction** -- pinning, hugepages, NUMA mbind, RT scheduling,
-PAUSE and HLT VM exit disabling, the KVM_HINTS_REALTIME CPUID hint,
-and skipping host-side halt poll (guest haltpoll disables it via
-MSR_KVM_POLL_CONTROL) reduce measurement variance. Scheduling gaps, spread, and throughput checks
+**Noise reduction** -- pinning, hugepages, NUMA mbind, and RT
+scheduling reduce measurement variance on both architectures. On
+x86_64, PAUSE and HLT VM exit disabling, the KVM_HINTS_REALTIME
+CPUID hint, and skipping host-side halt poll further reduce noise. Scheduling gaps, spread, and throughput checks
 become meaningful because host jitter is controlled. Without
 performance mode, a 50ms gap could be host noise; with it, the same
 gap indicates a scheduler problem.

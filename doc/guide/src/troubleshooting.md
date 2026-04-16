@@ -26,13 +26,16 @@ no kernel found
   hint: or set KTSTR_TEST_KERNEL=/path/to/bzImage
 ```
 
+On aarch64 the hint says `Image` instead of `bzImage`.
+
 `cargo ktstr shell` and `cargo ktstr verifier` show a similar message:
 
 ```text
 no kernel found. Provide --kernel or run `cargo ktstr kernel build` to download and cache one.
 ```
 
-ktstr needs a bootable Linux kernel image (bzImage). See
+ktstr needs a bootable Linux kernel image (`bzImage` on x86_64,
+`Image` on aarch64). See
 [Kernel discovery](getting-started.md#kernel-discovery) for the
 search order.
 

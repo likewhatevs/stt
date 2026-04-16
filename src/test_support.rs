@@ -563,14 +563,22 @@ pub struct KtstrTestEntry {
     /// Flags that must not be present in any flag profile for this test.
     pub excluded_flags: &'static [&'static str],
     /// Pin vCPU threads to host cores matching the virtual topology's LLC
-    /// structure, use 2MB hugepages for guest memory, set KVM_HINTS_REALTIME
-    /// CPUID hint (disables PV spinlocks, PV TLB flush, PV sched_yield;
-    /// enables haltpoll cpuidle), disable PAUSE and HLT VM exits via
+    /// structure, use 2MB hugepages for guest memory, NUMA mbind guest
+    /// memory to pinned vCPU nodes, and promote vCPU threads to
+    /// SCHED_FIFO. Validates that the host has enough CPUs and LLCs to
+    /// satisfy the request without oversubscription.
+    ///
+    /// On x86_64, additionally: set KVM_HINTS_REALTIME CPUID hint
+    /// (disables PV spinlocks, PV TLB flush, PV sched_yield; enables
+    /// haltpoll cpuidle), disable PAUSE and HLT VM exits via
     /// KVM_CAP_X86_DISABLE_EXITS (HLT falls back to PAUSE-only when
-    /// mitigate_smt_rsb is active), skip KVM_CAP_HALT_POLL (guest haltpoll
-    /// cpuidle disables host halt polling via MSR_KVM_POLL_CONTROL), and
-    /// validate that the host has enough CPUs and LLCs to satisfy the
-    /// request without oversubscription.
+    /// mitigate_smt_rsb is active), skip KVM_CAP_HALT_POLL (guest
+    /// haltpoll cpuidle disables host halt polling via
+    /// MSR_KVM_POLL_CONTROL), and check TSC stability.
+    ///
+    /// On aarch64, KVM exit suppression and CPUID hints are not
+    /// available. The four host-side optimizations (vCPU pinning,
+    /// hugepages, NUMA mbind, RT scheduling) apply.
     pub performance_mode: bool,
     /// Workload duration.
     pub duration: Duration,

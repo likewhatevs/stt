@@ -113,7 +113,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.2" }
+//! ktstr = { version = "0.3" }
 //! ```
 //!
 //! The only feature flag is `integration`, which gates
