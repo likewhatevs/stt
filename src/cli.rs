@@ -271,16 +271,6 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build the kernel (parallel make).
-pub fn make_kernel(kernel_dir: &Path) -> Result<()> {
-    let nproc = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let args = build_make_args(nproc);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_make(kernel_dir, &arg_refs)
-}
-
 /// Run make with merged stdout+stderr piped through a spinner.
 /// Uses `sh -c "make ... 2>&1"` for a single pipe — one reader,
 /// no threads, no channel, no pipe-buffer deadlock.
@@ -425,7 +415,7 @@ pub fn has_sched_ext(kernel_dir: &std::path::Path) -> bool {
 ///
 /// Call after `make` succeeds. Returns `Err` with a diagnostic
 /// message listing missing options and likely causes.
-pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
+fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
     let config_path = kernel_dir.join(".config");
     let config = std::fs::read_to_string(&config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
@@ -709,7 +699,7 @@ pub fn check_kvm() -> Result<()> {
 }
 
 /// Search PATH for a bare executable name.
-pub fn resolve_in_path(name: &std::path::Path) -> Option<std::path::PathBuf> {
+fn resolve_in_path(name: &std::path::Path) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -827,7 +817,7 @@ pub fn resolve_include_files(
 ///
 /// Checks local cache first. When `remote_cache::is_enabled()` returns
 /// true, falls back to the remote GHA cache on local miss.
-pub fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::path::PathBuf> {
+fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
     match id {
         KernelId::Version(ver) => {
@@ -1018,7 +1008,7 @@ pub fn stderr_color() -> bool {
 }
 
 /// Print a styled status message to stderr.
-pub fn status(msg: &str) {
+fn status(msg: &str) {
     if stderr_color() {
         eprintln!("\x1b[1m{msg}\x1b[0m");
     } else {
@@ -1027,7 +1017,7 @@ pub fn status(msg: &str) {
 }
 
 /// Print a green success message to stderr.
-pub fn success(msg: &str) {
+fn success(msg: &str) {
     if stderr_color() {
         eprintln!("\x1b[32m{msg}\x1b[0m");
     } else {
@@ -1036,18 +1026,9 @@ pub fn success(msg: &str) {
 }
 
 /// Print a blue warning to stderr.
-pub fn warn(msg: &str) {
+fn warn(msg: &str) {
     if stderr_color() {
         eprintln!("\x1b[34m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
-}
-
-/// Print a dim message to stderr.
-pub fn dim(msg: &str) {
-    if stderr_color() {
-        eprintln!("\x1b[2m{msg}\x1b[0m");
     } else {
         eprintln!("{msg}");
     }
