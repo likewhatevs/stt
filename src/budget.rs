@@ -40,6 +40,7 @@ pub(crate) struct TestCandidate {
 //   Bit  39:     workers_per_cgroup bucket (1 bit)
 //   Bit  40:     is gauntlet variant
 //   Bits 41..44: test name hash (4 one-hot bits)
+//   Bits 45..48: NUMA node count bucket (4 one-hot bits)
 
 const SCHED_SHIFT: u32 = 0;
 const REQ_FLAGS_SHIFT: u32 = 4;
@@ -55,6 +56,7 @@ const DURATION_SHIFT: u32 = 36;
 const WORKERS_SHIFT: u32 = 39;
 const GAUNTLET_SHIFT: u32 = 40;
 const NAME_HASH_SHIFT: u32 = 41;
+const NUMA_BUCKET_SHIFT: u32 = 45;
 
 /// Map a flag name to its bit index within the 6-bit flag fields.
 /// Uses `scenario::flags::ALL` as the canonical order.
@@ -121,6 +123,16 @@ fn workers_bucket(workers: u32) -> u64 {
     if workers <= 2 { 0 } else { 1 }
 }
 
+/// Classify NUMA node count into a one-hot bit (4 classes).
+fn numa_bucket(numa_nodes: u32) -> u64 {
+    match numa_nodes {
+        0..=1 => 1 << 0,
+        2 => 1 << 1,
+        3..=4 => 1 << 2,
+        _ => 1 << 3,
+    }
+}
+
 /// Extract feature bitset from a KtstrTestEntry and topology.
 ///
 /// `active_flags` is the flag profile for gauntlet variants (empty for
@@ -152,6 +164,7 @@ pub(crate) fn extract_features(
     if topo.threads_per_core > 1 {
         bits |= 1 << SMT_SHIFT;
     }
+    bits |= numa_bucket(topo.numa_nodes) << NUMA_BUCKET_SHIFT;
 
     // Test properties
     if entry.performance_mode {
@@ -418,6 +431,57 @@ mod tests {
         assert_eq!(workers_bucket(2), 0);
         assert_eq!(workers_bucket(3), 1);
         assert_eq!(workers_bucket(32), 1);
+    }
+
+    #[test]
+    fn numa_bucket_one_hot() {
+        assert_eq!(numa_bucket(0), 1 << 0);
+        assert_eq!(numa_bucket(1), 1 << 0);
+        assert_eq!(numa_bucket(2), 1 << 1);
+        assert_eq!(numa_bucket(3), 1 << 2);
+        assert_eq!(numa_bucket(4), 1 << 2);
+        assert_eq!(numa_bucket(5), 1 << 3);
+        assert_eq!(numa_bucket(8), 1 << 3);
+    }
+
+    #[test]
+    fn numa_bucket_no_shared_bits() {
+        let vals = [
+            numa_bucket(1),
+            numa_bucket(2),
+            numa_bucket(3),
+            numa_bucket(5),
+        ];
+        for (i, &a) in vals.iter().enumerate() {
+            assert_eq!(a.count_ones(), 1, "bucket {i} not one-hot: {a:#b}");
+            for &b in &vals[i + 1..] {
+                assert_eq!(a & b, 0, "buckets share bits: {a:#b} & {b:#b}");
+            }
+        }
+    }
+
+    #[test]
+    fn extract_features_numa_differentiation() {
+        let entry = KtstrTestEntry::DEFAULT;
+        let topo1 = Topology {
+            llcs: 4,
+            cores_per_llc: 4,
+            threads_per_core: 1,
+            numa_nodes: 1,
+        };
+        let topo2 = Topology {
+            llcs: 4,
+            cores_per_llc: 4,
+            threads_per_core: 1,
+            numa_nodes: 2,
+        };
+        let f1 = extract_features(&entry, &topo1, &[], false, "numa_test");
+        let f2 = extract_features(&entry, &topo2, &[], false, "numa_test");
+        // Same CPU/LLC counts, different NUMA => different features.
+        assert_ne!(f1, f2);
+        // NUMA bits differ.
+        let numa_mask = 0xFu64 << NUMA_BUCKET_SHIFT;
+        assert_ne!(f1 & numa_mask, f2 & numa_mask);
     }
 
     #[test]
