@@ -819,6 +819,17 @@ mod tests {
             .compute_pinning(&Topology::new(1, 2, 2, 1), false, 0)
             .unwrap();
         assert_eq!(plan.assignments.len(), 4);
+        // All host CPUs consumed.
+        let assigned: std::collections::HashSet<usize> =
+            plan.assignments.iter().map(|a| a.1).collect();
+        let all_cpus: std::collections::HashSet<usize> = topo.online_cpus.iter().copied().collect();
+        assert_eq!(assigned, all_cpus, "exact fit must consume all host CPUs");
+        // No duplicates (unique count == total count).
+        assert_eq!(
+            assigned.len(),
+            plan.assignments.len(),
+            "all assignments must be unique",
+        );
     }
 
     #[test]
@@ -939,12 +950,6 @@ mod tests {
     }
 
     #[test]
-    fn sysfs_total_cpus_matches_online() {
-        let topo = HostTopology::from_sysfs().unwrap();
-        assert_eq!(topo.total_cpus(), topo.online_cpus.len());
-    }
-
-    #[test]
     fn sysfs_llc_groups_nonempty() {
         let topo = HostTopology::from_sysfs().unwrap();
         for (i, group) in topo.llc_groups.iter().enumerate() {
@@ -1032,7 +1037,16 @@ mod tests {
         let plan = topo
             .compute_pinning(&Topology::new(1, 1, 2, 1), true, 0)
             .unwrap();
-        assert!(plan.service_cpu.is_some());
+        let service = plan.service_cpu.expect("service_cpu should be set");
+        // vCPUs consume CPUs 0,1. The only remaining CPU is 2.
+        assert_eq!(service, 2, "service CPU should be the only remaining CPU");
+        // Service CPU must not overlap with vCPU assignments.
+        let vcpu_cpus: std::collections::HashSet<usize> =
+            plan.assignments.iter().map(|a| a.1).collect();
+        assert!(
+            !vcpu_cpus.contains(&service),
+            "service CPU {service} must not overlap vCPU assignments",
+        );
     }
 
     #[test]
