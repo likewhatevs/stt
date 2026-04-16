@@ -1,0 +1,25 @@
+error: expected array of string literals for extra_sched_args
+ --> tests/compile_fail/ktstr_test_extra_sched_args_not_array.rs:6:33
+  |
+6 | #[ktstr_test(extra_sched_args = "not-an-array")]
+  |                                 ^^^^^^^^^^^^^^
+
+warning: unused import: `anyhow::Result`
+ --> tests/compile_fail/ktstr_test_extra_sched_args_not_array.rs:1:5
+  |
+1 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ktstr::assert::AssertResult`
+ --> tests/compile_fail/ktstr_test_extra_sched_args_not_array.rs:2:5
+  |
+2 | use ktstr::assert::AssertResult;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ktstr::scenario::Ctx`
+ --> tests/compile_fail/ktstr_test_extra_sched_args_not_array.rs:4:5
+  |
+4 | use ktstr::scenario::Ctx;
+  |     ^^^^^^^^^^^^^^^^^^^^

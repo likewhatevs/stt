@@ -1,0 +1,5 @@
+error: unknown scheduler attribute `bogus`
+ --> tests/compile_fail/derive_unknown_scheduler_attr.rs:2:27
+  |
+2 | #[scheduler(name = "bad", bogus = "value")]
+  |                           ^^^^^

@@ -1,0 +1,5 @@
+error: unknown flag attribute `bogus`
+ --> tests/compile_fail/derive_unknown_flag_attr.rs:5:12
+  |
+5 |     #[flag(bogus = ["x"])]
+  |            ^^^^^

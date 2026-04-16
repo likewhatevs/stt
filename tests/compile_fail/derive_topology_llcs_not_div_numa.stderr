@@ -1,0 +1,5 @@
+error: topology: llcs (3) must be divisible by numa_nodes (2)
+ --> tests/compile_fail/derive_topology_llcs_not_div_numa.rs:4:6
+  |
+4 | enum LlcsNotDivFlag {}
+  |      ^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: enum name cannot be just "Flag" or "Flags"
+ --> tests/compile_fail/derive_bare_flag_name.rs:4:6
+  |
+4 | enum Flag {}
+  |      ^^^^

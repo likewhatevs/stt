@@ -84,6 +84,7 @@ assert_cmd = "2"
 insta = "1"
 predicates = "3"
 proptest = "1"
+trybuild = "1"
 
 [build-dependencies]
 cc = "1"
@@ -115,3 +116,6 @@ name = "cargo_ktstr_cli"
 
 [[test]]
 name = "verifier_pipeline"
+
+[[test]]
+name = "compile_fail"

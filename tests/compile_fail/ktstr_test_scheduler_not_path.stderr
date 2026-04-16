@@ -1,0 +1,25 @@
+error: expected path for scheduler (e.g. MITOSIS or crate::MITOSIS)
+ --> tests/compile_fail/ktstr_test_scheduler_not_path.rs:6:26
+  |
+6 | #[ktstr_test(scheduler = 42)]
+  |                          ^^
+
+warning: unused import: `anyhow::Result`
+ --> tests/compile_fail/ktstr_test_scheduler_not_path.rs:1:5
+  |
+1 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ktstr::assert::AssertResult`
+ --> tests/compile_fail/ktstr_test_scheduler_not_path.rs:2:5
+  |
+2 | use ktstr::assert::AssertResult;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ktstr::scenario::Ctx`
+ --> tests/compile_fail/ktstr_test_scheduler_not_path.rs:4:5
+  |
+4 | use ktstr::scenario::Ctx;
+  |     ^^^^^^^^^^^^^^^^^^^^

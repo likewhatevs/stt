@@ -45,6 +45,11 @@ retries = 0
 filter = "test(gauntlet/)"
 slow-timeout = { period = "120s", terminate-after = 2 }
 
+# Compile-fail tests: trybuild compiles the dependency tree on first run.
+[[profile.default.overrides]]
+filter = "test(compile_fail)"
+slow-timeout = { period = "180s", terminate-after = 2 }
+
 # ── perf-vm ──────────────────────────────────────────────────────────
 [test-groups.perf-vm]
 max-threads = 8

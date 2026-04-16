@@ -1,0 +1,5 @@
+error: unknown variant `NonExistent` in requires (expected one of: Alpha, Beta)
+ --> tests/compile_fail/derive_unknown_requires_variant.rs:6:24
+  |
+6 |     #[flag(requires = [NonExistent])]
+  |                        ^^^^^^^^^^^

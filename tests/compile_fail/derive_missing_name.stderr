@@ -1,0 +1,5 @@
+error: missing `name` in #[scheduler(...)]
+ --> tests/compile_fail/derive_missing_name.rs:4:6
+  |
+4 | enum MissingNameFlag {}
+  |      ^^^^^^^^^^^^^^^
