@@ -86,6 +86,9 @@ fn patch_cache_topology_eax(entry: &mut kvm_cpuid_entry2, smt: u32, core: u32, c
 /// topology-related leaves. The base should be fetched once and reused for
 /// all vCPUs — each call clones and patches per-vCPU fields (APIC ID etc).
 ///
+/// Leaf 0x8000001E ECX is NUMA-aware: sets node ID from
+/// `Topology::numa_node_of` and nodes-per-processor from `numa_nodes`.
+///
 /// When `performance_mode` is true, sets KVM_HINTS_REALTIME (CPUID leaf
 /// 0x40000001 EDX bit 0). This disables PV spinlocks, PV TLB flush, and
 /// PV sched_yield in the guest, and enables haltpoll cpuidle. PV spinlocks
@@ -111,7 +114,7 @@ pub fn generate_cpuid(
             0x1 => {
                 // EBX[31:24] = initial APIC ID (8-bit)
                 entry.ebx = (entry.ebx & 0x00ffffff) | ((apic & 0xff) << 24);
-                // EBX[23:16] = max addressable logical processors per package
+                // EBX[23:16] = max addressable logical processors per LLC
                 entry.ebx = (entry.ebx & 0xff00ffff) | ((threads_per_llc.min(255)) << 16);
                 // EBX[15:8] = CLFLUSH line size — preserved from KVM
                 // ECX.31 = hypervisor — preserved from KVM
@@ -623,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf1_threads_per_package_not_total() {
+    fn leaf1_threads_per_llc_not_total() {
         let kvm = match kvm_ioctls::Kvm::new() {
             Ok(k) => k,
             Err(_) => return,
@@ -645,11 +648,11 @@ mod tests {
         );
         let leaf1 = cpuid.iter().find(|e| e.function == 1);
         if let Some(entry) = leaf1 {
-            let threads_per_pkg = (entry.ebx >> 16) & 0xff;
+            let threads_per_llc = (entry.ebx >> 16) & 0xff;
             assert_eq!(
-                threads_per_pkg,
+                threads_per_llc,
                 8, // cores_per_llc * threads_per_core, not total
-                "EBX[23:16] should be threads per package (8), not total CPUs (32)"
+                "EBX[23:16] should be threads per LLC (8), not total CPUs (32)"
             );
         }
     }
