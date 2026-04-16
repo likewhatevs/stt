@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
-use ktstr::cache::{CacheDir, CacheEntry, KernelMetadata};
+use ktstr::cache::{CacheDir, CacheEntry};
 use ktstr::cli;
 
 use ktstr::fetch;
@@ -365,158 +365,16 @@ fn kernel_build(
         }
     }
 
-    let source_dir = &acquired.source_dir;
-
-    // Clean step (local source only).
-    if clean {
-        if source.is_none() {
-            eprintln!(
-                "cargo-ktstr: --clean is only meaningful with --source (downloaded sources start clean)"
-            );
-        } else {
-            eprintln!("cargo-ktstr: make mrproper");
-            cli::run_make(source_dir, &["mrproper"]).map_err(|e| format!("{e:#}"))?;
-        }
-    }
-
-    // Configure.
-    if !cli::has_sched_ext(source_dir) {
-        let sp = cli::Spinner::start("Configuring kernel...");
-        let result =
-            cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"));
-        if result.is_err() {
-            sp.clear();
-        } else {
-            sp.finish("Kernel configured");
-        }
-        result?;
-    }
-
-    // Build.
-    let sp = cli::Spinner::start("Building kernel...");
-    let result = cli::make_kernel_with_output(source_dir, Some(&sp)).map_err(|e| format!("{e:#}"));
-    if result.is_err() {
-        sp.clear();
-    } else {
-        sp.finish("Kernel built");
-    }
-    result?;
-
-    // Validate critical config options were not silently disabled.
-    cli::validate_kernel_config(source_dir).map_err(|e| format!("{e:#}"))?;
-
-    // Generate compile_commands.json for local trees (LSP support).
-    if !acquired.is_temp {
-        let sp = cli::Spinner::start("Generating compile_commands.json...");
-        let result = cli::run_make_with_output(source_dir, &["compile_commands.json"], Some(&sp))
-            .map_err(|e| format!("{e:#}"));
-        if result.is_err() {
-            sp.clear();
-        } else {
-            sp.finish("Done");
-        }
-        result?;
-    }
-
-    // Find the built kernel image and vmlinux.
-    let image_path = ktstr::kernel_path::find_image_in_dir(source_dir)
-        .ok_or_else(|| format!("no kernel image found in {}", source_dir.display()))?;
-    let vmlinux_path = source_dir.join("vmlinux");
-    // Strip DWARF debug sections from vmlinux before caching.
-    // The cached vmlinux is only used for .symtab and .BTF; DWARF
-    // sections (often >1GB on arm64) are dead weight in the cache.
-    let _stripped_dir; // kept alive so the temp file survives until store()
-    let vmlinux_ref = if vmlinux_path.exists() {
-        if let Ok(file_meta) = std::fs::metadata(&vmlinux_path) {
-            let orig_mb = file_meta.len() as f64 / (1024.0 * 1024.0);
-            match ktstr::cache::strip_vmlinux_debug(&vmlinux_path) {
-                Ok((dir, stripped_path)) => {
-                    let stripped_mb = std::fs::metadata(&stripped_path)
-                        .map(|m| m.len() as f64 / (1024.0 * 1024.0))
-                        .unwrap_or(0.0);
-                    eprintln!(
-                        "cargo-ktstr: caching vmlinux ({orig_mb:.0} MB -> {stripped_mb:.0} MB, debug stripped)"
-                    );
-                    _stripped_dir = Some(dir);
-                    Some(stripped_path)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "cargo-ktstr: warning: vmlinux strip failed ({e:#}), caching unstripped ({orig_mb:.0} MB)"
-                    );
-                    _stripped_dir = None;
-                    Some(vmlinux_path.clone())
-                }
-            }
-        } else {
-            _stripped_dir = None;
-            Some(vmlinux_path.clone())
-        }
-    } else {
-        eprintln!("cargo-ktstr: warning: vmlinux not found, BTF will not be cached");
-        _stripped_dir = None;
-        None
-    };
-    let vmlinux_ref = vmlinux_ref.as_deref();
-
-    // Cache (skip for dirty local trees).
-    if acquired.is_dirty {
-        eprintln!("cargo-ktstr: kernel built at {}", image_path.display());
-        eprintln!("cargo-ktstr: skipping cache (dirty tree)");
-        return Ok(());
-    }
-
-    // Compute config hash.
-    let config_path = source_dir.join(".config");
-    let config_hash = if config_path.exists() {
-        let data = std::fs::read(&config_path).map_err(|e| format!("read .config: {e:#}"))?;
-        Some(format!("{:08x}", crc32fast::hash(&data)))
-    } else {
-        None
-    };
-
-    let (arch, image_name) = fetch::arch_info();
-    let kconfig_hash = cli::embedded_kconfig_hash();
-
-    let metadata = KernelMetadata::new(
-        acquired.source_type.clone(),
-        arch.to_string(),
-        image_name.to_string(),
-        cli::now_iso8601(),
-    )
-    .with_version(acquired.version.clone())
-    .with_config_hash(config_hash)
-    .with_ktstr_kconfig_hash(Some(kconfig_hash))
-    .with_ktstr_git_hash(Some(ktstr::GIT_FULL_HASH.to_string()))
-    .with_git_hash(acquired.git_hash.clone())
-    .with_git_ref(acquired.git_ref.clone())
-    .with_source_tree_path(if source.is_some() {
-        Some(acquired.source_dir.clone())
-    } else {
-        None
-    });
-
-    let config_ref = config_path.exists().then_some(config_path.as_path());
-    let entry = cache
-        .store(
-            &acquired.cache_key,
-            &image_path,
-            vmlinux_ref,
-            config_ref,
-            &metadata,
-        )
-        .map_err(|e| format!("cache store: {e:#}"))?;
+    let result =
+        cli::kernel_build_pipeline(&acquired, &cache, "cargo-ktstr", clean, source.is_some())
+            .map_err(|e| format!("{e:#}"))?;
 
     // Store to remote cache when enabled.
-    if remote_cache::is_enabled() {
-        remote_cache::remote_store(&entry);
+    if let Some(ref entry) = result.entry
+        && remote_cache::is_enabled()
+    {
+        remote_cache::remote_store(entry);
     }
-
-    cli::success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
-    eprintln!(
-        "cargo-ktstr: image: {}",
-        entry.path.join(image_name).display()
-    );
 
     Ok(())
 }
@@ -1036,6 +894,7 @@ fn main() {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use ktstr::cache::KernelMetadata;
 
     // -- structural validation --
 

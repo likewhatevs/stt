@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
-use ktstr::cache::KernelMetadata;
 use ktstr::cgroup::CgroupManager;
 use ktstr::cli;
 use ktstr::runner::Runner;
@@ -255,134 +254,7 @@ fn kernel_build(
         }
     }
 
-    let source_dir = &acquired.source_dir;
-
-    // Clean step (local source only).
-    if clean {
-        if source.is_none() {
-            eprintln!(
-                "ktstr: --clean is only meaningful with --source (downloaded sources start clean)"
-            );
-        } else {
-            eprintln!("ktstr: make mrproper");
-            cli::run_make(source_dir, &["mrproper"])?;
-        }
-    }
-
-    // Configure.
-    if !cli::has_sched_ext(source_dir) {
-        let sp = cli::Spinner::start("Configuring kernel...");
-        let result = cli::configure_kernel(source_dir, cli::EMBEDDED_KCONFIG);
-        if result.is_err() {
-            sp.clear();
-        } else {
-            sp.finish("Kernel configured");
-        }
-        result?;
-    }
-
-    // Build.
-    let sp = cli::Spinner::start("Building kernel...");
-    let result = cli::make_kernel_with_output(source_dir, Some(&sp));
-    if result.is_err() {
-        sp.clear();
-    } else {
-        sp.finish("Kernel built");
-    }
-    result?;
-
-    // Validate critical config options were not silently disabled.
-    cli::validate_kernel_config(source_dir)?;
-
-    // Generate compile_commands.json for local trees (LSP support).
-    if !acquired.is_temp {
-        eprintln!("ktstr: generating compile_commands.json");
-        cli::run_make(source_dir, &["compile_commands.json"])?;
-    }
-
-    // Find the built kernel image and vmlinux.
-    let image_path = ktstr::kernel_path::find_image_in_dir(source_dir)
-        .ok_or_else(|| anyhow::anyhow!("no kernel image found in {}", source_dir.display()))?;
-    let vmlinux_path = source_dir.join("vmlinux");
-    let _stripped_dir;
-    let vmlinux_ref = if vmlinux_path.exists() {
-        let orig_mb = std::fs::metadata(&vmlinux_path)
-            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
-            .unwrap_or(0.0);
-        match ktstr::cache::strip_vmlinux_debug(&vmlinux_path) {
-            Ok((dir, stripped_path)) => {
-                let stripped_mb = std::fs::metadata(&stripped_path)
-                    .map(|m| m.len() as f64 / (1024.0 * 1024.0))
-                    .unwrap_or(0.0);
-                eprintln!(
-                    "ktstr: caching vmlinux ({orig_mb:.0} MB -> {stripped_mb:.0} MB, debug stripped)"
-                );
-                _stripped_dir = Some(dir);
-                Some(stripped_path)
-            }
-            Err(e) => {
-                eprintln!(
-                    "ktstr: warning: vmlinux strip failed ({e:#}), caching unstripped ({orig_mb:.0} MB)"
-                );
-                _stripped_dir = None;
-                Some(vmlinux_path.clone())
-            }
-        }
-    } else {
-        eprintln!("ktstr: warning: vmlinux not found, BTF will not be cached");
-        _stripped_dir = None;
-        None
-    };
-    let vmlinux_ref = vmlinux_ref.as_deref();
-
-    // Cache (skip for dirty local trees).
-    if acquired.is_dirty {
-        eprintln!("ktstr: kernel built at {}", image_path.display());
-        eprintln!("ktstr: skipping cache (dirty tree)");
-        return Ok(());
-    }
-
-    // Compute config hash.
-    let config_path = source_dir.join(".config");
-    let config_hash = if config_path.exists() {
-        let data = std::fs::read(&config_path)?;
-        Some(format!("{:08x}", crc32fast::hash(&data)))
-    } else {
-        None
-    };
-
-    let (arch, image_name) = fetch::arch_info();
-    let kconfig_hash = cli::embedded_kconfig_hash();
-
-    let metadata = KernelMetadata::new(
-        acquired.source_type.clone(),
-        arch.to_string(),
-        image_name.to_string(),
-        cli::now_iso8601(),
-    )
-    .with_version(acquired.version.clone())
-    .with_config_hash(config_hash)
-    .with_ktstr_kconfig_hash(Some(kconfig_hash))
-    .with_ktstr_git_hash(Some(ktstr::GIT_FULL_HASH.to_string()))
-    .with_git_hash(acquired.git_hash.clone())
-    .with_git_ref(acquired.git_ref.clone())
-    .with_source_tree_path(if source.is_some() {
-        Some(acquired.source_dir.clone())
-    } else {
-        None
-    });
-
-    let config_ref = config_path.exists().then_some(config_path.as_path());
-    let entry = cache.store(
-        &acquired.cache_key,
-        &image_path,
-        vmlinux_ref,
-        config_ref,
-        &metadata,
-    )?;
-
-    cli::success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
-    eprintln!("ktstr: image: {}", entry.path.join(image_name).display());
+    cli::kernel_build_pipeline(&acquired, &cache, "ktstr", clean, source.is_some())?;
 
     Ok(())
 }

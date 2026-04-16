@@ -478,6 +478,173 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Result of the post-acquisition kernel build pipeline.
+///
+/// Returned by [`kernel_build_pipeline`] so callers can do
+/// post-processing (e.g. remote cache store) with the entry.
+#[non_exhaustive]
+pub struct KernelBuildResult {
+    /// Cache entry, if the build was cached. `None` for dirty trees.
+    pub entry: Option<crate::cache::CacheEntry>,
+}
+
+/// Post-acquisition kernel build pipeline shared by both binaries.
+///
+/// Handles: clean, configure, build, validate config, generate
+/// compile_commands.json for local trees, find image, strip vmlinux,
+/// compute metadata, and cache store. Callers handle source
+/// acquisition and any remote cache operations.
+///
+/// `label` is the binary name used as a prefix for diagnostic messages
+/// to stderr (e.g. "ktstr" or "cargo-ktstr").
+///
+/// `is_local_source` should be true when the user passed `--source`.
+/// It controls the mrproper warning and `source_tree_path` in metadata.
+pub fn kernel_build_pipeline(
+    acquired: &crate::fetch::AcquiredSource,
+    cache: &crate::cache::CacheDir,
+    label: &str,
+    clean: bool,
+    is_local_source: bool,
+) -> Result<KernelBuildResult> {
+    let source_dir = &acquired.source_dir;
+    let (arch, image_name) = crate::fetch::arch_info();
+
+    // Clean step (local source only).
+    if clean {
+        if !is_local_source {
+            eprintln!(
+                "{label}: --clean is only meaningful with --source (downloaded sources start clean)"
+            );
+        } else {
+            eprintln!("{label}: make mrproper");
+            run_make(source_dir, &["mrproper"])?;
+        }
+    }
+
+    // Configure.
+    if !has_sched_ext(source_dir) {
+        let sp = Spinner::start("Configuring kernel...");
+        let result = configure_kernel(source_dir, EMBEDDED_KCONFIG);
+        if result.is_err() {
+            sp.clear();
+        } else {
+            sp.finish("Kernel configured");
+        }
+        result?;
+    }
+
+    // Build.
+    let sp = Spinner::start("Building kernel...");
+    let result = make_kernel_with_output(source_dir, Some(&sp));
+    if result.is_err() {
+        sp.clear();
+    } else {
+        sp.finish("Kernel built");
+    }
+    result?;
+
+    // Validate critical config options were not silently disabled.
+    validate_kernel_config(source_dir)?;
+
+    // Generate compile_commands.json for local trees (LSP support).
+    if !acquired.is_temp {
+        let sp = Spinner::start("Generating compile_commands.json...");
+        let result = run_make_with_output(source_dir, &["compile_commands.json"], Some(&sp));
+        if result.is_err() {
+            sp.clear();
+        } else {
+            sp.finish("compile_commands.json generated");
+        }
+        result?;
+    }
+
+    // Find the built kernel image and vmlinux.
+    let image_path = crate::kernel_path::find_image_in_dir(source_dir)
+        .ok_or_else(|| anyhow::anyhow!("no kernel image found in {}", source_dir.display()))?;
+    let vmlinux_path = source_dir.join("vmlinux");
+    let _stripped_dir;
+    let vmlinux_ref = if vmlinux_path.exists() {
+        let orig_mb = std::fs::metadata(&vmlinux_path)
+            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+            .unwrap_or(0.0);
+        match crate::cache::strip_vmlinux_debug(&vmlinux_path) {
+            Ok((dir, stripped_path)) => {
+                let stripped_mb = std::fs::metadata(&stripped_path)
+                    .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+                    .unwrap_or(0.0);
+                eprintln!(
+                    "{label}: caching vmlinux ({orig_mb:.0} MB -> {stripped_mb:.0} MB, debug stripped)"
+                );
+                _stripped_dir = Some(dir);
+                Some(stripped_path)
+            }
+            Err(e) => {
+                eprintln!(
+                    "{label}: warning: vmlinux strip failed ({e:#}), caching unstripped ({orig_mb:.0} MB)"
+                );
+                _stripped_dir = None;
+                Some(vmlinux_path.clone())
+            }
+        }
+    } else {
+        eprintln!("{label}: warning: vmlinux not found, BTF will not be cached");
+        _stripped_dir = None;
+        None
+    };
+    let vmlinux_ref = vmlinux_ref.as_deref();
+
+    // Cache (skip for dirty local trees).
+    if acquired.is_dirty {
+        eprintln!("{label}: kernel built at {}", image_path.display());
+        eprintln!("{label}: skipping cache (dirty tree)");
+        return Ok(KernelBuildResult { entry: None });
+    }
+
+    // Compute config hash.
+    let config_path = source_dir.join(".config");
+    let config_hash = if config_path.exists() {
+        let data = std::fs::read(&config_path)?;
+        Some(format!("{:08x}", crc32fast::hash(&data)))
+    } else {
+        None
+    };
+
+    let kconfig_hash = embedded_kconfig_hash();
+
+    let metadata = crate::cache::KernelMetadata::new(
+        acquired.source_type.clone(),
+        arch.to_string(),
+        image_name.to_string(),
+        now_iso8601(),
+    )
+    .with_version(acquired.version.clone())
+    .with_config_hash(config_hash)
+    .with_ktstr_kconfig_hash(Some(kconfig_hash))
+    .with_ktstr_git_hash(Some(crate::GIT_FULL_HASH.to_string()))
+    .with_git_hash(acquired.git_hash.clone())
+    .with_git_ref(acquired.git_ref.clone())
+    .with_source_tree_path(if is_local_source {
+        Some(acquired.source_dir.clone())
+    } else {
+        None
+    });
+
+    let config_ref = config_path.exists().then_some(config_path.as_path());
+    let entry = cache.store(
+        &acquired.cache_key,
+        &image_path,
+        vmlinux_ref,
+        config_ref,
+        &metadata,
+    )?;
+
+    success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
+    eprintln!("{label}: image: {}", entry.path.join(image_name).display());
+
+    Ok(KernelBuildResult { entry: Some(entry) })
+}
+
 /// Build the make arguments for a kernel build.
 ///
 /// Returns the argument list that would be passed to `make` for a
