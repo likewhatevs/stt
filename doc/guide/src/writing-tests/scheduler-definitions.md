@@ -16,6 +16,7 @@ pub struct Scheduler {
     pub cgroup_parent: Option<&'static str>,
     pub sched_args: &'static [&'static str],
     pub topology: Topology,
+    pub constraints: TopologyConstraints,
 }
 ```
 
@@ -169,7 +170,7 @@ per-test `extra_sched_args`, then flag-derived args.
 ## Default topology
 
 `Scheduler.topology` sets the default VM topology for all tests using
-this scheduler. When `#[ktstr_test]` omits `sockets`, `cores`, and
+this scheduler. When `#[ktstr_test]` omits `llcs`, `cores`, and
 `threads`, the scheduler's topology is used. Explicit attributes on
 `#[ktstr_test]` override the scheduler default.
 
@@ -179,14 +180,14 @@ In the derive:
 #[scheduler(topology(1, 2, 4, 1))]
 ```
 
-Arguments are `(sockets, cores_per_socket, threads_per_core)`.
-`Scheduler::new()` defaults to `(1, 2, 1)`.
+Arguments are `(numa_nodes, llcs, cores_per_llc, threads_per_core)`.
+`Scheduler::new()` defaults to `(1, 1, 2, 1)`.
 
 Tests that need a different topology (e.g. SMT) override individual
 dimensions. Unset dimensions still inherit from the scheduler:
 
 ```rust,ignore
-// Inherits sockets=2, cores=4 from MITOSIS; overrides threads to 2
+// Inherits llcs=2, cores=4 from MITOSIS; overrides threads to 2
 #[ktstr_test(scheduler = MITOSIS, threads = 2)]
 fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```

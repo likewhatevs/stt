@@ -8,7 +8,7 @@ inside a VM.
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(sockets = 2, cores = 4, threads = 2)]
+#[ktstr_test(llcs = 2, cores = 4, threads = 2)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     // ctx provides cgroup manager, topology, duration, etc.
     Ok(AssertResult::pass())
@@ -25,7 +25,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
 
 #[ktstr_test(scheduler = MY_SCHED)]
 fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
-    // VM boots with 1 NUMA node, 2 LLCs, 4 cores, 1 thread (from MY_SCHED)
+    // Inherits 1s2l4c1t from MY_SCHED
     Ok(AssertResult::pass())
 }
 ```
@@ -50,15 +50,16 @@ All attributes are optional with defaults.
 
 | Attribute | Default | Description |
 |---|---|---|
-| `sockets` | inherited | Number of CPU sockets |
-| `cores` | inherited | Cores per socket |
+| `llcs` | inherited | Number of LLCs (`sockets` is accepted as an alias) |
+| `numa_nodes` | inherited | Number of NUMA nodes |
+| `cores` | inherited | Cores per LLC |
 | `threads` | inherited | Threads per core |
 | `memory_mb` | 2048 | VM memory in MB |
 
 Each dimension independently inherits from `Scheduler.topology` when
 a `scheduler` is specified and that dimension is not explicitly set.
-Without a scheduler, unset dimensions use macro defaults (sockets=1,
-cores=2, threads=1). See
+Without a scheduler, unset dimensions use macro defaults (numa_nodes=1,
+llcs=1, cores=2, threads=1). See
 [Default topology](scheduler-definitions.md#default-topology).
 
 ### Scheduler
@@ -133,15 +134,20 @@ profiles each test runs with. See
 
 | Attribute | Default | Description |
 |---|---|---|
-| `min_sockets` | 1 | Minimum sockets for gauntlet topology filtering |
 | `min_llcs` | 1 | Minimum LLCs for gauntlet topology filtering |
-| `requires_smt` | `false` | Require SMT (threads > 1) topologies |
+| `max_llcs` | 12 | Maximum LLCs for gauntlet topology filtering |
 | `min_cpus` | 1 | Minimum total CPU count for gauntlet topology filtering |
+| `max_cpus` | 192 | Maximum total CPU count for gauntlet topology filtering |
+| `min_numa_nodes` | 1 | Minimum NUMA nodes for gauntlet topology filtering |
+| `max_numa_nodes` | 1 | Maximum NUMA nodes for gauntlet topology filtering |
+| `requires_smt` | `false` | Require SMT (threads > 1) topologies |
 
 The gauntlet skips topology presets that do not satisfy these
 constraints. A test with `min_llcs = 3` will not run on `tiny-1llc`
-(1 LLC) or `tiny-2llc` (2 LLCs). The gauntlet uses these
-attributes to filter which presets each test runs on. See
+(1 LLC) or `tiny-2llc` (2 LLCs). Multi-NUMA presets are excluded by
+default (`max_numa_nodes = 1`); set `max_numa_nodes` higher to
+include them. The gauntlet uses these attributes to filter which
+presets each test runs on. See
 [Gauntlet](../running-tests/gauntlet.md#topology-presets).
 
 ### Execution
@@ -189,7 +195,7 @@ enum MySchedFlag {
     required_flags = [MySchedFlag::LLC],
 )]
 fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 2s4c1t from MY_SCHED
+    // Inherits 1s2l4c1t from MY_SCHED
     Ok(AssertResult::pass())
 }
 ```

@@ -12,7 +12,7 @@ Seven optimizations are applied when `performance_mode` is enabled
 `KVM_CAP_HALT_POLL` is explicitly skipped — the guest haltpoll
 cpuidle driver disables it via `MSR_KVM_POLL_CONTROL` (see below):
 
-**vCPU pinning** -- each virtual socket is mapped to a physical LLC
+**vCPU pinning** -- each virtual LLC is mapped to a physical LLC
 group on the host. vCPU threads are pinned to cores within their
 assigned LLC via `sched_setaffinity`. This prevents the host scheduler
 from migrating vCPU threads across LLCs, which would add cache
@@ -73,10 +73,10 @@ the x86 kernel default), or 0 when vCPUs exceed host CPUs.
 ## Prerequisites
 
 **Sufficient host CPUs** -- the host must have at least
-`(sockets * cores * threads) + 1` online CPUs. The extra CPU is
-reserved for service threads (monitor, watchdog) so they do not share
-a core with any RT vCPU. The host must also have at least as many LLC
-groups as virtual sockets.
+`(llcs * cores_per_llc * threads_per_core) + 1` online CPUs. The extra
+CPU is reserved for service threads (monitor, watchdog) so they do not
+share a core with any RT vCPU. The host must also have at least as many
+LLC groups as virtual LLCs.
 
 **2MB hugepages** (optional) -- the host must have free 2MB hugepages
 (check `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages`).
@@ -102,9 +102,9 @@ levels of checks:
 
 **Errors (fatal):**
 - Total vCPUs + 1 service CPU exceed available host CPUs.
-- Virtual sockets exceed available LLC groups.
+- Virtual LLCs exceed available LLC groups.
 - Pinning plan cannot be satisfied (an LLC group has fewer available
-  CPUs than the virtual socket requires).
+  CPUs than the virtual LLC requires).
 - No free host CPU for service threads after vCPU assignment.
 
 **Warnings (non-fatal):**
@@ -122,7 +122,7 @@ In `#[ktstr_test]`:
 
 ```rust,ignore
 #[ktstr_test(
-    sockets = 2,
+    llcs = 2,
     cores = 4,
     threads = 2,
     performance_mode = true,
@@ -191,7 +191,7 @@ The `SKIP:` prefix in stderr distinguishes skips from real passes.
 ## LLC exclusivity validation
 
 When `performance_mode` is enabled, the build step validates LLC
-exclusivity: each virtual socket must reserve the entire physical
+exclusivity: each virtual LLC must reserve the entire physical
 LLC group it maps to. The validation sums the actual CPU count of
 each LLC group and checks the total (plus service CPU) fits within
 the host's online CPUs. If validation fails, the build returns an

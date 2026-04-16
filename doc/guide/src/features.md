@@ -18,8 +18,8 @@ Tests boot a real Linux kernel in a KVM virtual machine with
 configurable topology: NUMA nodes, LLCs, cores per LLC, threads per core.
 Multi-NUMA topologies produce NUMA domains via ACPI SRAT/SLIT
 tables on x86_64. On aarch64, CPU topology is described via FDT cpu
-nodes with MPIDR affinity. Both architectures are supported (19
-topology presets on x86_64, 11 on aarch64).
+nodes with MPIDR affinity. Both architectures are supported (24
+topology presets on x86_64, 14 on aarch64).
 See [Gauntlet](running-tests/gauntlet.md) for the full preset list.
 
 </details>
@@ -118,7 +118,7 @@ Budget-based selection (`KTSTR_BUDGET_SECS`) picks the subset that
 maximizes coverage within a CI time limit.
 
 **Constraint attributes:**
-- `min_llcs`, `min_cpus`, `requires_smt`, `min_sockets` — topology gates
+- `min_llcs`, `max_llcs`, `min_cpus`, `max_cpus`, `min_numa_nodes`, `max_numa_nodes`, `requires_smt` — topology gates
 - `required_flags`, `excluded_flags` — flag profile filters
 - `extra_sched_args` — per-test scheduler CLI arguments
 

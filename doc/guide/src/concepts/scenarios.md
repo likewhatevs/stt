@@ -12,7 +12,7 @@ can be called directly from `#[ktstr_test]`:
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     scenarios::steady(ctx)
 }

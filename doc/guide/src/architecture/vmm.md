@@ -32,8 +32,8 @@ pub struct Topology {
 }
 ```
 
-`total_cpus()` = sockets * cores_per_socket * threads_per_core.
-`num_llcs()` = sockets (one LLC per socket).
+`total_cpus()` = llcs * cores_per_llc * threads_per_core.
+`num_llcs()` = llcs.
 
 ## initramfs
 

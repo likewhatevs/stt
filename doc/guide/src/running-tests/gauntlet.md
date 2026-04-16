@@ -1,6 +1,6 @@
 # Gauntlet
 
-The gauntlet runs every test across 19 topology presets (11 on aarch64)
+The gauntlet runs every test across 24 topology presets (14 on aarch64)
 and all valid flag profiles. Gauntlet variants are prefixed with `gauntlet/` and
 ignored by default.
 
@@ -36,50 +36,59 @@ cargo nextest run --run-ignored ignored-only \
 
 ## Topology presets
 
-| Preset | Topology | CPUs | LLCs | Description |
-|---|---|---|---|---|
-| `tiny-1llc` | 1s4c1t | 4 | 1 | Single LLC |
-| `tiny-2llc` | 2s2c1t | 4 | 2 | Minimal multi-LLC |
-| `odd-3llc` | 3s3c1t | 9 | 3 | Odd CPU count |
-| `odd-5llc` | 5s3c1t | 15 | 5 | Prime LLC count |
-| `odd-7llc` | 7s2c1t | 14 | 7 | Prime LLC count |
-| `smt-2llc` | 2s2c2t | 8 | 2 | SMT enabled |
-| `smt-3llc` | 3s2c2t | 12 | 3 | SMT, 3 LLCs |
-| `medium-4llc` | 4s4c2t | 32 | 4 | Medium topology |
-| `medium-8llc` | 8s4c2t | 64 | 8 | Medium, many LLCs |
-| `large-4llc` | 4s16c2t | 128 | 4 | Large, few LLCs |
-| `large-8llc` | 8s8c2t | 128 | 8 | Large, many LLCs |
-| `near-max-llc` | 15s8c2t | 240 | 15 | Near maximum |
-| `max-cpu` | 14s9c2t | 252 | 14 | Near KVM vCPU limit |
-| `medium-4llc-nosmt` | 4s8c1t | 32 | 4 | Medium, no SMT |
-| `medium-8llc-nosmt` | 8s8c1t | 64 | 8 | Medium, many LLCs, no SMT |
-| `large-4llc-nosmt` | 4s32c1t | 128 | 4 | Large, no SMT |
-| `large-8llc-nosmt` | 8s16c1t | 128 | 8 | Large, many LLCs, no SMT |
-| `near-max-llc-nosmt` | 15s16c1t | 240 | 15 | Near maximum, no SMT |
-| `max-cpu-nosmt` | 14s18c1t | 252 | 14 | Near KVM vCPU limit, no SMT |
+| Preset | Topology | CPUs | LLCs | NUMA | Description |
+|---|---|---|---|---|---|
+| `tiny-1llc` | 1s1l4c1t | 4 | 1 | 1 | Single LLC |
+| `tiny-2llc` | 1s2l2c1t | 4 | 2 | 1 | Minimal multi-LLC |
+| `odd-3llc` | 1s3l3c1t | 9 | 3 | 1 | Odd CPU count |
+| `odd-5llc` | 1s5l3c1t | 15 | 5 | 1 | Prime LLC count |
+| `odd-7llc` | 1s7l2c1t | 14 | 7 | 1 | Prime LLC count |
+| `smt-2llc` | 1s2l2c2t | 8 | 2 | 1 | SMT enabled |
+| `smt-3llc` | 1s3l2c2t | 12 | 3 | 1 | SMT, 3 LLCs |
+| `medium-4llc` | 1s4l4c2t | 32 | 4 | 1 | Medium topology |
+| `medium-8llc` | 1s8l4c2t | 64 | 8 | 1 | Medium, many LLCs |
+| `large-4llc` | 1s4l16c2t | 128 | 4 | 1 | Large, few LLCs |
+| `large-8llc` | 1s8l8c2t | 128 | 8 | 1 | Large, many LLCs |
+| `near-max-llc` | 1s15l8c2t | 240 | 15 | 1 | Near maximum |
+| `max-cpu` | 1s14l9c2t | 252 | 14 | 1 | Near KVM vCPU limit |
+| `medium-4llc-nosmt` | 1s4l8c1t | 32 | 4 | 1 | Medium, no SMT |
+| `medium-8llc-nosmt` | 1s8l8c1t | 64 | 8 | 1 | Medium, many LLCs, no SMT |
+| `large-4llc-nosmt` | 1s4l32c1t | 128 | 4 | 1 | Large, no SMT |
+| `large-8llc-nosmt` | 1s8l16c1t | 128 | 8 | 1 | Large, many LLCs, no SMT |
+| `near-max-llc-nosmt` | 1s15l16c1t | 240 | 15 | 1 | Near maximum, no SMT |
+| `max-cpu-nosmt` | 1s14l18c1t | 252 | 14 | 1 | Near KVM vCPU limit, no SMT |
+| `numa2-4llc` | 2s4l4c1t | 16 | 4 | 2 | Multi-NUMA, 2 nodes |
+| `numa2-8llc` | 2s8l8c2t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, SMT |
+| `numa2-8llc-nosmt` | 2s8l16c1t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, no SMT |
+| `numa4-8llc` | 4s8l4c1t | 32 | 8 | 4 | Multi-NUMA, 4 nodes |
+| `numa4-12llc` | 4s12l8c2t | 192 | 12 | 4 | Multi-NUMA, 4 nodes, SMT |
 
-Topology format: `{sockets}s{cores_per_socket}c{threads_per_core}t`.
-Presets are defined in `gauntlet_presets()`.
+Topology format: `{numa_nodes}s{llcs}l{cores_per_llc}c{threads_per_core}t`.
+Presets are defined in `gauntlet_presets()`. Multi-NUMA presets are
+excluded by default (`max_numa_nodes: Some(1)` in `TopologyConstraints::DEFAULT`).
 
 > **aarch64:** ARM64 CPUs do not have SMT. Presets with
-> `threads_per_core > 1` are excluded on aarch64, leaving 11 presets
-> (the 5 small presets plus 6 `-nosmt` variants).
+> `threads_per_core > 1` are excluded on aarch64, leaving 14 presets
+> (the 5 small presets, 6 `-nosmt` variants, and 3 non-SMT NUMA presets).
 
 ## Constraint filtering
 
 `#[ktstr_test]` topology constraints filter which presets a test runs
 on. A preset is skipped when any constraint is not met:
 
-- `sockets < min_sockets`
+- `num_numa_nodes() < min_numa_nodes`
+- `max_numa_nodes` is set and `num_numa_nodes() > max_numa_nodes`
 - `num_llcs() < min_llcs`
+- `max_llcs` is set and `num_llcs() > max_llcs`
 - `requires_smt` and `threads_per_core < 2`
 - `total_cpus() < min_cpus`
+- `max_cpus` is set and `total_cpus() > max_cpus`
 
 Example:
 
 ```rust,ignore
 #[ktstr_test(
-    sockets = 2, cores = 4, threads = 2,
+    llcs = 2, cores = 4, threads = 2,
     scheduler = MY_SCHED,
     min_llcs = 2,
     requires_smt = true,
@@ -88,10 +97,10 @@ Example:
 fn cross_llc_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
-This test skips `tiny-1llc` (1 LLC) and all non-SMT presets. It runs
-on 8 presets: `smt-2llc`, `smt-3llc`, `medium-4llc`, `medium-8llc`,
-`large-4llc`, `large-8llc`, `near-max-llc`, `max-cpu`. Every
-generated flag profile includes `llc`.
+This test skips `tiny-1llc` (1 LLC), all non-SMT presets, and all
+multi-NUMA presets (default `max_numa_nodes = 1`). Default
+`max_llcs = 12` and `max_cpus = 192` further exclude `near-max-llc`
+and `max-cpu`. Every generated flag profile includes `llc`.
 
 See [Topology Constraints](../writing-tests/ktstr-test-macro.md#topology-constraints)
 and [Flag Constraints](../writing-tests/ktstr-test-macro.md#flag-constraints)

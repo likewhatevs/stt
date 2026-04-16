@@ -30,14 +30,14 @@ constants (`MySchedFlag::LLC`, `MySchedFlag::STEAL`).
 ## 2. Write integration tests
 
 Tests inherit the scheduler's topology. Override with explicit
-`sockets`, `cores`, or `threads` when needed.
+`llcs`, `cores`, or `threads` when needed.
 
 ```rust,ignore
 use ktstr::prelude::*;
 
 #[ktstr_test(scheduler = MY_SCHED)]
 fn basic_steady(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 2s4c1t from MY_SCHED
+    // Inherits 1s2l4c1t from MY_SCHED
     scenarios::steady(ctx)
 }
 

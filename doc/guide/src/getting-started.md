@@ -50,7 +50,7 @@ The simplest test uses a canned scenario:
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     scenarios::steady(ctx)
 }
@@ -62,7 +62,7 @@ them with `execute_defs`. This is the most common custom test pattern:
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("cg_0").workers(4),
@@ -79,7 +79,7 @@ For multi-phase scenarios with dynamic topology changes, use
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(sockets = 1, cores = 2, threads = 1)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
