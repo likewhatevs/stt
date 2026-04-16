@@ -822,6 +822,32 @@ mod tests {
         assert_eq!(parse_cache_size("   "), None);
     }
 
+    #[test]
+    fn numa_aligned_cpuset_two_nodes() {
+        // 2 NUMA nodes, 4 LLCs (2 per NUMA), 4 cores, 1 thread
+        // LLCs 0,1 -> NUMA 0 (CPUs 0-7), LLCs 2,3 -> NUMA 1 (CPUs 8-15)
+        // Total = 4 * 4 * 1 = 16 CPUs per NUMA pair = each LLC has 4 CPUs
+        // NUMA 0: LLCs 0,1 → CPUs 0-3, 4-7 = 0-7
+        // NUMA 1: LLCs 2,3 → CPUs 8-11, 12-15 = 8-15 (but only 16 CPUs)
+        //
+        // from_spec(2, 4, 4, 1) → 4 LLCs × 4 cores × 1 thread = 16 CPUs
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        assert_eq!(t.total_cpus(), 16);
+        assert_eq!(t.num_numa_nodes(), 2);
+        assert_eq!(t.num_llcs(), 4);
+
+        let node0: BTreeSet<usize> = t.numa_aligned_cpuset(0);
+        let node1: BTreeSet<usize> = t.numa_aligned_cpuset(1);
+
+        // NUMA 0: LLCs 0,1 each with 4 CPUs → CPUs 0-7
+        let expected0: BTreeSet<usize> = (0..8).collect();
+        assert_eq!(node0, expected0);
+
+        // NUMA 1: LLCs 2,3 each with 4 CPUs → CPUs 8-15
+        let expected1: BTreeSet<usize> = (8..16).collect();
+        assert_eq!(node1, expected1);
+    }
+
     // -- proptest --
 
     proptest::proptest! {

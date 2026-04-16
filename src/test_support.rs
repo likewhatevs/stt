@@ -6021,4 +6021,33 @@ mod tests {
         let t = Topology::new(1, 2, 8, 2);
         assert!(!c.accepts(&t, 128, 16, 8));
     }
+
+    // -- validate_entry_flags panic paths --
+
+    #[test]
+    #[should_panic(expected = "unknown required_flag")]
+    fn validate_entry_flags_unknown_required() {
+        static SCHED: Scheduler = Scheduler::new("sched").flags(FLAGS_AB);
+        let entry = KtstrTestEntry {
+            name: "bad_required",
+            scheduler: &SCHED,
+            required_flags: &["nonexistent"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        validate_entry_flags(&entry);
+    }
+
+    #[test]
+    #[should_panic(expected = "in both required_flags and excluded_flags")]
+    fn validate_entry_flags_both_required_and_excluded() {
+        static SCHED: Scheduler = Scheduler::new("sched").flags(FLAGS_AB);
+        let entry = KtstrTestEntry {
+            name: "bad_both",
+            scheduler: &SCHED,
+            required_flags: &["a"],
+            excluded_flags: &["a"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        validate_entry_flags(&entry);
+    }
 }

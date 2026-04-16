@@ -620,6 +620,32 @@ mod tests {
     // -- pack with various metadata --
 
     #[test]
+    fn remote_cache_source_tree_path_sanitized_on_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+
+        let src = tempfile::TempDir::new().unwrap();
+        let image = create_fake_image(src.path());
+        let meta =
+            test_metadata().with_source_tree_path(Some(std::path::PathBuf::from("/tmp/linux-src")));
+        assert!(meta.source_tree_path.is_some());
+
+        let entry = cache.store("stp-key", &image, None, None, &meta).unwrap();
+
+        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
+        let restored = unpack_and_store(&cache2, "stp-key", &packed).unwrap();
+
+        let restored_meta = restored.metadata.unwrap();
+        assert!(
+            restored_meta.source_tree_path.is_none(),
+            "source_tree_path must be stripped during pack"
+        );
+    }
+
+    #[test]
     fn remote_cache_pack_with_git_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();

@@ -471,3 +471,20 @@ fn cover_monitor_evaluation(ctx: &Ctx) -> Result<AssertResult> {
     // monitor samples against merged thresholds.
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
+
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_execute_defs_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
+    use ktstr::scenario::ops::{CgroupDef, execute_defs};
+    use ktstr::workload::WorkType;
+    execute_defs(
+        ctx,
+        vec![
+            CgroupDef::named("cg_0")
+                .workers(2)
+                .work_type(WorkType::CpuSpin),
+            CgroupDef::named("cg_1")
+                .workers(2)
+                .work_type(WorkType::CpuSpin),
+        ],
+    )
+}

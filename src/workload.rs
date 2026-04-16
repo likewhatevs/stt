@@ -3169,4 +3169,20 @@ mod tests {
             _ => panic!("expected RoundRobin"),
         }
     }
+
+    #[test]
+    fn sched_policy_fifo_default_priority() {
+        match SchedPolicy::fifo(1) {
+            SchedPolicy::Fifo(p) => assert_eq!(p, 1),
+            _ => panic!("expected Fifo(1)"),
+        }
+    }
+
+    #[test]
+    fn sched_policy_rr_default_priority() {
+        match SchedPolicy::round_robin(1) {
+            SchedPolicy::RoundRobin(p) => assert_eq!(p, 1),
+            _ => panic!("expected RoundRobin(1)"),
+        }
+    }
 }
