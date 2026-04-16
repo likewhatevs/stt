@@ -50,6 +50,18 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 filter = "test(compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
+# ── vm-cli ───────────────────────────────────────────────────────────
+[test-groups.vm-cli]
+max-threads = 1
+
+# Serialize shell_exec_* tests (CLI-spawned VMs) to avoid CPU-lock
+# contention with concurrent in-process VM tests — acquire_cpu_locks
+# fast-fails when peers hold all locks.
+[[profile.default.overrides]]
+filter = "test(shell_exec_)"
+test-group = "vm-cli"
+threads-required = 1
+
 # ── perf-vm ──────────────────────────────────────────────────────────
 [test-groups.perf-vm]
 max-threads = 8

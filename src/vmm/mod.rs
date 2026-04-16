@@ -295,10 +295,11 @@ impl<T> Drop for PiMutexGuard<'_, T> {
 // Initramfs cache — two-tier: POSIX shm (cross-process) + in-process HashMap
 // ---------------------------------------------------------------------------
 
-/// Cache key for base initramfs (payload + scheduler + optional
-/// include files). Derived from content hashes of the binary files
-/// and their shared libs so identical inputs produce the same key
-/// regardless of path or mtime.
+/// Cache key for base initramfs. Derived from content hashes of the
+/// payload binary and its shared libs, plus the optional scheduler
+/// binary and its shared libs. Shell mode additionally mixes in a
+/// sentinel, include files, and the busybox flag; see [`Self::new`]
+/// and [`Self::new_shell`] for per-constructor inputs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(u64);
 
@@ -404,7 +405,7 @@ impl BaseKey {
 }
 
 /// Process-global cache for base initramfs bytes. Keyed by content hash
-/// of commit hash, payload, scheduler, include files, and busybox flag.
+/// of payload, scheduler, include files, and busybox flag.
 /// The lock is only held during map lookup/insert, never during the
 /// actual build.
 fn base_cache() -> &'static Mutex<HashMap<BaseKey, Arc<Vec<u8>>>> {

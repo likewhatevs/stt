@@ -421,7 +421,7 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 if vmlinux.exists()
                     && let Err(e) = monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux)
                 {
-                    tracing::info!(
+                    tracing::warn!(
                         entry = %entry.path.display(),
                         error = %e,
                         "skipping cached kernel with unusable vmlinux"

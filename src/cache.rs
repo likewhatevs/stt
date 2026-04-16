@@ -1649,9 +1649,10 @@ mod tests {
         let data = fs::read(&stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
 
-        // Symbol table readable after stripping — the keep-list
-        // retains .symtab and .strtab. Symbol addresses survive
-        // even though .text (the referenced section) is deleted.
+        // Smoke check: stripping a synthetic ELF produces a readable
+        // symbol table whose strtab still contains our test symbol
+        // name. End-to-end symbol preservation on real vmlinuxes is
+        // covered by the *_preserves_monitor_symbols tests below.
         let found = elf
             .syms
             .iter()
@@ -1698,6 +1699,36 @@ mod tests {
         assert!(
             syms.init_top_pgt.is_some(),
             "init_top_pgt/swapper_pg_dir symbol missing from stripped vmlinux"
+        );
+        // For every optional symbol KernelSymbols tracks: presence must
+        // survive the strip. A symbol that is absent from the source
+        // vmlinux stays absent (kernel-config-dependent); a symbol that
+        // is present must still be present.
+        let source_syms = crate::monitor::symbols::KernelSymbols::from_vmlinux(&path).unwrap();
+        assert_eq!(
+            source_syms.page_offset_base_kva.is_some(),
+            syms.page_offset_base_kva.is_some(),
+            "strip changed page_offset_base_kva presence"
+        );
+        assert_eq!(
+            source_syms.scx_root.is_some(),
+            syms.scx_root.is_some(),
+            "strip changed scx_root presence"
+        );
+        assert_eq!(
+            source_syms.scx_watchdog_timeout.is_some(),
+            syms.scx_watchdog_timeout.is_some(),
+            "strip changed scx_watchdog_timeout presence"
+        );
+        assert_eq!(
+            source_syms.pgtable_l5_enabled.is_some(),
+            syms.pgtable_l5_enabled.is_some(),
+            "strip changed pgtable_l5_enabled presence"
+        );
+        assert_eq!(
+            source_syms.prog_idr.is_some(),
+            syms.prog_idr.is_some(),
+            "strip changed prog_idr presence"
         );
     }
 
