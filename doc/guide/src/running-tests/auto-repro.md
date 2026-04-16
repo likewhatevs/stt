@@ -50,9 +50,9 @@ auto-repro falls back to dynamic BPF program discovery in the repro VM.
 6. **Stitching** -- the task_struct pointer is read from the trigger
    event's `bpf_get_current_task()` value. Events with a task_struct
    parameter are filtered to that pointer; events without a
-   task_struct parameter are dropped
-   (they cannot be associated with the triggering task). Events
-   are sorted by timestamp and
+   task_struct parameter are retained if their `task_ptr` (from
+   `bpf_get_current_task()` at probe time) matches the triggering
+   task. Events are sorted by timestamp and
    formatted with decoded field values (cpumask ranges, DSQ names,
    enqueue flags, etc.) and source locations (DWARF for kernel,
    line_info for BPF).

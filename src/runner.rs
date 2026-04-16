@@ -152,6 +152,7 @@ impl Runner {
                 std::thread::JoinHandle<(
                     Option<Vec<crate::probe::process::ProbeEvent>>,
                     crate::probe::process::ProbeDiagnostics,
+                    Vec<(u32, String)>,
                 )>,
                 Vec<(u32, String)>,
                 std::collections::HashMap<String, String>,
@@ -223,6 +224,7 @@ impl Runner {
                             &stop_clone,
                             &bpf_fds,
                             &probes_ready_thread,
+                            None,
                         )
                     });
                     while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
@@ -244,26 +246,31 @@ impl Runner {
                     skeleton_handle.take()
                 {
                     probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    handle.join().ok().and_then(|(events, diag)| {
-                        let mut out = String::new();
-                        // Format diagnostics summary.
-                        let pipeline = crate::test_support::PipelineDiagnostics::default();
-                        out.push_str(&crate::test_support::format_probe_diagnostics(
-                            &pipeline, &diag,
-                        ));
-                        if let Some(events) = events {
-                            out.push_str(&crate::probe::output::format_probe_events_with_bpf_locs(
-                                &events,
-                                &func_names,
-                                self.config.kernel_dir.as_deref(),
-                                &bpf_locs,
-                                Some(self.topo.total_cpus() as u32),
-                                &param_names,
-                                &render_hints,
+                    handle
+                        .join()
+                        .ok()
+                        .and_then(|(events, diag, _accumulated_fn)| {
+                            let mut out = String::new();
+                            // Format diagnostics summary.
+                            let pipeline = crate::test_support::PipelineDiagnostics::default();
+                            out.push_str(&crate::test_support::format_probe_diagnostics(
+                                &pipeline, &diag,
                             ));
-                        }
-                        if out.is_empty() { None } else { Some(out) }
-                    })
+                            if let Some(events) = events {
+                                out.push_str(
+                                    &crate::probe::output::format_probe_events_with_bpf_locs(
+                                        &events,
+                                        &func_names,
+                                        self.config.kernel_dir.as_deref(),
+                                        &bpf_locs,
+                                        Some(self.topo.total_cpus() as u32),
+                                        &param_names,
+                                        &render_hints,
+                                    ),
+                                );
+                            }
+                            if out.is_empty() { None } else { Some(out) }
+                        })
                 } else {
                     None
                 };

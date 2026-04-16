@@ -262,6 +262,25 @@ pub(crate) fn ktstr_guest_init() -> ! {
         force_reboot();
     }
 
+    // Read test args from /args early so Phase 2b can parse
+    // --ktstr-probe-stack for probe setup before the scheduler starts.
+    let args: Vec<String> = {
+        let content = fs::read_to_string("/args").unwrap_or_default();
+        let mut a = vec!["/init".to_string()];
+        a.extend(content.lines().map(|s| s.to_string()));
+        a
+    };
+    tracing::debug!(args = ?args, "parsed /args");
+
+    // Phase 2b: Probe Phase A (before scheduler starts).
+    // Attaches kprobes + trigger + kernel fexit so the one-shot
+    // sched_ext_exit tracepoint is captured even if the scheduler
+    // crashes immediately on startup.
+    let _s_phase2b = tracing::debug_span!("phase2b_probe_phase_a").entered();
+    let probe_phase_a = crate::test_support::start_probe_phase_a(&args);
+    let probes_active = probe_phase_a.is_some();
+    drop(_s_phase2b);
+
     // Phase 3: Cgroup parent + Scheduler.
     // Create the cgroup parent directory before starting the scheduler
     // so it exists when the scheduler looks for it.
@@ -285,24 +304,28 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Spawn a thread that polls /proc/{pid}. If the scheduler exits during
     // the test, the thread writes MSG_TYPE_SCHED_EXIT to SHM so the host
     // can detect early death without waiting for the watchdog.
+    //
+    // When probes are active, suppress COM2 log dump to avoid
+    // interleaving with probe JSON output on the same serial port.
+    let suppress_com2 = Arc::new(AtomicBool::new(probes_active));
     let sched_exit_stop = start_sched_exit_monitor(
         sched_child.as_ref().map(|c| c.id()),
         sched_log_path.as_deref(),
+        suppress_com2,
     );
 
     // Phase 5: Dispatch.
-    // Read test args from /args in the initramfs. As PID 1, the kernel
-    // passes cmdline args (console=ttyS0 etc.), not the test args.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
-    let args: Vec<String> = {
-        let content = fs::read_to_string("/args").unwrap_or_default();
-        let mut a = vec!["/init".to_string()];
-        a.extend(content.lines().map(|s| s.to_string()));
-        a
-    };
-    tracing::debug!(args = ?args, "dispatching test");
+    tracing::debug!("dispatching test");
     write_com2("KTSTR_PAYLOAD_STARTING");
-    let code = crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1);
+    let code = if let Some(pa) = probe_phase_a {
+        // Phase A/B split path: Phase A already attached, dispatch
+        // with Phase B for BPF fentry after scheduler is running.
+        crate::test_support::maybe_dispatch_vm_test_with_phase_a(&args, pa).unwrap_or(1)
+    } else {
+        // Non-split path: standard dispatch.
+        crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1)
+    };
     drop(_s_phase5);
 
     // Flush test output before teardown. Rust's BufWriter on stdout
@@ -1148,7 +1171,8 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
 ///
 /// Polls `/proc/{pid}` every 200ms. When the directory disappears, the
 /// scheduler has exited. Writes MSG_TYPE_SCHED_EXIT to SHM with exit
-/// code 1, then dumps the scheduler log to COM2. The host monitor thread
+/// code 1, then dumps the scheduler log to COM2 (unless `suppress_com2`
+/// is set, which prevents interleaving with probe output). The host monitor thread
 /// detects this message via mid-flight SHM drain and can terminate the
 /// VM early.
 ///
@@ -1159,6 +1183,7 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
 fn start_sched_exit_monitor(
     sched_pid: Option<u32>,
     log_path: Option<&str>,
+    suppress_com2: Arc<AtomicBool>,
 ) -> Option<Arc<AtomicBool>> {
     let pid = sched_pid?;
     let proc_path = format!("/proc/{pid}");
@@ -1179,7 +1204,12 @@ fn start_sched_exit_monitor(
                     );
 
                     // Dump scheduler log to COM2 for diagnostics.
-                    if let Some(ref path) = log_path {
+                    // Skip when probes are active to avoid interleaving
+                    // with probe JSON output on the same serial port.
+                    // The SHM signal above is the important part.
+                    if !suppress_com2.load(Ordering::Acquire)
+                        && let Some(ref path) = log_path
+                    {
                         dump_sched_output(path);
                     }
                     return;

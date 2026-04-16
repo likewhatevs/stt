@@ -324,7 +324,8 @@ journey:
    `bpf_get_current_task()` value (`args[0]`)
 2. For functions with a task_struct parameter: keep events where
    `args[param_idx] == tptr`
-3. For functions without a task_struct parameter: drop (cannot
-   associate with the triggering task)
+3. For functions without a task_struct parameter: keep events where
+   `task_ptr == tptr` (matched via `bpf_get_current_task()` at
+   probe time)
 
 Events are sorted by timestamp for chronological output.

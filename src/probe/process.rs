@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -5,6 +6,30 @@ use super::btf::{BtfFunc, RenderHint, STRUCT_FIELDS};
 use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
+
+/// Input for Phase B probe attachment (BPF fentry/fexit).
+///
+/// Sent via mpsc channel after the scheduler starts and BPF programs
+/// are discoverable. Phase A (kprobes + trigger + kernel fexit) runs
+/// before the scheduler; Phase B attaches fentry/fexit to the
+/// scheduler's BPF struct_ops callbacks.
+pub struct PhaseBInput {
+    /// BPF functions and kernel callers discovered from the running
+    /// scheduler. Includes both BPF callbacks (for fentry) and their
+    /// kernel-side callers from `expand_bpf_to_kernel_callers` (for
+    /// additional kprobes).
+    pub functions: Vec<StackFunction>,
+    /// Pre-opened BPF program FDs keyed by prog_id.
+    pub bpf_prog_fds: std::collections::HashMap<u32, i32>,
+    /// BTF-resolved function signatures for BPF callbacks and kernel callers.
+    pub btf_funcs: Vec<BtfFunc>,
+    /// Set to true when Phase B attachment is complete.
+    pub done: Arc<AtomicBool>,
+    /// Starting func_idx for Phase B functions. Must equal the number
+    /// of functions in Phase A to avoid index collisions in the shared
+    /// `func_meta_map` and `probe_data` maps.
+    pub func_idx_offset: u32,
+}
 
 /// Ring buffer event type for the trigger (matches `EVENT_TRIGGER`
 /// in `intf.h`).
@@ -223,35 +248,40 @@ pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashM
 
 /// Run the BPF probe skeleton for auto-repro.
 ///
-/// Loads two BPF skeletons:
-/// - **Kprobe skeleton** (`probe.bpf.c`): attaches to kernel functions
-///   via `attach_kprobe`. Uses `bpf_get_func_ip` to identify the
-///   firing function and writes to the shared `probe_data` hash map.
-///   Also contains the trigger: `tp_btf/sched_ext_exit` tracepoint.
-/// - **Fentry/fexit skeleton** (`fentry_probe.bpf.c`): attaches
-///   fentry+fexit to BPF struct_ops callbacks and kernel functions
-///   in batches of 4 via `set_attach_target`. Fexit re-reads struct
-///   fields into `exit_fields` for paired entry/exit display. Shares
-///   `probe_data` and `func_meta_map` via `reuse_fd`.
+/// Operates in two modes depending on `phase_b_rx`:
+///
+/// **Single-phase (`phase_b_rx = None`):** loads the kprobe skeleton
+/// and fentry/fexit skeleton together, attaches all probes, then
+/// polls until the trigger fires.
+///
+/// **Two-phase (`phase_b_rx = Some`):** Phase A attaches kprobes +
+/// kernel fexit + the `tp_btf/sched_ext_exit` trigger before the
+/// scheduler starts, signals `ready`, then polls the ring buffer
+/// while waiting for Phase B input via the channel. When Phase B
+/// input arrives, attaches fentry/fexit to BPF struct_ops callbacks
+/// and additional kprobes for kernel callers. Signals `done` on the
+/// `PhaseBInput` when Phase B attachment completes. If the trigger
+/// fires before Phase B input arrives, fentry is skipped — the
+/// crash happened before BPF programs could be probed.
 ///
 /// The trigger fires on `sched_ext_exit` inside `scx_claim_exit()`
-/// — exactly once per scheduler lifetime, in the context of the
-/// current task at exit time. If the tracepoint is unavailable
-/// (kernel lacks CONFIG_SCHED_CLASS_EXT tracepoint support), auto-repro
-/// is skipped.
+/// — exactly once per scheduler lifetime. If the tracepoint is
+/// unavailable, auto-repro is skipped.
 ///
-/// Polls until the trigger fires (via ring buffer EVENT_TRIGGER)
-/// or `stop` is set. Then iterates `probe_data` entries, matches them
-/// to functions by IP, stitches events by `task_struct` arg value
-/// (using param indices from [`BPF_OP_CALLERS`](super::stack::BPF_OP_CALLERS)
-/// and BTF), and returns them sorted by timestamp.
+/// Returns accumulated func_names from both phases as the third
+/// tuple element.
 pub fn run_probe_skeleton(
     functions: &[StackFunction],
     btf_funcs: &[BtfFunc],
     stop: &AtomicBool,
     bpf_prog_fds: &std::collections::HashMap<u32, i32>,
     ready: &AtomicBool,
-) -> (Option<Vec<ProbeEvent>>, ProbeDiagnostics) {
+    phase_b_rx: Option<std::sync::mpsc::Receiver<PhaseBInput>>,
+) -> (
+    Option<Vec<ProbeEvent>>,
+    ProbeDiagnostics,
+    Vec<(u32, String)>,
+) {
     use crate::bpf_skel::*;
     use libbpf_rs::skel::{OpenSkel, SkelBuilder};
     use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder};
@@ -268,7 +298,7 @@ pub fn run_probe_skeleton(
         Err(e) => {
             tracing::error!(%e, "probe skeleton open failed");
             ready.store(true, Ordering::Release);
-            return (None, diag);
+            return (None, diag, Vec::new());
         }
     };
 
@@ -283,7 +313,7 @@ pub fn run_probe_skeleton(
         Err(e) => {
             tracing::error!(%e, "probe skeleton load failed");
             ready.store(true, Ordering::Release);
-            return (None, diag);
+            return (None, diag, Vec::new());
         }
     };
 
@@ -340,12 +370,12 @@ pub fn run_probe_skeleton(
         func_ips.push((idx as u32, ip, func.display_name.clone()));
     }
 
-    if func_ips.is_empty() && bpf_funcs.is_empty() {
+    if func_ips.is_empty() && bpf_funcs.is_empty() && phase_b_rx.is_none() {
         tracing::warn!("no kprobe IPs resolved and no BPF functions for fentry");
         ready.store(true, Ordering::Release);
-        return (None, diag);
+        return (None, diag, Vec::new());
     }
-    if func_ips.is_empty() {
+    if func_ips.is_empty() && (phase_b_rx.is_some() || !bpf_funcs.is_empty()) {
         tracing::debug!("no kernel functions resolved to IPs, proceeding with fentry only");
     }
 
@@ -408,298 +438,308 @@ pub fn run_probe_skeleton(
 
     // Interleave: process BPF targets first, then kernel targets.
     // Each gets batched into the fentry skeleton in groups of 4.
+    //
+    // When phase_b_rx is Some (Phase A/B split), BPF callback fentry
+    // attachment is deferred to Phase B after the scheduler starts.
+    // Only kernel fexit (fd=0) and kprobes run in Phase A.
 
-    // --- BPF callback batches ---
-    for chunk in valid_bpf.chunks(FENTRY_BATCH) {
-        let mut targets: Vec<FentryTarget<'_>> = Vec::new();
-        for (slot, (idx, func)) in chunk.iter().enumerate() {
-            let prog_id = func.bpf_prog_id.unwrap();
-            let fd = if let Some(&pre_fd) = bpf_prog_fds.get(&prog_id) {
-                let dup_fd = unsafe { libc::dup(pre_fd) };
-                if dup_fd < 0 {
-                    tracing::warn!(prog_id, func = %func.display_name, "fentry: dup failed");
-                    diag.fentry_attach_failed.push((
-                        func.display_name.clone(),
-                        format!("dup(pre_fd={pre_fd}) failed"),
-                    ));
-                    continue;
-                }
-                dup_fd
-            } else {
-                let fd = unsafe { libbpf_rs::libbpf_sys::bpf_prog_get_fd_by_id(prog_id) };
-                if fd < 0 {
-                    tracing::warn!(prog_id, func = %func.display_name, "fentry: failed to get fd");
-                    diag.fentry_attach_failed.push((
-                        func.display_name.clone(),
-                        format!("bpf_prog_get_fd_by_id({prog_id}) returned {fd}"),
-                    ));
-                    continue;
-                }
-                fd
-            };
-            targets.push(FentryTarget {
-                slot,
-                fd,
-                idx: *idx,
-                name: &func.display_name,
-                ok: false,
-                is_kernel: false,
-            });
-        }
-        if targets.is_empty() {
-            continue;
-        }
-
-        use crate::bpf_skel::fentry::*;
-        let mut fentry_open_obj = std::mem::MaybeUninit::uninit();
-        let fentry_builder = FentryProbeSkelBuilder::default();
-        let mut fentry_open = match fentry_builder.open(&mut fentry_open_obj) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(%e, "fentry skeleton open failed");
-                for t in &targets {
-                    unsafe { libc::close(t.fd) };
-                }
+    // --- BPF callback batches (skip in Phase A when split is active) ---
+    if phase_b_rx.is_none() {
+        for chunk in valid_bpf.chunks(FENTRY_BATCH) {
+            let mut targets: Vec<FentryTarget<'_>> = Vec::new();
+            for (slot, (idx, func)) in chunk.iter().enumerate() {
+                let prog_id = func.bpf_prog_id.unwrap();
+                let fd = if let Some(&pre_fd) = bpf_prog_fds.get(&prog_id) {
+                    let dup_fd = unsafe { libc::dup(pre_fd) };
+                    if dup_fd < 0 {
+                        tracing::warn!(prog_id, func = %func.display_name, "fentry: dup failed");
+                        diag.fentry_attach_failed.push((
+                            func.display_name.clone(),
+                            format!("dup(pre_fd={pre_fd}) failed"),
+                        ));
+                        continue;
+                    }
+                    dup_fd
+                } else {
+                    let fd = unsafe { libbpf_rs::libbpf_sys::bpf_prog_get_fd_by_id(prog_id) };
+                    if fd < 0 {
+                        tracing::warn!(prog_id, func = %func.display_name, "fentry: failed to get fd");
+                        diag.fentry_attach_failed.push((
+                            func.display_name.clone(),
+                            format!("bpf_prog_get_fd_by_id({prog_id}) returned {fd}"),
+                        ));
+                        continue;
+                    }
+                    fd
+                };
+                targets.push(FentryTarget {
+                    slot,
+                    fd,
+                    idx: *idx,
+                    name: &func.display_name,
+                    ok: false,
+                    is_kernel: false,
+                });
+            }
+            if targets.is_empty() {
                 continue;
             }
-        };
 
-        // Set rodata: func_idx and is_kernel per slot.
-        if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
-            rodata.ktstr_enabled = true;
-            for t in &targets {
-                let k = t.is_kernel as u8;
-                match t.slot {
-                    0 => {
-                        rodata.ktstr_fentry_func_idx_0 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_0 = k;
-                    }
-                    1 => {
-                        rodata.ktstr_fentry_func_idx_1 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_1 = k;
-                    }
-                    2 => {
-                        rodata.ktstr_fentry_func_idx_2 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_2 = k;
-                    }
-                    3 => {
-                        rodata.ktstr_fentry_func_idx_3 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_3 = k;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        for t in targets.iter_mut() {
-            // Set fentry attach target.
-            let fentry_prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fentry_0,
-                1 => &mut fentry_open.progs.ktstr_fentry_1,
-                2 => &mut fentry_open.progs.ktstr_fentry_2,
-                3 => &mut fentry_open.progs.ktstr_fentry_3,
-                _ => continue,
-            };
-            match fentry_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
-                Ok(()) => {
-                    t.ok = true;
-                    tracing::debug!(slot = t.slot, func = t.name, "fentry: set_attach_target ok");
-                }
+            use crate::bpf_skel::fentry::*;
+            let mut fentry_open_obj = std::mem::MaybeUninit::uninit();
+            let fentry_builder = FentryProbeSkelBuilder::default();
+            let mut fentry_open = match fentry_builder.open(&mut fentry_open_obj) {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(slot = t.slot, func = t.name, %e, "fentry: set_attach_target failed");
-                    diag.fentry_attach_failed
-                        .push((t.name.to_string(), format!("set_attach_target: {e}")));
+                    tracing::warn!(%e, "fentry skeleton open failed");
+                    for t in &targets {
+                        unsafe { libc::close(t.fd) };
+                    }
                     continue;
                 }
-            }
-            // Set fexit attach target on the same function.
-            let fexit_prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fexit_0,
-                1 => &mut fentry_open.progs.ktstr_fexit_1,
-                2 => &mut fentry_open.progs.ktstr_fexit_2,
-                3 => &mut fentry_open.progs.ktstr_fexit_3,
-                _ => continue,
             };
-            if let Err(e) = fexit_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
-                tracing::debug!(slot = t.slot, func = t.name, %e, "fexit: set_attach_target failed (entry-only)");
-                // Disable autoload so the verifier doesn't reject the
-                // skeleton due to a stale placeholder target.
-                fexit_prog.set_autoload(false);
-            }
-        }
 
-        if !targets.iter().any(|t| t.ok) {
-            for t in &targets {
-                unsafe { libc::close(t.fd) };
-            }
-            continue;
-        }
-
-        // Disable autoload on unused or failed fentry/fexit slots so the
-        // verifier doesn't reject the placeholder target.
-        let used_slots: std::collections::HashSet<usize> =
-            targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
-        for slot in 0..FENTRY_BATCH {
-            if !used_slots.contains(&slot) {
-                match slot {
-                    0 => {
-                        fentry_open.progs.ktstr_fentry_0.set_autoload(false);
-                        fentry_open.progs.ktstr_fexit_0.set_autoload(false);
+            // Set rodata: func_idx and is_kernel per slot.
+            if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
+                rodata.ktstr_enabled = true;
+                for t in &targets {
+                    let k = t.is_kernel as u8;
+                    match t.slot {
+                        0 => {
+                            rodata.ktstr_fentry_func_idx_0 = t.idx;
+                            rodata.ktstr_fentry_is_kernel_0 = k;
+                        }
+                        1 => {
+                            rodata.ktstr_fentry_func_idx_1 = t.idx;
+                            rodata.ktstr_fentry_is_kernel_1 = k;
+                        }
+                        2 => {
+                            rodata.ktstr_fentry_func_idx_2 = t.idx;
+                            rodata.ktstr_fentry_is_kernel_2 = k;
+                        }
+                        3 => {
+                            rodata.ktstr_fentry_func_idx_3 = t.idx;
+                            rodata.ktstr_fentry_is_kernel_3 = k;
+                        }
+                        _ => {}
                     }
-                    1 => {
-                        fentry_open.progs.ktstr_fentry_1.set_autoload(false);
-                        fentry_open.progs.ktstr_fexit_1.set_autoload(false);
-                    }
-                    2 => {
-                        fentry_open.progs.ktstr_fentry_2.set_autoload(false);
-                        fentry_open.progs.ktstr_fexit_2.set_autoload(false);
-                    }
-                    3 => {
-                        fentry_open.progs.ktstr_fentry_3.set_autoload(false);
-                        fentry_open.progs.ktstr_fexit_3.set_autoload(false);
-                    }
-                    _ => {}
                 }
             }
-        }
-        tracing::debug!(
-            active = used_slots.len(),
-            disabled = FENTRY_BATCH - used_slots.len(),
-            "fentry: loading batch",
-        );
-        // Reuse the main skeleton's maps so fentry events land in the
-        // same probe_data map that the Rust side reads.
-        use std::os::unix::io::AsFd;
-        if let Err(e) = fentry_open
-            .maps
-            .probe_data
-            .reuse_fd(skel.maps.probe_data.as_fd())
-        {
-            tracing::warn!(%e, "fentry: probe_data reuse_fd failed");
-        }
-        if let Err(e) = fentry_open
-            .maps
-            .func_meta_map
-            .reuse_fd(skel.maps.func_meta_map.as_fd())
-        {
-            tracing::warn!(%e, "fentry: func_meta_map reuse_fd failed");
-        }
 
-        let fentry_skel = match fentry_open.load() {
-            Ok(s) => {
-                tracing::debug!("fentry: batch load success");
-                for t in &targets {
-                    unsafe { libc::close(t.fd) };
-                }
-                s
-            }
-            Err(e) => {
-                tracing::warn!(%e, "fentry: batch load failed");
-                for t in &targets {
-                    if t.ok {
+            for t in targets.iter_mut() {
+                // Set fentry attach target.
+                let fentry_prog = match t.slot {
+                    0 => &mut fentry_open.progs.ktstr_fentry_0,
+                    1 => &mut fentry_open.progs.ktstr_fentry_1,
+                    2 => &mut fentry_open.progs.ktstr_fentry_2,
+                    3 => &mut fentry_open.progs.ktstr_fentry_3,
+                    _ => continue,
+                };
+                match fentry_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
+                    Ok(()) => {
+                        t.ok = true;
+                        tracing::debug!(
+                            slot = t.slot,
+                            func = t.name,
+                            "fentry: set_attach_target ok"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(slot = t.slot, func = t.name, %e, "fentry: set_attach_target failed");
                         diag.fentry_attach_failed
-                            .push((t.name.to_string(), format!("batch load: {e}")));
+                            .push((t.name.to_string(), format!("set_attach_target: {e}")));
+                        continue;
                     }
+                }
+                // Set fexit attach target on the same function.
+                let fexit_prog = match t.slot {
+                    0 => &mut fentry_open.progs.ktstr_fexit_0,
+                    1 => &mut fentry_open.progs.ktstr_fexit_1,
+                    2 => &mut fentry_open.progs.ktstr_fexit_2,
+                    3 => &mut fentry_open.progs.ktstr_fexit_3,
+                    _ => continue,
+                };
+                if let Err(e) = fexit_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
+                    tracing::debug!(slot = t.slot, func = t.name, %e, "fexit: set_attach_target failed (entry-only)");
+                    // Disable autoload so the verifier doesn't reject the
+                    // skeleton due to a stale placeholder target.
+                    fexit_prog.set_autoload(false);
+                }
+            }
+
+            if !targets.iter().any(|t| t.ok) {
+                for t in &targets {
                     unsafe { libc::close(t.fd) };
                 }
                 continue;
             }
-        };
 
-        // Populate func_meta and attach each slot.
-        for t in &targets {
-            if !t.ok {
-                continue;
-            }
-
-            let sentinel_ip = (t.idx as u64) | (1u64 << 63);
-            let mut meta = crate::bpf_skel::types::func_meta {
-                func_idx: t.idx,
-                ..Default::default()
-            };
-
-            if let Some(btf_func) = btf_funcs.iter().find(|f| f.name == t.name) {
-                // Try vmlinux BTF first (for known struct params like
-                // task_struct and auto-discovered vmlinux fields),
-                // then BPF program BTF (for BPF-local types like task_ctx).
-                let mut field_specs = super::btf::resolve_field_specs(btf_func, None);
-                if field_specs.is_empty()
-                    && let Some(prog_id) = functions
-                        .iter()
-                        .find(|f| f.display_name == t.name)
-                        .and_then(|f| f.bpf_prog_id)
-                {
-                    field_specs = super::btf::resolve_bpf_field_specs(btf_func, prog_id);
+            // Disable autoload on unused or failed fentry/fexit slots so the
+            // verifier doesn't reject the placeholder target.
+            let used_slots: std::collections::HashSet<usize> =
+                targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
+            for slot in 0..FENTRY_BATCH {
+                if !used_slots.contains(&slot) {
+                    match slot {
+                        0 => {
+                            fentry_open.progs.ktstr_fentry_0.set_autoload(false);
+                            fentry_open.progs.ktstr_fexit_0.set_autoload(false);
+                        }
+                        1 => {
+                            fentry_open.progs.ktstr_fentry_1.set_autoload(false);
+                            fentry_open.progs.ktstr_fexit_1.set_autoload(false);
+                        }
+                        2 => {
+                            fentry_open.progs.ktstr_fentry_2.set_autoload(false);
+                            fentry_open.progs.ktstr_fexit_2.set_autoload(false);
+                        }
+                        3 => {
+                            fentry_open.progs.ktstr_fentry_3.set_autoload(false);
+                            fentry_open.progs.ktstr_fexit_3.set_autoload(false);
+                        }
+                        _ => {}
+                    }
                 }
-                populate_field_specs(&mut meta, &field_specs);
-                meta.str_param_idx = detect_str_param(btf_func);
             }
-
-            let key_bytes = sentinel_ip.to_ne_bytes();
-            let meta_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &meta as *const _ as *const u8,
-                    std::mem::size_of::<crate::bpf_skel::types::func_meta>(),
-                )
-            };
-            if let Err(e) = skel
+            tracing::debug!(
+                active = used_slots.len(),
+                disabled = FENTRY_BATCH - used_slots.len(),
+                "fentry: loading batch",
+            );
+            // Reuse the main skeleton's maps so fentry events land in the
+            // same probe_data map that the Rust side reads.
+            use std::os::unix::io::AsFd;
+            if let Err(e) = fentry_open
+                .maps
+                .probe_data
+                .reuse_fd(skel.maps.probe_data.as_fd())
+            {
+                tracing::warn!(%e, "fentry: probe_data reuse_fd failed");
+            }
+            if let Err(e) = fentry_open
                 .maps
                 .func_meta_map
-                .update(&key_bytes, meta_bytes, MapFlags::ANY)
+                .reuse_fd(skel.maps.func_meta_map.as_fd())
             {
-                tracing::warn!(%e, func = t.name, "fentry: failed to update func_meta_map");
-                continue;
+                tracing::warn!(%e, "fentry: func_meta_map reuse_fd failed");
             }
-            func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
 
-            let result = match t.slot {
-                0 => fentry_skel.progs.ktstr_fentry_0.attach_trace(),
-                1 => fentry_skel.progs.ktstr_fentry_1.attach_trace(),
-                2 => fentry_skel.progs.ktstr_fentry_2.attach_trace(),
-                3 => fentry_skel.progs.ktstr_fentry_3.attach_trace(),
-                _ => continue,
-            };
-            match result {
-                Ok(link) => {
-                    tracing::debug!(func = t.name, "fentry attached");
-                    fentry_links.push(link);
+            let fentry_skel = match fentry_open.load() {
+                Ok(s) => {
+                    tracing::debug!("fentry: batch load success");
+                    for t in &targets {
+                        unsafe { libc::close(t.fd) };
+                    }
+                    s
                 }
                 Err(e) => {
-                    tracing::warn!(%e, func = t.name, "fentry attach failed");
-                    diag.fentry_attach_failed
-                        .push((t.name.to_string(), e.to_string()));
+                    tracing::warn!(%e, "fentry: batch load failed");
+                    for t in &targets {
+                        if t.ok {
+                            diag.fentry_attach_failed
+                                .push((t.name.to_string(), format!("batch load: {e}")));
+                        }
+                        unsafe { libc::close(t.fd) };
+                    }
+                    continue;
                 }
-            }
-            // Attach fexit for exit-side capture.
-            let fexit_result = match t.slot {
-                0 => fentry_skel.progs.ktstr_fexit_0.attach_trace(),
-                1 => fentry_skel.progs.ktstr_fexit_1.attach_trace(),
-                2 => fentry_skel.progs.ktstr_fexit_2.attach_trace(),
-                3 => fentry_skel.progs.ktstr_fexit_3.attach_trace(),
-                _ => continue,
             };
-            match fexit_result {
-                Ok(link) => {
-                    tracing::debug!(func = t.name, "fexit attached");
-                    fexit_links.push(link);
+
+            // Populate func_meta and attach each slot.
+            for t in &targets {
+                if !t.ok {
+                    continue;
                 }
-                Err(e) => {
-                    tracing::debug!(%e, func = t.name, "fexit attach failed (entry-only)");
+
+                let sentinel_ip = (t.idx as u64) | (1u64 << 63);
+                let mut meta = crate::bpf_skel::types::func_meta {
+                    func_idx: t.idx,
+                    ..Default::default()
+                };
+
+                if let Some(btf_func) = btf_funcs.iter().find(|f| f.name == t.name) {
+                    // Try vmlinux BTF first (for known struct params like
+                    // task_struct and auto-discovered vmlinux fields),
+                    // then BPF program BTF (for BPF-local types like task_ctx).
+                    let mut field_specs = super::btf::resolve_field_specs(btf_func, None);
+                    if field_specs.is_empty()
+                        && let Some(prog_id) = functions
+                            .iter()
+                            .find(|f| f.display_name == t.name)
+                            .and_then(|f| f.bpf_prog_id)
+                    {
+                        field_specs = super::btf::resolve_bpf_field_specs(btf_func, prog_id);
+                    }
+                    populate_field_specs(&mut meta, &field_specs);
+                    meta.str_param_idx = detect_str_param(btf_func);
+                }
+
+                let key_bytes = sentinel_ip.to_ne_bytes();
+                let meta_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &meta as *const _ as *const u8,
+                        std::mem::size_of::<crate::bpf_skel::types::func_meta>(),
+                    )
+                };
+                if let Err(e) =
+                    skel.maps
+                        .func_meta_map
+                        .update(&key_bytes, meta_bytes, MapFlags::ANY)
+                {
+                    tracing::warn!(%e, func = t.name, "fentry: failed to update func_meta_map");
+                    continue;
+                }
+                func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
+
+                let result = match t.slot {
+                    0 => fentry_skel.progs.ktstr_fentry_0.attach_trace(),
+                    1 => fentry_skel.progs.ktstr_fentry_1.attach_trace(),
+                    2 => fentry_skel.progs.ktstr_fentry_2.attach_trace(),
+                    3 => fentry_skel.progs.ktstr_fentry_3.attach_trace(),
+                    _ => continue,
+                };
+                match result {
+                    Ok(link) => {
+                        tracing::debug!(func = t.name, "fentry attached");
+                        fentry_links.push(link);
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, func = t.name, "fentry attach failed");
+                        diag.fentry_attach_failed
+                            .push((t.name.to_string(), e.to_string()));
+                    }
+                }
+                // Attach fexit for exit-side capture.
+                let fexit_result = match t.slot {
+                    0 => fentry_skel.progs.ktstr_fexit_0.attach_trace(),
+                    1 => fentry_skel.progs.ktstr_fexit_1.attach_trace(),
+                    2 => fentry_skel.progs.ktstr_fexit_2.attach_trace(),
+                    3 => fentry_skel.progs.ktstr_fexit_3.attach_trace(),
+                    _ => continue,
+                };
+                match fexit_result {
+                    Ok(link) => {
+                        tracing::debug!(func = t.name, "fexit attached");
+                        fexit_links.push(link);
+                    }
+                    Err(e) => {
+                        tracing::debug!(%e, func = t.name, "fexit attach failed (entry-only)");
+                    }
                 }
             }
+
+            drop(fentry_skel);
         }
-
-        drop(fentry_skel);
-    }
-    diag.fentry_attached = fentry_links.len() as u32;
-    if !valid_bpf.is_empty() {
-        tracing::debug!(
-            fentry = fentry_links.len(),
-            fexit = fexit_links.len(),
-            total = valid_bpf.len(),
-            "BPF probes",
-        );
-    }
+        diag.fentry_attached = fentry_links.len() as u32;
+        if !valid_bpf.is_empty() {
+            tracing::debug!(
+                fentry = fentry_links.len(),
+                fexit = fexit_links.len(),
+                total = valid_bpf.len(),
+                "BPF probes",
+            );
+        }
+    } // end if phase_b_rx.is_none() — BPF callback batches
 
     // --- Kernel function fexit batches (fd=0 = vmlinux BTF) ---
     for chunk in kernel_fexit_targets.chunks(FENTRY_BATCH) {
@@ -878,7 +918,7 @@ pub fn run_probe_skeleton(
             tracing::error!(%msg, "trigger attach failed");
             diag.trigger_attach_error = Some(msg);
             ready.store(true, Ordering::Release);
-            return (None, diag);
+            return (None, diag, Vec::new());
         }
     }
 
@@ -933,7 +973,7 @@ pub fn run_probe_skeleton(
     }) {
         tracing::error!(%e, "failed to register ring buffer callback");
         ready.store(true, Ordering::Release);
-        return (None, diag);
+        return (None, diag, Vec::new());
     }
 
     let rb = match rb_builder.build() {
@@ -941,7 +981,7 @@ pub fn run_probe_skeleton(
         Err(e) => {
             tracing::error!(%e, "failed to build ring buffer");
             ready.store(true, Ordering::Release);
-            return (None, diag);
+            return (None, diag, Vec::new());
         }
     };
 
@@ -957,16 +997,69 @@ pub fn run_probe_skeleton(
         "polling for probe data",
     );
 
-    // Signal that all probes are attached. The caller should wait
-    // for this before starting the test function to avoid racing
-    // with probe attachment.
+    // Signal Phase A probes attached (kprobes + kernel fexit +
+    // trigger). When phase_b_rx is None, this means all probes.
+    // When Some, BPF fentry is deferred to Phase B.
     ready.store(true, Ordering::Release);
+
+    // Phase B: receive BPF fentry targets and attach them while
+    // polling the ring buffer. The channel is consumed once; after
+    // that phase_b_done prevents re-checking.
+    let mut phase_b_rx = phase_b_rx;
+    let mut phase_b_done = false;
+    // Accumulates BTF from Phase B functions so the readout phase
+    // can resolve field keys for both Phase A and Phase B functions.
+    let mut phase_b_btf: Vec<BtfFunc> = Vec::new();
 
     // Poll until trigger fires or stop requested.  When stop is
     // signaled, iterate all probe_data entries instead of waiting
     // for the trigger.
     loop {
         let _ = rb.poll(Duration::from_millis(100));
+
+        // Check for Phase B input while polling.
+        if !phase_b_done && let Some(ref rx) = phase_b_rx {
+            match rx.try_recv() {
+                Ok(pb) => {
+                    tracing::debug!(
+                        bpf_funcs = pb.functions.len(),
+                        "Phase B: attaching BPF fentry/fexit"
+                    );
+                    // Save Phase B BTF for readout field key resolution.
+                    phase_b_btf = pb.btf_funcs.clone();
+                    // Attach Phase B probes: kernel callers (kprobes
+                    // + kernel fexit) and BPF callbacks (fentry/fexit).
+                    attach_phase_b_fentry(
+                        &skel,
+                        &pb,
+                        &mut func_ips,
+                        &mut fentry_links,
+                        &mut fexit_links,
+                        &mut links,
+                        &mut diag,
+                    );
+                    pb.done.store(true, Ordering::Release);
+                    phase_b_done = true;
+                    // Drop the receiver to release the channel.
+                    phase_b_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // No Phase B input yet; if trigger already fired,
+                    // break immediately — the crash happened before
+                    // Phase B could attach.
+                    if triggered.load(Ordering::Relaxed) {
+                        tracing::debug!("trigger fired during Phase B wait, skipping fentry");
+                        phase_b_done = true;
+                        phase_b_rx = None;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tracing::debug!("Phase B channel disconnected");
+                    phase_b_done = true;
+                    phase_b_rx = None;
+                }
+            }
+        }
 
         if triggered.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
             diag.trigger_fired = triggered.load(Ordering::Relaxed);
@@ -1013,6 +1106,7 @@ pub fn run_probe_skeleton(
 
                     let field_keys_hints: Vec<(String, RenderHint)> = btf_funcs
                         .iter()
+                        .chain(phase_b_btf.iter())
                         .find(|f| f.name == display_name)
                         .map(build_field_keys)
                         .unwrap_or_default();
@@ -1079,7 +1173,7 @@ pub fn run_probe_skeleton(
             );
 
             if probe_events.is_empty() {
-                return (None, diag);
+                return (None, diag, Vec::new());
             }
 
             // Stitch by task_struct pointer. Build a map of func_idx ->
@@ -1104,7 +1198,10 @@ pub fn run_probe_skeleton(
                         return Some((*idx, *tidx as usize));
                     }
                     // Fallback: BTF params with task_struct
-                    let btf = btf_funcs.iter().find(|f| f.name == *name)?;
+                    let btf = btf_funcs
+                        .iter()
+                        .chain(phase_b_btf.iter())
+                        .find(|f| f.name == *name)?;
                     let pos = btf
                         .params
                         .iter()
@@ -1128,7 +1225,7 @@ pub fn run_probe_skeleton(
                 // No causal task (stall, sysrq, unregistration) —
                 // suppress probe output rather than dumping unstitched noise.
                 tracing::debug!("no causal tptr — suppressing probe output");
-                return (None, diag);
+                return (None, diag, Vec::new());
             };
 
             let before = probe_events.len();
@@ -1153,9 +1250,553 @@ pub fn run_probe_skeleton(
                 last.kstack = trigger_kstack;
             }
 
-            return (Some(probe_events), diag);
+            let fnames: Vec<(u32, String)> = func_ips
+                .iter()
+                .map(|(idx, _, name)| (*idx, name.clone()))
+                .collect();
+            return (Some(probe_events), diag, fnames);
         }
     }
+}
+
+/// Attach Phase B probes after the scheduler starts.
+///
+/// Handles both kernel callers (kprobes + kernel fexit) and BPF
+/// callbacks (fentry/fexit). Uses `pb.func_idx_offset` for all
+/// func_idx values to avoid collisions with Phase A indices.
+///
+/// Kprobes are attached via the Phase A kprobe skeleton (`skel`),
+/// which stays alive throughout. BPF fentry/fexit use separate
+/// skeleton loads that share `probe_data` and `func_meta_map` via
+/// `reuse_fd`.
+fn attach_phase_b_fentry(
+    skel: &crate::bpf_skel::ProbeSkel<'_>,
+    pb: &PhaseBInput,
+    func_ips: &mut Vec<(u32, u64, String)>,
+    fentry_links: &mut Vec<libbpf_rs::Link>,
+    fexit_links: &mut Vec<libbpf_rs::Link>,
+    links: &mut Vec<(libbpf_rs::Link, String)>,
+    diag: &mut ProbeDiagnostics,
+) {
+    use libbpf_rs::MapCore;
+    use libbpf_rs::MapFlags;
+    use libbpf_rs::skel::{OpenSkel, SkelBuilder};
+
+    const FENTRY_BATCH: usize = 4;
+
+    struct FentryTarget<'a> {
+        slot: usize,
+        fd: i32,
+        idx: u32,
+        name: &'a str,
+        ok: bool,
+        is_kernel: bool,
+    }
+
+    let offset = pb.func_idx_offset;
+
+    // --- Phase B kernel functions: kprobes + func_meta ---
+    for (i, func) in pb.functions.iter().enumerate() {
+        if func.is_bpf {
+            continue;
+        }
+        let idx = offset + i as u32;
+        let ip = match resolve_func_ip(&func.raw_name) {
+            Some(ip) => ip,
+            None => {
+                tracing::warn!(func = %func.raw_name, "phase_b: could not resolve function IP");
+                diag.kprobe_resolve_failed.push(func.raw_name.clone());
+                continue;
+            }
+        };
+
+        let mut meta = types::func_meta {
+            func_idx: idx,
+            ..Default::default()
+        };
+
+        if let Some(btf_func) = pb.btf_funcs.iter().find(|f| f.name == func.raw_name) {
+            let field_specs = super::btf::resolve_field_specs(btf_func, None);
+            populate_field_specs(&mut meta, &field_specs);
+            meta.str_param_idx = detect_str_param(btf_func);
+        }
+
+        let key_bytes = ip.to_ne_bytes();
+        let meta_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &meta as *const _ as *const u8,
+                std::mem::size_of::<types::func_meta>(),
+            )
+        };
+
+        if let Err(e) = skel
+            .maps
+            .func_meta_map
+            .update(&key_bytes, meta_bytes, MapFlags::ANY)
+        {
+            tracing::warn!(%e, func = %func.raw_name, "phase_b: failed to update func_meta_map");
+            continue;
+        }
+
+        // Attach kprobe using Phase A's skeleton.
+        match skel.progs.ktstr_probe.attach_kprobe(false, &func.raw_name) {
+            Ok(link) => {
+                links.push((link, func.raw_name.clone()));
+                diag.kprobe_attached += 1;
+            }
+            Err(e) => {
+                tracing::warn!(%e, func = %func.raw_name, "phase_b kprobe attach failed");
+                diag.kprobe_attach_failed
+                    .push((func.raw_name.clone(), e.to_string()));
+            }
+        }
+
+        diag.kprobe_resolved += 1;
+        func_ips.push((idx, ip, func.display_name.clone()));
+    }
+
+    // --- Phase B kernel function fexit batches (fd=0 = vmlinux BTF) ---
+    struct KernelFexitTarget {
+        idx: u32,
+        name: String,
+    }
+    let kernel_fexit_targets: Vec<KernelFexitTarget> = pb
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.is_bpf)
+        .map(|(i, f)| KernelFexitTarget {
+            idx: offset + i as u32,
+            name: f.display_name.clone(),
+        })
+        .collect();
+
+    for chunk in kernel_fexit_targets.chunks(FENTRY_BATCH) {
+        let mut targets: Vec<FentryTarget<'_>> = Vec::new();
+        for (slot, kt) in chunk.iter().enumerate() {
+            targets.push(FentryTarget {
+                slot,
+                fd: 0,
+                idx: kt.idx,
+                name: &kt.name,
+                ok: false,
+                is_kernel: true,
+            });
+        }
+
+        use crate::bpf_skel::fentry::*;
+        let mut fentry_open_obj = std::mem::MaybeUninit::uninit();
+        let fentry_builder = FentryProbeSkelBuilder::default();
+        let mut fentry_open = match fentry_builder.open(&mut fentry_open_obj) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "phase_b kernel fexit skeleton open failed");
+                continue;
+            }
+        };
+
+        if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
+            rodata.ktstr_enabled = true;
+            for t in &targets {
+                let k = t.is_kernel as u8;
+                match t.slot {
+                    0 => {
+                        rodata.ktstr_fentry_func_idx_0 = t.idx;
+                        rodata.ktstr_fentry_is_kernel_0 = k;
+                    }
+                    1 => {
+                        rodata.ktstr_fentry_func_idx_1 = t.idx;
+                        rodata.ktstr_fentry_is_kernel_1 = k;
+                    }
+                    2 => {
+                        rodata.ktstr_fentry_func_idx_2 = t.idx;
+                        rodata.ktstr_fentry_is_kernel_2 = k;
+                    }
+                    3 => {
+                        rodata.ktstr_fentry_func_idx_3 = t.idx;
+                        rodata.ktstr_fentry_is_kernel_3 = k;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for t in targets.iter_mut() {
+            let fentry_prog = match t.slot {
+                0 => &mut fentry_open.progs.ktstr_fentry_0,
+                1 => &mut fentry_open.progs.ktstr_fentry_1,
+                2 => &mut fentry_open.progs.ktstr_fentry_2,
+                3 => &mut fentry_open.progs.ktstr_fentry_3,
+                _ => continue,
+            };
+            fentry_prog.set_autoload(false);
+
+            let fexit_prog = match t.slot {
+                0 => &mut fentry_open.progs.ktstr_fexit_0,
+                1 => &mut fentry_open.progs.ktstr_fexit_1,
+                2 => &mut fentry_open.progs.ktstr_fexit_2,
+                3 => &mut fentry_open.progs.ktstr_fexit_3,
+                _ => continue,
+            };
+            match fexit_prog.set_attach_target(0, Some(t.name.to_string())) {
+                Ok(()) => {
+                    t.ok = true;
+                }
+                Err(e) => {
+                    tracing::debug!(func = t.name, %e, "phase_b kernel fexit: set_attach_target failed");
+                    fexit_prog.set_autoload(false);
+                }
+            }
+        }
+
+        if !targets.iter().any(|t| t.ok) {
+            continue;
+        }
+
+        let used_slots: std::collections::HashSet<usize> =
+            targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
+        for slot in 0..FENTRY_BATCH {
+            if !used_slots.contains(&slot) {
+                match slot {
+                    0 => fentry_open.progs.ktstr_fexit_0.set_autoload(false),
+                    1 => fentry_open.progs.ktstr_fexit_1.set_autoload(false),
+                    2 => fentry_open.progs.ktstr_fexit_2.set_autoload(false),
+                    3 => fentry_open.progs.ktstr_fexit_3.set_autoload(false),
+                    _ => {}
+                }
+            }
+        }
+
+        use std::os::unix::io::AsFd;
+        if let Err(e) = fentry_open
+            .maps
+            .probe_data
+            .reuse_fd(skel.maps.probe_data.as_fd())
+        {
+            tracing::warn!(%e, "phase_b kernel fexit: probe_data reuse_fd failed");
+        }
+        if let Err(e) = fentry_open
+            .maps
+            .func_meta_map
+            .reuse_fd(skel.maps.func_meta_map.as_fd())
+        {
+            tracing::warn!(%e, "phase_b kernel fexit: func_meta_map reuse_fd failed");
+        }
+
+        let fentry_skel = match fentry_open.load() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "phase_b kernel fexit: batch load failed");
+                continue;
+            }
+        };
+
+        for t in &targets {
+            if !t.ok {
+                continue;
+            }
+            let result = match t.slot {
+                0 => fentry_skel.progs.ktstr_fexit_0.attach_trace(),
+                1 => fentry_skel.progs.ktstr_fexit_1.attach_trace(),
+                2 => fentry_skel.progs.ktstr_fexit_2.attach_trace(),
+                3 => fentry_skel.progs.ktstr_fexit_3.attach_trace(),
+                _ => continue,
+            };
+            match result {
+                Ok(link) => {
+                    tracing::debug!(func = t.name, "phase_b kernel fexit attached");
+                    fexit_links.push(link);
+                }
+                Err(e) => {
+                    tracing::debug!(%e, func = t.name, "phase_b kernel fexit attach failed");
+                }
+            }
+        }
+
+        drop(fentry_skel);
+    }
+
+    // --- Phase B BPF callback fentry/fexit batches ---
+    let valid_bpf: Vec<(u32, &StackFunction)> = pb
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.bpf_prog_id.is_some())
+        .map(|(i, f)| (offset + i as u32, f))
+        .collect();
+    diag.fentry_candidates += valid_bpf.len() as u32;
+
+    for chunk in valid_bpf.chunks(FENTRY_BATCH) {
+        let mut targets: Vec<FentryTarget<'_>> = Vec::new();
+        for (slot, (idx, func)) in chunk.iter().enumerate() {
+            let prog_id = func.bpf_prog_id.unwrap();
+            let fd = if let Some(&pre_fd) = pb.bpf_prog_fds.get(&prog_id) {
+                let dup_fd = unsafe { libc::dup(pre_fd) };
+                if dup_fd < 0 {
+                    tracing::warn!(prog_id, func = %func.display_name, "phase_b fentry: dup failed");
+                    diag.fentry_attach_failed.push((
+                        func.display_name.clone(),
+                        format!("dup(pre_fd={pre_fd}) failed"),
+                    ));
+                    continue;
+                }
+                dup_fd
+            } else {
+                let fd = unsafe { libbpf_rs::libbpf_sys::bpf_prog_get_fd_by_id(prog_id) };
+                if fd < 0 {
+                    tracing::warn!(prog_id, func = %func.display_name, "phase_b fentry: failed to get fd");
+                    diag.fentry_attach_failed.push((
+                        func.display_name.clone(),
+                        format!("bpf_prog_get_fd_by_id({prog_id}) returned {fd}"),
+                    ));
+                    continue;
+                }
+                fd
+            };
+            targets.push(FentryTarget {
+                slot,
+                fd,
+                idx: *idx,
+                name: &func.display_name,
+                ok: false,
+                is_kernel: false,
+            });
+        }
+        if targets.is_empty() {
+            continue;
+        }
+
+        use crate::bpf_skel::fentry::*;
+        let mut fentry_open_obj = std::mem::MaybeUninit::uninit();
+        let fentry_builder = FentryProbeSkelBuilder::default();
+        let mut fentry_open = match fentry_builder.open(&mut fentry_open_obj) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "phase_b fentry skeleton open failed");
+                for t in &targets {
+                    unsafe { libc::close(t.fd) };
+                }
+                continue;
+            }
+        };
+
+        if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
+            rodata.ktstr_enabled = true;
+            for t in &targets {
+                let k = t.is_kernel as u8;
+                match t.slot {
+                    0 => {
+                        rodata.ktstr_fentry_func_idx_0 = t.idx;
+                        rodata.ktstr_fentry_is_kernel_0 = k;
+                    }
+                    1 => {
+                        rodata.ktstr_fentry_func_idx_1 = t.idx;
+                        rodata.ktstr_fentry_is_kernel_1 = k;
+                    }
+                    2 => {
+                        rodata.ktstr_fentry_func_idx_2 = t.idx;
+                        rodata.ktstr_fentry_is_kernel_2 = k;
+                    }
+                    3 => {
+                        rodata.ktstr_fentry_func_idx_3 = t.idx;
+                        rodata.ktstr_fentry_is_kernel_3 = k;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for t in targets.iter_mut() {
+            let fentry_prog = match t.slot {
+                0 => &mut fentry_open.progs.ktstr_fentry_0,
+                1 => &mut fentry_open.progs.ktstr_fentry_1,
+                2 => &mut fentry_open.progs.ktstr_fentry_2,
+                3 => &mut fentry_open.progs.ktstr_fentry_3,
+                _ => continue,
+            };
+            match fentry_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
+                Ok(()) => {
+                    t.ok = true;
+                }
+                Err(e) => {
+                    tracing::warn!(slot = t.slot, func = t.name, %e, "phase_b fentry: set_attach_target failed");
+                    diag.fentry_attach_failed
+                        .push((t.name.to_string(), format!("set_attach_target: {e}")));
+                    continue;
+                }
+            }
+            let fexit_prog = match t.slot {
+                0 => &mut fentry_open.progs.ktstr_fexit_0,
+                1 => &mut fentry_open.progs.ktstr_fexit_1,
+                2 => &mut fentry_open.progs.ktstr_fexit_2,
+                3 => &mut fentry_open.progs.ktstr_fexit_3,
+                _ => continue,
+            };
+            if let Err(e) = fexit_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
+                tracing::debug!(slot = t.slot, func = t.name, %e, "phase_b fexit: set_attach_target failed (entry-only)");
+                fexit_prog.set_autoload(false);
+            }
+        }
+
+        if !targets.iter().any(|t| t.ok) {
+            for t in &targets {
+                unsafe { libc::close(t.fd) };
+            }
+            continue;
+        }
+
+        let used_slots: std::collections::HashSet<usize> =
+            targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
+        for slot in 0..FENTRY_BATCH {
+            if !used_slots.contains(&slot) {
+                match slot {
+                    0 => {
+                        fentry_open.progs.ktstr_fentry_0.set_autoload(false);
+                        fentry_open.progs.ktstr_fexit_0.set_autoload(false);
+                    }
+                    1 => {
+                        fentry_open.progs.ktstr_fentry_1.set_autoload(false);
+                        fentry_open.progs.ktstr_fexit_1.set_autoload(false);
+                    }
+                    2 => {
+                        fentry_open.progs.ktstr_fentry_2.set_autoload(false);
+                        fentry_open.progs.ktstr_fexit_2.set_autoload(false);
+                    }
+                    3 => {
+                        fentry_open.progs.ktstr_fentry_3.set_autoload(false);
+                        fentry_open.progs.ktstr_fexit_3.set_autoload(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        use std::os::unix::io::AsFd;
+        if let Err(e) = fentry_open
+            .maps
+            .probe_data
+            .reuse_fd(skel.maps.probe_data.as_fd())
+        {
+            tracing::warn!(%e, "phase_b fentry: probe_data reuse_fd failed");
+        }
+        if let Err(e) = fentry_open
+            .maps
+            .func_meta_map
+            .reuse_fd(skel.maps.func_meta_map.as_fd())
+        {
+            tracing::warn!(%e, "phase_b fentry: func_meta_map reuse_fd failed");
+        }
+
+        let fentry_skel = match fentry_open.load() {
+            Ok(s) => {
+                for t in &targets {
+                    unsafe { libc::close(t.fd) };
+                }
+                s
+            }
+            Err(e) => {
+                tracing::warn!(%e, "phase_b fentry: batch load failed");
+                for t in &targets {
+                    if t.ok {
+                        diag.fentry_attach_failed
+                            .push((t.name.to_string(), format!("batch load: {e}")));
+                    }
+                    unsafe { libc::close(t.fd) };
+                }
+                continue;
+            }
+        };
+
+        for t in &targets {
+            if !t.ok {
+                continue;
+            }
+
+            let sentinel_ip = (t.idx as u64) | (1u64 << 63);
+            let mut meta = crate::bpf_skel::types::func_meta {
+                func_idx: t.idx,
+                ..Default::default()
+            };
+
+            if let Some(btf_func) = pb.btf_funcs.iter().find(|f| f.name == t.name) {
+                let mut field_specs = super::btf::resolve_field_specs(btf_func, None);
+                if field_specs.is_empty()
+                    && let Some(prog_id) = pb
+                        .functions
+                        .iter()
+                        .find(|f| f.display_name == t.name)
+                        .and_then(|f| f.bpf_prog_id)
+                {
+                    field_specs = super::btf::resolve_bpf_field_specs(btf_func, prog_id);
+                }
+                populate_field_specs(&mut meta, &field_specs);
+                meta.str_param_idx = detect_str_param(btf_func);
+            }
+
+            let key_bytes = sentinel_ip.to_ne_bytes();
+            let meta_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &meta as *const _ as *const u8,
+                    std::mem::size_of::<crate::bpf_skel::types::func_meta>(),
+                )
+            };
+            if let Err(e) = skel
+                .maps
+                .func_meta_map
+                .update(&key_bytes, meta_bytes, MapFlags::ANY)
+            {
+                tracing::warn!(%e, func = t.name, "phase_b fentry: failed to update func_meta_map");
+                continue;
+            }
+            func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
+
+            let result = match t.slot {
+                0 => fentry_skel.progs.ktstr_fentry_0.attach_trace(),
+                1 => fentry_skel.progs.ktstr_fentry_1.attach_trace(),
+                2 => fentry_skel.progs.ktstr_fentry_2.attach_trace(),
+                3 => fentry_skel.progs.ktstr_fentry_3.attach_trace(),
+                _ => continue,
+            };
+            match result {
+                Ok(link) => {
+                    tracing::debug!(func = t.name, "phase_b fentry attached");
+                    fentry_links.push(link);
+                }
+                Err(e) => {
+                    tracing::warn!(%e, func = t.name, "phase_b fentry attach failed");
+                    diag.fentry_attach_failed
+                        .push((t.name.to_string(), e.to_string()));
+                }
+            }
+            let fexit_result = match t.slot {
+                0 => fentry_skel.progs.ktstr_fexit_0.attach_trace(),
+                1 => fentry_skel.progs.ktstr_fexit_1.attach_trace(),
+                2 => fentry_skel.progs.ktstr_fexit_2.attach_trace(),
+                3 => fentry_skel.progs.ktstr_fexit_3.attach_trace(),
+                _ => continue,
+            };
+            match fexit_result {
+                Ok(link) => {
+                    tracing::debug!(func = t.name, "phase_b fexit attached");
+                    fexit_links.push(link);
+                }
+                Err(e) => {
+                    tracing::debug!(%e, func = t.name, "phase_b fexit attach failed (entry-only)");
+                }
+            }
+        }
+
+        drop(fentry_skel);
+    }
+
+    diag.fentry_attached = fentry_links.len() as u32;
+    tracing::debug!(
+        fentry = fentry_links.len(),
+        fexit = fexit_links.len(),
+        bpf_targets = valid_bpf.len(),
+        kernel_targets = kernel_fexit_targets.len(),
+        "Phase B probes attached",
+    );
 }
 
 #[cfg(test)]
