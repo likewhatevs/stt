@@ -255,7 +255,8 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
         }
     }
     // When kernel is None, the test framework discovers a kernel via
-    // find_kernel() (which now includes cache lookup).
+    // resolve_test_kernel() (KTSTR_TEST_KERNEL, then find_kernel() for
+    // cache and filesystem fallbacks).
 
     eprintln!("cargo-ktstr: running tests");
     let err = cmd.exec();

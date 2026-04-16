@@ -12,12 +12,13 @@ Build the kernel (if needed) and run tests via `cargo nextest run`.
 cargo ktstr test                                               # auto-discover kernel
 cargo ktstr test --kernel ../linux                             # local source tree
 cargo ktstr test --kernel 6.14.2                               # cached version
-cargo ktstr test --kernel 6.14.2-tarball-x86_64                # explicit cache key
+cargo ktstr test --kernel 6.14.2-tarball-x86_64-kc...          # cache key (from kernel list)
 ```
 
 `--kernel` accepts a path, version string, or cache key. When absent,
-the test framework discovers a kernel via `find_kernel()` (cache then
-filesystem). When `--kernel` is a path, cargo-ktstr configures and
+the test framework discovers a kernel via `resolve_test_kernel()`
+(`KTSTR_TEST_KERNEL` env var, then `find_kernel()` for cache and
+filesystem fallbacks). When `--kernel` is a path, cargo-ktstr configures and
 builds the kernel before running tests. Version strings and cache
 keys resolve from the cache only -- they error if not cached (run
 `cargo ktstr kernel build VERSION` first).

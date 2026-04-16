@@ -6,8 +6,8 @@ Environment variables that control ktstr behavior.
 
 | Variable | Description | Default |
 |---|---|---|
-| `KTSTR_KERNEL` | Kernel identifier for build-time BTF resolution and runtime image discovery. Accepts a path (`../linux`), version string (`6.14.2`), or cache key (`6.14.2-tarball-x86_64`). At build time, only paths are used (BTF from `vmlinux`). At runtime, version strings and cache keys resolve via the XDG cache; paths search only the specified directory (error if no image found). Set automatically by `cargo ktstr test --kernel`. | Auto-discovered |
-| `KTSTR_TEST_KERNEL` | Path to a bootable kernel image (bzImage). See [Getting Started](../getting-started.md#build-a-kernel) and [Troubleshooting](../troubleshooting.md#no-kernel-found) for search order. | Auto-discovered |
+| `KTSTR_KERNEL` | Kernel identifier for build-time BTF resolution and runtime image discovery. Accepts a path (`../linux`), version string (`6.14.2`), or cache key (use `cargo ktstr kernel list` for actual keys). At build time, only paths are used (BTF from `vmlinux`). At runtime, version strings and cache keys resolve via the XDG cache; paths search only the specified directory (error if no image found). Set automatically by `cargo ktstr test --kernel`. | Auto-discovered |
+| `KTSTR_TEST_KERNEL` | Path to a bootable kernel image (bzImage). See [Getting Started](../getting-started.md#kernel-discovery) and [Troubleshooting](../troubleshooting.md#no-kernel-found) for search order. | Auto-discovered |
 | `KTSTR_CACHE_DIR` | Override the kernel image cache directory. When set, all cache operations use this path instead of the XDG default. | `$XDG_CACHE_HOME/ktstr/kernels/` or `$HOME/.cache/ktstr/kernels/` |
 | `KTSTR_GHA_CACHE` | Set to `"1"` to enable remote kernel cache via GitHub Actions cache service. Requires `ACTIONS_CACHE_URL` (set by the GHA runner). Local cache is always authoritative; remote failures are non-fatal. | None (disabled) |
 | `KTSTR_SCHEDULER` | Path to a scheduler binary for `SchedulerSpec::Name`. See [Troubleshooting](../troubleshooting.md#scheduler-not-found) for search order. | Auto-discovered |

@@ -110,8 +110,8 @@ Tests require a bootable Linux kernel. ktstr searches (in order):
 1. `KTSTR_TEST_KERNEL` environment variable (direct image path)
 2. `KTSTR_KERNEL` environment variable, parsed as a `KernelId`:
    - Path: search that directory for `arch/<arch>/boot/<image>`
-   - Version (e.g. `6.14.2`): look up `{ver}-tarball-{arch}` in XDG cache
-   - Cache key (e.g. `6.14.2-tarball-x86_64`): exact cache lookup
+   - Version (e.g. `6.14.2`): look up the version in XDG cache
+   - Cache key (from `cargo ktstr kernel list`): exact cache lookup
 3. XDG cache: most recent cached image (newest first). Skipped when
    `KTSTR_KERNEL` was an explicit version or cache key that missed.
 4. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
