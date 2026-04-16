@@ -126,9 +126,8 @@ Values are arrays of string literals or path expressions from
 These constrain `generate_profiles()`: `required_flags` are always
 included, `excluded_flags` are never included. Invalid combinations
 (e.g. `steal` without `llc`) are still rejected by dependency checks.
-The gauntlet uses these attributes to determine which flag
-profiles each test runs with. See
-[Gauntlet](../running-tests/gauntlet.md#flag-profiles).
+See [Gauntlet Tests](gauntlet-tests.md#controlling-flag-coverage)
+for profile generation examples.
 
 ### Topology constraints
 
@@ -142,13 +141,12 @@ profiles each test runs with. See
 | `max_numa_nodes` | 1 | Maximum NUMA nodes for gauntlet topology filtering |
 | `requires_smt` | `false` | Require SMT (threads > 1) topologies |
 
-The gauntlet skips topology presets that do not satisfy these
-constraints. A test with `min_llcs = 3` will not run on `tiny-1llc`
-(1 LLC) or `tiny-2llc` (2 LLCs). Multi-NUMA presets are excluded by
-default (`max_numa_nodes = 1`); set `max_numa_nodes` higher to
-include them. The gauntlet uses these attributes to filter which
-presets each test runs on. See
-[Gauntlet](../running-tests/gauntlet.md#topology-presets).
+The gauntlet skips presets that do not satisfy these constraints.
+Multi-NUMA presets are excluded by default (`max_numa_nodes = 1`).
+See [Gauntlet](../running-tests/gauntlet.md#constraint-filtering)
+for filtering rules and
+[Gauntlet Tests](gauntlet-tests.md#worked-example) for a worked
+example.
 
 ### Execution
 

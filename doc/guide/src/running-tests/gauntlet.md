@@ -84,27 +84,11 @@ on. A preset is skipped when any constraint is not met:
 - `total_cpus() < min_cpus`
 - `max_cpus` is set and `total_cpus() > max_cpus`
 
-Example:
-
-```rust,ignore
-#[ktstr_test(
-    llcs = 2, cores = 4, threads = 2,
-    scheduler = MY_SCHED,
-    min_llcs = 2,
-    requires_smt = true,
-    required_flags = ["llc"],
-)]
-fn cross_llc_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
-```
-
-This test skips `tiny-1llc` (1 LLC), all non-SMT presets, and all
-multi-NUMA presets (default `max_numa_nodes = 1`). Default
-`max_llcs = 12` and `max_cpus = 192` further exclude `near-max-llc`
-and `max-cpu`. Every generated flag profile includes `llc`.
-
 See [Topology Constraints](../writing-tests/ktstr-test-macro.md#topology-constraints)
-and [Flag Constraints](../writing-tests/ktstr-test-macro.md#flag-constraints)
-for the full attribute lists.
+for the full attribute table and
+[Gauntlet Tests](../writing-tests/gauntlet-tests.md#worked-example)
+for a worked example showing which presets survive a given constraint
+set.
 
 ## Flag profiles
 
