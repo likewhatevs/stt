@@ -200,13 +200,15 @@ struct SratCpuAffinity {
 }
 
 /// SRAT memory affinity (type 1, 40 bytes).
+///
+/// Layout matches kernel `acpi_srat_mem_affinity` (actbl3.h).
+/// Proximity domain is a contiguous u32 at offset 2 for SRAT rev >= 2.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 struct SratMemAffinity {
     entry_type: u8,
     length: u8,
-    proximity_domain_lo: u16, // low 16 bits (we put full u32 split)
-    proximity_domain_hi: u16, // high 16 bits
+    proximity_domain: u32,
     _reserved0: u16,
     base_address: u64,
     address_length: u64,
@@ -456,8 +458,7 @@ fn write_srat(
         let entry = SratMemAffinity {
             entry_type: 1,
             length: std::mem::size_of::<SratMemAffinity>() as u8,
-            proximity_domain_lo: node as u16,
-            proximity_domain_hi: (node >> 16) as u16,
+            proximity_domain: node,
             base_address: base,
             address_length: length,
             flags: 1,
@@ -1390,9 +1391,7 @@ mod tests {
             let mut prev_end: u64 = 0;
             let mut total: u64 = 0;
             for (i, (_, _, data)) in mem_entries.iter().enumerate() {
-                let prox_lo = u16::from_le_bytes(data[2..4].try_into().unwrap()) as u32;
-                let prox_hi = u16::from_le_bytes(data[4..6].try_into().unwrap()) as u32;
-                let prox_domain = (prox_hi << 16) | prox_lo;
+                let prox_domain = u32::from_le_bytes(data[2..6].try_into().unwrap());
                 assert_eq!(
                     prox_domain, i as u32,
                     "node {i}: proximity_domain {prox_domain} != {i} \
