@@ -610,35 +610,31 @@ pub(crate) type MonitorLoopResult = (
     Option<super::WatchdogObservation>,
 );
 
-/// Run the monitor loop, sampling all CPUs at the given interval.
-/// Returns collected samples when `kill` is set.
-///
-/// `event_pcpu_pas`: optional per-CPU physical addresses of `scx_sched_pcpu`.
-/// When present (and `event_offsets` exist), each sample includes event counters.
-///
-/// `dump_trigger`: optional reactive dump configuration. When a sustained
-/// threshold violation is detected, writes the dump request flag to guest
-/// SHM to trigger a SysRq-D dump inside the guest.
-///
-/// `page_offset`: runtime `PAGE_OFFSET` for direct-mapping KVA translation.
-/// Used by sched_domain tree walking to translate `rq->sd` and
-/// `sd->parent` pointers.
-///
 /// Configuration for the monitor sampling loop.
 ///
 /// Bundles the parameters that `monitor_loop` needs beyond the
 /// required `mem`, `rq_pas`, `offsets`, `interval`, `kill`, and `start`.
 pub(crate) struct MonitorConfig<'a> {
+    /// Per-CPU physical addresses of `scx_sched_pcpu`. When present (and
+    /// `event_offsets` exist), each sample includes event counters.
     pub event_pcpu_pas: Option<&'a [u64]>,
+    /// Reactive dump configuration. When a sustained threshold violation is
+    /// detected, writes the dump request flag to guest SHM to trigger a
+    /// SysRq-D dump inside the guest.
     pub dump_trigger: Option<&'a DumpTrigger>,
     pub watchdog_override: Option<&'a WatchdogOverride>,
     pub vcpu_timing: Option<&'a VcpuTiming>,
     pub preemption_threshold_ns: u64,
     pub shm_base_pa: Option<u64>,
     pub prog_stats_ctx: Option<&'a ProgStatsCtx>,
+    /// Runtime `PAGE_OFFSET` for direct-mapping KVA translation. Used by
+    /// sched_domain tree walking to translate `rq->sd` and `sd->parent`
+    /// pointers.
     pub page_offset: u64,
 }
 
+/// Run the monitor loop, sampling all CPUs at the given interval.
+/// Returns collected samples when `kill` is set.
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
     rq_pas: &[u64],
