@@ -68,53 +68,17 @@ ktstr cleanup
 ktstr cleanup --parent-cgroup /sys/fs/cgroup/ktstr
 ```
 
-### kernel list
+### kernel
 
-List cached kernel images:
-
-```sh
-ktstr kernel list
-ktstr kernel list --json
-```
-
-### kernel build
-
-Download, build, and cache a kernel image:
-
-```sh
-ktstr kernel build 6.14.2
-ktstr kernel build 6.15-rc3
-ktstr kernel build                                    # latest stable
-ktstr kernel build --source ../linux
-ktstr kernel build --git https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git --ref v6.14
-ktstr kernel build --force 6.14.2
-ktstr kernel build --source ../linux --clean
-```
-
-Three source modes: positional VERSION (tarball download), `--source PATH`
-(local tree), `--git URL --ref REF` (shallow clone). Without arguments,
-downloads the latest stable release.
-
-`--force` rebuilds even if a cached image exists. `--clean` runs
-`make mrproper` before configuring (local source only). Dirty trees
-(uncommitted changes) are built but not cached.
-
-### kernel clean
-
-Remove cached kernel images:
-
-```sh
-ktstr kernel clean
-ktstr kernel clean --keep 2
-ktstr kernel clean --force
-```
-
-`--keep N` retains the N most recent entries. Without `--force`,
-prompts for confirmation (requires a terminal).
+The `kernel` subcommand manages cached kernel images. Subcommands:
+`list`, `build`, `clean`. See
+[cargo-ktstr kernel](cargo-ktstr.md#kernel) for full documentation
+-- the kernel subcommands are identical in both binaries.
 
 ### shell
 
-Boot an interactive shell in a KVM virtual machine:
+Boot an interactive shell in a KVM virtual machine. Launches a VM
+with busybox and drops into a shell.
 
 ```sh
 ktstr shell
@@ -125,27 +89,32 @@ ktstr shell -i /path/to/binary
 ktstr shell -i my_tool -i another_tool
 ```
 
-Launches a VM with busybox and drops into a shell. The `--kernel`
-flag accepts the same identifiers as other subcommands (path, version,
-cache key). Without `--kernel`, resolves automatically via cache then
-filesystem.
-
-`--topology` sets the guest CPU topology as `numa_nodes,llcs,cores,threads`
-(default: `1,1,1,1`).
-
-Files and directories passed via `-i`/`--include-files` are available
-at `/include-files/<name>` inside the guest. Directories are walked
+Files and directories passed via `-i` are available at
+`/include-files/<name>` inside the guest. Directories are walked
 recursively, preserving structure (e.g. `-i ./release` includes all
 files under `release/` at `/include-files/release/...`). Bare names
-are resolved via PATH. Dynamically-linked ELF binaries get automatic
-shared library resolution.
+(without path separators) are resolved via `PATH` lookup.
+Dynamically-linked ELF binaries get automatic shared library
+resolution via ELF DT_NEEDED parsing. Non-ELF files are copied as-is.
 
-`--memory-mb` sets guest memory in MB (minimum 128). When absent, memory
-is computed from the actual initramfs size after build.
+Stdin is a terminal requirement. The host terminal enters raw mode
+for bidirectional stdin/stdout forwarding. Terminal state is restored
+on all exit paths.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kernel ID` | auto | Kernel identifier (path, version, or cache key). |
+| `--topology N,L,C,T` | `1,1,1,1` | Virtual CPU topology as `numa_nodes,llcs,cores,threads`. All values must be >= 1. |
+| `-i, --include-files PATH` | -- | Files or directories to include in the guest. Repeatable. Directories are walked recursively. |
+| `--memory-mb MB` | auto | Guest memory in MB (minimum 128). When absent, estimated from payload and include file sizes. |
+| `--dmesg` | off | Forward kernel console (COM1/dmesg) to stderr in real-time. Sets loglevel=7 for verbose kernel output. |
+| `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
+
+The same subcommand is available as `cargo ktstr shell`.
 
 ### completions
 
-Generate shell completions:
+Generate shell completions for ktstr.
 
 ```sh
 ktstr completions bash
@@ -153,4 +122,9 @@ ktstr completions zsh
 ktstr completions fish
 ```
 
-Supported shells: bash, zsh, fish, elvish, powershell.
+| Arg | Description |
+|------|-------------|
+| `SHELL` | Shell to generate completions for (`bash`, `zsh`, `fish`, `elvish`, `powershell`). |
+
+The same subcommand is available as `cargo ktstr completions` (which
+also accepts `--binary` to set the binary name for completions).

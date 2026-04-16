@@ -83,7 +83,7 @@ cargo ktstr coverage -- --features integration
 ## kernel
 
 Manage cached kernel images. Three subcommands: `list`, `build`,
-`clean`.
+`clean`. The standalone `ktstr kernel` subcommands are identical.
 
 ### kernel list
 
@@ -111,13 +111,15 @@ version (tarball download), `--source` (local tree), `--git` (clone).
 cargo ktstr kernel build                               # latest stable from kernel.org
 cargo ktstr kernel build 6.14.2                        # specific version
 cargo ktstr kernel build 6.15-rc3                      # RC release
+cargo ktstr kernel build 6.12                          # latest 6.12.x patch release
 cargo ktstr kernel build --source ../linux             # local source tree
 cargo ktstr kernel build --git URL --ref v6.14         # git clone (shallow, depth 1)
 cargo ktstr kernel build --force 6.14.2                # rebuild even if cached
 ```
 
 When no version or source is given, fetches the latest stable version
-from kernel.org's `releases.json`. Skips building when a cached entry
+from kernel.org's `releases.json`. A major.minor prefix (e.g. `6.12`)
+resolves to the latest patch release in that series. Skips building when a cached entry
 already exists (use `--force` to override). Stale entries (built with
 a different `ktstr.kconfig`) are rebuilt automatically. For
 `--source`, generates `compile_commands.json` for LSP support. Dirty
@@ -126,7 +128,7 @@ cached.
 
 | Flag | Description |
 |------|-------------|
-| `VERSION` | Kernel version to download (e.g. `6.14.2`, `6.15-rc3`). Conflicts with `--source` and `--git`. |
+| `VERSION` | Kernel version to download (e.g. `6.14.2`, `6.15-rc3`). A major.minor prefix (e.g. `6.12`) resolves to the latest patch release. Conflicts with `--source` and `--git`. |
 | `--source PATH` | Path to existing kernel source directory. Conflicts with `VERSION` and `--git`. |
 | `--git URL` | Git URL to clone. Requires `--ref`. Conflicts with `VERSION` and `--source`. |
 | `--ref REF` | Git ref to checkout (branch, tag, commit). Required with `--git`. |
@@ -186,8 +188,9 @@ output format.
 
 ## shell
 
-Boot an interactive shell in a KVM virtual machine. Launches a VM
-with busybox and drops into a shell.
+Identical to the standalone `ktstr shell` -- see
+[ktstr shell](ktstr.md#shell) for full documentation and flag
+reference.
 
 ```sh
 cargo ktstr shell
@@ -196,28 +199,10 @@ cargo ktstr shell --topology 1,2,4,1
 cargo ktstr shell -i ./my-binary -i strace
 ```
 
-Files and directories passed via `-i` are available at
-`/include-files/<name>` inside the guest. Directories are walked
-recursively, preserving structure (e.g. `-i ./release` includes all
-files under `release/` at `/include-files/release/...`). Bare names
-(without path separators) are resolved via `PATH` lookup.
-Dynamically-linked ELF binaries get automatic shared library
-resolution via ELF DT_NEEDED parsing. Non-ELF files are copied as-is.
-
-Stdin is a terminal requirement. The host terminal enters raw mode
-for bidirectional stdin/stdout forwarding. Terminal state is restored
-on all exit paths.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--kernel ID` | auto | Kernel identifier (path, version, or cache key). |
-| `--topology N,L,C,T` | `1,1,1,1` | Virtual CPU topology as `numa_nodes,llcs,cores,threads`. All values must be >= 1. |
-| `-i, --include-files PATH` | -- | Files or directories to include in the guest. Repeatable. Directories are walked recursively. |
-| `--memory-mb MB` | auto | Guest memory in MB (minimum 128). When absent, computed from actual initramfs size after build. |
-
 ## completions
 
-Generate shell completions for cargo-ktstr.
+Generate shell completions for cargo-ktstr. See
+[ktstr completions](ktstr.md#completions) for the base subcommand.
 
 ```sh
 cargo ktstr completions bash >> ~/.local/share/bash-completion/completions/cargo
