@@ -678,18 +678,28 @@ fn proxy_serial_pty(master: &OwnedFd, child_pid: u32) {
 
 /// Print the topology line for the shell MOTD.
 ///
-/// Parses KTSTR_TOPO=L,C,T from /proc/cmdline (passed by the host).
+/// Parses KTSTR_TOPO=N,L,C,T from /proc/cmdline (passed by the host).
 /// Falls back to counting online CPUs via /sys/devices/system/cpu/online.
 fn print_topology_line() {
-    if let Some((s, c, t)) = parse_topo_from_cmdline() {
+    if let Some((n, s, c, t)) = parse_topo_from_cmdline() {
         let total = s * c * t;
-        println!(
-            "  topology:  {s} LLC{}, {c} core{}, {t} thread{} ({total} vCPU{})",
-            if s == 1 { "" } else { "s" },
-            if c == 1 { "" } else { "s" },
-            if t == 1 { "" } else { "s" },
-            if total == 1 { "" } else { "s" },
-        );
+        if n > 1 {
+            println!(
+                "  topology:  {n} NUMA nodes, {s} LLC{}, {c} core{}, {t} thread{} ({total} vCPU{})",
+                if s == 1 { "" } else { "s" },
+                if c == 1 { "" } else { "s" },
+                if t == 1 { "" } else { "s" },
+                if total == 1 { "" } else { "s" },
+            );
+        } else {
+            println!(
+                "  topology:  {s} LLC{}, {c} core{}, {t} thread{} ({total} vCPU{})",
+                if s == 1 { "" } else { "s" },
+                if c == 1 { "" } else { "s" },
+                if t == 1 { "" } else { "s" },
+                if total == 1 { "" } else { "s" },
+            );
+        }
     } else if let Some(count) = count_online_cpus() {
         println!(
             "  topology:  {count} vCPU{}",
@@ -698,21 +708,18 @@ fn print_topology_line() {
     }
 }
 
-/// Parse KTSTR_TOPO=L,C,T from /proc/cmdline.
-fn parse_topo_from_cmdline() -> Option<(u32, u32, u32)> {
-    let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
-    let val = cmdline
-        .split_whitespace()
-        .find(|s| s.starts_with("KTSTR_TOPO="))?
-        .strip_prefix("KTSTR_TOPO=")?;
+/// Parse KTSTR_TOPO=N,L,C,T from /proc/cmdline.
+fn parse_topo_from_cmdline() -> Option<(u32, u32, u32, u32)> {
+    let val = cmdline_val("KTSTR_TOPO")?;
     let parts: Vec<&str> = val.split(',').collect();
-    if parts.len() != 3 {
+    if parts.len() != 4 {
         return None;
     }
-    let s: u32 = parts[0].parse().ok()?;
-    let c: u32 = parts[1].parse().ok()?;
-    let t: u32 = parts[2].parse().ok()?;
-    Some((s, c, t))
+    let n: u32 = parts[0].parse().ok()?;
+    let s: u32 = parts[1].parse().ok()?;
+    let c: u32 = parts[2].parse().ok()?;
+    let t: u32 = parts[3].parse().ok()?;
+    Some((n, s, c, t))
 }
 
 /// Count online CPUs from /sys/devices/system/cpu/online.

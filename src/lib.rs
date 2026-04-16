@@ -523,7 +523,7 @@ pub fn run_shell(
         .map(|(a, p)| (a.to_string(), p.to_path_buf()))
         .collect();
 
-    let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={llcs},{cores},{threads}");
+    let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={numa_nodes},{llcs},{cores},{threads}");
     if dmesg {
         cmdline.push_str(" loglevel=7");
     }
