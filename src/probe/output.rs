@@ -1206,15 +1206,10 @@ mod tests {
     fn resolve_addrs_from_elf_finds_kernel_function() {
         let path = match crate::monitor::find_test_vmlinux() {
             Some(p) => p,
-            None => {
-                eprintln!("skipping: no vmlinux available");
-                return;
-            }
+            None => return,
         };
-        // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
-        // not an ELF), which resolve_addrs_from_elf cannot parse.
         if path.starts_with("/sys/") {
-            eprintln!("skipping: {} is raw BTF, not ELF", path.display());
+            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot parse symbols");
             return;
         }
         let func_names = vec![(0u32, "schedule".to_string())];

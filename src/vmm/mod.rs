@@ -4497,6 +4497,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_produces_output() {
         let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
             return;
         };
 
@@ -4513,6 +4514,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
@@ -4529,6 +4531,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_smp_topology() {
         let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
             return;
         };
 
@@ -4545,6 +4548,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
@@ -4562,6 +4566,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn bench_boot_time() {
         let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
             return;
         };
 
@@ -4885,9 +4890,11 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
         let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
             return;
         };
         let Some(_vmlinux) = find_vmlinux(&kernel) else {
+            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
             return;
         };
 
@@ -4903,6 +4910,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
@@ -4954,9 +4962,11 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn watchdog_timeout_override_lands_in_guest_memory() {
         let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
             return;
         };
         let Some(vmlinux) = find_vmlinux(&kernel) else {
+            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
             return;
         };
 
@@ -4964,15 +4974,19 @@ mod tests {
         // before paying for a VM boot on kernels that can't satisfy
         // the invariant.
         let Ok(syms) = crate::monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux) else {
+            eprintln!("ktstr: SKIP: KernelSymbols resolution failed");
             return;
         };
         if syms.scx_root.is_none() {
+            eprintln!("ktstr: SKIP: scx_root symbol not found in vmlinux");
             return;
         }
         let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
+            eprintln!("ktstr: SKIP: KernelOffsets BTF resolution failed");
             return;
         };
         if offsets.watchdog_offsets.is_none() {
+            eprintln!("ktstr: SKIP: watchdog_offsets not resolved from BTF");
             return;
         }
 
@@ -4982,9 +4996,10 @@ mod tests {
 
         let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
             Ok(p) => p,
-            // Build failures indicate a dev-environment issue, not a
-            // regression in the watchdog path. Skip rather than fail.
-            Err(_) => return,
+            Err(_) => {
+                eprintln!("ktstr: SKIP: scx-ktstr binary not found");
+                return;
+            }
         };
 
         let vm = match KtstrVm::builder()
@@ -5001,13 +5016,14 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
         };
         let result = vm.run().unwrap();
         let Some(ref report) = result.monitor else {
-            // Monitor couldn't initialize — kernel/BTF incompatible.
+            eprintln!("ktstr: SKIP: monitor not initialized (kernel/BTF incompatible)");
             return;
         };
         let Some(obs) = &report.watchdog_observation else {
@@ -5041,15 +5057,20 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn monitor_reads_runqueue_data_with_scheduler() {
         let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
             return;
         };
         let Some(_vmlinux) = find_vmlinux(&kernel) else {
+            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
             return;
         };
 
         let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => {
+                eprintln!("ktstr: SKIP: scx-ktstr binary not found");
+                return;
+            }
         };
 
         let vm = match KtstrVm::builder()
@@ -5065,12 +5086,14 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
         };
         let result = vm.run().unwrap();
         let Some(ref report) = result.monitor else {
+            eprintln!("ktstr: SKIP: monitor not initialized");
             return;
         };
 
@@ -5114,28 +5137,37 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn event_counters_populated_with_scheduler() {
         let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
             return;
         };
         let Some(vmlinux) = find_vmlinux(&kernel) else {
+            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
             return;
         };
 
         let Ok(syms) = crate::monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux) else {
+            eprintln!("ktstr: SKIP: KernelSymbols resolution failed");
             return;
         };
         if syms.scx_root.is_none() {
+            eprintln!("ktstr: SKIP: scx_root symbol not found in vmlinux");
             return;
         }
         let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
+            eprintln!("ktstr: SKIP: KernelOffsets BTF resolution failed");
             return;
         };
         if offsets.event_offsets.is_none() {
+            eprintln!("ktstr: SKIP: event_offsets not resolved from BTF");
             return;
         }
 
         let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => {
+                eprintln!("ktstr: SKIP: scx-ktstr binary not found");
+                return;
+            }
         };
 
         let vm = match KtstrVm::builder()
@@ -5151,12 +5183,14 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
         };
         let result = vm.run().unwrap();
         let Some(ref report) = result.monitor else {
+            eprintln!("ktstr: SKIP: monitor not initialized");
             return;
         };
 
@@ -5504,9 +5538,8 @@ mod tests {
     fn builder_performance_mode_valid_succeeds() {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
-        // Need 2 vCPUs + 1 service CPU = 3 host CPUs minimum,
-        // plus the LLC must have >= 2 cores.
         if host_topo.total_cpus() < 3 {
+            eprintln!("ktstr: SKIP: need >= 3 host CPUs for performance_mode test");
             return;
         }
         let result = KtstrVmBuilder::default()
@@ -5531,8 +5564,8 @@ mod tests {
     fn builder_performance_mode_preserves_in_vm() {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
-        // Need 2 vCPUs + 1 service CPU = 3 host CPUs minimum.
         if host_topo.total_cpus() < 3 {
+            eprintln!("ktstr: SKIP: need >= 3 host CPUs for performance_mode test");
             return;
         }
         let vm = match KtstrVmBuilder::default()
@@ -5546,6 +5579,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
@@ -5567,6 +5601,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
@@ -5579,6 +5614,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
         if host_topo.total_cpus() < 3 {
+            eprintln!("ktstr: SKIP: need >= 3 host CPUs for performance_mode test");
             return;
         }
         let vm = KtstrVmBuilder::default()
@@ -5708,6 +5744,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),
@@ -5741,6 +5778,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
                 return;
             }
             Err(e) => panic!("{e:#}"),

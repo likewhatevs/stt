@@ -170,7 +170,11 @@ pub fn sample_looks_valid(sample: &MonitorSample) -> bool {
 #[cfg(test)]
 pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
     let kernel_dir = std::env::var("KTSTR_KERNEL").ok();
-    crate::kernel_path::resolve_btf(kernel_dir.as_deref())
+    let result = crate::kernel_path::resolve_btf(kernel_dir.as_deref());
+    if result.is_none() {
+        eprintln!("ktstr: SKIP: no vmlinux found (set KTSTR_KERNEL or place vmlinux in ./linux)");
+    }
+    result
 }
 
 /// Collected monitor data from a VM run.

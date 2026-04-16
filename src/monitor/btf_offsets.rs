@@ -879,7 +879,10 @@ mod tests {
         };
         let offsets = match KernelOffsets::from_vmlinux(&path) {
             Ok(o) => o,
-            Err(_) => return, // vmlinux lacks required BTF types (e.g. no sched_ext)
+            Err(e) => {
+                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
+                return;
+            }
         };
         assert_ne!(
             offsets.rq_nr_running, offsets.rq_clock,
@@ -898,7 +901,10 @@ mod tests {
         };
         let offsets = match KernelOffsets::from_vmlinux(&path) {
             Ok(o) => o,
-            Err(_) => return, // vmlinux lacks required BTF types (e.g. no sched_ext)
+            Err(e) => {
+                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
+                return;
+            }
         };
         // Event offsets are optional — only assert if present.
         if let Some(ev) = &offsets.event_offsets {
@@ -926,7 +932,10 @@ mod tests {
         };
         let offsets = match KernelOffsets::from_vmlinux(&path) {
             Ok(o) => o,
-            Err(_) => return, // vmlinux lacks required BTF types (e.g. no sched_ext)
+            Err(e) => {
+                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
+                return;
+            }
         };
         // Schedstat offsets are optional — only assert if present.
         if let Some(ss) = &offsets.schedstat_offsets {
@@ -973,7 +982,10 @@ mod tests {
         };
         let offsets = match KernelOffsets::from_vmlinux(&path) {
             Ok(o) => o,
-            Err(_) => return, // vmlinux lacks required BTF types (e.g. no sched_ext)
+            Err(e) => {
+                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
+                return;
+            }
         };
         // Sched domain offsets are optional — only assert if present.
         if let Some(sd) = &offsets.sched_domain_offsets {
@@ -1068,7 +1080,10 @@ mod tests {
         };
         let offsets = match BpfMapOffsets::from_vmlinux(&path) {
             Ok(o) => o,
-            Err(_) => return, // vmlinux lacks required BTF types
+            Err(e) => {
+                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
+                return;
+            }
         };
         // All offsets should be nonzero in a real kernel BTF.
         assert!(offsets.map_name > 0);
@@ -1092,7 +1107,10 @@ mod tests {
         };
         let offsets = match BpfProgOffsets::from_vmlinux(&path) {
             Ok(o) => o,
-            Err(_) => return, // vmlinux lacks required BTF types
+            Err(e) => {
+                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
+                return;
+            }
         };
         assert!(offsets.prog_aux > 0);
         assert!(offsets.aux_verified_insns > 0);

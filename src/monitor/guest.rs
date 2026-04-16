@@ -453,15 +453,12 @@ mod tests {
     fn new_parses_vmlinux_symbols() {
         let path = match crate::monitor::find_test_vmlinux() {
             Some(p) => p,
-            None => {
-                eprintln!("skipping: no vmlinux available");
-                return;
-            }
+            None => return,
         };
         // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
         // not an ELF), which GuestKernel cannot parse.
         if path.starts_with("/sys/") {
-            eprintln!("skipping: {} is raw BTF, not ELF", path.display());
+            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot parse symbols");
             return;
         }
         // Allocate a buffer large enough for text_kva_to_pa reads.

@@ -1684,6 +1684,7 @@ mod tests {
         // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
         // not an ELF), which strip_vmlinux_debug cannot parse.
         if path.starts_with("/sys/") {
+            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot strip debug");
             return;
         }
         let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
@@ -1734,6 +1735,7 @@ mod tests {
             None => return,
         };
         if path.starts_with("/sys/") {
+            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot strip debug");
             return;
         }
         let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
