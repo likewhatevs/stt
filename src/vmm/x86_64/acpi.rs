@@ -236,13 +236,13 @@ fn set_sdt_checksum(buf: &mut [u8]) {
 // Table generation
 // ---------------------------------------------------------------------------
 
-/// Write ACPI tables to guest memory with dynamic layout.
+/// Write ACPI tables to guest memory.
 ///
-/// Tables are packed contiguously starting after the RSDP (which is at a
-/// fixed address). Order: DSDT, MADT, FADT, SRAT, SLIT, RSDT, XSDT, RSDP.
+/// RSDP is at fixed address 0xE0000; remaining tables pack contiguously
+/// after it in order: DSDT, MADT, FADT, SRAT, SLIT, RSDT, XSDT.
 ///
-/// When `shm_size > 0`, SRAT memory affinity for the last NUMA node is reduced
-/// so the SHM region at the top of guest physical memory is excluded.
+/// SRAT memory affinity divides usable memory (`mem_bytes - shm_size`)
+/// evenly across NUMA nodes. The last node absorbs any rounding remainder.
 pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     topo: &Topology,
