@@ -84,6 +84,10 @@ node, cache size, and core map.
 
 **`llc_aligned_cpuset(idx) -> BTreeSet<usize>`** -- CPUs in LLC as a set.
 
+**`numa_aligned_cpuset(node) -> BTreeSet<usize>`** -- CPUs in all LLCs
+belonging to NUMA node `node`. Filters LLCs by `numa_node() == node`
+and collects their CPUs.
+
 ## Cpuset generation
 
 **`split_by_llc() -> Vec<BTreeSet<usize>>`** -- one set of CPUs per LLC.
@@ -128,6 +132,18 @@ topologies).
 | `Overlap(frac)` | `overlapping_cpusets(n, frac)` |
 | `Uneven(frac)` | `usable_cpus()` with asymmetric split |
 | `Holdback(frac)` | `all_cpus()` with fraction held back |
+
+The ops system's `CpusetSpec` also resolves against topology:
+
+| CpusetSpec | Topology method |
+|---|---|
+| `Llc(idx)` | `llc_aligned_cpuset(idx)` |
+| `Numa(node)` | `numa_aligned_cpuset(node)` |
+
+`Llc` confines a cgroup to a single LLC's CPUs; `Numa` spans all
+LLCs in a NUMA node.
+
+See [Ops and Steps](ops.md#cpusetspec) for the full `CpusetSpec` enum.
 
 ## CPU list parsing
 
