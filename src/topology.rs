@@ -353,15 +353,22 @@ impl TestTopology {
         ranges.join(",")
     }
 
-    /// Build a topology from a VM spec (LLCs x cores x threads).
+    /// Build a topology from a VM spec (NUMA nodes x LLCs x cores x threads).
     ///
-    /// One LLC per group, one NUMA node per LLC, CPUs numbered
-    /// sequentially. Used as a fallback when sysfs is incomplete
-    /// inside a guest VM.
-    pub fn from_spec(llcs: u32, cores: u32, threads: u32) -> Self {
+    /// Parameters are big-to-little: NUMA nodes, LLCs, cores per LLC,
+    /// threads per core. Multiple LLCs can share a NUMA node when
+    /// `numa_nodes < llcs`. CPUs are numbered sequentially. Used as a
+    /// fallback when sysfs is incomplete inside a guest VM.
+    pub fn from_spec(numa_nodes: u32, llcs: u32, cores: u32, threads: u32) -> Self {
+        assert!(numa_nodes > 0, "numa_nodes must be > 0");
+        assert!(
+            llcs.is_multiple_of(numa_nodes),
+            "llcs ({llcs}) must be divisible by numa_nodes ({numa_nodes})"
+        );
         let total = (llcs * cores * threads) as usize;
         let cpus_per_llc = (cores * threads) as usize;
         let cpus: Vec<usize> = (0..total).collect();
+        let llcs_per_node = (llcs / numa_nodes) as usize;
         let llc_infos: Vec<LlcInfo> = (0..llcs as usize)
             .map(|l| {
                 let start = l * cpus_per_llc;
@@ -374,17 +381,17 @@ impl TestTopology {
                 }
                 LlcInfo {
                     cpus: (start..end).collect(),
-                    numa_node: l,
+                    numa_node: l / llcs_per_node,
                     cache_size_kb: None,
                     cores: core_map,
                 }
             })
             .collect();
-        let numa_nodes = (0..llcs as usize).collect();
+        let numa_node_set = (0..numa_nodes as usize).collect();
         Self {
             cpus,
             llcs: llc_infos,
-            numa_nodes,
+            numa_nodes: numa_node_set,
         }
     }
 
@@ -495,7 +502,7 @@ mod tests {
 
     #[test]
     fn from_spec_single_llc() {
-        let t = TestTopology::from_spec(1, 4, 2);
+        let t = TestTopology::from_spec(1, 1, 4, 2);
         assert_eq!(t.total_cpus(), 8);
         assert_eq!(t.num_llcs(), 1);
         assert_eq!(t.num_numa_nodes(), 1);
@@ -505,17 +512,17 @@ mod tests {
 
     #[test]
     fn from_spec_multi_llc() {
-        let t = TestTopology::from_spec(2, 4, 2);
+        let t = TestTopology::from_spec(1, 2, 4, 2);
         assert_eq!(t.total_cpus(), 16);
         assert_eq!(t.num_llcs(), 2);
-        assert_eq!(t.num_numa_nodes(), 2);
+        assert_eq!(t.num_numa_nodes(), 1);
         assert_eq!(t.cpus_in_llc(0), &[0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(t.cpus_in_llc(1), &[8, 9, 10, 11, 12, 13, 14, 15]);
     }
 
     #[test]
     fn from_spec_no_smt() {
-        let t = TestTopology::from_spec(2, 2, 1);
+        let t = TestTopology::from_spec(1, 2, 2, 1);
         assert_eq!(t.total_cpus(), 4);
         assert_eq!(t.num_llcs(), 2);
         assert_eq!(t.cpus_in_llc(0), &[0, 1]);
@@ -524,10 +531,23 @@ mod tests {
 
     #[test]
     fn from_spec_minimal() {
-        let t = TestTopology::from_spec(1, 1, 1);
+        let t = TestTopology::from_spec(1, 1, 1, 1);
         assert_eq!(t.total_cpus(), 1);
         assert_eq!(t.num_llcs(), 1);
         assert_eq!(t.all_cpus(), &[0]);
+    }
+
+    #[test]
+    fn from_spec_multi_numa() {
+        let t = TestTopology::from_spec(2, 4, 4, 2);
+        assert_eq!(t.total_cpus(), 32);
+        assert_eq!(t.num_llcs(), 4);
+        assert_eq!(t.num_numa_nodes(), 2);
+        // LLCs 0,1 -> NUMA node 0; LLCs 2,3 -> NUMA node 1
+        assert_eq!(t.llcs()[0].numa_node(), 0);
+        assert_eq!(t.llcs()[1].numa_node(), 0);
+        assert_eq!(t.llcs()[2].numa_node(), 1);
+        assert_eq!(t.llcs()[3].numa_node(), 1);
     }
 
     #[test]
@@ -599,7 +619,7 @@ mod tests {
     /// llc_sets[1].
     #[test]
     fn split_by_llc_two_llc_regression() {
-        let t = TestTopology::from_spec(2, 4, 1);
+        let t = TestTopology::from_spec(1, 2, 4, 1);
         assert_eq!(t.total_cpus(), 8);
         assert_eq!(t.num_llcs(), 2);
 
@@ -675,10 +695,10 @@ mod tests {
 
     #[test]
     fn from_spec_large() {
-        let t = TestTopology::from_spec(4, 8, 2);
+        let t = TestTopology::from_spec(1, 4, 8, 2);
         assert_eq!(t.total_cpus(), 64);
         assert_eq!(t.num_llcs(), 4);
-        assert_eq!(t.num_numa_nodes(), 4);
+        assert_eq!(t.num_numa_nodes(), 1);
     }
 
     #[test]
@@ -694,7 +714,7 @@ mod tests {
 
     #[test]
     fn from_spec_cores_populated() {
-        let t = TestTopology::from_spec(2, 4, 2);
+        let t = TestTopology::from_spec(1, 2, 4, 2);
         let llc0 = &t.llcs()[0];
         assert_eq!(llc0.num_cores(), 4);
         assert_eq!(llc0.cores().len(), 4);
@@ -708,7 +728,7 @@ mod tests {
 
     #[test]
     fn from_spec_no_smt_cores() {
-        let t = TestTopology::from_spec(1, 4, 1);
+        let t = TestTopology::from_spec(1, 1, 4, 1);
         let llc = &t.llcs()[0];
         assert_eq!(llc.num_cores(), 4);
         assert_eq!(llc.cores()[&0], vec![0]);

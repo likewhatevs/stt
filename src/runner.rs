@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn runner_new_preserves_config() {
-        let topo = TestTopology::from_spec(2, 4, 2);
+        let topo = TestTopology::from_spec(1, 2, 4, 2);
         let config = RunConfig {
             duration: Duration::from_secs(30),
             workers_per_cgroup: 8,

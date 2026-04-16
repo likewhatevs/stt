@@ -1351,7 +1351,7 @@ mod tests {
     fn cpusetspec_exact_is_passthrough() {
         let cpus: BTreeSet<usize> = [0, 2, 4].iter().copied().collect();
         let spec = CpusetSpec::Exact(cpus.clone());
-        let topo = crate::topology::TestTopology::from_spec(1, 4, 1);
+        let topo = crate::topology::TestTopology::from_spec(1, 1, 4, 1);
         let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
         let ctx = Ctx {
             cgroups: &cgroups,
@@ -1391,7 +1391,7 @@ mod tests {
         threads: u32,
     ) -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
         let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
-        let topo = crate::topology::TestTopology::from_spec(llcs, cores, threads);
+        let topo = crate::topology::TestTopology::from_spec(1, llcs, cores, threads);
         (cgroups, topo)
     }
 

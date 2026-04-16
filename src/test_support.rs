@@ -1047,6 +1047,7 @@ fn run_host_only_test(entry: &KtstrTestEntry) -> i32 {
 /// Used for tests that need host tools (cargo, nested VMs).
 fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
     let topo = crate::topology::TestTopology::from_spec(
+        entry.topology.numa_nodes,
         entry.topology.llcs,
         entry.topology.cores_per_llc,
         entry.topology.threads_per_core,
@@ -2575,6 +2576,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         Err(e) => {
             eprintln!("ktstr_test: topology from sysfs failed ({e}), using VM spec fallback");
             crate::topology::TestTopology::from_spec(
+                entry.topology.numa_nodes,
                 entry.topology.llcs,
                 entry.topology.cores_per_llc,
                 entry.topology.threads_per_core,
