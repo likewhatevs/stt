@@ -408,10 +408,11 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
         && let Ok(entries) = cache.list()
     {
         let kc_hash = kconfig_hash();
+        let git_hash = GIT_FULL_HASH;
         for entry in &entries {
             if let Some(ref meta) = entry.metadata {
-                // Skip entries built with a different kconfig.
-                if entry.has_stale_kconfig(&kc_hash) {
+                // Skip entries built with a different kconfig or ktstr version.
+                if entry.has_stale_kconfig(&kc_hash) || entry.has_stale_ktstr(git_hash) {
                     continue;
                 }
                 let image = entry.path.join(&meta.image_name);

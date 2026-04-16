@@ -23,18 +23,21 @@ pub fn embedded_kconfig_hash() -> String {
 }
 
 /// Format a human-readable table row for a cache entry.
-pub fn format_entry_row(entry: &CacheEntry, kconfig_hash: &str) -> String {
+pub fn format_entry_row(entry: &CacheEntry, kconfig_hash: &str, ktstr_hash: &str) -> String {
     match &entry.metadata {
         Some(meta) => {
             let version = meta.version.as_deref().unwrap_or("-");
             let source = meta.source.to_string();
-            let stale = match &meta.ktstr_kconfig_hash {
-                Some(h) if h != kconfig_hash => " (stale kconfig)",
-                _ => "",
-            };
+            let mut stale_tags = String::new();
+            if entry.has_stale_kconfig(kconfig_hash) {
+                stale_tags.push_str(" (stale kconfig)");
+            }
+            if entry.has_stale_ktstr(ktstr_hash) {
+                stale_tags.push_str(" (stale ktstr)");
+            }
             format!(
                 "  {:<48} {:<12} {:<8} {:<7} {}{}",
-                entry.key, version, source, meta.arch, meta.built_at, stale,
+                entry.key, version, source, meta.arch, meta.built_at, stale_tags,
             )
         }
         None => {
@@ -80,6 +83,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
     let cache = CacheDir::new()?;
     let entries = cache.list()?;
     let kconfig_hash = embedded_kconfig_hash();
+    let ktstr_hash = crate::GIT_FULL_HASH;
 
     if json {
         let json_entries: Vec<serde_json::Value> = entries
@@ -93,7 +97,9 @@ pub fn kernel_list(json: bool) -> Result<()> {
                     "arch": meta.arch,
                     "built_at": meta.built_at,
                     "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
+                    "ktstr_git_hash": meta.ktstr_git_hash,
                     "stale_kconfig": e.has_stale_kconfig(&kconfig_hash),
+                    "stale_ktstr": e.has_stale_ktstr(ktstr_hash),
                     "config_hash": meta.config_hash,
                     "image_name": meta.image_name,
                     "image_path": e.path.join(&meta.image_name).display().to_string(),
@@ -111,6 +117,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
             .collect();
         let wrapper = serde_json::json!({
             "current_ktstr_kconfig_hash": kconfig_hash,
+            "current_ktstr_git_hash": ktstr_hash,
             "entries": json_entries,
         });
         println!("{}", serde_json::to_string_pretty(&wrapper)?);
@@ -128,16 +135,26 @@ pub fn kernel_list(json: bool) -> Result<()> {
         "  {:<48} {:<12} {:<8} {:<7} BUILT",
         "KEY", "VERSION", "SOURCE", "ARCH"
     );
-    let mut has_stale = false;
+    let mut has_stale_kconfig = false;
+    let mut has_stale_ktstr = false;
     for entry in &entries {
         if entry.has_stale_kconfig(&kconfig_hash) {
-            has_stale = true;
+            has_stale_kconfig = true;
         }
-        println!("{}", format_entry_row(entry, &kconfig_hash));
+        if entry.has_stale_ktstr(ktstr_hash) {
+            has_stale_ktstr = true;
+        }
+        println!("{}", format_entry_row(entry, &kconfig_hash, ktstr_hash));
     }
-    if has_stale {
+    if has_stale_kconfig {
         eprintln!(
             "warning: entries marked (stale kconfig) were built with a different ktstr.kconfig. \
+             Rebuild with: kernel build --force VERSION"
+        );
+    }
+    if has_stale_ktstr {
+        eprintln!(
+            "warning: entries marked (stale ktstr) were built with a different ktstr version. \
              Rebuild with: kernel build --force VERSION"
         );
     }
@@ -155,6 +172,7 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
     }
 
     let kconfig_hash = embedded_kconfig_hash();
+    let ktstr_hash = crate::GIT_FULL_HASH;
     let skip = keep.unwrap_or(0);
     let to_remove: Vec<&CacheEntry> = entries.iter().skip(skip).collect();
 
@@ -170,7 +188,7 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
         }
         println!("the following entries will be removed:");
         for entry in &to_remove {
-            println!("{}", format_entry_row(entry, &kconfig_hash));
+            println!("{}", format_entry_row(entry, &kconfig_hash, ktstr_hash));
         }
         eprint!("remove {} entries? [y/N] ", to_remove.len());
         std::io::stderr().flush()?;
@@ -745,6 +763,7 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
         && let Some(entry) = cache.lookup(&cache_key)
         && let Some(ref meta) = entry.metadata
         && !entry.has_stale_kconfig(&embedded_kconfig_hash())
+        && !entry.has_stale_ktstr(crate::GIT_FULL_HASH)
     {
         let image = entry.path.join(&meta.image_name);
         if image.exists() {

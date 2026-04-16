@@ -331,8 +331,10 @@ fn kernel_build(
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}-kc{}", ktstr::cache_key_suffix());
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
-            if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
-                eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
+            if entry.has_stale_kconfig(&cli::embedded_kconfig_hash())
+                || entry.has_stale_ktstr(ktstr::GIT_FULL_HASH)
+            {
+                eprintln!("cargo-ktstr: cached kernel is stale, rebuilding");
             } else {
                 eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
                 eprintln!("cargo-ktstr: use --force to rebuild");
@@ -352,8 +354,10 @@ fn kernel_build(
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
-        if entry.has_stale_kconfig(&cli::embedded_kconfig_hash()) {
-            eprintln!("cargo-ktstr: cached kernel has stale kconfig, rebuilding");
+        if entry.has_stale_kconfig(&cli::embedded_kconfig_hash())
+            || entry.has_stale_ktstr(ktstr::GIT_FULL_HASH)
+        {
+            eprintln!("cargo-ktstr: cached kernel is stale, rebuilding");
         } else {
             eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
             eprintln!("cargo-ktstr: use --force to rebuild");
@@ -1558,7 +1562,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "6.14.2-tarball-x86_64", &meta);
-        let row = cli::format_entry_row(&entry, "abc123");
+        let row = cli::format_entry_row(&entry, "abc123", "abc123");
         assert!(row.contains("6.14.2-tarball-x86_64"));
         assert!(row.contains("6.14.2"));
         assert!(row.contains("tarball"));
@@ -1572,11 +1576,37 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("old_hash".to_string()));
         let entry = store_test_entry(&cache, "stale-key", &meta);
-        let row = cli::format_entry_row(&entry, "new_hash");
+        let row = cli::format_entry_row(&entry, "new_hash", "any");
         assert!(
             row.contains("stale kconfig"),
             "should show stale kconfig marker"
         );
+    }
+
+    #[test]
+    fn format_entry_row_stale_ktstr() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata().with_ktstr_git_hash(Some("old_commit".to_string()));
+        let entry = store_test_entry(&cache, "stale-ktstr-key", &meta);
+        let row = cli::format_entry_row(&entry, "any", "new_commit");
+        assert!(
+            row.contains("stale ktstr"),
+            "should show stale ktstr marker"
+        );
+    }
+
+    #[test]
+    fn format_entry_row_both_stale() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata()
+            .with_ktstr_kconfig_hash(Some("old_kc".to_string()))
+            .with_ktstr_git_hash(Some("old_git".to_string()));
+        let entry = store_test_entry(&cache, "both-stale-key", &meta);
+        let row = cli::format_entry_row(&entry, "new_kc", "new_git");
+        assert!(row.contains("stale kconfig"), "should show stale kconfig");
+        assert!(row.contains("stale ktstr"), "should show stale ktstr");
     }
 
     #[test]
@@ -1585,7 +1615,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "match-key", &meta);
-        let row = cli::format_entry_row(&entry, "same");
+        let row = cli::format_entry_row(&entry, "same", "any");
         assert!(
             !row.contains("stale kconfig"),
             "should not show stale marker when hashes match"
@@ -1598,9 +1628,13 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "no-hash-key", &meta);
-        let row = cli::format_entry_row(&entry, "anything");
+        let row = cli::format_entry_row(&entry, "anything", "anything");
         assert!(
             !row.contains("stale kconfig"),
+            "should not show stale marker when entry has no hash"
+        );
+        assert!(
+            !row.contains("stale ktstr"),
             "should not show stale marker when entry has no hash"
         );
     }
@@ -1616,7 +1650,7 @@ mod tests {
             "2026-04-12T10:00:00Z".to_string(),
         );
         let entry = store_test_entry(&cache, "local-key", &meta);
-        let row = cli::format_entry_row(&entry, "hash");
+        let row = cli::format_entry_row(&entry, "hash", "hash");
         assert!(row.contains("-"), "missing version should show dash");
     }
 
@@ -1625,7 +1659,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let entry = store_corrupt_entry(&cache, "corrupt-key");
-        let row = cli::format_entry_row(&entry, "hash");
+        let row = cli::format_entry_row(&entry, "hash", "hash");
         assert!(row.contains("corrupt-key"));
         assert!(row.contains("corrupt metadata"));
     }
@@ -1665,6 +1699,43 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let entry = store_corrupt_entry(&cache, "corrupt");
         assert!(!entry.has_stale_kconfig("anything"));
+    }
+
+    // -- has_stale_ktstr (via CacheEntry method) --
+
+    #[test]
+    fn has_stale_ktstr_different_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata().with_ktstr_git_hash(Some("old_commit".to_string()));
+        let entry = store_test_entry(&cache, "stale-ktstr", &meta);
+        assert!(entry.has_stale_ktstr("new_commit"));
+    }
+
+    #[test]
+    fn has_stale_ktstr_same_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata().with_ktstr_git_hash(Some("same".to_string()));
+        let entry = store_test_entry(&cache, "fresh-ktstr", &meta);
+        assert!(!entry.has_stale_ktstr("same"));
+    }
+
+    #[test]
+    fn has_stale_ktstr_no_hash_in_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let meta = test_metadata();
+        let entry = store_test_entry(&cache, "no-ktstr-hash", &meta);
+        assert!(!entry.has_stale_ktstr("anything"));
+    }
+
+    #[test]
+    fn has_stale_ktstr_no_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let entry = store_corrupt_entry(&cache, "corrupt-ktstr");
+        assert!(!entry.has_stale_ktstr("anything"));
     }
 
     // -- embedded_kconfig_hash --

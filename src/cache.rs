@@ -193,6 +193,17 @@ impl CacheEntry {
             .and_then(|m| m.ktstr_kconfig_hash.as_deref())
             .is_some_and(|h| h != current_hash)
     }
+
+    /// Check if this entry was built with a different ktstr version than `current_hash`.
+    ///
+    /// Returns `false` when metadata is missing or the entry has no
+    /// recorded ktstr git hash (pre-version-tracking entries).
+    pub fn has_stale_ktstr(&self, current_hash: &str) -> bool {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.ktstr_git_hash.as_deref())
+            .is_some_and(|h| h != current_hash)
+    }
 }
 
 /// Handle to the kernel image cache directory.
