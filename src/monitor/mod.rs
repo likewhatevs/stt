@@ -175,6 +175,7 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
 
 /// Collected monitor data from a VM run.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct MonitorReport {
     /// Periodic snapshots of per-CPU state.
     pub samples: Vec<MonitorSample>,
@@ -185,6 +186,30 @@ pub struct MonitorReport {
     /// stall detection. 0 means use a default.
     #[serde(default)]
     pub preemption_threshold_ns: u64,
+    /// Post-write readback of the scx_sched.watchdog_timeout field.
+    /// Framework-internal regression guard that the host-side override
+    /// actually lands in guest memory; populated once per VM run after
+    /// the first successful deref.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_observation: Option<WatchdogObservation>,
+}
+
+/// Observation of the `scx_sched.watchdog_timeout` override,
+/// recorded once by the monitor loop after the first successful
+/// write to the runtime-allocated scx_sched struct.
+///
+/// Regression guard for the host-write mechanism: when the kernel
+/// refactors the location of watchdog_timeout (as happened before
+/// the runtime scx_root deref was introduced), `observed_jiffies`
+/// will diverge from `expected_jiffies` and the test will fail.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WatchdogObservation {
+    /// Jiffies value the override was configured to write.
+    pub expected_jiffies: u64,
+    /// Jiffies value read back from guest memory after the write.
+    pub observed_jiffies: u64,
 }
 
 /// Tracks consecutive threshold violations and records the worst run.
@@ -3676,6 +3701,7 @@ mod tests {
             samples,
             summary,
             preemption_threshold_ns: 10_000_000,
+            watchdog_observation: None,
         };
         let v = t.evaluate(&report);
         assert!(
@@ -3743,6 +3769,7 @@ mod tests {
             samples,
             summary,
             preemption_threshold_ns: 10_000_000,
+            watchdog_observation: None,
         };
         let v = t.evaluate(&report);
         assert!(!v.passed, "running vCPU stall must fail: {:?}", v.details);

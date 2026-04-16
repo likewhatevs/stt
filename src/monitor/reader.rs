@@ -602,6 +602,14 @@ pub(crate) struct ProgStatsCtx {
     pub offsets: super::btf_offsets::BpfProgOffsets,
 }
 
+/// Samples, SHM drain, and optional watchdog observation returned by
+/// [`monitor_loop`].
+pub(crate) type MonitorLoopResult = (
+    Vec<MonitorSample>,
+    crate::vmm::shm_ring::ShmDrainResult,
+    Option<super::WatchdogObservation>,
+);
+
 /// Run the monitor loop, sampling all CPUs at the given interval.
 /// Returns collected samples when `kill` is set.
 ///
@@ -639,7 +647,7 @@ pub(crate) fn monitor_loop(
     kill: &AtomicBool,
     start: Instant,
     cfg: &MonitorConfig<'_>,
-) -> (Vec<MonitorSample>, crate::vmm::shm_ring::ShmDrainResult) {
+) -> MonitorLoopResult {
     let event_pcpu_pas = cfg.event_pcpu_pas;
     let dump_trigger = cfg.dump_trigger;
     let watchdog_override = cfg.watchdog_override;
@@ -662,6 +670,7 @@ pub(crate) fn monitor_loop(
     let mut prev_vcpu_times: Option<Vec<u64>> = None;
     let mut shm_entries: Vec<crate::vmm::shm_ring::ShmEntry> = Vec::new();
     let mut shm_drops: u64 = 0;
+    let mut watchdog_observation: Option<super::WatchdogObservation> = None;
 
     loop {
         if kill.load(Ordering::Acquire) {
@@ -672,6 +681,16 @@ pub(crate) fn monitor_loop(
             if sch_kva != 0 {
                 let sch_pa = super::symbols::kva_to_pa(sch_kva, wd.page_offset);
                 mem.write_u64(sch_pa, wd.watchdog_offset, wd.jiffies);
+                if watchdog_observation.is_none() {
+                    // Read back after writing so the recorded value
+                    // reflects this iteration's override, not any
+                    // initial value the kernel placed there.
+                    let observed = mem.read_u64(sch_pa, wd.watchdog_offset);
+                    watchdog_observation = Some(super::WatchdogObservation {
+                        expected_jiffies: wd.jiffies,
+                        observed_jiffies: observed,
+                    });
+                }
             }
         }
         cpus.clear();
@@ -830,7 +849,7 @@ pub(crate) fn monitor_loop(
         entries: shm_entries,
         drops: shm_drops,
     };
-    (samples, shm_result)
+    (samples, shm_result, watchdog_observation)
 }
 
 #[cfg(test)]
@@ -964,7 +983,7 @@ mod tests {
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let kill = AtomicBool::new(true);
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -991,7 +1010,7 @@ mod tests {
             })
         };
 
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1078,7 +1097,7 @@ mod tests {
             })
         };
 
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -1117,7 +1136,7 @@ mod tests {
             })
         };
 
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1309,7 +1328,7 @@ mod tests {
             event_pcpu_pas: Some(&ev_pas),
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[rq_pa],
             &offsets,
@@ -1344,7 +1363,7 @@ mod tests {
             })
         };
 
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1412,7 +1431,7 @@ mod tests {
             watchdog_override: Some(&wd),
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, watchdog_observation) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1428,6 +1447,10 @@ mod tests {
         let write_pa = sch_pa as usize + watchdog_offset;
         let written = u64::from_ne_bytes(combined[write_pa..write_pa + 8].try_into().unwrap());
         assert_eq!(written, 99999);
+        // Verify monitor_loop recorded the observation.
+        let obs = watchdog_observation.expect("watchdog_observation should be Some after write");
+        assert_eq!(obs.expected_jiffies, 99999);
+        assert_eq!(obs.observed_jiffies, 99999);
     }
 
     #[test]
@@ -1462,7 +1485,7 @@ mod tests {
             watchdog_override: Some(&wd),
             ..test_config()
         };
-        let _ = monitor_loop(
+        let (_, _, watchdog_observation) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1477,6 +1500,11 @@ mod tests {
         assert!(
             combined[scx_root_pa as usize..].iter().all(|&b| b == 0),
             "no write should occur when scx_root is null"
+        );
+        // No observation should have been recorded.
+        assert!(
+            watchdog_observation.is_none(),
+            "watchdog_observation should be None when scx_root is null"
         );
     }
 
@@ -1518,7 +1546,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -1580,7 +1608,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1643,7 +1671,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1718,7 +1746,7 @@ mod tests {
             preemption_threshold_ns: 10_000_000,
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1796,7 +1824,7 @@ mod tests {
             preemption_threshold_ns: 10_000_000,
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -1868,7 +1896,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0, pa1],
             &offsets,
@@ -1950,7 +1978,7 @@ mod tests {
             dump_trigger: Some(&trigger),
             ..test_config()
         };
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -2104,7 +2132,7 @@ mod tests {
             })
         };
 
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,
@@ -2139,7 +2167,7 @@ mod tests {
             })
         };
 
-        let (samples, _) = monitor_loop(
+        let (samples, _, _) = monitor_loop(
             &mem,
             &[0],
             &offsets,

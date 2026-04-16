@@ -1996,6 +1996,7 @@ fn trim_settle_samples(report: &crate::monitor::MonitorReport) -> crate::monitor
         samples: trimmed,
         summary,
         preemption_threshold_ns: report.preemption_threshold_ns,
+        watchdog_observation: report.watchdog_observation,
     }
 }
 
@@ -5765,6 +5766,7 @@ mod tests {
                 samples: imbalance_samples,
                 summary,
                 preemption_threshold_ns: 0,
+                watchdog_observation: None,
             }),
             shm_data: None,
             stimulus_events: Vec::new(),
@@ -6142,6 +6144,7 @@ mod tests {
                     ..Default::default()
                 },
                 preemption_threshold_ns: 0,
+                watchdog_observation: None,
             }),
             shm_data: None,
             stimulus_events: Vec::new(),
@@ -6212,6 +6215,7 @@ mod tests {
                 samples: imbalance_samples,
                 summary,
                 preemption_threshold_ns: 0,
+                watchdog_observation: None,
             }),
             shm_data: None,
             stimulus_events: Vec::new(),

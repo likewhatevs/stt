@@ -1049,7 +1049,7 @@ struct VmRunState {
     exit_code: i32,
     timed_out: bool,
     ap_threads: Vec<VcpuThread>,
-    monitor_handle: Option<JoinHandle<(Vec<monitor::MonitorSample>, shm_ring::ShmDrainResult)>>,
+    monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     bpf_write_handle: Option<JoinHandle<()>>,
     com1: Arc<PiMutex<console::Serial>>,
     com2: Arc<PiMutex<console::Serial>>,
@@ -2338,7 +2338,6 @@ impl KtstrVm {
 
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
-    #[allow(clippy::type_complexity)]
     fn run_vm(&self, start: Instant, mut vm: kvm::KtstrKvm) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
@@ -2622,14 +2621,13 @@ impl KtstrVm {
     }
 
     /// Start the monitor thread if vmlinux is available.
-    #[allow(clippy::type_complexity)]
     fn start_monitor(
         &self,
         vm: &kvm::KtstrKvm,
         kill: &Arc<AtomicBool>,
         start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
-    ) -> Result<Option<JoinHandle<(Vec<monitor::MonitorSample>, shm_ring::ShmDrainResult)>>> {
+    ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
         };
@@ -3034,7 +3032,7 @@ impl KtstrVm {
 
         let (monitor_report, mid_flight_drain) =
             match run.monitor_handle.and_then(|h| h.join().ok()) {
-                Some((samples, drain)) => {
+                Some((samples, drain, watchdog_observation)) => {
                     let preemption_threshold_ns =
                         monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
                     let summary = monitor::MonitorSummary::from_samples_with_threshold(
@@ -3045,6 +3043,7 @@ impl KtstrVm {
                         samples,
                         summary,
                         preemption_threshold_ns,
+                        watchdog_observation,
                     };
                     (Some(report), drain)
                 }
@@ -4898,6 +4897,96 @@ mod tests {
             );
         }
         // If monitor is None, the kernel/BTF wasn't compatible — not a failure.
+    }
+
+    /// Regression guard for the `scx_sched.watchdog_timeout` host-write
+    /// mechanism. Boots a VM with scx-ktstr loaded plus a distinctive
+    /// 7-second watchdog override, then asserts the monitor loop
+    /// observed the expected jiffies value in guest memory.
+    ///
+    /// Skips gracefully when: no host kernel available, no vmlinux for
+    /// BTF, `scx_root` symbol or `scx_sched.watchdog_timeout` BTF field
+    /// missing, scheduler failed to attach, or the monitor report
+    /// wasn't produced. Real failure requires the override path to
+    /// silently stop writing — which is exactly what we want to catch.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn watchdog_timeout_override_lands_in_guest_memory() {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
+            return;
+        };
+        let Some(vmlinux) = find_vmlinux(&kernel) else {
+            return;
+        };
+
+        // Gate on the two kernel-dependent resolutions so we skip
+        // before paying for a VM boot on kernels that can't satisfy
+        // the invariant.
+        let Ok(syms) = crate::monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux) else {
+            return;
+        };
+        if syms.scx_root.is_none() {
+            return;
+        }
+        let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
+            return;
+        };
+        if offsets.watchdog_offsets.is_none() {
+            return;
+        }
+
+        const TIMEOUT_SECS: u64 = 7;
+        let hz = crate::monitor::guest_kernel_hz(Some(&kernel));
+        let expected_jiffies = TIMEOUT_SECS * hz;
+
+        let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
+            Ok(p) => p,
+            // Build failures indicate a dev-environment issue, not a
+            // regression in the watchdog path. Skip rather than fail.
+            Err(_) => return,
+        };
+
+        let vm = match KtstrVm::builder()
+            .kernel(&kernel)
+            .topology(1, 1, 1, 1)
+            .memory_mb(256)
+            .timeout(Duration::from_secs(10))
+            .scheduler_binary(&sched_bin)
+            .watchdog_timeout(Duration::from_secs(TIMEOUT_SECS))
+            .build()
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
+        let result = vm.run().unwrap();
+        let Some(ref report) = result.monitor else {
+            // Monitor couldn't initialize — kernel/BTF incompatible.
+            return;
+        };
+        let Some(obs) = &report.watchdog_observation else {
+            // Scheduler never attached (scx_root stayed null for the
+            // whole run). Not a watchdog regression — skip.
+            eprintln!(
+                "SKIP: watchdog_observation is None (scx_root stayed null; scheduler may not have attached)"
+            );
+            return;
+        };
+        assert_eq!(
+            obs.expected_jiffies, expected_jiffies,
+            "expected_jiffies recorded by monitor ({}) does not match {} * HZ {} = {}",
+            obs.expected_jiffies, TIMEOUT_SECS, hz, expected_jiffies,
+        );
+        assert_eq!(
+            obs.observed_jiffies, obs.expected_jiffies,
+            "host wrote {} jiffies to scx_sched.watchdog_timeout but guest memory holds {} — host-write mechanism broken",
+            obs.expected_jiffies, obs.observed_jiffies,
+        );
     }
 
     // -- initramfs cache tests --
