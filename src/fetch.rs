@@ -7,6 +7,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 /// Downloaded/cloned kernel source ready for building.
+#[non_exhaustive]
 pub struct AcquiredSource {
     /// Path to the kernel source directory.
     pub source_dir: PathBuf,

@@ -415,7 +415,7 @@ pub fn has_sched_ext(kernel_dir: &std::path::Path) -> bool {
 ///
 /// Call after `make` succeeds. Returns `Err` with a diagnostic
 /// message listing missing options and likely causes.
-fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
+pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
     let config_path = kernel_dir.join(".config");
     let config = std::fs::read_to_string(&config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
@@ -872,9 +872,9 @@ fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::path:
 
 /// Resolve a kernel identifier to a bootable image path.
 ///
-/// Handles all `KernelId` variants (path to file or directory,
-/// version string, cache key) and the `None` case (automatic
-/// resolution via cache then filesystem).
+/// Handles `KernelId` variants: directory (auto-build), version
+/// string, and cache key. Raw image file paths are rejected.
+/// The `None` case resolves automatically via cache then filesystem.
 pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
 

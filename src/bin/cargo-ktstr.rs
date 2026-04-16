@@ -222,6 +222,8 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     }
     result?;
 
+    cli::validate_kernel_config(kernel_dir).map_err(|e| format!("{e:#}"))?;
+
     let sp = cli::Spinner::start("Generating compile_commands.json...");
     let result = cli::run_make_with_output(kernel_dir, &["compile_commands.json"], Some(&sp))
         .map_err(|e| format!("{e:#}"));
@@ -467,7 +469,9 @@ fn resolve_cached_kernel_with_remote(id: &ktstr::kernel_path::KernelId) -> Resul
                 )),
             }
         }
-        KernelId::Path(_) => Err("resolve_cached_kernel called with Path variant".to_string()),
+        KernelId::Path(_) => {
+            Err("resolve_cached_kernel_with_remote called with Path variant".to_string())
+        }
     }
 }
 
