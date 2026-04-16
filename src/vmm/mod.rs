@@ -5225,6 +5225,106 @@ mod tests {
         );
     }
 
+    /// Validate that sched_domain data is populated when BTF offsets
+    /// resolve. Domains are kernel-built at boot and do not require a
+    /// scheduler.
+    ///
+    /// Gates on sched_domain_offsets BTF availability. Uses a 2-CPU
+    /// topology so the domain tree spans multiple CPUs.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sched_domain_data_populated() {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
+            return;
+        };
+        let Some(vmlinux) = find_vmlinux(&kernel) else {
+            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
+            return;
+        };
+
+        let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
+            eprintln!("ktstr: SKIP: KernelOffsets BTF resolution failed");
+            return;
+        };
+        if offsets.sched_domain_offsets.is_none() {
+            eprintln!("ktstr: SKIP: sched_domain_offsets not resolved from BTF");
+            return;
+        }
+
+        let vm = match KtstrVm::builder()
+            .kernel(&kernel)
+            .topology(1, 1, 2, 1)
+            .memory_mb(256)
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
+        let result = vm.run().unwrap();
+        let Some(ref report) = result.monitor else {
+            eprintln!("ktstr: SKIP: monitor not initialized");
+            return;
+        };
+
+        assert!(
+            report.summary.total_samples > 0,
+            "monitor should have collected at least one sample"
+        );
+
+        let last = report.samples.last().unwrap();
+        let has_domains = last.cpus.iter().any(|c| {
+            c.sched_domains
+                .as_ref()
+                .is_some_and(|doms| !doms.is_empty())
+        });
+        assert!(
+            has_domains,
+            "at least one CPU must have non-empty sched_domains after boot — \
+             got {:?}",
+            last.cpus
+                .iter()
+                .map(|c| c.sched_domains.as_ref().map(|d| d.len()))
+                .collect::<Vec<_>>()
+        );
+
+        for cpu in &last.cpus {
+            if let Some(ref doms) = cpu.sched_domains {
+                if doms.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    doms[0].level, 0,
+                    "lowest domain must be level 0, got {}",
+                    doms[0].level
+                );
+                for w in doms.windows(2) {
+                    assert!(
+                        w[1].level > w[0].level,
+                        "domain levels must be strictly increasing: {} -> {}",
+                        w[0].level,
+                        w[1].level
+                    );
+                }
+                for dom in doms {
+                    assert!(
+                        dom.span_weight > 0,
+                        "domain level {} span_weight must be > 0",
+                        dom.level
+                    );
+                }
+            }
+        }
+    }
+
     // -- initramfs cache tests --
 
     #[test]
