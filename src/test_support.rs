@@ -1603,10 +1603,11 @@ fn run_ktstr_test_inner(
         // When auto-repro was attempted but produced no data, return a
         // diagnostic so the user knows it was tried.
         Some(repro.unwrap_or_else(|| {
-            "auto-repro: no probe data — the repro VM may have failed to \
-             boot, or the kernel may lack the sched_ext_exit tracepoint \
-             required for the probe trigger. Check the sched_ext dump \
-             and scheduler log sections above for crash details."
+            "auto-repro: no probe data — the crash may not have \
+             reproduced in the repro VM, or probe output was \
+             corrupted. Re-run with RUST_LOG=debug for repro VM \
+             diagnostics. Check the sched_ext dump and scheduler \
+             log sections above for crash details."
                 .to_string()
         }))
     };
@@ -2555,9 +2556,9 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             use crate::probe::process::run_probe_skeleton;
             let (events, diag) =
                 run_probe_skeleton(&funcs, &btf_funcs, &stop, &bpf_fds, &probes_ready_thread);
-            // Serialize probe output immediately so it reaches COM2
-            // even if the test function hangs and never calls
-            // collect_and_print_probe_data.
+            // Serialize probe output after the trigger fires or stop
+            // is signaled. Runs before the thread returns so output
+            // reaches COM2 even if the main thread is blocked.
             emit_probe_payload(
                 events.as_deref().unwrap_or(&[]),
                 &fn_names,

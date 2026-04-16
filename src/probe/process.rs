@@ -642,10 +642,14 @@ pub fn run_probe_skeleton(
                     std::mem::size_of::<crate::bpf_skel::types::func_meta>(),
                 )
             };
-            let _ = skel
+            if let Err(e) = skel
                 .maps
                 .func_meta_map
-                .update(&key_bytes, meta_bytes, MapFlags::ANY);
+                .update(&key_bytes, meta_bytes, MapFlags::ANY)
+            {
+                tracing::warn!(%e, func = t.name, "fentry: failed to update func_meta_map");
+                continue;
+            }
             func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
 
             let result = match t.slot {
@@ -900,35 +904,37 @@ pub fn run_probe_skeleton(
     }
 
     let mut rb_builder = RingBufferBuilder::new();
-    rb_builder
-        .add(&skel.maps.events, move |data: &[u8]| {
-            if data.len() < std::mem::size_of::<RbEvent>() {
-                return 0;
-            }
-            let raw: &RbEvent = unsafe { &*(data.as_ptr() as *const RbEvent) };
+    if let Err(e) = rb_builder.add(&skel.maps.events, move |data: &[u8]| {
+        if data.len() < std::mem::size_of::<RbEvent>() {
+            return 0;
+        }
+        let raw: &RbEvent = unsafe { &*(data.as_ptr() as *const RbEvent) };
 
-            if raw.type_ == EVENT_TRIGGER {
-                triggered_clone.store(true, Ordering::Relaxed);
+        if raw.type_ == EVENT_TRIGGER {
+            triggered_clone.store(true, Ordering::Relaxed);
 
-                let kstack_sz = (raw.kstack_sz as usize).min(32);
-                let event = ProbeEvent {
-                    func_idx: 0,
-                    task_ptr: raw.args[0],
-                    ts: raw.ts,
-                    args: raw.args,
-                    fields: vec![],
-                    kstack: raw.kstack[..kstack_sz].to_vec(),
-                    str_val: None,
-                    exit_fields: vec![],
-                    exit_ts: None,
-                };
+            let kstack_sz = (raw.kstack_sz as usize).min(32);
+            let event = ProbeEvent {
+                func_idx: 0,
+                task_ptr: raw.args[0],
+                ts: raw.ts,
+                args: raw.args,
+                fields: vec![],
+                kstack: raw.kstack[..kstack_sz].to_vec(),
+                str_val: None,
+                exit_fields: vec![],
+                exit_ts: None,
+            };
 
-                events_clone.lock().unwrap().push(event);
-            }
+            events_clone.lock().unwrap().push(event);
+        }
 
-            0
-        })
-        .ok();
+        0
+    }) {
+        tracing::error!(%e, "failed to register ring buffer callback");
+        ready.store(true, Ordering::Release);
+        return (None, diag);
+    }
 
     let rb = match rb_builder.build() {
         Ok(rb) => rb,
