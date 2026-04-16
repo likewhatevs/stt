@@ -2694,23 +2694,32 @@ impl KtstrVm {
                     monitor::symbols::compute_rq_pas(symbols.runqueues, &offsets_arr, page_offset);
 
                 let watchdog_override = watchdog_jiffies.and_then(|jiffies| {
-                    symbols
+                    // 7.1+ path: deref scx_root -> scx_sched.watchdog_timeout.
+                    if let Some((scx_root_kva, wd_offs)) = symbols
                         .scx_root
                         .zip(offsets.watchdog_offsets.as_ref())
-                        .map(|(scx_root_kva, wd_offs)| {
-                            // scx_root is a kernel data symbol: text mapping.
-                            let scx_root_pa = monitor::symbols::text_kva_to_pa(scx_root_kva);
-                            monitor::reader::WatchdogOverride {
-                                scx_root_pa,
-                                watchdog_offset: wd_offs.scx_sched_watchdog_timeout_off,
-                                jiffies,
-                                page_offset,
-                            }
-                        })
+                    {
+                        let scx_root_pa = monitor::symbols::text_kva_to_pa(scx_root_kva);
+                        return Some(monitor::reader::WatchdogOverride::ScxSched {
+                            scx_root_pa,
+                            watchdog_offset: wd_offs.scx_sched_watchdog_timeout_off,
+                            jiffies,
+                            page_offset,
+                        });
+                    }
+                    // 6.16 fallback: direct write to scx_watchdog_timeout static global.
+                    if let Some(wdt_kva) = symbols.scx_watchdog_timeout {
+                        let watchdog_timeout_pa = monitor::symbols::text_kva_to_pa(wdt_kva);
+                        return Some(monitor::reader::WatchdogOverride::StaticGlobal {
+                            watchdog_timeout_pa,
+                            jiffies,
+                        });
+                    }
+                    None
                 });
                 if watchdog_jiffies.is_some() && watchdog_override.is_none() {
                     tracing::warn!(
-                        "scx_root symbol or scx_sched.watchdog_timeout BTF field not found — watchdog_timeout override ignored"
+                        "no watchdog override path available — neither scx_sched.watchdog_timeout BTF field nor scx_watchdog_timeout symbol found"
                     );
                 }
 

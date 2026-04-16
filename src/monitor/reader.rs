@@ -580,28 +580,36 @@ pub(crate) struct DumpTrigger {
     pub thresholds: super::MonitorThresholds,
 }
 
-/// Override for `scx_sched.watchdog_timeout` written every monitor
+/// Override for the scheduler watchdog timeout, written every monitor
 /// iteration.
 ///
-/// The watchdog timeout lives inside the `scx_sched` struct that
-/// `scx_root` points to. `scx_root` is null before scheduler attach
-/// and during unload, and the struct itself is reallocated on each
-/// (re)load, so the host cannot resolve the address once up front —
-/// it must deref `*scx_root` every iteration and write the override
-/// into whichever struct is currently live.
-pub(crate) struct WatchdogOverride {
-    /// Physical address of the `scx_root` global pointer (text
-    /// mapping, not direct). `*scx_root_pa` is the KVA of the active
-    /// `scx_sched` struct or 0 when no scheduler is loaded.
-    pub scx_root_pa: u64,
-    /// Byte offset of `watchdog_timeout` within `struct scx_sched`,
-    /// resolved from BTF.
-    pub watchdog_offset: usize,
-    /// Jiffies to write at `scx_sched + watchdog_offset`.
-    pub jiffies: u64,
-    /// Runtime `PAGE_OFFSET` used to translate the `scx_sched` KVA
-    /// (which lives in the direct mapping) to a DRAM-relative PA.
-    pub page_offset: u64,
+/// Two write paths are supported:
+/// - 7.1+ (`ScxSched`): deref `*scx_root` to find the runtime
+///   `scx_sched` struct, then write at the BTF-resolved offset.
+///   Re-derefs each iteration because `scx_sched` is reallocated on
+///   scheduler (re)load.
+/// - 6.16 (`StaticGlobal`): write directly to the PA of the
+///   `scx_watchdog_timeout` static global. No deref needed — the
+///   address is fixed for the kernel's lifetime.
+pub(crate) enum WatchdogOverride {
+    /// 7.1+ path: deref `scx_root` -> `scx_sched` -> write at offset.
+    ScxSched {
+        /// PA of the `scx_root` global pointer (text mapping).
+        scx_root_pa: u64,
+        /// Byte offset of `watchdog_timeout` within `struct scx_sched`.
+        watchdog_offset: usize,
+        /// Jiffies value to write.
+        jiffies: u64,
+        /// Runtime `PAGE_OFFSET` for KVA-to-PA translation.
+        page_offset: u64,
+    },
+    /// 6.16 path: write directly to the static global's PA.
+    StaticGlobal {
+        /// PA of the `scx_watchdog_timeout` static global (text mapping).
+        watchdog_timeout_pa: u64,
+        /// Jiffies value to write.
+        jiffies: u64,
+    },
 }
 
 /// Pre-resolved BPF program stats context for the monitor loop.
@@ -683,17 +691,32 @@ pub(crate) fn monitor_loop(
             break;
         }
         if let Some(wd) = watchdog_override {
-            let sch_kva = mem.read_u64(wd.scx_root_pa, 0);
-            if sch_kva != 0 {
-                let sch_pa = super::symbols::kva_to_pa(sch_kva, wd.page_offset);
-                mem.write_u64(sch_pa, wd.watchdog_offset, wd.jiffies);
+            let (write_pa, write_offset, wd_jiffies) = match wd {
+                WatchdogOverride::ScxSched {
+                    scx_root_pa,
+                    watchdog_offset,
+                    jiffies,
+                    page_offset,
+                } => {
+                    let sch_kva = mem.read_u64(*scx_root_pa, 0);
+                    if sch_kva == 0 {
+                        (None, 0, *jiffies)
+                    } else {
+                        let sch_pa = super::symbols::kva_to_pa(sch_kva, *page_offset);
+                        (Some(sch_pa), *watchdog_offset, *jiffies)
+                    }
+                }
+                WatchdogOverride::StaticGlobal {
+                    watchdog_timeout_pa,
+                    jiffies,
+                } => (Some(*watchdog_timeout_pa), 0, *jiffies),
+            };
+            if let Some(pa) = write_pa {
+                mem.write_u64(pa, write_offset, wd_jiffies);
                 if watchdog_observation.is_none() {
-                    // Read back after writing so the recorded value
-                    // reflects this iteration's override, not any
-                    // initial value the kernel placed there.
-                    let observed = mem.read_u64(sch_pa, wd.watchdog_offset);
+                    let observed = mem.read_u64(pa, write_offset);
                     watchdog_observation = Some(super::WatchdogObservation {
-                        expected_jiffies: wd.jiffies,
+                        expected_jiffies: wd_jiffies,
                         observed_jiffies: observed,
                     });
                 }
@@ -1422,7 +1445,7 @@ mod tests {
         let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
-        let wd = WatchdogOverride {
+        let wd = WatchdogOverride::ScxSched {
             scx_root_pa,
             watchdog_offset,
             jiffies: 99999,
@@ -1480,7 +1503,7 @@ mod tests {
 
         let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
         let kill = std::sync::Arc::new(AtomicBool::new(false));
-        let wd = WatchdogOverride {
+        let wd = WatchdogOverride::ScxSched {
             scx_root_pa,
             watchdog_offset: 16,
             jiffies: 0xDEADBEEF,
@@ -1523,6 +1546,62 @@ mod tests {
             watchdog_observation.is_none(),
             "watchdog_observation should be None when scx_root is null"
         );
+    }
+
+    #[test]
+    fn monitor_loop_watchdog_static_global_writes_directly() {
+        let offsets = test_offsets();
+        let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        let watchdog_pa = rq_buf.len() as u64;
+
+        let mut combined = rq_buf;
+        combined.extend_from_slice(&[0u8; 8]);
+
+        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+
+        let wd = WatchdogOverride::StaticGlobal {
+            watchdog_timeout_pa: watchdog_pa,
+            jiffies: 77777,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            watchdog_override: Some(&wd),
+            ..test_config()
+        };
+        let MonitorLoopResult {
+            samples,
+            watchdog_observation,
+            ..
+        } = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert!(!samples.is_empty());
+        let written = u64::from_ne_bytes(
+            combined[watchdog_pa as usize..watchdog_pa as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(written, 77777);
+        let obs = watchdog_observation.expect("watchdog_observation should be Some");
+        assert_eq!(obs.expected_jiffies, 77777);
+        assert_eq!(obs.observed_jiffies, 77777);
     }
 
     #[test]

@@ -55,6 +55,11 @@ pub(crate) struct KernelSymbols {
     /// Kernel virtual address of `prog_idr` (BPF program IDR).
     /// None if the symbol is absent.
     pub prog_idr: Option<u64>,
+    /// Kernel virtual address of `scx_watchdog_timeout` (static global).
+    /// Present on 6.16 where the watchdog timeout is a file-scope static
+    /// rather than a field on `struct scx_sched`. None on 7.1+ or when
+    /// the symbol is absent.
+    pub scx_watchdog_timeout: Option<u64>,
 }
 
 impl KernelSymbols {
@@ -91,6 +96,8 @@ impl KernelSymbols {
 
         let prog_idr = sym_addr("prog_idr");
 
+        let scx_watchdog_timeout = sym_addr("scx_watchdog_timeout");
+
         Ok(Self {
             runqueues,
             per_cpu_offset,
@@ -99,6 +106,7 @@ impl KernelSymbols {
             init_top_pgt,
             pgtable_l5_enabled,
             prog_idr,
+            scx_watchdog_timeout,
         })
     }
 }
@@ -346,6 +354,7 @@ mod tests {
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
+            scx_watchdog_timeout: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), expected_page_offset);
@@ -365,6 +374,7 @@ mod tests {
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
+            scx_watchdog_timeout: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -386,6 +396,7 @@ mod tests {
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
+            scx_watchdog_timeout: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -410,6 +421,7 @@ mod tests {
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
+            scx_watchdog_timeout: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -437,6 +449,7 @@ mod tests {
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
+            scx_watchdog_timeout: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), randomized_page_offset);
@@ -460,6 +473,7 @@ mod tests {
             init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
             prog_idr: None,
+            scx_watchdog_timeout: None,
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols));
@@ -483,6 +497,7 @@ mod tests {
             init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
             prog_idr: None,
+            scx_watchdog_timeout: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));
@@ -502,6 +517,7 @@ mod tests {
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
+            scx_watchdog_timeout: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));
