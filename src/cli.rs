@@ -47,7 +47,7 @@ pub fn format_entry_row(entry: &CacheEntry, kconfig_hash: &str, ktstr_hash: &str
 }
 
 /// Current time as ISO 8601 string (UTC, second precision).
-pub fn now_iso8601() -> String {
+fn now_iso8601() -> String {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -63,7 +63,7 @@ pub fn now_iso8601() -> String {
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-pub fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     // Algorithm from https://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
     let era = z / 146097;
@@ -662,7 +662,7 @@ pub fn kernel_build_pipeline(
 ///
 /// Returns the argument list that would be passed to `make` for a
 /// parallel kernel build: `["-jN", "KCFLAGS=-Wno-error"]`.
-pub fn build_make_args(nproc: usize) -> Vec<String> {
+fn build_make_args(nproc: usize) -> Vec<String> {
     vec![format!("-j{nproc}"), "KCFLAGS=-Wno-error".into()]
 }
 
