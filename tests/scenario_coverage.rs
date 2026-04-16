@@ -419,7 +419,6 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
     },
     scheduler: &KTSTR_SCHED,
     bpf_map_write: Some(&BPF_CRASH),
-    expect_err: true,
     ..KtstrTestEntry::DEFAULT
 };
 
