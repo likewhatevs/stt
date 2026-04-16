@@ -1318,6 +1318,198 @@ mod tests {
         assert_eq!(topo.llc_numa_node(0), 0);
     }
 
+    // -- llc_offset pinning tests --
+
+    #[test]
+    fn pinning_offset_single_llc_wraps() {
+        // 1 host LLC with 4 CPUs, request 1l2c1t, offset 1.
+        // (0 + 1) % 1 = 0 — wraps back to the only LLC.
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 2, 1), false, 1)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 2);
+        assert_eq!(plan.assignments[0], (0, 0));
+        assert_eq!(plan.assignments[1], (1, 1));
+    }
+
+    #[test]
+    fn pinning_offset_two_llcs_shifts() {
+        // 2 host LLCs, request 2l2c1t, offset 1.
+        // vLLC 0 -> (0+1)%2 = host LLC 1 (CPUs 4,5).
+        // vLLC 1 -> (1+1)%2 = host LLC 0 (CPUs 0,1).
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), false, 1)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 4);
+        assert_eq!(plan.assignments[0], (0, 4));
+        assert_eq!(plan.assignments[1], (1, 5));
+        assert_eq!(plan.assignments[2], (2, 0));
+        assert_eq!(plan.assignments[3], (3, 1));
+    }
+
+    #[test]
+    fn pinning_offset_wraps_modulo() {
+        // 2 host LLCs, request 2l2c1t, offset 2.
+        // (0+2)%2 = 0, (1+2)%2 = 1 — same as offset 0.
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), false, 2)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 4);
+        assert_eq!(plan.assignments[0], (0, 0));
+        assert_eq!(plan.assignments[1], (1, 1));
+        assert_eq!(plan.assignments[2], (2, 4));
+        assert_eq!(plan.assignments[3], (3, 5));
+    }
+
+    #[test]
+    fn pinning_offset_three_llcs_partial() {
+        // 3 host LLCs (4 CPUs each), request 2l2c1t, offset 1.
+        // vLLC 0 -> (0+1)%3 = host LLC 1 (CPUs 4,5).
+        // vLLC 1 -> (1+1)%3 = host LLC 2 (CPUs 8,9).
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]]);
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), false, 1)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 4);
+        assert_eq!(plan.assignments[0], (0, 4));
+        assert_eq!(plan.assignments[1], (1, 5));
+        assert_eq!(plan.assignments[2], (2, 8));
+        assert_eq!(plan.assignments[3], (3, 9));
+    }
+
+    #[test]
+    fn pinning_offset_large_wraps() {
+        // 3 host LLCs, request 1l2c1t, offset 5.
+        // (0 + 5) % 3 = 2 — maps to host LLC 2 (CPUs 8,9).
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]]);
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 1, 2, 1), false, 5)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 2);
+        assert_eq!(plan.assignments[0], (0, 8));
+        assert_eq!(plan.assignments[1], (1, 9));
+    }
+
+    #[test]
+    fn pinning_offset_numa_within_rotation() {
+        // 4 host LLCs across 2 NUMA nodes, offset 1.
+        // node_offset = 1/2 = 0 (no node rotation).
+        // within_offset = 1 % 2 = 1 (rotate within each node).
+        // Guest node 0 → host node 0: LLCs [1, 0].
+        // Guest node 1 → host node 1: LLCs [3, 2].
+        // LLC order: [1, 0, 3, 2].
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1, 2, 3]),
+            (0, vec![4, 5, 6, 7]),
+            (1, vec![8, 9, 10, 11]),
+            (1, vec![12, 13, 14, 15]),
+        ]);
+        let plan = topo
+            .compute_pinning(&Topology::new(2, 4, 2, 1), false, 1)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 8);
+        // vLLC 0 → host LLC 1 (CPUs 4,5).
+        assert_eq!(plan.assignments[0], (0, 4));
+        assert_eq!(plan.assignments[1], (1, 5));
+        // vLLC 1 → host LLC 0 (CPUs 0,1).
+        assert_eq!(plan.assignments[2], (2, 0));
+        assert_eq!(plan.assignments[3], (3, 1));
+        // vLLC 2 → host LLC 3 (CPUs 12,13).
+        assert_eq!(plan.assignments[4], (4, 12));
+        assert_eq!(plan.assignments[5], (5, 13));
+        // vLLC 3 → host LLC 2 (CPUs 8,9).
+        assert_eq!(plan.assignments[6], (6, 8));
+        assert_eq!(plan.assignments[7], (7, 9));
+    }
+
+    #[test]
+    fn pinning_offset_numa_node_rotation() {
+        // 4 host LLCs across 2 NUMA nodes, offset 2.
+        // node_offset = 2/2 = 1 (rotates guest→host node mapping).
+        // within_offset = 2 % 2 = 0 (no within-node rotation).
+        // Guest node 0 → host node 1: LLCs [2, 3].
+        // Guest node 1 → host node 0: LLCs [0, 1].
+        // LLC order: [2, 3, 0, 1].
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1, 2, 3]),
+            (0, vec![4, 5, 6, 7]),
+            (1, vec![8, 9, 10, 11]),
+            (1, vec![12, 13, 14, 15]),
+        ]);
+        let plan = topo
+            .compute_pinning(&Topology::new(2, 4, 2, 1), false, 2)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 8);
+        // vLLC 0 → host LLC 2 (CPUs 8,9).
+        assert_eq!(plan.assignments[0], (0, 8));
+        assert_eq!(plan.assignments[1], (1, 9));
+        // vLLC 1 → host LLC 3 (CPUs 12,13).
+        assert_eq!(plan.assignments[2], (2, 12));
+        assert_eq!(plan.assignments[3], (3, 13));
+        // vLLC 2 → host LLC 0 (CPUs 0,1).
+        assert_eq!(plan.assignments[4], (4, 0));
+        assert_eq!(plan.assignments[5], (5, 1));
+        // vLLC 3 → host LLC 1 (CPUs 4,5).
+        assert_eq!(plan.assignments[6], (6, 4));
+        assert_eq!(plan.assignments[7], (7, 5));
+    }
+
+    #[test]
+    fn pinning_offset_with_service_cpu() {
+        // 2 host LLCs, offset 1, reserve_service_cpu=true.
+        // LLC order: [1, 0]. vCPUs consume 4,5,0,1.
+        // Service CPU: first online_cpus entry not in {0,1,4,5} → 2.
+        let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+        let plan = topo
+            .compute_pinning(&Topology::new(1, 2, 2, 1), true, 1)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 4);
+        assert_eq!(plan.assignments[0], (0, 4));
+        assert_eq!(plan.assignments[1], (1, 5));
+        assert_eq!(plan.assignments[2], (2, 0));
+        assert_eq!(plan.assignments[3], (3, 1));
+        let service = plan.service_cpu.expect("service_cpu should be set");
+        assert_eq!(service, 2);
+        let vcpu_cpus: std::collections::HashSet<usize> =
+            plan.assignments.iter().map(|a| a.1).collect();
+        assert!(!vcpu_cpus.contains(&service));
+    }
+
+    #[test]
+    fn pinning_offset_numa_combined_rotation() {
+        // 4 host LLCs across 2 NUMA nodes, offset 3.
+        // node_offset = 3/2 = 1 (rotates node mapping).
+        // within_offset = 3 % 2 = 1 (rotates within each node).
+        // Guest node 0 → host node 1: LLCs [3, 2].
+        // Guest node 1 → host node 0: LLCs [1, 0].
+        // LLC order: [3, 2, 1, 0].
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1, 2, 3]),
+            (0, vec![4, 5, 6, 7]),
+            (1, vec![8, 9, 10, 11]),
+            (1, vec![12, 13, 14, 15]),
+        ]);
+        let plan = topo
+            .compute_pinning(&Topology::new(2, 4, 2, 1), false, 3)
+            .unwrap();
+        assert_eq!(plan.assignments.len(), 8);
+        // vLLC 0 → host LLC 3 (CPUs 12,13).
+        assert_eq!(plan.assignments[0], (0, 12));
+        assert_eq!(plan.assignments[1], (1, 13));
+        // vLLC 1 → host LLC 2 (CPUs 8,9).
+        assert_eq!(plan.assignments[2], (2, 8));
+        assert_eq!(plan.assignments[3], (3, 9));
+        // vLLC 2 → host LLC 1 (CPUs 4,5).
+        assert_eq!(plan.assignments[4], (4, 4));
+        assert_eq!(plan.assignments[5], (5, 5));
+        // vLLC 3 → host LLC 0 (CPUs 0,1).
+        assert_eq!(plan.assignments[6], (6, 0));
+        assert_eq!(plan.assignments[7], (7, 1));
+    }
+
     // -- resource lock tests --
 
     /// Clean up a lock file. Best-effort; ignores errors.
