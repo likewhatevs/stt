@@ -2,12 +2,18 @@
 
 ## Prerequisites
 
+**Linux only (x86_64, aarch64).** ktstr boots KVM virtual machines;
+it does not build or run on other platforms.
+
 - Linux host with KVM access (`/dev/kvm`)
 - Rust toolchain (stable, >= 1.88)
-- clang and BPF toolchain (builds BPF skeletons via libbpf-cargo)
-- pkg-config
-- Autotools and make, for building the vendored copies of libbpf,
-  libelf, and zlib pulled in via `libbpf-sys`'s `vendored` feature
+- clang (BPF skeleton compilation)
+- pkg-config, make, gcc
+- autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
+  libbpf/libelf/zlib build
+- BTF (`/sys/kernel/btf/vmlinux` -- present by default on most
+  distros; set `KTSTR_KERNEL` if missing)
+- Internet access on first build (downloads busybox source)
 - Linux kernel 6.12+ for sched_ext tests (check with `uname -r`).
   The host kernel has no version requirement beyond KVM; the test
   kernel is whichever you build or cache via `cargo ktstr kernel build`.
@@ -17,23 +23,24 @@
 **Ubuntu/Debian:**
 
 ```sh
-sudo apt install clang pkg-config make autoconf autopoint flex bison gawk
+sudo apt install clang pkg-config make gcc autoconf autopoint flex bison gawk
 ```
 
 **Fedora:**
 
 ```sh
-sudo dnf install clang pkgconf make autoconf gettext-devel flex bison gawk
+sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 ```
 
 ## Install tools
 
 ```sh
-cargo install cargo-nextest           # required test runner
+cargo install cargo-nextest           # recommended test runner (optional)
 cargo install ktstr                   # both binaries: ktstr + cargo-ktstr (optional)
 ```
 
-`cargo-nextest` is the test runner. `cargo install ktstr` installs
+`cargo-nextest` enables gauntlet expansion; `cargo test` works
+without it for base topology. `cargo install ktstr` installs
 both the host-side CLI (`ktstr`) and the dev workflow plugin
 (`cargo-ktstr`).
 

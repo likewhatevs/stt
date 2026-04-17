@@ -52,7 +52,7 @@ automates this:
 
 ```sh
 cargo install ktstr                   # both binaries (ktstr + cargo-ktstr)
-cargo install cargo-nextest           # required test runner
+cargo install cargo-nextest           # recommended test runner (optional)
 ```
 
 `ktstr` is the host-side CLI for running scenarios and managing cached
@@ -63,17 +63,35 @@ by the workspace and does not need a separate install.
 
 ## Setup
 
-**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang,
-pkg-config, plus autotools and make for the vendored libbpf/libelf/zlib
-builds pulled in via `libbpf-sys`'s `vendored` feature. Test kernel:
-Linux 6.12+ with sched_ext; `cargo ktstr kernel build` fetches one if
-your host (`uname -r`) is older. See
-[Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels)
-for details.
+**Linux only (x86_64, aarch64).** ktstr boots KVM virtual machines;
+it does not build or run on other platforms.
+
+**Required:**
+
+- Linux host with `/dev/kvm`
+- Rust >= 1.88 (stable)
+- clang (BPF skeleton compilation)
+- pkg-config, make, gcc
+- autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
+  libbpf/libelf/zlib build
+- BTF (`/sys/kernel/btf/vmlinux` -- present by default on most
+  distros; set `KTSTR_KERNEL` if missing)
+- Internet access on first build (downloads busybox source)
+
+**Optional:**
+
+- [cargo-nextest](https://nexte.st/) -- enables gauntlet expansion;
+  `cargo test` works without it for base topology.
+- Test kernel: Linux 6.12+ with sched_ext for scheduler tests;
+  `cargo ktstr kernel build` fetches and caches one. See
+  [Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels).
 
 ```sh
 # Ubuntu/Debian
-sudo apt install clang pkg-config make autoconf autopoint flex bison gawk
+sudo apt install clang pkg-config make gcc autoconf autopoint flex bison gawk
+
+# Fedora
+sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 ```
 
 **Add to your crate**:
@@ -89,7 +107,7 @@ dev-dependency for the shown code to compile.
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
 
-See the [getting started guide](https://likewhatevs.github.io/ktstr/guide/getting-started.html) for Fedora packages, kernel discovery, and building a test kernel.
+See the [getting started guide](https://likewhatevs.github.io/ktstr/guide/getting-started.html) for kernel discovery and building a test kernel.
 
 ## Quick start
 
