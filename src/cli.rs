@@ -726,7 +726,7 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 pub fn run_test_stats(dir: Option<&std::path::Path>) -> String {
     let report = crate::test_support::analyze_sidecars(dir);
     if report.is_empty() {
-        eprintln!("cargo-ktstr: no sidecar data found (skipped)");
+        eprintln!("cargo ktstr: no sidecar data found (skipped)");
         return String::new();
     }
     report

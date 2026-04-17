@@ -191,7 +191,7 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     }
 
     if clean {
-        eprintln!("cargo-ktstr: make mrproper");
+        eprintln!("cargo ktstr: make mrproper");
         cli::run_make(kernel_dir, &["mrproper"]).map_err(|e| format!("{e:#}"))?;
     }
 
@@ -246,7 +246,7 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
                 let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
                     .map_err(|e| format!("{e:#}"))?;
-                eprintln!("cargo-ktstr: using kernel {}", cache_dir.display());
+                eprintln!("cargo ktstr: using kernel {}", cache_dir.display());
                 cmd.env("KTSTR_KERNEL", &cache_dir);
             }
         }
@@ -255,7 +255,7 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
     // KTSTR_TEST_KERNEL, then KTSTR_KERNEL, then falls back to cache
     // and filesystem lookup.
 
-    eprintln!("cargo-ktstr: running tests");
+    eprintln!("cargo ktstr: running tests");
     let err = cmd.exec();
     Err(format!("exec cargo nextest run: {err}"))
 }
@@ -276,13 +276,13 @@ fn run_coverage(kernel: Option<String>, args: Vec<String>) -> Result<(), String>
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
                 let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
                     .map_err(|e| format!("{e:#}"))?;
-                eprintln!("cargo-ktstr: using kernel {}", cache_dir.display());
+                eprintln!("cargo ktstr: using kernel {}", cache_dir.display());
                 cmd.env("KTSTR_KERNEL", &cache_dir);
             }
         }
     }
 
-    eprintln!("cargo-ktstr: running coverage");
+    eprintln!("cargo ktstr: running coverage");
     let err = cmd.exec();
     Err(format!("exec cargo llvm-cov nextest: {err}"))
 }
@@ -329,8 +329,8 @@ fn kernel_build(
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}-kc{}", ktstr::cache_key_suffix());
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
-            eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
-            eprintln!("cargo-ktstr: use --force to rebuild");
+            eprintln!("cargo ktstr: cached kernel found: {}", entry.path.display());
+            eprintln!("cargo ktstr: use --force to rebuild");
             return Ok(());
         }
         let sp = cli::Spinner::start("Downloading kernel...");
@@ -346,8 +346,8 @@ fn kernel_build(
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
-        eprintln!("cargo-ktstr: cached kernel found: {}", entry.path.display());
-        eprintln!("cargo-ktstr: use --force to rebuild");
+        eprintln!("cargo ktstr: cached kernel found: {}", entry.path.display());
+        eprintln!("cargo ktstr: use --force to rebuild");
         return Ok(());
     }
 
@@ -491,7 +491,7 @@ fn generate_flag_profiles(
 
     if n > 31 {
         eprintln!(
-            "cargo-ktstr: error: scheduler has {n} flags, power set too large (2^{n}). \
+            "cargo ktstr: error: scheduler has {n} flags, power set too large (2^{n}). \
              Use --profiles to select specific profiles."
         );
         return profiles;
@@ -592,7 +592,7 @@ fn run_verifier(
         );
     }
 
-    eprintln!("cargo-ktstr: collecting verifier stats");
+    eprintln!("cargo ktstr: collecting verifier stats");
     let result =
         ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel_path, &[])
             .map_err(|e| format!("collect verifier output: {e:#}"))?;
@@ -613,7 +613,7 @@ fn run_verifier_all_profiles(
     let flags = query_scheduler_flags(sched_bin)?;
     if flags.is_empty() {
         eprintln!(
-            "cargo-ktstr: scheduler does not support --ktstr-list-flags, \
+            "cargo ktstr: scheduler does not support --ktstr-list-flags, \
              running with default profile only"
         );
         let result =
@@ -650,13 +650,13 @@ fn run_verifier_all_profiles(
     let total = profiles.len();
     if total > 32 {
         eprintln!(
-            "cargo-ktstr: warning: {total} profiles to verify (>32). \
+            "cargo ktstr: warning: {total} profiles to verify (>32). \
              Use --profiles to select a subset."
         );
     }
 
     eprintln!(
-        "cargo-ktstr: verifying {total} profile{}",
+        "cargo ktstr: verifying {total} profile{}",
         if total == 1 { "" } else { "s" }
     );
 
@@ -665,7 +665,7 @@ fn run_verifier_all_profiles(
 
     for (i, (profile_name, active_flags)) in profiles.iter().enumerate() {
         eprintln!(
-            "cargo-ktstr: [{}/{}] profile: {}",
+            "cargo ktstr: [{}/{}] profile: {}",
             i + 1,
             total,
             profile_name
@@ -754,7 +754,7 @@ fn main() {
     let result = match ktstr.command {
         KtstrCommand::BuildKernel { kernel, clean } => {
             eprintln!(
-                "cargo-ktstr: warning: build-kernel is deprecated, use `cargo ktstr kernel build --source {}` instead",
+                "cargo ktstr: warning: build-kernel is deprecated, use `cargo ktstr kernel build --source {}` instead",
                 kernel.display()
             );
             build_kernel(&kernel, clean)

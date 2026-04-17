@@ -268,7 +268,7 @@ pub fn remote_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
     let op = match create_operator() {
         Ok(op) => op,
         Err(e) => {
-            eprintln!("cargo-ktstr: remote cache warning: {e}");
+            eprintln!("cargo ktstr: remote cache warning: {e}");
             return None;
         }
     };
@@ -279,18 +279,18 @@ pub fn remote_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
             if e.kind() == opendal::ErrorKind::NotFound {
                 return None;
             }
-            eprintln!("cargo-ktstr: remote cache read warning: {e}");
+            eprintln!("cargo ktstr: remote cache read warning: {e}");
             return None;
         }
     };
 
     match unpack_and_store(cache, cache_key, &data) {
         Ok(entry) => {
-            eprintln!("cargo-ktstr: fetched from remote cache: {cache_key}");
+            eprintln!("cargo ktstr: fetched from remote cache: {cache_key}");
             Some(entry)
         }
         Err(e) => {
-            eprintln!("cargo-ktstr: remote cache unpack warning: {e}");
+            eprintln!("cargo ktstr: remote cache unpack warning: {e}");
             None
         }
     }
@@ -304,7 +304,7 @@ pub fn remote_store(entry: &CacheEntry) {
     let meta = match &entry.metadata {
         Some(m) => m,
         None => {
-            eprintln!("cargo-ktstr: remote cache store skipped: no metadata");
+            eprintln!("cargo ktstr: remote cache store skipped: no metadata");
             return;
         }
     };
@@ -312,7 +312,7 @@ pub fn remote_store(entry: &CacheEntry) {
     let op = match create_operator() {
         Ok(op) => op,
         Err(e) => {
-            eprintln!("cargo-ktstr: remote cache warning: {e}");
+            eprintln!("cargo ktstr: remote cache warning: {e}");
             return;
         }
     };
@@ -320,17 +320,17 @@ pub fn remote_store(entry: &CacheEntry) {
     let data = match pack_entry(&entry.path, meta) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("cargo-ktstr: remote cache pack warning: {e}");
+            eprintln!("cargo ktstr: remote cache pack warning: {e}");
             return;
         }
     };
 
     match RUNTIME.block_on(op.write(&entry.key, data)) {
         Ok(_) => {
-            eprintln!("cargo-ktstr: stored to remote cache: {}", entry.key);
+            eprintln!("cargo ktstr: stored to remote cache: {}", entry.key);
         }
         Err(e) => {
-            eprintln!("cargo-ktstr: remote cache write warning: {e}");
+            eprintln!("cargo ktstr: remote cache write warning: {e}");
         }
     }
 }
