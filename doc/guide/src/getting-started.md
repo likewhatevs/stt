@@ -8,6 +8,11 @@
 - pkg-config
 - Autotools and make, for building the vendored copies of libbpf,
   libelf, and zlib pulled in via `libbpf-sys`'s `vendored` feature
+- Linux kernel 6.12+ for sched_ext tests (check with `uname -r`).
+  The host kernel has no version requirement beyond KVM; the test
+  kernel is whichever you build or cache via `cargo ktstr kernel build`.
+  See [Supported kernels](features.md#supported-kernels) for
+  per-feature version boundaries.
 
 **Ubuntu/Debian:**
 

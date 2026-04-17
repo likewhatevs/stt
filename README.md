@@ -41,7 +41,11 @@ by the workspace and does not need a separate install.
 
 **Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang,
 pkg-config, plus autotools and make for the vendored libbpf/libelf/zlib
-builds pulled in via `libbpf-sys`'s `vendored` feature.
+builds pulled in via `libbpf-sys`'s `vendored` feature. Test kernel:
+Linux 6.12+ with sched_ext; `cargo ktstr kernel build` fetches one if
+your host (`uname -r`) is older. See
+[Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels)
+for details.
 
 ```sh
 # Ubuntu/Debian
