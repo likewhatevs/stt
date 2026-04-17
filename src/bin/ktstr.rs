@@ -84,10 +84,17 @@ enum Command {
     /// Show host CPU topology.
     Topo,
     /// Clean up leftover cgroups.
+    ///
+    /// Without `--parent-cgroup`, removes all cgroups matching
+    /// `/sys/fs/cgroup/ktstr` and `/sys/fs/cgroup/ktstr-<pid>`
+    /// (the paths `ktstr run` and the in-process test harness create).
+    /// The directories themselves are removed too.
     Cleanup {
-        /// Parent cgroup path.
-        #[arg(long, default_value = "/sys/fs/cgroup/ktstr")]
-        parent_cgroup: String,
+        /// Parent cgroup path. When set, cleans only this path and
+        /// leaves the parent directory in place; when omitted, globs
+        /// the default ktstr parents and rmdirs each.
+        #[arg(long)]
+        parent_cgroup: Option<String>,
     },
     /// Manage cached kernel images.
     Kernel {
@@ -181,6 +188,38 @@ enum KernelCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// List cgroup directories that `ktstr cleanup` targets by default:
+/// `/sys/fs/cgroup/ktstr` (test-harness parent) and any
+/// `/sys/fs/cgroup/ktstr-<pid>` left behind by `ktstr run`.
+///
+/// Returns only entries that exist and are directories. Silently
+/// returns empty when `/sys/fs/cgroup` isn't a cgroup v2 mount.
+fn default_cleanup_parents() -> Vec<PathBuf> {
+    let root = Path::new("/sys/fs/cgroup");
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(ty) = entry.file_type() else { continue };
+        if !ty.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == "ktstr"
+            || name
+                .strip_prefix("ktstr-")
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    out
 }
 
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
@@ -381,11 +420,39 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Cleanup { parent_cgroup } => {
-            let cgroups = CgroupManager::new(&parent_cgroup);
-            cgroups.cleanup_all()?;
-            println!("cleaned up {parent_cgroup}");
-        }
+        Command::Cleanup { parent_cgroup } => match parent_cgroup {
+            Some(path) => {
+                if !Path::new(&path).exists() {
+                    anyhow::bail!("cgroup path not found: {path}");
+                }
+                let cgroups = CgroupManager::new(&path);
+                cgroups.cleanup_all()?;
+                println!("cleaned up {path}");
+            }
+            None => {
+                let parents = default_cleanup_parents();
+                if parents.is_empty() {
+                    println!("no leftover cgroups found");
+                } else {
+                    for path in parents {
+                        let cgroups = CgroupManager::new(path.to_str().unwrap_or_default());
+                        if let Err(e) = cgroups.cleanup_all() {
+                            eprintln!("ktstr: cleanup_all failed on {}: {e}", path.display());
+                            continue;
+                        }
+                        match std::fs::remove_dir(&path) {
+                            Ok(()) => println!("cleaned up {}", path.display()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                println!("cleaned up {}", path.display());
+                            }
+                            Err(e) => {
+                                eprintln!("ktstr: failed to remove {}: {e}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        },
 
         Command::Kernel { command } => match command {
             KernelCommand::List { json } => cli::kernel_list(json)?,

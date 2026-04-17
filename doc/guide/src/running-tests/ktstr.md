@@ -82,11 +82,15 @@ ktstr topo
 
 ### cleanup
 
-Remove leftover cgroups from a previous run:
+Remove leftover cgroups from a previous run. With no arguments, cleans
+up `/sys/fs/cgroup/ktstr` (used by the test harness) and every
+`/sys/fs/cgroup/ktstr-<pid>` directory (one per `ktstr run` that
+exited abnormally), removing the directories themselves. Pass
+`--parent-cgroup PATH` to clean a single explicit path instead.
 
 ```sh
 ktstr cleanup
-ktstr cleanup --parent-cgroup /sys/fs/cgroup/ktstr
+ktstr cleanup --parent-cgroup /sys/fs/cgroup/ktstr-12345
 ```
 
 ### kernel
