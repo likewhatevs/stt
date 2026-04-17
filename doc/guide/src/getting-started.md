@@ -210,7 +210,7 @@ one command:
 ```sh
 cargo ktstr test                                              # auto-discover kernel
 cargo ktstr test --kernel ../linux                            # local source tree
-cargo ktstr test --kernel 6.14.2                              # cached version
+cargo ktstr test --kernel 6.14.2                              # version (auto-downloads on miss)
 cargo ktstr test -- -E 'test(my_test)'                        # pass nextest args
 ```
 

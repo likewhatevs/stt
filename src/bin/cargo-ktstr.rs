@@ -9,17 +9,15 @@ use ktstr::cli;
 use ktstr::fetch;
 use ktstr::remote_cache;
 
-/// Help text shared by test/coverage --kernel (verifier uses its
-/// own due to file-path acceptance). Raw image files are not
-/// supported here; version and cache-key forms require the entry
-/// to already be cached (run `cargo ktstr kernel build` first).
-/// Shell uses its own help because it accepts image files and has
-/// a different no-match error path.
+/// Help text shared by test/coverage --kernel. Raw image files are
+/// not supported here; versions auto-download from kernel.org on
+/// cache miss; cache keys must already be cached. Verifier and
+/// shell use their own help because they accept image files.
 const KERNEL_IDENTIFIER_HELP: &str = "Kernel identifier: a source directory path (e.g. `../linux`), a version \
-     (`6.14.2`), or a cache key (see `cargo ktstr kernel list`). Raw \
-     image files are not supported here; version/cache-key forms \
-     require the entry to already be cached (run `cargo ktstr kernel \
-     build` first).";
+     (`6.14.2`, or major.minor prefix `6.14` for latest patch), or a cache \
+     key (see `cargo ktstr kernel list`). Raw image files are not supported \
+     here. Versions auto-download from kernel.org on cache miss; cache keys \
+     must already be cached.";
 
 #[derive(Parser)]
 #[command(name = "cargo-ktstr", bin_name = "cargo")]
@@ -93,9 +91,12 @@ enum KtstrCommand {
         #[arg(long, conflicts_with = "scheduler")]
         scheduler_bin: Option<PathBuf>,
         /// Kernel identifier: a source directory path (e.g. `../linux`),
-        /// a version (`6.14.2`), or a cache key (see
-        /// `cargo ktstr kernel list`). When absent, resolves
-        /// automatically via cache then filesystem.
+        /// a raw image file (`bzImage` / `Image`), a version (`6.14.2`,
+        /// or major.minor prefix `6.14` for latest patch), or a cache
+        /// key (see `cargo ktstr kernel list`). Source directories
+        /// auto-build; versions auto-download from kernel.org on cache
+        /// miss. When absent, resolves via cache then filesystem,
+        /// falling back to downloading the latest stable kernel.
         #[arg(long)]
         kernel: Option<String>,
         /// Print raw verifier output without formatting.
@@ -130,11 +131,13 @@ enum KtstrCommand {
     /// library resolution via ELF DT_NEEDED parsing.
     Shell {
         /// Kernel identifier: a source directory path (e.g. `../linux`),
-        /// a raw image file (`bzImage` / `Image`), a version
-        /// (`6.14.2`), or a cache key (see `cargo ktstr kernel list`).
-        /// Source directories auto-build (can be slow on a fresh tree).
-        /// When absent, resolves via cache then filesystem, falling back
-        /// to downloading the latest stable kernel from kernel.org.
+        /// a raw image file (`bzImage` / `Image`), a version (`6.14.2`,
+        /// or major.minor prefix `6.14` for latest patch), or a cache
+        /// key (see `cargo ktstr kernel list`). Source directories
+        /// auto-build (can be slow on a fresh tree); versions
+        /// auto-download from kernel.org on cache miss. When absent,
+        /// resolves via cache then filesystem, falling back to
+        /// downloading the latest stable kernel from kernel.org.
         #[arg(long)]
         kernel: Option<String>,
         /// Virtual topology as "numa_nodes,llcs,cores,threads".
@@ -268,14 +271,14 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
                 let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
                     .map_err(|e| format!("{e:#}"))?;
-                eprintln!("cargo-ktstr: using cached kernel {}", cache_dir.display());
+                eprintln!("cargo-ktstr: using kernel {}", cache_dir.display());
                 cmd.env("KTSTR_KERNEL", &cache_dir);
             }
         }
     }
-    // When kernel is None, the test framework discovers a kernel via
-    // resolve_test_kernel() (KTSTR_TEST_KERNEL, then find_kernel() for
-    // cache and filesystem fallbacks).
+    // When kernel is None, the test framework discovers a kernel from
+    // KTSTR_TEST_KERNEL, then KTSTR_KERNEL, then falls back to cache
+    // and filesystem lookup.
 
     eprintln!("cargo-ktstr: running tests");
     let err = cmd.exec();
@@ -298,7 +301,7 @@ fn run_coverage(kernel: Option<String>, args: Vec<String>) -> Result<(), String>
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
                 let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
                     .map_err(|e| format!("{e:#}"))?;
-                eprintln!("cargo-ktstr: using cached kernel {}", cache_dir.display());
+                eprintln!("cargo-ktstr: using kernel {}", cache_dir.display());
                 cmd.env("KTSTR_KERNEL", &cache_dir);
             }
         }

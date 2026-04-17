@@ -11,22 +11,25 @@ Build the kernel (if needed) and run tests via `cargo nextest run`.
 ```sh
 cargo ktstr test                                               # auto-discover kernel
 cargo ktstr test --kernel ../linux                             # local source tree
-cargo ktstr test --kernel 6.14.2                               # cached version
+cargo ktstr test --kernel 6.14.2                               # version (auto-downloads on miss)
 cargo ktstr test --kernel 6.14.2-tarball-x86_64-kc...          # cache key (from kernel list)
 ```
 
 `--kernel` accepts a path, version string, or cache key. When absent,
-the test framework discovers a kernel via `resolve_test_kernel()`
-(`KTSTR_TEST_KERNEL` env var, then `find_kernel()` for cache and
-filesystem fallbacks). When `--kernel` is a path, cargo-ktstr configures and
-builds the kernel before running tests. Version strings and cache
-keys resolve from the cache only -- they error if not cached (run
-`cargo ktstr kernel build VERSION` first).
+the test framework discovers a kernel from `KTSTR_TEST_KERNEL`, then
+`KTSTR_KERNEL`, then falls back to cache and filesystem lookup.
+When `--kernel` is a path,
+cargo-ktstr configures and builds the kernel before running tests.
+Version strings auto-download and build on cache miss (both explicit
+patch versions like `6.14.2` and major.minor prefixes like `6.14`).
+Cache keys resolve from the cache only — they error if not cached
+(run `cargo ktstr kernel list` to see available keys).
 
 ### What it does (path mode only)
 
 These steps run only when `--kernel` is a source directory path.
-Version strings and cache keys skip to step 5.
+Cached version and cache-key identifiers skip to step 5; uncached
+version identifiers run through download + configure + build first.
 
 1. **Config check** -- reads `<kernel>/.config` for
    `CONFIG_SCHED_CLASS_EXT=y`.
@@ -59,7 +62,7 @@ Build the kernel (if needed) and run tests with coverage via
 ```sh
 cargo ktstr coverage                                               # auto-discover kernel
 cargo ktstr coverage --kernel ../linux                             # local source tree
-cargo ktstr coverage --kernel 6.14.2                               # cached version
+cargo ktstr coverage --kernel 6.14.2                               # version (auto-downloads on miss)
 cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 ```
 
@@ -185,7 +188,7 @@ across profiles.
 |------|-------------|
 | `--scheduler PKG` | Scheduler package name to build and analyze. |
 | `--scheduler-bin PATH` | Path to pre-built scheduler binary. Conflicts with `--scheduler`. |
-| `--kernel ID` | Kernel identifier (path, version, or cache key). Auto-resolves when absent. |
+| `--kernel ID` | Kernel identifier: path, raw image file (`bzImage`/`Image`), version, or cache key. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. |
 | `--raw` | Print raw verifier output without cycle collapse. |
 | `--all-profiles` | Run verifier for all flag profiles (power set). |
 | `--profiles LIST` | Run verifier for specific profiles only (comma-separated, e.g. `default,llc,llc+steal`). |

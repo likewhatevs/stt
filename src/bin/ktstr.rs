@@ -113,12 +113,12 @@ enum Command {
     /// library resolution via ELF DT_NEEDED parsing.
     Shell {
         /// Kernel identifier: a source directory path (e.g. `../linux`),
-        /// a version (`6.14.2`), or a cache key (see `ktstr kernel list`).
-        /// Raw image files are rejected. Source directories auto-build
-        /// (can be slow on a fresh tree). When absent, resolves via
-        /// cache then filesystem and falls back to downloading the
-        /// latest stable kernel from kernel.org and building it into
-        /// the cache.
+        /// a version (`6.14.2`, or major.minor prefix `6.14` for latest
+        /// patch), or a cache key (see `ktstr kernel list`). Raw image
+        /// files are rejected. Source directories auto-build (can be
+        /// slow on a fresh tree); versions auto-download from kernel.org
+        /// on cache miss. When absent, resolves via cache then filesystem
+        /// and falls back to downloading the latest stable kernel.
         #[arg(long)]
         kernel: Option<String>,
         /// Virtual topology as "numa_nodes,llcs,cores,threads".

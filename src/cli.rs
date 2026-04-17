@@ -851,14 +851,22 @@ pub fn resolve_include_files(
     Ok(resolved_includes)
 }
 
-/// Resolve the cache entry directory from a Version or CacheKey identifier.
+/// Resolve a Version or CacheKey identifier to a cache entry directory.
 ///
-/// Checks local cache first. When `remote_cache::is_enabled()` returns
-/// true, falls back to the remote GHA cache on local miss.
+/// Lookup order: local cache, then the remote GHA cache when
+/// `remote_cache::is_enabled()` returns true. Miss behavior differs
+/// by variant:
+/// - **Version**: major.minor prefixes (e.g. `"6.14"`) resolve to
+///   the latest patch via [`crate::fetch::fetch_version_for_prefix`]
+///   first. On full miss, downloads the kernel from kernel.org,
+///   builds it, and stores it in the cache via
+///   [`download_and_cache_version`].
+/// - **CacheKey**: errors on miss — cache keys are content-hashes
+///   and not downloadable. The error hint suggests running
+///   `{cli_label} kernel list`.
 ///
-/// `cli_label` is the human-facing command name (e.g. `"ktstr"` or
-/// `"cargo ktstr"`) used in error messages that suggest a follow-up
-/// command.
+/// `cli_label` is the human-facing command name (`"ktstr"` or
+/// `"cargo ktstr"`) threaded into status output and error messages.
 pub fn resolve_cached_kernel(
     id: &crate::kernel_path::KernelId,
     cli_label: &str,
@@ -921,9 +929,9 @@ pub fn resolve_cached_kernel(
 
 /// Policy controlling `resolve_kernel_image` behavior across binaries.
 ///
-/// Each binary passes its own policy to share the resolution pipeline
-/// while keeping documented divergences (currently only raw-image
-/// acceptance).
+/// The resolution pipeline — directory auto-build, version
+/// auto-download, cache lookup — is shared. `KernelResolvePolicy`
+/// carries the per-binary knobs documented on each field.
 pub struct KernelResolvePolicy<'a> {
     /// Accept raw kernel image files (e.g. `bzImage`, `Image`) passed
     /// as `--kernel`. `ktstr` uses `false` (rejects); `cargo ktstr`
