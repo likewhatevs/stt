@@ -96,6 +96,11 @@ pub struct GauntletRow {
     pub mean_run_delay_us: f64,
     #[serde(default)]
     pub worst_run_delay_us: f64,
+    // NUMA fields.
+    #[serde(default)]
+    pub page_locality: f64,
+    #[serde(default)]
+    pub cross_node_migration_ratio: f64,
     // Timeline degradation fields.
     pub worst_degradation_op: String,
     pub worst_imbalance_delta: f64,
@@ -156,6 +161,8 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         total_iterations: sc.stats.total_iterations,
         mean_run_delay_us: sc.stats.mean_run_delay_us,
         worst_run_delay_us: sc.stats.worst_run_delay_us,
+        page_locality: sc.stats.worst_page_locality,
+        cross_node_migration_ratio: sc.stats.worst_cross_node_migration_ratio,
         worst_degradation_op: String::new(),
         worst_imbalance_delta: 0.0,
         worst_dsq_delta: 0.0,
@@ -341,6 +348,10 @@ pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
             total_iterations: stats.map(|s| s.total_iterations).unwrap_or(0),
             mean_run_delay_us: stats.map(|s| s.mean_run_delay_us).unwrap_or(0.0),
             worst_run_delay_us: stats.map(|s| s.worst_run_delay_us).unwrap_or(0.0),
+            page_locality: stats.map(|s| s.worst_page_locality).unwrap_or(0.0),
+            cross_node_migration_ratio: stats
+                .map(|s| s.worst_cross_node_migration_ratio)
+                .unwrap_or(0.0),
             worst_degradation_op: worst_deg_op,
             worst_imbalance_delta: worst_imb_delta,
             worst_dsq_delta,
@@ -1290,6 +1301,8 @@ mod tests {
             total_iterations: 0,
             mean_run_delay_us: 0.0,
             worst_run_delay_us: 0.0,
+            page_locality: 0.0,
+            cross_node_migration_ratio: 0.0,
             worst_degradation_op: String::new(),
             worst_imbalance_delta: 0.0,
             worst_dsq_delta: 0.0,

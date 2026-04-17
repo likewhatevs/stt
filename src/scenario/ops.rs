@@ -255,6 +255,13 @@ impl CgroupDef {
         self
     }
 
+    /// Set the NUMA memory policy mode flags (convenience for single Work).
+    pub fn mpol_flags(mut self, f: crate::workload::MpolFlags) -> Self {
+        self.ensure_default_work();
+        self.works[0].mpol_flags = f;
+        self
+    }
+
     /// When true, the gauntlet work_type override replaces each Work's work type.
     pub fn swappable(mut self, swappable: bool) -> Self {
         self.swappable = swappable;
@@ -815,7 +822,7 @@ pub fn execute_steps_with(
     for (step_idx, step) in steps.iter().enumerate() {
         // Check scheduler liveness between steps (skip before first).
         if step_idx > 0 && !process_alive(ctx.sched_pid) {
-            let mut r = collect_result(&mut state, effective_checks);
+            let mut r = collect_result(&mut state, effective_checks, ctx.topo);
             r.passed = false;
             r.details.push(format!(
                 "scheduler crashed after completing step {} of {} ({:.1}s into test)",
@@ -879,7 +886,7 @@ pub fn execute_steps_with(
     // Final liveness check.
     let sched_dead = !process_alive(ctx.sched_pid);
 
-    let mut result = collect_result(&mut state, effective_checks);
+    let mut result = collect_result(&mut state, effective_checks, ctx.topo);
 
     if sched_dead {
         result.passed = false;
@@ -979,6 +986,11 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
         } else {
             &def.works
         };
+        for work in effective_works {
+            if let Err(reason) = work.mem_policy.validate() {
+                anyhow::bail!("cgroup '{}': {}", def.name, reason);
+            }
+        }
         let cgroup_cpuset = state.cpusets.get(def.name.as_ref());
         if let Some(resolved) = cgroup_cpuset {
             for work in effective_works {
@@ -1001,6 +1013,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
                 work_type: effective_work_type,
                 sched_policy: work.sched_policy,
                 mem_policy: work.mem_policy.clone(),
+                mpol_flags: work.mpol_flags,
             };
             let mut h = WorkloadHandle::spawn(&wl)?;
             ctx.cgroups.move_tasks(&def.name, &h.tids())?;
@@ -1050,8 +1063,14 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 }
             }
             Op::Spawn { cgroup, work } => {
+                if let Err(reason) = work.mem_policy.validate() {
+                    anyhow::bail!("cgroup '{}': {}", cgroup, reason);
+                }
                 let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
                 let cgroup_cpuset = state.cpusets.get(cgroup.as_ref());
+                if let Some(resolved) = cgroup_cpuset {
+                    validate_mempolicy_cpuset(&work.mem_policy, resolved, ctx, cgroup)?;
+                }
                 let affinity =
                     super::resolve_affinity_for_cgroup(&work.affinity, cgroup_cpuset, ctx.topo);
                 let wl = WorkloadConfig {
@@ -1060,6 +1079,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     work_type: work.work_type.clone(),
                     sched_policy: work.sched_policy,
                     mem_policy: work.mem_policy.clone(),
+                    mpol_flags: work.mpol_flags,
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
                 ctx.cgroups.move_tasks(cgroup, &h.tids())?;
@@ -1102,6 +1122,9 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 }
             }
             Op::SpawnHost { work } => {
+                if let Err(reason) = work.mem_policy.validate() {
+                    anyhow::bail!("SpawnHost: {}", reason);
+                }
                 let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
                 let affinity = super::resolve_affinity_for_cgroup(&work.affinity, None, ctx.topo);
                 let wl = WorkloadConfig {
@@ -1110,6 +1133,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     work_type: work.work_type.clone(),
                     sched_policy: work.sched_policy,
                     mem_policy: work.mem_policy.clone(),
+                    mpol_flags: work.mpol_flags,
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
                 h.start();
@@ -1162,13 +1186,18 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
 ///
 /// Drains handles from state and delegates to [`collect_handles`](super::collect_handles),
 /// passing each cgroup's tracked cpuset for isolation checks.
-fn collect_result(state: &mut StepState<'_>, checks: &crate::assert::Assert) -> AssertResult {
+fn collect_result(
+    state: &mut StepState<'_>,
+    checks: &crate::assert::Assert,
+    topo: &crate::topology::TestTopology,
+) -> AssertResult {
     let handles = std::mem::take(&mut state.handles);
     super::collect_handles(
         handles
             .into_iter()
             .map(|(name, h)| (h, state.cpusets.get(&name))),
         checks,
+        Some(topo),
     )
 }
 

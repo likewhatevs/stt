@@ -536,25 +536,18 @@ pub fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
     if nodes.is_empty() || len == 0 {
         return;
     }
-    let max_node = nodes.iter().copied().max().unwrap_or(0);
-    // nodemask is a bitmask: bit N = node N. Size in unsigned longs.
-    let mask_bits = max_node + 2; // mbind maxnode is 1-indexed
-    let mask_longs = mask_bits.div_ceil(usize::BITS as usize);
-    let mut nodemask = vec![0usize; mask_longs];
-    for &node in nodes {
-        nodemask[node / (usize::BITS as usize)] |= 1 << (node % (usize::BITS as usize));
-    }
+    let node_set: std::collections::BTreeSet<usize> = nodes.iter().copied().collect();
+    let (nodemask, maxnode) = crate::workload::build_nodemask(&node_set);
 
-    const MPOL_BIND: i32 = 2;
     let rc = unsafe {
         libc::syscall(
             libc::SYS_mbind,
             addr as *mut libc::c_void,
             len,
-            MPOL_BIND,
+            libc::MPOL_BIND,
             nodemask.as_ptr(),
-            mask_bits as libc::c_ulong,
-            0u32, // flags: 0 = policy applies to future allocations only, existing pages not moved
+            maxnode,
+            0u32,
         )
     };
     if rc == 0 {

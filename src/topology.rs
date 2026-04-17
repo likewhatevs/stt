@@ -574,15 +574,35 @@ impl TestTopology {
     /// `numa_nodes < llcs`. CPUs are numbered sequentially. Used as a
     /// fallback when sysfs is incomplete inside a guest VM.
     pub fn from_spec(numa_nodes: u32, llcs: u32, cores: u32, threads: u32) -> Self {
-        assert!(numa_nodes > 0, "numa_nodes must be > 0");
-        assert!(
-            llcs.is_multiple_of(numa_nodes),
-            "llcs ({llcs}) must be divisible by numa_nodes ({numa_nodes})"
-        );
+        let topo = crate::vmm::topology::Topology::new(numa_nodes, llcs, cores, threads);
+        Self::from_vm_topology(&topo)
+    }
+
+    /// Build a [`TestTopology`] from a [`Topology`](crate::vmm::topology::Topology).
+    ///
+    /// Populates LLCs, NUMA nodes, distances, per-node memory info,
+    /// and memory-only node flags from the VM spec. Handles both
+    /// uniform and explicit-node topologies. For uniform topologies,
+    /// pass `total_memory_mb` to populate per-node memory info; when
+    /// `None`, memory info is omitted.
+    pub fn from_vm_topology(topo: &crate::vmm::topology::Topology) -> Self {
+        Self::from_vm_topology_with_memory(topo, None)
+    }
+
+    /// Build a [`TestTopology`] with optional total memory for uniform topologies.
+    pub fn from_vm_topology_with_memory(
+        topo: &crate::vmm::topology::Topology,
+        total_memory_mb: Option<u32>,
+    ) -> Self {
+        let llcs = topo.llcs;
+        let cores = topo.cores_per_llc;
+        let threads = topo.threads_per_core;
+        let numa_nodes = topo.numa_nodes;
+
         let total = (llcs * cores * threads) as usize;
         let cpus_per_llc = (cores * threads) as usize;
         let cpus: Vec<usize> = (0..total).collect();
-        let llcs_per_node = (llcs / numa_nodes) as usize;
+
         let llc_infos: Vec<LlcInfo> = (0..llcs as usize)
             .map(|l| {
                 let start = l * cpus_per_llc;
@@ -595,27 +615,70 @@ impl TestTopology {
                 }
                 LlcInfo {
                     cpus: (start..end).collect(),
-                    numa_node: l / llcs_per_node,
+                    numa_node: topo.numa_node_of(l as u32) as usize,
                     cache_size_kb: None,
                     cores: core_map,
                 }
             })
             .collect();
+
         let n = numa_nodes as usize;
         let numa_node_set: BTreeSet<usize> = (0..n).collect();
+
         let mut distances = vec![0u8; n * n];
         for i in 0..n {
             for j in 0..n {
-                distances[i * n + j] = if i == j { 10 } else { 20 };
+                distances[i * n + j] = topo.distance(i as u32, j as u32);
             }
         }
+
+        let mut node_mem = BTreeMap::new();
+        let mut memory_only_nodes = BTreeSet::new();
+        match topo.nodes {
+            Some(nodes) => {
+                for (i, node) in nodes.iter().enumerate() {
+                    if node.memory_mb > 0 {
+                        node_mem.insert(
+                            i,
+                            NodeMemInfo {
+                                total_kb: (node.memory_mb as u64) * 1024,
+                                free_kb: (node.memory_mb as u64) * 1024,
+                            },
+                        );
+                    }
+                    if node.is_memory_only() {
+                        memory_only_nodes.insert(i);
+                    }
+                }
+            }
+            None => {
+                if let Some(total_mb) = total_memory_mb {
+                    let per_node_mb = total_mb / numa_nodes;
+                    for i in 0..n {
+                        let mb = if i == n - 1 {
+                            total_mb - per_node_mb * (numa_nodes - 1)
+                        } else {
+                            per_node_mb
+                        };
+                        node_mem.insert(
+                            i,
+                            NodeMemInfo {
+                                total_kb: (mb as u64) * 1024,
+                                free_kb: (mb as u64) * 1024,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
         Self {
             cpus,
             llcs: llc_infos,
             numa_nodes: numa_node_set,
             numa_distances: distances,
-            node_mem: BTreeMap::new(),
-            memory_only_nodes: BTreeSet::new(),
+            node_mem,
+            memory_only_nodes,
         }
     }
 

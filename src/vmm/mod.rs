@@ -1069,8 +1069,10 @@ pub struct KtstrVm {
     /// Pinning plan computed during build() when performance_mode is enabled.
     /// Stored so topology is read once and the plan is reused at VM start.
     pinning_plan: Option<host_topology::PinningPlan>,
-    /// NUMA nodes to mbind guest memory to (derived from pinning plan).
-    mbind_nodes: Vec<usize>,
+    /// Per-guest-NUMA-node host NUMA nodes for mbind. Indexed by guest
+    /// node ID. Each entry is the set of host NUMA nodes that the guest
+    /// node's vCPUs are pinned to. Empty when performance_mode is off.
+    mbind_node_map: Vec<Vec<usize>>,
     /// CPU flock fds for non-perf VMs. Held for the VM's lifetime to
     /// prevent other VMs from double-booking the same CPUs.
     #[allow(dead_code)]
@@ -1617,10 +1619,9 @@ impl KtstrVm {
         // When memory is already allocated (non-deferred path), do mbind
         // and load kernel now. Deferred path does this in setup_memory.
         let kernel_result = if self.memory_mb.is_some() {
-            if self.performance_mode && !self.mbind_nodes.is_empty() {
+            if self.performance_mode && !self.mbind_node_map.is_empty() {
                 let layout = vm.numa_layout.as_ref().unwrap();
-                let host_nodes = self.build_host_node_map(layout);
-                layout.mbind_regions(&vm.guest_mem, &host_nodes);
+                layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
             }
 
             let t0 = Instant::now();
@@ -1914,27 +1915,6 @@ impl KtstrVm {
         Ok((Some(load_addr), Some(size), memory_mb))
     }
 
-    /// Resolve effective memory in MB from the actual guest memory allocation.
-    fn build_host_node_map(
-        &self,
-        numa_layout: &crate::vmm::numa_mem::NumaMemoryLayout,
-    ) -> Vec<Vec<usize>> {
-        let max_node = numa_layout
-            .regions()
-            .iter()
-            .map(|r| r.node_id)
-            .max()
-            .unwrap_or(0) as usize;
-        let mut map = vec![vec![]; max_node + 1];
-        for r in numa_layout.regions() {
-            let idx = r.node_id as usize;
-            if !map[idx].contains(&self.mbind_nodes[0]) {
-                map[idx] = self.mbind_nodes.clone();
-            }
-        }
-        map
-    }
-
     fn effective_memory_mb(&self, guest_mem: &GuestMemoryMmap) -> u32 {
         use vm_memory::GuestMemoryRegion;
         match self.memory_mb {
@@ -2108,10 +2088,9 @@ impl KtstrVm {
                 }
             };
 
-            if self.performance_mode && !self.mbind_nodes.is_empty() {
+            if self.performance_mode && !self.mbind_node_map.is_empty() {
                 let layout = vm.numa_layout.as_ref().unwrap();
-                let host_nodes = self.build_host_node_map(layout);
-                layout.mbind_regions(&vm.guest_mem, &host_nodes);
+                layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
             }
 
             // Load kernel into the freshly allocated memory.
@@ -4018,14 +3997,12 @@ impl KtstrVmBuilder {
             self.performance_mode = false;
         }
 
-        let (pinning_plan, mbind_nodes, cpu_locks) = if self.no_perf_mode {
+        let (pinning_plan, mbind_node_map, cpu_locks) = if self.no_perf_mode {
             (None, Vec::new(), Vec::new())
         } else if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
-            let pinned_cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
-            let nodes = host_topo.numa_nodes_for_cpus(&pinned_cpus);
-            // Perf VMs already hold CPU locks via PinningPlan.locks.
-            (Some(plan), nodes, Vec::new())
+            let node_map = build_per_node_map(&plan, &host_topo, &self.topology);
+            (Some(plan), node_map, Vec::new())
         } else {
             let total_cpus = self.topology.total_cpus() as usize;
             let host_topo = host_topology::HostTopology::from_sysfs().ok();
@@ -4075,7 +4052,7 @@ impl KtstrVmBuilder {
             bpf_map_write: self.bpf_map_write,
             performance_mode: self.performance_mode,
             pinning_plan,
-            mbind_nodes,
+            mbind_node_map,
             cpu_locks,
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
@@ -4162,6 +4139,27 @@ impl KtstrVmBuilder {
 }
 
 /// Try each LLC slot, compute a pinning plan, and acquire resource
+/// Build per-guest-NUMA-node host NUMA node mapping from a pinning plan.
+fn build_per_node_map(
+    plan: &host_topology::PinningPlan,
+    host_topo: &host_topology::HostTopology,
+    topo: &crate::vmm::topology::Topology,
+) -> Vec<Vec<usize>> {
+    let n = topo.numa_nodes as usize;
+    let mut map: Vec<std::collections::BTreeSet<usize>> =
+        vec![std::collections::BTreeSet::new(); n];
+    let cpus_per_llc = topo.cores_per_llc * topo.threads_per_core;
+    for &(vcpu_id, host_cpu) in &plan.assignments {
+        let llc_id = vcpu_id / cpus_per_llc;
+        let guest_node = topo.numa_node_of(llc_id) as usize;
+        let host_node = host_topo.cpu_to_node.get(&host_cpu).copied().unwrap_or(0);
+        if guest_node < n {
+            map[guest_node].insert(host_node);
+        }
+    }
+    map.into_iter().map(|s| s.into_iter().collect()).collect()
+}
+
 /// locks (non-blocking). Single pass through all available slots.
 /// Returns `ResourceContention` when all slots are busy; callers
 /// rely on nextest retry backoff for contention resolution.
@@ -5869,8 +5867,8 @@ mod tests {
             .build();
         if let Ok(vm) = vm {
             assert!(
-                !vm.mbind_nodes.is_empty(),
-                "mbind_nodes should be populated for performance_mode",
+                !vm.mbind_node_map.is_empty(),
+                "mbind_node_map should be populated for performance_mode",
             );
         }
     }

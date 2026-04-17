@@ -470,6 +470,9 @@ impl SchedPolicy {
 /// Applied via `set_mempolicy(2)` after fork, before the work loop.
 /// Maps to Linux `MPOL_*` constants. When `Default`, no syscall is
 /// made (inherits the parent's policy).
+///
+/// Optional [`MpolFlags`] modify behavior (e.g. `STATIC_NODES` to
+/// keep the nodemask absolute across cpuset changes).
 #[derive(Clone, Debug, Default)]
 pub enum MemPolicy {
     /// Inherit the parent process's memory policy (no syscall).
@@ -486,6 +489,53 @@ pub enum MemPolicy {
     /// Prefer the nearest node to the CPU where the allocation occurs
     /// (`MPOL_LOCAL`). No nodemask.
     Local,
+    /// Prefer allocations from any of the specified nodes, falling back
+    /// to others when all preferred nodes are full
+    /// (`MPOL_PREFERRED_MANY`, kernel 5.15+).
+    PreferredMany(BTreeSet<usize>),
+    /// Weighted interleave across the specified nodes. Page distribution
+    /// is proportional to per-node weights set via
+    /// `/sys/kernel/mm/mempolicy/weighted_interleave/nodeN`
+    /// (`MPOL_WEIGHTED_INTERLEAVE`, kernel 6.9+).
+    WeightedInterleave(BTreeSet<usize>),
+}
+
+/// Optional mode flags for `set_mempolicy(2)`.
+///
+/// OR'd into the mode argument. See `MPOL_F_*` in
+/// `include/uapi/linux/mempolicy.h`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MpolFlags(u32);
+
+impl MpolFlags {
+    /// No flags.
+    pub const NONE: Self = Self(0);
+    /// `MPOL_F_STATIC_NODES` (1 << 15): nodemask is absolute, not
+    /// remapped when the task's cpuset changes.
+    pub const STATIC_NODES: Self = Self(1 << 15);
+    /// `MPOL_F_RELATIVE_NODES` (1 << 14): nodemask is relative to
+    /// the task's current cpuset.
+    pub const RELATIVE_NODES: Self = Self(1 << 14);
+    /// `MPOL_F_NUMA_BALANCING` (1 << 13): enable NUMA balancing
+    /// optimization for this policy.
+    pub const NUMA_BALANCING: Self = Self(1 << 13);
+
+    /// Combine two flag sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Raw flag bits for passing to the syscall.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::ops::BitOr for MpolFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 impl MemPolicy {
@@ -508,26 +558,65 @@ impl MemPolicy {
         MemPolicy::Interleave(nodes.into_iter().collect())
     }
 
+    /// Construct a `PreferredMany` policy from any iterator of NUMA node IDs.
+    pub fn preferred_many(nodes: impl IntoIterator<Item = usize>) -> Self {
+        MemPolicy::PreferredMany(nodes.into_iter().collect())
+    }
+
+    /// Construct a `WeightedInterleave` policy from any iterator of NUMA node IDs.
+    pub fn weighted_interleave(nodes: impl IntoIterator<Item = usize>) -> Self {
+        MemPolicy::WeightedInterleave(nodes.into_iter().collect())
+    }
+
     /// NUMA node IDs referenced by this policy.
     ///
-    /// Returns the node set for `Bind` and `Interleave`, a single-element
-    /// set for `Preferred`, and an empty set for `Default`/`Local`.
+    /// Returns the node set for `Bind`, `Interleave`, `PreferredMany`,
+    /// and `WeightedInterleave`, a single-element set for `Preferred`,
+    /// and an empty set for `Default`/`Local`.
     pub fn node_set(&self) -> BTreeSet<usize> {
         match self {
             MemPolicy::Default | MemPolicy::Local => BTreeSet::new(),
-            MemPolicy::Bind(nodes) | MemPolicy::Interleave(nodes) => nodes.clone(),
+            MemPolicy::Bind(nodes)
+            | MemPolicy::Interleave(nodes)
+            | MemPolicy::PreferredMany(nodes)
+            | MemPolicy::WeightedInterleave(nodes) => nodes.clone(),
             MemPolicy::Preferred(node) => [*node].into_iter().collect(),
+        }
+    }
+
+    /// Validate that this policy's node set is non-empty where required.
+    ///
+    /// Returns `Err` with a description when a node-set-bearing policy
+    /// has an empty set.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match self {
+            MemPolicy::Default | MemPolicy::Local => Ok(()),
+            MemPolicy::Preferred(_) => Ok(()),
+            MemPolicy::Bind(nodes) if nodes.is_empty() => {
+                Err("Bind policy requires at least one NUMA node".into())
+            }
+            MemPolicy::Interleave(nodes) if nodes.is_empty() => {
+                Err("Interleave policy requires at least one NUMA node".into())
+            }
+            MemPolicy::PreferredMany(nodes) if nodes.is_empty() => {
+                Err("PreferredMany policy requires at least one NUMA node".into())
+            }
+            MemPolicy::WeightedInterleave(nodes) if nodes.is_empty() => {
+                Err("WeightedInterleave policy requires at least one NUMA node".into())
+            }
+            _ => Ok(()),
         }
     }
 }
 
-/// Build a nodemask bitmask and maxnode value for `set_mempolicy(2)`.
+/// Build a nodemask bitmask and maxnode value for `set_mempolicy(2)`
+/// and `mbind(2)`.
 ///
 /// Returns `(nodemask_vec, maxnode)`. The nodemask is a bitmask of
 /// `c_ulong` words where bit N corresponds to NUMA node N. `maxnode`
 /// must be `max_node + 2` because the kernel's `get_nodes()` does
 /// `--maxnode` before reading the bitmask.
-fn build_nodemask(nodes: &BTreeSet<usize>) -> (Vec<libc::c_ulong>, libc::c_ulong) {
+pub fn build_nodemask(nodes: &BTreeSet<usize>) -> (Vec<libc::c_ulong>, libc::c_ulong) {
     if nodes.is_empty() {
         return (vec![], 0);
     }
@@ -542,20 +631,25 @@ fn build_nodemask(nodes: &BTreeSet<usize>) -> (Vec<libc::c_ulong>, libc::c_ulong
     (nodemask, mask_bits as libc::c_ulong)
 }
 
-/// Call `set_mempolicy(2)` for the current process.
+const MPOL_PREFERRED_MANY: i32 = 5;
+const MPOL_WEIGHTED_INTERLEAVE: i32 = 6;
+
+/// Call `set_mempolicy(2)` for the current process with mode flags.
 ///
 /// No-op for `MemPolicy::Default`. Logs a warning on syscall failure.
-fn apply_mempolicy(policy: &MemPolicy) {
+fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
     let (mode, node_set): (i32, BTreeSet<usize>) = match policy {
         MemPolicy::Default => return,
         MemPolicy::Bind(nodes) => (libc::MPOL_BIND, nodes.clone()),
         MemPolicy::Preferred(node) => (libc::MPOL_PREFERRED, [*node].into_iter().collect()),
         MemPolicy::Interleave(nodes) => (libc::MPOL_INTERLEAVE, nodes.clone()),
+        MemPolicy::PreferredMany(nodes) => (MPOL_PREFERRED_MANY, nodes.clone()),
+        MemPolicy::WeightedInterleave(nodes) => (MPOL_WEIGHTED_INTERLEAVE, nodes.clone()),
         MemPolicy::Local => {
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_set_mempolicy,
-                    libc::MPOL_LOCAL,
+                    libc::MPOL_LOCAL | flags.bits() as i32,
                     std::ptr::null::<libc::c_ulong>(),
                     0 as libc::c_ulong,
                 )
@@ -574,7 +668,15 @@ fn apply_mempolicy(policy: &MemPolicy) {
         return;
     }
     let (mask, maxnode) = build_nodemask(&node_set);
-    let rc = unsafe { libc::syscall(libc::SYS_set_mempolicy, mode, mask.as_ptr(), maxnode) };
+    let effective_mode = mode | flags.bits() as i32;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            effective_mode,
+            mask.as_ptr(),
+            maxnode,
+        )
+    };
     if rc != 0 {
         eprintln!(
             "ktstr: set_mempolicy(mode={}, nodes={:?}) failed: {}",
@@ -598,6 +700,8 @@ pub struct WorkloadConfig {
     pub sched_policy: SchedPolicy,
     /// NUMA memory placement policy.
     pub mem_policy: MemPolicy,
+    /// Optional mode flags for `set_mempolicy(2)`.
+    pub mpol_flags: MpolFlags,
 }
 
 impl Default for WorkloadConfig {
@@ -608,6 +712,7 @@ impl Default for WorkloadConfig {
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             mem_policy: MemPolicy::Default,
+            mpol_flags: MpolFlags::NONE,
         }
     }
 }
@@ -641,6 +746,8 @@ pub struct Work {
     /// NUMA memory placement policy. Applied via `set_mempolicy(2)`
     /// after fork, before the work loop.
     pub mem_policy: MemPolicy,
+    /// Optional mode flags for `set_mempolicy(2)`.
+    pub mpol_flags: MpolFlags,
 }
 
 impl Default for Work {
@@ -651,6 +758,7 @@ impl Default for Work {
             num_workers: None,
             affinity: AffinityKind::Inherit,
             mem_policy: MemPolicy::Default,
+            mpol_flags: MpolFlags::NONE,
         }
     }
 }
@@ -683,6 +791,12 @@ impl Work {
     /// Set the NUMA memory placement policy.
     pub fn mem_policy(mut self, p: MemPolicy) -> Self {
         self.mem_policy = p;
+        self
+    }
+
+    /// Set the NUMA memory policy mode flags.
+    pub fn mpol_flags(mut self, f: MpolFlags) -> Self {
+        self.mpol_flags = f;
         self
     }
 }
@@ -1019,6 +1133,7 @@ impl WorkloadHandle {
                         config.work_type.clone(),
                         config.sched_policy,
                         config.mem_policy.clone(),
+                        config.mpol_flags,
                         worker_pipe_fds,
                         worker_futex,
                         iter_slot,
@@ -1256,11 +1371,13 @@ use std::os::unix::io::FromRawFd;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
+#[allow(clippy::too_many_arguments)]
 fn worker_main(
     affinity: Option<BTreeSet<usize>>,
     work_type: WorkType,
     sched_policy: SchedPolicy,
     mem_policy: MemPolicy,
+    mpol_flags: MpolFlags,
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, bool)>,
     iter_slot: *mut u64,
@@ -1271,7 +1388,7 @@ fn worker_main(
         let _ = set_thread_affinity(tid, cpus);
     }
     let _ = set_sched_policy(tid, sched_policy);
-    apply_mempolicy(&mem_policy);
+    apply_mempolicy_with_flags(&mem_policy, mpol_flags);
 
     let start = Instant::now();
     let mut work_units: u64 = 0;
@@ -4168,6 +4285,63 @@ mod tests {
     }
 
     #[test]
+    fn mempolicy_preferred_many_node_set() {
+        let p = MemPolicy::preferred_many([0, 2]);
+        assert_eq!(p.node_set(), [0, 2].into_iter().collect());
+    }
+
+    #[test]
+    fn mempolicy_weighted_interleave_node_set() {
+        let p = MemPolicy::weighted_interleave([1, 3]);
+        assert_eq!(p.node_set(), [1, 3].into_iter().collect());
+    }
+
+    #[test]
+    fn mempolicy_validate_preferred_many_empty() {
+        assert!(
+            MemPolicy::PreferredMany(BTreeSet::new())
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mempolicy_validate_weighted_interleave_empty() {
+        assert!(
+            MemPolicy::WeightedInterleave(BTreeSet::new())
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mempolicy_validate_preferred_many_ok() {
+        assert!(MemPolicy::preferred_many([0]).validate().is_ok());
+    }
+
+    #[test]
+    fn mempolicy_validate_weighted_interleave_ok() {
+        assert!(MemPolicy::weighted_interleave([0, 1]).validate().is_ok());
+    }
+
+    #[test]
+    fn mpol_flags_union() {
+        let f = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert_eq!(f.bits(), (1 << 15) | (1 << 13));
+    }
+
+    #[test]
+    fn mpol_flags_none_is_zero() {
+        assert_eq!(MpolFlags::NONE.bits(), 0);
+    }
+
+    #[test]
+    fn work_mpol_flags_builder() {
+        let w = Work::default().mpol_flags(MpolFlags::STATIC_NODES);
+        assert_eq!(w.mpol_flags, MpolFlags::STATIC_NODES);
+    }
+
+    #[test]
     fn build_nodemask_empty() {
         let (mask, maxnode) = build_nodemask(&BTreeSet::new());
         assert!(mask.is_empty());
@@ -4205,17 +4379,17 @@ mod tests {
 
     #[test]
     fn apply_mempolicy_default_is_noop() {
-        apply_mempolicy(&MemPolicy::Default);
+        apply_mempolicy_with_flags(&MemPolicy::Default, MpolFlags::NONE);
     }
 
     #[test]
     fn apply_mempolicy_empty_bind_skipped() {
-        apply_mempolicy(&MemPolicy::Bind(BTreeSet::new()));
+        apply_mempolicy_with_flags(&MemPolicy::Bind(BTreeSet::new()), MpolFlags::NONE);
     }
 
     #[test]
     fn apply_mempolicy_empty_interleave_skipped() {
-        apply_mempolicy(&MemPolicy::Interleave(BTreeSet::new()));
+        apply_mempolicy_with_flags(&MemPolicy::Interleave(BTreeSet::new()), MpolFlags::NONE);
     }
 
     #[test]

@@ -311,12 +311,13 @@ pub mod prelude {
     pub use crate::scenario::scenarios;
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::test_support::{
-        BpfMapWrite, CgroupPath, NumaDistance, NumaNode, Scheduler, SchedulerSpec, Sysctl,
+        BpfMapWrite, CgroupPath, MemSideCache, NumaDistance, NumaNode, Scheduler, SchedulerSpec,
+        Sysctl, Topology,
     };
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
-        AffinityKind, AffinityMode, MemPolicy, Phase, SchedPolicy, Work, WorkType, WorkerReport,
-        WorkloadConfig, WorkloadHandle,
+        AffinityKind, AffinityMode, MemPolicy, MpolFlags, Phase, SchedPolicy, Work, WorkType,
+        WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,
     };
 }
 

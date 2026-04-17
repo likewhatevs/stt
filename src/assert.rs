@@ -362,6 +362,8 @@ pub(crate) struct AssertPlan {
     pub(crate) max_wake_latency_cv: Option<f64>,
     pub(crate) min_iteration_rate: Option<f64>,
     pub(crate) max_migration_ratio: Option<f64>,
+    pub(crate) min_page_locality: Option<f64>,
+    pub(crate) max_slow_tier_ratio: Option<f64>,
 }
 
 impl AssertPlan {
@@ -377,6 +379,8 @@ impl AssertPlan {
             max_wake_latency_cv: None,
             min_iteration_rate: None,
             max_migration_ratio: None,
+            min_page_locality: None,
+            max_slow_tier_ratio: None,
         }
     }
 
@@ -385,10 +389,15 @@ impl AssertPlan {
     /// `cpuset` is the expected CPU set for isolation checks. Pass `None`
     /// when there is no cpuset constraint (isolation check is skipped).
     ///
+    /// `numa_nodes` is the NUMA node IDs covered by the cpuset (derived
+    /// via `TestTopology::numa_nodes_for_cpuset`). Used for page locality
+    /// and slow-tier ratio checks. Pass `None` when NUMA checks are not
+    /// applicable.
     pub(crate) fn assert_cgroup(
         &self,
         reports: &[WorkerReport],
         cpuset: Option<&BTreeSet<usize>>,
+        numa_nodes: Option<&BTreeSet<usize>>,
     ) -> AssertResult {
         let mut r = AssertResult::pass();
         if self.not_starved {
@@ -483,8 +492,81 @@ impl AssertPlan {
                 ));
             }
         }
+        if let Some(min_locality) = self.min_page_locality
+            && let Some(nodes) = numa_nodes
+        {
+            for w in reports {
+                if w.numa_pages.is_empty() {
+                    continue;
+                }
+                let total: u64 = w.numa_pages.values().sum();
+                let local: u64 = w
+                    .numa_pages
+                    .iter()
+                    .filter(|(node, _)| nodes.contains(node))
+                    .map(|(_, count)| count)
+                    .sum();
+                if total > 0 {
+                    let locality = local as f64 / total as f64;
+                    r.merge(assert_page_locality(
+                        locality,
+                        Some(min_locality),
+                        total,
+                        local,
+                    ));
+                }
+            }
+        }
+        if let Some(max_ratio) = self.max_slow_tier_ratio
+            && numa_nodes.is_some()
+        {
+            for w in reports {
+                if w.numa_pages.is_empty() {
+                    continue;
+                }
+                let total: u64 = w.numa_pages.values().sum();
+                if total > 0 {
+                    r.merge(assert_slow_tier_ratio(
+                        &w.numa_pages,
+                        max_ratio,
+                        total,
+                        numa_nodes,
+                    ));
+                }
+            }
+        }
         r
     }
+}
+
+/// Check slow-tier page ratio against threshold.
+///
+/// "Slow tier" nodes are NUMA nodes NOT in the cpuset's NUMA node set.
+/// For CXL memory-only nodes, these are the nodes without CPUs.
+fn assert_slow_tier_ratio(
+    numa_pages: &BTreeMap<usize, u64>,
+    max_ratio: f64,
+    total_pages: u64,
+    numa_nodes: Option<&BTreeSet<usize>>,
+) -> AssertResult {
+    let mut r = AssertResult::pass();
+    let Some(cpu_nodes) = numa_nodes else {
+        return r;
+    };
+    let slow_pages: u64 = numa_pages
+        .iter()
+        .filter(|(node, _)| !cpu_nodes.contains(node))
+        .map(|(_, count)| count)
+        .sum();
+    let ratio = slow_pages as f64 / total_pages as f64;
+    if ratio > max_ratio {
+        r.passed = false;
+        r.details.push(format!(
+            "slow-tier page ratio {ratio:.4} exceeds threshold {max_ratio:.4} \
+             ({slow_pages}/{total_pages} pages on non-CPU nodes)",
+        ));
+    }
+    r
 }
 
 /// Check NUMA page locality against threshold.
@@ -651,6 +733,11 @@ pub struct Assert {
     /// which measures CPU migrations per iteration. Fails if the
     /// observed migration ratio exceeds this.
     pub max_cross_node_migration_ratio: Option<f64>,
+    /// Maximum fraction of pages on slow-tier (memory-only) NUMA nodes
+    /// (0.0-1.0). For CXL memory tiering tests: fails if more than
+    /// this fraction of pages land on memory-only nodes. Requires
+    /// `slow_tier_nodes` to be set at evaluation time.
+    pub max_slow_tier_ratio: Option<f64>,
 }
 
 impl Assert {
@@ -674,6 +761,7 @@ impl Assert {
         max_keep_last_rate: None,
         min_page_locality: None,
         max_cross_node_migration_ratio: None,
+        max_slow_tier_ratio: None,
     };
 
     /// Default checks: not_starved enabled, monitor thresholds
@@ -700,6 +788,7 @@ impl Assert {
             max_keep_last_rate: Some(MonitorThresholds::DEFAULT.max_keep_last_rate),
             min_page_locality: None,
             max_cross_node_migration_ratio: None,
+            max_slow_tier_ratio: None,
         }
     }
 
@@ -796,6 +885,11 @@ impl Assert {
         self
     }
 
+    pub const fn max_slow_tier_ratio(mut self, v: f64) -> Self {
+        self.max_slow_tier_ratio = Some(v);
+        self
+    }
+
     /// True when any worker-level check field is `Some`.
     pub const fn has_worker_checks(&self) -> bool {
         self.not_starved.is_some()
@@ -810,6 +904,7 @@ impl Assert {
             || self.max_migration_ratio.is_some()
             || self.min_page_locality.is_some()
             || self.max_cross_node_migration_ratio.is_some()
+            || self.max_slow_tier_ratio.is_some()
     }
 
     /// Merge `other` on top of `self`. Each `Some` field in `other`
@@ -892,6 +987,10 @@ impl Assert {
                 Some(v) => Some(v),
                 None => self.max_cross_node_migration_ratio,
             },
+            max_slow_tier_ratio: match other.max_slow_tier_ratio {
+                Some(v) => Some(v),
+                None => self.max_slow_tier_ratio,
+            },
         }
     }
 
@@ -908,16 +1007,34 @@ impl Assert {
             max_wake_latency_cv: self.max_wake_latency_cv,
             min_iteration_rate: self.min_iteration_rate,
             max_migration_ratio: self.max_migration_ratio,
+            min_page_locality: self.min_page_locality,
+            max_slow_tier_ratio: self.max_slow_tier_ratio,
         }
     }
 
     /// Run the configured worker checks against one cgroup's reports.
+    ///
+    /// `cpuset` is the CPU set for isolation checks. `numa_nodes` is
+    /// the NUMA node IDs covered by the cpuset (for page locality and
+    /// slow-tier checks). Derive via
+    /// [`TestTopology::numa_nodes_for_cpuset`](crate::topology::TestTopology::numa_nodes_for_cpuset).
     pub fn assert_cgroup(
         &self,
         reports: &[crate::workload::WorkerReport],
         cpuset: Option<&BTreeSet<usize>>,
     ) -> AssertResult {
-        self.worker_plan().assert_cgroup(reports, cpuset)
+        self.worker_plan().assert_cgroup(reports, cpuset, None)
+    }
+
+    /// Run worker checks with explicit NUMA node set for page locality.
+    pub fn assert_cgroup_with_numa(
+        &self,
+        reports: &[crate::workload::WorkerReport],
+        cpuset: Option<&BTreeSet<usize>>,
+        numa_nodes: Option<&BTreeSet<usize>>,
+    ) -> AssertResult {
+        self.worker_plan()
+            .assert_cgroup(reports, cpuset, numa_nodes)
     }
 
     /// Run NUMA page locality check.
@@ -1671,7 +1788,7 @@ mod tests {
     fn plan_check_not_starved() {
         let plan = AssertPlan::new().check_not_starved();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(r.passed);
         assert_eq!(r.stats.total_workers, 1);
     }
@@ -1681,7 +1798,7 @@ mod tests {
         let plan = AssertPlan::new().check_not_starved().check_isolation();
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
-        let r = plan.assert_cgroup(&reports, Some(&expected));
+        let r = plan.assert_cgroup(&reports, Some(&expected), None);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("unexpected")));
     }
@@ -1691,7 +1808,7 @@ mod tests {
         let plan = AssertPlan::new().check_isolation();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
         // No cpuset provided -- isolation check is skipped.
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(r.passed);
     }
 
@@ -1700,7 +1817,7 @@ mod tests {
         let plan = AssertPlan::new().check_not_starved().max_gap_ms(3000);
         // 2500ms gap: passes with 3000ms threshold.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2500)];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(r.passed, "2500ms < 3000ms threshold: {:?}", r.details);
     }
 
@@ -1709,7 +1826,7 @@ mod tests {
         let plan = AssertPlan::new().check_not_starved().max_gap_ms(1500);
         // 2000ms gap: fails with 1500ms threshold.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("stuck")));
         assert!(r.details.iter().any(|d| d.contains("threshold 1500ms")));
@@ -1719,7 +1836,7 @@ mod tests {
     fn plan_no_checks_always_passes() {
         let plan = AssertPlan::new();
         let reports = [rpt(1, 0, 0, 0, &[], 5000)]; // starved + stuck
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(r.passed, "no checks enabled should pass");
     }
 
@@ -1740,7 +1857,7 @@ mod tests {
         );
         // A plan with all checks disabled must pass even pathological input.
         let reports = [rpt(1, 0, 0, 0, &[], 99999)];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(r.passed, "all-disabled plan must pass any input");
     }
 
@@ -1756,8 +1873,8 @@ mod tests {
         assert_eq!(d.max_spread_pct, n.max_spread_pct);
         // Both should produce identical pass/fail on the same input.
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-        let rd = d.assert_cgroup(&reports, None);
-        let rn = n.assert_cgroup(&reports, None);
+        let rd = d.assert_cgroup(&reports, None, None);
+        let rn = n.assert_cgroup(&reports, None, None);
         assert_eq!(rd.passed, rn.passed);
     }
 
@@ -1855,7 +1972,7 @@ mod tests {
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100), // healthy
             rpt(2, 0, 5e9 as u64, 0, &[1], 1500),            // starved, gap < threshold
         ];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(
             !r.passed,
             "starved worker must fail even with relaxed gap threshold"
@@ -2248,7 +2365,7 @@ mod tests {
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
         ];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(!r.passed, "custom 500ms threshold must catch 1000ms gap");
         // Format: "stuck 1000ms on cpu1 at +1000ms (threshold 500ms)"
         let detail = r.details.iter().find(|d| d.contains("stuck")).unwrap();
@@ -2271,7 +2388,7 @@ mod tests {
             rpt(1, 0, 5e9 as u64, 0, &[0], 0),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[4, 5], 50),
         ];
-        let r = plan.assert_cgroup(&reports, Some(&expected));
+        let r = plan.assert_cgroup(&reports, Some(&expected), None);
         assert!(!r.passed);
         // Starvation detail must name tid 1 with "0 work units".
         let starved_detail = r.details.iter().find(|d| d.contains("starved")).unwrap();
@@ -2441,7 +2558,7 @@ mod tests {
             rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
         ];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         // 1000ms gap < 5000ms threshold, so it passes.
         let has_stuck = r.details.iter().any(|d| d.contains("stuck"));
         assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");
@@ -2661,6 +2778,8 @@ mod tests {
             max_wake_latency_cv: None,
             min_iteration_rate: None,
             max_migration_ratio: None,
+            min_page_locality: None,
+            max_slow_tier_ratio: None,
         };
         let reports = [rpt_with_latencies(
             1,
@@ -2668,7 +2787,7 @@ mod tests {
             10,
             5_000_000_000,
         )];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(!r.passed, "p99 1000ns > 500ns limit");
         assert!(r.details.iter().any(|d| d.contains("p99 wake latency")));
     }
@@ -2690,8 +2809,10 @@ mod tests {
             max_wake_latency_cv: None,
             min_iteration_rate: None,
             max_migration_ratio: Some(0.05),
+            min_page_locality: None,
+            max_slow_tier_ratio: None,
         };
-        let r = plan.assert_cgroup(&[w], None);
+        let r = plan.assert_cgroup(&[w], None, None);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("migration ratio")));
     }
@@ -2713,8 +2834,10 @@ mod tests {
             max_wake_latency_cv: None,
             min_iteration_rate: None,
             max_migration_ratio: Some(0.05),
+            min_page_locality: None,
+            max_slow_tier_ratio: None,
         };
-        let r = plan.assert_cgroup(&[w], None);
+        let r = plan.assert_cgroup(&[w], None, None);
         assert!(r.passed, "{:?}", r.details);
     }
 
@@ -2731,9 +2854,11 @@ mod tests {
             max_wake_latency_cv: None,
             min_iteration_rate: Some(1000.0),
             max_migration_ratio: None,
+            min_page_locality: None,
+            max_slow_tier_ratio: None,
         };
         let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
-        let r = plan.assert_cgroup(&reports, None);
+        let r = plan.assert_cgroup(&reports, None, None);
         assert!(!r.passed, "2/s < 1000/s floor");
         assert!(r.details.iter().any(|d| d.contains("iteration rate")));
     }
@@ -2995,6 +3120,54 @@ not_hex default N0=10
     #[test]
     fn assert_page_locality_exact_threshold() {
         let r = assert_page_locality(0.8, Some(0.8), 100, 80);
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    // -- assert_slow_tier_ratio tests --
+
+    #[test]
+    fn assert_slow_tier_ratio_pass() {
+        let mut pages = BTreeMap::new();
+        pages.insert(0, 90);
+        pages.insert(1, 10);
+        let nodes: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    #[test]
+    fn assert_slow_tier_ratio_fail() {
+        let mut pages = BTreeMap::new();
+        pages.insert(0, 40);
+        pages.insert(2, 60);
+        let nodes: BTreeSet<usize> = [0].into_iter().collect();
+        let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
+        assert!(!r.passed);
+        assert!(r.details.iter().any(|d| d.contains("slow-tier")));
+    }
+
+    #[test]
+    fn assert_slow_tier_ratio_none_numa_nodes() {
+        let mut pages = BTreeMap::new();
+        pages.insert(0, 100);
+        let r = assert_slow_tier_ratio(&pages, 0.1, 100, None);
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn assert_slow_tier_ratio_zero_pages() {
+        let pages = BTreeMap::new();
+        let nodes: BTreeSet<usize> = [0].into_iter().collect();
+        let r = assert_slow_tier_ratio(&pages, 0.5, 0, Some(&nodes));
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn assert_slow_tier_ratio_all_local() {
+        let mut pages = BTreeMap::new();
+        pages.insert(0, 100);
+        let nodes: BTreeSet<usize> = [0].into_iter().collect();
+        let r = assert_slow_tier_ratio(&pages, 0.0, 100, Some(&nodes));
         assert!(r.passed, "{:?}", r.details);
     }
 

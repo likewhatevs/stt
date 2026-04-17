@@ -549,6 +549,9 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
             .or(scenario.cgroup_works.first())
             .cloned()
             .unwrap_or_default();
+        if let Err(reason) = cw.mem_policy.validate() {
+            anyhow::bail!("cgroup '{}': {}", name, reason);
+        }
         let n = cw.num_workers.unwrap_or(ctx.workers_per_cgroup);
         let affinity = resolve_affinity_kind(&cw.affinity, cpusets.as_deref(), i, ctx.topo);
         let effective_work_type = crate::workload::resolve_work_type(
@@ -563,6 +566,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
             work_type: effective_work_type,
             sched_policy: cw.sched_policy,
             mem_policy: cw.mem_policy.clone(),
+            mpol_flags: cw.mpol_flags,
         };
         let h = WorkloadHandle::spawn(&wl)?;
         tracing::debug!(cgroup = %name, workers = n, tids = h.tids().len(), "spawned workers");
@@ -602,7 +606,11 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     for (i, h) in handles.into_iter().enumerate() {
         let reports = h.stop_and_collect();
         let cs = cpusets.as_ref().map(|v| &v[i]);
-        result.merge(ctx.assert.assert_cgroup(&reports, cs));
+        let numa_nodes = cs.map(|c| ctx.topo.numa_nodes_for_cpuset(c));
+        result.merge(
+            ctx.assert
+                .assert_cgroup_with_numa(&reports, cs, numa_nodes.as_ref()),
+        );
     }
 
     // Capture kernel log on failure
@@ -811,12 +819,14 @@ pub fn setup_cgroups<'a>(
 pub(crate) fn collect_handles<'a>(
     handles: impl IntoIterator<Item = (WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
     checks: &crate::assert::Assert,
+    topo: Option<&crate::topology::TestTopology>,
 ) -> AssertResult {
     let mut r = AssertResult::pass();
     for (h, cpuset) in handles {
         let reports = h.stop_and_collect();
         if checks.has_worker_checks() {
-            r.merge(checks.assert_cgroup(&reports, cpuset));
+            let numa_nodes = cpuset.and_then(|cs| topo.map(|t| t.numa_nodes_for_cpuset(cs)));
+            r.merge(checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref()));
         } else {
             r.merge(assert::assert_not_starved(&reports));
         }
@@ -831,7 +841,7 @@ pub(crate) fn collect_handles<'a>(
 /// to `assert_not_starved`. Returns a merged [`AssertResult`]
 /// across all workers.
 pub fn collect_all(handles: Vec<WorkloadHandle>, checks: &crate::assert::Assert) -> AssertResult {
-    collect_handles(handles.into_iter().map(|h| (h, None)), checks)
+    collect_handles(handles.into_iter().map(|h| (h, None)), checks, None)
 }
 
 /// Default [`WorkloadConfig`] with `ctx.workers_per_cgroup` workers.

@@ -6,10 +6,10 @@
 /// (PIC, PIT, ISA serial). Per-CPU APIC type: Local APIC (type 0) for
 /// apic_id < 255, x2APIC (type 9) for apic_id >= 255.
 ///
-/// HMAT (Heterogeneous Memory Attribute Table) is emitted when the
-/// topology has memory-only nodes (CXL). It provides latency and
-/// bandwidth attributes that the kernel uses to compute abstract
-/// distance (adistance) for memory tiering.
+/// HMAT (Heterogeneous Memory Attribute Table) is emitted for all
+/// multi-NUMA topologies. It provides latency and bandwidth attributes
+/// that the kernel uses to compute abstract distance (adistance) for
+/// memory tiering and NUMA optimization.
 use anyhow::{Context, Result};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
@@ -251,7 +251,7 @@ fn set_sdt_checksum(buf: &mut [u8]) {
 ///
 /// SRAT memory affinity uses `NumaMemoryLayout` regions directly,
 /// ensuring GPA ranges match KVM memory slots exactly. HMAT is emitted
-/// when the topology has memory-only nodes (CXL).
+/// for all multi-NUMA topologies.
 pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     topo: &Topology,
@@ -259,7 +259,7 @@ pub fn setup_acpi(
 ) -> Result<AcpiLayout> {
     let num_cpus = topo.total_cpus();
 
-    let emit_hmat = topo.has_memory_only_nodes();
+    let emit_hmat = topo.numa_nodes > 1;
 
     // Compute table sizes.
     let dsdt_size: u64 = 36;
@@ -585,6 +585,32 @@ struct HmatSllbiHeader {
 
 const _: () = assert!(std::mem::size_of::<HmatSllbiHeader>() == 32);
 
+/// HMAT Memory Side Cache Information Structure (type 2, 32 bytes).
+///
+/// Matches kernel `acpi_hmat_cache` (actbl1.h). `cache_attributes`
+/// packs line_size in bits [31:16], associativity in [11:8], write
+/// policy in [15:12], cache level in [7:4], total levels in [3:0].
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+struct HmatMsci {
+    hmat_type: u16,
+    _reserved0: u16,
+    length: u32,
+    memory_proximity_domain: u32,
+    _reserved1: u32,
+    cache_size: u64,
+    /// Bits [3:0] = total cache levels,
+    /// bits [7:4] = cache level being described,
+    /// bits [11:8] = associativity (0=none,1=direct,2=complex),
+    /// bits [15:12] = write policy (0=none,1=WB,2=WT),
+    /// bits [31:16] = cache line size in bytes.
+    cache_attributes: u32,
+    address_mode: u16,
+    _num_smbios_handles: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<HmatMsci>() == 32);
+
 fn compute_hmat_size(topo: &Topology, numa_layout: &NumaMemoryLayout) -> u32 {
     let num_initiators = topo.cpu_bearing_nodes();
     let num_targets = numa_layout.regions().len() as u32;
@@ -596,16 +622,20 @@ fn compute_hmat_size(topo: &Topology, numa_layout: &NumaMemoryLayout) -> u32 {
     let mpda_size = std::mem::size_of::<HmatMpda>() as u32 * num_mpdas;
 
     // Two SLLBI subtables: access_latency and access_bandwidth.
-    // Each: header (32) + initiator PD list (4 * num_initiators)
-    //        + target PD list (4 * num_targets)
-    //        + entry matrix (2 * num_initiators * num_targets)
     let sllbi_size = (std::mem::size_of::<HmatSllbiHeader>() as u32
         + 4 * num_initiators
         + 4 * num_targets
         + 2 * num_initiators * num_targets)
         * 2;
 
-    hmat_header + mpda_size + sllbi_size
+    // Type 2: one MSCI per node that has a mem_side_cache.
+    let num_msci = topo
+        .nodes
+        .map(|nodes| nodes.iter().filter(|n| n.mem_side_cache.is_some()).count() as u32)
+        .unwrap_or(0);
+    let msci_size = std::mem::size_of::<HmatMsci>() as u32 * num_msci;
+
+    hmat_header + mpda_size + sllbi_size + msci_size
 }
 
 fn write_hmat(
@@ -658,18 +688,14 @@ fn write_hmat(
 
     // Type 1: SLLBI — latency (data_type=0) and bandwidth (data_type=3).
     // actual_value = entry_u16 * entry_base_unit.
+    //
+    // Cross-node latency scales by SLIT distance ratio: for initiator I
+    // accessing target T, latency = target_base_latency * (distance(I,T) / 10).
+    // Cross-node bandwidth scales inversely: bw = target_base_bw * (10 / distance(I,T)).
     let ni = initiators.len() as u32;
     let nt = targets.len() as u32;
 
-    for (data_type, base_unit, dram_entry, cxl_entry) in [
-        (
-            0u8,
-            HMAT_LATENCY_BASE_PS,
-            HMAT_DRAM_LATENCY_ENTRY,
-            HMAT_CXL_LATENCY_ENTRY,
-        ),
-        (3u8, HMAT_BW_BASE_MBS, HMAT_DRAM_BW_ENTRY, HMAT_CXL_BW_ENTRY),
-    ] {
+    for (data_type, base_unit) in [(0u8, HMAT_LATENCY_BASE_PS), (3u8, HMAT_BW_BASE_MBS)] {
         let sllbi_len =
             std::mem::size_of::<HmatSllbiHeader>() as u32 + 4 * ni + 4 * nt + 2 * ni * nt;
 
@@ -698,16 +724,68 @@ fn write_hmat(
             offset += 4;
         }
 
-        // Entry matrix: row = initiator, col = target. u16 entries.
-        // actual_value = entry * entry_base_unit.
-        for &_init_node in &initiators {
+        for &init_node in &initiators {
             for &tgt_node in &targets {
                 let is_cxl = topo
                     .nodes
                     .is_some_and(|nodes| nodes[tgt_node as usize].is_memory_only());
-                let entry = if is_cxl { cxl_entry } else { dram_entry };
+
+                let entry = if data_type == 0 {
+                    // Latency: base value from per-node config or defaults.
+                    let base = topo
+                        .nodes
+                        .and_then(|nodes| nodes[tgt_node as usize].latency_ns)
+                        .map(|ns| {
+                            let ps = ns as u64 * 1000;
+                            (ps / base_unit).max(1) as u16
+                        })
+                        .unwrap_or(if is_cxl {
+                            HMAT_CXL_LATENCY_ENTRY
+                        } else {
+                            HMAT_DRAM_LATENCY_ENTRY
+                        });
+                    let dist = topo.distance(init_node, tgt_node) as u32;
+                    ((base as u32 * dist / 10) as u16).max(1)
+                } else {
+                    // Bandwidth: base value from per-node config or defaults.
+                    let base = topo
+                        .nodes
+                        .and_then(|nodes| nodes[tgt_node as usize].bandwidth_mbs)
+                        .map(|mbs| (mbs as u64 / base_unit).max(1) as u16)
+                        .unwrap_or(if is_cxl {
+                            HMAT_CXL_BW_ENTRY
+                        } else {
+                            HMAT_DRAM_BW_ENTRY
+                        });
+                    let dist = topo.distance(init_node, tgt_node) as u32;
+                    ((base as u32 * 10 / dist.max(1)) as u16).max(1)
+                };
                 buf[offset..offset + 2].copy_from_slice(&entry.to_le_bytes());
                 offset += 2;
+            }
+        }
+    }
+
+    // Type 2: Memory Side Cache Information — one per node with cache.
+    if let Some(nodes) = topo.nodes {
+        for (i, node) in nodes.iter().enumerate() {
+            if let Some(cache) = &node.mem_side_cache {
+                let attrs: u32 = 1 // total_cache_levels = 1
+                    | (1 << 4) // cache_level = 1
+                    | ((cache.associativity as u32 & 0xF) << 8)
+                    | ((cache.write_policy as u32 & 0xF) << 12)
+                    | ((cache.line_size as u32) << 16);
+                let msci = HmatMsci {
+                    hmat_type: 2,
+                    length: std::mem::size_of::<HmatMsci>() as u32,
+                    memory_proximity_domain: i as u32,
+                    cache_size: cache.size,
+                    cache_attributes: attrs,
+                    ..Default::default()
+                };
+                let bytes = msci.as_bytes();
+                buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+                offset += bytes.len();
             }
         }
     }
@@ -1882,7 +1960,22 @@ mod tests {
     ];
 
     #[test]
-    fn hmat_not_emitted_without_cxl() {
+    fn hmat_not_emitted_single_node() {
+        let mem = test_mem(16);
+        let topo = Topology {
+            llcs: 2,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let l = test_setup(&mem, &topo, 256, 0);
+        assert_eq!(l.hmat_size, 0, "HMAT must not be emitted for single-node");
+    }
+
+    #[test]
+    fn hmat_emitted_multi_numa_without_cxl() {
         let mem = test_mem(16);
         let topo = Topology {
             llcs: 4,
@@ -1893,7 +1986,7 @@ mod tests {
             distances: None,
         };
         let l = test_setup(&mem, &topo, 256, 0);
-        assert_eq!(l.hmat_size, 0, "HMAT must not be emitted without CXL nodes");
+        assert!(l.hmat_size > 0, "HMAT must be emitted for multi-NUMA");
     }
 
     #[test]
@@ -2054,8 +2147,13 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(dram_entry, 1, "DRAM latency entry must be 1");
-        assert_eq!(cxl_entry, 3, "CXL latency entry must be 3");
+        // Local DRAM: base=1, distance=10 → 1*10/10 = 1
+        assert_eq!(dram_entry, 1, "local DRAM latency entry must be 1");
+        // Remote CXL: base=3, distance=20 → 3*20/10 = 6
+        assert_eq!(
+            cxl_entry, 6,
+            "remote CXL latency entry must be 6 (distance-scaled)"
+        );
     }
 
     #[test]
@@ -2083,7 +2181,7 @@ mod tests {
     #[test]
     fn no_hmat_rsdt_has_4_entries() {
         let mem = test_mem(16);
-        let topo = Topology::new(2, 4, 2, 1);
+        let topo = Topology::new(1, 2, 2, 1);
         let l = test_setup(&mem, &topo, 256, 0);
         let rsdt = read_table(&mem, l.rsdt_addr);
         let rsdt_entries = (rsdt.len() - 36) / 4;

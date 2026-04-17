@@ -41,12 +41,106 @@ pub struct NumaNode {
     pub llcs: u32,
     /// Memory attached to this node in MiB.
     pub memory_mb: u32,
+    /// HMAT access latency in nanoseconds. `None` uses the default
+    /// (100ns for CPU-bearing, 300ns for memory-only).
+    pub latency_ns: Option<u32>,
+    /// HMAT read bandwidth in MB/s. `None` uses the default
+    /// (51200 MB/s for CPU-bearing, 20480 MB/s for memory-only).
+    pub bandwidth_mbs: Option<u32>,
+    /// HMAT Type 2 memory-side cache. `None` means no cache entry
+    /// is emitted for this node.
+    pub mem_side_cache: Option<MemSideCache>,
+}
+
+/// HMAT Type 2 memory-side cache descriptor.
+///
+/// Models a hardware cache between the CPU and memory on this node
+/// (e.g. CXL HDM decoder cache, HBM cache). Emitted as an HMAT
+/// Memory Side Cache Information Structure.
+///
+/// `associativity` and `write_policy` occupy 4-bit nibbles in the
+/// HMAT cache_attributes field. Values above 15 are invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemSideCache {
+    /// Cache size in bytes.
+    pub size: u64,
+    /// Cache associativity (0=none, 1=direct-mapped, 2=complex).
+    /// Must be <= 15 (4-bit field).
+    pub associativity: u8,
+    /// Write policy (0=none, 1=write-back, 2=write-through).
+    /// Must be <= 15 (4-bit field).
+    pub write_policy: u8,
+    /// Cache line size in bytes.
+    pub line_size: u16,
+}
+
+impl MemSideCache {
+    /// Const constructor with validation.
+    ///
+    /// Panics if `associativity > 15` or `write_policy > 15`
+    /// (4-bit HMAT nibble fields).
+    pub const fn new(size: u64, associativity: u8, write_policy: u8, line_size: u16) -> Self {
+        assert!(
+            associativity <= 15,
+            "MemSideCache: associativity must fit in 4 bits (0-15)"
+        );
+        assert!(
+            write_policy <= 15,
+            "MemSideCache: write_policy must fit in 4 bits (0-15)"
+        );
+        Self {
+            size,
+            associativity,
+            write_policy,
+            line_size,
+        }
+    }
+
+    /// Non-panicking validation.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.associativity > 15 {
+            return Err(format!(
+                "associativity {} exceeds 4-bit maximum (15)",
+                self.associativity
+            ));
+        }
+        if self.write_policy > 15 {
+            return Err(format!(
+                "write_policy {} exceeds 4-bit maximum (15)",
+                self.write_policy
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl NumaNode {
     /// Const constructor.
     pub const fn new(llcs: u32, memory_mb: u32) -> Self {
-        Self { llcs, memory_mb }
+        Self {
+            llcs,
+            memory_mb,
+            latency_ns: None,
+            bandwidth_mbs: None,
+            mem_side_cache: None,
+        }
+    }
+
+    /// Const constructor with HMAT attributes.
+    pub const fn with_hmat(llcs: u32, memory_mb: u32, latency_ns: u32, bandwidth_mbs: u32) -> Self {
+        Self {
+            llcs,
+            memory_mb,
+            latency_ns: Some(latency_ns),
+            bandwidth_mbs: Some(bandwidth_mbs),
+            mem_side_cache: None,
+        }
+    }
+
+    /// Attach a memory-side cache descriptor.
+    pub const fn with_cache(mut self, cache: MemSideCache) -> Self {
+        self.mem_side_cache = Some(cache);
+        self
     }
 
     /// Whether this is a memory-only node (CXL: has RAM but no CPUs).
