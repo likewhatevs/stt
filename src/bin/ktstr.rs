@@ -197,7 +197,8 @@ enum KernelCommand {
 
 /// List cgroup directories that `ktstr cleanup` targets by default:
 /// `/sys/fs/cgroup/ktstr` (test-harness parent) and any
-/// `/sys/fs/cgroup/ktstr-<pid>` left behind by a crashed `ktstr run`.
+/// `/sys/fs/cgroup/ktstr-<pid>` left behind by a `ktstr run` that
+/// crashed or was SIGKILLed.
 ///
 /// Returns only entries that exist and are directories. Silently
 /// returns empty when `/sys/fs/cgroup` isn't a cgroup v2 mount.
