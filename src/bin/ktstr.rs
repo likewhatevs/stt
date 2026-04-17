@@ -88,7 +88,10 @@ enum Command {
     /// Without `--parent-cgroup`, removes all cgroups matching
     /// `/sys/fs/cgroup/ktstr` and `/sys/fs/cgroup/ktstr-<pid>`
     /// (the paths `ktstr run` and the in-process test harness create).
-    /// The directories themselves are removed too.
+    /// The directories themselves are removed too. `ktstr-<pid>`
+    /// directories whose pid is still a running ktstr or cargo-ktstr
+    /// process are skipped, so a concurrent cleanup run doesn't
+    /// yank an active run's cgroup.
     Cleanup {
         /// Parent cgroup path. When set, cleans only this path and
         /// leaves the parent directory in place; when omitted, globs
@@ -194,10 +197,13 @@ enum KernelCommand {
 
 /// List cgroup directories that `ktstr cleanup` targets by default:
 /// `/sys/fs/cgroup/ktstr` (test-harness parent) and any
-/// `/sys/fs/cgroup/ktstr-<pid>` left behind by `ktstr run`.
+/// `/sys/fs/cgroup/ktstr-<pid>` left behind by a crashed `ktstr run`.
 ///
 /// Returns only entries that exist and are directories. Silently
 /// returns empty when `/sys/fs/cgroup` isn't a cgroup v2 mount.
+/// Skips `ktstr-<pid>` directories whose pid still owns a live
+/// ktstr (or cargo-ktstr) process, so a concurrent `cleanup` run
+/// doesn't rmdir an active run's cgroup out from under it.
 fn default_cleanup_parents() -> Vec<PathBuf> {
     let root = Path::new("/sys/fs/cgroup");
     let entries = match std::fs::read_dir(root) {
@@ -212,16 +218,36 @@ fn default_cleanup_parents() -> Vec<PathBuf> {
         }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name == "ktstr"
-            || name
-                .strip_prefix("ktstr-")
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        if name == "ktstr" {
+            out.push(entry.path());
+            continue;
+        }
+        if let Some(pid_str) = name.strip_prefix("ktstr-")
+            && !pid_str.is_empty()
+            && pid_str.bytes().all(|b| b.is_ascii_digit())
         {
+            if is_ktstr_pid_alive(pid_str) {
+                eprintln!("ktstr: skipping {} (live process)", entry.path().display());
+                continue;
+            }
             out.push(entry.path());
         }
     }
     out.sort();
     out
+}
+
+/// Return true when `/proc/{pid}/comm` identifies a live ktstr or
+/// cargo-ktstr process. Returns false on any read error (pid exited,
+/// non-Linux host, /proc not mounted) so the caller treats the cgroup
+/// as cleanable.
+fn is_ktstr_pid_alive(pid: &str) -> bool {
+    let comm_path = format!("/proc/{pid}/comm");
+    let Ok(comm) = std::fs::read_to_string(&comm_path) else {
+        return false;
+    };
+    let comm = comm.trim();
+    comm == "ktstr" || comm == "cargo-ktstr"
 }
 
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
