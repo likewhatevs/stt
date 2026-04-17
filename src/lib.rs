@@ -315,7 +315,7 @@ pub mod prelude {
     };
     pub use crate::topology::{LlcInfo, TestTopology};
     pub use crate::workload::{
-        AffinityKind, AffinityMode, Phase, SchedPolicy, Work, WorkType, WorkerReport,
+        AffinityKind, AffinityMode, MemPolicy, Phase, SchedPolicy, Work, WorkType, WorkerReport,
         WorkloadConfig, WorkloadHandle,
     };
 }

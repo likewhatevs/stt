@@ -17,7 +17,7 @@ use anyhow::Result;
 
 use crate::assert::AssertResult;
 use crate::vmm::shm_ring::{self, StimulusPayload};
-use crate::workload::{AffinityKind, Work, WorkType, WorkloadConfig, WorkloadHandle};
+use crate::workload::{AffinityKind, MemPolicy, Work, WorkType, WorkloadConfig, WorkloadHandle};
 
 use super::{CgroupGroup, Ctx, process_alive};
 
@@ -245,6 +245,13 @@ impl CgroupDef {
     pub fn affinity(mut self, a: crate::workload::AffinityKind) -> Self {
         self.ensure_default_work();
         self.works[0].affinity = a;
+        self
+    }
+
+    /// Set the NUMA memory placement policy (convenience for single Work).
+    pub fn mem_policy(mut self, p: crate::workload::MemPolicy) -> Self {
+        self.ensure_default_work();
+        self.works[0].mem_policy = p;
         self
     }
 
@@ -917,6 +924,37 @@ fn build_stimulus(
 
 /// Create cgroups, set cpusets, and spawn workers from CgroupDefs.
 ///
+/// Validate that a MemPolicy's nodes are covered by the NUMA nodes
+/// reachable from the resolved cpuset. Returns `Err` with a description
+/// when the policy requests nodes outside the cpuset's NUMA coverage.
+fn validate_mempolicy_cpuset(
+    policy: &MemPolicy,
+    cpuset: &BTreeSet<usize>,
+    ctx: &Ctx,
+    cgroup_name: &str,
+) -> Result<()> {
+    let policy_nodes = policy.node_set();
+    if policy_nodes.is_empty() {
+        return Ok(());
+    }
+    let cpuset_numa = ctx.topo.numa_nodes_for_cpuset(cpuset);
+    let uncovered: Vec<usize> = policy_nodes
+        .iter()
+        .copied()
+        .filter(|n| !cpuset_numa.contains(n))
+        .collect();
+    if !uncovered.is_empty() {
+        anyhow::bail!(
+            "cgroup '{}': MemPolicy references NUMA node(s) {:?} \
+             but cpuset covers only node(s) {:?}",
+            cgroup_name,
+            uncovered,
+            cpuset_numa,
+        );
+    }
+    Ok(())
+}
+
 /// Each CgroupDef's `works` vec is iterated, spawning one WorkloadHandle
 /// per Work entry. Multiple Works for the same cgroup produce multiple
 /// handle entries with the same name key; Ops that filter by cgroup name
@@ -942,6 +980,11 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             &def.works
         };
         let cgroup_cpuset = state.cpusets.get(def.name.as_ref());
+        if let Some(resolved) = cgroup_cpuset {
+            for work in effective_works {
+                validate_mempolicy_cpuset(&work.mem_policy, resolved, ctx, &def.name)?;
+            }
+        }
         for work in effective_works {
             let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
             let effective_work_type = crate::workload::resolve_work_type(
@@ -957,6 +1000,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
                 affinity,
                 work_type: effective_work_type,
                 sched_policy: work.sched_policy,
+                mem_policy: work.mem_policy.clone(),
             };
             let mut h = WorkloadHandle::spawn(&wl)?;
             ctx.cgroups.move_tasks(&def.name, &h.tids())?;
@@ -1015,6 +1059,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     affinity,
                     work_type: work.work_type.clone(),
                     sched_policy: work.sched_policy,
+                    mem_policy: work.mem_policy.clone(),
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
                 ctx.cgroups.move_tasks(cgroup, &h.tids())?;
@@ -1064,6 +1109,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     affinity,
                     work_type: work.work_type.clone(),
                     sched_policy: work.sched_policy,
+                    mem_policy: work.mem_policy.clone(),
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
                 h.start();
@@ -2035,5 +2081,77 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let spec = CpusetSpec::Disjoint { index: 1, of: 2 };
         assert!(spec.validate(&ctx).is_ok());
+    }
+
+    // -- MemPolicy + cpuset validation tests --
+
+    #[test]
+    fn validate_mempolicy_default_always_ok() {
+        // 2 NUMA nodes, 2 LLCs (1 per node), 4 cores, 1 thread = 8 CPUs
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect();
+        assert!(validate_mempolicy_cpuset(&MemPolicy::Default, &cpuset, &ctx, "cg_0").is_ok());
+    }
+
+    #[test]
+    fn validate_mempolicy_local_always_ok() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect();
+        assert!(validate_mempolicy_cpuset(&MemPolicy::Local, &cpuset, &ctx, "cg_0").is_ok());
+    }
+
+    #[test]
+    fn validate_mempolicy_bind_covered() {
+        // 2 NUMA nodes, 2 LLCs, 4 cores each = 8 CPUs total
+        // LLC 0 (CPUs 0-3) = NUMA 0, LLC 1 (CPUs 4-7) = NUMA 1
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..8).collect(); // covers both nodes
+        let policy = MemPolicy::Bind([0, 1].into_iter().collect());
+        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_ok());
+    }
+
+    #[test]
+    fn validate_mempolicy_bind_uncovered() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
+        let policy = MemPolicy::Bind([1].into_iter().collect()); // node 1 not in cpuset
+        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_err());
+    }
+
+    #[test]
+    fn validate_mempolicy_preferred_covered() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (4..8).collect(); // NUMA node 1
+        let policy = MemPolicy::Preferred(1);
+        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_ok());
+    }
+
+    #[test]
+    fn validate_mempolicy_preferred_uncovered() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
+        let policy = MemPolicy::Preferred(1);
+        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_err());
+    }
+
+    #[test]
+    fn validate_mempolicy_interleave_partial_uncovered() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
+        let policy = MemPolicy::Interleave([0, 1].into_iter().collect());
+        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_err());
+    }
+
+    #[test]
+    fn cgroupdef_mem_policy_builder() {
+        let def = CgroupDef::named("test").mem_policy(MemPolicy::Bind([0].into_iter().collect()));
+        assert!(matches!(def.works[0].mem_policy, MemPolicy::Bind(_)));
     }
 }

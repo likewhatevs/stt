@@ -127,11 +127,6 @@ impl GuestMem {
         self.base
     }
 
-    /// Per-node memory regions.
-    pub(crate) fn regions(&self) -> &[MemRegion] {
-        &self.regions
-    }
-
     /// Resolve a DRAM-relative byte offset to a host pointer.
     ///
     /// Binary-searches the sorted region list. Returns `None` if the

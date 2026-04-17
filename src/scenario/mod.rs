@@ -562,6 +562,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
             affinity,
             work_type: effective_work_type,
             sched_policy: cw.sched_policy,
+            mem_policy: cw.mem_policy.clone(),
         };
         let h = WorkloadHandle::spawn(&wl)?;
         tracing::debug!(cgroup = %name, workers = n, tids = h.tids().len(), "spawned workers");
@@ -1149,6 +1150,7 @@ mod tests {
         assert!(matches!(cw.work_type, WorkType::CpuSpin));
         assert!(matches!(cw.sched_policy, SchedPolicy::Normal));
         assert!(matches!(cw.affinity, AffinityKind::Inherit));
+        assert!(matches!(cw.mem_policy, MemPolicy::Default));
     }
 
     #[test]

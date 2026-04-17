@@ -11,6 +11,7 @@
 //! - [`Work`] -- workload definition for a single group of workers within a cgroup
 //! - [`Phase`] -- a single phase in a [`WorkType::Sequence`] compound work pattern
 //! - [`SchedPolicy`] -- Linux scheduling policy for a worker process
+//! - [`MemPolicy`] -- NUMA memory placement policy for worker processes
 //!
 //! See the [Work Types](https://likewhatevs.github.io/ktstr/guide/concepts/work-types.html)
 //! and [Worker Processes](https://likewhatevs.github.io/ktstr/guide/architecture/workers.html)
@@ -464,6 +465,126 @@ impl SchedPolicy {
     }
 }
 
+/// NUMA memory placement policy for worker processes.
+///
+/// Applied via `set_mempolicy(2)` after fork, before the work loop.
+/// Maps to Linux `MPOL_*` constants. When `Default`, no syscall is
+/// made (inherits the parent's policy).
+#[derive(Clone, Debug, Default)]
+pub enum MemPolicy {
+    /// Inherit the parent process's memory policy (no syscall).
+    #[default]
+    Default,
+    /// Allocate only from the specified NUMA nodes (`MPOL_BIND`).
+    Bind(BTreeSet<usize>),
+    /// Prefer allocations from the specified node, falling back to
+    /// others when the preferred node is full (`MPOL_PREFERRED`).
+    Preferred(usize),
+    /// Interleave allocations round-robin across the specified nodes
+    /// (`MPOL_INTERLEAVE`).
+    Interleave(BTreeSet<usize>),
+    /// Prefer the nearest node to the CPU where the allocation occurs
+    /// (`MPOL_LOCAL`). No nodemask.
+    Local,
+}
+
+impl MemPolicy {
+    /// Construct a `Bind` policy from any iterator of NUMA node IDs.
+    ///
+    /// Accepts arrays, ranges, `Vec`, `BTreeSet`, or any `IntoIterator<Item = usize>`.
+    pub fn bind(nodes: impl IntoIterator<Item = usize>) -> Self {
+        MemPolicy::Bind(nodes.into_iter().collect())
+    }
+
+    /// Construct a `Preferred` policy for a single NUMA node.
+    pub fn preferred(node: usize) -> Self {
+        MemPolicy::Preferred(node)
+    }
+
+    /// Construct an `Interleave` policy from any iterator of NUMA node IDs.
+    ///
+    /// Accepts arrays, ranges, `Vec`, `BTreeSet`, or any `IntoIterator<Item = usize>`.
+    pub fn interleave(nodes: impl IntoIterator<Item = usize>) -> Self {
+        MemPolicy::Interleave(nodes.into_iter().collect())
+    }
+
+    /// NUMA node IDs referenced by this policy.
+    ///
+    /// Returns the node set for `Bind` and `Interleave`, a single-element
+    /// set for `Preferred`, and an empty set for `Default`/`Local`.
+    pub fn node_set(&self) -> BTreeSet<usize> {
+        match self {
+            MemPolicy::Default | MemPolicy::Local => BTreeSet::new(),
+            MemPolicy::Bind(nodes) | MemPolicy::Interleave(nodes) => nodes.clone(),
+            MemPolicy::Preferred(node) => [*node].into_iter().collect(),
+        }
+    }
+}
+
+/// Build a nodemask bitmask and maxnode value for `set_mempolicy(2)`.
+///
+/// Returns `(nodemask_vec, maxnode)`. The nodemask is a bitmask of
+/// `c_ulong` words where bit N corresponds to NUMA node N. `maxnode`
+/// must be `max_node + 2` because the kernel's `get_nodes()` does
+/// `--maxnode` before reading the bitmask.
+fn build_nodemask(nodes: &BTreeSet<usize>) -> (Vec<libc::c_ulong>, libc::c_ulong) {
+    if nodes.is_empty() {
+        return (vec![], 0);
+    }
+    let max_node = nodes.iter().copied().max().unwrap_or(0);
+    let mask_bits = max_node + 2;
+    let bits_per_word = std::mem::size_of::<libc::c_ulong>() * 8;
+    let mask_words = mask_bits.div_ceil(bits_per_word);
+    let mut nodemask = vec![0 as libc::c_ulong; mask_words];
+    for &node in nodes {
+        nodemask[node / bits_per_word] |= 1 << (node % bits_per_word);
+    }
+    (nodemask, mask_bits as libc::c_ulong)
+}
+
+/// Call `set_mempolicy(2)` for the current process.
+///
+/// No-op for `MemPolicy::Default`. Logs a warning on syscall failure.
+fn apply_mempolicy(policy: &MemPolicy) {
+    let (mode, node_set): (i32, BTreeSet<usize>) = match policy {
+        MemPolicy::Default => return,
+        MemPolicy::Bind(nodes) => (libc::MPOL_BIND, nodes.clone()),
+        MemPolicy::Preferred(node) => (libc::MPOL_PREFERRED, [*node].into_iter().collect()),
+        MemPolicy::Interleave(nodes) => (libc::MPOL_INTERLEAVE, nodes.clone()),
+        MemPolicy::Local => {
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_set_mempolicy,
+                    libc::MPOL_LOCAL,
+                    std::ptr::null::<libc::c_ulong>(),
+                    0 as libc::c_ulong,
+                )
+            };
+            if rc != 0 {
+                eprintln!(
+                    "ktstr: set_mempolicy(MPOL_LOCAL) failed: {}",
+                    std::io::Error::last_os_error(),
+                );
+            }
+            return;
+        }
+    };
+    if node_set.is_empty() {
+        eprintln!("ktstr: set_mempolicy: empty node set, skipping");
+        return;
+    }
+    let (mask, maxnode) = build_nodemask(&node_set);
+    let rc = unsafe { libc::syscall(libc::SYS_set_mempolicy, mode, mask.as_ptr(), maxnode) };
+    if rc != 0 {
+        eprintln!(
+            "ktstr: set_mempolicy(mode={}, nodes={:?}) failed: {}",
+            mode,
+            node_set,
+            std::io::Error::last_os_error(),
+        );
+    }
+}
+
 /// Configuration for spawning a group of worker processes.
 #[derive(Debug, Clone)]
 pub struct WorkloadConfig {
@@ -475,6 +596,8 @@ pub struct WorkloadConfig {
     pub work_type: WorkType,
     /// Linux scheduling policy.
     pub sched_policy: SchedPolicy,
+    /// NUMA memory placement policy.
+    pub mem_policy: MemPolicy,
 }
 
 impl Default for WorkloadConfig {
@@ -484,6 +607,7 @@ impl Default for WorkloadConfig {
             affinity: AffinityMode::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            mem_policy: MemPolicy::Default,
         }
     }
 }
@@ -495,11 +619,12 @@ impl Default for WorkloadConfig {
 /// set of worker processes.
 ///
 /// ```
-/// # use ktstr::workload::{Work, WorkType, SchedPolicy};
+/// # use ktstr::workload::{Work, WorkType, SchedPolicy, MemPolicy};
 /// let w = Work::default()
 ///     .workers(4)
 ///     .work_type(WorkType::bursty(50, 100))
-///     .sched_policy(SchedPolicy::Batch);
+///     .sched_policy(SchedPolicy::Batch)
+///     .mem_policy(MemPolicy::bind([0, 1]));
 /// assert_eq!(w.num_workers, Some(4));
 /// ```
 #[derive(Clone, Debug)]
@@ -513,6 +638,9 @@ pub struct Work {
     /// Per-worker affinity intent. Resolved to [`AffinityMode`] at
     /// runtime via [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
     pub affinity: AffinityKind,
+    /// NUMA memory placement policy. Applied via `set_mempolicy(2)`
+    /// after fork, before the work loop.
+    pub mem_policy: MemPolicy,
 }
 
 impl Default for Work {
@@ -522,6 +650,7 @@ impl Default for Work {
             sched_policy: SchedPolicy::Normal,
             num_workers: None,
             affinity: AffinityKind::Inherit,
+            mem_policy: MemPolicy::Default,
         }
     }
 }
@@ -548,6 +677,12 @@ impl Work {
     /// Set the per-worker affinity intent.
     pub fn affinity(mut self, a: AffinityKind) -> Self {
         self.affinity = a;
+        self
+    }
+
+    /// Set the NUMA memory placement policy.
+    pub fn mem_policy(mut self, p: MemPolicy) -> Self {
+        self.mem_policy = p;
         self
     }
 }
@@ -876,6 +1011,7 @@ impl WorkloadHandle {
                         affinity,
                         config.work_type.clone(),
                         config.sched_policy,
+                        config.mem_policy.clone(),
                         worker_pipe_fds,
                         worker_futex,
                         iter_slot,
@@ -1115,6 +1251,7 @@ fn worker_main(
     affinity: Option<BTreeSet<usize>>,
     work_type: WorkType,
     sched_policy: SchedPolicy,
+    mem_policy: MemPolicy,
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, bool)>,
     iter_slot: *mut u64,
@@ -1125,6 +1262,7 @@ fn worker_main(
         let _ = set_thread_affinity(tid, cpus);
     }
     let _ = set_sched_policy(tid, sched_policy);
+    apply_mempolicy(&mem_policy);
 
     let start = Instant::now();
     let mut work_units: u64 = 0;
@@ -2153,6 +2291,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         assert_eq!(h.tids().len(), 2);
@@ -2174,6 +2313,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let h = WorkloadHandle::spawn(&config).unwrap();
         // Don't call start() - collect should auto-start
@@ -2188,6 +2328,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::YieldHeavy,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2204,6 +2345,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::Mixed,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2220,6 +2362,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         let tids = h.tids();
@@ -2239,6 +2382,7 @@ mod tests {
             affinity: AffinityMode::Fixed([0].into_iter().collect()),
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2273,6 +2417,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::IoSync,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2292,6 +2437,7 @@ mod tests {
                 sleep_ms: 50,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2308,6 +2454,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::PipeIo { burst_iters: 1024 },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2326,6 +2473,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::PipeIo { burst_iters: 1024 },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let result = WorkloadHandle::spawn(&config);
         assert!(result.is_err(), "PipeIo with odd workers should fail");
@@ -2453,6 +2601,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::IoSync,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2501,6 +2650,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2540,6 +2690,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -2557,6 +2708,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::PipeIo { burst_iters: 512 },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         assert_eq!(h.tids().len(), 4);
@@ -2772,6 +2924,7 @@ mod tests {
             affinity: AffinityMode::SingleCpu(3),
             work_type: WorkType::YieldHeavy,
             sched_policy: SchedPolicy::Batch,
+            ..Default::default()
         };
         let s = format!("{:?}", c);
         assert!(s.contains("7"), "must show num_workers value");
@@ -2922,6 +3075,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3073,6 +3227,7 @@ mod tests {
                 spin_iters: 1024,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3094,6 +3249,7 @@ mod tests {
                 spin_iters: 512,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3114,6 +3270,7 @@ mod tests {
                 spin_iters: 1024,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let result = WorkloadHandle::spawn(&config);
         assert!(result.is_err());
@@ -3134,6 +3291,7 @@ mod tests {
                 spin_iters: 512,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         assert_eq!(h.tids().len(), 10);
@@ -3157,6 +3315,7 @@ mod tests {
                 spin_iters: 1024,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3400,6 +3559,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3601,6 +3761,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::FutexPingPong { spin_iters: 1024 },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3626,6 +3787,7 @@ mod tests {
                 stride: 64,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3645,6 +3807,7 @@ mod tests {
                 stride: 64,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3664,6 +3827,7 @@ mod tests {
                 burst_iters: 1024,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3685,6 +3849,7 @@ mod tests {
                 rest: vec![Phase::Yield(Duration::from_millis(10))],
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3770,6 +3935,7 @@ mod tests {
             affinity: AffinityMode::None,
             work_type: WorkType::custom("test_spin", custom_spin_fn),
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3846,6 +4012,7 @@ mod tests {
                 sleep_usec: 100,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
@@ -3871,6 +4038,7 @@ mod tests {
                 sleep_usec: 100,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let result = WorkloadHandle::spawn(&config);
         assert!(result.is_err());
@@ -3893,6 +4061,7 @@ mod tests {
                 sleep_usec: 100,
             },
             sched_policy: SchedPolicy::Normal,
+            ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         assert_eq!(h.tids().len(), 10);
@@ -3903,5 +4072,104 @@ mod tests {
         for r in &reports {
             assert!(r.work_units > 0, "SchBench worker {} did no work", r.tid);
         }
+    }
+
+    // -- MemPolicy tests --
+
+    #[test]
+    fn mempolicy_default_node_set_empty() {
+        assert!(MemPolicy::Default.node_set().is_empty());
+    }
+
+    #[test]
+    fn mempolicy_local_node_set_empty() {
+        assert!(MemPolicy::Local.node_set().is_empty());
+    }
+
+    #[test]
+    fn mempolicy_bind_node_set() {
+        let p = MemPolicy::Bind([0, 2].into_iter().collect());
+        assert_eq!(p.node_set(), [0, 2].into_iter().collect());
+    }
+
+    #[test]
+    fn mempolicy_preferred_node_set() {
+        let p = MemPolicy::Preferred(1);
+        assert_eq!(p.node_set(), [1].into_iter().collect());
+    }
+
+    #[test]
+    fn mempolicy_interleave_node_set() {
+        let p = MemPolicy::Interleave([0, 1, 3].into_iter().collect());
+        assert_eq!(p.node_set(), [0, 1, 3].into_iter().collect());
+    }
+
+    #[test]
+    fn build_nodemask_empty() {
+        let (mask, maxnode) = build_nodemask(&BTreeSet::new());
+        assert!(mask.is_empty());
+        assert_eq!(maxnode, 0);
+    }
+
+    #[test]
+    fn build_nodemask_single() {
+        let (mask, maxnode) = build_nodemask(&[0].into_iter().collect());
+        // kernel get_nodes() does --maxnode, so maxnode = max_node + 2
+        assert_eq!(maxnode, 2);
+        assert_eq!(mask.len(), 1);
+        assert_eq!(mask[0], 1);
+    }
+
+    #[test]
+    fn build_nodemask_multiple() {
+        let (mask, maxnode) = build_nodemask(&[0, 2].into_iter().collect());
+        assert_eq!(maxnode, 4); // max_node=2, +2 = 4
+        assert_eq!(mask[0] & 1, 1); // node 0
+        assert_eq!(mask[0] & 4, 4); // node 2
+        assert_eq!(mask[0] & 2, 0); // node 1 not set
+    }
+
+    #[test]
+    fn build_nodemask_high_node() {
+        let bits_per_word = std::mem::size_of::<libc::c_ulong>() * 8;
+        let high = bits_per_word + 3;
+        let (mask, maxnode) = build_nodemask(&[high].into_iter().collect());
+        assert_eq!(maxnode, (high + 2) as libc::c_ulong);
+        assert_eq!(mask.len(), 2);
+        assert_eq!(mask[0], 0);
+        assert_eq!(mask[1], 1 << 3);
+    }
+
+    #[test]
+    fn apply_mempolicy_default_is_noop() {
+        apply_mempolicy(&MemPolicy::Default);
+    }
+
+    #[test]
+    fn apply_mempolicy_empty_bind_skipped() {
+        apply_mempolicy(&MemPolicy::Bind(BTreeSet::new()));
+    }
+
+    #[test]
+    fn apply_mempolicy_empty_interleave_skipped() {
+        apply_mempolicy(&MemPolicy::Interleave(BTreeSet::new()));
+    }
+
+    #[test]
+    fn work_mem_policy_builder() {
+        let w = Work::default().mem_policy(MemPolicy::Bind([0].into_iter().collect()));
+        assert!(matches!(w.mem_policy, MemPolicy::Bind(_)));
+    }
+
+    #[test]
+    fn work_default_mempolicy_is_default() {
+        let w = Work::default();
+        assert!(matches!(w.mem_policy, MemPolicy::Default));
+    }
+
+    #[test]
+    fn workload_config_default_mempolicy() {
+        let wl = WorkloadConfig::default();
+        assert!(matches!(wl.mem_policy, MemPolicy::Default));
     }
 }

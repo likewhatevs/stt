@@ -289,6 +289,10 @@ impl TestTopology {
     pub fn num_numa_nodes(&self) -> usize {
         self.numa_nodes.len()
     }
+    /// NUMA node IDs as a `BTreeSet`.
+    pub fn numa_node_ids(&self) -> &BTreeSet<usize> {
+        &self.numa_nodes
+    }
     /// All LLC domains.
     pub fn llcs(&self) -> &[LlcInfo] {
         &self.llcs
@@ -331,6 +335,15 @@ impl TestTopology {
             .filter(|llc| llc.numa_node() == node)
             .flat_map(|llc| llc.cpus())
             .copied()
+            .collect()
+    }
+
+    /// NUMA nodes covered by the given CPU set.
+    pub fn numa_nodes_for_cpuset(&self, cpus: &BTreeSet<usize>) -> BTreeSet<usize> {
+        self.llcs
+            .iter()
+            .filter(|llc| llc.cpus.iter().any(|c| cpus.contains(c)))
+            .map(|llc| llc.numa_node)
             .collect()
     }
 
@@ -929,5 +942,34 @@ mod tests {
             let roundtrip: std::collections::BTreeSet<usize> = parsed.into_iter().collect();
             assert_eq!(cpus, roundtrip);
         }
+    }
+
+    #[test]
+    fn numa_node_ids_synthetic() {
+        let t = TestTopology::synthetic(8, 2);
+        assert_eq!(*t.numa_node_ids(), [0, 1].into_iter().collect());
+    }
+
+    #[test]
+    fn numa_nodes_for_cpuset_single_node() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // LLC 0, NUMA 0
+        assert_eq!(t.numa_nodes_for_cpuset(&cpuset), [0].into_iter().collect());
+    }
+
+    #[test]
+    fn numa_nodes_for_cpuset_both_nodes() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let cpuset: BTreeSet<usize> = [0, 8].into_iter().collect(); // NUMA 0 + NUMA 1
+        assert_eq!(
+            t.numa_nodes_for_cpuset(&cpuset),
+            [0, 1].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn numa_nodes_for_cpuset_empty() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        assert!(t.numa_nodes_for_cpuset(&BTreeSet::new()).is_empty());
     }
 }

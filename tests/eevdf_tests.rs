@@ -35,6 +35,7 @@ fn eevdf_spinlock_contention(ctx: &Ctx) -> Result<AssertResult> {
             sleep_ms: 0,
         },
         sched_policy: ktstr::workload::SchedPolicy::Normal,
+        ..Default::default()
     };
 
     let mut handle = WorkloadHandle::spawn(&config)?;
