@@ -3,9 +3,11 @@ use super::stack::StackFunction;
 /// Display hint derived from BTF type information.
 ///
 /// Controls how auto-discovered field values are formatted in probe
-/// output. Known struct fields (in [`STRUCT_FIELDS`]) use dedicated
-/// decoders in `decode.rs`; this hint only applies to auto-discovered
-/// fields where the default would otherwise be hex.
+/// output. Dedicated decoders in `decode.rs` fire by field-key name
+/// (`dsq_id`, `enq_flags`, etc.) regardless of how the field was
+/// discovered; this hint only applies to auto-discovered fields
+/// that do not match a dedicated decoder and would otherwise
+/// default to hex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RenderHint {
     /// Unsigned decimal (u32 sizes, counters).
@@ -26,9 +28,11 @@ pub enum RenderHint {
 /// auto-discovered from vmlinux or BPF program BTF.
 #[derive(Debug, Clone, Default)]
 pub struct BtfParam {
+    /// Parameter name from BTF (argument name in the function signature).
     pub name: String,
     /// Known struct name (in STRUCT_FIELDS) for field key generation
     pub struct_name: Option<String>,
+    /// True if the parameter is a pointer type.
     pub is_ptr: bool,
     /// True if this is a char * / const char * (string pointer).
     pub is_string_ptr: bool,
@@ -49,7 +53,9 @@ pub struct BtfParam {
 /// generate output labels.
 #[derive(Debug, Clone, Default)]
 pub struct BtfFunc {
+    /// Fully qualified function name as it appears in BTF.
     pub name: String,
+    /// Ordered parameter metadata, one entry per argument.
     pub params: Vec<BtfParam>,
     /// True if BTF FuncProto has a variadic sentinel parameter
     /// (name_off=0, type=0). Variadic functions should not have
@@ -106,9 +112,14 @@ pub fn resolve_btf_path(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> 
 /// Maps 1:1 to the C `struct field_spec` in intf.h.
 #[derive(Debug, Clone)]
 pub struct FieldSpec {
+    /// Parameter index whose pointer value supplies the base address.
     pub param_idx: u32,
+    /// Byte offset from the base pointer at which to read.
     pub offset: u32,
+    /// Number of bytes to read (1/2/4/8 for scalars; larger for
+    /// `Bytes` values).
     pub size: u32,
+    /// Slot in the shared probe output map that receives this field.
     pub field_idx: u32,
     /// Byte offset to intermediate pointer for chained dereferences.
     /// 0 = single-level read. Nonzero = read ptr at base+ptr_offset,
@@ -611,7 +622,10 @@ pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> V
 ///
 /// Returns a [`StackFunction`] per discovered program with `is_bpf = true`
 /// and the program's ID in `bpf_prog_id`. The `raw_name` is
-/// `bpf_prog_{id}_{name}` to match kallsyms format.
+/// `bpf_prog_{id}_{name}`, which reuses the kallsyms pattern shape
+/// but substitutes the integer `prog_id` for the hex hash that real
+/// kallsyms entries carry; treat it as an internal bookkeeping key,
+/// not a string that will literally appear in `/proc/kallsyms`.
 pub fn discover_bpf_symbols(stack_names: &[&str]) -> Vec<StackFunction> {
     use libbpf_rs::query::ProgInfoIter;
 
@@ -686,8 +700,11 @@ pub fn discover_bpf_symbols(stack_names: &[&str]) -> Vec<StackFunction> {
 /// Resolve the full function name for a BPF program from its BTF.
 ///
 /// `bpf_prog_info.name` is truncated to 15 characters. The full name
-/// is resolved from `func_info[0].type_id` in the program's BTF,
-/// which the kernel guarantees is the entry point (`insn_off == 0`).
+/// is resolved from `func_info[0].type_id` in the program's BTF.
+/// The kernel populates the `func_info` array in `insn_off` order,
+/// so the first entry corresponds to the program's entry point
+/// (`insn_off == 0`); this is the convention the BPF loader relies
+/// on, not a documented guarantee.
 fn resolve_bpf_prog_full_name(prog_id: u32) -> Option<String> {
     use libbpf_rs::AsRawLibbpf;
     use libbpf_rs::libbpf_sys;

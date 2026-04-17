@@ -69,8 +69,8 @@ so most tests do not need to set `numa_nodes`. See
 | Attribute | Default | Description |
 |---|---|---|
 | `scheduler = CONST` | `Scheduler::EEVDF` | Rust const path to a `Scheduler` definition |
-| `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler |
-| `watchdog_timeout_s` | 4 | scx watchdog override (seconds) |
+| `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
+| `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on 6.16-7.0 kernels. When neither path is available the override silently no-ops. |
 
 ### Verification
 
@@ -139,9 +139,9 @@ for profile generation examples.
 | `max_llcs` | 12 | Maximum LLCs for gauntlet topology filtering |
 | `min_cpus` | 1 | Minimum total CPU count for gauntlet topology filtering |
 | `max_cpus` | 192 | Maximum total CPU count for gauntlet topology filtering |
-| `min_numa_nodes` | 1 | Minimum NUMA nodes for gauntlet topology filtering |
+| `min_numa_nodes` | 1 | Minimum NUMA nodes for gauntlet topology filtering (`min_sockets` accepted as alias) |
 | `max_numa_nodes` | 1 | Maximum NUMA nodes for gauntlet topology filtering |
-| `requires_smt` | `false` | Require SMT (threads > 1) topologies |
+| `requires_smt` | `false` | Require SMT (threads > 1) topologies. On aarch64 the gauntlet ships only non-SMT presets, so any test with `requires_smt = true` is skipped entirely on that arch. |
 
 The gauntlet skips presets that do not satisfy these constraints.
 Multi-NUMA presets are excluded by default (`max_numa_nodes = 1`).
@@ -154,13 +154,19 @@ example.
 
 | Attribute | Default | Description |
 |---|---|---|
-| `auto_repro` | `true` | Auto-repro on crash |
+| `auto_repro` | `true` | On scheduler crash, boot a second VM with probes attached. Set to `false` for fast iteration. |
 | `replicas` | 1 | Number of times to run |
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
 | `duration_s` | 2 | Per-scenario duration in seconds |
 | `workers_per_cgroup` | 2 | Workers per cgroup |
 | `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
 | `bpf_map_write = CONST` | `None` | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads |
+
+`KtstrTestEntry` also carries a `host_only` field, but it is not an
+accepted `#[ktstr_test]` attribute: the macro always emits
+`host_only: false`. Tests that run on the host instead of inside a
+VM must be registered manually via a `KtstrTestEntry` literal added
+to `KTSTR_TESTS`.
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
 what `performance_mode` enables, prerequisites, and validation behavior.

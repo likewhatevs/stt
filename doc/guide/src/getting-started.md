@@ -6,17 +6,19 @@
 - Rust toolchain (stable, >= 1.88)
 - clang and BPF toolchain (builds BPF skeletons via libbpf-cargo)
 - pkg-config
+- Autotools and make, for building the vendored copies of libbpf,
+  libelf, and zlib pulled in via `libbpf-sys`'s `vendored` feature
 
 **Ubuntu/Debian:**
 
 ```sh
-sudo apt install clang pkg-config
+sudo apt install clang pkg-config make autoconf autopoint flex bison gawk
 ```
 
 **Fedora:**
 
 ```sh
-sudo dnf install clang pkgconf
+sudo dnf install clang pkgconf make autoconf gettext-devel flex bison gawk
 ```
 
 ## Install tools
@@ -52,6 +54,9 @@ use ktstr::prelude::*;
 
 #[ktstr_test(llcs = 1, cores = 2, threads = 1)]  // llcs = last-level caches
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
+    // `scenarios::steady` is a canned scenario: two cgroups of equal
+    // CPU-spin workers, no cpuset restrictions, run for the default
+    // duration.
     scenarios::steady(ctx)
 }
 ```
@@ -105,16 +110,22 @@ for gauntlet expansion and budget-driven test selection.
 
 ## Kernel discovery
 
-Tests require a bootable Linux kernel. ktstr searches (in order):
+Tests require a bootable Linux kernel. Discovery happens in two
+layers. The test harness first calls `resolve_test_kernel()`, which
+honours `KTSTR_TEST_KERNEL` (step 1); on miss, it delegates to
+`find_kernel()`, which runs the remaining steps.
 
-1. `KTSTR_TEST_KERNEL` environment variable (direct image path)
+1. `KTSTR_TEST_KERNEL` environment variable (direct image path). Used
+   by `resolve_test_kernel()` only.
 2. `KTSTR_KERNEL` environment variable, parsed as one of three forms:
    - Path: search that directory for `arch/<arch>/boot/<image>`
    - Version (e.g. `6.14.2`): look up the version in XDG cache
    - Cache key (from `cargo ktstr kernel list`): exact cache lookup
 3. XDG cache: most recent cached image (newest first); entries built
-   with a different kconfig fragment are skipped. Skipped entirely when
-   `KTSTR_KERNEL` was an explicit version or cache key that missed.
+   with a different kconfig fragment are skipped. When `KTSTR_KERNEL`
+   named an explicit version or cache key that was not present in the
+   cache, the cache scan is skipped entirely -- discovery moves on to
+   step 4 rather than substituting an unrelated cached kernel.
 4. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
 5. `../linux/arch/<arch>/boot/<image>` (sibling directory)
 6. `/lib/modules/$(uname -r)/build/arch/<arch>/boot/<image>` (installed kernel build tree)
@@ -136,11 +147,17 @@ configures it with the embedded `ktstr.kconfig` fragment, builds it,
 and caches the result:
 
 ```sh
-cargo ktstr kernel build               # latest stable
+cargo ktstr kernel build               # latest stable series with >= 8 maintenance releases
 cargo ktstr kernel build 6.14.2        # specific version
 cargo ktstr kernel build 6.12          # highest 6.12.x patch release
 cargo ktstr kernel build 6             # highest 6.x.y release
 ```
+
+The bare `cargo ktstr kernel build` skips series that have fewer
+than 8 maintenance releases to keep CI off brand-new majors whose
+early point releases tend to hit build issues on older toolchains;
+pass the specific version explicitly if you need a series that
+hasn't reached `.8` yet.
 
 Subsequent runs of `cargo ktstr test` or `cargo nextest run` will
 find the cached kernel automatically (step 3 in the discovery chain

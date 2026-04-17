@@ -148,6 +148,9 @@ pub struct ScenarioStats {
 }
 
 impl AssertResult {
+    /// Empty passing result with no details and default stats. Use
+    /// when a scenario completed successfully with nothing interesting
+    /// to report.
     pub fn pass() -> Self {
         Self {
             passed: true,
@@ -164,6 +167,10 @@ impl AssertResult {
             stats: Default::default(),
         }
     }
+    /// Fold `other` into `self`. `passed` is conjoined (any failure
+    /// wins), `details` concatenate, and aggregate stats adopt the
+    /// worst-case value per dimension so the merged result represents
+    /// the union of all checks applied.
     pub fn merge(&mut self, other: AssertResult) {
         if !other.passed {
             self.passed = false;
@@ -400,9 +407,21 @@ impl AssertPlan {
 #[derive(Clone, Copy, Debug)]
 pub struct Assert {
     // Worker checks
+    /// Enable starvation, fairness spread, and gap checks across
+    /// worker reports. `Some(true)` enables, `Some(false)` explicitly
+    /// disables (overriding any enabling merge from a lower layer),
+    /// `None` inherits from the merge parent.
     pub not_starved: Option<bool>,
+    /// Enable per-worker CPU isolation checks (ensure workers remain
+    /// within their assigned cpuset). Same tri-state semantics as
+    /// `not_starved`.
     pub isolation: Option<bool>,
+    /// Max per-worker scheduling gap in milliseconds. Fails the
+    /// assertion if any worker's longest off-CPU stretch exceeds this.
     pub max_gap_ms: Option<u64>,
+    /// Max per-cgroup fairness spread as a percentage. Fails if the
+    /// range between the most- and least-served workers exceeds this
+    /// fraction of their mean.
     pub max_spread_pct: Option<f64>,
 
     // Throughput checks
@@ -424,11 +443,24 @@ pub struct Assert {
     pub max_migration_ratio: Option<f64>,
 
     // Monitor checks
+    /// Max `nr_running` / LLC imbalance ratio observed by the monitor.
+    /// Fails if the worst sample's imbalance exceeds this.
     pub max_imbalance_ratio: Option<f64>,
+    /// Max local DSQ depth observed by the monitor. Fails if any
+    /// sampled CPU's local DSQ grew beyond this.
     pub max_local_dsq_depth: Option<u32>,
+    /// Treat a stall verdict from the monitor as a hard failure. Same
+    /// tri-state semantics as `not_starved`.
     pub fail_on_stall: Option<bool>,
+    /// Minimum number of consecutive samples that must exceed the
+    /// monitor threshold before a verdict is raised. Smooths out
+    /// single-sample spikes.
     pub sustained_samples: Option<usize>,
+    /// Max `select_cpu_fallback` rate (events/sec). Fails if the
+    /// scx event counter delta over the run exceeds this rate.
     pub max_fallback_rate: Option<f64>,
+    /// Max `keep_last` rate (events/sec). Fails if the scx event
+    /// counter delta over the run exceeds this rate.
     pub max_keep_last_rate: Option<f64>,
 }
 
@@ -538,11 +570,14 @@ impl Assert {
         self
     }
 
+    /// Control whether a monitor stall verdict fails the assertion.
     pub const fn fail_on_stall(mut self, v: bool) -> Self {
         self.fail_on_stall = Some(v);
         self
     }
 
+    /// Set the number of consecutive over-threshold samples required
+    /// before the monitor raises a verdict.
     pub const fn sustained_samples(mut self, v: usize) -> Self {
         self.sustained_samples = Some(v);
         self

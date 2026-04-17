@@ -433,6 +433,7 @@ fn read_percpu_array_value(
 /// `write_field` returns `false` on mismatch.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BpfValue {
+    /// 1-byte boolean.
     Bool(bool),
     U8(u8),
     I8(i8),
@@ -442,6 +443,7 @@ pub enum BpfValue {
     I32(i32),
     U64(u64),
     I64(i64),
+    /// Opaque byte buffer for non-standard sizes or unknown types.
     Bytes(Vec<u8>),
 }
 
@@ -452,6 +454,7 @@ pub enum BpfValue {
 /// Falls back to [`Bytes`](Self::Bytes) for non-standard sizes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BpfFieldKind {
+    /// 1-byte boolean.
     Bool,
     U8,
     I8,
@@ -461,6 +464,7 @@ pub enum BpfFieldKind {
     I32,
     U64,
     I64,
+    /// Opaque byte buffer; the `usize` is the field size in bytes.
     Bytes(usize),
 }
 
@@ -532,9 +536,8 @@ impl BpfValueLayout {
     }
 }
 
-/// Chase modifier chains (Volatile, Const, Typedef, TypeTag, Restrict)
-/// to reach the underlying Struct.
-/// Chase modifiers, pointers, and typedefs from `type_id` to find a Struct.
+/// Chase modifiers (Volatile, Const, Typedef, TypeTag, Restrict),
+/// pointers, and typedefs from `type_id` to find a Struct.
 ///
 /// Returns `None` if the chain ends in a non-Struct type or exceeds
 /// depth 20. Also resolves through Ptr (for pointer-to-struct members).

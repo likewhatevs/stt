@@ -138,7 +138,7 @@ checks run normally.
 
 | Threshold | Default | Rationale |
 |---|---|---|
-| `max_imbalance_ratio` | 4.0 | Max/min `nr_running` across CPUs. Lower values (2-3) false-positive during cpuset transitions. |
+| `max_imbalance_ratio` | 4.0 | `max(nr_running) / max(1, min(nr_running))` across CPUs (denominator clamped to 1 so an all-idle sample does not divide by zero). Lower values (2-3) false-positive during cpuset transitions. |
 | `max_local_dsq_depth` | 50 | Per-CPU dispatch queue overflow. Sustained depth above this means the scheduler is not consuming dispatched tasks. |
 | `fail_on_stall` | true | Fail when `rq_clock` does not advance on a CPU with runnable tasks. Idle CPUs (NOHZ) and preempted vCPUs are exempt. |
 | `sustained_samples` | 5 | At ~100ms sample interval, requires ~500ms of sustained violation. Filters transient spikes from cpuset reconfiguration. |

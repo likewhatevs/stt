@@ -45,7 +45,10 @@ worker group fails, the overall result fails.
 `ctx.workers_per_cgroup` workers and default settings.
 
 **`spawn_diverse(ctx, cgroup_names)`** -- spawns different work types
-(CpuSpin, Bursty, IoSync, Mixed, YieldHeavy) across cgroups.
+across cgroups, rotating through (CpuSpin, Bursty{50ms burst /
+100ms sleep}, IoSync, Mixed, YieldHeavy). Each cgroup uses
+`ctx.workers_per_cgroup` workers except IoSync cgroups, which always
+use 2 workers so blocking IO does not drown the scenario.
 
 ## The Ctx struct
 
@@ -66,8 +69,11 @@ pub struct Ctx<'a> {
 ```
 
 **`cgroups`** -- create/remove cgroups, set cpusets, move tasks.
-`move_task(name, tid)` moves a single task; `move_tasks(name, &tids)`
-moves all tasks in a slice (calls `move_task` per TID).
+`move_task(name, tid)` moves a single task. `move_tasks(name, &tids)`
+moves each task in a slice with bounded EBUSY retry (3 attempts,
+100ms backoff) to ride out transient rejections from sched_ext
+`cgroup_prep_move` callbacks, and tolerates ESRCH when a task exits
+between listing and migration.
 
 **`topo`** -- query CPU topology (LLCs, NUMA nodes, total CPUs).
 Key methods:

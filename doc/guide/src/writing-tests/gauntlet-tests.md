@@ -22,7 +22,7 @@ A test with `min_llcs = 2`, `requires_smt = true`, and default
 - `tiny-1llc` (1 LLC): excluded — below `min_llcs`
 - All non-SMT presets (`tiny-2llc`, `odd-*`, `*-nosmt`): excluded — `requires_smt`
 - `near-max-llc` (15 LLCs): excluded — above default `max_llcs = 12`
-- `max-cpu` (252 CPUs): excluded — above default `max_cpus = 192`
+- `max-cpu` (252 CPUs, 14 LLCs): excluded — above default `max_cpus = 192` (also above default `max_llcs = 12`)
 - All `numa*` presets: excluded — above default `max_numa_nodes = 1`
 
 Result: 6 of 24 presets survive (`smt-2llc`, `smt-3llc`, `medium-4llc`,
@@ -75,8 +75,10 @@ variants.
 
 ## Tests that skip gauntlet
 
-- `host_only = true` tests never produce gauntlet variants (no VM to
-  vary topology on).
+- Entries with `host_only = true` never produce gauntlet variants
+  (no VM to vary topology on). See
+  [`host_only`](ktstr-test-macro.md#execution) for how that flag is
+  set.
 - Tests whose names start with `demo_` are ignored by default. Their
   gauntlet variants are also ignored (all gauntlet variants are
   ignored).

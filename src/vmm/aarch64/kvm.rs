@@ -34,7 +34,9 @@ pub(crate) const GIC_REDIST_SIZE_PER_CPU: u64 = 0x2_0000;
 /// ns16550a serial MMIO base address. SPI 33.
 pub(crate) const SERIAL_MMIO_BASE: u64 = 0x0900_0000;
 
-/// ns16550a serial MMIO size: 4 KB (one page, 8 registers x 4 bytes).
+/// ns16550a serial MMIO size: one 4 KB page covering the 8-byte register
+/// window. KVM/OS accesses are 4-byte aligned; the page-sized region
+/// keeps each UART on its own guest page.
 pub(crate) const SERIAL_MMIO_SIZE: u64 = 0x1000;
 
 /// Second serial for application output. SPI 34.

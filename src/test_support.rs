@@ -7,6 +7,15 @@
 //! See the [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
 //! and [`#[ktstr_test]` Macro](https://likewhatevs.github.io/ktstr/guide/writing-tests/ktstr-test-macro.html)
 //! chapters of the guide.
+//!
+//! # Consumer API
+//!
+//! Test authors interact primarily with the `#[ktstr_test]` proc
+//! macro; programmatic test generation can instead populate
+//! [`KtstrTestEntry`] values into the [`KTSTR_TESTS`]
+//! `linkme` distributed slice. The remaining items in this module
+//! are runtime glue invoked by the macro-generated code and the
+//! `ktstr` / `cargo-ktstr` binaries.
 
 use anyhow::{Context, Result};
 use linkme::distributed_slice;
@@ -21,7 +30,12 @@ use crate::timeline::StimulusEvent;
 use crate::vmm;
 
 /// True when RUST_BACKTRACE is set to "1" or "full".
-/// Gates verbose diagnostic output (dmesg, scheduler log, COM1/COM2 dumps).
+///
+/// Controls whether the full guest kernel console is appended to the
+/// `--- diagnostics ---` section of a failed test, and whether
+/// auto-repro forwards the repro VM's COM1/COM2 output to the host
+/// terminal in real time. The scheduler-log and sched_ext-dump
+/// sections of a failure are always emitted regardless of this flag.
 fn verbose() -> bool {
     std::env::var("RUST_BACKTRACE")
         .map(|v| v == "1" || v == "full")
@@ -31,18 +45,40 @@ fn verbose() -> bool {
 /// Test result sidecar written to KTSTR_SIDECAR_DIR for post-run analysis.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SidecarResult {
+    /// Fully qualified test name (matches `KtstrTestEntry::name` and
+    /// the nextest path).
     pub test_name: String,
+    /// Rendered topology label (e.g. `1n2l4c1t`) for the variant this
+    /// sidecar describes.
     pub topology: String,
+    /// Scheduler name (matches `Scheduler::name`); `"eevdf"` for
+    /// tests run without an scx scheduler.
     pub scheduler: String,
+    /// Overall pass/fail verdict for this run.
     pub passed: bool,
+    /// Aggregate per-cgroup statistics merged across every worker.
     pub stats: ScenarioStats,
+    /// Monitor summary. `None` means the monitor loop did not run
+    /// (host-only tests, early VM failure) or sample collection
+    /// produced no valid data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor: Option<MonitorSummary>,
+    /// Ordered stimulus events published by the guest step executor
+    /// while the scenario ran.
     pub stimulus_events: Vec<StimulusEvent>,
+    /// Work type label used for post-hoc filtering and A/B comparison
+    /// (distinct from the `WorkType` enum — this is the text name).
     #[serde(default = "crate::stats::default_work_type")]
     pub work_type: String,
+    /// Per-BPF-program verifier statistics captured from the VM's
+    /// scheduler (when one was loaded). Absent when no scheduler
+    /// programs were inspected; empty vec distinguishes "inspected,
+    /// none matched" from absence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verifier_stats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
+    /// Aggregate per-vCPU KVM stats read after VM exit. `None` when
+    /// the VM did not run (host-only tests) or KVM stats were
+    /// unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kvm_stats: Option<crate::vmm::KvmStatsTotals>,
 }
@@ -219,7 +255,12 @@ pub enum SchedulerSpec {
     /// Kernel-built scheduler (e.g. BPF-less sched_ext or debugfs-tuned).
     /// Activated/deactivated via shell commands rather than a binary.
     KernelBuiltin {
+        /// Shell commands invoked before the scenario runs to switch
+        /// the kernel into this scheduling policy (e.g. write to
+        /// `/sys/kernel/debug/sched/...`).
         enable: &'static [&'static str],
+        /// Shell commands invoked after the scenario finishes to
+        /// restore the kernel's baseline scheduling policy.
         disable: &'static [&'static str],
     },
 }
@@ -240,11 +281,24 @@ pub use crate::scenario::flags::FlagDecl;
 /// its binary, flag declarations, sysctls, kernel args, cgroup parent,
 /// scheduler args, topology constraints, and monitor thresholds.
 pub struct Scheduler {
+    /// Short human name for the scheduler, used in logs and sidecar
+    /// metadata.
     pub name: &'static str,
+    /// Source of the scheduler: a built-in spec variant (`None`,
+    /// `Name`, `Path`, or `KernelBuiltin`).
     pub binary: SchedulerSpec,
+    /// Flag declarations from which gauntlet profiles are generated.
     pub flags: &'static [&'static FlagDecl],
+    /// Guest sysctls applied before the scheduler starts (set via
+    /// `/proc/sys/...`). Not yet wired into the `#[ktstr_test]` macro;
+    /// only reachable through manual `Scheduler` construction.
     pub sysctls: &'static [(&'static str, &'static str)],
+    /// Guest kernel command-line arguments appended when booting the
+    /// VM. Not yet wired into the `#[ktstr_test]` macro; only
+    /// reachable through manual `Scheduler` construction.
     pub kargs: &'static [&'static str],
+    /// Scheduler-wide assertion overrides merged on top of
+    /// `Assert::default_checks()` and below each per-entry `assert`.
     pub assert: crate::assert::Assert,
     /// Cgroup parent path. When set, the init creates
     /// `/sys/fs/cgroup/{path}` before starting the scheduler, and
@@ -262,6 +316,11 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Placeholder scheduler representing "no scx scheduler." Tests
+    /// that use `Scheduler::EEVDF` run under the kernel's default
+    /// scheduler (EEVDF on current kernels), with no scheduler binary
+    /// launched. Useful as a baseline and for tests that exercise
+    /// framework behavior independent of any scx scheduler.
     pub const EEVDF: Scheduler = Scheduler {
         name: "eevdf",
         binary: SchedulerSpec::None,
@@ -429,8 +488,11 @@ impl Scheduler {
 
     /// Generate flag profiles scoped to this scheduler's supported flags.
     ///
-    /// Uses `FlagDecl::requires` for dependency constraints instead of
-    /// the module-level `flag_requires()` hardcoded table.
+    /// Dependency constraints come from each flag's `FlagDecl::requires`
+    /// list: the result contains every valid combination of the
+    /// scheduler's flags that honours those `requires` edges while also
+    /// including the caller-supplied `required` flags and excluding
+    /// `excluded` flags.
     pub fn generate_profiles(
         &self,
         required: &[&'static str],
@@ -508,6 +570,12 @@ pub struct TopologyConstraints {
 }
 
 impl TopologyConstraints {
+    /// Conservative default constraints: single NUMA node, 1-12 LLCs,
+    /// no SMT requirement, 1-192 CPUs. Accepts the common single-node
+    /// gauntlet presets ktstr ships while rejecting the multi-NUMA
+    /// presets (numa2-*, numa4-*) and any exotic topologies tests
+    /// rarely exercise by default. Test authors that want multi-NUMA
+    /// coverage must raise `max_numa_nodes` explicitly.
     pub const DEFAULT: TopologyConstraints = TopologyConstraints {
         min_numa_nodes: 1,
         max_numa_nodes: Some(1),
@@ -544,15 +612,32 @@ impl TopologyConstraints {
 
 /// Registration entry for an `#[ktstr_test]`-annotated function.
 pub struct KtstrTestEntry {
+    /// Fully qualified test name as it appears in nextest output.
     pub name: &'static str,
+    /// Entry point invoked once per replica, inside the guest VM when
+    /// `host_only` is false and on the host when it is true.
     pub func: fn(&Ctx) -> Result<AssertResult>,
+    /// Base virtual topology; gauntlet expansion produces additional
+    /// variants layered on top of this baseline.
     pub topology: Topology,
+    /// Host-topology constraints (CPU and LLC bounds) that gate
+    /// whether this entry is eligible on the current machine.
     pub constraints: TopologyConstraints,
+    /// Guest memory in MB.
     pub memory_mb: u32,
+    /// Scheduler definition to load inside the guest. Defaults to
+    /// `Scheduler::EEVDF` (no scx scheduler).
     pub scheduler: &'static Scheduler,
+    /// When true, a crash triggers an auto-repro run with BPF probes
+    /// attached to the crash call chain.
     pub auto_repro: bool,
+    /// Number of times the scenario is replicated within a single
+    /// test invocation.
     pub replicas: u32,
+    /// Per-entry assertion overrides merged on top of
+    /// `Assert::default_checks()` and the scheduler's `assert`.
     pub assert: crate::assert::Assert,
+    /// Extra CLI arguments appended to the scheduler invocation.
     pub extra_sched_args: &'static [&'static str],
     /// `scx_sched.watchdog_timeout` override applied to the guest kernel.
     pub watchdog_timeout: Duration,
@@ -600,13 +685,16 @@ fn default_test_func(_ctx: &Ctx) -> Result<AssertResult> {
 
 impl KtstrTestEntry {
     /// Sensible defaults for all fields. Override `name`, `func`, and
-    /// `scheduler` (at minimum) via struct update syntax:
+    /// `scheduler` (at minimum) via struct update syntax. Manual
+    /// consumers should also set `auto_repro` explicitly: the default
+    /// `true` boots a second VM with BPF probes attached on failure,
+    /// which roughly doubles a failing test's wall-clock time.
     ///
     /// ```ignore
     /// static ENTRY: KtstrTestEntry = KtstrTestEntry {
     ///     name: "my_test",
     ///     func: my_test_fn,
-    ///     scheduler: &MITOSIS,
+    ///     scheduler: &Scheduler::EEVDF,
     ///     ..KtstrTestEntry::DEFAULT
     /// };
     /// ```
@@ -2485,8 +2573,9 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
 
 /// Guest-side dispatch: check for `--ktstr-test-fn=NAME` in args, run the
 /// registered function, write the result to SHM and stdout (COM2),
-/// and exit. Profraw flush is handled by `try_flush_profraw()` in the
-/// ctor before `std::process::exit()`.
+/// and exit. Profraw data is flushed via `try_flush_profraw()`
+/// inline on both the success and failure paths before
+/// `std::process::exit()` is invoked.
 ///
 /// Called from `ktstr_test_early_dispatch()` (ctor) before `main()`, or
 /// from `ktstr_guest_init()` when running as PID 1.

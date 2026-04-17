@@ -8,6 +8,7 @@ without hand-written `Action::Custom` functions.
 ```rust,ignore
 use ktstr::prelude::*;
 
+#[ktstr_test(llcs = 2, cores = 4, threads = 1)]
 fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         // Phase 1: two disjoint cgroups, hold for half the duration
@@ -34,6 +35,10 @@ fn my_resize_scenario(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 ```
+
+Call this function directly from a `#[ktstr_test]` body — no
+registration is required for tests living in a consumer's `tests/`
+directory.
 
 ## Registering (ktstr contributors only)
 

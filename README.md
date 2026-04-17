@@ -16,7 +16,7 @@ scheduling correctness. Also tests under the kernel's default EEVDF
 scheduler.
 
 - **Clean slate** -- each test boots its own kernel in KVM. Fresh state each run.
-- **Topology as code** -- `topology(1, 2, 4, 2)` gives you 1 NUMA node, 2 LLCs, 4 cores, 2 threads with real NUMA domains when ur hw can support it. x86_64 and aarch64.
+- **Topology as code** -- `topology(1, 2, 4, 2)` gives you 1 NUMA node, 2 LLCs, 4 cores, 2 threads with real NUMA domains when the host hardware supports them. x86_64 and aarch64.
 - **Data-driven** -- scenarios declare cgroups, cpusets, workloads, and verification as data.
 - **Gauntlet** -- one `#[ktstr_test]`, hundreds of topology x flag variants. Budget-aware CI selection and baseline A/B comparison.
 - **Host-side introspection** -- read/write kernel state and BPF maps from host memory. No guest instrumentation.
@@ -39,11 +39,13 @@ by the workspace and does not need a separate install.
 
 ## Setup
 
-**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang, pkg-config.
+**Prerequisites:** Linux with `/dev/kvm`, Rust >= 1.88, clang,
+pkg-config, plus autotools and make for the vendored libbpf/libelf/zlib
+builds pulled in via `libbpf-sys`'s `vendored` feature.
 
 ```sh
 # Ubuntu/Debian
-sudo apt install clang pkg-config
+sudo apt install clang pkg-config make autoconf autopoint flex bison gawk
 ```
 
 **Add to your crate**:
@@ -52,6 +54,10 @@ sudo apt install clang pkg-config
 [dev-dependencies]
 ktstr = { version = "0.4" }
 ```
+
+The `anyhow::Result` referenced in examples below is re-exported
+through `ktstr::prelude`; consumers do not need a separate `anyhow`
+dev-dependency for the shown code to compile.
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
 
@@ -71,16 +77,19 @@ use ktstr::prelude::*;
 #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(1, 2, 4, 1))]
 #[allow(dead_code)]
 enum MySchedFlag {
-    #[flag(args = ["--enable-feature-a"])]
-    FeatureA,
-    #[flag(args = ["--enable-feature-b"], requires = [FeatureA])]
-    FeatureB,
+    #[flag(args = ["--enable-llc"])]
+    Llc,
+    #[flag(args = ["--enable-stealing"], requires = [Llc])]
+    Steal,
 }
 ```
 
 This generates a `const MY_SCHED: Scheduler` and per-variant flag
 constants. Tests referencing `MY_SCHED` inherit its topology and
-flags. Without a scheduler, tests run under EEVDF.
+flags. Without a scheduler, tests run under EEVDF. The topology
+macro argument requires `llcs` to be an exact multiple of
+`numa_nodes`; `topology(1, 2, 4, 1)` (2 LLCs, 1 NUMA node) is fine,
+`topology(2, 3, ...)` is rejected at compile time.
 
 ### Write a test
 
@@ -128,27 +137,50 @@ Requires `/dev/kvm`.
 
 ### Dev workflow
 
-`cargo ktstr` handles kernel config, build, and test execution:
+The frictionless loop is to build a cached kernel once and then run
+tests against the cache:
 
 ```sh
-cargo ktstr test --kernel ~/linux                          # build kernel + run all tests
-cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # pass nextest filter
+cargo ktstr kernel build                                   # latest stable into XDG cache
+cargo nextest run                                          # tests find the cached kernel
+```
+
+`cargo ktstr` wraps the full workflow and has subcommands beyond
+`test`:
+
+```sh
+cargo ktstr test                                           # build/resolve kernel + run tests
+cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # local source tree + nextest filter
+cargo ktstr coverage                                       # tests under llvm-cov
+cargo ktstr kernel build 6.14.2                            # cache a specific version
+cargo ktstr kernel build --source ~/linux                  # build from local source tree
+cargo ktstr kernel build --git URL --ref v6.14             # shallow-clone a git tree
+cargo ktstr kernel list                                    # list cached kernels (shows (EOL) tags)
+cargo ktstr kernel clean --keep 3                          # keep 3 most recent
+cargo ktstr verifier --scheduler scx_my_sched              # BPF verifier stats
+cargo ktstr test-stats                                     # aggregate gauntlet sidecars
+cargo ktstr shell --kernel 6.14.2                          # interactive VM shell
+cargo ktstr completions bash                               # shell completions
 ```
 
 ### Host-side CLI
 
 `ktstr` runs scenarios on the host (outside VMs) under whatever
-scheduler is already active, and manages cached kernel images:
+scheduler is already active, and manages cached kernel images. Every
+`ktstr kernel ...` subcommand is identical to the corresponding
+`cargo ktstr kernel ...`.
 
 ```sh
-ktstr list
-ktstr run
-ktstr topo
-ktstr cleanup
-ktstr shell --kernel 6.14.2
-ktstr kernel list
+ktstr list                                                 # list available scenarios
+ktstr run                                                  # run all scenarios on the host
+ktstr topo                                                 # show host CPU topology
+ktstr cleanup                                              # remove leftover cgroups
+ktstr shell --kernel 6.14.2                                # interactive VM shell (kernel optional)
+ktstr kernel list                                          # manage cached kernels
 ktstr kernel build 6.14.2
-ktstr kernel clean
+ktstr kernel build --source ../linux
+ktstr kernel build --git URL --ref v6.14
+ktstr kernel clean --keep 3
 ktstr completions bash
 ```
 

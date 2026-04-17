@@ -1,8 +1,8 @@
 # cargo-ktstr
 
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
-workflow. Subcommands: `test`, `coverage`, `kernel`, `verifier`,
-`shell`, `completions`, `test-stats`.
+workflow. Subcommands in `--help` order: `test`, `coverage`,
+`test-stats`, `kernel`, `verifier`, `completions`, `shell`.
 
 ## test
 
@@ -97,11 +97,14 @@ cargo ktstr kernel list --json       # JSON output for CI scripting
 
 Human-readable output shows key, version, source type, arch, and
 build timestamp. Entries built with a different `ktstr.kconfig` are
-marked `(stale kconfig)`.
+marked `(stale kconfig)`. Entries whose major.minor version is no
+longer in kernel.org's active releases list are marked `(EOL)`;
+prefix lookups for EOL series fall back to probing cdn.kernel.org
+for the latest patch release.
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Output in JSON format. Includes all metadata fields. |
+| `--json` | Output in JSON format. Each entry includes a boolean `eol` field (computed at list time by fetching kernel.org's `releases.json`) alongside the cached metadata. |
 
 ### kernel build
 
@@ -118,11 +121,13 @@ cargo ktstr kernel build --git URL --ref v6.14         # git clone (shallow, dep
 cargo ktstr kernel build --force 6.14.2                # rebuild even if cached
 ```
 
-When no version or source is given, fetches the latest stable version
-from kernel.org's `releases.json`. A major.minor prefix (e.g. `6.12`)
-resolves to the highest patch release in that series. For EOL series
-no longer in `releases.json`, probes cdn.kernel.org to find the latest
-available tarball. Skips building when a cached entry already exists
+When no version or source is given, fetches the latest stable
+series that has had at least 8 maintenance releases — keeping CI
+off brand-new majors whose early builds are more likely to break —
+from kernel.org's `releases.json`. A major.minor prefix (e.g.
+`6.12`) resolves to the highest patch release in that series. For
+EOL series no longer in `releases.json`, probes cdn.kernel.org to
+find the latest available tarball. Skips building when a cached entry already exists
 (use `--force` to override). Stale entries (built with a different
 `ktstr.kconfig`) are rebuilt automatically. For `--source`, generates
 `compile_commands.json` for LSP support. Dirty local trees
@@ -190,9 +195,11 @@ output format.
 
 ## shell
 
-Identical to the standalone `ktstr shell` -- see
-[ktstr shell](ktstr.md#shell) for full documentation and flag
-reference.
+Shares the VM boot flow with `ktstr shell` and accepts the same
+flags. See [ktstr shell](ktstr.md#shell) for the full flag
+reference and the two behavior differences (`--kernel` accepting
+raw image files, and the no-discoverable-kernel error path instead
+of an auto-download fallback) called out there.
 
 ```sh
 cargo ktstr shell
@@ -255,7 +262,9 @@ Set `KTSTR_SIDECAR_DIR` to override the default sidecar directory.
 
 ## Deprecated: build-kernel
 
-`cargo ktstr build-kernel` is deprecated. Use `cargo ktstr kernel build --source` instead:
+**DEPRECATED** -- `cargo ktstr build-kernel` is hidden from `--help`
+and retained only for backward compatibility. Use
+`cargo ktstr kernel build --source` instead:
 
 ```sh
 # Old (deprecated):

@@ -1,3 +1,14 @@
+//! Probe event formatting: turn captured [`ProbeEvent`]s into the
+//! human-readable report surfaced through auto-repro output.
+//!
+//! Entry points are [`format_probe_events`] and its BPF-aware
+//! variant [`format_probe_events_with_bpf_locs`]; everything else
+//! here is private formatting helpers plus the field-key decoder
+//! glue that connects BTF types in [`super::btf`] to the typed
+//! value decoders in [`super::decode`].
+//!
+//! [`ProbeEvent`]: super::process::ProbeEvent
+
 use super::decode::{decode_named_value, decode_named_value_hinted, format_raw_arg};
 
 /// Read nr_cpu_ids from sysfs. Returns the number of possible CPUs
@@ -65,6 +76,8 @@ fn format_cpumask_display(cpumask_words: &[u64; 4], nr_cpus: Option<u32>) -> Str
     }
 }
 
+/// Extract the substring between `start` and `end` sentinels, or
+/// return an empty string when either sentinel is missing.
 // Used by test_support.rs; #[allow] suppresses false positive from binary crate.
 #[allow(dead_code)]
 pub(crate) fn extract_section(text: &str, start: &str, end: &str) -> String {
@@ -111,6 +124,10 @@ fn resolve_addrs_from_elf(
     result
 }
 
+/// Strip host-specific prefixes so the path begins at a
+/// kernel-tree-relative directory (e.g. `kernel/sched/core.c`),
+/// yielding stable source-location strings that do not leak host
+/// build paths.
 pub(crate) fn make_relative(path: &str) -> String {
     for marker in [
         "/kernel/",
@@ -142,8 +159,8 @@ pub(crate) fn make_relative(path: &str) -> String {
 /// Groups fields by parameter, emits type headers for struct pointer
 /// params (e.g. `task_struct *p`), coalesces cpumask_0..3 into a
 /// single `cpus_ptr` line, deduplicates scalar params that duplicate
-/// struct fields, and appends the trigger's kernel stack trace with
-/// blazesym-resolved source locations.
+/// struct fields, and annotates each function header with its
+/// blazesym-resolved source location.
 ///
 /// When `kernel_dir` is set and contains a vmlinux, resolves source
 /// locations from DWARF via ELF symbol table addresses (not host

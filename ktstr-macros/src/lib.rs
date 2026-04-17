@@ -28,20 +28,27 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 /// 3. Emits a `#[test]` wrapper that boots a VM and runs the function
 ///    inside it.
 ///
-/// Optional attributes (all with defaults):
+/// Every key=value attribute is optional. The accepted attributes and
+/// their defaults are the fields of
+/// [`ktstr::test_support::KtstrTestEntry`] (runtime metadata) and
+/// [`ktstr::assert::Assert`] (verification thresholds). A few are
+/// worth calling out because their names differ from the underlying
+/// field or because they have nontrivial defaults:
+///
 ///   - `llcs = N` / `sockets = N` (default: inherited from scheduler, or 1)
 ///   - `cores = N` (default: inherited from scheduler, or 2)
 ///   - `threads = N` (default: inherited from scheduler, or 1)
 ///   - `numa_nodes = N` (default: inherited from scheduler, or 1)
 ///   - `memory_mb = N` (default: 2048)
-///   - `performance_mode = bool` (default: false) -- vCPU pinning, hugepages
-///   - `duration_s = N`, `workers_per_cgroup = N` -- workload overrides
-///   - `scheduler = PATH` -- scheduler constant reference
-///   - `max_gap_ms`, `max_spread_pct`, `max_imbalance_ratio` -- assertion thresholds
-///   - `max_p99_wake_latency_ns`, `max_wake_latency_cv`, `min_iteration_rate` -- benchmarking
-///   - `required_flags`, `excluded_flags` -- flag profile filtering
-///   - `max_llcs = N`, `max_numa_nodes = N`, `max_cpus = N` -- upper bound constraints
-///   - See KtstrTestEntry and Assert for the full field list.
+///   - `duration_s = N` — maps onto `KtstrTestEntry::duration`
+///   - `watchdog_timeout_s = N` — maps onto `KtstrTestEntry::watchdog_timeout`
+///   - `scheduler = PATH` — path to a `const Scheduler` (default
+///     `Scheduler::EEVDF`, which runs without an scx scheduler)
+///   - `auto_repro = bool` (default: `true`)
+///
+/// Fields that only exist on manually constructed `KtstrTestEntry`
+/// literals (e.g. `host_only`) are NOT accepted by this macro and
+/// will error as unknown attributes.
 #[proc_macro_attribute]
 pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);

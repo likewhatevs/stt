@@ -1,3 +1,19 @@
+//! Virtual machine monitor for booting Linux kernels in KVM to host
+//! scheduler test scenarios.
+//!
+//! The entry point is [`KtstrVm::builder()`], which returns a
+//! [`KtstrVmBuilder`] for configuring the kernel, init binary,
+//! virtual topology, memory, host-side performance options, and
+//! monitor thresholds. Calling `.build()?.run()?` on the result
+//! boots the guest and returns a [`VmResult`] containing exit state,
+//! captured console, monitor samples, and drained SHM ring data.
+//!
+//! See the [VMM architecture
+//! page](https://likewhatevs.github.io/ktstr/guide/architecture/vmm.html)
+//! for the boot flow and the [Performance Mode
+//! page](https://likewhatevs.github.io/ktstr/guide/concepts/performance-mode.html)
+//! for the isolation options the builder exposes.
+
 pub mod console;
 pub mod host_topology;
 pub mod initramfs;
@@ -988,12 +1004,24 @@ fn set_rt_priority(priority: i32, label: &str) {
 /// Result of a VM execution.
 #[derive(Debug)]
 pub struct VmResult {
+    /// Overall success flag: `true` when the test reported a pass AND
+    /// the VM exited cleanly without crash, timeout, or watchdog.
     pub success: bool,
+    /// Guest exit code as surfaced through the SHM ring
+    /// (`MSG_TYPE_EXIT`) or COM2 sentinel.
     pub exit_code: i32,
+    /// Wall-clock duration of the VM run.
     pub duration: Duration,
+    /// True when the host hit its watchdog before the guest exited.
     pub timed_out: bool,
+    /// Captured guest stdout (and any non-dmesg serial console content).
     pub output: String,
+    /// Captured guest stderr (separated from `output` when the guest
+    /// reported them distinctly).
     pub stderr: String,
+    /// Host-side monitor report: sampled per-CPU state, stall
+    /// verdicts, and SCX event deltas. `None` when the monitor did
+    /// not run (host-only tests, early VM failure).
     pub monitor: Option<monitor::MonitorReport>,
     /// Data drained from the SHM ring buffer after VM exit.
     pub shm_data: Option<shm_ring::ShmDrainResult>,
@@ -1016,7 +1044,11 @@ pub struct KvmStatsTotals {
     pub per_vcpu: Vec<HashMap<String, u64>>,
 }
 
-/// Trust-relevant stats for scheduler testing.
+/// KVM stat names surfaced in sidecar output for scheduler testing.
+///
+/// Covers VM exit rate, halt-polling behavior, preemption notifications,
+/// signal-driven exits, and hypercall counts; all fields scheduler
+/// authors typically correlate with scx decisions.
 pub const KVM_INTERESTING_STATS: &[&str] = &[
     "exits",
     "halt_exits",
@@ -3771,6 +3803,14 @@ pub(crate) fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
 // Builder
 // ---------------------------------------------------------------------------
 
+/// Builder for [`KtstrVm`].
+///
+/// Obtain via [`KtstrVm::builder()`], configure with the chained
+/// setters below, then call [`build`](Self::build) to validate the
+/// configuration and materialise a `KtstrVm`. Required inputs are a
+/// `kernel` source directory or image, an `init_binary`, and either
+/// a `run_args` payload (for test runs) or an `exec_cmd` / shell
+/// configuration (for `ktstr shell`). Everything else is optional.
 pub struct KtstrVmBuilder {
     kernel: Option<PathBuf>,
     init_binary: Option<PathBuf>,
@@ -3829,32 +3869,43 @@ impl Default for KtstrVmBuilder {
 }
 
 impl KtstrVmBuilder {
+    /// Path to the guest kernel: either a source directory (the VMM
+    /// extracts `arch/*/boot/{bzImage,Image}`) or a prebuilt image.
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
         self.kernel = Some(path.into());
         self
     }
 
+    /// Path to the userspace init binary run as PID 1 inside the
+    /// guest (typically the current test binary).
     pub fn init_binary(mut self, path: impl Into<PathBuf>) -> Self {
         self.init_binary = Some(path.into());
         self
     }
 
+    /// Path to an optional scheduler binary loaded alongside the
+    /// init binary; the init spawns it before dispatching the test.
     pub fn scheduler_binary(mut self, path: impl Into<PathBuf>) -> Self {
         self.scheduler_binary = Some(path.into());
         self
     }
 
+    /// CLI argv passed to the init binary inside the guest (typically
+    /// the per-test dispatch string like `--ktstr-test-fn NAME`).
     pub fn run_args(mut self, args: &[String]) -> Self {
         self.run_args = args.to_vec();
         self
     }
 
+    /// Extra CLI arguments appended to the scheduler binary invocation.
     #[allow(dead_code)]
     pub fn sched_args(mut self, args: &[String]) -> Self {
         self.sched_args = args.to_vec();
         self
     }
 
+    /// Resolve the kernel image from a source-tree root (sets
+    /// `kernel` to `arch/<arch>/boot/<image>`).
     #[allow(dead_code)]
     pub fn kernel_dir(mut self, path: impl Into<PathBuf>) -> Self {
         let dir: PathBuf = path.into();
@@ -3869,6 +3920,8 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Set the virtual CPU topology (big-to-little:
+    /// `numa_nodes, llcs, cores_per_llc, threads_per_core`).
     pub fn topology(mut self, numa_nodes: u32, llcs: u32, cores: u32, threads: u32) -> Self {
         self.topology = Topology {
             llcs,
@@ -3879,6 +3932,9 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Pin guest memory to an explicit MB value and clear the
+    /// deferred-sizing hint. Use `memory_deferred` when the payload
+    /// size should drive the allocation.
     pub fn memory_mb(mut self, mb: u32) -> Self {
         self.memory_mb = Some(mb);
         self.memory_min_mb = 0;
@@ -3905,35 +3961,54 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Append extra tokens to the guest kernel command line. Useful
+    /// for one-off debug knobs (e.g. enabling extra subsystem
+    /// verbosity) that shouldn't live in `ktstr.kconfig`.
     #[allow(dead_code)]
     pub fn cmdline(mut self, extra: &str) -> Self {
         self.cmdline_extra = extra.to_string();
         self
     }
 
+    /// Host-side watchdog timeout. The VM is killed if it has not
+    /// exited on its own within this duration; the `VmResult`
+    /// returned will have `timed_out = true`.
     pub fn timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self
     }
 
+    /// Size the guest-to-host SHM ring in bytes. `0` lets the builder
+    /// derive a sensible default from the guest payload.
     #[allow(dead_code)]
     pub fn shm_size(mut self, bytes: u64) -> Self {
         self.shm_size = bytes;
         self
     }
 
+    /// Override the `MonitorThresholds` used for stall detection and
+    /// verdict rendering. Defaults to `MonitorThresholds::DEFAULT`.
     #[allow(dead_code)]
     pub fn monitor_thresholds(mut self, thresholds: crate::monitor::MonitorThresholds) -> Self {
         self.monitor_thresholds = Some(thresholds);
         self
     }
 
+    /// Override the guest scx watchdog timeout. Applied via
+    /// `scx_sched.watchdog_timeout` (7.1+) or the static
+    /// `scx_watchdog_timeout` symbol (6.16-7.0); silently no-ops on
+    /// kernels where neither path is available.
     #[allow(dead_code)]
     pub fn watchdog_timeout(mut self, timeout: Duration) -> Self {
         self.watchdog_timeout = Some(timeout);
         self
     }
 
+    /// Schedule a host-side write into a named BPF map after the
+    /// scheduler is loaded. `map_name_suffix` is matched against
+    /// `bpf_map.name` (kernel truncates to 15 chars); `offset` is
+    /// the byte offset within the array-map value region; `value`
+    /// is a `u32` written in native byte order.
     #[allow(dead_code)]
     pub fn bpf_map_write(mut self, map_name_suffix: &str, offset: usize, value: u32) -> Self {
         self.bpf_map_write = Some(BpfMapWriteParams {
@@ -3962,11 +4037,17 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Shell commands run inside the guest before the scenario to
+    /// switch on a kernel-builtin scheduler (mirrors
+    /// `SchedulerSpec::KernelBuiltin::enable`).
     pub fn sched_enable_cmds(mut self, cmds: &[&str]) -> Self {
         self.sched_enable_cmds = cmds.iter().map(|s| s.to_string()).collect();
         self
     }
 
+    /// Shell commands run inside the guest after the scenario to
+    /// revert a kernel-builtin scheduler change (mirrors
+    /// `SchedulerSpec::KernelBuiltin::disable`).
     pub fn sched_disable_cmds(mut self, cmds: &[&str]) -> Self {
         self.sched_disable_cmds = cmds.iter().map(|s| s.to_string()).collect();
         self
@@ -3987,17 +4068,30 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Stream the guest kernel console (COM1/dmesg) to stderr in
+    /// real time. Also bumps `loglevel=7` for verbose kernel output.
     pub fn dmesg(mut self, enabled: bool) -> Self {
         self.dmesg = enabled;
         self
     }
 
+    /// Run a single command inside the guest instead of an
+    /// interactive shell; the VM exits when the command completes.
+    /// Requires `busybox(true)` and is typically paired with
+    /// `KtstrVm::new_shell`.
     #[allow(dead_code)]
     pub fn exec_cmd(mut self, cmd: String) -> Self {
         self.exec_cmd = Some(cmd);
         self
     }
 
+    /// Validate the builder configuration and materialise a [`KtstrVm`].
+    ///
+    /// Returns `Err` for missing required inputs (kernel, init binary),
+    /// invalid topology, or host resources insufficient to satisfy
+    /// `performance_mode` requirements (the last surfaces as
+    /// `ResourceContention`, which callers typically treat as a
+    /// skip rather than a failure).
     pub fn build(mut self) -> Result<KtstrVm> {
         let (pinning_plan, mbind_nodes, cpu_locks) = if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;

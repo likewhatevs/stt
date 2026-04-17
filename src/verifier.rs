@@ -16,15 +16,23 @@ use std::collections::HashMap;
 /// Parsed verifier stats from the kernel log line:
 /// `processed N insns (limit M) max_states_per_insn X total_states Y peak_states Z mark_read W`
 pub struct VerifierStats {
+    /// Instructions processed during verification.
     pub processed_insns: u64,
+    /// Total explored verifier states.
     pub total_states: u64,
+    /// Peak concurrent explored states.
     pub peak_states: u64,
+    /// Total verification wall time in microseconds, when
+    /// BPF_LOG_STATS emitted a "verification time" line.
     pub time_usec: Option<u64>,
+    /// Stack depth in the format "<prog>+<subprog>+<main>" (e.g.
+    /// `"32+16+8"`) when BPF_LOG_STATS emitted a "stack depth" line.
     pub stack_depth: Option<String>,
 }
 
 /// Per-program verifier statistics collected from a VM run.
 pub struct ProgStats {
+    /// Program name as registered with the kernel.
     pub name: String,
     /// Instructions processed by the verifier (from host-side
     /// `bpf_prog_aux->verified_insns`).
@@ -33,9 +41,14 @@ pub struct ProgStats {
 
 /// A single row in the A/B diff output.
 pub struct DiffRow {
+    /// Program name present in both A and B runs.
     pub name: String,
+    /// `verified_insns` from the A run.
     pub a: u64,
+    /// `verified_insns` from the B run.
     pub b: u64,
+    /// Signed delta (`b - a`); positive means B's verifier cost grew
+    /// relative to A.
     pub delta: i64,
 }
 

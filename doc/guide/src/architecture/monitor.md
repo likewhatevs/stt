@@ -152,7 +152,10 @@ Map discovery walks the kernel's `map_idr` xarray:
 
 1. Read `map_idr` (BSS symbol, text mapping translation)
 2. Walk xa_node tree (SLAB-allocated, direct mapping translation)
-3. Read `struct bpf_map` fields (vmalloc'd, page table walk)
+3. Read `struct bpf_map` fields. The allocation may be kmalloc'd or
+   vmalloc'd depending on size and flags, so the translation uses
+   `translate_any_kva` which handles both paths rather than assuming
+   either.
 
 `find_map` searches by **name suffix** (e.g. `".bss"` matches
 `"mitosis.bss"`). Only `BPF_MAP_TYPE_ARRAY` maps are returned.

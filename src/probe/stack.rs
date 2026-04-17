@@ -56,7 +56,10 @@ pub fn should_skip_probe(name: &str) -> bool {
 
 /// Maps sched_ext BPF op name fragments to (kernel_caller, task_arg_idx).
 /// When a BPF function name contains the op fragment, its kernel-side
-/// caller is probed instead. The task_struct pointer is at arg{task_arg_idx}.
+/// caller is probed in addition to the BPF function itself (see
+/// `expand_bpf_to_kernel_callers`, which keeps the BPF function for
+/// fentry attachment and adds the kernel caller for a bridge kprobe).
+/// The task_struct pointer is at arg{task_arg_idx}.
 pub(super) const BPF_OP_CALLERS: &[(&str, &str, u32)] = &[
     ("select_cpu", "do_enqueue_task", 1),
     ("enqueue", "do_enqueue_task", 1),
@@ -113,14 +116,24 @@ pub fn expand_bpf_to_kernel_callers(functions: Vec<StackFunction>) -> Vec<StackF
 
 /// A function to probe, from a crash stack or BPF program discovery.
 ///
-/// `raw_name` is the symbol as it appears in kallsyms (e.g.
-/// `bpf_prog_9_mitosis_enqueue` for BPF). `display_name` is the
-/// short name used in output (e.g. `mitosis_enqueue`).
+/// For kernel functions, `raw_name` is the symbol as it appears in
+/// kallsyms. For BPF programs discovered through `bpf_prog_info`,
+/// `raw_name` is synthesized as `bpf_prog_{prog_id}_{name}`: this
+/// uses the integer `prog_id` (not the hex hash that appears in
+/// real kallsyms entries like `bpf_prog_d62ea951ad3da50b_name`) as
+/// the internal bookkeeping key. `display_name` is the short name
+/// used in output (e.g. `mitosis_enqueue`).
 #[derive(Debug, Clone)]
 pub struct StackFunction {
+    /// Symbol name as it appears in kallsyms.
     pub raw_name: String,
+    /// Short user-facing name used in probe output.
     pub display_name: String,
+    /// True when the symbol identifies a BPF program (as opposed to
+    /// a kernel function).
     pub is_bpf: bool,
+    /// BPF program ID when `is_bpf` is true; `None` for kernel
+    /// functions.
     pub bpf_prog_id: Option<u32>,
 }
 

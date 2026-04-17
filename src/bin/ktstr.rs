@@ -12,7 +12,9 @@ use ktstr::topology::TestTopology;
 #[derive(Parser)]
 #[command(
     name = "ktstr",
-    about = "Run ktstr scheduler test scenarios on the host"
+    about = "Run ktstr scheduler test scenarios on the host",
+    after_help = "See also: `cargo ktstr` for cargo-integrated workflows \
+                  (test, coverage, verifier, test-stats)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -52,7 +54,10 @@ enum Command {
         #[arg(long)]
         probe_stack: Option<String>,
 
-        /// Enable auto-repro on crash.
+        /// On scheduler crash, rerun the scenario in a second VM with
+        /// BPF probes attached on the crash call chain. Requires a
+        /// kernel with the `sched_ext_exit` tracepoint; falls back to
+        /// dynamic stack discovery when no --probe-stack is supplied.
         #[arg(long)]
         auto_repro: bool,
 
@@ -60,7 +65,7 @@ enum Command {
         #[arg(long)]
         kernel_dir: Option<String>,
 
-        /// Override work type for all cgroups.
+        /// Override work type for all cgroups. Case-sensitive.
         /// Valid: CpuSpin, YieldHeavy, Mixed, IoSync, Bursty, PipeIo,
         /// FutexPingPong, CachePressure, CacheYield, CachePipe, FutexFanOut.
         #[arg(long)]
@@ -72,7 +77,7 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
 
-        /// Output as JSON.
+        /// Output in JSON format for CI scripting.
         #[arg(long)]
         json: bool,
     },
@@ -97,17 +102,17 @@ enum Command {
     /// structure. Dynamically-linked ELF binaries get automatic shared
     /// library resolution via ELF DT_NEEDED parsing.
     Shell {
-        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (see `ktstr kernel list`).
-        /// When absent, resolves automatically via cache then filesystem.
+        /// Kernel identifier: a source directory path (e.g. `../linux`),
+        /// a version (`6.14.2`), or a cache key (see `ktstr kernel list`).
+        /// Raw image files are rejected. When absent, resolves via cache
+        /// then filesystem and falls back to downloading the latest
+        /// stable kernel from kernel.org and building it into the cache.
         #[arg(long)]
         kernel: Option<String>,
-        /// Virtual topology as "numa_nodes,llcs,cores,threads" (default: "1,1,1,1").
+        /// Virtual topology as "numa_nodes,llcs,cores,threads".
         #[arg(long, default_value = "1,1,1,1")]
         topology: String,
-        /// Files or directories to include in the guest at /include-files/<name>.
-        /// Directories are walked recursively, preserving structure.
-        /// Dynamically-linked ELF binaries get shared library resolution.
+        /// Files or directories to include in the guest. Repeatable.
         #[arg(short = 'i', long = "include-files", action = ArgAction::Append)]
         include_files: Vec<PathBuf>,
         /// Guest memory in MB (minimum 128). When absent, estimated
@@ -134,22 +139,28 @@ enum Command {
 enum KernelCommand {
     /// List cached kernel images.
     List {
-        /// Output in JSON format for CI scripting.
+        /// Output in JSON format for CI scripting. Each entry includes
+        /// a computed `eol` boolean derived by fetching kernel.org's
+        /// `releases.json`; this requires network access on the host.
         #[arg(long)]
         json: bool,
     },
     /// Download, build, and cache a kernel image.
     Build {
-        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3).
+        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3). A
+        /// major.minor prefix (e.g. 6.12) resolves to the highest
+        /// patch release in that series, falling back to probing
+        /// cdn.kernel.org for EOL series no longer in releases.json.
         #[arg(conflicts_with_all = ["source", "git"])]
         version: Option<String>,
         /// Path to existing kernel source directory.
         #[arg(long, conflicts_with_all = ["version", "git"])]
         source: Option<PathBuf>,
-        /// Git URL to clone kernel source from.
+        /// Git URL to clone kernel source from. Cloned shallow (depth 1)
+        /// at the ref supplied via --ref.
         #[arg(long, requires = "git_ref", conflicts_with_all = ["version", "source"])]
         git: Option<String>,
-        /// Git ref to checkout (branch, tag, commit).
+        /// Git ref to checkout (branch, tag, commit). Required with --git.
         #[arg(long = "ref", requires = "git")]
         git_ref: Option<String>,
         /// Rebuild even if a cached image exists.
@@ -161,10 +172,12 @@ enum KernelCommand {
     },
     /// Remove cached kernel images.
     Clean {
-        /// Keep the N most recent cached kernels.
+        /// Keep the N most recent cached kernels. When absent, removes
+        /// all cached entries (subject to the confirmation prompt
+        /// unless --force is also set).
         #[arg(long)]
         keep: Option<usize>,
-        /// Skip confirmation prompt.
+        /// Skip confirmation prompt. Required in non-interactive contexts.
         #[arg(long)]
         force: bool,
     },

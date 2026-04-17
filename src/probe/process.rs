@@ -89,12 +89,24 @@ pub struct ProbeDiagnostics {
 /// `task_struct` pointer before output.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProbeEvent {
+    /// Index into the run's function list (matches the slot used in
+    /// the shared `func_meta_map`).
     pub func_idx: u32,
+    /// `task_struct` pointer for the thread that triggered the probe;
+    /// used to stitch entry/exit pairs.
     pub task_ptr: u64,
+    /// Nanosecond timestamp captured at entry.
     pub ts: u64,
+    /// First six callee arguments captured verbatim from the call
+    /// site (after convention lowering).
     pub args: [u64; 6],
-    pub fields: Vec<(String, u64)>, // (field_key, value) — decoded by caller
+    /// BTF-resolved struct field values decoded post-hoc by the
+    /// caller; each entry is `(field_key, raw_value)`.
+    pub fields: Vec<(String, u64)>,
+    /// Kernel stack trace captured at entry, most recent frame first.
     pub kstack: Vec<u64>,
+    /// Optional UTF-8 string associated with the event (e.g. a
+    /// scheduler-provided exit reason).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub str_val: Option<String>,
     /// Post-mutation field values captured by fexit.
@@ -155,7 +167,7 @@ fn populate_field_specs(meta: &mut types::func_meta, field_specs: &[super::btf::
 ///
 /// Returns a vec mapping `field_idx` to an output key name. Format:
 /// - Known struct param: `"p:task_struct.pid"`
-/// - Auto-discovered BPF struct: `"ctx:task_ctx*.field_a"`
+/// - Auto-discovered BPF struct: `"ctx:task_ctx.field_a"`
 /// - Scalar param: `"flags:val.flags"`
 ///
 /// Processes at most 6 params (fentry/kprobe register limit) and

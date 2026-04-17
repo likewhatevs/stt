@@ -9,6 +9,15 @@ ktstr is a test framework for Linux process schedulers.
 See [Overview](overview.md) for a quick introduction with code
 examples.
 
+## Supported kernels
+
+ktstr's runtime dispatches to per-kernel-version fallback paths for
+the watchdog timeout and event counters. CI explicitly exercises
+6.12 and 7.0 on x86_64; arm64 CI runs against the latest stable.
+The 6.16 `scx_sched` refactor is supported at runtime via BTF
+detection; pre-refactor kernels use the static `scx_watchdog_timeout`
+symbol.
+
 ## Testing
 
 <details>
@@ -37,7 +46,7 @@ boot time is dominated by kernel init, not initramfs preparation.
 </details>
 
 <details>
-<summary><b>Automatic shared library resolution</b> — recursive DT_NEEDED discovery, no need static</summary>
+<summary><b>Automatic shared library resolution</b> — recursive DT_NEEDED discovery, no need to link statically</summary>
 
 Shared library dependencies for the test binary and any injected
 host files are resolved automatically by walking `DT_NEEDED` entries
@@ -298,8 +307,8 @@ guest and host coverage for unified `cargo llvm-cov` reports.
 <summary><b>cargo-ktstr</b> — cargo subcommand for the full workflow, more introspection less shell scripts</summary>
 
 Wraps `cargo nextest run` with automatic kernel resolution.
-Subcommands: `test`, `coverage`, `kernel`, `verifier`, `shell`,
-`test-stats`, `completions`.
+Subcommands (in `--help` order): `test`, `coverage`, `test-stats`,
+`kernel`, `verifier`, `completions`, `shell`.
 See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
 
 </details>
@@ -340,7 +349,7 @@ shared memory mapped into both address spaces.
 </details>
 
 <details>
-<summary><b>High test coverage</b> — so it actually works, mostly <a href="https://codecov.io/gh/likewhatevs/ktstr"><img src="https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM" alt="codecov"></a></summary>
+<summary><b>High test coverage</b> — broad self-coverage of the framework itself <a href="https://codecov.io/gh/likewhatevs/ktstr"><img src="https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM" alt="codecov"></a></summary>
 
 </details>
 

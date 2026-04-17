@@ -82,7 +82,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     performance_mode = true,
     duration_s = 5,
     workers_per_cgroup = 4,
-    extra_sched_args = ["--degrade"],
+    extra_sched_args = ["--fail-verify"],
     expect_err = true,
 )]
 fn perf_negative(ctx: &Ctx) -> Result<AssertResult> {
@@ -98,7 +98,11 @@ fn perf_negative(ctx: &Ctx) -> Result<AssertResult> {
 Key points:
 - `expect_err = true` tells the harness to assert failure and disable
   auto-repro.
-- `extra_sched_args = ["--degrade"]` passes a flag that makes the
-  scheduler intentionally slow (the scheduler handles this flag to degrade performance for negative testing).
+- `extra_sched_args = [...]` passes CLI args to the scheduler
+  binary. `"--fail-verify"` is a real knob that the test fixture
+  scheduler `scx-ktstr` exposes to force a verifier failure (see
+  `scx-ktstr/src/main.rs` and `scx-ktstr/src/bpf/main.bpf.c`);
+  substitute your own scheduler's equivalent of the behaviour you
+  want to exercise in a negative test.
 - The test function returns the scenario result normally; the harness
   checks that it produces an error.

@@ -104,8 +104,8 @@ const REG_CORE_BASE: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE a
 const REG_X0: u64 = REG_CORE_BASE;
 
 /// Register ID for PC (regs.pc, offset = 256/4 = 64 in u32 units).
-/// In kvm_regs: regs[31] at offset 248, sp at 248, pc at 256, pstate at 264.
-/// 256 bytes / 4 = 64 u32-offset.
+/// In user_pt_regs: regs[0..31] at offsets 0..248, sp at 248, pc at
+/// 256, pstate at 264. 256 bytes / 4 = 64 u32-offset.
 const REG_PC: u64 = REG_CORE_BASE | (256 / 4);
 
 /// Register ID for pstate (regs.pstate, offset = 264/4 = 66).

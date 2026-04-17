@@ -23,18 +23,25 @@ pub struct LlcInfo {
 }
 
 impl LlcInfo {
+    /// Sorted list of CPU IDs in this LLC domain.
     pub fn cpus(&self) -> &[usize] {
         &self.cpus
     }
+    /// NUMA node containing this LLC.
     pub fn numa_node(&self) -> usize {
         self.numa_node
     }
+    /// LLC cache size in KiB when sysfs reported it, else `None`.
     pub fn cache_size_kb(&self) -> Option<u64> {
         self.cache_size_kb
     }
+    /// Per-core sibling map: `core_id -> sorted list of CPU IDs that
+    /// are SMT siblings of that core`.
     pub fn cores(&self) -> &BTreeMap<usize, Vec<usize>> {
         &self.cores
     }
+    /// Number of physical cores in the LLC; falls back to the CPU
+    /// count when core-group data is unavailable.
     pub fn num_cores(&self) -> usize {
         if self.cores.is_empty() {
             self.cpus.len()
@@ -295,8 +302,9 @@ impl TestTopology {
         self.cpus.iter().copied().collect()
     }
 
-    /// CPUs available for workload placement. Reserves the last CPU for
-    /// the root cgroup (cgroup 0) when the topology has more than 2 CPUs.
+    /// CPUs available for workload placement. When the topology has
+    /// more than 2 CPUs, the last CPU is reserved for the root cgroup
+    /// (cgroup 0); with 2 or fewer CPUs, every CPU is returned.
     pub fn usable_cpus(&self) -> &[usize] {
         if self.cpus.len() > 2 {
             &self.cpus[..self.cpus.len() - 1]

@@ -9,6 +9,17 @@ use ktstr::cli;
 use ktstr::fetch;
 use ktstr::remote_cache;
 
+/// Help text shared by test/coverage --kernel (verifier uses its
+/// own due to file-path acceptance). Raw image files are rejected
+/// here; version and cache-key forms require the entry to already
+/// be cached (run `cargo ktstr kernel build` first). Shell uses
+/// its own help because it accepts image files and has a different
+/// no-match error path.
+const KERNEL_IDENTIFIER_HELP: &str = "Kernel identifier: a source directory path (e.g. `../linux`), a version \
+     (`6.14.2`), or a cache key (see `cargo ktstr kernel list`). Raw \
+     image files are rejected here; version/cache-key forms require \
+     the entry to already be cached (run `cargo ktstr kernel build` first).";
+
 #[derive(Parser)]
 #[command(name = "cargo-ktstr", bin_name = "cargo")]
 struct Cargo {
@@ -42,10 +53,7 @@ enum KtstrCommand {
     },
     /// Build the kernel (if needed) and run tests via cargo nextest.
     Test {
-        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (see `cargo ktstr kernel list`).
-        /// When absent, resolves automatically via cache then filesystem.
-        #[arg(long)]
+        #[arg(long, help = KERNEL_IDENTIFIER_HELP)]
         kernel: Option<String>,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -53,10 +61,7 @@ enum KtstrCommand {
     },
     /// Build the kernel (if needed) and run tests with coverage via cargo llvm-cov nextest.
     Coverage {
-        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (see `cargo ktstr kernel list`).
-        /// When absent, resolves automatically via cache then filesystem.
-        #[arg(long)]
+        #[arg(long, help = KERNEL_IDENTIFIER_HELP)]
         kernel: Option<String>,
         /// Arguments passed through to cargo llvm-cov nextest.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -86,9 +91,10 @@ enum KtstrCommand {
         /// Path to pre-built scheduler binary (alternative to --scheduler).
         #[arg(long, conflicts_with = "scheduler")]
         scheduler_bin: Option<PathBuf>,
-        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (see `cargo ktstr kernel list`).
-        /// When absent, resolves automatically via cache then filesystem.
+        /// Kernel identifier: a source directory path (e.g. `../linux`),
+        /// a version (`6.14.2`), or a cache key (see
+        /// `cargo ktstr kernel list`). When absent, resolves
+        /// automatically via cache then filesystem.
         #[arg(long)]
         kernel: Option<String>,
         /// Print raw verifier output without formatting.
@@ -110,7 +116,7 @@ enum KtstrCommand {
     Completions {
         /// Shell to generate completions for.
         shell: clap_complete::Shell,
-        /// Binary name for completions (default: "cargo").
+        /// Binary name for completions.
         #[arg(long, default_value = "cargo")]
         binary: String,
     },
@@ -122,17 +128,18 @@ enum KtstrCommand {
     /// structure. Dynamically-linked ELF binaries get automatic shared
     /// library resolution via ELF DT_NEEDED parsing.
     Shell {
-        /// Kernel identifier: path (`../linux`), version (`6.14.2`),
-        /// or cache key (see `cargo ktstr kernel list`).
-        /// When absent, resolves automatically via cache then filesystem.
+        /// Kernel identifier: a source directory path (e.g. `../linux`),
+        /// a raw image file (`bzImage` / `Image`), a version
+        /// (`6.14.2`), or a cache key (see `cargo ktstr kernel list`).
+        /// When absent, resolves via cache then filesystem; errors
+        /// with a hint if nothing is found (run `cargo ktstr kernel
+        /// build` first).
         #[arg(long)]
         kernel: Option<String>,
-        /// Virtual topology as "numa_nodes,llcs,cores,threads" (default: "1,1,1,1").
+        /// Virtual topology as "numa_nodes,llcs,cores,threads".
         #[arg(long, default_value = "1,1,1,1")]
         topology: String,
-        /// Files or directories to include in the guest at /include-files/<name>.
-        /// Directories are walked recursively, preserving structure.
-        /// Dynamically-linked ELF binaries get shared library resolution.
+        /// Files or directories to include in the guest. Repeatable.
         #[arg(short = 'i', long = "include-files", action = ArgAction::Append)]
         include_files: Vec<PathBuf>,
         /// Guest memory in MB (minimum 128). When absent, estimated
@@ -154,22 +161,28 @@ enum KtstrCommand {
 enum KernelCommand {
     /// List cached kernel images.
     List {
-        /// Output in JSON format for CI scripting.
+        /// Output in JSON format for CI scripting. Each entry includes
+        /// a computed `eol` boolean derived by fetching kernel.org's
+        /// `releases.json`; this requires network access on the host.
         #[arg(long)]
         json: bool,
     },
     /// Download, build, and cache a kernel image.
     Build {
-        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3).
+        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3). A
+        /// major.minor prefix (e.g. 6.12) resolves to the highest
+        /// patch release in that series, falling back to probing
+        /// cdn.kernel.org for EOL series no longer in releases.json.
         #[arg(conflicts_with_all = ["source", "git"])]
         version: Option<String>,
         /// Path to existing kernel source directory.
         #[arg(long, conflicts_with_all = ["version", "git"])]
         source: Option<PathBuf>,
-        /// Git URL to clone kernel source from.
+        /// Git URL to clone kernel source from. Cloned shallow (depth 1)
+        /// at the ref supplied via --ref.
         #[arg(long, requires = "git_ref", conflicts_with_all = ["version", "source"])]
         git: Option<String>,
-        /// Git ref to checkout (branch, tag, commit).
+        /// Git ref to checkout (branch, tag, commit). Required with --git.
         #[arg(long = "ref", requires = "git")]
         git_ref: Option<String>,
         /// Rebuild even if a cached image exists.
@@ -181,10 +194,12 @@ enum KernelCommand {
     },
     /// Remove cached kernel images.
     Clean {
-        /// Keep the N most recent cached kernels.
+        /// Keep the N most recent cached kernels. When absent, removes
+        /// all cached entries (subject to the confirmation prompt
+        /// unless --force is also set).
         #[arg(long)]
         keep: Option<usize>,
-        /// Skip confirmation prompt.
+        /// Skip confirmation prompt. Required in non-interactive contexts.
         #[arg(long)]
         force: bool,
     },

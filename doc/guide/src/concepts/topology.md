@@ -36,9 +36,7 @@ for multi-NUMA configurations.
 use ktstr::prelude::*;
 
 pub struct TestTopology {
-    cpus: Vec<usize>,
-    llcs: Vec<LlcInfo>,
-    numa_nodes: BTreeSet<usize>,
+    // private fields — use the accessors below
 }
 ```
 
@@ -51,9 +49,12 @@ IDs, NUMA node IDs, core IDs, and cache sizes for each online CPU.
 **`from_spec(numa_nodes, llcs, cores, threads) -> Self`** -- builds a
 topology from a VM spec. Parameters are big-to-little: NUMA nodes,
 last-level caches, cores per LLC, threads per core. Multiple LLCs
-can share a NUMA node when `numa_nodes < llcs`. CPUs numbered
-sequentially. Used as a fallback when sysfs is incomplete inside a
-guest VM.
+can share a NUMA node when `numa_nodes < llcs`; `llcs` must be an
+exact multiple of `numa_nodes` so LLCs partition evenly across nodes
+(the `#[derive(Scheduler)]` macro rejects violations at compile time
+and runtime `from_spec` callers inside ktstr hold the same invariant).
+CPUs numbered sequentially. Used as a fallback when sysfs is
+incomplete inside a guest VM.
 
 **`synthetic(num_cpus, num_llcs) -> Self`** (test-only) -- creates a
 topology with evenly distributed CPUs across LLCs. Used in unit tests.
@@ -73,7 +74,9 @@ topology with evenly distributed CPUs across LLCs. Used in unit tests.
 **`usable_cpus() -> &[usize]`** -- CPUs available for workload
 placement. Reserves the last CPU for the root cgroup (cgroup 0) when
 the topology has more than 2 CPUs. On 8 CPUs: usable = 0-6, CPU 7
-reserved.
+reserved. Most built-in scenarios and `CgroupDef` cpuset specs
+operate on `usable_cpus()` automatically; test authors rarely need
+to query it directly.
 
 **`usable_cpuset() -> BTreeSet<usize>`** -- usable CPUs as a set.
 

@@ -283,13 +283,27 @@ fn generate_profiles(required: &[&'static str], excluded: &[&'static str]) -> Ve
 /// partitions at the scenario level; `CpusetSpec` specifies per-cgroup.
 #[derive(Clone, Debug)]
 pub enum CpusetMode {
+    /// Each cgroup sees the full usable CPU set; no partitioning.
     None,
+    /// Each cgroup is pinned to the CPUs of one full LLC, assigned in
+    /// order. Requires at least as many LLCs as cgroups.
     LlcAligned,
+    /// Partition `usable_cpus()` into contiguous even halves (or
+    /// as-even-as-possible groups) per cgroup.
     SplitHalf,
+    /// Like `SplitHalf` but chooses boundaries that cross LLC lines
+    /// to stress cross-LLC placement.
     SplitMisaligned,
+    /// Each cgroup gets the full set overlapped by the given fraction
+    /// with its neighbour; `0.0` behaves like `SplitHalf`, `1.0` like
+    /// `None`.
     Overlap(f64),
-    Uneven(f64),   // fraction for cgroup 0
-    Holdback(f64), // fraction of CPUs held back, rest split evenly
+    /// Asymmetric split where cgroup 0 receives this fraction of the
+    /// usable CPUs and the remaining cgroups share the rest.
+    Uneven(f64),
+    /// Reserve this fraction of CPUs outside the scenario, then split
+    /// the rest evenly across cgroups.
+    Holdback(f64),
 }
 
 /// What happens during a scenario's workload phase.
@@ -474,11 +488,24 @@ pub struct Ctx<'a> {
     pub assert: crate::assert::Assert,
     /// When true, `execute_steps` polls SHM signal slot 0 after writing
     /// the scenario start marker, blocking until the host confirms its
-    /// BPF map write is complete.
+    /// BPF map write is complete. Set automatically by the framework
+    /// when a `KtstrTestEntry` declares `bpf_map_write`; custom
+    /// scenarios typically do not flip this manually.
     pub wait_for_map_write: bool,
 }
 
-/// Run a scenario. Returns assertion result.
+/// Run a scenario and return its assertion result.
+///
+/// Skips early (returning `AssertResult::skip`) when the scenario's
+/// requested cpuset partitioning produces an empty cpuset for any
+/// cgroup under the current topology. Polls scheduler liveness at
+/// 500ms intervals. If the scheduler exits after cgroup creation but
+/// before the workload starts, returns an `Err` so callers can treat
+/// the run as a setup failure. A scheduler death mid-workload is
+/// reported as a completed-but-failed `AssertResult` with
+/// "scheduler crashed during workload" in `details`, not an error.
+/// On workload failure, captures the guest kernel console via
+/// `read_kmsg` so diagnostics include the stall or crash context.
 pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     tracing::info!(scenario = scenario.name, "running");
     if let Action::Custom(f) = &scenario.action {
@@ -824,7 +851,10 @@ pub fn split_half(ctx: &Ctx) -> (BTreeSet<usize>, BTreeSet<usize>) {
     )
 }
 
-/// Spawn diverse workloads across N cgroups: CpuSpin, Bursty, IoSync, Mixed, YieldHeavy.
+/// Spawn diverse workloads across N cgroups: CpuSpin, Bursty, IoSync,
+/// Mixed, YieldHeavy. Each cgroup uses `ctx.workers_per_cgroup`
+/// workers except IoSync cgroups, which always use 2 workers to
+/// avoid drowning the scenario in blocking IO.
 pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHandle>> {
     let types = [
         WorkType::CpuSpin,

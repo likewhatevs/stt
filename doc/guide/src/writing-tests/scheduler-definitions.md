@@ -20,6 +20,11 @@ pub struct Scheduler {
 }
 ```
 
+`sysctls` and `kargs` are only reachable by constructing a
+`Scheduler` as a manual `const`; the `#[derive(Scheduler)]` macro
+does not yet accept `sysctls = [...]` / `kargs = [...]` attributes.
+Adding derive support is tracked as a separate workstream.
+
 ## SchedulerSpec
 
 How to find the scheduler binary:

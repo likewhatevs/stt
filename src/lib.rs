@@ -123,6 +123,8 @@
 //!
 //! - [`cache`] -- kernel image cache (XDG directories, metadata, atomic writes)
 //! - [`cgroup`] -- cgroup v2 filesystem operations
+//! - [`cli`] -- shared helpers backing the `ktstr` and `cargo-ktstr` binaries
+//! - [`runner`] -- host-side scenario runner used by `ktstr run`
 //! - [`scenario`] -- declarative ops API (`CgroupDef`, `Step`, `Op`, `execute_defs`, `execute_steps`)
 //! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
 //! - [`mod@assert`] -- pass/fail assertions (starvation, isolation, fairness)
@@ -246,7 +248,13 @@ pub const GIT_FULL_HASH: &str = env!("KTSTR_GIT_FULL_HASH");
 /// without `.git` in the manifest dir (see build.rs).
 pub const GIT_BRANCH: &str = env!("KTSTR_GIT_BRANCH");
 
-/// Embedded ktstr.kconfig fragment.
+/// Contents of `ktstr.kconfig` (the kernel-config fragment that
+/// enables sched_ext, BPF, kprobes, cgroups, and the other options
+/// ktstr requires) baked into the binary at build time via
+/// `include_str!`. Consumed by the kernel build pipeline to
+/// `olddefconfig` a kernel source tree, and used to derive the
+/// cache key suffix so a kconfig change produces a fresh cache
+/// entry.
 pub const EMBEDDED_KCONFIG: &str = include_str!("../ktstr.kconfig");
 
 /// CRC32 hash of the embedded kconfig fragment (8 hex chars).
@@ -439,7 +447,8 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
 
 /// Build a cargo binary package and return its output path.
 ///
-/// Runs from the workspace root so that workspace-level feature
+/// Runs from the ktstr crate's manifest directory (which is also the
+/// workspace root in this repo) so that workspace-level feature
 /// unification (e.g. vendored libbpf-sys) is always in effect,
 /// regardless of the calling process's working directory.
 pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf> {

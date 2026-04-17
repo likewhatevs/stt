@@ -78,7 +78,19 @@ cargo ktstr verifier --scheduler scx_my_sched
 See [BPF Verifier](../running-tests/verifier.md) for output format and
 cycle collapse.
 
-## 6. Debug failures
+## 6. Manage the kernel cache
+
+Cached kernel images accumulate under
+`$XDG_CACHE_HOME/ktstr/kernels/`. Keep a handful of recent builds
+and drop the rest when disk pressure grows:
+
+```sh
+cargo ktstr kernel list                # inspect cache contents
+cargo ktstr kernel clean --keep 3      # keep the 3 most recent images
+cargo ktstr kernel clean --force       # remove everything (non-interactive)
+```
+
+## 7. Debug failures
 
 Boot an interactive shell with the scheduler binary:
 

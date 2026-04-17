@@ -271,7 +271,10 @@ pub fn mpidr_to_fdt_reg(mpidr: u64) -> u64 {
 
 /// Compute MPIDR affinity encoding from topology decomposition.
 /// Aff0 = thread, Aff1 = core, Aff2 = LLC.
-/// This matches KVM's default MPIDR assignment for linearly-created vCPUs.
+/// This is our own MPIDR layout. KVM's default reset_mpidr
+/// (arch/arm64/kvm/sys_regs.c) maps vcpu_id linearly into affinity
+/// levels (Aff0 bits [3:0], Aff1 bits [11:4], Aff2 bits [19:12]), which
+/// does not match this layout.
 pub fn mpidr_from_topology(topo: &Topology, cpu_id: u32) -> u64 {
     let (llc, core, thread) = topo.decompose(cpu_id);
     let aff0 = thread as u64;

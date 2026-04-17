@@ -34,6 +34,11 @@ unsafe impl Send for GuestMem {}
 unsafe impl Sync for GuestMem {}
 
 impl GuestMem {
+    /// Wrap the host-mapped guest DRAM region.
+    ///
+    /// `base` is a pointer to the start of the KVM memory mapping;
+    /// `size` is the mapped length in bytes. Callers are responsible
+    /// for ensuring the mapping outlives the returned `GuestMem`.
     pub fn new(base: *mut u8, size: u64) -> Self {
         Self { base, size }
     }
@@ -614,17 +619,28 @@ pub(crate) enum WatchdogOverride {
 
 /// Pre-resolved BPF program stats context for the monitor loop.
 pub(crate) struct ProgStatsCtx {
+    /// Cached per-program info (name + stats_percpu_kva) resolved
+    /// once at startup to avoid re-walking `prog_idr` each sample.
     pub cached: Vec<super::bpf_prog::CachedProgInfo>,
+    /// Per-CPU offset table (`__per_cpu_offset[]`) used to translate
+    /// each program's percpu stats pointer into a concrete KVA.
     pub per_cpu_offsets: Vec<u64>,
+    /// Runtime `PAGE_OFFSET` used for direct-mapping KVA translation.
     pub page_offset: u64,
+    /// BTF offsets for the `bpf_prog` + related struct fields read
+    /// while summing stats.
     pub offsets: super::btf_offsets::BpfProgOffsets,
 }
 
 /// Samples, SHM drain, and optional watchdog observation returned by
 /// [`monitor_loop`].
 pub(crate) struct MonitorLoopResult {
+    /// Per-interval `MonitorSample`s collected across the run.
     pub(crate) samples: Vec<MonitorSample>,
+    /// Final drain of the guest-to-host SHM ring (stimulus events,
+    /// test results, any residual messages).
     pub(crate) drain: crate::vmm::shm_ring::ShmDrainResult,
+    /// Watchdog read-back, when a watchdog override was installed.
     pub(crate) watchdog_observation: Option<super::WatchdogObservation>,
 }
 
@@ -640,10 +656,19 @@ pub(crate) struct MonitorConfig<'a> {
     /// detected, writes the dump request flag to guest SHM to trigger a
     /// SysRq-D dump inside the guest.
     pub dump_trigger: Option<&'a DumpTrigger>,
+    /// Optional watchdog timeout override to install before sampling
+    /// begins; read back into `WatchdogObservation` after the loop.
     pub watchdog_override: Option<&'a WatchdogOverride>,
+    /// Optional per-vCPU timing context for preemption accounting.
     pub vcpu_timing: Option<&'a VcpuTiming>,
+    /// Preemption threshold in nanoseconds used for stall detection.
+    /// Pass 0 to derive it from the guest kernel's CONFIG_HZ.
     pub preemption_threshold_ns: u64,
+    /// Physical address of the guest-side SHM ring region; enables
+    /// mid-flight drain when present.
     pub shm_base_pa: Option<u64>,
+    /// Optional BPF program statistics context; when present, each
+    /// sample includes per-program exec counters.
     pub prog_stats_ctx: Option<&'a ProgStatsCtx>,
     /// Runtime `PAGE_OFFSET` for direct-mapping KVA translation. Used by
     /// sched_domain tree walking to translate `rq->sd` and `sd->parent`
@@ -651,8 +676,11 @@ pub(crate) struct MonitorConfig<'a> {
     pub page_offset: u64,
 }
 
-/// Run the monitor loop, sampling all CPUs at the given interval.
-/// Returns collected samples when `kill` is set.
+/// Run the monitor loop, sampling all CPUs at the given interval
+/// until `kill` is set. Returns a [`MonitorLoopResult`] containing
+/// the collected per-interval samples, a final drain of the
+/// guest-to-host SHM ring, and — when a watchdog override was
+/// installed — the post-run `WatchdogObservation` read-back.
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
     rq_pas: &[u64],

@@ -45,10 +45,11 @@ pub fn is_enabled() -> bool {
 
 /// Create an opendal operator for the GHA cache service.
 ///
-/// Uses `ACTIONS_CACHE_URL` and `ACTIONS_RUNTIME_TOKEN` from the
-/// environment (set automatically by the GHA runner). The `version`
-/// field namespaces cache entries to avoid collisions with other
-/// tools using the same GHA cache.
+/// Relies on opendal's Ghac service, which reads `ACTIONS_CACHE_URL`
+/// and `ACTIONS_RUNTIME_TOKEN` from the environment (set automatically
+/// by the GHA runner); ktstr itself does not touch either variable.
+/// The `version` field namespaces cache entries to avoid collisions
+/// with other tools using the same GHA cache.
 fn create_operator() -> Result<opendal::Operator, String> {
     let builder = opendal::services::Ghac::default()
         .root("/")

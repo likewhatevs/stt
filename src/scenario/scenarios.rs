@@ -10,7 +10,7 @@
 //! - **Cpuset**: cpuset assignment and mid-run mutation.
 //! - **Dynamic**: cgroup add/remove during a running workload.
 //! - **Affinity**: per-worker CPU affinity patterns.
-//! - **Stress**: oversubscription, per-CPU pinning, diverse workloads.
+//! - **Stress**: host/cgroup contention and mixed workload types.
 //! - **Nested**: workers in nested sub-cgroups.
 //!
 //! # Example

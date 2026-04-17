@@ -6,7 +6,7 @@ Environment variables that control ktstr behavior.
 
 | Variable | Description | Default |
 |---|---|---|
-| `KTSTR_KERNEL` | Kernel identifier for build-time BTF resolution and runtime image discovery. Accepts a path (`../linux`), version string (`6.14.2`), or cache key (use `cargo ktstr kernel list` for actual keys). At build time, only paths are used (BTF from `vmlinux`). At runtime, version strings and cache keys resolve via the XDG cache; paths search only the specified directory (error if no image found). Set automatically by `cargo ktstr test --kernel`. | Auto-discovered |
+| `KTSTR_KERNEL` | Kernel identifier for cargo-build-time BTF resolution (read by `build.rs`) and runtime image discovery. Accepts a path (`../linux`), version string (`6.14.2`), or cache key (use `cargo ktstr kernel list` for actual keys). During `cargo build`, only paths are used (`build.rs` extracts BTF from `vmlinux`). At runtime, version strings and cache keys resolve via the XDG cache; paths search only the specified directory (error if no image found). Set automatically by `cargo ktstr test --kernel`. | Auto-discovered |
 | `KTSTR_TEST_KERNEL` | Path to a bootable kernel image (`bzImage` on x86_64, `Image` on aarch64). See [Getting Started](../getting-started.md#kernel-discovery) and [Troubleshooting](../troubleshooting.md#no-kernel-found) for search order. | Auto-discovered |
 | `KTSTR_CACHE_DIR` | Override the kernel image cache directory. When set, all cache operations use this path instead of the XDG default. | `$XDG_CACHE_HOME/ktstr/kernels/` or `$HOME/.cache/ktstr/kernels/` |
 | `KTSTR_GHA_CACHE` | Set to `"1"` to enable remote kernel cache via GitHub Actions cache service. Requires `ACTIONS_CACHE_URL` (set by the GHA runner). Local cache is always authoritative; remote failures are non-fatal. | None (disabled) |
@@ -28,12 +28,28 @@ Environment variables that control ktstr behavior.
 
 | Variable | Description | Default |
 |---|---|---|
-| `NEXTEST` | Set by nextest. ktstr intercepts `--list` and `--exact` args when present. | None |
+| `NEXTEST` | Set by nextest when it invokes the test binary. ktstr's `#[ctor]` dispatch inspects this to decide whether to intercept the nextest protocol args (`--list`, `--exact`) for gauntlet expansion and budget-based selection before `main()` runs. Under plain `cargo test`, this is unset and the standard harness runs the `#[test]` wrappers directly. | None |
 
 ## VM-internal
 
-These are set inside the VM by the guest init and are not intended for user configuration.
+Set by the host on the guest kernel command line and read by the
+guest init (via `/proc/cmdline`). Not intended for user
+configuration; listed here for debugging.
 
-| Variable | Description | Default |
-|---|---|---|
-| `SCHED_PID` | PID of the scheduler process inside the guest. | Set after scheduler spawn |
+| Variable | Description |
+|---|---|
+| `SCHED_PID` | PID of the scheduler process inside the guest, published after scheduler spawn. |
+| `KTSTR_MODE` | Guest execution mode (`run` for test dispatch, `shell` for interactive shell). |
+| `KTSTR_TOPO` | Topology string (`numa_nodes,llcs,cores,threads`) for guest-side scenario resolution. |
+| `KTSTR_SHM_BASE` | Host-physical base address of the SHM ring region (hex). |
+| `KTSTR_SHM_SIZE` | Size in bytes of the SHM ring region (hex). |
+| `KTSTR_TERM` | Terminal type forwarded from the host (sets guest `TERM`). |
+| `KTSTR_COLORTERM` | Color capability forwarded from the host (sets guest `COLORTERM`). |
+| `KTSTR_COLS` | Host terminal column count, used to size the guest pty when available. |
+| `KTSTR_ROWS` | Host terminal row count, used to size the guest pty when available. |
+
+Sentinel tokens (`===KTSTR_TEST_RESULT_START===`,
+`===KTSTR_TEST_RESULT_END===`, `KTSTR_EXIT=N`,
+`KTSTR_INIT_STARTED`, `KTSTR_PAYLOAD_STARTING`, `KTSTR_EXEC_EXIT`)
+are protocol markers written to COM2; they are not environment
+variables.

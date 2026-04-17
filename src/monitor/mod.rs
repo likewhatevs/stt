@@ -582,13 +582,21 @@ pub struct ScxEventDeltas {
 }
 
 impl MonitorSummary {
+    /// Summarize a run's monitor samples using the derived default
+    /// preemption threshold (equivalent to
+    /// [`from_samples_with_threshold`](Self::from_samples_with_threshold)
+    /// with `0`).
     pub fn from_samples(samples: &[MonitorSample]) -> Self {
         Self::from_samples_with_threshold(samples, 0)
     }
 
     /// Like [`from_samples`](Self::from_samples) but uses an explicit
     /// preemption threshold (ns) for stall detection. Pass 0 to derive
-    /// the threshold from the host kernel's CONFIG_HZ.
+    /// the threshold from the guest kernel's `CONFIG_HZ` by calling
+    /// [`vcpu_preemption_threshold_ns`], which tries (in order) the
+    /// embedded IKCONFIG in the guest `vmlinux`, a `.config` beside
+    /// the kernel image, the host's `/boot/config-$(uname -r)`, and
+    /// finally the built-in `DEFAULT_HZ`.
     pub fn from_samples_with_threshold(
         samples: &[MonitorSample],
         preemption_threshold_ns: u64,

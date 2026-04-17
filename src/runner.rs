@@ -20,15 +20,27 @@ use crate::topology::TestTopology;
 /// start or stop schedulers.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
+    /// Parent cgroup path under which each scenario's cgroups are
+    /// created.
     pub parent_cgroup: String,
+    /// Wall-clock duration each scenario runs for before teardown.
     pub duration: Duration,
+    /// Default number of worker processes spawned per cgroup when a
+    /// scenario does not specify its own count.
     pub workers_per_cgroup: usize,
+    /// Flag selection: `None` expands to every valid profile,
+    /// `Some([])` runs the default profile only, `Some([flags..])`
+    /// runs the single profile with exactly those flags active.
     pub active_flags: Option<Vec<&'static str>>,
+    /// Attach BPF probes while scenarios run so crashes are captured
+    /// in-line.
     pub repro: bool,
     /// Crash stack for auto-probe (file path or comma-separated function names).
     pub probe_stack: Option<String>,
     /// Auto-repro: crash -> extract stack -> rerun with probe-stack.
     pub auto_repro: bool,
+    /// Kernel build directory used for DWARF source-line lookups in
+    /// probe output.
     pub kernel_dir: Option<String>,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
@@ -62,10 +74,19 @@ impl Default for RunConfig {
 /// Result of running a single scenario with a specific flag profile.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScenarioResult {
+    /// Scenario name combined with the flag profile (e.g.
+    /// `steady/llc+steal`).
     pub scenario_name: String,
+    /// Overall pass/fail verdict after merging every worker- and
+    /// monitor-level check.
     pub passed: bool,
+    /// Wall-clock seconds the scenario body ran for.
     pub duration_s: f64,
+    /// Human-readable per-check messages surfaced on failure; empty
+    /// on clean passes.
     pub details: Vec<String>,
+    /// Aggregate statistics merged across all cgroups and workers for
+    /// this scenario.
     #[serde(default)]
     pub stats: ScenarioStats,
 }
@@ -112,6 +133,12 @@ pub struct Runner {
 
 impl Runner {
     /// Create a runner with the given configuration and topology.
+    ///
+    /// When `config.repro` is true, this also flips the process-wide
+    /// `workload::set_repro_mode(true)` global so spawned workers
+    /// disable their SIGUSR2 scheduler watchdog. The flag is not
+    /// reset on drop; once repro mode is on it stays on for the life
+    /// of the process.
     pub fn new(config: RunConfig, topo: TestTopology) -> Result<Self> {
         if config.repro {
             crate::workload::set_repro_mode(true);

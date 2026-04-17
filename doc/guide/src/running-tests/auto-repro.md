@@ -136,13 +136,14 @@ sched_ext dump, and dmesg (each only when non-empty).
 
 ## Demo test
 
-The `demo_host_crash_auto_repro` test:
+A demo test in this shape (reduced from
+`demo_host_crash_auto_repro` in `tests/scenario_coverage.rs`):
 
 ```rust,ignore
 use ktstr::prelude::*;
 use ktstr::test_support::{BpfMapWrite, KtstrTestEntry, run_ktstr_test};
 
-fn scenario(ctx: &Ctx) -> Result<AssertResult> {
+fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("demo_workers")

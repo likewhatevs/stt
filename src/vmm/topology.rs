@@ -8,9 +8,14 @@
 /// [`validate`](Self::validate) to check a struct-literal value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Topology {
+    /// Total number of last-level caches across the whole VM; must be
+    /// a multiple of `numa_nodes`.
     pub llcs: u32,
+    /// Physical cores grouped into each LLC.
     pub cores_per_llc: u32,
+    /// Hardware threads exposed per core (`1` = no SMT, `2` = SMT-2).
     pub threads_per_core: u32,
+    /// Number of NUMA nodes; LLCs partition evenly across them.
     pub numa_nodes: u32,
 }
 
@@ -110,14 +115,17 @@ impl Topology {
         Ok(())
     }
 
+    /// Total vCPU count = `llcs * cores_per_llc * threads_per_core`.
     pub fn total_cpus(&self) -> u32 {
         self.llcs * self.cores_per_llc * self.threads_per_core
     }
 
+    /// Number of LLC domains in the topology.
     pub fn num_llcs(&self) -> u32 {
         self.llcs
     }
 
+    /// Number of NUMA nodes in the topology.
     pub fn num_numa_nodes(&self) -> u32 {
         self.numa_nodes
     }

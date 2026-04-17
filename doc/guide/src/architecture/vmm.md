@@ -56,10 +56,12 @@ and exit codes (`KTSTR_EXIT=N`) are written to COM2 as fallback when
 SHM is unavailable.
 
 **SHM ring buffer** -- the primary guest-to-host data channel. A shared
-memory ring buffer carries test results (`MSG_TYPE_TEST_RESULT`), exit
-codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`), and
-profraw coverage data (`MSG_TYPE_PROFRAW`). Each entry has a CRC32
-for integrity checking.
+memory ring buffer carries scenario markers (`MSG_TYPE_SCENARIO_START`,
+`MSG_TYPE_SCENARIO_END`), test results (`MSG_TYPE_TEST_RESULT`), exit
+codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`),
+scheduler exit notifications (`MSG_TYPE_SCHED_EXIT`), guest crash
+payloads (`MSG_TYPE_CRASH`), and profraw coverage data
+(`MSG_TYPE_PROFRAW`). Each entry has a CRC32 for integrity checking.
 
 ## Performance mode
 

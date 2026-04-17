@@ -110,8 +110,9 @@ internal type; external tests use
 `Holdback` operates on `all_cpus()` (no reservation).
 
 **`cgroup_works`** -- per-cgroup workload definition using
-[`Work`](../api/ktstr/workload/struct.Work.html) from the workload
-module (same type used by `CgroupDef` and `Op::Spawn`).
+[`Work`](https://likewhatevs.github.io/ktstr/api/ktstr/workload/struct.Work.html)
+from the workload module (same type used by `CgroupDef` and
+`Op::Spawn`).
 
 **`action`** -- `Steady` (run workers for the duration) or
 `Custom(fn(&Ctx) -> Result<AssertResult>)` for scenarios with custom

@@ -15,8 +15,10 @@ cargo nextest run --run-ignored ignored-only -E 'test(gauntlet/)'
 cargo nextest run --run-ignored all
 ```
 
-Tests with `host_only = true` never produce gauntlet variants (topology
-variation is meaningless without a VM).
+Entries with `host_only = true` never produce gauntlet variants
+(topology variation is meaningless without a VM). See
+[`host_only`](../writing-tests/ktstr-test-macro.md#execution) for
+how that flag is set.
 
 ## Variant naming
 

@@ -5,6 +5,10 @@ same `#[ktstr_test]` suite against each and diffing sidecar results.
 
 ## Setup worktrees
 
+The examples below use the `scx` scheduler crate under
+`~/opensource/scx`; substitute your own scheduler crate's path and
+remote everywhere `scx` appears.
+
 ```sh
 cd ~/opensource/scx
 
@@ -31,11 +35,28 @@ KTSTR_SIDECAR_DIR=./current cargo nextest run --workspace
 Diff the sidecar JSON files between the two directories. See
 [Baselines](../running-tests/baselines.md) for the sidecar format.
 
-Compare test pass/fail counts between runs:
+Sanity-check that the two runs produced the same test set (same file
+count and same test names):
 
 ```sh
-diff <(ls baseline/*.ktstr.json | wc -l) <(ls current/*.ktstr.json | wc -l)
+diff <(ls baseline | sort) <(ls current | sort)
 ```
+
+Compare pass/fail verdicts for each test that appears in both runs:
+
+```sh
+for f in baseline/*.ktstr.json; do
+    name=$(basename "$f")
+    [ -f "current/$name" ] || continue
+    a=$(jq -r '.passed' "$f")
+    b=$(jq -r '.passed' "current/$name")
+    [ "$a" = "$b" ] || echo "$name: baseline=$a current=$b"
+done
+```
+
+For deeper field-by-field comparison (scheduler telemetry, latency
+percentiles, etc.), use `jq` to extract specific keys and diff those
+between matching sidecar pairs.
 
 ## Cleanup
 

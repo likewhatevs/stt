@@ -45,8 +45,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceType {
+    /// Downloaded tarball from kernel.org (version / prefix / EOL
+    /// probe paths).
     Tarball,
+    /// Shallow clone of a git URL at a caller-specified ref.
     Git,
+    /// Build of a local on-disk kernel source tree.
     Local,
 }
 

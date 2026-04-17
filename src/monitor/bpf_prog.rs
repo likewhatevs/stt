@@ -19,7 +19,10 @@ const BPF_OBJ_NAME_LEN: usize = 16;
 /// Per-program BPF verifier statistics collected from the host.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProgVerifierStats {
+    /// Program name as registered with the kernel.
     pub name: String,
+    /// Instructions accepted by the verifier (from
+    /// `bpf_prog_aux->verified_insns`).
     pub verified_insns: u32,
 }
 
@@ -103,6 +106,7 @@ pub(crate) fn find_struct_ops_progs(
 /// Per-program runtime stats summed across all CPUs.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProgRuntimeStats {
+    /// Program name as registered with the kernel.
     pub name: String,
     /// Total invocation count across all CPUs.
     pub cnt: u64,

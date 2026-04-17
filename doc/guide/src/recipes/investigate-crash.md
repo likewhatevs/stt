@@ -3,6 +3,21 @@
 When a scheduler crashes during a test, the failure output and
 auto-repro pipeline help identify the cause.
 
+## First step: enable full diagnostics
+
+Rerun the failing test with `RUST_BACKTRACE=1` before digging into
+individual sections:
+
+```sh
+RUST_BACKTRACE=1 cargo nextest run -E 'test(my_test)'
+```
+
+Setting `RUST_BACKTRACE=1` unconditionally appends the
+`--- diagnostics ---` section (init stage, VM exit code, last lines
+of kernel console) to every failure, not only when the scheduler
+self-dies. It also enables verbose VM console output (equivalent to
+`KTSTR_VERBOSE=1`).
+
 ## Reading failure output
 
 A test failure message contains up to eight sections, each present
@@ -15,12 +30,12 @@ only when relevant:
 | `--- diagnostics ---` | Init stage classification, VM exit code, last 20 lines of kernel console. |
 | `--- timeline ---` | Kernel version, topology, scheduler, scenario duration, phase breakdown with monitor samples. |
 | `--- scheduler log ---` | Scheduler process stdout+stderr (cycle-collapsed). |
-| `--- monitor ---` | Host-side monitor: sample count, max imbalance, max DSQ depth, stall flag, threshold verdict. |
+| `--- monitor ---` | Host-side monitor: sample count, max imbalance ratio, max local-DSQ depth, sustained-violation flag, SCX event counters (select_cpu_fallback, keep_last, skip_exiting, skip_migration_disabled), per-sched_domain load-balance rates, per-BPF-program `verified_insns`, and the merged threshold verdict. |
 | `--- sched_ext dump ---` | `sched_ext_dump` trace lines from the guest kernel. |
 | `--- auto-repro ---` | BPF probe data from a second VM run, plus repro VM duration, scheduler log, sched_ext dump, and dmesg tails. |
 
 `--- diagnostics ---` appears automatically when the scheduler died
-or when `RUST_BACKTRACE=1` is set.
+or crashed, or when `RUST_BACKTRACE` is set to `1` or `full`.
 
 ## Auto-repro
 

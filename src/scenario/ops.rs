@@ -175,7 +175,11 @@ impl CpusetSpec {
 /// ```
 #[derive(Clone, Debug)]
 pub struct CgroupDef {
+    /// Cgroup name relative to the scenario's parent cgroup. Must be a
+    /// valid cgroupfs filename.
     pub name: Cow<'static, str>,
+    /// Optional cpuset assignment. `None` inherits the parent cgroup's
+    /// cpuset (typically the scenario's usable CPU set).
     pub cpuset: Option<CpusetSpec>,
     /// Work groups to spawn. Empty means use a single default Work
     /// (CpuSpin, Normal, ctx.workers_per_cgroup workers).
@@ -325,8 +329,13 @@ impl From<Vec<CgroupDef>> for Setup {
 /// with only ops (no setup).
 #[derive(Clone, Debug)]
 pub struct Step {
+    /// Cgroup setup applied before (non-`Loop`) or once above (`Loop`)
+    /// the ops list. Runtime cgroups are spawned from this spec.
     pub setup: Setup,
+    /// Ordered operations applied each time the step body runs:
+    /// cpuset edits, task moves, spawn/despawn, etc.
     pub ops: Vec<Op>,
+    /// How long, and whether to loop, after the ops finish one pass.
     pub hold: HoldSpec,
 }
 
@@ -359,7 +368,9 @@ impl Step {
     }
 }
 
-/// How long to hold after a step's ops are applied.
+/// How a step advances after its ops are applied. `Frac` and `Fixed`
+/// hold for a duration; `Loop` repeatedly re-applies `Step::ops` at a
+/// fixed interval instead of holding.
 #[derive(Clone, Debug)]
 pub enum HoldSpec {
     /// Fraction of the total scenario duration.
@@ -642,6 +653,13 @@ impl CpusetSpec {
     }
 
     /// Resolve to a concrete CPU set given the topology.
+    ///
+    /// Out-of-range `Llc` and `Numa` indices are clamped to the
+    /// largest valid index and a `tracing::warn!` is emitted rather
+    /// than panicking. `validate` already rejects these inputs
+    /// upstream; `resolve` is intentionally lenient so a late-bound
+    /// topology mismatch degrades into a usable cpuset instead of a
+    /// crash.
     pub fn resolve(&self, ctx: &Ctx) -> BTreeSet<usize> {
         let usable = ctx.topo.usable_cpus();
         match self {

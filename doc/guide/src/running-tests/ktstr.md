@@ -6,6 +6,10 @@ KVM VMs), `ktstr` operates on the host's real topology and cgroups.
 It does not manage scheduler lifecycle -- start your scheduler
 externally before running.
 
+See also [`cargo ktstr`](cargo-ktstr.md) for cargo-integrated
+workflows including test execution, coverage, BPF verifier stats,
+and gauntlet statistics.
+
 Build from the workspace:
 
 ```sh
@@ -23,6 +27,8 @@ ktstr run
 ktstr run --flags llc,borrow --duration 30
 ktstr run --filter cpuset --json
 ktstr run --work-type YieldHeavy
+ktstr run --repro --kernel-dir ../linux
+ktstr run --auto-repro --probe-stack crash_stack.txt
 ```
 
 Scenarios run under whatever scheduler is currently active on the
@@ -36,10 +42,25 @@ running ktstr.
 
 `--filter` selects scenarios whose name contains the given substring.
 
-**Flags:** llc, borrow, steal, rebal, reject-pin, no-ctrl.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--duration SECS` | `20` | Scenario duration in seconds. |
+| `--workers N` | `4` | Workers per cgroup. |
+| `--flags LIST` | all profiles | Active flags (comma-separated). Omit for all valid profiles. Built-in catalog flags: `llc, borrow, steal, rebal, reject-pin, no-ctrl`. |
+| `--filter SUB` | -- | Run only scenarios whose name contains the substring. |
+| `--json` | off | Output results as JSON. |
+| `--repro` | off | Attach BPF probes for crash capture while running. |
+| `--probe-stack` | -- | Crash stack for auto-probe: a file path or comma-separated function names. |
+| `--auto-repro` | off | Rerun a crashing scenario with probes attached. |
+| `--kernel-dir PATH` | -- | Kernel build directory; used for DWARF source location lookup in probe output (requires `--repro` or `--auto-repro`). |
+| `--work-type NAME` | per-scenario | Override the work type for all cgroups. Case-sensitive; see list below. |
 
-**Work types:** CpuSpin, YieldHeavy, Mixed, IoSync, Bursty, PipeIo,
-FutexPingPong, CachePressure, CacheYield, CachePipe, FutexFanOut.
+**Work types (for `--work-type`):** `CpuSpin`, `YieldHeavy`, `Mixed`,
+`IoSync`, `Bursty`, `PipeIo`, `FutexPingPong`, `CachePressure`,
+`CacheYield`, `CachePipe`, `FutexFanOut`. Names are matched
+case-sensitively. The `Sequence` work type exists in the library but
+is not constructible from `--work-type` because it requires explicit
+phases defined in Rust.
 
 ### list
 
@@ -103,14 +124,17 @@ on all exit paths.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` | auto | Kernel identifier (path, version, or cache key). |
+| `--kernel ID` | auto | Kernel identifier: a source directory path, version string, or cache key. Raw image files are rejected. When absent, resolves via cache then filesystem and, as a last resort, downloads the latest stable kernel from kernel.org and builds it into the cache (`ktstr shell` only — see the note below for how `cargo ktstr shell` differs). |
 | `--topology N,L,C,T` | `1,1,1,1` | Virtual CPU topology as `numa_nodes,llcs,cores,threads`. All values must be >= 1. |
 | `-i, --include-files PATH` | -- | Files or directories to include in the guest. Repeatable. Directories are walked recursively. |
 | `--memory-mb MB` | auto | Guest memory in MB (minimum 128). When absent, estimated from payload and include file sizes. |
 | `--dmesg` | off | Forward kernel console (COM1/dmesg) to stderr in real-time. Sets loglevel=7 for verbose kernel output. |
 | `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
 
-The same subcommand is available as `cargo ktstr shell`.
+`cargo ktstr shell` runs the same VM boot flow, but with two
+differences from `ktstr shell`: it accepts raw image file paths for
+`--kernel`, and when no kernel is discoverable it errors (with a hint
+to run `cargo ktstr kernel build`) instead of auto-downloading.
 
 ### completions
 

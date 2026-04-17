@@ -2,19 +2,41 @@
 
 ## /dev/kvm not accessible
 
+The host-side pre-flight emits one of the following, depending on
+whether the device node is missing or merely unreadable:
+
 ```text
-/dev/kvm not accessible — KVM is required for ktstr_test.
-Check that KVM is enabled and your user is in the kvm group.
+/dev/kvm not found. KVM requires:
+  - Linux kernel with KVM support (CONFIG_KVM)
+  - Access to /dev/kvm (check permissions or add user to 'kvm' group)
+  - Hardware virtualization enabled in BIOS (VT-x/AMD-V)
+```
+
+```text
+/dev/kvm: permission denied. Add your user to the 'kvm' group:
+  sudo usermod -aG kvm $USER
+  then log out and back in.
 ```
 
 ktstr boots Linux kernels in KVM virtual machines. The host must have
 KVM enabled and the user must have read+write access to `/dev/kvm`.
 
+**Diagnose:**
+
+- Check the device exists and inspect its permissions and owning group:
+  `ls -l /dev/kvm`. Typical output: `crw-rw---- 1 root kvm 10, 232 ...`.
+- Confirm the `kvm` group exists and see its members:
+  `getent group kvm`.
+
 **Fixes:**
 
 - Load the KVM module: `modprobe kvm_intel` or `modprobe kvm_amd`.
-- Add your user to the `kvm` group: `sudo usermod -aG kvm $USER`
-  (log out and back in for the group change to take effect).
+- Follow the group-membership hint in the error text above (log out
+  and back in afterward for the group change to take effect).
+- On cloud VMs (GCP, AWS, Azure) or nested hypervisors, nested
+  virtualization is typically off by default. Enable it per the
+  provider's instructions (e.g. GCP `--enable-nested-virtualization`,
+  AWS metal/`.metal` instance types, Azure Dv3/Ev3+ with nested virt).
 - In CI, ensure the runner has KVM access (e.g. `runs-on: [self-hosted, kvm]`).
 
 ## No kernel found

@@ -74,8 +74,9 @@ Workers collect two categories of timing data:
 recorded around blocking operations. Populated for work types with a
 blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
 (futex wait), FutexFanOut (futex wait, receivers only), CacheYield
-(yield), CachePipe (pipe read), IoSync (sleep). Each sample
-is `Instant::elapsed()` across the blocking call, in nanoseconds.
+(yield), CachePipe (pipe read), IoSync (sleep), and Sequence when
+its phases include Sleep, Yield, or Io. Each sample is
+`Instant::elapsed()` across the blocking call, in nanoseconds.
 
 **schedstat deltas**: read from `/proc/self/schedstat` at work-loop
 start and end. Three fields:
