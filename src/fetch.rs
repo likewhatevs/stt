@@ -62,6 +62,60 @@ fn is_rc(version: &str) -> bool {
     version.contains("-rc")
 }
 
+/// Find the latest version in the same major.minor series from releases.json.
+///
+/// Returns `Some("6.14.10")` for prefix `"6.14"` if that series exists in
+/// releases.json. Returns `None` if the series is not found (EOL or invalid).
+fn latest_in_series(version: &str) -> Option<String> {
+    let prefix = {
+        let parts: Vec<&str> = version.split('.').collect();
+        if parts.len() >= 2 {
+            format!("{}.{}", parts[0], parts[1])
+        } else {
+            return None;
+        }
+    };
+
+    let releases = fetch_releases().ok()?;
+    let mut best: Option<(String, (u32, u32, u32))> = None;
+    for (moniker, ver) in &releases {
+        if moniker == "linux-next" {
+            continue;
+        }
+        if !ver.starts_with(&prefix) {
+            continue;
+        }
+        if ver.len() != prefix.len() && ver.as_bytes()[prefix.len()] != b'.' {
+            continue;
+        }
+        if let Some(tuple) = version_tuple(ver)
+            && (best.is_none() || tuple > best.as_ref().unwrap().1)
+        {
+            best = Some((ver.clone(), tuple));
+        }
+    }
+    best.map(|(v, _)| v)
+}
+
+/// Build a user-facing error message for a version that was not found.
+///
+/// Suggests the latest version in the same major.minor series when
+/// releases.json contains one.
+fn version_not_found_msg(version: &str) -> String {
+    let parts: Vec<&str> = version.split('.').collect();
+    let prefix = if parts.len() >= 2 {
+        format!("{}.{}", parts[0], parts[1])
+    } else {
+        version.to_string()
+    };
+    match latest_in_series(version) {
+        Some(latest) if latest != version => {
+            format!("version {version} not found. latest {prefix}.x: {latest}")
+        }
+        _ => format!("version {version} not found"),
+    }
+}
+
 /// Reject responses where the server returned HTML instead of a binary
 /// archive. Some CDN error pages return 200 with text/html.
 fn reject_html_response(response: &reqwest::blocking::Response, url: &str) -> Result<(), String> {
@@ -100,6 +154,9 @@ fn download_stable_tarball(
 
     let response = reqwest::blocking::get(&url).map_err(|e| format!("download {url}: {e}"))?;
     if !response.status().is_success() {
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(version_not_found_msg(version));
+        }
         return Err(format!("download {url}: HTTP {}", response.status()));
     }
     reject_html_response(&response, &url)?;

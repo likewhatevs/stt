@@ -340,11 +340,27 @@ during auto-download, see
 [Kernel auto-download failures](#kernel-auto-download-failures).
 
 ```text
-download https://cdn.kernel.org/.../linux-6.99.0.tar.xz: HTTP 404
+version 6.14.22 not found. latest 6.14.x: 6.14.10
 ```
 
-The version does not exist on kernel.org. RC releases are removed from
-git.kernel.org after the stable version ships.
+The requested version does not exist on kernel.org. When a version in
+the same major.minor series is available in releases.json, the error
+suggests it.
+
+```text
+version 5.4.99 not found
+```
+
+When the series is EOL or not in releases.json, only the "not found"
+message appears (no suggestion).
+
+```text
+RC tarball not found: https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz
+  RC releases are removed from git.kernel.org after the stable version ships.
+```
+
+RC tarballs are removed from git.kernel.org after the stable version
+ships. Use `--git` with a git.kernel.org URL to clone the tag instead.
 
 ```text
 download ...: server returned HTML instead of tarball (URL may be invalid)
@@ -355,6 +371,7 @@ The download rejects these responses.
 
 **Fixes:**
 
+- Check the suggested version in the error message.
 - Verify the version exists: check
   `https://www.kernel.org/releases.json` for available versions.
 - For RC releases, use `--git` with a git.kernel.org URL instead of
