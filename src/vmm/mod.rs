@@ -5423,7 +5423,6 @@ mod tests {
                 if doms.is_empty() {
                     continue;
                 }
-                assert!(!doms.is_empty(), "must have at least one sched_domain");
                 for w in doms.windows(2) {
                     assert!(
                         w[1].level > w[0].level,

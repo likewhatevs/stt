@@ -210,7 +210,7 @@ pub(crate) fn fetch_releases() -> Result<Vec<(String, String)>, String> {
 /// Fetch the latest stable kernel version from kernel.org.
 ///
 /// Selects from the `releases` array (moniker "stable" or "longterm"),
-/// requiring at least 8 patch releases to avoid brand-new major versions
+/// requiring patch version >= 8 to avoid brand-new major versions
 /// that may have build issues on CI runners.
 pub fn fetch_latest_stable_version() -> Result<String, String> {
     eprintln!("ktstr: fetching latest kernel version");
@@ -298,14 +298,15 @@ pub fn fetch_version_for_prefix(prefix: &str) -> Result<String, String> {
 
 /// Probe cdn.kernel.org to find the highest patch version for an EOL series.
 ///
-/// Sends HEAD requests for {prefix}.1, {prefix}.2, ... until a 404.
-/// Returns the last version that returned 200.
+/// Sends HEAD requests for {prefix}.1, {prefix}.2, ... until a non-success
+/// response or the safety cap (500). Returns the last version that returned
+/// 200 with a non-HTML content type.
 fn probe_latest_patch(prefix: &str) -> Result<String, String> {
     let major = major_version(prefix)?;
     let client = reqwest::blocking::Client::new();
 
     let mut last_good: Option<String> = None;
-    for patch in 1u32.. {
+    for patch in 1u32..=500 {
         let version = format!("{prefix}.{patch}");
         let url =
             format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz");
@@ -314,6 +315,12 @@ fn probe_latest_patch(prefix: &str) -> Result<String, String> {
             .send()
             .map_err(|e| format!("HEAD {url}: {e}"))?;
         if !response.status().is_success() {
+            break;
+        }
+        if let Some(ct) = response.headers().get(reqwest::header::CONTENT_TYPE)
+            && let Ok(ct_str) = ct.to_str()
+            && ct_str.contains("text/html")
+        {
             break;
         }
         last_good = Some(version);
