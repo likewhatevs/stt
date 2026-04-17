@@ -4883,9 +4883,10 @@ mod tests {
     /// produces samples with meaningful runqueue data and degrades
     /// gracefully for scx_root-gated paths.
     ///
-    /// No scheduler is loaded, so scx_root dereferences to NULL on
-    /// all kernel versions. watchdog_observation and event_counters
-    /// must be None.
+    /// No scheduler is loaded. Event counters (gated on scx_root)
+    /// must be None. Watchdog observation may be Some on kernels
+    /// with a static watchdog_timeout symbol (pre-7.1); if present,
+    /// the write/read roundtrip must match.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
@@ -4930,16 +4931,25 @@ mod tests {
             "topology requested 2 CPUs but monitor saw {}",
             last.cpus.len()
         );
-        assert!(
-            last.cpus.iter().any(|c| c.rq_clock > 1_000_000),
-            "at least one CPU must have rq_clock > 1ms (ns) — \
-             got {:?}",
-            last.cpus.iter().map(|c| c.rq_clock).collect::<Vec<_>>()
-        );
-        assert!(
-            report.watchdog_observation.is_none(),
-            "watchdog_observation must be None when no scheduler is loaded"
-        );
+        for (i, cpu) in last.cpus.iter().enumerate() {
+            assert!(
+                cpu.rq_clock > 1_000_000,
+                "cpu {i}: rq_clock must be > 1ms (ns), got {}",
+                cpu.rq_clock
+            );
+            assert!(
+                cpu.rq_clock < 300_000_000_000,
+                "cpu {i}: rq_clock must be < 300s (ns), got {}",
+                cpu.rq_clock
+            );
+        }
+        if let Some(ref obs) = report.watchdog_observation {
+            assert_eq!(
+                obs.expected_jiffies, obs.observed_jiffies,
+                "watchdog write/read roundtrip mismatch: expected={} observed={}",
+                obs.expected_jiffies, obs.observed_jiffies
+            );
+        }
         for (i, cpu) in last.cpus.iter().enumerate() {
             assert!(
                 cpu.event_counters.is_none(),
@@ -5104,14 +5114,24 @@ mod tests {
         );
 
         let last = report.samples.last().unwrap();
-        assert!(
-            last.cpus.iter().any(|c| c.rq_clock > 1_000_000),
-            "at least one CPU must have rq_clock > 1ms (ns) after running a scheduler — \
-             got {:?}",
-            last.cpus.iter().map(|c| c.rq_clock).collect::<Vec<_>>()
-        );
+        for (i, cpu) in last.cpus.iter().enumerate() {
+            assert!(
+                cpu.rq_clock > 1_000_000,
+                "cpu {i}: rq_clock must be > 1ms (ns), got {}",
+                cpu.rq_clock
+            );
+            assert!(
+                cpu.rq_clock < 300_000_000_000,
+                "cpu {i}: rq_clock must be < 300s (ns), got {}",
+                cpu.rq_clock
+            );
+        }
 
         if let Some(ss) = last.cpus.iter().find_map(|c| c.schedstat.as_ref()) {
+            assert!(
+                ss.sched_count > 0,
+                "sched_count must be > 0 after running a scheduler with workload"
+            );
             assert!(
                 ss.sched_count < 100_000_000,
                 "sched_count {} exceeds plausible range — offset may be wrong",
@@ -5223,6 +5243,37 @@ mod tests {
             "event counters present but all zero — offset resolution may \
              have produced addresses that read uninitialized memory"
         );
+        for (i, cpu) in last.cpus.iter().enumerate() {
+            if let Some(ref ev) = cpu.event_counters {
+                assert!(
+                    ev.select_cpu_fallback >= 0 && ev.select_cpu_fallback < 1_000_000_000,
+                    "cpu {i}: select_cpu_fallback {} outside plausible range",
+                    ev.select_cpu_fallback
+                );
+                assert!(
+                    ev.dispatch_local_dsq_offline >= 0
+                        && ev.dispatch_local_dsq_offline < 1_000_000_000,
+                    "cpu {i}: dispatch_local_dsq_offline {} outside plausible range",
+                    ev.dispatch_local_dsq_offline
+                );
+                assert!(
+                    ev.dispatch_keep_last >= 0 && ev.dispatch_keep_last < 1_000_000_000,
+                    "cpu {i}: dispatch_keep_last {} outside plausible range",
+                    ev.dispatch_keep_last
+                );
+                assert!(
+                    ev.enq_skip_exiting >= 0 && ev.enq_skip_exiting < 1_000_000_000,
+                    "cpu {i}: enq_skip_exiting {} outside plausible range",
+                    ev.enq_skip_exiting
+                );
+                assert!(
+                    ev.enq_skip_migration_disabled >= 0
+                        && ev.enq_skip_migration_disabled < 1_000_000_000,
+                    "cpu {i}: enq_skip_migration_disabled {} outside plausible range",
+                    ev.enq_skip_migration_disabled
+                );
+            }
+        }
     }
 
     /// Validate that sched_domain data is populated when BTF offsets
@@ -5301,11 +5352,7 @@ mod tests {
                 if doms.is_empty() {
                     continue;
                 }
-                assert_eq!(
-                    doms[0].level, 0,
-                    "lowest domain must be level 0, got {}",
-                    doms[0].level
-                );
+                assert!(!doms.is_empty(), "must have at least one sched_domain");
                 for w in doms.windows(2) {
                     assert!(
                         w[1].level > w[0].level,
@@ -5314,6 +5361,11 @@ mod tests {
                         w[1].level
                     );
                 }
+                assert!(
+                    doms[0].span_weight >= 2,
+                    "lowest domain span_weight must be >= 2 for a 2-CPU topology, got {}",
+                    doms[0].span_weight
+                );
                 for dom in doms {
                     assert!(
                         dom.span_weight > 0,

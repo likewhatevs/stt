@@ -236,31 +236,93 @@ pub fn fetch_latest_stable_version() -> Result<String, String> {
     Ok(version.to_string())
 }
 
-/// Resolve the latest patch release for a major.minor prefix.
+/// Parse a version string into numeric components for comparison.
+/// "6.14.2" → Some((6, 14, 2)), "6.14" → Some((6, 14, 0)),
+/// "7.0" → Some((7, 0, 0)). Returns None for unparseable versions.
+fn version_tuple(version: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<&str> = version.split('.').collect();
+    match parts.len() {
+        2 => {
+            let major = parts[0].parse().ok()?;
+            let minor = parts[1].parse().ok()?;
+            Some((major, minor, 0))
+        }
+        3 => {
+            let major = parts[0].parse().ok()?;
+            let minor = parts[1].parse().ok()?;
+            let patch = parts[2].parse().ok()?;
+            Some((major, minor, patch))
+        }
+        _ => None,
+    }
+}
+
+/// Resolve the highest version matching a prefix.
 ///
-/// E.g., "6.12" → "6.12.8" (the highest 6.12.x in releases.json).
+/// E.g., "6.12" → "6.12.81", "6" → "6.19.12" (highest 6.x.y).
+///
+/// Scans all monikers in releases.json except linux-next. If no
+/// match is found (EOL series), probes cdn.kernel.org with HEAD
+/// requests to find the highest patch version with a tarball.
 pub fn fetch_version_for_prefix(prefix: &str) -> Result<String, String> {
     eprintln!("ktstr: fetching latest {prefix}.x kernel version");
     let releases = fetch_releases()?;
 
-    let mut best: Option<&str> = None;
+    let mut best: Option<(&str, (u32, u32, u32))> = None;
     for (moniker, version) in &releases {
-        if moniker == "mainline" {
+        if moniker == "linux-next" {
             continue;
         }
-        if version.starts_with(prefix)
-            && (version.len() == prefix.len() || version.as_bytes()[prefix.len()] == b'.')
-        {
-            // First match is newest (releases.json is ordered newest first).
-            if best.is_none() {
-                best = Some(version.as_str());
-            }
+        if !version.starts_with(prefix) {
+            continue;
+        }
+        if version.len() != prefix.len() && version.as_bytes()[prefix.len()] != b'.' {
+            continue;
+        }
+        let Some(tuple) = version_tuple(version) else {
+            continue;
+        };
+        if best.is_none() || tuple > best.unwrap().1 {
+            best = Some((version.as_str(), tuple));
         }
     }
 
-    let version = best.ok_or_else(|| format!("no release matching {prefix}.x found"))?;
-    eprintln!("ktstr: latest {prefix}.x kernel: {version}");
-    Ok(version.to_string())
+    if let Some((version, _)) = best {
+        eprintln!("ktstr: latest {prefix}.x kernel: {version}");
+        return Ok(version.to_string());
+    }
+
+    eprintln!("ktstr: {prefix}.x not in releases.json (EOL series), probing cdn.kernel.org");
+    probe_latest_patch(prefix)
+}
+
+/// Probe cdn.kernel.org to find the highest patch version for an EOL series.
+///
+/// Sends HEAD requests for {prefix}.1, {prefix}.2, ... until a 404.
+/// Returns the last version that returned 200.
+fn probe_latest_patch(prefix: &str) -> Result<String, String> {
+    let major = major_version(prefix)?;
+    let client = reqwest::blocking::Client::new();
+
+    let mut last_good: Option<String> = None;
+    for patch in 1u32.. {
+        let version = format!("{prefix}.{patch}");
+        let url =
+            format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz");
+        let response = client
+            .head(&url)
+            .send()
+            .map_err(|e| format!("HEAD {url}: {e}"))?;
+        if !response.status().is_success() {
+            break;
+        }
+        last_good = Some(version);
+    }
+
+    let version =
+        last_good.ok_or_else(|| format!("no tarball found for {prefix}.x on cdn.kernel.org"))?;
+    eprintln!("ktstr: latest {prefix}.x kernel (from cdn probe): {version}");
+    Ok(version)
 }
 
 /// Clone a git repository with shallow depth.
