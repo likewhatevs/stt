@@ -313,7 +313,7 @@ pub mod prelude {
     pub use crate::test_support::{
         BpfMapWrite, CgroupPath, NumaDistance, NumaNode, Scheduler, SchedulerSpec, Sysctl,
     };
-    pub use crate::topology::{LlcInfo, TestTopology};
+    pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
         AffinityKind, AffinityMode, MemPolicy, Phase, SchedPolicy, Work, WorkType, WorkerReport,
         WorkloadConfig, WorkloadHandle,

@@ -51,16 +51,41 @@ impl LlcInfo {
     }
 }
 
+/// Per-node memory information (total and free KiB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeMemInfo {
+    /// Total memory in KiB.
+    pub total_kb: u64,
+    /// Free memory in KiB.
+    pub free_kb: u64,
+}
+
+impl NodeMemInfo {
+    /// Used memory in KiB (`total_kb - free_kb`).
+    pub fn used_kb(&self) -> u64 {
+        self.total_kb.saturating_sub(self.free_kb)
+    }
+}
+
 /// CPU topology abstraction for test configuration.
 ///
-/// Provides LLC-aware CPU partitioning, cpuset generation, and
-/// topology queries. Built from sysfs (`from_system()`), a VM spec
-/// (`from_spec()`), or synthetic parameters (test-only).
+/// Provides LLC-aware CPU partitioning, cpuset generation, NUMA
+/// distance queries, and per-node memory introspection. Built from
+/// sysfs (`from_system()`), a VM spec (`from_spec()`), or synthetic
+/// parameters (test-only).
 #[derive(Debug, Clone)]
 pub struct TestTopology {
     cpus: Vec<usize>,
     llcs: Vec<LlcInfo>,
     numa_nodes: BTreeSet<usize>,
+    /// Flat row-major NxN distance matrix. Dimension equals
+    /// `numa_nodes.len()`, rows ordered by ascending node ID.
+    /// Default 10/20 when sysfs distances are unavailable.
+    numa_distances: Vec<u8>,
+    /// Per-node memory info, keyed by NUMA node ID.
+    node_mem: BTreeMap<usize, NodeMemInfo>,
+    /// NUMA nodes that have memory but no CPUs (CXL memory-only).
+    memory_only_nodes: BTreeSet<usize>,
 }
 
 /// Parse a CPU list string (e.g., "0-3,5,7-9") into a sorted vec of CPU IDs.
@@ -214,6 +239,54 @@ fn read_core_id(cpu: usize) -> Option<usize> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// Read per-node memory info from `/sys/devices/system/node/nodeN/meminfo`.
+///
+/// Parses `MemTotal` and `MemFree` lines; returns `None` if the file
+/// is missing or unparseable.
+fn read_node_meminfo(node: usize) -> Option<NodeMemInfo> {
+    let path = format!("/sys/devices/system/node/node{node}/meminfo");
+    let content = fs::read_to_string(path).ok()?;
+    let mut total_kb = None;
+    let mut free_kb = None;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_suffix("kB").map(str::trim_end) {
+            if rest.contains("MemTotal") {
+                total_kb = rest
+                    .rsplit_once(char::is_whitespace)
+                    .and_then(|(_, v)| v.parse().ok());
+            } else if rest.contains("MemFree") {
+                free_kb = rest
+                    .rsplit_once(char::is_whitespace)
+                    .and_then(|(_, v)| v.parse().ok());
+            }
+        }
+    }
+    Some(NodeMemInfo {
+        total_kb: total_kb?,
+        free_kb: free_kb?,
+    })
+}
+
+/// Read NUMA distance row from `/sys/devices/system/node/nodeN/distance`.
+///
+/// Returns the space-separated distance values as a `Vec<u8>`.
+fn read_node_distances(node: usize) -> Option<Vec<u8>> {
+    let path = format!("/sys/devices/system/node/node{node}/distance");
+    let content = fs::read_to_string(path).ok()?;
+    let values: Option<Vec<u8>> = content.split_whitespace().map(|s| s.parse().ok()).collect();
+    values
+}
+
+/// Read the cpulist for a NUMA node. Returns `true` if the node has
+/// no CPUs (memory-only / CXL).
+fn is_node_memory_only(node: usize) -> bool {
+    let path = format!("/sys/devices/system/node/node{node}/cpulist");
+    match fs::read_to_string(path) {
+        Ok(s) => s.trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
 impl TestTopology {
     /// Discover topology from sysfs (reads `/sys/devices/system/cpu/`).
     pub fn from_system() -> Result<Self> {
@@ -270,10 +343,76 @@ impl TestTopology {
                 siblings.sort();
             }
         }
+
+        // Discover additional NUMA nodes from /sys/devices/system/node/
+        // (catches memory-only nodes that have no CPUs).
+        if let Ok(entries) = fs::read_dir("/sys/devices/system/node") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(id_str) = name.strip_prefix("node")
+                    && let Ok(id) = id_str.parse::<usize>()
+                {
+                    numa_nodes.insert(id);
+                }
+            }
+        }
+
+        let n = numa_nodes.len();
+        let node_ids: Vec<usize> = numa_nodes.iter().copied().collect();
+
+        // Read per-node memory info.
+        let mut node_mem = BTreeMap::new();
+        for &nid in &node_ids {
+            if let Some(mi) = read_node_meminfo(nid) {
+                node_mem.insert(nid, mi);
+            }
+        }
+
+        // Identify memory-only nodes.
+        let mut memory_only_nodes = BTreeSet::new();
+        for &nid in &node_ids {
+            if is_node_memory_only(nid) {
+                memory_only_nodes.insert(nid);
+            }
+        }
+
+        // Build distance matrix. Try sysfs first, fall back to 10/20.
+        let numa_distances = {
+            let mut matrix = Vec::with_capacity(n * n);
+            let mut from_sysfs = true;
+            for &nid in &node_ids {
+                if let Some(row) = read_node_distances(nid) {
+                    if row.len() == n {
+                        matrix.extend_from_slice(&row);
+                    } else {
+                        from_sysfs = false;
+                        break;
+                    }
+                } else {
+                    from_sysfs = false;
+                    break;
+                }
+            }
+            if !from_sysfs || matrix.len() != n * n {
+                matrix.clear();
+                matrix.resize(n * n, 0);
+                for i in 0..n {
+                    for j in 0..n {
+                        matrix[i * n + j] = if i == j { 10 } else { 20 };
+                    }
+                }
+            }
+            matrix
+        };
+
         Ok(Self {
             cpus: cpus.into_iter().collect(),
             llcs: llc_map.into_values().collect(),
             numa_nodes,
+            numa_distances,
+            node_mem,
+            memory_only_nodes,
         })
     }
 
@@ -345,6 +484,31 @@ impl TestTopology {
             .filter(|llc| llc.cpus.iter().any(|c| cpus.contains(c)))
             .map(|llc| llc.numa_node)
             .collect()
+    }
+
+    /// Per-node memory info. Returns `None` when the node ID is not
+    /// present or meminfo is unavailable.
+    pub fn node_meminfo(&self, node_id: usize) -> Option<&NodeMemInfo> {
+        self.node_mem.get(&node_id)
+    }
+
+    /// Inter-node NUMA distance. Returns 255 when either node ID is
+    /// not present, matching the kernel's unreachable distance.
+    pub fn numa_distance(&self, from: usize, to: usize) -> u8 {
+        let n = self.numa_nodes.len();
+        let Some(from_idx) = self.numa_nodes.iter().position(|&id| id == from) else {
+            return 255;
+        };
+        let Some(to_idx) = self.numa_nodes.iter().position(|&id| id == to) else {
+            return 255;
+        };
+        self.numa_distances[from_idx * n + to_idx]
+    }
+
+    /// Whether the node is memory-only (has RAM but no CPUs). Typical
+    /// for CXL-attached memory tiers.
+    pub fn is_memory_only(&self, node_id: usize) -> bool {
+        self.memory_only_nodes.contains(&node_id)
     }
 
     /// One `BTreeSet` of CPUs per LLC.
@@ -437,11 +601,21 @@ impl TestTopology {
                 }
             })
             .collect();
-        let numa_node_set = (0..numa_nodes as usize).collect();
+        let n = numa_nodes as usize;
+        let numa_node_set: BTreeSet<usize> = (0..n).collect();
+        let mut distances = vec![0u8; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                distances[i * n + j] = if i == j { 10 } else { 20 };
+            }
+        }
         Self {
             cpus,
             llcs: llc_infos,
             numa_nodes: numa_node_set,
+            numa_distances: distances,
+            node_mem: BTreeMap::new(),
+            memory_only_nodes: BTreeSet::new(),
         }
     }
 
@@ -465,11 +639,21 @@ impl TestTopology {
                 }
             })
             .collect();
-        let numa_nodes = (0..num_llcs).collect();
+        let n = num_llcs;
+        let numa_nodes: BTreeSet<usize> = (0..n).collect();
+        let mut distances = vec![0u8; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                distances[i * n + j] = if i == j { 10 } else { 20 };
+            }
+        }
         Self {
             cpus,
             llcs,
             numa_nodes,
+            numa_distances: distances,
+            node_mem: BTreeMap::new(),
+            memory_only_nodes: BTreeSet::new(),
         }
     }
 }
@@ -971,5 +1155,90 @@ mod tests {
     fn numa_nodes_for_cpuset_empty() {
         let t = TestTopology::from_spec(2, 4, 4, 1);
         assert!(t.numa_nodes_for_cpuset(&BTreeSet::new()).is_empty());
+    }
+
+    // -- NUMA distance tests --
+
+    #[test]
+    fn from_spec_numa_distance_local() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        assert_eq!(t.numa_distance(0, 0), 10);
+        assert_eq!(t.numa_distance(1, 1), 10);
+    }
+
+    #[test]
+    fn from_spec_numa_distance_remote() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        assert_eq!(t.numa_distance(0, 1), 20);
+        assert_eq!(t.numa_distance(1, 0), 20);
+    }
+
+    #[test]
+    fn from_spec_numa_distance_single_node() {
+        let t = TestTopology::from_spec(1, 2, 4, 1);
+        assert_eq!(t.numa_distance(0, 0), 10);
+    }
+
+    #[test]
+    fn numa_distance_invalid_node() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        assert_eq!(t.numa_distance(0, 99), 255);
+        assert_eq!(t.numa_distance(99, 0), 255);
+    }
+
+    #[test]
+    fn synthetic_distances_default() {
+        let t = TestTopology::synthetic(8, 2);
+        assert_eq!(t.numa_distance(0, 0), 10);
+        assert_eq!(t.numa_distance(0, 1), 20);
+        assert_eq!(t.numa_distance(1, 0), 20);
+    }
+
+    // -- node_meminfo tests --
+
+    #[test]
+    fn node_meminfo_used_kb() {
+        let mi = NodeMemInfo {
+            total_kb: 1024,
+            free_kb: 256,
+        };
+        assert_eq!(mi.used_kb(), 768);
+    }
+
+    #[test]
+    fn node_meminfo_used_kb_saturates() {
+        let mi = NodeMemInfo {
+            total_kb: 0,
+            free_kb: 100,
+        };
+        assert_eq!(mi.used_kb(), 0);
+    }
+
+    #[test]
+    fn from_spec_no_meminfo() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        assert!(t.node_meminfo(0).is_none());
+        assert!(t.node_meminfo(1).is_none());
+    }
+
+    #[test]
+    fn synthetic_no_meminfo() {
+        let t = TestTopology::synthetic(8, 2);
+        assert!(t.node_meminfo(0).is_none());
+    }
+
+    // -- is_memory_only tests --
+
+    #[test]
+    fn from_spec_not_memory_only() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        assert!(!t.is_memory_only(0));
+        assert!(!t.is_memory_only(1));
+    }
+
+    #[test]
+    fn is_memory_only_nonexistent_node() {
+        let t = TestTopology::from_spec(2, 4, 4, 1);
+        assert!(!t.is_memory_only(99));
     }
 }
