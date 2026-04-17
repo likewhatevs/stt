@@ -132,9 +132,9 @@ enum KtstrCommand {
         /// Kernel identifier: a source directory path (e.g. `../linux`),
         /// a raw image file (`bzImage` / `Image`), a version
         /// (`6.14.2`), or a cache key (see `cargo ktstr kernel list`).
-        /// When absent, resolves via cache then filesystem; errors
-        /// with a hint if nothing is found (run `cargo ktstr kernel
-        /// build` first).
+        /// Source directories auto-build (can be slow on a fresh tree).
+        /// When absent, resolves via cache then filesystem, falling back
+        /// to downloading the latest stable kernel from kernel.org.
         #[arg(long)]
         kernel: Option<String>,
         /// Virtual topology as "numa_nodes,llcs,cores,threads".
@@ -400,42 +400,18 @@ fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
     None
 }
 
-/// Resolve a kernel identifier to a bootable image path.
-///
-/// Uses `ktstr::cli::resolve_cached_kernel` for Version/CacheKey
-/// lookups so GHA remote cache is checked when enabled.
-fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
-    use ktstr::kernel_path::KernelId;
+/// Policy for cargo-ktstr's shell + verifier kernel resolution:
+/// accept raw image files, use "cargo ktstr" as the CLI label.
+const KERNEL_POLICY: ktstr::cli::KernelResolvePolicy<'static> = ktstr::cli::KernelResolvePolicy {
+    accept_raw_image: true,
+    cli_label: "cargo ktstr",
+};
 
-    if let Some(val) = kernel {
-        match KernelId::parse(val) {
-            KernelId::Path(p) => {
-                let path = PathBuf::from(&p);
-                if path.is_file() {
-                    Ok(path)
-                } else if path.is_dir() {
-                    ktstr::kernel_path::find_image_in_dir(&path)
-                        .ok_or_else(|| format!("no kernel image found in {}", path.display()))
-                } else {
-                    Err(format!("kernel path not found: {}", path.display()))
-                }
-            }
-            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
-                    .map_err(|e| format!("{e:#}"))?;
-                ktstr::kernel_path::find_image_in_dir(&cache_dir)
-                    .ok_or_else(|| format!("no kernel image found in {}", cache_dir.display()))
-            }
-        }
-    } else {
-        ktstr::find_kernel()
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or_else(|| {
-                "no kernel found. Provide --kernel or run \
-                 `cargo ktstr kernel build` to download and cache one."
-                    .to_string()
-            })
-    }
+/// Resolve a kernel identifier to a bootable image path via the
+/// shared `ktstr::cli::resolve_kernel_image` helper with cargo-ktstr's
+/// policy.
+fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
+    ktstr::cli::resolve_kernel_image(kernel, &KERNEL_POLICY).map_err(|e| format!("{e:#}"))
 }
 
 fn run_shell(

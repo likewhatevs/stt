@@ -197,9 +197,8 @@ output format.
 
 Shares the VM boot flow with `ktstr shell` and accepts the same
 flags. See [ktstr shell](ktstr.md#shell) for the full flag
-reference and the two behavior differences (`--kernel` accepting
-raw image files, and the no-discoverable-kernel error path instead
-of an auto-download fallback) called out there.
+reference. The one behavior difference from `ktstr shell` is that
+`cargo ktstr shell` accepts raw image file paths for `--kernel`.
 
 ```sh
 cargo ktstr shell

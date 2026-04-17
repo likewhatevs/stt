@@ -135,10 +135,10 @@ on all exit paths.
 | `--dmesg` | off | Forward kernel console (COM1/dmesg) to stderr in real-time. Sets loglevel=7 for verbose kernel output. |
 | `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
 
-`cargo ktstr shell` runs the same VM boot flow, but with two
-differences from `ktstr shell`: it accepts raw image file paths for
-`--kernel`, and when no kernel is discoverable it errors (with a hint
-to run `cargo ktstr kernel build`) instead of auto-downloading.
+`cargo ktstr shell` runs the same VM boot flow and differs in one
+respect: it accepts raw image file paths for `--kernel` (e.g.
+`bzImage`, `Image`). Source-tree directories auto-build and no-kernel
+invocations auto-download — same as `ktstr shell`.
 
 ### completions
 

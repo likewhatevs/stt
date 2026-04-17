@@ -111,9 +111,11 @@ enum Command {
     Shell {
         /// Kernel identifier: a source directory path (e.g. `../linux`),
         /// a version (`6.14.2`), or a cache key (see `ktstr kernel list`).
-        /// Raw image files are rejected. When absent, resolves via cache
-        /// then filesystem and falls back to downloading the latest
-        /// stable kernel from kernel.org and building it into the cache.
+        /// Raw image files are rejected. Source directories auto-build
+        /// (can be slow on a fresh tree). When absent, resolves via
+        /// cache then filesystem and falls back to downloading the
+        /// latest stable kernel from kernel.org and building it into
+        /// the cache.
         #[arg(long)]
         kernel: Option<String>,
         /// Virtual topology as "numa_nodes,llcs,cores,threads".
@@ -476,7 +478,13 @@ fn main() -> Result<()> {
             exec,
         } => {
             cli::check_kvm()?;
-            let kernel_path = cli::resolve_kernel_image(kernel.as_deref())?;
+            let kernel_path = cli::resolve_kernel_image(
+                kernel.as_deref(),
+                &cli::KernelResolvePolicy {
+                    accept_raw_image: false,
+                    cli_label: "ktstr",
+                },
+            )?;
 
             // Parse topology "N,L,C,T" (numa_nodes,llcs,cores,threads).
             let parts: Vec<&str> = topology.split(',').collect();

@@ -915,12 +915,32 @@ pub fn resolve_cached_kernel(
     }
 }
 
+/// Policy controlling `resolve_kernel_image` behavior across binaries.
+///
+/// Each binary passes its own policy to share the resolution pipeline
+/// while keeping documented divergences (currently only raw-image
+/// acceptance).
+pub struct KernelResolvePolicy<'a> {
+    /// Accept raw kernel image files (e.g. `bzImage`, `Image`) passed
+    /// as `--kernel`. `ktstr` uses `false` (rejects); `cargo ktstr`
+    /// uses `true` (accepts).
+    pub accept_raw_image: bool,
+    /// CLI label for diagnostic status messages (e.g. `"ktstr"`,
+    /// `"cargo ktstr"`), threaded into auto-build and auto-download
+    /// status output.
+    pub cli_label: &'a str,
+}
+
 /// Resolve a kernel identifier to a bootable image path.
 ///
 /// Handles `KernelId` variants: directory (auto-build), version
-/// string, and cache key. Raw image file paths are rejected.
-/// The `None` case resolves automatically via cache then filesystem.
-pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> {
+/// string, and cache key. Raw image file acceptance is controlled by
+/// `policy.accept_raw_image`. The `None` case resolves automatically
+/// via cache then filesystem, falling back to auto-download.
+pub fn resolve_kernel_image(
+    kernel: Option<&str>,
+    policy: &KernelResolvePolicy<'_>,
+) -> Result<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
 
     if let Some(val) = kernel {
@@ -928,22 +948,26 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
             KernelId::Path(p) => {
                 let path = std::path::PathBuf::from(&p);
                 if path.is_dir() {
-                    resolve_kernel_dir(&path)
+                    resolve_kernel_dir(&path, policy.cli_label)
                 } else if path.is_file() {
-                    // Raw kernel image file — reject. Use a source
-                    // directory or version string so kconfig validation
-                    // and caching work correctly.
-                    bail!(
-                        "--kernel {}: raw image files are not supported. \
-                         Pass a source directory, version, or cache key.",
-                        path.display()
-                    )
+                    if policy.accept_raw_image {
+                        Ok(path)
+                    } else {
+                        // Raw kernel image file — reject. Use a source
+                        // directory or version string so kconfig validation
+                        // and caching work correctly.
+                        bail!(
+                            "--kernel {}: raw image files are not supported. \
+                             Pass a source directory, version, or cache key.",
+                            path.display()
+                        )
+                    }
                 } else {
                     bail!("kernel path not found: {}", path.display())
                 }
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = resolve_cached_kernel(&id, "ktstr")?;
+                let cache_dir = resolve_cached_kernel(&id, policy.cli_label)?;
                 crate::kernel_path::find_image_in_dir(&cache_dir).ok_or_else(|| {
                     anyhow::anyhow!("no kernel image found in {}", cache_dir.display())
                 })
@@ -952,7 +976,7 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
     } else {
         match crate::find_kernel()? {
             Some(image) => Ok(image),
-            None => auto_download_kernel(),
+            None => auto_download_kernel(policy.cli_label),
         }
     }
 }
@@ -962,9 +986,12 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
 /// Called when no --kernel is specified and no kernel is found via
 /// cache or filesystem. Downloads the latest stable tarball from
 /// kernel.org and delegates to [`kernel_build_pipeline`] for
-/// configure, build, validate, and cache.
-fn auto_download_kernel() -> Result<std::path::PathBuf> {
-    status("ktstr: no kernel found, downloading latest stable");
+/// configure, build, validate, and cache. `cli_label` prefixes
+/// status output (e.g. `"ktstr"`, `"cargo ktstr"`).
+pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
+    status(&format!(
+        "{cli_label}: no kernel found, downloading latest stable"
+    ));
 
     let sp = Spinner::start("Fetching latest kernel version...");
     let ver = crate::fetch::fetch_latest_stable_version().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -992,7 +1019,7 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
     sp.finish("Downloaded");
 
     let cache = crate::cache::CacheDir::new()?;
-    let result = kernel_build_pipeline(&acquired, &cache, "ktstr", false, false)?;
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false)?;
 
     match result.entry {
         Some(entry) => Ok(entry.path.join(image_name)),
@@ -1005,8 +1032,10 @@ fn auto_download_kernel() -> Result<std::path::PathBuf> {
 /// Resolve a kernel directory: auto-build from source tree.
 ///
 /// Requires Makefile + Kconfig. Checks cache for clean trees,
-/// delegates to [`kernel_build_pipeline`] on miss.
-fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
+/// delegates to [`kernel_build_pipeline`] on miss. `cli_label`
+/// prefixes status output and is passed through to
+/// [`kernel_build_pipeline`] as the diagnostic label.
+pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std::path::PathBuf> {
     let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
     if !is_source_tree {
         bail!(
@@ -1029,13 +1058,13 @@ fn resolve_kernel_dir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     {
         let image = entry.path.join(&meta.image_name);
         if image.exists() {
-            success(&format!("ktstr: using cached kernel {cache_key}"));
+            success(&format!("{cli_label}: using cached kernel {cache_key}"));
             return Ok(image);
         }
     }
 
     let cache = crate::cache::CacheDir::new()?;
-    let result = kernel_build_pipeline(&acquired, &cache, "ktstr", false, true)?;
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true)?;
 
     // Prefer the cached image path (stable across rebuilds).
     match result.entry {
