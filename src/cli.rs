@@ -22,7 +22,6 @@ pub fn embedded_kconfig_hash() -> String {
     crate::kconfig_hash()
 }
 
-/// Format a human-readable table row for a cache entry.
 /// Extract major.minor prefix from a version string.
 /// "6.12.81" → "6.12", "7.0" → "7.0", "abc" → None.
 fn version_prefix(version: &str) -> Option<String> {
@@ -63,6 +62,7 @@ pub fn fetch_active_prefixes() -> Vec<String> {
     prefixes
 }
 
+/// Format a human-readable table row for a cache entry.
 pub fn format_entry_row(
     entry: &CacheEntry,
     kconfig_hash: &str,

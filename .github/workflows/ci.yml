@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel-version: ['6.16', '7.1']
+        kernel-version: ['6.12', '7.0']
     env:
       KTSTR_GHA_CACHE: "1"
     steps:

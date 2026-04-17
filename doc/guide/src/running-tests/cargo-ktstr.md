@@ -120,16 +120,17 @@ cargo ktstr kernel build --force 6.14.2                # rebuild even if cached
 
 When no version or source is given, fetches the latest stable version
 from kernel.org's `releases.json`. A major.minor prefix (e.g. `6.12`)
-resolves to the latest patch release in that series. Skips building when a cached entry
-already exists (use `--force` to override). Stale entries (built with
-a different `ktstr.kconfig`) are rebuilt automatically. For
-`--source`, generates `compile_commands.json` for LSP support. Dirty
-local trees (uncommitted changes to tracked files) are built but not
-cached.
+resolves to the highest patch release in that series. For EOL series
+no longer in `releases.json`, probes cdn.kernel.org to find the latest
+available tarball. Skips building when a cached entry already exists
+(use `--force` to override). Stale entries (built with a different
+`ktstr.kconfig`) are rebuilt automatically. For `--source`, generates
+`compile_commands.json` for LSP support. Dirty local trees
+(uncommitted changes to tracked files) are built but not cached.
 
 | Flag | Description |
 |------|-------------|
-| `VERSION` | Kernel version to download (e.g. `6.14.2`, `6.15-rc3`). A major.minor prefix (e.g. `6.12`) resolves to the latest patch release. Conflicts with `--source` and `--git`. |
+| `VERSION` | Kernel version or prefix to download (e.g. `6.14.2`, `6.12`, `6.15-rc3`). A major.minor prefix resolves to the highest patch release, probing cdn.kernel.org for EOL series. Conflicts with `--source` and `--git`. |
 | `--source PATH` | Path to existing kernel source directory. Conflicts with `VERSION` and `--git`. |
 | `--git URL` | Git URL to clone. Requires `--ref`. Conflicts with `VERSION` and `--source`. |
 | `--ref REF` | Git ref to checkout (branch, tag, commit). Required with `--git`. |
