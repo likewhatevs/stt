@@ -325,8 +325,8 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
 }
 
 /// Read scx event counters from one CPU's per-CPU event stats struct.
-/// On 7.1+, `pcpu_pa` points to `scx_sched_pcpu`; on 6.16, it points
-/// directly to `scx_event_stats` (`event_stats_off` = 0).
+/// On 6.18+, `pcpu_pa` points to `scx_sched_pcpu`; on 6.16-6.17, it
+/// points directly to `scx_event_stats` (`event_stats_off` = 0).
 pub(crate) fn read_event_stats(
     mem: &GuestMem,
     pcpu_pa: u64,
@@ -505,9 +505,9 @@ pub(crate) fn read_sched_domain_tree(
 /// Resolve per-CPU physical addresses for event counter reads.
 ///
 /// Reads `*scx_root` to find the active `scx_sched` struct, then reads
-/// the percpu pointer at `scx_sched_pcpu_off` within it. On 7.1+ this
-/// is `scx_sched.pcpu` (pointing to `scx_sched_pcpu`); on 6.16 it is
-/// `scx_sched.event_stats_cpu` (pointing directly to `scx_event_stats`).
+/// the percpu pointer at `scx_sched_pcpu_off` within it. On 6.18+ this
+/// is `scx_sched.pcpu` (pointing to `scx_sched_pcpu`); on 6.16-6.17 it
+/// is `scx_sched.event_stats_cpu` (pointing directly to `scx_event_stats`).
 /// Computes each CPU's PA via `__per_cpu_offset`.
 ///
 /// Returns None if `scx_root` is null (no scheduler loaded).
@@ -593,7 +593,7 @@ pub(crate) struct DumpTrigger {
 ///   `scx_sched` struct, then write at the BTF-resolved offset.
 ///   Re-derefs each iteration because `scx_sched` is reallocated on
 ///   scheduler (re)load.
-/// - 6.16 (`StaticGlobal`): write directly to the PA of the
+/// - 6.16-7.0 (`StaticGlobal`): write directly to the PA of the
 ///   `scx_watchdog_timeout` static global. No deref needed — the
 ///   address is fixed for the kernel's lifetime.
 pub(crate) enum WatchdogOverride {
@@ -608,7 +608,7 @@ pub(crate) enum WatchdogOverride {
         /// Runtime `PAGE_OFFSET` for KVA-to-PA translation.
         page_offset: u64,
     },
-    /// 6.16 path: write directly to the static global's PA.
+    /// 6.16-7.0 path: write directly to the static global's PA.
     StaticGlobal {
         /// PA of the `scx_watchdog_timeout` static global (text mapping).
         watchdog_timeout_pa: u64,

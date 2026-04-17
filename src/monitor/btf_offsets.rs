@@ -63,8 +63,8 @@ pub struct KernelOffsets {
     /// Offset of `nr` within `struct scx_dispatch_q`.
     pub dsq_nr: usize,
     /// Offsets for scx event counters. Resolved via `scx_sched.pcpu`
-    /// (7.1+) or `scx_sched.event_stats_cpu` (6.16) fallback. None if
-    /// BTF lacks both paths.
+    /// (6.18+) or `scx_sched.event_stats_cpu` (6.16-6.17) fallback.
+    /// None if BTF lacks both paths.
     pub event_offsets: Option<ScxEventOffsets>,
     /// Offsets for struct rq schedstat fields. None if CONFIG_SCHEDSTATS
     /// is not enabled (BTF lacks the required fields).
@@ -91,22 +91,23 @@ pub struct ScxWatchdogOffsets {
 /// Byte offsets for reading scx event counters from guest memory.
 ///
 /// Two kernel layouts are supported:
-/// - 7.1+: `scx_sched.pcpu` -> `scx_sched_pcpu.event_stats` (percpu
+/// - 6.18+: `scx_sched.pcpu` -> `scx_sched_pcpu.event_stats` (percpu
 ///   pointer to an intermediate struct containing the stats).
-/// - 6.16: `scx_sched.event_stats_cpu` -> `scx_event_stats` directly
-///   (percpu pointer to the stats struct, `event_stats_off` = 0).
+/// - 6.16-6.17: `scx_sched.event_stats_cpu` -> `scx_event_stats`
+///   directly (percpu pointer to the stats struct, `event_stats_off`
+///   = 0).
 ///
 /// The host resolves per-CPU addresses via `scx_root -> scx_sched`
 /// plus `__per_cpu_offset[cpu]`.
 #[derive(Debug, Clone)]
 pub struct ScxEventOffsets {
     /// Offset of the percpu pointer within `struct scx_sched`.
-    /// On 7.1+: offset of `pcpu` (`__percpu *scx_sched_pcpu`).
-    /// On 6.16: offset of `event_stats_cpu` (`__percpu *scx_event_stats`).
+    /// On 6.18+: offset of `pcpu` (`__percpu *scx_sched_pcpu`).
+    /// On 6.16-6.17: offset of `event_stats_cpu` (`__percpu *scx_event_stats`).
     pub scx_sched_pcpu_off: usize,
     /// Offset of `event_stats` within the per-CPU struct.
-    /// On 7.1+: offset within `struct scx_sched_pcpu`.
-    /// On 6.16: 0 (the percpu pointer points directly to the stats).
+    /// On 6.18+: offset within `struct scx_sched_pcpu`.
+    /// On 6.16-6.17: 0 (the percpu pointer points directly to the stats).
     pub event_stats_off: usize,
     /// Offset of `SCX_EV_SELECT_CPU_FALLBACK` within `struct scx_event_stats`.
     pub ev_select_cpu_fallback: usize,
@@ -168,16 +169,16 @@ impl KernelOffsets {
 
 /// Resolve BTF offsets for scx event counters.
 ///
-/// Tries the 7.1+ layout first (`scx_sched.pcpu` ->
-/// `scx_sched_pcpu.event_stats`), then falls back to the 6.16 layout
-/// (`scx_sched.event_stats_cpu` -> `scx_event_stats` directly with
-/// `event_stats_off` = 0).
+/// Tries the 6.18+ layout first (`scx_sched.pcpu` ->
+/// `scx_sched_pcpu.event_stats`), then falls back to the 6.16-6.17
+/// layout (`scx_sched.event_stats_cpu` -> `scx_event_stats` directly
+/// with `event_stats_off` = 0).
 ///
 /// Returns Err if both paths fail.
 fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
     let (scx_sched_struct, _) = find_struct(btf, "scx_sched")?;
 
-    // Try 7.1+ path: scx_sched.pcpu -> scx_sched_pcpu.event_stats.
+    // Try 6.18+ path: scx_sched.pcpu -> scx_sched_pcpu.event_stats.
     let pcpu_path = member_byte_offset(btf, &scx_sched_struct, "pcpu")
         .ok()
         .and_then(|pcpu_off| {
@@ -188,7 +189,7 @@ fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
             Some((pcpu_off, stats_off, stats_struct))
         });
 
-    // Try 6.16 path: scx_sched.event_stats_cpu -> scx_event_stats directly.
+    // Try 6.16-6.17 path: scx_sched.event_stats_cpu -> scx_event_stats directly.
     let (scx_sched_pcpu_off, event_stats_off, event_stats_struct) = match pcpu_path {
         Some(resolved) => resolved,
         None => {
@@ -1122,7 +1123,7 @@ mod tests {
     ///
     /// `watchdog_offsets` requires the post-refactor `scx_sched` layout
     /// (with `watchdog_timeout` field). `event_offsets` can resolve via
-    /// either path (7.1+ `pcpu` or 6.16 `event_stats_cpu`).
+    /// either path (6.18+ `pcpu` or 6.16-6.17 `event_stats_cpu`).
     /// `watchdog_offsets` being present implies `event_offsets` is also
     /// present, but not vice versa.
     ///

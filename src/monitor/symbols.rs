@@ -56,7 +56,7 @@ pub(crate) struct KernelSymbols {
     /// None if the symbol is absent.
     pub prog_idr: Option<u64>,
     /// Kernel virtual address of `scx_watchdog_timeout` (static global).
-    /// Present on 6.16 where the watchdog timeout is a file-scope static
+    /// Present on 6.16-7.0 where the watchdog timeout is a file-scope static
     /// rather than a field on `struct scx_sched`. None on 7.1+ or when
     /// the symbol is absent.
     pub scx_watchdog_timeout: Option<u64>,

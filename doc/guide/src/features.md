@@ -18,6 +18,12 @@ override uses `scx_sched.watchdog_timeout` via BTF detection; on
 6.16-7.0 kernels it uses the static `scx_watchdog_timeout` symbol;
 older kernels silently no-op.
 
+Event counters follow a different layout split: 6.18+ kernels
+(backported to 6.17.7+ stable) read via
+`scx_sched.pcpu -> scx_sched_pcpu.event_stats`; 6.16-6.17 kernels
+read `scx_sched.event_stats_cpu` directly. When neither path is
+available, event-counter sampling is silently disabled.
+
 ## Testing
 
 <details>
