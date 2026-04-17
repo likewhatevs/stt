@@ -1,0 +1,4 @@
+# Test fixture for derive macro tests (ktstr_test_macro).
+# Content is arbitrary — the framework passes it to the guest unchanged.
+[test]
+enabled = true
