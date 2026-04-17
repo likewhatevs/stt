@@ -419,9 +419,8 @@ impl Scheduler {
         self
     }
 
-    /// Set cgroup parent path. The init creates
-    /// `/sys/fs/cgroup/{path}` before starting the scheduler, and
-    /// `--cell-parent-cgroup {path}` is injected into scheduler args.
+    /// Set cgroup parent path. See the [`cgroup_parent`](field@Self::cgroup_parent)
+    /// field for path format requirements (must begin with `/`).
     pub const fn cgroup_parent(mut self, path: &'static str) -> Self {
         self.cgroup_parent = Some(path);
         self

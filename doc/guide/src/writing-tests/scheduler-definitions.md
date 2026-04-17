@@ -147,6 +147,9 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
 `/sys/fs/cgroup` for the scheduler to manage. When set, the VM init
 creates the directory before starting the scheduler, and
 `--cell-parent-cgroup <path>` is injected into the scheduler args.
+The path must begin with `/` (e.g. `"/ktstr"`) because the VM init
+concatenates it to `/sys/fs/cgroup` without inserting a separator;
+`"ktstr"` (no leading slash) would produce `/sys/fs/cgroupktstr`.
 
 In the derive:
 

@@ -852,7 +852,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | `name = "..."` | yes | Scheduler name passed to `Scheduler::new()` |
 /// | `binary = "..."` | no | Binary name for `SchedulerSpec::Name(...)`. Omit for EEVDF. |
 /// | `topology(N, L, C, T)` | no | Default VM topology `(numa_nodes, llcs, cores, threads)`. Defaults to `(1, 1, 2, 1)`. |
-/// | `cgroup_parent = "..."` | no | Cgroup parent path. |
+/// | `cgroup_parent = "..."` | no | Cgroup parent path. Must begin with `/` (e.g. `"/ktstr"`). |
 /// | `sched_args = [...]` | no | Default scheduler CLI args. |
 /// | `sysctls = [Sysctl::new("key", "value"), ...]` | no | Guest sysctls applied before the scheduler starts. |
 /// | `kargs = ["arg1", "arg2"]` | no | Extra kernel command-line args appended when booting the VM. |
