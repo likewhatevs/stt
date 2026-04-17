@@ -296,7 +296,7 @@ fn kernel_build(
         // Check cache before downloading.
         let (arch, _) = fetch::arch_info();
         let cache_key = format!("{ver}-tarball-{arch}-kc{}", ktstr::cache_key_suffix());
-        if !force && let Some(entry) = cache.lookup(&cache_key) {
+        if !force && let Some(entry) = cli::cache_lookup(&cache, &cache_key, "ktstr") {
             eprintln!("ktstr: cached kernel found: {}", entry.path.display());
             eprintln!("ktstr: use --force to rebuild");
             return Ok(());
@@ -312,7 +312,7 @@ fn kernel_build(
     if !force
         && (source.is_some() || git.is_some())
         && !acquired.is_dirty
-        && let Some(entry) = cache.lookup(&acquired.cache_key)
+        && let Some(entry) = cli::cache_lookup(&cache, &acquired.cache_key, "ktstr")
     {
         eprintln!("ktstr: cached kernel found: {}", entry.path.display());
         eprintln!("ktstr: use --force to rebuild");

@@ -530,8 +530,8 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
 
 /// Result of the post-acquisition kernel build pipeline.
 ///
-/// Returned by [`kernel_build_pipeline`] so callers can do
-/// post-processing (e.g. remote cache store) with the entry.
+/// Returned by [`kernel_build_pipeline`] so callers can inspect
+/// the cache entry and built image path.
 #[non_exhaustive]
 pub struct KernelBuildResult {
     /// Cache entry, if the build was cached. `None` for dirty trees
@@ -545,8 +545,8 @@ pub struct KernelBuildResult {
 ///
 /// Handles: clean, configure, build, validate config, generate
 /// compile_commands.json for local trees, find image, strip vmlinux,
-/// compute metadata, and cache store. Callers handle source
-/// acquisition; some callers also handle remote cache operations.
+/// compute metadata, cache store, and remote cache store (when
+/// enabled). Callers handle source acquisition.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
@@ -695,6 +695,9 @@ pub fn kernel_build_pipeline(
                 "{cli_label}: image: {}",
                 entry.path.join(image_name).display()
             );
+            if crate::remote_cache::is_enabled() {
+                crate::remote_cache::remote_store(&entry, cli_label);
+            }
             Some(entry)
         }
         Err(e) => {
@@ -871,6 +874,26 @@ pub fn resolve_include_files(
     Ok(resolved_includes)
 }
 
+/// Look up a cache key, checking local first, then remote (if enabled).
+///
+/// `cli_label` prefixes diagnostic output (e.g. `"ktstr"` or
+/// `"cargo ktstr"`).
+pub fn cache_lookup(
+    cache: &crate::cache::CacheDir,
+    cache_key: &str,
+    cli_label: &str,
+) -> Option<crate::cache::CacheEntry> {
+    if let Some(entry) = cache.lookup(cache_key) {
+        return Some(entry);
+    }
+
+    if crate::remote_cache::is_enabled() {
+        return crate::remote_cache::remote_lookup(cache, cache_key, cli_label);
+    }
+
+    None
+}
+
 /// Resolve a Version or CacheKey identifier to a cache entry directory.
 ///
 /// Lookup order: local cache, then the remote GHA cache when
@@ -904,15 +927,7 @@ pub fn resolve_cached_kernel(
             let cache = crate::cache::CacheDir::new()?;
             let (arch, _) = crate::fetch::arch_info();
             let cache_key = format!("{resolved}-tarball-{arch}-kc{}", crate::cache_key_suffix());
-            if let Some(entry) = cache.lookup(&cache_key) {
-                entry.metadata.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("cached entry {cache_key} has corrupt metadata")
-                })?;
-                return Ok(entry.path);
-            }
-            if crate::remote_cache::is_enabled()
-                && let Some(entry) = crate::remote_cache::remote_lookup(&cache, &cache_key)
-            {
+            if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
                 entry.metadata.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("cached entry {cache_key} has corrupt metadata")
                 })?;
@@ -923,16 +938,7 @@ pub fn resolve_cached_kernel(
         }
         KernelId::CacheKey(key) => {
             let cache = crate::cache::CacheDir::new()?;
-            if let Some(entry) = cache.lookup(key) {
-                entry
-                    .metadata
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("cached entry {key} has corrupt metadata"))?;
-                return Ok(entry.path);
-            }
-            if crate::remote_cache::is_enabled()
-                && let Some(entry) = crate::remote_cache::remote_lookup(&cache, key)
-            {
+            if let Some(entry) = cache_lookup(&cache, key, cli_label) {
                 entry
                     .metadata
                     .as_ref()
@@ -1047,7 +1053,7 @@ fn download_and_cache_version(version: &str, cli_label: &str) -> Result<std::pat
 
     // Check cache one more time with the resolved version.
     if let Ok(cache) = crate::cache::CacheDir::new()
-        && let Some(entry) = cache.lookup(&cache_key)
+        && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
         && entry.metadata.is_some()
     {
         return Ok(entry.path);
@@ -1096,7 +1102,7 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
     // Dirty trees: skip cache, always build.
     if !acquired.is_dirty
         && let Ok(cache) = crate::cache::CacheDir::new()
-        && let Some(entry) = cache.lookup(&cache_key)
+        && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
         && let Some(ref meta) = entry.metadata
     {
         let image = entry.path.join(&meta.image_name);

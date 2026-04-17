@@ -7,7 +7,6 @@ use ktstr::cache::{CacheDir, CacheEntry};
 use ktstr::cli;
 use ktstr::cli::{KERNEL_HELP_NO_RAW, KERNEL_HELP_RAW_OK};
 use ktstr::fetch;
-use ktstr::remote_cache;
 
 #[derive(Parser)]
 #[command(name = "cargo-ktstr", bin_name = "cargo")]
@@ -351,31 +350,15 @@ fn kernel_build(
         return Ok(());
     }
 
-    let result =
-        cli::kernel_build_pipeline(&acquired, &cache, "cargo ktstr", clean, source.is_some())
-            .map_err(|e| format!("{e:#}"))?;
-
-    // Store to remote cache when enabled.
-    if let Some(ref entry) = result.entry
-        && remote_cache::is_enabled()
-    {
-        remote_cache::remote_store(entry);
-    }
+    cli::kernel_build_pipeline(&acquired, &cache, "cargo ktstr", clean, source.is_some())
+        .map_err(|e| format!("{e:#}"))?;
 
     Ok(())
 }
 
 /// Look up a cache key, checking local first, then remote (if enabled).
 fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
-    if let Some(entry) = cache.lookup(cache_key) {
-        return Some(entry);
-    }
-
-    if remote_cache::is_enabled() {
-        return remote_cache::remote_lookup(cache, cache_key);
-    }
-
-    None
+    cli::cache_lookup(cache, cache_key, "cargo ktstr")
 }
 
 /// Policy for cargo-ktstr's shell + verifier kernel resolution:
