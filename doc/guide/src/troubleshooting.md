@@ -50,11 +50,11 @@ no kernel found
 
 On aarch64 the hint says `Image` instead of `bzImage`.
 
-`cargo ktstr shell` and `cargo ktstr verifier` show a similar message:
-
-```text
-no kernel found. Provide --kernel or run `cargo ktstr kernel build` to download and cache one.
-```
+`ktstr shell` and `cargo ktstr shell` auto-download the latest
+stable kernel when no `--kernel` is specified and no kernel is found
+via the discovery chain. See
+[Kernel auto-download failures](#kernel-auto-download-failures) for
+download-specific errors.
 
 ktstr needs a bootable Linux kernel image (`bzImage` on x86_64,
 `Image` on aarch64). See
@@ -264,7 +264,80 @@ Rebuilds happen automatically on the next `cargo ktstr kernel build`
 for stale entries. Use `--force` to override the cache for other
 reasons.
 
+## Kernel auto-download failures
+
+```text
+ktstr: no kernel found, downloading latest stable
+fetch https://www.kernel.org/releases.json: <error>
+```
+
+ktstr auto-downloads a kernel when no `--kernel` is specified and no
+kernel is found via the discovery chain (see
+[Kernel discovery](getting-started.md#kernel-discovery)). The same
+download path runs when `--kernel` specifies a version (e.g.
+`--kernel 6.14.2`) that is not in the cache. The CLI label varies:
+`ktstr:` for the standalone binary, `cargo ktstr:` for the cargo
+subcommand.
+
+The `<error>` above is the underlying reqwest error (DNS resolution,
+connection refused, timeout, TLS handshake failure).
+
+```text
+fetch https://www.kernel.org/releases.json: HTTP 503
+```
+
+kernel.org returned a non-success status code.
+
+```text
+no stable kernel with patch >= 8 found in releases.json
+```
+
+ktstr requires a stable or longterm release with patch version >= 8
+to avoid brand-new major versions that may have build issues. This
+error means releases.json contained no qualifying version.
+
+```text
+download https://cdn.kernel.org/.../linux-6.14.10.tar.xz: <error>
+```
+
+Network failure during tarball download (same causes as above).
+
+```text
+extract tarball: <error>
+```
+
+Tarball extraction failed. Common causes: disk full, insufficient
+permissions on the temp directory, or a truncated download.
+
+```text
+kernel built but cache store failed — cannot return image from temporary directory
+```
+
+The kernel built successfully but could not be stored in the cache.
+Check disk space and permissions on the cache directory.
+
+For version-specific download errors (HTTP 404, HTML responses), see
+[Kernel download failures](#kernel-download-failures).
+
+**Fixes:**
+
+- Verify network connectivity: `curl -sI https://www.kernel.org/releases.json`
+- Check DNS resolution for kernel.org and cdn.kernel.org.
+- Check disk space — the download, extraction, and build require
+  significant disk space.
+- If behind a proxy, set `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
+  (reqwest respects these environment variables).
+- Override the cache directory via `KTSTR_CACHE_DIR` if the default
+  location has insufficient space or permissions.
+- Pre-download a kernel explicitly: `cargo ktstr kernel build 6.14.10`
+  to isolate whether the failure is in version resolution or download.
+
 ## Kernel download failures
+
+These errors occur when `cargo ktstr kernel build` or `--kernel`
+specifies an explicit version. For network and extraction errors
+during auto-download, see
+[Kernel auto-download failures](#kernel-auto-download-failures).
 
 ```text
 download https://cdn.kernel.org/.../linux-6.99.0.tar.xz: HTTP 404
