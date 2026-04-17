@@ -1,0 +1,5 @@
+error: expected string literal
+ --> tests/compile_fail/derive_config_file_non_string.rs:2:41
+  |
+2 | #[scheduler(name = "bad", config_file = 42)]
+  |                                         ^^

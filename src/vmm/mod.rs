@@ -4055,7 +4055,6 @@ impl KtstrVmBuilder {
 
     /// Add files to include in the guest initramfs.
     /// Each entry is `(archive_path, host_path)`.
-    #[allow(dead_code)]
     pub fn include_files(mut self, files: Vec<(String, PathBuf)>) -> Self {
         self.include_files = files;
         self

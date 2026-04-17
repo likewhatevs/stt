@@ -863,6 +863,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | `min_cpus = N` | no | Minimum total CPUs for gauntlet filtering. |
 /// | `max_cpus = N` | no | Maximum total CPUs for gauntlet filtering. |
 /// | `requires_smt = bool` | no | Require SMT (threads_per_core > 1). |
+/// | `config_file = "..."` | no | Host-side path to an opaque config file passed to the scheduler via `--config`. |
 ///
 /// # Flag attributes (`#[flag(...)]`)
 ///
@@ -943,6 +944,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     let mut sched_min_cpus: Option<u32> = None;
     let mut sched_max_cpus: Option<u32> = None;
     let mut sched_requires_smt: Option<bool> = None;
+    let mut sched_config_file: Option<String> = None;
 
     for attr in &input.attrs {
         if !attr.path().is_ident("scheduler") {
@@ -1060,6 +1062,11 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
                 let value = meta.value()?;
                 let lit: syn::LitBool = value.parse()?;
                 sched_requires_smt = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("config_file") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                sched_config_file = Some(lit.value());
                 Ok(())
             } else {
                 Err(meta.error(format!(
@@ -1355,6 +1362,9 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     }
     if let Some(v) = sched_max_cpus {
         builder_chain = quote! { #builder_chain.max_cpus(#v) };
+    }
+    if let Some(ref v) = sched_config_file {
+        builder_chain = quote! { #builder_chain.config_file(#v) };
     }
 
     // Generate the ctor function name for --ktstr-list-flags interception.

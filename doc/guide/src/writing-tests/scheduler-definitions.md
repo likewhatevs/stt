@@ -17,6 +17,7 @@ pub struct Scheduler {
     pub sched_args: &'static [&'static str],
     pub topology: Topology,
     pub constraints: TopologyConstraints,
+    pub config_file: Option<&'static str>,
 }
 ```
 
@@ -170,6 +171,39 @@ const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
 This creates `/sys/fs/cgroup/ktstr` in the guest and passes
 `--cell-parent-cgroup /ktstr` to the scheduler binary.
 
+## Config file
+
+`Scheduler.config_file` specifies a host-side path to an opaque config
+file that the scheduler binary reads at startup. The framework packs
+the file into the guest initramfs at `/include-files/{filename}` and
+prepends `--config /include-files/{filename}` to the scheduler args.
+ktstr does not parse or validate the file — it is passed through as-is.
+
+The `--config` flag name is not configurable. Schedulers that use
+`config_file` must accept `--config <path>`. For schedulers that use a
+different flag, use `config_file` to place the file in the guest and
+add the desired flag via `sched_args` — the scheduler will also
+receive `--config` and must not reject unknown flags.
+
+In the derive:
+
+```rust,ignore
+#[scheduler(config_file = "configs/my_sched.toml")]
+```
+
+Or manually:
+
+```rust,ignore
+const MY_SCHED: Scheduler = Scheduler::new("my_sched")
+    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .topology(1, 2, 4, 1)
+    .config_file("configs/my_sched.toml");
+```
+
+This copies `configs/my_sched.toml` from the host into the guest at
+`/include-files/my_sched.toml` and passes
+`--config /include-files/my_sched.toml` to the scheduler binary.
+
 ## Scheduler args
 
 `Scheduler.sched_args` provides default CLI args that apply to every
@@ -192,8 +226,9 @@ const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
     .sched_args(&["--exit-dump-len", "1048576"]);
 ```
 
-Merge order: `cgroup_parent` injection, then `sched_args`, then
-per-test `extra_sched_args`, then flag-derived args.
+Merge order: `config_file` injection, then `cgroup_parent` injection,
+then `sched_args`, then per-test `extra_sched_args`, then flag-derived
+args.
 
 ## Default topology
 

@@ -396,6 +396,11 @@ pub struct Scheduler {
     /// Gauntlet topology constraints. Tests inherit these unless they
     /// override specific fields in `#[ktstr_test]`.
     pub constraints: TopologyConstraints,
+    /// Host-side path to an opaque config file passed to the scheduler
+    /// binary inside the VM. The file is included in the initramfs at
+    /// `/include-files/{filename}` and `--config /include-files/{filename}`
+    /// is prepended to `sched_args`.
+    pub config_file: Option<&'static str>,
 }
 
 impl Scheduler {
@@ -420,6 +425,7 @@ impl Scheduler {
             numa_nodes: 1,
         },
         constraints: TopologyConstraints::DEFAULT,
+        config_file: None,
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -440,6 +446,7 @@ impl Scheduler {
                 numa_nodes: 1,
             },
             constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
         }
     }
 
@@ -550,6 +557,13 @@ impl Scheduler {
         self
     }
 
+    /// Set a host-side config file path. The file is included in the
+    /// guest initramfs and `--config` is injected into scheduler args.
+    pub const fn config_file(mut self, path: &'static str) -> Self {
+        self.config_file = Some(path);
+        self
+    }
+
     /// Names of all flags this scheduler supports.
     pub fn supported_flag_names(&self) -> Vec<&str> {
         self.flags.iter().map(|f| f.name).collect()
@@ -610,6 +624,19 @@ impl Scheduler {
         }
         out
     }
+}
+
+/// Derive initramfs archive path, host path, and guest path from a
+/// scheduler's `config_file`. Returns `None` when no config file is set.
+fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
+    let config_path = entry.scheduler.config_file?;
+    let file_name = Path::new(config_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("config_file must have a valid filename");
+    let archive_path = format!("include-files/{file_name}");
+    let guest_path = format!("/include-files/{file_name}");
+    Some((archive_path, PathBuf::from(config_path), guest_path))
 }
 
 /// Host-side BPF map write performed during VM execution.
@@ -1654,6 +1681,11 @@ fn run_ktstr_test_inner(
     }
 
     let mut sched_args: Vec<String> = Vec::new();
+    if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
+        builder = builder.include_files(vec![(archive_path, host_path)]);
+        sched_args.push("--config".to_string());
+        sched_args.push(guest_path);
+    }
     if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
         sched_args.push("--cell-parent-cgroup".to_string());
         sched_args.push(cgroup_path.to_string());
@@ -2304,6 +2336,11 @@ fn attempt_auto_repro(
 
     {
         let mut args: Vec<String> = Vec::new();
+        if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
+            builder = builder.include_files(vec![(archive_path, host_path)]);
+            args.push("--config".to_string());
+            args.push(guest_path);
+        }
         if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
             args.push("--cell-parent-cgroup".to_string());
             args.push(cgroup_path.to_string());
@@ -5533,6 +5570,7 @@ mod tests {
             numa_nodes: 1,
         },
         constraints: TopologyConstraints::DEFAULT,
+        config_file: None,
     };
 
     fn sched_entry(name: &'static str) -> KtstrTestEntry {
@@ -6720,5 +6758,42 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         validate_entry_flags(&entry);
+    }
+
+    #[test]
+    fn config_file_parts_nested_path() {
+        static SCHED: Scheduler = Scheduler::new("cfg").config_file("configs/my_sched.toml");
+        let entry = KtstrTestEntry {
+            name: "cfg_test",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (archive, host, guest) = config_file_parts(&entry).unwrap();
+        assert_eq!(archive, "include-files/my_sched.toml");
+        assert_eq!(host, PathBuf::from("configs/my_sched.toml"));
+        assert_eq!(guest, "/include-files/my_sched.toml");
+    }
+
+    #[test]
+    fn config_file_parts_bare_filename() {
+        static SCHED: Scheduler = Scheduler::new("cfg").config_file("config.toml");
+        let entry = KtstrTestEntry {
+            name: "cfg_bare",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (archive, host, guest) = config_file_parts(&entry).unwrap();
+        assert_eq!(archive, "include-files/config.toml");
+        assert_eq!(host, PathBuf::from("config.toml"));
+        assert_eq!(guest, "/include-files/config.toml");
+    }
+
+    #[test]
+    fn config_file_parts_none_when_unset() {
+        let entry = KtstrTestEntry {
+            name: "no_cfg",
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(config_file_parts(&entry).is_none());
     }
 }

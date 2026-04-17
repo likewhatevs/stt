@@ -327,7 +327,8 @@ fn entry_performance_mode_set() {
     binary = "scx-ktstr",
     topology(1, 2, 4, 1),
     cgroup_parent = "/test",
-    sched_args = ["--arg1", "--arg2"]
+    sched_args = ["--arg1", "--arg2"],
+    config_file = "test-config.toml"
 )]
 #[allow(dead_code)]
 enum TestDeriveFlag {
@@ -376,6 +377,12 @@ fn derive_scheduler_cgroup_parent() {
 #[test]
 fn derive_scheduler_sched_args() {
     assert_eq!(TEST_DERIVE.sched_args, &["--arg1", "--arg2"]);
+}
+
+/// Verify scheduler config_file.
+#[test]
+fn derive_scheduler_config_file() {
+    assert_eq!(TEST_DERIVE.config_file, Some("test-config.toml"));
 }
 
 /// Verify the derive generates the correct number of flags.
@@ -650,6 +657,7 @@ fn derive_minimal_defaults() {
     assert!(MINIMAL.flags.is_empty());
     assert!(MINIMAL.sched_args.is_empty());
     assert!(MINIMAL.cgroup_parent.is_none());
+    assert_eq!(MINIMAL.config_file, None);
 }
 
 /// Topology validation: boot a multi-LLC VM and verify the guest sees
