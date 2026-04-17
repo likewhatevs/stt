@@ -15,6 +15,7 @@ pub enum WorkType {
     CacheYield { size_kb: usize, stride: usize },
     CachePipe { size_kb: usize, burst_iters: u64 },
     FutexFanOut { fan_out: usize, spin_iters: u64 },
+    SchBench { fan_out: usize, cache_footprint_kb: usize, operations: usize, sleep_usec: u64 },
     Sequence { first: Phase, rest: Vec<Phase> },
     ForkExit,
     NiceSweep,
@@ -29,6 +30,7 @@ Parameterized variants have convenience constructors:
 `WorkType::futex_ping_pong(1024)`, `WorkType::cache_pressure(32, 64)`,
 `WorkType::cache_yield(32, 64)`, `WorkType::cache_pipe(32, 1024)`,
 `WorkType::futex_fan_out(4, 1024)`,
+`WorkType::schbench(4, 256, 5, 100)`,
 `WorkType::affinity_churn(1024)`, `WorkType::policy_churn(1024)`,
 `WorkType::custom("my_work", my_fn)`.
 
@@ -41,6 +43,7 @@ Parameterized variants have convenience constructors:
 | CPU borrowing / idle balance | `Bursty` |
 | Cross-CPU wake latency | `PipeIo`, `CachePipe` |
 | Cache-aware scheduling | `CachePressure`, `CacheYield` |
+| Cache-aware fan-out wake latency | `SchBench` |
 | Fan-out wake storms | `FutexFanOut` |
 | Mixed real-world patterns | `Sequence` |
 | Task creation/destruction pressure | `ForkExit` |
@@ -91,10 +94,20 @@ scheduler re-placement after voluntary yield with a cache-hot working set.
 a partner worker. Combines cache-hot working set with cross-CPU wake
 placement. Requires even `num_workers`.
 
-**`FutexFanOut`** -- 1:N fan-out wake pattern (schbench-style). One
-messenger per group does `spin_iters` of CPU work then wakes `fan_out`
-receivers via `FUTEX_WAKE`. Receivers measure wake-to-run latency.
-Requires `num_workers` divisible by `fan_out + 1`.
+**`FutexFanOut`** -- 1:N fan-out wake pattern without cache pressure.
+One messenger per group does `spin_iters` of CPU spin work then wakes
+`fan_out` receivers via `FUTEX_WAKE`. Receivers measure wake-to-run
+latency. For cache-aware fan-out with matrix multiply work, see
+`SchBench`. Requires `num_workers` divisible by `fan_out + 1`.
+
+**`SchBench`** -- schbench-style messenger/worker workload. One
+messenger per group stamps a `CLOCK_MONOTONIC` timestamp then wakes
+`fan_out` workers via `FUTEX_WAKE`. Workers measure wake-to-run latency
+(time from messenger's timestamp to worker getting the CPU), sleep for
+`sleep_usec` microseconds (simulating think time), then do `operations`
+iterations of naive matrix multiply over a `cache_footprint_kb`-sized
+working set (three square matrices of u64, O(n^3)). Requires
+`num_workers` divisible by `fan_out + 1`.
 
 **`Sequence`** -- compound work pattern: loop through phases in order,
 repeat. Each phase runs for its specified duration before the next
@@ -198,12 +211,12 @@ let wt = WorkType::custom("my_workload", my_workload);
 ## Grouped work types
 
 `PipeIo`, `FutexPingPong`, and `CachePipe` require `num_workers`
-divisible by 2 (paired). `FutexFanOut` requires `num_workers` divisible
-by `fan_out + 1` (1 messenger + N receivers per group).
-`WorkType::worker_group_size()` returns the group size for these
+divisible by 2 (paired). `FutexFanOut` and `SchBench` require
+`num_workers` divisible by `fan_out + 1` (1 messenger + N receivers per
+group). `WorkType::worker_group_size()` returns the group size for these
 variants, or `None` for ungrouped types. `PipeIo` and `CachePipe` use
-pipes; `FutexPingPong` and `FutexFanOut` use shared mmap pages with
-futex wait/wake.
+pipes; `FutexPingPong`, `FutexFanOut`, and `SchBench` use shared mmap
+pages with futex wait/wake.
 
 ## Default values
 
@@ -215,6 +228,7 @@ futex wait/wake.
 - `CacheYield`: `size_kb=32`, `stride=64`
 - `CachePipe`: `size_kb=32`, `burst_iters=1024`
 - `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
+- `SchBench`: `fan_out=4`, `cache_footprint_kb=256`, `operations=5`, `sleep_usec=100`
 - `AffinityChurn`: `spin_iters=1024`
 - `PolicyChurn`: `spin_iters=1024`
 
@@ -269,8 +283,8 @@ for all scenarios that use it. Scenarios with non-`CpuSpin` work types
 are not overridden.
 
 Overrides to grouped work types (`PipeIo`, `FutexPingPong`,
-`CachePipe`, `FutexFanOut`) are skipped when `num_workers` is not
-divisible by the work type's group size.
+`CachePipe`, `FutexFanOut`, `SchBench`) are skipped when `num_workers`
+is not divisible by the work type's group size.
 
 Ops-based scenarios have a separate override mechanism via
 `CgroupDef.swappable`. See [Ops and Steps](ops.md#work-type-overrides-and-swappable).

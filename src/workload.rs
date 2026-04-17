@@ -139,10 +139,11 @@ pub enum WorkType {
     /// worker. Combines cache-hot working set with cross-CPU wake
     /// placement. Requires even num_workers.
     CachePipe { size_kb: usize, burst_iters: u64 },
-    /// 1:N fan-out wake pattern (schbench-style). One messenger per group
-    /// does CPU work then wakes N receivers via FUTEX_WAKE. Receivers
-    /// measure wake-to-run latency. Requires num_workers divisible by
-    /// (fan_out + 1).
+    /// 1:N fan-out wake pattern without cache pressure. One messenger per
+    /// group does CPU spin work then wakes N receivers via FUTEX_WAKE.
+    /// Receivers measure wake-to-run latency. For cache-aware fan-out with
+    /// matrix multiply work, see [`SchBench`](Self::SchBench). Requires
+    /// num_workers divisible by (fan_out + 1).
     FutexFanOut { fan_out: usize, spin_iters: u64 },
     /// Compound work pattern: loop through phases in order, repeat.
     /// Each phase runs for its duration before the next starts.
@@ -167,6 +168,19 @@ pub enum WorkType {
     /// when CAP_SYS_NICE is available). Exercises __sched_setscheduler
     /// and scheduling class transitions.
     PolicyChurn { spin_iters: u64 },
+    /// Schbench-style messenger/worker workload. One messenger per group
+    /// wakes `fan_out` workers via shared futex. Each worker does
+    /// `operations` matrix multiplications over a `cache_footprint_kb`-sized
+    /// working set, preceded by a `sleep_usec` microsecond sleep simulating
+    /// think time. Workers measure wake-to-run latency (time from messenger's
+    /// timestamp to worker getting the CPU). Requires num_workers divisible
+    /// by (fan_out + 1).
+    SchBench {
+        fan_out: usize,
+        cache_footprint_kb: usize,
+        operations: usize,
+        sleep_usec: u64,
+    },
     /// User-supplied work function. The function receives a reference to
     /// the stop flag and returns a [`WorkerReport`] when signaled.
     /// Function pointers are fork-safe (`Copy`), so `Custom` works with
@@ -203,6 +217,7 @@ impl WorkType {
         "NiceSweep",
         "AffinityChurn",
         "PolicyChurn",
+        "SchBench",
         "Custom",
     ];
 
@@ -227,6 +242,7 @@ impl WorkType {
             WorkType::NiceSweep => "NiceSweep",
             WorkType::AffinityChurn { .. } => "AffinityChurn",
             WorkType::PolicyChurn { .. } => "PolicyChurn",
+            WorkType::SchBench { .. } => "SchBench",
             WorkType::Custom { name, .. } => name,
         }
     }
@@ -267,6 +283,12 @@ impl WorkType {
             "NiceSweep" => Some(WorkType::NiceSweep),
             "AffinityChurn" => Some(WorkType::AffinityChurn { spin_iters: 1024 }),
             "PolicyChurn" => Some(WorkType::PolicyChurn { spin_iters: 1024 }),
+            "SchBench" => Some(WorkType::SchBench {
+                fan_out: 4,
+                cache_footprint_kb: 256,
+                operations: 5,
+                sleep_usec: 100,
+            }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
         }
@@ -282,6 +304,7 @@ impl WorkType {
             | WorkType::FutexPingPong { .. }
             | WorkType::CachePipe { .. } => Some(2),
             WorkType::FutexFanOut { fan_out, .. } => Some(fan_out + 1),
+            WorkType::SchBench { fan_out, .. } => Some(fan_out + 1),
             _ => None,
         }
     }
@@ -290,7 +313,9 @@ impl WorkType {
     pub fn needs_shared_mem(&self) -> bool {
         matches!(
             self,
-            WorkType::FutexPingPong { .. } | WorkType::FutexFanOut { .. }
+            WorkType::FutexPingPong { .. }
+                | WorkType::FutexFanOut { .. }
+                | WorkType::SchBench { .. }
         )
     }
 
@@ -301,6 +326,7 @@ impl WorkType {
             WorkType::CachePressure { .. }
                 | WorkType::CacheYield { .. }
                 | WorkType::CachePipe { .. }
+                | WorkType::SchBench { .. }
         )
     }
 
@@ -353,6 +379,21 @@ impl WorkType {
     /// Cycle scheduling policies with `spin_iters` CPU work between switches.
     pub fn policy_churn(spin_iters: u64) -> Self {
         WorkType::PolicyChurn { spin_iters }
+    }
+
+    /// Schbench-style messenger/worker workload with the given parameters.
+    pub fn schbench(
+        fan_out: usize,
+        cache_footprint_kb: usize,
+        operations: usize,
+        sleep_usec: u64,
+    ) -> Self {
+        WorkType::SchBench {
+            fan_out,
+            cache_footprint_kb,
+            operations,
+            sleep_usec,
+        }
     }
 
     /// User-supplied work function with a display name.
@@ -554,8 +595,9 @@ pub struct WorkerReport {
     /// When the longest gap happened (ms from start).
     pub max_gap_at_ms: u64,
     /// Per-wakeup latency samples (ns). Populated for blocking work types
-    /// (Bursty, PipeIo, FutexPingPong, FutexFanOut, CacheYield, CachePipe,
-    /// IoSync, NiceSweep, AffinityChurn, Sequence with Sleep/Yield/Io phases).
+    /// (Bursty, PipeIo, FutexPingPong, FutexFanOut, SchBench, CacheYield,
+    /// CachePipe, IoSync, NiceSweep, AffinityChurn, Sequence with
+    /// Sleep/Yield/Io phases).
     #[serde(default)]
     pub wake_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
@@ -603,6 +645,8 @@ pub struct WorkloadHandle {
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
+    /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut, 16 for SchBench).
+    futex_region_size: usize,
     /// MAP_SHARED region of per-worker u64 iteration counters. Workers
     /// atomically store their iteration count; parent reads via
     /// `snapshot_iterations()`. Pointer to the first element; length
@@ -655,17 +699,23 @@ impl WorkloadHandle {
             }
         }
 
-        // For FutexPingPong/FutexFanOut, allocate one shared futex word per
-        // worker group via MAP_SHARED|MAP_ANONYMOUS so all members of the
-        // fork see the same physical page.
+        // For FutexPingPong/FutexFanOut/SchBench, allocate one shared region
+        // per worker group via MAP_SHARED|MAP_ANONYMOUS so all members of the
+        // fork see the same physical page. SchBench needs 16 bytes (futex u32
+        // at offset 0, wake timestamp u64 at offset 8); others need 4 bytes.
         let mut futex_ptrs: Vec<*mut u32> = Vec::new();
         let futex_group_size = config.work_type.worker_group_size().unwrap_or(2);
+        let futex_region_size = if matches!(config.work_type, WorkType::SchBench { .. }) {
+            16
+        } else {
+            std::mem::size_of::<u32>()
+        };
         if needs_futex {
             for _ in 0..config.num_workers / futex_group_size {
                 let ptr = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
-                        std::mem::size_of::<u32>(),
+                        futex_region_size,
                         libc::PROT_READ | libc::PROT_WRITE,
                         libc::MAP_SHARED | libc::MAP_ANONYMOUS,
                         -1,
@@ -675,7 +725,7 @@ impl WorkloadHandle {
                 if ptr == libc::MAP_FAILED {
                     anyhow::bail!("mmap failed: {}", std::io::Error::last_os_error());
                 }
-                unsafe { *(ptr as *mut u32) = 0 };
+                unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, futex_region_size) };
                 futex_ptrs.push(ptr as *mut u32);
             }
         }
@@ -863,6 +913,7 @@ impl WorkloadHandle {
             children,
             started: false,
             futex_ptrs,
+            futex_region_size,
             iter_counters,
             iter_counter_len,
         })
@@ -1042,7 +1093,7 @@ impl Drop for WorkloadHandle {
         }
         for &ptr in &self.futex_ptrs {
             unsafe {
-                libc::munmap(ptr as *mut libc::c_void, std::mem::size_of::<u32>());
+                libc::munmap(ptr as *mut libc::c_void, self.futex_region_size);
             }
         }
         if !self.iter_counters.is_null() && self.iter_counter_len > 0 {
@@ -1086,7 +1137,7 @@ fn worker_main(
     let mut max_gap_ns: u64 = 0;
     let mut max_gap_cpu: usize = last_cpu;
     let mut max_gap_at_ns: u64 = 0;
-    // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe).
+    // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe, SchBench).
     let mut cache_pressure_buf: Option<Vec<u8>> = None;
     // Persistent temp file for IoSync / Phase::Io (opened on first use, removed on exit).
     let mut io_sync_file: Option<(std::fs::File, String)> = None;
@@ -1140,6 +1191,22 @@ fn worker_main(
         } else {
             Vec::new()
         };
+    // SchBench: pre-compute matrix dimension from cache_footprint_kb.
+    let schbench_matrix_size: usize = if let WorkType::SchBench {
+        cache_footprint_kb,
+        operations,
+        ..
+    } = &work_type
+    {
+        if *operations > 0 && *cache_footprint_kb > 0 {
+            ((cache_footprint_kb * 1024 / 3 / std::mem::size_of::<u64>()) as f64).sqrt() as usize
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     // schedstat snapshot at work-loop start.
     let (ss_cpu_start, ss_delay_start, ss_ts_start) = read_schedstat();
 
@@ -1583,6 +1650,99 @@ fn worker_main(
                 );
                 iterations += 1;
             }
+            WorkType::SchBench {
+                fan_out,
+                operations,
+                sleep_usec,
+                ..
+            } => {
+                let (futex_ptr, is_messenger) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                // Shared memory layout: [u32 generation @ offset 0] [u64 wake_ns @ offset 8]
+                let wake_ts_ptr = unsafe { (futex_ptr as *mut u8).add(8) as *mut u64 };
+                if is_messenger {
+                    // Messenger: stamp wake time, advance generation, wake workers.
+                    let mut ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                    let wake_ns = (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64);
+                    unsafe { std::ptr::write_volatile(wake_ts_ptr, wake_ns) };
+                    let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
+                    unsafe {
+                        std::ptr::write_volatile(futex_ptr, next);
+                        libc::syscall(
+                            libc::SYS_futex,
+                            futex_ptr,
+                            libc::FUTEX_WAKE,
+                            fan_out as i32,
+                            std::ptr::null::<libc::timespec>(),
+                            std::ptr::null::<u32>(),
+                            0u32,
+                        );
+                    }
+                    spin_burst(&mut work_units, 256);
+                } else {
+                    // Worker: wait for generation advance, then do work.
+                    let expected = unsafe { std::ptr::read_volatile(futex_ptr) };
+                    let ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 100_000_000, // 100ms timeout
+                    };
+                    loop {
+                        if STOP.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
+                        if cur != expected {
+                            let mut now_ts = libc::timespec {
+                                tv_sec: 0,
+                                tv_nsec: 0,
+                            };
+                            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now_ts) };
+                            let now_ns =
+                                (now_ts.tv_sec as u64) * 1_000_000_000 + (now_ts.tv_nsec as u64);
+                            let wake_ns = unsafe { std::ptr::read_volatile(wake_ts_ptr) };
+                            let latency = now_ns.saturating_sub(wake_ns);
+                            reservoir_push(
+                                &mut wake_latencies_ns,
+                                &mut wake_sample_count,
+                                latency,
+                                MAX_WAKE_SAMPLES,
+                            );
+                            break;
+                        }
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_futex,
+                                futex_ptr,
+                                libc::FUTEX_WAIT,
+                                expected,
+                                &ts as *const libc::timespec,
+                                std::ptr::null::<u32>(),
+                                0u32,
+                            );
+                        }
+                    }
+                    if sleep_usec > 0 && !STOP.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_micros(sleep_usec));
+                    }
+                    if schbench_matrix_size > 0 && !STOP.load(Ordering::Relaxed) {
+                        let buf = cache_pressure_buf.get_or_insert_with(|| {
+                            vec![0u8; 3 * schbench_matrix_size * schbench_matrix_size * 8]
+                        });
+                        for _ in 0..operations {
+                            schbench_matrix_multiply(buf, schbench_matrix_size);
+                            work_units = work_units.wrapping_add(1);
+                        }
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
             WorkType::Custom { .. } => unreachable!("handled by early return"),
         }
 
@@ -1701,6 +1861,25 @@ fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_units: &mut u6
         buf[idx] = buf[idx].wrapping_add(1);
         idx = (idx + stride) % len;
         *work_units = std::hint::black_box(work_units.wrapping_add(1));
+    }
+}
+
+/// Naive matrix multiply: three square matrices of u64, O(n^3).
+fn schbench_matrix_multiply(buf: &mut [u8], size: usize) {
+    let data =
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u64, 3 * size * size) };
+    let stride = size * size;
+    for i in 0..size {
+        for j in 0..size {
+            let mut acc: u64 = 0;
+            for k in 0..size {
+                acc = acc.wrapping_add(
+                    std::hint::black_box(data[i * size + k])
+                        .wrapping_mul(std::hint::black_box(data[stride + k * size + j])),
+                );
+            }
+            data[2 * stride + i * size + j] = std::hint::black_box(acc);
+        }
     }
 }
 
@@ -1873,7 +2052,7 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        assert_eq!(WorkType::ALL_NAMES.len(), 17);
+        assert_eq!(WorkType::ALL_NAMES.len(), 18);
     }
 
     #[test]
@@ -3603,5 +3782,126 @@ mod tests {
             reports[0].work_units
         );
         assert!(reports[0].wall_time_ns > 0);
+    }
+
+    // -- SchBench tests --
+
+    #[test]
+    fn schbench_name() {
+        let wt = WorkType::SchBench {
+            fan_out: 4,
+            cache_footprint_kb: 256,
+            operations: 5,
+            sleep_usec: 100,
+        };
+        assert_eq!(wt.name(), "SchBench");
+    }
+
+    #[test]
+    fn schbench_from_name() {
+        let wt = WorkType::from_name("SchBench").unwrap();
+        match wt {
+            WorkType::SchBench {
+                fan_out,
+                cache_footprint_kb,
+                operations,
+                sleep_usec,
+            } => {
+                assert_eq!(fan_out, 4);
+                assert_eq!(cache_footprint_kb, 256);
+                assert_eq!(operations, 5);
+                assert_eq!(sleep_usec, 100);
+            }
+            _ => panic!("expected SchBench"),
+        }
+    }
+
+    #[test]
+    fn schbench_group_size() {
+        let wt = WorkType::schbench(4, 256, 5, 100);
+        assert_eq!(wt.worker_group_size(), Some(5));
+        let wt2 = WorkType::schbench(1, 256, 5, 100);
+        assert_eq!(wt2.worker_group_size(), Some(2));
+    }
+
+    #[test]
+    fn schbench_needs_shared_mem() {
+        assert!(WorkType::schbench(4, 256, 5, 100).needs_shared_mem());
+    }
+
+    #[test]
+    fn schbench_needs_cache_buf() {
+        assert!(WorkType::schbench(4, 256, 5, 100).needs_cache_buf());
+    }
+
+    #[test]
+    fn spawn_schbench_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 5, // 1 messenger + 4 workers
+            affinity: AffinityMode::None,
+            work_type: WorkType::SchBench {
+                fan_out: 4,
+                cache_footprint_kb: 256,
+                operations: 5,
+                sleep_usec: 100,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 5);
+        for r in &reports {
+            assert!(r.work_units > 0, "SchBench worker {} did no work", r.tid);
+        }
+        let has_latencies = reports.iter().any(|r| !r.wake_latencies_ns.is_empty());
+        assert!(has_latencies, "workers should record wake latencies");
+    }
+
+    #[test]
+    fn spawn_schbench_bad_worker_count_fails() {
+        let config = WorkloadConfig {
+            num_workers: 3,
+            affinity: AffinityMode::None,
+            work_type: WorkType::SchBench {
+                fan_out: 4,
+                cache_footprint_kb: 256,
+                operations: 5,
+                sleep_usec: 100,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let result = WorkloadHandle::spawn(&config);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("divisible by 5"),
+            "expected divisibility error: {msg}"
+        );
+    }
+
+    #[test]
+    fn spawn_schbench_two_groups() {
+        let config = WorkloadConfig {
+            num_workers: 10, // 2 groups of (1 messenger + 4 workers)
+            affinity: AffinityMode::None,
+            work_type: WorkType::SchBench {
+                fan_out: 4,
+                cache_footprint_kb: 256,
+                operations: 5,
+                sleep_usec: 100,
+            },
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        assert_eq!(h.tids().len(), 10);
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 10);
+        for r in &reports {
+            assert!(r.work_units > 0, "SchBench worker {} did no work", r.tid);
+        }
     }
 }

@@ -886,6 +886,18 @@ pub fn all_scenarios() -> Vec<Scenario> {
             cgroup_works: vec![],
             action: Action::Custom(custom_fanout_wake),
         },
+        // Performance: schbench-style messenger/worker workload
+        Scenario {
+            name: "schbench_style",
+            category: "performance",
+            description: "Schbench-style wake latency vs compute workers",
+            required_flags: F_BORROW,
+            excluded_flags: &[],
+            num_cgroups: 0,
+            cpuset_mode: CpusetMode::None,
+            cgroup_works: vec![],
+            action: Action::Custom(custom_schbench_style),
+        },
         // Stress: task creation/destruction churn
         s!(
             "fork_exit_churn",
