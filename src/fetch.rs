@@ -77,17 +77,24 @@ fn reject_html_response(response: &reqwest::blocking::Response, url: &str) -> Re
 }
 
 /// Print download size from Content-Length header if available.
-fn print_download_size(response: &reqwest::blocking::Response, url: &str) {
+///
+/// `cli_label` prefixes the diagnostic line so the message matches the
+/// binary the user invoked (`"ktstr"` vs `"cargo ktstr"`).
+fn print_download_size(response: &reqwest::blocking::Response, url: &str, cli_label: &str) {
     if let Some(len) = response.content_length() {
         let mb = len as f64 / (1024.0 * 1024.0);
-        eprintln!("ktstr: downloading {url} ({mb:.1} MB)");
+        eprintln!("{cli_label}: downloading {url} ({mb:.1} MB)");
     } else {
-        eprintln!("ktstr: downloading {url}");
+        eprintln!("{cli_label}: downloading {url}");
     }
 }
 
 /// Download a stable kernel tarball (.tar.xz) from cdn.kernel.org.
-fn download_stable_tarball(version: &str, dest_dir: &Path) -> Result<PathBuf, String> {
+fn download_stable_tarball(
+    version: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+) -> Result<PathBuf, String> {
     let major = major_version(version)?;
     let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz");
 
@@ -96,9 +103,9 @@ fn download_stable_tarball(version: &str, dest_dir: &Path) -> Result<PathBuf, St
         return Err(format!("download {url}: HTTP {}", response.status()));
     }
     reject_html_response(&response, &url)?;
-    print_download_size(&response, &url);
+    print_download_size(&response, &url, cli_label);
 
-    eprintln!("ktstr: extracting tarball (xz)");
+    eprintln!("{cli_label}: extracting tarball (xz)");
     let decoder = xz2::read::XzDecoder::new(response);
     let mut archive = tar::Archive::new(decoder);
     archive
@@ -116,7 +123,7 @@ fn download_stable_tarball(version: &str, dest_dir: &Path) -> Result<PathBuf, St
 }
 
 /// Download an RC kernel tarball (.tar.gz) from git.kernel.org.
-fn download_rc_tarball(version: &str, dest_dir: &Path) -> Result<PathBuf, String> {
+fn download_rc_tarball(version: &str, dest_dir: &Path, cli_label: &str) -> Result<PathBuf, String> {
     let url = format!("https://git.kernel.org/torvalds/t/linux-{version}.tar.gz");
 
     let response = reqwest::blocking::get(&url).map_err(|e| format!("download {url}: {e}"))?;
@@ -130,9 +137,9 @@ fn download_rc_tarball(version: &str, dest_dir: &Path) -> Result<PathBuf, String
         return Err(format!("download {url}: HTTP {}", response.status()));
     }
     reject_html_response(&response, &url)?;
-    print_download_size(&response, &url);
+    print_download_size(&response, &url, cli_label);
 
-    eprintln!("ktstr: extracting tarball (gzip)");
+    eprintln!("{cli_label}: extracting tarball (gzip)");
     let decoder = flate2::read::GzDecoder::new(response);
     let mut archive = tar::Archive::new(decoder);
     archive
@@ -150,12 +157,19 @@ fn download_rc_tarball(version: &str, dest_dir: &Path) -> Result<PathBuf, String
 }
 
 /// Download a kernel tarball (stable or RC) and extract it.
-pub fn download_tarball(version: &str, dest_dir: &Path) -> Result<AcquiredSource, String> {
+///
+/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
+/// `"cargo ktstr"`).
+pub fn download_tarball(
+    version: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+) -> Result<AcquiredSource, String> {
     let (arch, _) = arch_info();
     let source_dir = if is_rc(version) {
-        download_rc_tarball(version, dest_dir)?
+        download_rc_tarball(version, dest_dir, cli_label)?
     } else {
-        download_stable_tarball(version, dest_dir)?
+        download_stable_tarball(version, dest_dir, cli_label)?
     };
 
     Ok(AcquiredSource {
@@ -212,8 +226,11 @@ pub(crate) fn fetch_releases() -> Result<Vec<(String, String)>, String> {
 /// Selects from the `releases` array (moniker "stable" or "longterm"),
 /// requiring patch version >= 8 to avoid brand-new major versions
 /// that may have build issues on CI runners.
-pub fn fetch_latest_stable_version() -> Result<String, String> {
-    eprintln!("ktstr: fetching latest kernel version");
+///
+/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
+/// `"cargo ktstr"`).
+pub fn fetch_latest_stable_version(cli_label: &str) -> Result<String, String> {
+    eprintln!("{cli_label}: fetching latest kernel version");
     let releases = fetch_releases()?;
 
     let mut best: Option<&str> = None;
@@ -232,7 +249,7 @@ pub fn fetch_latest_stable_version() -> Result<String, String> {
 
     let version =
         best.ok_or_else(|| "no stable kernel with patch >= 8 found in releases.json".to_string())?;
-    eprintln!("ktstr: latest stable kernel: {version}");
+    eprintln!("{cli_label}: latest stable kernel: {version}");
     Ok(version.to_string())
 }
 
@@ -276,8 +293,11 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 /// Scans all monikers in releases.json except linux-next. If no
 /// match is found (EOL series), probes cdn.kernel.org with HEAD
 /// requests to find the highest patch version with a tarball.
-pub fn fetch_version_for_prefix(prefix: &str) -> Result<String, String> {
-    eprintln!("ktstr: fetching latest {prefix}.x kernel version");
+///
+/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
+/// `"cargo ktstr"`).
+pub fn fetch_version_for_prefix(prefix: &str, cli_label: &str) -> Result<String, String> {
+    eprintln!("{cli_label}: fetching latest {prefix}.x kernel version");
     let releases = fetch_releases()?;
 
     let mut best: Option<(&str, (u32, u32, u32))> = None;
@@ -300,12 +320,12 @@ pub fn fetch_version_for_prefix(prefix: &str) -> Result<String, String> {
     }
 
     if let Some((version, _)) = best {
-        eprintln!("ktstr: latest {prefix}.x kernel: {version}");
+        eprintln!("{cli_label}: latest {prefix}.x kernel: {version}");
         return Ok(version.to_string());
     }
 
-    eprintln!("ktstr: {prefix}.x not in releases.json (EOL series), probing cdn.kernel.org");
-    probe_latest_patch(prefix)
+    eprintln!("{cli_label}: {prefix}.x not in releases.json (EOL series), probing cdn.kernel.org");
+    probe_latest_patch(prefix, cli_label)
 }
 
 /// Probe cdn.kernel.org to find the highest patch version for an EOL series.
@@ -313,7 +333,7 @@ pub fn fetch_version_for_prefix(prefix: &str) -> Result<String, String> {
 /// Sends HEAD requests for {prefix}.1, {prefix}.2, ... until a non-success
 /// response or the safety cap (500). Returns the last version that returned
 /// 200 with a non-HTML content type.
-fn probe_latest_patch(prefix: &str) -> Result<String, String> {
+fn probe_latest_patch(prefix: &str, cli_label: &str) -> Result<String, String> {
     let major = major_version(prefix)?;
     let client = reqwest::blocking::Client::new();
 
@@ -340,14 +360,22 @@ fn probe_latest_patch(prefix: &str) -> Result<String, String> {
 
     let version =
         last_good.ok_or_else(|| format!("no tarball found for {prefix}.x on cdn.kernel.org"))?;
-    eprintln!("ktstr: latest {prefix}.x kernel (from cdn probe): {version}");
+    eprintln!("{cli_label}: latest {prefix}.x kernel (from cdn probe): {version}");
     Ok(version)
 }
 
 /// Clone a git repository with shallow depth.
-pub fn git_clone(url: &str, git_ref: &str, dest_dir: &Path) -> Result<AcquiredSource, String> {
+///
+/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
+/// `"cargo ktstr"`).
+pub fn git_clone(
+    url: &str,
+    git_ref: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+) -> Result<AcquiredSource, String> {
     let (arch, _) = arch_info();
-    eprintln!("ktstr: cloning {url} (ref: {git_ref}, depth: 1)");
+    eprintln!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
 
     let clone_dir = dest_dir.join("linux");
 
@@ -397,10 +425,14 @@ pub fn git_clone(url: &str, git_ref: &str, dest_dir: &Path) -> Result<AcquiredSo
 
 /// Use a local kernel source tree.
 ///
-/// Performs dirty detection via gix (`Repository::is_dirty`) to
-/// determine if the working tree has modifications to tracked files.
-/// Untracked files do not affect the dirty flag.
-pub fn local_source(source_path: &Path) -> Result<AcquiredSource, String> {
+/// Dirty detection uses gix `tree_index_status` (HEAD-vs-index) and
+/// `status().into_index_worktree_iter()` (index-vs-worktree) to check
+/// for modifications to tracked files. Submodule checks are skipped
+/// entirely. Untracked files do not affect the dirty flag.
+///
+/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
+/// `"cargo ktstr"`).
+pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSource, String> {
     let (arch, _) = arch_info();
 
     if !source_path.is_dir() {
@@ -412,8 +444,7 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource, String> {
         .map_err(|e| format!("canonicalize {}: {e}", source_path.display()))?;
 
     // Git hash extraction and dirty detection via gix.
-    // Use the status API directly instead of is_dirty() to skip
-    // submodule checks (which produce false positives on kernel
+    // Submodule checks are skipped (false positives on kernel
     // trees with uninitialized submodules).
     let (short_hash, is_dirty) = match gix::discover(&canonical) {
         Ok(repo) => {
@@ -460,7 +491,7 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource, String> {
         }
         Err(_) => {
             eprintln!(
-                "ktstr: warning: {} is not a git repository, cannot detect dirty state",
+                "{cli_label}: warning: {} is not a git repository, cannot detect dirty state",
                 source_path.display()
             );
             (None, true)

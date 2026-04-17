@@ -336,19 +336,19 @@ fn kernel_build(
 
     // Acquire source.
     let acquired = if let Some(ref src_path) = source {
-        fetch::local_source(src_path)?
+        fetch::local_source(src_path, "cargo ktstr")?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
-        fetch::git_clone(url, ref_name, tmp_dir.path())?
+        fetch::git_clone(url, ref_name, tmp_dir.path(), "cargo ktstr")?
     } else {
         // Tarball download: explicit version, prefix, or latest stable.
         let ver = match version {
             Some(v) if fetch::is_major_minor_prefix(&v) => {
                 // Major.minor prefix (e.g., "6.12") — resolve latest patch.
-                fetch::fetch_version_for_prefix(&v)?
+                fetch::fetch_version_for_prefix(&v, "cargo ktstr")?
             }
             Some(v) => v,
-            None => fetch::fetch_latest_stable_version()?,
+            None => fetch::fetch_latest_stable_version("cargo ktstr")?,
         };
         // Check cache before downloading.
         let (arch, _) = fetch::arch_info();
@@ -359,7 +359,7 @@ fn kernel_build(
             return Ok(());
         }
         let sp = cli::Spinner::start("Downloading kernel...");
-        let result = fetch::download_tarball(&ver, tmp_dir.path());
+        let result = fetch::download_tarball(&ver, tmp_dir.path(), "cargo ktstr");
         sp.clear();
         result?
     };
@@ -377,7 +377,7 @@ fn kernel_build(
     }
 
     let result =
-        cli::kernel_build_pipeline(&acquired, &cache, "cargo-ktstr", clean, source.is_some())
+        cli::kernel_build_pipeline(&acquired, &cache, "cargo ktstr", clean, source.is_some())
             .map_err(|e| format!("{e:#}"))?;
 
     // Store to remote cache when enabled.

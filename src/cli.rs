@@ -527,15 +527,15 @@ pub struct KernelBuildResult {
 /// compute metadata, and cache store. Callers handle source
 /// acquisition; some callers also handle remote cache operations.
 ///
-/// `label` is the binary name used as a prefix for diagnostic messages
-/// to stderr (e.g. "ktstr" or "cargo-ktstr").
+/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
+/// `"cargo ktstr"`).
 ///
 /// `is_local_source` should be true when the user passed `--source`.
 /// It controls the mrproper warning and `source_tree_path` in metadata.
 pub fn kernel_build_pipeline(
     acquired: &crate::fetch::AcquiredSource,
     cache: &crate::cache::CacheDir,
-    label: &str,
+    cli_label: &str,
     clean: bool,
     is_local_source: bool,
 ) -> Result<KernelBuildResult> {
@@ -546,10 +546,10 @@ pub fn kernel_build_pipeline(
     if clean {
         if !is_local_source {
             eprintln!(
-                "{label}: --clean is only meaningful with --source (downloaded sources start clean)"
+                "{cli_label}: --clean is only meaningful with --source (downloaded sources start clean)"
             );
         } else {
-            eprintln!("{label}: make mrproper");
+            eprintln!("{cli_label}: make mrproper");
             run_make(source_dir, &["mrproper"])?;
         }
     }
@@ -606,21 +606,21 @@ pub fn kernel_build_pipeline(
                     .map(|m| m.len() as f64 / (1024.0 * 1024.0))
                     .unwrap_or(0.0);
                 eprintln!(
-                    "{label}: caching vmlinux ({orig_mb:.0} MB -> {stripped_mb:.0} MB, debug stripped)"
+                    "{cli_label}: caching vmlinux ({orig_mb:.0} MB -> {stripped_mb:.0} MB, debug stripped)"
                 );
                 _stripped_dir = Some(dir);
                 Some(stripped_path)
             }
             Err(e) => {
                 eprintln!(
-                    "{label}: warning: vmlinux strip failed ({e:#}), caching unstripped ({orig_mb:.0} MB)"
+                    "{cli_label}: warning: vmlinux strip failed ({e:#}), caching unstripped ({orig_mb:.0} MB)"
                 );
                 _stripped_dir = None;
                 Some(vmlinux_path.clone())
             }
         }
     } else {
-        eprintln!("{label}: warning: vmlinux not found, BTF will not be cached");
+        eprintln!("{cli_label}: warning: vmlinux not found, BTF will not be cached");
         _stripped_dir = None;
         None
     };
@@ -628,8 +628,8 @@ pub fn kernel_build_pipeline(
 
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
-        eprintln!("{label}: kernel built at {}", image_path.display());
-        eprintln!("{label}: skipping cache (dirty tree)");
+        eprintln!("{cli_label}: kernel built at {}", image_path.display());
+        eprintln!("{cli_label}: skipping cache (dirty tree)");
         return Ok(KernelBuildResult {
             entry: None,
             image_path,
@@ -674,11 +674,14 @@ pub fn kernel_build_pipeline(
     ) {
         Ok(entry) => {
             success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
-            eprintln!("{label}: image: {}", entry.path.join(image_name).display());
+            eprintln!(
+                "{cli_label}: image: {}",
+                entry.path.join(image_name).display()
+            );
             Some(entry)
         }
         Err(e) => {
-            warn(&format!("{label}: cache store failed: {e:#}"));
+            warn(&format!("{cli_label}: cache store failed: {e:#}"));
             None
         }
     };
@@ -876,7 +879,8 @@ pub fn resolve_cached_kernel(
         KernelId::Version(ver) => {
             // Major.minor prefix (e.g. "6.14") → resolve to latest patch.
             let resolved = if crate::fetch::is_major_minor_prefix(ver) {
-                crate::fetch::fetch_version_for_prefix(ver).map_err(|e| anyhow::anyhow!("{e}"))?
+                crate::fetch::fetch_version_for_prefix(ver, cli_label)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
             } else {
                 ver.clone()
             };
@@ -1005,7 +1009,8 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
     ));
 
     let sp = Spinner::start("Fetching latest kernel version...");
-    let ver = crate::fetch::fetch_latest_stable_version().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ver =
+        crate::fetch::fetch_latest_stable_version(cli_label).map_err(|e| anyhow::anyhow!("{e}"))?;
     sp.finish(format!("Latest stable: {ver}"));
 
     let cache_dir = download_and_cache_version(&ver, cli_label)?;
@@ -1034,7 +1039,7 @@ fn download_and_cache_version(version: &str, cli_label: &str) -> Result<std::pat
     let tmp_dir = tempfile::TempDir::new()?;
 
     let sp = Spinner::start("Downloading kernel...");
-    let acquired = crate::fetch::download_tarball(version, tmp_dir.path())
+    let acquired = crate::fetch::download_tarball(version, tmp_dir.path(), cli_label)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     sp.finish("Downloaded");
 
@@ -1065,7 +1070,8 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
         );
     }
 
-    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let acquired =
+        crate::fetch::local_source(path, cli_label).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (_, image_name) = crate::fetch::arch_info();
     let cache_key = acquired.cache_key.clone();
 

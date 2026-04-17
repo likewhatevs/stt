@@ -283,19 +283,22 @@ fn kernel_build(
 
     // Acquire source.
     let acquired = if let Some(ref src_path) = source {
-        fetch::local_source(src_path).map_err(|e| anyhow::anyhow!("{e}"))?
+        fetch::local_source(src_path, "ktstr").map_err(|e| anyhow::anyhow!("{e}"))?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
-        fetch::git_clone(url, ref_name, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"))?
+        fetch::git_clone(url, ref_name, tmp_dir.path(), "ktstr")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
     } else {
         // Tarball download: explicit version, prefix, or latest stable.
         let ver = match version {
             Some(v) if fetch::is_major_minor_prefix(&v) => {
                 // Major.minor prefix (e.g., "6.12") — resolve latest patch.
-                fetch::fetch_version_for_prefix(&v).map_err(|e| anyhow::anyhow!("{e}"))?
+                fetch::fetch_version_for_prefix(&v, "ktstr").map_err(|e| anyhow::anyhow!("{e}"))?
             }
             Some(v) => v,
-            None => fetch::fetch_latest_stable_version().map_err(|e| anyhow::anyhow!("{e}"))?,
+            None => {
+                fetch::fetch_latest_stable_version("ktstr").map_err(|e| anyhow::anyhow!("{e}"))?
+            }
         };
         // Check cache before downloading.
         let (arch, _) = fetch::arch_info();
@@ -306,8 +309,8 @@ fn kernel_build(
             return Ok(());
         }
         let sp = cli::Spinner::start("Downloading kernel...");
-        let result =
-            fetch::download_tarball(&ver, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"));
+        let result = fetch::download_tarball(&ver, tmp_dir.path(), "ktstr")
+            .map_err(|e| anyhow::anyhow!("{e}"));
         sp.clear();
         result?
     };
