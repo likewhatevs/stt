@@ -164,6 +164,8 @@ static __KTSTR_ENTRY_SCATTER: ktstr::test_support::KtstrTestEntry =
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         },
         scheduler: &SCATTER_SCHED,
         extra_sched_args: &["--scattershot"],

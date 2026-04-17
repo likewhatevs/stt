@@ -208,23 +208,35 @@ fn write_memory(fdt: &mut FdtWriter, topo: &Topology, memory_mb: u32, shm_size: 
         fdt.end_node(mem).context("end memory")?;
     } else {
         // Multi-NUMA: one memory node per NUMA node, each with
-        // numa-node-id. Usable memory is split evenly; the last
-        // node absorbs rounding remainder AND extends to cover
-        // the SHM region. SHM must be in memblock.memory so
+        // numa-node-id. When explicit per-node memory is configured,
+        // use it; otherwise split evenly. The last node extends to
+        // cover the SHM region. SHM must be in memblock.memory so
         // arm64 phys_mem_access_prot() maps it cacheable via
         // /dev/mem. /reserved-memory prevents kernel allocation
         // from SHM while keeping it in the linear map.
         let usable_bytes = mem_size - shm_size;
         let n = topo.numa_nodes as u64;
-        let per_node = (usable_bytes / n) & !0xFFF; // page-align down (4 KiB)
+        let uniform_per_node = (usable_bytes / n) & !0xFFF; // page-align down (4 KiB)
 
+        let mut base_offset: u64 = 0;
         for node in 0..topo.numa_nodes {
-            let base = DRAM_START + node as u64 * per_node;
-            let length = if node == topo.numa_nodes - 1 {
-                // Last node: cover remainder of usable memory + SHM.
-                mem_size - node as u64 * per_node
-            } else {
-                per_node
+            let base = DRAM_START + base_offset;
+            let length = match topo.node_memory_mb(node) {
+                Some(mb) => {
+                    let node_bytes = (mb as u64) << 20;
+                    if node == topo.numa_nodes - 1 {
+                        node_bytes + shm_size
+                    } else {
+                        node_bytes
+                    }
+                }
+                None => {
+                    if node == topo.numa_nodes - 1 {
+                        mem_size - base_offset
+                    } else {
+                        uniform_per_node
+                    }
+                }
             };
             let name = format!("memory@{base:x}");
             let mem = fdt.begin_node(&name).context("begin memory")?;
@@ -243,6 +255,7 @@ fn write_memory(fdt: &mut FdtWriter, topo: &Topology, memory_mb: u32, shm_size: 
             fdt.property_u32("numa-node-id", node)
                 .context("memory numa-node-id")?;
             fdt.end_node(mem).context("end memory")?;
+            base_offset += length;
         }
     }
 
@@ -507,8 +520,8 @@ fn write_psci(fdt: &mut FdtWriter) -> Result<()> {
 /// Write a `distance-map` node with `numa-distance-map-v1` compatible.
 ///
 /// The kernel parses `distance-matrix` as a flat array of (nodea, nodeb,
-/// distance) triples. Distance 10 = local (LOCAL_DISTANCE), 20 = remote.
-/// Matches the x86_64 SLIT values.
+/// distance) triples. Distances come from `topo.distance()`, defaulting
+/// to 10 (local) / 20 (remote).
 fn write_distance_map(fdt: &mut FdtWriter, topo: &Topology) -> Result<()> {
     let dm = fdt
         .begin_node("distance-map")
@@ -523,7 +536,7 @@ fn write_distance_map(fdt: &mut FdtWriter, topo: &Topology) -> Result<()> {
         for j in 0..n {
             matrix.push(i);
             matrix.push(j);
-            matrix.push(if i == j { 10 } else { 20 });
+            matrix.push(topo.distance(i, j) as u32);
         }
     }
     fdt.property_array_u32("distance-matrix", &matrix)
@@ -543,6 +556,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         }
     }
 
@@ -614,6 +629,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
@@ -637,6 +654,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
@@ -660,6 +679,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
@@ -683,6 +704,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 3,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
@@ -893,6 +916,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
@@ -916,6 +941,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         let mpidrs_smt = fake_mpidrs(topo_smt.total_cpus());
         let dtb_smt = create_fdt(
@@ -940,6 +967,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
@@ -1041,6 +1070,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
 
@@ -1084,6 +1115,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 3,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
@@ -1138,6 +1171,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(
@@ -1221,6 +1256,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = create_fdt(

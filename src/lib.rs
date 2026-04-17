@@ -310,7 +310,9 @@ pub mod prelude {
     };
     pub use crate::scenario::scenarios;
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
-    pub use crate::test_support::{BpfMapWrite, CgroupPath, Scheduler, SchedulerSpec, Sysctl};
+    pub use crate::test_support::{
+        BpfMapWrite, CgroupPath, NumaDistance, NumaNode, Scheduler, SchedulerSpec, Sysctl,
+    };
     pub use crate::topology::{LlcInfo, TestTopology};
     pub use crate::workload::{
         AffinityKind, AffinityMode, Phase, SchedPolicy, Work, WorkType, WorkerReport,

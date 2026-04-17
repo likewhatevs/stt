@@ -426,6 +426,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let ids: Vec<u32> = (0..t.total_cpus()).map(|i| apic_id(&t, i)).collect();
         let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
@@ -439,6 +441,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         // SMT siblings should differ only in thread_id bits
         let smt_mask = (1u32 << smt_shift(&t)) - 1;
@@ -463,6 +467,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let pkg_mask = !((1u32 << core_shift(&t)) - 1);
         let cpus_per_llc = t.cores_per_llc * t.threads_per_core;
@@ -490,6 +496,8 @@ mod tests {
                 cores_per_llc: 1,
                 threads_per_core: 1,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             }),
             0
         );
@@ -499,6 +507,8 @@ mod tests {
                 cores_per_llc: 1,
                 threads_per_core: 2,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             }),
             1
         );
@@ -508,6 +518,8 @@ mod tests {
                 cores_per_llc: 1,
                 threads_per_core: 4,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             }),
             2
         );
@@ -522,6 +534,8 @@ mod tests {
                 cores_per_llc: 4,
                 threads_per_core: 1,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             }),
             2
         );
@@ -532,6 +546,8 @@ mod tests {
                 cores_per_llc: 4,
                 threads_per_core: 2,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             }),
             3
         );
@@ -548,6 +564,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -578,6 +596,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid0 = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -614,6 +634,8 @@ mod tests {
             cores_per_llc: 3,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.total_cpus(), 9);
         let ids: Vec<u32> = (0..9).map(|i| apic_id(&t, i)).collect();
@@ -636,6 +658,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(topo.total_cpus(), 32);
         let cpuid = generate_cpuid(
@@ -676,6 +700,8 @@ mod tests {
                 cores_per_llc: cores,
                 threads_per_core: threads,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             };
             let ids: Vec<u32> = (0..t.total_cpus()).map(|i| apic_id(&t, i)).collect();
             let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
@@ -698,6 +724,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -733,6 +761,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -768,6 +798,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -808,6 +840,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -841,6 +875,8 @@ mod tests {
             cores_per_llc: 3,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -876,6 +912,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -906,6 +944,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -933,6 +973,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -962,6 +1004,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -993,6 +1037,8 @@ mod tests {
                 cores_per_llc: cores,
                 threads_per_core: threads,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             };
             for cpu in 0..t.total_cpus() {
                 let (s, c, th) = t.decompose(cpu);
@@ -1019,6 +1065,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1050,6 +1098,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
 
         // Check CPU 0
@@ -1108,6 +1158,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         let base = kvm
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1147,6 +1199,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1175,6 +1229,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1210,6 +1266,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1240,6 +1298,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1271,6 +1331,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1331,6 +1393,8 @@ mod tests {
                 cores_per_llc: cores,
                 threads_per_core: threads,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             };
             let cpuid = generate_cpuid(
                 kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1451,6 +1515,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1500,6 +1566,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1541,6 +1609,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1578,6 +1648,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1625,6 +1697,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1668,6 +1742,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         // Generate CPUID for cpu 0 (LLC 0) and cpu 4 (LLC 1)
         let cpuid0 = generate_cpuid(
@@ -1753,6 +1829,8 @@ mod tests {
                 cores_per_llc: cores,
                 threads_per_core: threads,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             };
             let cpus_per_llc = cores * threads;
 
@@ -1792,6 +1870,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(max_apic_id(&t), 0);
     }
@@ -1803,6 +1883,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(max_apic_id(&t), apic_id(&t, t.total_cpus() - 1));
     }
@@ -1815,6 +1897,8 @@ mod tests {
             cores_per_llc: 9,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         // core_bits = bits_needed(9) = 4, thread_bits = 1
         // last cpu = 251: LLC 13, core 8, thread 1
@@ -1830,6 +1914,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(smt_shift(&t), 0);
         // APIC IDs should still be unique
@@ -1845,6 +1931,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.total_cpus(), 1);
         assert_eq!(apic_id(&t, 0), 0);
@@ -1862,6 +1950,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1907,6 +1997,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1969,6 +2061,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let cpuid = generate_cpuid(&base, &topo, 0, true);
         let entry = cpuid

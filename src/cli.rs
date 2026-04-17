@@ -1357,7 +1357,7 @@ mod tests {
     #[test]
     fn cli_parse_work_type_all_valid() {
         for &name in WorkType::ALL_NAMES {
-            if name == "Sequence" {
+            if name == "Sequence" || name == "Custom" {
                 continue;
             }
             let wt = parse_work_type(Some(name)).unwrap().unwrap();

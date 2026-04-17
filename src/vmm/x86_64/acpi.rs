@@ -444,22 +444,36 @@ fn write_srat(
         offset += bytes.len();
     }
 
-    // Memory affinity: one entry per NUMA node, memory split evenly.
+    // Memory affinity: one entry per NUMA node. When explicit per-node
+    // memory is configured, use it; otherwise split evenly. The last
+    // node extends to cover the SHM region in both paths.
     let mem_bytes = (memory_mb as u64) << 20;
     let usable_bytes = mem_bytes - shm_size;
-    let per_node = usable_bytes / num_numa_nodes as u64;
+    let mut base_addr: u64 = 0;
     for node in 0..num_numa_nodes {
-        let base = node as u64 * per_node;
-        let length = if node == num_numa_nodes - 1 {
-            usable_bytes - base
-        } else {
-            per_node
+        let length = match topo.node_memory_mb(node) {
+            Some(mb) => {
+                let node_bytes = (mb as u64) << 20;
+                if node == num_numa_nodes - 1 {
+                    node_bytes + shm_size
+                } else {
+                    node_bytes
+                }
+            }
+            None => {
+                let per_node = usable_bytes / num_numa_nodes as u64;
+                if node == num_numa_nodes - 1 {
+                    usable_bytes - base_addr
+                } else {
+                    per_node
+                }
+            }
         };
         let entry = SratMemAffinity {
             entry_type: 1,
             length: std::mem::size_of::<SratMemAffinity>() as u8,
             proximity_domain: node,
-            base_address: base,
+            base_address: base_addr,
             address_length: length,
             flags: 1,
             ..Default::default()
@@ -467,6 +481,7 @@ fn write_srat(
         let bytes = entry.as_bytes();
         buf[offset..offset + bytes.len()].copy_from_slice(bytes);
         offset += bytes.len();
+        base_addr += length;
     }
 
     set_sdt_checksum(&mut buf);
@@ -486,7 +501,7 @@ fn write_slit(mem: &GuestMemoryMmap, topo: &Topology, addr: u64) -> Result<()> {
     let matrix_start = 44;
     for i in 0..n {
         for j in 0..n {
-            buf[matrix_start + (i * n + j) as usize] = if i == j { 10 } else { 20 };
+            buf[matrix_start + (i * n + j) as usize] = topo.distance(i as u32, j as u32);
         }
     }
 
@@ -706,6 +721,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut rsdp = [0u8; 20];
@@ -724,6 +741,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let rsdt = read_table(&mem, l.rsdt_addr);
@@ -740,6 +759,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -756,6 +777,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -775,6 +798,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -806,6 +831,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -827,6 +854,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut rsdp = [0u8; 20];
@@ -846,6 +875,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut entry = [0u8; 4];
@@ -871,6 +902,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -888,6 +921,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -903,6 +938,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -921,6 +958,8 @@ mod tests {
             cores_per_llc: 9,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let mut has_low = false;
         let mut has_high = false;
@@ -953,6 +992,8 @@ mod tests {
             cores_per_llc: 9,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -975,6 +1016,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -1007,6 +1050,8 @@ mod tests {
                 cores_per_llc: cores,
                 threads_per_core: threads,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             };
             let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
             let madt = read_madt(&mem, &l);
@@ -1034,6 +1079,8 @@ mod tests {
                 cores_per_llc: cores,
                 threads_per_core: threads,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             };
             let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
             let madt = read_madt(&mem, &l);
@@ -1067,6 +1114,8 @@ mod tests {
             cores_per_llc: 9,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -1093,6 +1142,8 @@ mod tests {
             cores_per_llc: 9,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -1114,6 +1165,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let madt = read_madt(&mem, &l);
@@ -1135,6 +1188,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut rsdp = [0u8; 36];
@@ -1165,6 +1220,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let xsdt = read_table(&mem, l.xsdt_addr);
@@ -1182,6 +1239,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut entry = [0u8; 8];
@@ -1207,6 +1266,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut fadt = [0u8; 276];
@@ -1227,6 +1288,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut fadt = [0u8; 276];
@@ -1246,6 +1309,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut fadt = [0u8; 276];
@@ -1262,6 +1327,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut fadt = [0u8; 276];
@@ -1285,6 +1352,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut dsdt = [0u8; 36];
@@ -1304,6 +1373,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
         let mut rsdp = [0u8; 36];
@@ -1343,6 +1414,8 @@ mod tests {
                 cores_per_llc: cores,
                 threads_per_core: threads,
                 numa_nodes,
+                nodes: None,
+                distances: None,
             };
             let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
             let srat = read_table(&mem, l.srat_addr);
@@ -1380,6 +1453,8 @@ mod tests {
                 cores_per_llc: 2,
                 threads_per_core: 1,
                 numa_nodes,
+                nodes: None,
+                distances: None,
             };
             let mem_bytes = 256u64 << 20;
             let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
@@ -1426,6 +1501,8 @@ mod tests {
                 cores_per_llc: 2,
                 threads_per_core: 1,
                 numa_nodes,
+                nodes: None,
+                distances: None,
             };
             let mem_bytes = 256u64 << 20;
             let expected_usable = mem_bytes - shm_size;
@@ -1454,6 +1531,8 @@ mod tests {
                 cores_per_llc: 1,
                 threads_per_core: 1,
                 numa_nodes,
+                nodes: None,
+                distances: None,
             };
             let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
             let slit = read_table(&mem, l.slit_addr);
@@ -1485,6 +1564,8 @@ mod tests {
                 cores_per_llc: cores,
                 threads_per_core: threads,
                 numa_nodes,
+                nodes: None,
+                distances: None,
             };
             let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
             let srat = read_table(&mem, l.srat_addr);
@@ -1513,6 +1594,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 3,
+            nodes: None,
+            distances: None,
         };
         let mem_bytes = (memory_mb as u64) << 20;
         let per_node = mem_bytes / 3;
@@ -1553,6 +1636,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let shm_size: u64 = 64 * 1024;
         let l = setup_acpi(&mem, &topo, 256, shm_size).unwrap();

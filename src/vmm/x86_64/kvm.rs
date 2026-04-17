@@ -412,6 +412,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
@@ -426,6 +428,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 256, false);
         assert!(vm.is_ok(), "multi-LLC VM creation failed: {:?}", vm.err());
@@ -440,6 +444,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false);
         assert!(vm.is_ok());
@@ -453,6 +459,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 512, false);
         assert!(vm.is_ok(), "large topology failed: {:?}", vm.err());
@@ -466,6 +474,8 @@ mod tests {
             cores_per_llc: 3,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "odd topology failed: {:?}", vm.err());
@@ -480,6 +490,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
@@ -510,6 +522,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         // max APIC ID = apic_id(15) = 1<<3 | 3<<1 | 1 = 15, well under 254
         assert!(max_apic_id(&topo) <= MAX_XAPIC_ID);
@@ -529,6 +543,8 @@ mod tests {
             cores_per_llc: 9,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert!(
             max_apic_id(&topo) > MAX_XAPIC_ID,
@@ -561,6 +577,8 @@ mod tests {
             cores_per_llc: 8,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert!(
             max_apic_id(&small) <= MAX_XAPIC_ID,
@@ -576,6 +594,8 @@ mod tests {
             cores_per_llc: 8,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert!(
             max_apic_id(&still_small) <= MAX_XAPIC_ID,
@@ -593,6 +613,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT is available since Linux 4.12.
@@ -606,6 +628,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 128, true);
         assert!(
@@ -622,6 +646,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm_normal = KtstrKvm::new(topo, 256, false).unwrap();
         let vm_perf = KtstrKvm::new(topo, 256, true).unwrap();
@@ -640,6 +666,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(
@@ -677,6 +705,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, true).unwrap();
         let clock = vm.vm_fd.get_clock().unwrap();
@@ -701,6 +731,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 128, true);
         assert!(

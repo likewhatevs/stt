@@ -3849,6 +3849,8 @@ impl Default for KtstrVmBuilder {
                 cores_per_llc: 1,
                 threads_per_core: 1,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             },
             memory_mb: Some(256),
             memory_min_mb: 0,
@@ -3930,6 +3932,8 @@ impl KtstrVmBuilder {
             cores_per_llc: cores,
             threads_per_core: threads,
             numa_nodes,
+            nodes: None,
+            distances: None,
         };
         self
     }
@@ -4584,6 +4588,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = kvm::KtstrKvm::new(topo, 128, false).unwrap();
         for vcpu in &vm.vcpus[1..] {
@@ -4734,6 +4740,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         // KVM_CAP_IMMEDIATE_EXIT has been available since Linux 4.12.
@@ -4751,6 +4759,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let handle = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -4787,6 +4797,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let h0 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -4819,6 +4831,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -6130,6 +6144,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         assert!(

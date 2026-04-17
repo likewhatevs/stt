@@ -191,6 +191,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         setup_mptable(&mem, &topo).unwrap();
         // Verify MP floating pointer magic
@@ -208,6 +210,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         setup_mptable(&mem, &topo).unwrap();
         let mut magic = [0u8; 4];
@@ -230,6 +234,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         setup_mptable(&mem, &topo).unwrap();
         let mut mpf = [0u8; 16];
@@ -247,6 +253,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -272,6 +280,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -296,6 +306,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -322,6 +334,8 @@ mod tests {
             cores_per_llc: 8,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(topo.total_cpus(), 240);
         // Should succeed — MP table uses u8 APIC IDs but max here is < 255
@@ -336,6 +350,8 @@ mod tests {
             cores_per_llc: 9,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(topo.total_cpus(), 252);
         assert!(setup_mptable(&mem, &topo).is_ok());

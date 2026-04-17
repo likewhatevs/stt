@@ -208,6 +208,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vm_fd) {
@@ -222,6 +224,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
@@ -236,6 +240,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
@@ -253,6 +259,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
@@ -271,6 +279,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(reader) = VcpuStatsReader::open(&vm.vcpus[0]) {
@@ -286,6 +296,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         if let Some(ctx) = open_stats_context(&vm.vcpus) {

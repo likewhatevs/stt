@@ -1,22 +1,175 @@
-/// CPU topology specification.
+/// CPU topology specification with NUMA memory topology.
 ///
 /// Models the hierarchy: NUMA nodes → LLCs → cores → threads.
-/// `llcs` is the total LLC count across all NUMA nodes.
-/// `numa_nodes` groups LLCs into NUMA proximity domains.
 ///
-/// Use [`new`](Self::new) for validated construction, or
-/// [`validate`](Self::validate) to check a struct-literal value.
+/// Each NUMA node owns a contiguous range of LLCs and a memory region.
+/// When `nodes` is `None` (the default), memory and LLCs are distributed
+/// uniformly across `numa_nodes` synthetic nodes with 10/20 distances.
+///
+/// Use [`new`](Self::new) for the simple uniform case, or
+/// [`with_nodes`](Self::with_nodes) for explicit per-node configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Topology {
     /// Total number of last-level caches across the whole VM; must be
-    /// a multiple of `numa_nodes`.
+    /// a multiple of `numa_nodes` when `nodes` is `None`.
     pub llcs: u32,
     /// Physical cores grouped into each LLC.
     pub cores_per_llc: u32,
     /// Hardware threads exposed per core (`1` = no SMT, `2` = SMT-2).
     pub threads_per_core: u32,
-    /// Number of NUMA nodes; LLCs partition evenly across them.
+    /// Number of NUMA nodes.
     pub numa_nodes: u32,
+    /// Per-node configuration. When `None`, LLCs and memory are
+    /// distributed uniformly. When `Some`, the slice length must
+    /// equal `numa_nodes` and the sum of all `NumaNode::llcs` must
+    /// equal `self.llcs`.
+    pub nodes: Option<&'static [NumaNode]>,
+    /// Inter-node distance matrix. When `None`, distances default to
+    /// 10 (local) / 20 (remote). When `Some`, the matrix dimension
+    /// must equal `numa_nodes`.
+    pub distances: Option<&'static NumaDistance>,
+}
+
+/// Per-NUMA-node configuration.
+///
+/// `llcs = 0` models a CXL memory-only node: the node has RAM but no
+/// CPUs or LLCs. Such nodes appear in the SRAT memory affinity table
+/// and SLIT distance matrix but contribute no CPU affinity entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumaNode {
+    /// Number of LLCs owned by this node. Zero means memory-only (CXL).
+    pub llcs: u32,
+    /// Memory attached to this node in MiB.
+    pub memory_mb: u32,
+}
+
+impl NumaNode {
+    /// Const constructor.
+    pub const fn new(llcs: u32, memory_mb: u32) -> Self {
+        Self { llcs, memory_mb }
+    }
+
+    /// Whether this is a memory-only node (CXL: has RAM but no CPUs).
+    pub const fn is_memory_only(&self) -> bool {
+        self.llcs == 0
+    }
+}
+
+/// NxN inter-NUMA-node distance matrix.
+///
+/// Stored as a flat row-major array. ACPI SLIT requires diagonal = 10
+/// and off-diagonal > 10. ktstr additionally enforces symmetry.
+///
+/// Construct via [`NumaDistance::new`] which validates all invariants
+/// at const-eval time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumaDistance {
+    /// Number of NUMA nodes (matrix is `n x n`).
+    n: u32,
+    /// Row-major distance values. Length must be `n * n`.
+    entries: &'static [u8],
+}
+
+impl NumaDistance {
+    /// Const constructor with full validation.
+    ///
+    /// Panics if:
+    /// - `n == 0`
+    /// - `entries.len() != n * n`
+    /// - any diagonal entry is not 10
+    /// - any off-diagonal entry is not > 10
+    /// - the matrix is not symmetric
+    pub const fn new(n: u32, entries: &'static [u8]) -> Self {
+        assert!(n > 0, "NumaDistance: n must be > 0");
+        let expected = (n as usize) * (n as usize);
+        assert!(
+            entries.len() == expected,
+            "NumaDistance: entries.len() must equal n * n"
+        );
+        Self::validate_entries(n, entries);
+        Self { n, entries }
+    }
+
+    const fn validate_entries(n: u32, entries: &[u8]) {
+        let dim = n as usize;
+        let mut i = 0;
+        while i < dim {
+            let mut j = 0;
+            while j < dim {
+                let idx = i * dim + j;
+                if i == j {
+                    assert!(
+                        entries[idx] == 10,
+                        "NumaDistance: diagonal entry must be 10"
+                    );
+                } else {
+                    assert!(
+                        entries[idx] > 10,
+                        "NumaDistance: off-diagonal entry must be > 10"
+                    );
+                    let sym_idx = j * dim + i;
+                    assert!(
+                        entries[idx] == entries[sym_idx],
+                        "NumaDistance: matrix must be symmetric"
+                    );
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// Non-panicking validation.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.n == 0 {
+            return Err("n must be > 0".into());
+        }
+        let expected = (self.n as usize) * (self.n as usize);
+        if self.entries.len() != expected {
+            return Err(format!(
+                "entries.len() ({}) must equal n * n ({})",
+                self.entries.len(),
+                expected
+            ));
+        }
+        let dim = self.n as usize;
+        for i in 0..dim {
+            for j in 0..dim {
+                let v = self.entries[i * dim + j];
+                if i == j {
+                    if v != 10 {
+                        return Err(format!("diagonal entry [{i}][{j}] is {v}, must be 10"));
+                    }
+                } else {
+                    if v <= 10 {
+                        return Err(format!(
+                            "off-diagonal entry [{i}][{j}] is {v}, must be > 10"
+                        ));
+                    }
+                    let sym = self.entries[j * dim + i];
+                    if v != sym {
+                        return Err(format!("asymmetric: [{i}][{j}]={v} != [{j}][{i}]={sym}"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Matrix dimension (number of NUMA nodes).
+    pub const fn dimension(&self) -> u32 {
+        self.n
+    }
+
+    /// Distance from node `i` to node `j`.
+    pub const fn distance(&self, i: u32, j: u32) -> u8 {
+        self.entries[(i as usize) * (self.n as usize) + (j as usize)]
+    }
+
+    /// Raw row-major entries.
+    pub const fn entries(&self) -> &[u8] {
+        self.entries
+    }
 }
 
 /// Formats as `NnNlNcNt` — e.g. `1n2l4c2t` (1 NUMA node, 2 LLCs, 4 cores, 2 threads).
@@ -31,15 +184,15 @@ impl std::fmt::Display for Topology {
 }
 
 impl Topology {
-    /// Validated const constructor. Panics on invalid values.
+    /// Validated const constructor for uniform topologies.
+    ///
+    /// Produces a topology where LLCs and memory are distributed evenly
+    /// across NUMA nodes, with default 10/20 distances.
     ///
     /// Invariants:
     /// - All fields must be > 0.
-    /// - `llcs` must be divisible by `numa_nodes` (uniform LLC distribution).
-    /// - Total CPU count (`llcs * cores_per_llc * threads_per_core`) must
-    ///   not overflow `u32`.
-    ///
-    /// An invalid topology is a programmer error, not a runtime condition.
+    /// - `llcs` must be divisible by `numa_nodes`.
+    /// - Total CPU count must not overflow `u32`.
     ///
     /// See [`validate`](Self::validate) for a non-panicking alternative.
     pub const fn new(
@@ -62,7 +215,6 @@ impl Topology {
             llcs.is_multiple_of(numa_nodes),
             "invalid Topology: llcs must be divisible by numa_nodes"
         );
-        // Overflow check.
         let cpus_per_llc = match cores_per_llc.checked_mul(threads_per_core) {
             Some(v) => v,
             None => panic!("invalid Topology: total CPU count overflows u32"),
@@ -76,15 +228,90 @@ impl Topology {
             cores_per_llc,
             threads_per_core,
             numa_nodes,
+            nodes: None,
+            distances: None,
         }
+    }
+
+    /// Const constructor with explicit per-node configuration.
+    ///
+    /// Total LLC count is computed from the sum of `NumaNode::llcs`
+    /// across all nodes. Memory-only nodes (llcs=0) are permitted.
+    ///
+    /// Panics if:
+    /// - `nodes` is empty
+    /// - `cores_per_llc == 0`
+    /// - `threads_per_core == 0`
+    /// - node LLC sum overflows `u32`
+    /// - a CPU-bearing node (`llcs > 0`) has `memory_mb == 0`
+    /// - total CPU count overflows `u32`
+    /// - no node has LLCs (at least one must have `llcs > 0`)
+    pub const fn with_nodes(
+        cores_per_llc: u32,
+        threads_per_core: u32,
+        nodes: &'static [NumaNode],
+    ) -> Self {
+        assert!(
+            !nodes.is_empty(),
+            "invalid Topology: nodes must not be empty"
+        );
+        assert!(
+            cores_per_llc > 0,
+            "invalid Topology: cores_per_llc must be > 0"
+        );
+        assert!(
+            threads_per_core > 0,
+            "invalid Topology: threads_per_core must be > 0"
+        );
+
+        let mut llcs: u32 = 0;
+        let mut i = 0;
+        while i < nodes.len() {
+            llcs = match llcs.checked_add(nodes[i].llcs) {
+                Some(v) => v,
+                None => panic!("invalid Topology: node LLC sum overflows u32"),
+            };
+            assert!(
+                !(nodes[i].llcs > 0 && nodes[i].memory_mb == 0),
+                "invalid Topology: CPU-bearing node has zero memory"
+            );
+            i += 1;
+        }
+        assert!(llcs > 0, "invalid Topology: total LLCs must be > 0");
+
+        let cpus_per_llc = match cores_per_llc.checked_mul(threads_per_core) {
+            Some(v) => v,
+            None => panic!("invalid Topology: total CPU count overflows u32"),
+        };
+        match llcs.checked_mul(cpus_per_llc) {
+            Some(_) => {}
+            None => panic!("invalid Topology: total CPU count overflows u32"),
+        };
+
+        Topology {
+            llcs,
+            cores_per_llc,
+            threads_per_core,
+            numa_nodes: nodes.len() as u32,
+            nodes: Some(nodes),
+            distances: None,
+        }
+    }
+
+    /// Attach a distance matrix. Panics if dimension doesn't match.
+    pub const fn with_distances(mut self, distances: &'static NumaDistance) -> Self {
+        assert!(
+            distances.n == self.numa_nodes,
+            "invalid Topology: NumaDistance dimension must equal numa_nodes"
+        );
+        self.distances = Some(distances);
+        self
     }
 
     /// Non-panicking validation.
     ///
     /// Returns `Ok(())` if all invariants hold, or `Err` with a
     /// description of the first violated invariant.
-    ///
-    /// Checks the same invariants as [`new`](Self::new).
     pub fn validate(&self) -> Result<(), String> {
         if self.llcs == 0 {
             return Err("llcs must be > 0".into());
@@ -98,12 +325,6 @@ impl Topology {
         if self.numa_nodes == 0 {
             return Err("numa_nodes must be > 0".into());
         }
-        if !self.llcs.is_multiple_of(self.numa_nodes) {
-            return Err(format!(
-                "llcs ({}) must be divisible by numa_nodes ({})",
-                self.llcs, self.numa_nodes,
-            ));
-        }
         if self
             .cores_per_llc
             .checked_mul(self.threads_per_core)
@@ -111,6 +332,46 @@ impl Topology {
             .is_none()
         {
             return Err("total CPU count overflows u32".into());
+        }
+        match &self.nodes {
+            None => {
+                if !self.llcs.is_multiple_of(self.numa_nodes) {
+                    return Err(format!(
+                        "llcs ({}) must be divisible by numa_nodes ({})",
+                        self.llcs, self.numa_nodes,
+                    ));
+                }
+            }
+            Some(nodes) => {
+                if nodes.len() != self.numa_nodes as usize {
+                    return Err(format!(
+                        "nodes.len() ({}) must equal numa_nodes ({})",
+                        nodes.len(),
+                        self.numa_nodes,
+                    ));
+                }
+                let llc_sum: u32 = nodes.iter().map(|n| n.llcs).sum();
+                if llc_sum != self.llcs {
+                    return Err(format!(
+                        "sum of node LLCs ({llc_sum}) must equal total llcs ({})",
+                        self.llcs,
+                    ));
+                }
+                for (i, node) in nodes.iter().enumerate() {
+                    if node.llcs > 0 && node.memory_mb == 0 {
+                        return Err(format!("node {i} has {} LLCs but zero memory", node.llcs,));
+                    }
+                }
+            }
+        }
+        if let Some(d) = &self.distances {
+            if d.n != self.numa_nodes {
+                return Err(format!(
+                    "NumaDistance dimension ({}) must equal numa_nodes ({})",
+                    d.n, self.numa_nodes,
+                ));
+            }
+            d.validate()?;
         }
         Ok(())
     }
@@ -130,10 +391,26 @@ impl Topology {
         self.numa_nodes
     }
 
-    /// LLCs per NUMA node (uniform distribution).
+    /// LLCs owned by NUMA node `node_id`.
     ///
-    /// Requires `numa_nodes > 0` and `llcs % numa_nodes == 0`.
+    /// With explicit nodes, returns `nodes[node_id].llcs`.
+    /// With uniform distribution, returns `llcs / numa_nodes`.
+    pub fn llcs_in_node(&self, node_id: u32) -> u32 {
+        match &self.nodes {
+            Some(nodes) => nodes[node_id as usize].llcs,
+            None => self.llcs / self.numa_nodes,
+        }
+    }
+
+    /// LLCs per NUMA node (uniform distribution only).
+    ///
+    /// Panics via debug_assert if the topology uses explicit nodes
+    /// with non-uniform LLC distribution.
     pub fn llcs_per_numa_node(&self) -> u32 {
+        debug_assert!(
+            self.nodes.is_none(),
+            "llcs_per_numa_node() requires uniform topology; use llcs_in_node() instead"
+        );
         debug_assert!(self.numa_nodes > 0, "numa_nodes must be > 0");
         debug_assert!(
             self.llcs.is_multiple_of(self.numa_nodes),
@@ -146,10 +423,88 @@ impl Topology {
 
     /// NUMA node that owns the given LLC index.
     ///
-    /// Requires `numa_nodes > 0` and `llcs % numa_nodes == 0`.
+    /// With explicit nodes, walks the node list to find the owning node.
+    /// With uniform distribution, computes `llc_id / llcs_per_node`.
     pub fn numa_node_of(&self, llc_id: u32) -> u32 {
-        let per_node = self.llcs_per_numa_node();
-        llc_id / per_node
+        match &self.nodes {
+            Some(nodes) => {
+                let mut cumulative: u32 = 0;
+                for (i, node) in nodes.iter().enumerate() {
+                    cumulative += node.llcs;
+                    if llc_id < cumulative {
+                        return i as u32;
+                    }
+                }
+                (nodes.len() - 1) as u32
+            }
+            None => {
+                let per_node = self.llcs / self.numa_nodes;
+                llc_id / per_node
+            }
+        }
+    }
+
+    /// First LLC index owned by NUMA node `node_id`.
+    pub fn first_llc_in_node(&self, node_id: u32) -> u32 {
+        match &self.nodes {
+            Some(nodes) => {
+                let mut offset: u32 = 0;
+                for i in 0..node_id as usize {
+                    offset += nodes[i].llcs;
+                }
+                offset
+            }
+            None => {
+                let per_node = self.llcs / self.numa_nodes;
+                node_id * per_node
+            }
+        }
+    }
+
+    /// Memory in MiB for NUMA node `node_id`.
+    ///
+    /// With explicit nodes, returns `nodes[node_id].memory_mb`.
+    /// With uniform distribution, returns `None` (caller must divide
+    /// total memory evenly).
+    pub fn node_memory_mb(&self, node_id: u32) -> Option<u32> {
+        self.nodes.map(|nodes| nodes[node_id as usize].memory_mb)
+    }
+
+    /// Total memory across all explicit nodes, or `None` for uniform.
+    pub fn total_node_memory_mb(&self) -> Option<u32> {
+        self.nodes
+            .map(|nodes| nodes.iter().map(|n| n.memory_mb).sum())
+    }
+
+    /// Distance from node `i` to node `j`.
+    ///
+    /// Returns the explicit distance if a matrix is attached,
+    /// otherwise 10 for local and 20 for remote.
+    pub fn distance(&self, i: u32, j: u32) -> u8 {
+        match &self.distances {
+            Some(d) => d.distance(i, j),
+            None => {
+                if i == j {
+                    10
+                } else {
+                    20
+                }
+            }
+        }
+    }
+
+    /// Whether any node is memory-only (CXL).
+    pub fn has_memory_only_nodes(&self) -> bool {
+        self.nodes
+            .is_some_and(|nodes| nodes.iter().any(|n| n.is_memory_only()))
+    }
+
+    /// Number of nodes that have CPUs (non-memory-only).
+    pub fn cpu_bearing_nodes(&self) -> u32 {
+        match &self.nodes {
+            Some(nodes) => nodes.iter().filter(|n| !n.is_memory_only()).count() as u32,
+            None => self.numa_nodes,
+        }
     }
 
     /// Decompose a logical CPU ID into (llc, core, thread).
@@ -174,6 +529,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.total_cpus(), 16);
     }
@@ -185,6 +542,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.num_llcs(), 3);
     }
@@ -196,8 +555,9 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
-        // 2 LLCs x 2 cores x 2 threads = 8 CPUs
         assert_eq!(t.decompose(0), (0, 0, 0));
         assert_eq!(t.decompose(1), (0, 0, 1));
         assert_eq!(t.decompose(2), (0, 1, 0));
@@ -215,6 +575,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.decompose(0), (0, 0, 0));
         assert_eq!(t.decompose(3), (0, 3, 0));
@@ -229,6 +591,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.decompose(0), (0, 0, 0));
         assert_eq!(t.decompose(3), (0, 3, 0));
@@ -241,6 +605,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         for llc in 0..4 {
             assert_eq!(t.numa_node_of(llc), 0);
@@ -254,6 +620,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.llcs_per_numa_node(), 2);
         assert_eq!(t.numa_node_of(0), 0);
@@ -269,6 +637,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 3,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.num_numa_nodes(), 3);
         assert_eq!(t.llcs_per_numa_node(), 2);
@@ -281,6 +651,8 @@ mod tests {
         assert_eq!(t.llcs, 4);
         assert_eq!(t.cores_per_llc, 2);
         assert_eq!(t.threads_per_core, 2);
+        assert!(t.nodes.is_none());
+        assert!(t.distances.is_none());
     }
 
     #[test]
@@ -296,6 +668,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 2,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         assert!(t.validate().is_ok());
     }
@@ -307,6 +681,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("llcs must be > 0"), "got: {err}");
@@ -319,6 +695,8 @@ mod tests {
             cores_per_llc: 0,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("cores_per_llc must be > 0"), "got: {err}");
@@ -331,6 +709,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 0,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("threads_per_core must be > 0"), "got: {err}");
@@ -343,6 +723,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 0,
+            nodes: None,
+            distances: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("numa_nodes must be > 0"), "got: {err}");
@@ -355,6 +737,8 @@ mod tests {
             cores_per_llc: 2,
             threads_per_core: 1,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("divisible"), "got: {err}");
@@ -403,6 +787,8 @@ mod tests {
             cores_per_llc: 65536,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("overflows"), "got: {err}");
@@ -415,6 +801,8 @@ mod tests {
             cores_per_llc: 4,
             threads_per_core: 2,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.to_string(), "1n2l4c2t");
     }
@@ -426,7 +814,395 @@ mod tests {
             cores_per_llc: 8,
             threads_per_core: 2,
             numa_nodes: 2,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.to_string(), "2n4l8c2t");
+    }
+
+    // -- NumaNode tests --
+
+    #[test]
+    fn numa_node_memory_only() {
+        let n = NumaNode::new(0, 1024);
+        assert!(n.is_memory_only());
+    }
+
+    #[test]
+    fn numa_node_with_cpus() {
+        let n = NumaNode::new(2, 512);
+        assert!(!n.is_memory_only());
+    }
+
+    // -- NumaDistance tests --
+
+    #[test]
+    fn numa_distance_single_node() {
+        static D: NumaDistance = NumaDistance::new(1, &[10]);
+        assert_eq!(D.dimension(), 1);
+        assert_eq!(D.distance(0, 0), 10);
+    }
+
+    #[test]
+    fn numa_distance_two_nodes() {
+        static D: NumaDistance = NumaDistance::new(2, &[10, 20, 20, 10]);
+        assert_eq!(D.dimension(), 2);
+        assert_eq!(D.distance(0, 0), 10);
+        assert_eq!(D.distance(0, 1), 20);
+        assert_eq!(D.distance(1, 0), 20);
+        assert_eq!(D.distance(1, 1), 10);
+    }
+
+    #[test]
+    fn numa_distance_three_nodes_varied_weights() {
+        static D: NumaDistance = NumaDistance::new(3, &[10, 20, 30, 20, 10, 40, 30, 40, 10]);
+        assert_eq!(D.distance(0, 2), 30);
+        assert_eq!(D.distance(1, 2), 40);
+    }
+
+    #[test]
+    fn numa_distance_validate_ok() {
+        let d = NumaDistance {
+            n: 2,
+            entries: &[10, 20, 20, 10],
+        };
+        assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn numa_distance_validate_bad_diagonal() {
+        let d = NumaDistance {
+            n: 2,
+            entries: &[11, 20, 20, 10],
+        };
+        let err = d.validate().unwrap_err();
+        assert!(err.contains("diagonal"), "got: {err}");
+    }
+
+    #[test]
+    fn numa_distance_validate_bad_offdiag() {
+        let d = NumaDistance {
+            n: 2,
+            entries: &[10, 10, 10, 10],
+        };
+        let err = d.validate().unwrap_err();
+        assert!(err.contains("off-diagonal"), "got: {err}");
+    }
+
+    #[test]
+    fn numa_distance_validate_asymmetric() {
+        let d = NumaDistance {
+            n: 2,
+            entries: &[10, 20, 30, 10],
+        };
+        let err = d.validate().unwrap_err();
+        assert!(err.contains("asymmetric"), "got: {err}");
+    }
+
+    #[test]
+    fn numa_distance_validate_wrong_size() {
+        let d = NumaDistance {
+            n: 2,
+            entries: &[10, 20, 20],
+        };
+        let err = d.validate().unwrap_err();
+        assert!(err.contains("n * n"), "got: {err}");
+    }
+
+    // -- with_nodes tests --
+
+    static TWO_NODES: [NumaNode; 2] = [NumaNode::new(2, 512), NumaNode::new(2, 512)];
+
+    #[test]
+    fn with_nodes_basic() {
+        let t = Topology::with_nodes(4, 2, &TWO_NODES);
+        assert_eq!(t.numa_nodes, 2);
+        assert_eq!(t.llcs, 4);
+        assert_eq!(t.total_cpus(), 32);
+        assert!(t.nodes.is_some());
+    }
+
+    #[test]
+    fn with_nodes_numa_node_of() {
+        let t = Topology::with_nodes(4, 2, &TWO_NODES);
+        assert_eq!(t.numa_node_of(0), 0);
+        assert_eq!(t.numa_node_of(1), 0);
+        assert_eq!(t.numa_node_of(2), 1);
+        assert_eq!(t.numa_node_of(3), 1);
+    }
+
+    static ASYMMETRIC_NODES: [NumaNode; 2] = [NumaNode::new(1, 256), NumaNode::new(3, 768)];
+
+    #[test]
+    fn with_nodes_asymmetric_llcs() {
+        let t = Topology::with_nodes(2, 1, &ASYMMETRIC_NODES);
+        assert_eq!(t.llcs_in_node(0), 1);
+        assert_eq!(t.llcs_in_node(1), 3);
+        assert_eq!(t.numa_node_of(0), 0);
+        assert_eq!(t.numa_node_of(1), 1);
+        assert_eq!(t.numa_node_of(2), 1);
+        assert_eq!(t.numa_node_of(3), 1);
+        assert_eq!(t.first_llc_in_node(0), 0);
+        assert_eq!(t.first_llc_in_node(1), 1);
+    }
+
+    #[test]
+    fn with_nodes_memory() {
+        let t = Topology::with_nodes(2, 1, &ASYMMETRIC_NODES);
+        assert_eq!(t.node_memory_mb(0), Some(256));
+        assert_eq!(t.node_memory_mb(1), Some(768));
+        assert_eq!(t.total_node_memory_mb(), Some(1024));
+    }
+
+    // -- CXL memory-only node tests --
+
+    static CXL_NODES: [NumaNode; 3] = [
+        NumaNode::new(2, 512),
+        NumaNode::new(2, 512),
+        NumaNode::new(0, 1024),
+    ];
+
+    #[test]
+    fn cxl_memory_only_node() {
+        let t = Topology::with_nodes(4, 1, &CXL_NODES);
+        assert_eq!(t.numa_nodes, 3);
+        assert!(t.has_memory_only_nodes());
+        assert_eq!(t.cpu_bearing_nodes(), 2);
+        assert_eq!(t.llcs_in_node(2), 0);
+        assert_eq!(t.node_memory_mb(2), Some(1024));
+    }
+
+    #[test]
+    fn cxl_first_llc_in_memory_only_node() {
+        let t = Topology::with_nodes(4, 1, &CXL_NODES);
+        assert_eq!(t.first_llc_in_node(0), 0);
+        assert_eq!(t.first_llc_in_node(1), 2);
+        assert_eq!(t.first_llc_in_node(2), 4);
+    }
+
+    static CXL_MIDDLE: [NumaNode; 3] = [
+        NumaNode::new(2, 512),
+        NumaNode::new(0, 256),
+        NumaNode::new(2, 512),
+    ];
+
+    #[test]
+    fn numa_node_of_cxl_middle_node() {
+        let t = Topology::with_nodes(4, 1, &CXL_MIDDLE);
+        assert_eq!(t.numa_nodes, 3);
+        assert_eq!(t.numa_node_of(0), 0);
+        assert_eq!(t.numa_node_of(1), 0);
+        assert_eq!(t.numa_node_of(2), 2);
+        assert_eq!(t.numa_node_of(3), 2);
+        assert!(t.has_memory_only_nodes());
+        assert_eq!(t.cpu_bearing_nodes(), 2);
+    }
+
+    #[test]
+    fn first_llc_in_cxl_middle_node() {
+        let t = Topology::with_nodes(4, 1, &CXL_MIDDLE);
+        assert_eq!(t.first_llc_in_node(0), 0);
+        assert_eq!(t.first_llc_in_node(1), 2);
+        assert_eq!(t.first_llc_in_node(2), 2);
+        assert_eq!(t.llcs_in_node(1), 0);
+        assert_eq!(t.llcs_in_node(2), 2);
+    }
+
+    static CXL_FIRST: [NumaNode; 3] = [
+        NumaNode::new(0, 256),
+        NumaNode::new(2, 512),
+        NumaNode::new(2, 512),
+    ];
+
+    #[test]
+    fn cxl_first_node_numa_node_of() {
+        let t = Topology::with_nodes(4, 1, &CXL_FIRST);
+        assert_eq!(t.numa_node_of(0), 1);
+        assert_eq!(t.numa_node_of(1), 1);
+        assert_eq!(t.numa_node_of(2), 2);
+        assert_eq!(t.numa_node_of(3), 2);
+        assert_eq!(t.first_llc_in_node(0), 0);
+        assert_eq!(t.first_llc_in_node(1), 0);
+        assert_eq!(t.first_llc_in_node(2), 2);
+    }
+
+    static MULTI_CXL: [NumaNode; 4] = [
+        NumaNode::new(2, 512),
+        NumaNode::new(0, 256),
+        NumaNode::new(0, 256),
+        NumaNode::new(2, 512),
+    ];
+
+    #[test]
+    fn multiple_consecutive_cxl_nodes() {
+        let t = Topology::with_nodes(4, 1, &MULTI_CXL);
+        assert_eq!(t.numa_nodes, 4);
+        assert_eq!(t.cpu_bearing_nodes(), 2);
+        assert_eq!(t.numa_node_of(0), 0);
+        assert_eq!(t.numa_node_of(1), 0);
+        assert_eq!(t.numa_node_of(2), 3);
+        assert_eq!(t.numa_node_of(3), 3);
+    }
+
+    static ASYMMETRIC_HEAVY: [NumaNode; 2] = [NumaNode::new(1, 256), NumaNode::new(7, 1792)];
+
+    #[test]
+    fn highly_asymmetric_llcs() {
+        let t = Topology::with_nodes(2, 1, &ASYMMETRIC_HEAVY);
+        assert_eq!(t.numa_node_of(0), 0);
+        assert_eq!(t.numa_node_of(1), 1);
+        assert_eq!(t.numa_node_of(7), 1);
+        assert_eq!(t.llcs_in_node(0), 1);
+        assert_eq!(t.llcs_in_node(1), 7);
+    }
+
+    static CXL_DIST: NumaDistance = NumaDistance::new(3, &[10, 20, 30, 20, 10, 25, 30, 25, 10]);
+
+    #[test]
+    fn distance_with_cxl_middle() {
+        let t = Topology::with_nodes(4, 1, &CXL_MIDDLE).with_distances(&CXL_DIST);
+        assert_eq!(t.distance(1, 2), 25);
+        assert_eq!(t.distance(0, 1), 20);
+        assert!(t.validate().is_ok());
+    }
+
+    // -- with_distances tests --
+
+    static DIST_2: NumaDistance = NumaDistance::new(2, &[10, 20, 20, 10]);
+
+    #[test]
+    fn with_distances() {
+        let t = Topology::new(2, 4, 2, 1).with_distances(&DIST_2);
+        assert_eq!(t.distance(0, 0), 10);
+        assert_eq!(t.distance(0, 1), 20);
+        assert_eq!(t.distance(1, 0), 20);
+        assert_eq!(t.distance(1, 1), 10);
+    }
+
+    #[test]
+    fn default_distances() {
+        let t = Topology::new(2, 4, 2, 1);
+        assert_eq!(t.distance(0, 0), 10);
+        assert_eq!(t.distance(0, 1), 20);
+    }
+
+    static DIST_3: NumaDistance = NumaDistance::new(3, &[10, 20, 30, 20, 10, 25, 30, 25, 10]);
+
+    #[test]
+    fn with_nodes_and_distances() {
+        let t = Topology::with_nodes(4, 1, &CXL_NODES).with_distances(&DIST_3);
+        assert_eq!(t.distance(0, 2), 30);
+        assert_eq!(t.distance(1, 2), 25);
+        assert!(t.validate().is_ok());
+    }
+
+    // -- Validation with nodes --
+
+    #[test]
+    fn validate_with_nodes_ok() {
+        let t = Topology::with_nodes(4, 2, &TWO_NODES);
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_with_nodes_llc_mismatch() {
+        static BAD: [NumaNode; 2] = [NumaNode::new(1, 256), NumaNode::new(1, 256)];
+        let t = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 2,
+            nodes: Some(&BAD),
+            distances: None,
+        };
+        let err = t.validate().unwrap_err();
+        assert!(err.contains("sum of node LLCs"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_with_nodes_count_mismatch() {
+        let t = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 3,
+            nodes: Some(&TWO_NODES),
+            distances: None,
+        };
+        let err = t.validate().unwrap_err();
+        assert!(err.contains("nodes.len()"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_distance_dimension_mismatch() {
+        static BAD_DIST: NumaDistance = NumaDistance::new(1, &[10]);
+        let t = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 2,
+            nodes: None,
+            distances: Some(&BAD_DIST),
+        };
+        let err = t.validate().unwrap_err();
+        assert!(err.contains("dimension"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_cpu_node_zero_memory() {
+        static BAD: [NumaNode; 2] = [NumaNode::new(2, 0), NumaNode::new(2, 512)];
+        let t = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 2,
+            nodes: Some(&BAD),
+            distances: None,
+        };
+        let err = t.validate().unwrap_err();
+        assert!(err.contains("zero memory"), "got: {err}");
+    }
+
+    #[test]
+    fn uniform_no_node_memory() {
+        let t = Topology::new(2, 4, 2, 1);
+        assert!(t.node_memory_mb(0).is_none());
+        assert!(t.total_node_memory_mb().is_none());
+    }
+
+    // -- const construction smoke tests --
+
+    const _CONST_TOPO: Topology = Topology::new(1, 2, 4, 2);
+
+    static _CONST_NODES: [NumaNode; 2] = [NumaNode::new(1, 256), NumaNode::new(1, 256)];
+    const _CONST_WITH_NODES: Topology = Topology::with_nodes(4, 2, &_CONST_NODES);
+
+    static _CONST_DIST: NumaDistance = NumaDistance::new(2, &[10, 20, 20, 10]);
+    const _CONST_WITH_DIST: Topology = Topology::new(2, 2, 4, 2).with_distances(&_CONST_DIST);
+
+    #[test]
+    fn const_construction_valid() {
+        assert!(_CONST_TOPO.validate().is_ok());
+        assert!(_CONST_WITH_NODES.validate().is_ok());
+        assert!(_CONST_WITH_DIST.validate().is_ok());
+    }
+
+    // -- single node edge case --
+
+    #[test]
+    fn single_node_topology() {
+        let t = Topology::new(1, 1, 1, 1);
+        assert_eq!(t.total_cpus(), 1);
+        assert_eq!(t.numa_node_of(0), 0);
+        assert_eq!(t.distance(0, 0), 10);
+        assert!(!t.has_memory_only_nodes());
+        assert_eq!(t.cpu_bearing_nodes(), 1);
+    }
+
+    #[test]
+    fn first_llc_in_node_uniform() {
+        let t = Topology::new(2, 4, 2, 1);
+        assert_eq!(t.first_llc_in_node(0), 0);
+        assert_eq!(t.first_llc_in_node(1), 2);
     }
 }

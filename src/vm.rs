@@ -33,6 +33,8 @@ impl Default for VmConfig {
                 cores_per_llc: 2,
                 threads_per_core: 1,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             },
             memory_mb: 4096,
             timeout: None,
@@ -272,6 +274,8 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
                 cores_per_llc: c,
                 threads_per_core: t,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             },
             memory_mb: m,
         })
@@ -283,6 +287,8 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
                 cores_per_llc: c,
                 threads_per_core: t,
                 numa_nodes: nn,
+                nodes: None,
+                distances: None,
             },
             memory_mb: m,
         }))
@@ -539,6 +545,8 @@ mod tests {
                 cores_per_llc: 8,
                 threads_per_core: 1,
                 numa_nodes: 1,
+                nodes: None,
+                distances: None,
             },
             memory_mb: 8192,
             timeout: Some(Duration::from_secs(300)),
@@ -557,6 +565,8 @@ mod tests {
             cores_per_llc: 1,
             threads_per_core: 1,
             numa_nodes: 1,
+            nodes: None,
+            distances: None,
         };
         assert_eq!(t.total_cpus(), 1);
         assert_eq!(t.num_llcs(), 1);

@@ -615,6 +615,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             cores_per_llc: #cores_tokens,
             threads_per_core: #threads_tokens,
             numa_nodes: #numa_nodes_tokens,
+            nodes: None,
+            distances: None,
         }
     };
 
