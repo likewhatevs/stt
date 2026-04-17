@@ -118,12 +118,13 @@ impl KtstrKvm {
 
     /// Allocate guest memory and register it with KVM.
     ///
-    /// Must be called exactly once on a VM created with `new_deferred`.
-    /// Replaces the placeholder guest memory with a real allocation of
-    /// `memory_mb` megabytes at DRAM_START. Re-checks hugepage
-    /// availability when performance_mode is set, since memory_mb was
-    /// unknown at construction time and `use_hugepages` may have been
-    /// false.
+    /// Should be called exactly once on a VM created with
+    /// `new_deferred`; calling twice unconditionally replaces the
+    /// backing memory. Replaces the placeholder guest memory with a
+    /// real allocation of `memory_mb` megabytes at DRAM_START.
+    /// Re-checks hugepage availability when performance_mode is set,
+    /// since memory_mb was unknown at construction time and
+    /// `use_hugepages` may have been false.
     pub fn allocate_and_register_memory(&mut self, memory_mb: u32) -> Result<()> {
         self.guest_mem = crate::vmm::allocate_and_register_guest_memory(
             &self.vm_fd,

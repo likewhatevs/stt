@@ -1,10 +1,10 @@
 /// ACPI 2.0 table generation for SMP topology via zerocopy packed structs.
 ///
-/// Generates RSDP rev 2 -> XSDT -> {FADT, MADT, SRAT, SLIT}.
-/// RSDT with 32-bit pointers is also provided as a fallback.
-/// FADT rev 6 with legacy hardware (PIC, PIT, ISA serial).
-/// Per-CPU APIC type: Local APIC (type 0) for apic_id < 255,
-/// x2APIC (type 9) for apic_id >= 255.
+/// Generates RSDP rev 2 -> XSDT/RSDT -> {FADT, MADT, SRAT, SLIT},
+/// with FADT referencing DSDT. RSDT with 32-bit pointers coexists with
+/// XSDT as an ACPI 1.0 fallback. FADT rev 6 with legacy hardware
+/// (PIC, PIT, ISA serial). Per-CPU APIC type: Local APIC (type 0) for
+/// apic_id < 255, x2APIC (type 9) for apic_id >= 255.
 use anyhow::{Context, Result};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
