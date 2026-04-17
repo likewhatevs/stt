@@ -265,7 +265,8 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
                 cmd.env("KTSTR_KERNEL", &dir);
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = resolve_cached_kernel_with_remote(&id)?;
+                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+                    .map_err(|e| format!("{e:#}"))?;
                 eprintln!("cargo-ktstr: using cached kernel {}", cache_dir.display());
                 cmd.env("KTSTR_KERNEL", &cache_dir);
             }
@@ -294,7 +295,8 @@ fn run_coverage(kernel: Option<String>, args: Vec<String>) -> Result<(), String>
                 cmd.env("KTSTR_KERNEL", &dir);
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = resolve_cached_kernel_with_remote(&id)?;
+                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+                    .map_err(|e| format!("{e:#}"))?;
                 eprintln!("cargo-ktstr: using cached kernel {}", cache_dir.display());
                 cmd.env("KTSTR_KERNEL", &cache_dir);
             }
@@ -418,7 +420,8 @@ fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
                 }
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = resolve_cached_kernel_with_remote(&id)?;
+                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+                    .map_err(|e| format!("{e:#}"))?;
                 ktstr::kernel_path::find_image_in_dir(&cache_dir)
                     .ok_or_else(|| format!("no kernel image found in {}", cache_dir.display()))
             }
@@ -431,50 +434,6 @@ fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
                  `cargo ktstr kernel build` to download and cache one."
                     .to_string()
             })
-    }
-}
-
-/// Resolve cached kernel with remote cache fallback.
-fn resolve_cached_kernel_with_remote(id: &ktstr::kernel_path::KernelId) -> Result<PathBuf, String> {
-    use ktstr::kernel_path::KernelId;
-    match id {
-        KernelId::Version(ver) => {
-            let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
-            let (arch, _) = fetch::arch_info();
-            let cache_key = format!("{ver}-tarball-{arch}-kc{}", ktstr::cache_key_suffix());
-            match cache_lookup(&cache, &cache_key) {
-                Some(entry) => {
-                    entry
-                        .metadata
-                        .as_ref()
-                        .ok_or_else(|| format!("cached entry {cache_key} has corrupt metadata"))?;
-                    Ok(entry.path)
-                }
-                None => Err(format!(
-                    "kernel version {ver} not found in cache. \
-                     Run `cargo ktstr kernel build {ver}` first."
-                )),
-            }
-        }
-        KernelId::CacheKey(key) => {
-            let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
-            match cache_lookup(&cache, key) {
-                Some(entry) => {
-                    entry
-                        .metadata
-                        .as_ref()
-                        .ok_or_else(|| format!("cached entry {key} has corrupt metadata"))?;
-                    Ok(entry.path)
-                }
-                None => Err(format!(
-                    "cache key {key} not found. \
-                     Run `cargo ktstr kernel list` to see available entries."
-                )),
-            }
-        }
-        KernelId::Path(_) => {
-            Err("resolve_cached_kernel_with_remote called with Path variant".to_string())
-        }
     }
 }
 

@@ -855,7 +855,14 @@ pub fn resolve_include_files(
 ///
 /// Checks local cache first. When `remote_cache::is_enabled()` returns
 /// true, falls back to the remote GHA cache on local miss.
-fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::path::PathBuf> {
+///
+/// `cli_label` is the human-facing command name (e.g. `"ktstr"` or
+/// `"cargo ktstr"`) used in error messages that suggest a follow-up
+/// command.
+pub fn resolve_cached_kernel(
+    id: &crate::kernel_path::KernelId,
+    cli_label: &str,
+) -> Result<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
     match id {
         KernelId::Version(ver) => {
@@ -878,7 +885,7 @@ fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::path:
             }
             bail!(
                 "kernel version {ver} not found in cache. \
-                 Build with `kernel build {ver}` first."
+                 Run `{cli_label} kernel build {ver}` first."
             )
         }
         KernelId::CacheKey(key) => {
@@ -901,7 +908,7 @@ fn resolve_cached_kernel(id: &crate::kernel_path::KernelId) -> Result<std::path:
             }
             bail!(
                 "cache key {key} not found. \
-                 Run `kernel list` to see available entries."
+                 Run `{cli_label} kernel list` to see available entries."
             )
         }
         KernelId::Path(_) => bail!("resolve_cached_kernel called with Path variant"),
@@ -936,7 +943,7 @@ pub fn resolve_kernel_image(kernel: Option<&str>) -> Result<std::path::PathBuf> 
                 }
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = resolve_cached_kernel(&id)?;
+                let cache_dir = resolve_cached_kernel(&id, "ktstr")?;
                 crate::kernel_path::find_image_in_dir(&cache_dir).ok_or_else(|| {
                     anyhow::anyhow!("no kernel image found in {}", cache_dir.display())
                 })
