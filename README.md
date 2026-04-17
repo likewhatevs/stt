@@ -10,19 +10,43 @@
 > Expect breaking changes between releases.
 
 Test harness for Linux process schedulers, with a focus on
-[sched_ext](https://github.com/sched-ext/scx). Boots kernels in KVM
-VMs with synthetic CPU topologies, runs workloads, and verifies
-scheduling correctness. Also tests under the kernel's default EEVDF
-scheduler.
+[sched_ext](https://github.com/sched-ext/scx).
 
-- **Clean slate** -- each test boots its own kernel in KVM. Fresh state each run.
-- **Topology as code** -- `topology(1, 2, 4, 2)` gives you 1 NUMA node, 2 LLCs, 4 cores, 2 threads with real NUMA domains when the host hardware supports them. x86_64 and aarch64.
-- **Data-driven** -- scenarios declare cgroups, cpusets, workloads, and verification as data.
-- **Gauntlet** -- one `#[ktstr_test]`, hundreds of topology x flag variants. Budget-aware CI selection and baseline A/B comparison.
-- **Host-side introspection** -- read/write kernel state and BPF maps from host memory. No guest instrumentation.
-- **Auto-repro** -- reruns failures with BPF probes on the crash call chain. Captures arguments and struct state at each call site. In kernel and BPF progs.
-- **`#[ktstr_test]`** -- proc macro for integration tests that boot their own VMs. No custom harness needed.
-- **[And more](https://likewhatevs.github.io/ktstr/guide/features.html)** -- 25 features across testing, observability, debugging, and infrastructure.
+## Why ktstr?
+
+sched_ext lets you write Linux process schedulers as BPF programs.
+A scheduler runs on every CPU and
+affects every process -- bugs cause system-wide stalls or crashes.
+Scheduler behavior depends on CPU topology, cgroup hierarchy, workload
+mix, and kernel version. You cannot test this with unit tests because
+the relevant state only exists inside a running kernel. ktstr also
+tests under EEVDF (the kernel's built-in scheduler) as a baseline.
+
+Without ktstr, testing means manually booting a VM, setting up cgroups,
+running workloads, and eyeballing whether things went wrong -- with no
+reproducibility across machines because topology varies per host. ktstr
+automates this:
+
+- **Clean slate** -- each test boots its own kernel in a KVM VM. No
+  shared state between tests.
+- **Topology as code** -- `topology(1, 2, 4, 2)` gives you 1 NUMA
+  node, 2 LLCs, 4 cores, 2 threads. x86_64 and aarch64. The same
+  test produces the same topology on any host.
+- **Declarative scenarios** -- tests declare cgroups, cpusets, and
+  workloads as data (`CgroupDef`, `Step`, `Op`). The framework
+  handles the rest.
+- **Automated assertions** -- checks for starvation, cgroup
+  isolation violations, and CPU time fairness. No manual inspection.
+- **Gauntlet** -- one `#[ktstr_test]` expands into hundreds of
+  topology x flag-profile variants. No custom harness needed.
+  Budget-aware CI selection.
+- **Host-side introspection** -- reads kernel state and BPF maps
+  from guest memory without guest-side instrumentation.
+- **Auto-repro** -- on failure, reruns the scenario with BPF probes
+  on the crash call chain, capturing arguments and struct state at
+  each call site.
+- **[Features](https://likewhatevs.github.io/ktstr/guide/features.html)** --
+  testing, observability, debugging, and infrastructure.
 
 ## Installation
 
