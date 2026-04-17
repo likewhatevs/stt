@@ -10,7 +10,7 @@ pub struct Scheduler {
     pub name: &'static str,
     pub binary: SchedulerSpec,
     pub flags: &'static [&'static FlagDecl],
-    pub sysctls: &'static [(&'static str, &'static str)],
+    pub sysctls: &'static [Sysctl],
     pub kargs: &'static [&'static str],
     pub assert: Assert,
     pub cgroup_parent: Option<&'static str>,
@@ -20,10 +20,29 @@ pub struct Scheduler {
 }
 ```
 
-`sysctls` and `kargs` are only reachable by constructing a
-`Scheduler` as a manual `const`; the `#[derive(Scheduler)]` macro
-does not yet accept `sysctls = [...]` / `kargs = [...]` attributes.
-Adding derive support is tracked as a separate workstream.
+`sysctls` takes `Sysctl` values. Construct them with
+`Sysctl::new("key", "value")` in `const` context. Use the
+dot-separated form for the key (e.g. `"kernel.foo"`, not
+`"kernel/foo"`); duplicate keys are applied in order and the last
+write wins.
+
+`kargs` is the extra GUEST KERNEL command-line (not the scheduler
+binary's CLI — use `sched_args` for that). Do not override the kargs
+ktstr injects itself (`nokaslr`, `console=`, `loglevel=`, `init=`):
+those break guest-side init and leave the VM unable to run tests.
+
+Both `sysctls` and `kargs` are accepted by `#[derive(Scheduler)]`:
+
+```rust,ignore
+#[derive(Scheduler)]
+#[scheduler(
+    name = "my_sched",
+    binary = "scx_my_sched",
+    sysctls = [Sysctl::new("kernel.sched_cfs_bandwidth_slice_us", "1000")],
+    kargs = ["nosmt"],
+)]
+enum MySchedFlag { /* ... */ }
+```
 
 ## SchedulerSpec
 

@@ -854,6 +854,8 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | `topology(N, L, C, T)` | no | Default VM topology `(numa_nodes, llcs, cores, threads)`. Defaults to `(1, 1, 2, 1)`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path. |
 /// | `sched_args = [...]` | no | Default scheduler CLI args. |
+/// | `sysctls = [Sysctl::new("key", "value"), ...]` | no | Guest sysctls applied before the scheduler starts. |
+/// | `kargs = ["arg1", "arg2"]` | no | Extra kernel command-line args appended when booting the VM. |
 /// | `min_numa_nodes = N` | no | Minimum NUMA nodes for gauntlet filtering. |
 /// | `max_numa_nodes = N` | no | Maximum NUMA nodes for gauntlet filtering. |
 /// | `min_llcs = N` | no | Minimum LLCs for gauntlet filtering. |
@@ -930,6 +932,10 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     let mut sched_topology: Option<(u32, u32, u32, u32)> = None;
     let mut sched_cgroup_parent: Option<String> = None;
     let mut sched_args: Vec<String> = Vec::new();
+    let mut sched_sysctls: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut sched_sysctls_set = false;
+    let mut sched_kargs: Vec<String> = Vec::new();
+    let mut sched_kargs_set = false;
     let mut sched_min_numa_nodes: Option<u32> = None;
     let mut sched_max_numa_nodes: Option<u32> = None;
     let mut sched_min_llcs: Option<u32> = None;
@@ -988,6 +994,33 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
                             return Err(syn::Error::new_spanned(
                                 elem,
                                 "expected string literal in sched_args",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            } else if meta.path.is_ident("sysctls") {
+                let value = meta.value()?;
+                let arr: syn::ExprArray = value.parse()?;
+                sched_sysctls_set = true;
+                for elem in &arr.elems {
+                    sched_sysctls.push(elem.to_token_stream());
+                }
+                Ok(())
+            } else if meta.path.is_ident("kargs") {
+                let value = meta.value()?;
+                let arr: syn::ExprArray = value.parse()?;
+                sched_kargs_set = true;
+                for elem in &arr.elems {
+                    match elem {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(ls),
+                            ..
+                        }) => sched_kargs.push(ls.value()),
+                        _ => {
+                            return Err(syn::Error::new_spanned(
+                                elem,
+                                "expected string literal in kargs",
                             ));
                         }
                     }
@@ -1284,6 +1317,19 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     if !sched_args.is_empty() {
         builder_chain = quote! {
             #builder_chain.sched_args(&[#(#sched_args),*])
+        };
+    }
+
+    if sched_sysctls_set {
+        let entries = &sched_sysctls;
+        builder_chain = quote! {
+            #builder_chain.sysctls(&[#(#entries),*])
+        };
+    }
+
+    if sched_kargs_set {
+        builder_chain = quote! {
+            #builder_chain.kargs(&[#(#sched_kargs),*])
         };
     }
 

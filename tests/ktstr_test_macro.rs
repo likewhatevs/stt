@@ -106,6 +106,36 @@ fn entry_host_only_attr() {
     assert!(entry.host_only);
 }
 
+/// Scheduler that exercises the sysctls + kargs derive attributes.
+#[derive(ktstr::Scheduler)]
+#[scheduler(
+    name = "sys_kargs_test",
+    sysctls = [
+        ktstr::test_support::Sysctl::new("kernel.sched_cfs_bandwidth_slice_us", "1000"),
+        ktstr::test_support::Sysctl::new("kernel.sched_rr_timeslice_ms", "25"),
+    ],
+    kargs = ["nosmt", "iomem=relaxed"],
+)]
+#[allow(dead_code)]
+enum SysKargsTestFlag {}
+
+/// Verify the derive threads sysctls + kargs into the Scheduler const.
+#[test]
+fn derive_scheduler_sysctls_kargs() {
+    assert_eq!(SYS_KARGS_TEST.sysctls.len(), 2);
+    assert_eq!(
+        SYS_KARGS_TEST.sysctls[0].key,
+        "kernel.sched_cfs_bandwidth_slice_us"
+    );
+    assert_eq!(SYS_KARGS_TEST.sysctls[0].value, "1000");
+    assert_eq!(
+        SYS_KARGS_TEST.sysctls[1].key,
+        "kernel.sched_rr_timeslice_ms"
+    );
+    assert_eq!(SYS_KARGS_TEST.sysctls[1].value, "25");
+    assert_eq!(SYS_KARGS_TEST.kargs, &["nosmt", "iomem=relaxed"]);
+}
+
 /// Scheduler with the flags referenced by flags_attrs_compile.
 #[derive(ktstr::Scheduler)]
 #[scheduler(name = "flag_attrs_test", topology(1, 1, 2, 1))]

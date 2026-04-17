@@ -275,6 +275,30 @@ impl SchedulerSpec {
 
 pub use crate::scenario::flags::FlagDecl;
 
+/// A `key=value` sysctl applied to the guest before the scheduler
+/// starts, injected into the guest kernel cmdline as
+/// `sysctl.<key>=<value>`.
+///
+/// Use the **dot-separated** form for `key` (e.g. `"kernel.foo"`, not
+/// `"kernel/foo"`). Duplicate keys in a scheduler's sysctls slice are
+/// applied in order; the last write wins.
+///
+/// Use [`Sysctl::new`] to construct in `const` context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sysctl {
+    /// Dotted sysctl name (e.g. `"kernel.sched_cfs_bandwidth_slice_us"`).
+    pub key: &'static str,
+    /// Value written to the sysctl file as a string.
+    pub value: &'static str,
+}
+
+impl Sysctl {
+    /// Const constructor for use in `static`/`const` context.
+    pub const fn new(key: &'static str, value: &'static str) -> Self {
+        Self { key, value }
+    }
+}
+
 /// Definition of a scheduler for the test framework.
 ///
 /// Captures everything the framework needs to know about a scheduler:
@@ -289,13 +313,17 @@ pub struct Scheduler {
     pub binary: SchedulerSpec,
     /// Flag declarations from which gauntlet profiles are generated.
     pub flags: &'static [&'static FlagDecl],
-    /// Guest sysctls applied before the scheduler starts (set via
-    /// `/proc/sys/...`). Not yet wired into the `#[ktstr_test]` macro;
-    /// only reachable through manual `Scheduler` construction.
-    pub sysctls: &'static [(&'static str, &'static str)],
-    /// Guest kernel command-line arguments appended when booting the
-    /// VM. Not yet wired into the `#[ktstr_test]` macro; only
-    /// reachable through manual `Scheduler` construction.
+    /// Guest sysctls applied before the scheduler starts (injected
+    /// into the guest kernel cmdline as `sysctl.<key>=<value>`).
+    /// Applied in order; duplicate keys last-write-wins.
+    pub sysctls: &'static [Sysctl],
+    /// Extra guest kernel command-line arguments appended when booting
+    /// the VM. This is the GUEST KERNEL cmdline, not the scheduler
+    /// binary's CLI — use [`sched_args`](Self::sched_args) for that.
+    ///
+    /// Do not override the kargs ktstr injects itself (`nokaslr`,
+    /// `console=`, `loglevel=`, `init=`): those break guest-side init
+    /// and leave the VM unable to run tests.
     pub kargs: &'static [&'static str],
     /// Scheduler-wide assertion overrides merged on top of
     /// `Assert::default_checks()` and below each per-entry `assert`.
@@ -373,7 +401,7 @@ impl Scheduler {
     }
 
     /// Set sysctls. Returns self for const chaining.
-    pub const fn sysctls(mut self, sysctls: &'static [(&'static str, &'static str)]) -> Self {
+    pub const fn sysctls(mut self, sysctls: &'static [Sysctl]) -> Self {
         self.sysctls = sysctls;
         self
     }
@@ -1509,8 +1537,8 @@ fn run_ktstr_test_inner(
 
     // Build cmdline: base args + sysctls (as sysctl.key=value) + kargs.
     let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
-    for &(key, value) in entry.scheduler.sysctls {
-        cmdline_parts.push(format!("sysctl.{}={}", key, value));
+    for s in entry.scheduler.sysctls {
+        cmdline_parts.push(format!("sysctl.{}={}", s.key, s.value));
     }
     for &karg in entry.scheduler.kargs {
         cmdline_parts.push(karg.to_string());
@@ -2176,8 +2204,8 @@ fn attempt_auto_repro(
 
     // Build cmdline: base args + sysctls + kargs (same as first VM).
     let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
-    for &(key, value) in entry.scheduler.sysctls {
-        cmdline_parts.push(format!("sysctl.{}={}", key, value));
+    for s in entry.scheduler.sysctls {
+        cmdline_parts.push(format!("sysctl.{}={}", s.key, s.value));
     }
     for &karg in entry.scheduler.kargs {
         cmdline_parts.push(karg.to_string());
@@ -4705,10 +4733,12 @@ mod tests {
 
     #[test]
     fn scheduler_new_builder() {
+        static TEST_SYSCTLS: &[Sysctl] =
+            &[Sysctl::new("kernel.sched_cfs_bandwidth_slice_us", "1000")];
         let s = Scheduler::new("test_sched")
             .binary(SchedulerSpec::Name("test_bin"))
             .flags(FLAGS_A)
-            .sysctls(&[("kernel.sched_cfs_bandwidth_slice_us", "1000")])
+            .sysctls(TEST_SYSCTLS)
             .kargs(&["nosmt"]);
         assert_eq!(s.name, "test_sched");
         assert_eq!(s.flags.len(), 1);
