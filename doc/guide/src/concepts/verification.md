@@ -55,7 +55,9 @@ attributes.
 The [host-side monitor](../architecture/monitor.md) reads guest VM
 memory (per-CPU runqueue structs via BTF offsets) and evaluates:
 
-- **Imbalance ratio**: max/min `nr_running` across CPUs.
+- **Imbalance ratio**: `max(nr_running) / max(1, min(nr_running))`
+  across CPUs. The denominator is clamped to 1 so an all-idle sample
+  does not divide by zero.
 - **Local DSQ depth**: per-CPU dispatch queue depth.
 - **Stall detection**: `rq_clock` not advancing on a CPU with
   runnable tasks. Idle CPUs and preempted vCPUs are exempt. See
