@@ -13,9 +13,10 @@ examples.
 
 ktstr's runtime dispatches to per-kernel-version fallback paths for
 the watchdog timeout and event counters. CI explicitly exercises
-6.12 and 7.0 on both x86_64 and aarch64. The 6.16 `scx_sched` refactor
-is supported at runtime via BTF detection; pre-refactor kernels use
-the static `scx_watchdog_timeout` symbol.
+6.12 and 7.0 on both x86_64 and aarch64. On 7.1+ kernels the watchdog
+override uses `scx_sched.watchdog_timeout` via BTF detection; on
+6.16-7.0 kernels it uses the static `scx_watchdog_timeout` symbol;
+older kernels silently no-op.
 
 ## Testing
 
