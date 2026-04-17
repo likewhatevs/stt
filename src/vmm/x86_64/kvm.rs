@@ -9,6 +9,7 @@ use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::topology::{generate_cpuid, max_apic_id};
+use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
 use crate::vmm::topology::Topology;
 
 /// Physical address where the kernel is loaded.
@@ -96,6 +97,9 @@ pub struct KtstrKvm {
     pub vcpus: Vec<VcpuFd>,
     pub guest_mem: GuestMemoryMmap,
     pub topology: Topology,
+    /// Per-node GPA layout used by ACPI SRAT/HMAT generation. `None`
+    /// in deferred mode before `allocate_and_register_memory()`.
+    pub(crate) numa_layout: Option<NumaMemoryLayout>,
     /// Whether KVM supports the immediate_exit mechanism (KVM_CAP_IMMEDIATE_EXIT).
     pub has_immediate_exit: bool,
     /// Split IRQ chip mode: LAPIC in kernel, PIC/IOAPIC emulated in userspace.
@@ -108,6 +112,9 @@ pub struct KtstrKvm {
     /// can check hugepage availability fresh when memory_mb was
     /// unknown at construction time.
     performance_mode: bool,
+    /// Owns the VA reservation for per-node MAP_FIXED mmaps.
+    /// Drop munmaps the entire reservation.
+    _reservation: Option<ReservationGuard>,
 }
 
 impl KtstrKvm {
@@ -143,18 +150,18 @@ impl KtstrKvm {
     /// Should be called exactly once on a VM created with
     /// `new_deferred`; calling twice unconditionally replaces the
     /// backing memory. Replaces the placeholder guest memory with a
-    /// real allocation of `memory_mb` megabytes. Re-checks hugepage
-    /// availability when performance_mode is set, since memory_mb was
-    /// unknown at construction time and `use_hugepages` may have been
-    /// false.
+    /// real allocation of `memory_mb` megabytes and sets
+    /// `numa_layout` to the computed per-node GPA layout. Re-checks
+    /// hugepage availability when performance_mode is set, since
+    /// memory_mb was unknown at construction time and `use_hugepages`
+    /// may have been false.
     pub fn allocate_and_register_memory(&mut self, memory_mb: u32) -> Result<()> {
-        self.guest_mem = crate::vmm::allocate_and_register_guest_memory(
-            &self.vm_fd,
-            memory_mb,
-            GuestAddress(0),
-            self.use_hugepages,
-            self.performance_mode,
-        )?;
+        let layout = NumaMemoryLayout::compute(&self.topology, memory_mb, 0)?;
+        let alloc =
+            layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
+        self.guest_mem = alloc.guest_mem;
+        self._reservation = Some(alloc.reservation);
+        self.numa_layout = Some(layout);
         Ok(())
     }
 
@@ -293,13 +300,19 @@ impl KtstrKvm {
             }
         }
 
-        let guest_mem = crate::vmm::allocate_initial_guest_memory(
-            &vm_fd,
-            memory_mb,
-            GuestAddress(0),
-            use_hugepages,
-            performance_mode,
-        )?;
+        let (guest_mem, numa_layout, reservation) = match memory_mb {
+            Some(mb) => {
+                let layout = NumaMemoryLayout::compute(&topo, mb, 0)?;
+                let alloc =
+                    layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
+                (alloc.guest_mem, Some(layout), Some(alloc.reservation))
+            }
+            None => {
+                let placeholder = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
+                    .context("allocate placeholder guest memory")?;
+                (placeholder, None, None)
+            }
+        };
 
         // Fetch host CPUID once, reuse for all vCPUs (Firecracker pattern).
         let base_cpuid = kvm
@@ -392,10 +405,12 @@ impl KtstrKvm {
             vcpus,
             guest_mem,
             topology: topo,
+            numa_layout,
             has_immediate_exit,
             split_irqchip,
             use_hugepages,
             performance_mode,
+            _reservation: reservation,
         })
     }
 }

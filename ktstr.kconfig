@@ -81,6 +81,10 @@ CONFIG_EARLY_PRINTK=y
 # and selects ACPI_NUMA automatically.
 CONFIG_SMP=y
 CONFIG_NUMA=y
+# HMAT: parses ACPI HMAT for memory tiering (CXL nodes).
+# NUMA_BALANCING: auto-migrates pages to local node based on access.
+CONFIG_ACPI_HMAT=y
+CONFIG_NUMA_BALANCING=y
 
 # -- Cgroups (required) --
 # Scenario cpuset partitioning and CPU controller.
@@ -132,9 +136,6 @@ CONFIG_IKCONFIG_PROC=y
 # Full preemption (kernel preemptible at most points):
 # CONFIG_PREEMPT=y
 # CONFIG_PREEMPT_DYNAMIC=y
-#
-# NUMA page migration (auto-migrates pages to local node):
-# CONFIG_NUMA_BALANCING=y
 #
 # Core scheduling (co-schedule trusted tasks on SMT siblings):
 # CONFIG_SCHED_CORE=y

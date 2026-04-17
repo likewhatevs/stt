@@ -1,15 +1,21 @@
 /// ACPI 2.0 table generation for SMP topology via zerocopy packed structs.
 ///
-/// Generates RSDP rev 2 -> XSDT/RSDT -> {FADT, MADT, SRAT, SLIT},
+/// Generates RSDP rev 2 -> XSDT/RSDT -> {FADT, MADT, SRAT, SLIT[, HMAT]},
 /// with FADT referencing DSDT. RSDT with 32-bit pointers coexists with
 /// XSDT as an ACPI 1.0 fallback. FADT rev 6 with legacy hardware
 /// (PIC, PIT, ISA serial). Per-CPU APIC type: Local APIC (type 0) for
 /// apic_id < 255, x2APIC (type 9) for apic_id >= 255.
+///
+/// HMAT (Heterogeneous Memory Attribute Table) is emitted when the
+/// topology has memory-only nodes (CXL). It provides latency and
+/// bandwidth attributes that the kernel uses to compute abstract
+/// distance (adistance) for memory tiering.
 use anyhow::{Context, Result};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
 
 use super::topology::apic_id;
+use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
 
 // RSDP at fixed address in BIOS ROM area — firmware scans for it here.
@@ -30,6 +36,8 @@ pub struct AcpiLayout {
     pub srat_size: u64,
     pub slit_addr: u64,
     pub slit_size: u64,
+    pub hmat_addr: u64,
+    pub hmat_size: u64,
     pub rsdt_addr: u64,
     pub rsdt_size: u64,
     pub xsdt_addr: u64,
@@ -53,8 +61,8 @@ const LAPIC_ADDR: u32 = 0xFEE0_0000;
 // Packed structs — field offsets verified by zerocopy at compile time
 // ---------------------------------------------------------------------------
 
-/// ACPI SDT header (36 bytes). Shared prefix for RSDT, XSDT, FADT, MADT,
-/// SRAT, SLIT.
+/// ACPI SDT header (36 bytes). Shared prefix for DSDT, RSDT, XSDT, FADT,
+/// MADT, SRAT, SLIT, HMAT.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 struct SdtHeader {
@@ -239,18 +247,19 @@ fn set_sdt_checksum(buf: &mut [u8]) {
 /// Write ACPI tables to guest memory.
 ///
 /// RSDP is at fixed address 0xE0000; remaining tables pack contiguously
-/// after it in order: DSDT, MADT, FADT, SRAT, SLIT, RSDT, XSDT.
+/// after it in order: DSDT, MADT, FADT, SRAT, SLIT, [HMAT], RSDT, XSDT.
 ///
-/// SRAT memory affinity divides usable memory (`mem_bytes - shm_size`)
-/// evenly across NUMA nodes. The last node absorbs any rounding remainder.
+/// SRAT memory affinity uses `NumaMemoryLayout` regions directly,
+/// ensuring GPA ranges match KVM memory slots exactly. HMAT is emitted
+/// when the topology has memory-only nodes (CXL).
 pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     topo: &Topology,
-    memory_mb: u32,
-    shm_size: u64,
+    numa_layout: &NumaMemoryLayout,
 ) -> Result<AcpiLayout> {
     let num_cpus = topo.total_cpus();
-    let num_numa_nodes = topo.numa_nodes;
+
+    let emit_hmat = topo.has_memory_only_nodes();
 
     // Compute table sizes.
     let dsdt_size: u64 = 36;
@@ -259,19 +268,28 @@ pub fn setup_acpi(
 
     let fadt_size: u64 = 276;
 
-    // SRAT: one CPU affinity entry per vCPU, one memory affinity entry per NUMA node.
+    // SRAT: one CPU affinity per vCPU + one memory affinity per layout
+    // region (nodes with memory). CPU-only nodes with zero memory do not
+    // get a memory affinity entry.
+    let num_mem_regions = numa_layout.regions().len() as u32;
     let srat_size: u64 =
         (48 + std::mem::size_of::<SratCpuAffinity>() as u32 * num_cpus
-            + std::mem::size_of::<SratMemAffinity>() as u32 * num_numa_nodes) as u64;
+            + std::mem::size_of::<SratMemAffinity>() as u32 * num_mem_regions) as u64;
 
     // SLIT: NxN distance matrix where N = NUMA node count.
-    let n = num_numa_nodes as u64;
+    let n = topo.numa_nodes as u64;
     let slit_size: u64 = 36 + 8 + n * n;
 
-    // RSDT: 36-byte header + 4 x 32-bit pointers
-    let rsdt_size: u64 = 36 + 16;
-    // XSDT: 36-byte header + 4 x 64-bit pointers
-    let xsdt_size: u64 = 36 + 32;
+    let hmat_size: u64 = if emit_hmat {
+        compute_hmat_size(topo, numa_layout) as u64
+    } else {
+        0
+    };
+
+    // Table count: FADT + MADT + SRAT + SLIT + optional HMAT.
+    let table_count: u64 = if emit_hmat { 5 } else { 4 };
+    let rsdt_size: u64 = 36 + table_count * 4;
+    let xsdt_size: u64 = 36 + table_count * 8;
 
     // Pack tables contiguously after RSDP.
     let mut cursor = RSDP_ADDR + RSDP_SIZE;
@@ -291,6 +309,9 @@ pub fn setup_acpi(
     let slit_addr = cursor;
     cursor += slit_size;
 
+    let hmat_addr = cursor;
+    cursor += hmat_size;
+
     let rsdt_addr = cursor;
     cursor += rsdt_size;
 
@@ -307,6 +328,8 @@ pub fn setup_acpi(
         srat_size,
         slit_addr,
         slit_size,
+        hmat_addr,
+        hmat_size,
         rsdt_addr,
         rsdt_size,
         xsdt_addr,
@@ -318,8 +341,11 @@ pub fn setup_acpi(
     write_dsdt(mem, dsdt_addr)?;
     write_madt(mem, topo, madt_addr)?;
     write_fadt(mem, &layout)?;
-    write_srat(mem, topo, memory_mb, shm_size, srat_addr)?;
+    write_srat(mem, topo, numa_layout, srat_addr)?;
     write_slit(mem, topo, slit_addr)?;
+    if emit_hmat {
+        write_hmat(mem, topo, numa_layout, hmat_addr)?;
+    }
     write_rsdt(mem, &layout)?;
     write_xsdt(mem, &layout)?;
     write_rsdp(mem, &layout)?;
@@ -344,17 +370,15 @@ fn write_rsdp(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
 }
 
 fn write_rsdt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
-    let len = 36 + 16;
+    let len = layout.rsdt_size as usize;
     let mut buf = vec![0u8; len];
     let hdr = SdtHeader::new(b"RSDT", len as u32, 1);
     buf[..36].copy_from_slice(hdr.as_bytes());
-    let entries: [u32; 4] = [
-        layout.fadt_addr as u32,
-        layout.madt_addr as u32,
-        layout.srat_addr as u32,
-        layout.slit_addr as u32,
-    ];
-    buf[36..52].copy_from_slice(entries.as_bytes());
+    let mut offset = 36;
+    for addr in rsdt_entries(layout) {
+        buf[offset..offset + 4].copy_from_slice(&(addr as u32).to_le_bytes());
+        offset += 4;
+    }
     set_sdt_checksum(&mut buf);
     mem.write_slice(&buf, GuestAddress(layout.rsdt_addr))
         .context("write RSDT")?;
@@ -362,21 +386,32 @@ fn write_rsdt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
 }
 
 fn write_xsdt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
-    let len = 36 + 32;
+    let len = layout.xsdt_size as usize;
     let mut buf = vec![0u8; len];
     let hdr = SdtHeader::new(b"XSDT", len as u32, 1);
     buf[..36].copy_from_slice(hdr.as_bytes());
-    let entries: [u64; 4] = [
+    let mut offset = 36;
+    for addr in rsdt_entries(layout) {
+        buf[offset..offset + 8].copy_from_slice(&addr.to_le_bytes());
+        offset += 8;
+    }
+    set_sdt_checksum(&mut buf);
+    mem.write_slice(&buf, GuestAddress(layout.xsdt_addr))
+        .context("write XSDT")?;
+    Ok(())
+}
+
+fn rsdt_entries(layout: &AcpiLayout) -> Vec<u64> {
+    let mut entries = vec![
         layout.fadt_addr,
         layout.madt_addr,
         layout.srat_addr,
         layout.slit_addr,
     ];
-    buf[36..68].copy_from_slice(entries.as_bytes());
-    set_sdt_checksum(&mut buf);
-    mem.write_slice(&buf, GuestAddress(layout.xsdt_addr))
-        .context("write XSDT")?;
-    Ok(())
+    if layout.hmat_size > 0 {
+        entries.push(layout.hmat_addr);
+    }
+    entries
 }
 
 fn write_dsdt(mem: &GuestMemoryMmap, addr: u64) -> Result<()> {
@@ -409,16 +444,15 @@ fn write_fadt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
 fn write_srat(
     mem: &GuestMemoryMmap,
     topo: &Topology,
-    memory_mb: u32,
-    shm_size: u64,
+    numa_layout: &NumaMemoryLayout,
     addr: u64,
 ) -> Result<()> {
     let num_cpus = topo.total_cpus();
-    let num_numa_nodes = topo.numa_nodes;
+    let num_mem_regions = numa_layout.regions().len() as u32;
 
     let len = 48
         + std::mem::size_of::<SratCpuAffinity>() as u32 * num_cpus
-        + std::mem::size_of::<SratMemAffinity>() as u32 * num_numa_nodes;
+        + std::mem::size_of::<SratMemAffinity>() as u32 * num_mem_regions;
     let mut buf = vec![0u8; len as usize];
 
     let hdr = SdtHeader::new(b"SRAT", len, 3);
@@ -427,7 +461,6 @@ fn write_srat(
 
     let mut offset = 48;
 
-    // CPU affinity: each vCPU maps to the NUMA node that owns its LLC.
     for cpu_id in 0..num_cpus {
         let (llc_id, _, _) = topo.decompose(cpu_id);
         let node_id = topo.numa_node_of(llc_id);
@@ -444,36 +477,17 @@ fn write_srat(
         offset += bytes.len();
     }
 
-    // Memory affinity: one entry per NUMA node. When explicit per-node
-    // memory is configured, use it; otherwise split evenly. The last
-    // node extends to cover the SHM region in both paths.
-    let mem_bytes = (memory_mb as u64) << 20;
-    let usable_bytes = mem_bytes - shm_size;
-    let mut base_addr: u64 = 0;
-    for node in 0..num_numa_nodes {
-        let length = match topo.node_memory_mb(node) {
-            Some(mb) => {
-                let node_bytes = (mb as u64) << 20;
-                if node == num_numa_nodes - 1 {
-                    node_bytes + shm_size
-                } else {
-                    node_bytes
-                }
-            }
-            None => {
-                let per_node = usable_bytes / num_numa_nodes as u64;
-                if node == num_numa_nodes - 1 {
-                    usable_bytes - base_addr
-                } else {
-                    per_node
-                }
-            }
-        };
+    // Memory affinity from NumaMemoryLayout regions. The layout covers
+    // the full guest memory including the SHM region at the top of
+    // DRAM. SHM is reserved via E820/memblock, not excluded from SRAT.
+    let regions = numa_layout.regions();
+    for region in regions {
+        let length = region.size;
         let entry = SratMemAffinity {
             entry_type: 1,
             length: std::mem::size_of::<SratMemAffinity>() as u8,
-            proximity_domain: node,
-            base_address: base_addr,
+            proximity_domain: region.node_id,
+            base_address: region.gpa_start,
             address_length: length,
             flags: 1,
             ..Default::default()
@@ -481,7 +495,6 @@ fn write_srat(
         let bytes = entry.as_bytes();
         buf[offset..offset + bytes.len()].copy_from_slice(bytes);
         offset += bytes.len();
-        base_addr += length;
     }
 
     set_sdt_checksum(&mut buf);
@@ -508,6 +521,202 @@ fn write_slit(mem: &GuestMemoryMmap, topo: &Topology, addr: u64) -> Result<()> {
     set_sdt_checksum(&mut buf);
     mem.write_slice(&buf, GuestAddress(addr))
         .context("write SLIT")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// HMAT — Heterogeneous Memory Attribute Table (rev 2)
+// ---------------------------------------------------------------------------
+
+/// SLLBI ACCESS_LATENCY entry_base_unit: 100ns expressed in picoseconds.
+/// actual_latency = entry_u16 * entry_base_unit. DRAM=1*100000ps=100ns,
+/// CXL=3*100000ps=300ns.
+const HMAT_LATENCY_BASE_PS: u64 = 100_000;
+/// DRAM latency entry value (100ns / 100ns = 1).
+const HMAT_DRAM_LATENCY_ENTRY: u16 = 1;
+/// CXL latency entry value (300ns / 100ns = 3).
+const HMAT_CXL_LATENCY_ENTRY: u16 = 3;
+
+/// SLLBI ACCESS_BANDWIDTH entry_base_unit: 10 GB/s in MB/s.
+/// actual_bw = entry_u16 * entry_base_unit. DRAM=5*10240=51200 MB/s=50GB/s,
+/// CXL=2*10240=20480 MB/s=20GB/s.
+const HMAT_BW_BASE_MBS: u64 = 10_240;
+/// DRAM bandwidth entry value (50GB / 10GB = 5).
+const HMAT_DRAM_BW_ENTRY: u16 = 5;
+/// CXL bandwidth entry value (20GB / 10GB = 2).
+const HMAT_CXL_BW_ENTRY: u16 = 2;
+
+/// HMAT Memory Proximity Domain Attributes (type 0, 40 bytes).
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+struct HmatMpda {
+    hmat_type: u16,
+    _reserved0: u16,
+    length: u32,
+    flags: u16,
+    _reserved1: u16,
+    initiator_proximity_domain: u32,
+    memory_proximity_domain: u32,
+    _reserved2: u32,
+    _reserved3: u64,
+    _reserved4: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<HmatMpda>() == 40);
+
+/// HMAT System Locality Latency and Bandwidth Info (type 1).
+/// Variable-length: header (32 bytes) + PD lists (4 bytes each)
+/// + entry matrix (2 bytes each).
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+struct HmatSllbiHeader {
+    hmat_type: u16,
+    _reserved0: u16,
+    length: u32,
+    flags: u8,
+    data_type: u8,
+    min_transfer_size: u8,
+    _reserved1: u8,
+    num_initiator_pds: u32,
+    num_target_pds: u32,
+    _reserved2: u32,
+    entry_base_unit: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<HmatSllbiHeader>() == 32);
+
+fn compute_hmat_size(topo: &Topology, numa_layout: &NumaMemoryLayout) -> u32 {
+    let num_initiators = topo.cpu_bearing_nodes();
+    let num_targets = numa_layout.regions().len() as u32;
+    let num_mpdas = num_targets;
+
+    // SDT header (36) + 4 reserved bytes = 40.
+    let hmat_header = 40u32;
+
+    let mpda_size = std::mem::size_of::<HmatMpda>() as u32 * num_mpdas;
+
+    // Two SLLBI subtables: access_latency and access_bandwidth.
+    // Each: header (32) + initiator PD list (4 * num_initiators)
+    //        + target PD list (4 * num_targets)
+    //        + entry matrix (2 * num_initiators * num_targets)
+    let sllbi_size = (std::mem::size_of::<HmatSllbiHeader>() as u32
+        + 4 * num_initiators
+        + 4 * num_targets
+        + 2 * num_initiators * num_targets)
+        * 2;
+
+    hmat_header + mpda_size + sllbi_size
+}
+
+fn write_hmat(
+    mem: &GuestMemoryMmap,
+    topo: &Topology,
+    numa_layout: &NumaMemoryLayout,
+    addr: u64,
+) -> Result<()> {
+    let len = compute_hmat_size(topo, numa_layout);
+    let mut buf = vec![0u8; len as usize];
+
+    // SDT header: HMAT revision 2.
+    let hdr = SdtHeader::new(b"HMAT", len, 2);
+    buf[..36].copy_from_slice(hdr.as_bytes());
+    // 4 reserved bytes at offset 36..40 (already zero).
+
+    let mut offset = 40usize;
+
+    // Collect initiator and target node IDs.
+    let initiators: Vec<u32> = (0..topo.numa_nodes)
+        .filter(|&n| topo.llcs_in_node(n) > 0)
+        .collect();
+    let targets: Vec<u32> = numa_layout.regions().iter().map(|r| r.node_id).collect();
+
+    // Type 0: MPDA — one per memory target, mapping to its closest
+    // CPU-bearing initiator. flags=3: bit 0 (PROCESSOR_PD_VALID) +
+    // bit 1 (MEMORY_PD_VALID). Without both bits, hmat_update_target()
+    // skips the entry and SLLBI perf data is never associated.
+    for &target_node in &targets {
+        let initiator = if topo.llcs_in_node(target_node) > 0 {
+            target_node
+        } else {
+            *initiators
+                .iter()
+                .min_by_key(|&&i| topo.distance(i, target_node))
+                .unwrap_or(&initiators[0])
+        };
+        let mpda = HmatMpda {
+            hmat_type: 0,
+            length: std::mem::size_of::<HmatMpda>() as u32,
+            flags: 3,
+            initiator_proximity_domain: initiator,
+            memory_proximity_domain: target_node,
+            ..Default::default()
+        };
+        let bytes = mpda.as_bytes();
+        buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+        offset += bytes.len();
+    }
+
+    // Type 1: SLLBI — latency (data_type=0) and bandwidth (data_type=3).
+    // actual_value = entry_u16 * entry_base_unit.
+    let ni = initiators.len() as u32;
+    let nt = targets.len() as u32;
+
+    for (data_type, base_unit, dram_entry, cxl_entry) in [
+        (
+            0u8,
+            HMAT_LATENCY_BASE_PS,
+            HMAT_DRAM_LATENCY_ENTRY,
+            HMAT_CXL_LATENCY_ENTRY,
+        ),
+        (3u8, HMAT_BW_BASE_MBS, HMAT_DRAM_BW_ENTRY, HMAT_CXL_BW_ENTRY),
+    ] {
+        let sllbi_len =
+            std::mem::size_of::<HmatSllbiHeader>() as u32 + 4 * ni + 4 * nt + 2 * ni * nt;
+
+        let sllbi_hdr = HmatSllbiHeader {
+            hmat_type: 1,
+            length: sllbi_len,
+            flags: 0,
+            data_type,
+            min_transfer_size: 0,
+            num_initiator_pds: ni,
+            num_target_pds: nt,
+            entry_base_unit: base_unit,
+            ..Default::default()
+        };
+        let bytes = sllbi_hdr.as_bytes();
+        buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+        offset += bytes.len();
+
+        for &i in &initiators {
+            buf[offset..offset + 4].copy_from_slice(&i.to_le_bytes());
+            offset += 4;
+        }
+
+        for &t in &targets {
+            buf[offset..offset + 4].copy_from_slice(&t.to_le_bytes());
+            offset += 4;
+        }
+
+        // Entry matrix: row = initiator, col = target. u16 entries.
+        // actual_value = entry * entry_base_unit.
+        for &_init_node in &initiators {
+            for &tgt_node in &targets {
+                let is_cxl = topo
+                    .nodes
+                    .is_some_and(|nodes| nodes[tgt_node as usize].is_memory_only());
+                let entry = if is_cxl { cxl_entry } else { dram_entry };
+                buf[offset..offset + 2].copy_from_slice(&entry.to_le_bytes());
+                offset += 2;
+            }
+        }
+    }
+
+    debug_assert_eq!(offset, len as usize);
+
+    set_sdt_checksum(&mut buf);
+    mem.write_slice(&buf, GuestAddress(addr))
+        .context("write HMAT")?;
     Ok(())
 }
 
@@ -669,6 +878,15 @@ mod tests {
         GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), (mb as usize) << 20)]).unwrap()
     }
 
+    fn test_layout(topo: &Topology, mb: u32) -> NumaMemoryLayout {
+        NumaMemoryLayout::compute(topo, mb, 0).unwrap()
+    }
+
+    fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mb: u32, _shm_size: u64) -> AcpiLayout {
+        let layout = test_layout(topo, mb);
+        setup_acpi(mem, topo, &layout).unwrap()
+    }
+
     fn read_table(mem: &GuestMemoryMmap, addr: u64) -> Vec<u8> {
         let mut len_bytes = [0u8; 4];
         mem.read_slice(&mut len_bytes, GuestAddress(addr + 4))
@@ -724,7 +942,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut rsdp = [0u8; 20];
         mem.read_slice(&mut rsdp, GuestAddress(l.rsdp_addr))
             .unwrap();
@@ -744,7 +962,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let rsdt = read_table(&mem, l.rsdt_addr);
         assert_eq!(&rsdt[..4], b"RSDT");
         let sum: u8 = rsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
@@ -762,7 +980,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         assert_eq!(&madt[..4], b"APIC");
         let sum: u8 = madt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
@@ -780,7 +998,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let cpu_count = entries
@@ -801,7 +1019,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let mut cpu_idx = 0u32;
@@ -834,7 +1052,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let ioapic = entries.iter().find(|(t, _, _)| *t == 1);
@@ -857,7 +1075,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut rsdp = [0u8; 20];
         mem.read_slice(&mut rsdp, GuestAddress(l.rsdp_addr))
             .unwrap();
@@ -878,7 +1096,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut entry = [0u8; 4];
         mem.read_slice(&mut entry, GuestAddress(l.rsdt_addr + 36))
             .unwrap();
@@ -905,7 +1123,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let iso = entries.iter().find(|(t, _, _)| *t == 2).unwrap();
@@ -924,7 +1142,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         assert!(entries.iter().any(|(t, _, _)| *t == 4 || *t == 0x0A));
@@ -941,7 +1159,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         assert_eq!(entries.iter().filter(|(t, _, _)| *t == 9).count(), 0);
@@ -972,7 +1190,7 @@ mod tests {
             }
         }
         assert!(has_low && has_high);
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let lapic_count = entries.iter().filter(|(t, _, _)| *t == 0).count();
@@ -995,7 +1213,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let (_, len, data) = entries.iter().find(|(t, _, _)| *t == 0x0A).unwrap();
@@ -1019,7 +1237,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let (_, len, data) = entries.iter().find(|(t, _, _)| *t == 4).unwrap();
@@ -1053,7 +1271,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let l = test_setup(&mem, &topo, 256, 0);
             let madt = read_madt(&mem, &l);
             let sum: u8 = madt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
             assert_eq!(
@@ -1082,7 +1300,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let l = test_setup(&mem, &topo, 256, 0);
             let madt = read_madt(&mem, &l);
             let entries = walk_madt_entries(&madt);
             let mut cpu_idx = 0u32;
@@ -1117,7 +1335,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         for (entry_type, entry_len, _) in &entries {
@@ -1145,7 +1363,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let declared_len = u32::from_le_bytes(madt[4..8].try_into().unwrap()) as usize;
         assert_eq!(declared_len, madt.len());
@@ -1168,7 +1386,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         for (entry_type, _, data) in &entries {
@@ -1191,7 +1409,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut rsdp = [0u8; 36];
         mem.read_slice(&mut rsdp, GuestAddress(l.rsdp_addr))
             .unwrap();
@@ -1223,7 +1441,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let xsdt = read_table(&mem, l.xsdt_addr);
         assert_eq!(&xsdt[..4], b"XSDT");
         assert_eq!(xsdt.len(), 68);
@@ -1242,7 +1460,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut entry = [0u8; 8];
         mem.read_slice(&mut entry, GuestAddress(l.xsdt_addr + 36))
             .unwrap();
@@ -1269,7 +1487,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut fadt = [0u8; 276];
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
@@ -1291,7 +1509,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut fadt = [0u8; 276];
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
@@ -1312,7 +1530,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut fadt = [0u8; 276];
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
@@ -1330,7 +1548,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut fadt = [0u8; 276];
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
@@ -1355,7 +1573,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut dsdt = [0u8; 36];
         mem.read_slice(&mut dsdt, GuestAddress(l.dsdt_addr))
             .unwrap();
@@ -1376,7 +1594,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+        let l = test_setup(&mem, &topo, 256, 0);
         let mut rsdp = [0u8; 36];
         mem.read_slice(&mut rsdp, GuestAddress(l.rsdp_addr))
             .unwrap();
@@ -1417,7 +1635,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let l = test_setup(&mem, &topo, 256, 0);
             let srat = read_table(&mem, l.srat_addr);
             let entries = walk_srat_entries(&srat);
             let mut cpu_idx = 0u32;
@@ -1457,7 +1675,7 @@ mod tests {
                 distances: None,
             };
             let mem_bytes = 256u64 << 20;
-            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let l = test_setup(&mem, &topo, 256, 0);
             let srat = read_table(&mem, l.srat_addr);
             let entries = walk_srat_entries(&srat);
             let mem_entries: Vec<_> = entries.iter().filter(|(t, _, _)| *t == 1).collect();
@@ -1505,8 +1723,7 @@ mod tests {
                 distances: None,
             };
             let mem_bytes = 256u64 << 20;
-            let expected_usable = mem_bytes - shm_size;
-            let l = setup_acpi(&mem, &topo, 256, shm_size).unwrap();
+            let l = test_setup(&mem, &topo, 256, shm_size);
             let srat = read_table(&mem, l.srat_addr);
             let entries = walk_srat_entries(&srat);
             let total: u64 = entries
@@ -1515,8 +1732,8 @@ mod tests {
                 .map(|(_, _, data)| u64::from_le_bytes(data[16..24].try_into().unwrap()))
                 .sum();
             assert_eq!(
-                total, expected_usable,
-                "shm_size={shm_size}: total {total} != expected {expected_usable} \
+                total, mem_bytes,
+                "shm_size={shm_size}: total {total} != expected {mem_bytes} \
                  (topo: {numa_nodes}n/{llcs}l)"
             );
         }
@@ -1534,7 +1751,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let l = test_setup(&mem, &topo, 256, 0);
             let slit = read_table(&mem, l.slit_addr);
             assert_eq!(&slit[..4], b"SLIT", "SLIT signature mismatch");
             let n = u64::from_le_bytes(slit[36..44].try_into().unwrap());
@@ -1567,7 +1784,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = setup_acpi(&mem, &topo, 256, 0).unwrap();
+            let l = test_setup(&mem, &topo, 256, 0);
             let srat = read_table(&mem, l.srat_addr);
             let srat_sum: u8 = srat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
             assert_eq!(
@@ -1585,8 +1802,8 @@ mod tests {
 
     #[test]
     fn srat_memory_split_remainder() {
-        // 257 MB / 3 nodes: per_node = floor(269_484_032 / 3) = 89_828_010.
-        // Last node absorbs remainder: 269_484_032 - 2*89_828_010 = 89_828_012.
+        // 257 MB / 3 nodes: NumaMemoryLayout divides MiB first.
+        // per_node_mb = 257/3 = 85, last = 257 - 85*2 = 87.
         let memory_mb = 257u32;
         let mem = test_mem(memory_mb);
         let topo = Topology {
@@ -1598,8 +1815,11 @@ mod tests {
             distances: None,
         };
         let mem_bytes = (memory_mb as u64) << 20;
-        let per_node = mem_bytes / 3;
-        let l = setup_acpi(&mem, &topo, memory_mb, 0).unwrap();
+        let per_node_mb = memory_mb / 3;
+        let per_node = (per_node_mb as u64) << 20;
+        let last = (memory_mb - per_node_mb * 2) as u64;
+        let last_bytes = last << 20;
+        let l = test_setup(&mem, &topo, memory_mb, 0);
         let srat = read_table(&mem, l.srat_addr);
         let entries = walk_srat_entries(&srat);
         let mem_entries: Vec<_> = entries.iter().filter(|(t, _, _)| *t == 1).collect();
@@ -1613,10 +1833,9 @@ mod tests {
                     "node {i}: expected {per_node}, got {length}"
                 );
             } else {
-                let expected_last = mem_bytes - 2 * per_node;
                 assert_eq!(
-                    length, expected_last,
-                    "last node: expected {expected_last}, got {length}"
+                    length, last_bytes,
+                    "last node: expected {last_bytes}, got {length}"
                 );
                 assert!(
                     length > per_node,
@@ -1629,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn srat_shm_reduces_last_node_memory() {
+    fn srat_shm_included_in_memory() {
         let mem = test_mem(16);
         let topo = Topology {
             llcs: 2,
@@ -1640,7 +1859,7 @@ mod tests {
             distances: None,
         };
         let shm_size: u64 = 64 * 1024;
-        let l = setup_acpi(&mem, &topo, 256, shm_size).unwrap();
+        let l = test_setup(&mem, &topo, 256, shm_size);
         let srat = read_table(&mem, l.srat_addr);
         let entries = walk_srat_entries(&srat);
         let total_mem: u64 = entries
@@ -1648,7 +1867,229 @@ mod tests {
             .filter(|(t, _, _)| *t == 1)
             .map(|(_, _, data)| u64::from_le_bytes(data[16..24].try_into().unwrap()))
             .sum();
-        let expected = (256u64 << 20) - shm_size;
+        let expected = 256u64 << 20;
         assert_eq!(total_mem, expected);
+    }
+
+    // -- HMAT tests --
+
+    use crate::vmm::topology::NumaNode;
+
+    static CXL_NODES: [NumaNode; 3] = [
+        NumaNode::new(2, 256),
+        NumaNode::new(2, 256),
+        NumaNode::new(0, 128),
+    ];
+
+    #[test]
+    fn hmat_not_emitted_without_cxl() {
+        let mem = test_mem(16);
+        let topo = Topology {
+            llcs: 4,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 2,
+            nodes: None,
+            distances: None,
+        };
+        let l = test_setup(&mem, &topo, 256, 0);
+        assert_eq!(l.hmat_size, 0, "HMAT must not be emitted without CXL nodes");
+    }
+
+    #[test]
+    fn hmat_emitted_with_cxl() {
+        let topo = Topology::with_nodes(4, 1, &CXL_NODES);
+        let mem = test_mem(16);
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let l = setup_acpi(&mem, &topo, &layout).unwrap();
+        assert!(l.hmat_size > 0, "HMAT must be emitted with CXL nodes");
+    }
+
+    #[test]
+    fn hmat_checksum() {
+        let topo = Topology::with_nodes(4, 1, &CXL_NODES);
+        let mem = test_mem(16);
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let l = setup_acpi(&mem, &topo, &layout).unwrap();
+        let hmat = read_table(&mem, l.hmat_addr);
+        let sum: u8 = hmat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0, "HMAT checksum must be zero");
+    }
+
+    #[test]
+    fn hmat_header_fields() {
+        let topo = Topology::with_nodes(4, 1, &CXL_NODES);
+        let mem = test_mem(16);
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let l = setup_acpi(&mem, &topo, &layout).unwrap();
+        let hmat = read_table(&mem, l.hmat_addr);
+        assert_eq!(&hmat[..4], b"HMAT");
+        assert_eq!(hmat[8], 2, "HMAT revision must be 2");
+        assert_eq!(
+            &hmat[36..40],
+            &[0, 0, 0, 0],
+            "4 reserved bytes after SDT header"
+        );
+    }
+
+    #[test]
+    fn hmat_mpda_count_and_flags() {
+        let topo = Topology::with_nodes(4, 1, &CXL_NODES);
+        let mem = test_mem(16);
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let l = setup_acpi(&mem, &topo, &layout).unwrap();
+        let hmat = read_table(&mem, l.hmat_addr);
+
+        let num_targets = layout.regions().len();
+        let mut offset = 40;
+        let mut mpda_count = 0;
+        while offset < hmat.len() {
+            let hmat_type = u16::from_le_bytes(hmat[offset..offset + 2].try_into().unwrap());
+            if hmat_type != 0 {
+                break;
+            }
+            let length = u32::from_le_bytes(hmat[offset + 4..offset + 8].try_into().unwrap());
+            assert_eq!(length, 40, "MPDA length must be 40");
+            let flags = u16::from_le_bytes(hmat[offset + 8..offset + 10].try_into().unwrap());
+            assert_eq!(
+                flags, 3,
+                "MPDA flags must be 3 (PROCESSOR_PD_VALID | MEMORY_PD_VALID)"
+            );
+            mpda_count += 1;
+            offset += length as usize;
+        }
+        assert_eq!(
+            mpda_count, num_targets,
+            "one MPDA per memory target (layout region)"
+        );
+    }
+
+    #[test]
+    fn hmat_mpda_cxl_initiator() {
+        let topo = Topology::with_nodes(4, 1, &CXL_NODES);
+        let mem = test_mem(16);
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let l = setup_acpi(&mem, &topo, &layout).unwrap();
+        let hmat = read_table(&mem, l.hmat_addr);
+
+        let mut offset = 40;
+        for region in layout.regions() {
+            let hmat_type = u16::from_le_bytes(hmat[offset..offset + 2].try_into().unwrap());
+            assert_eq!(hmat_type, 0);
+            let initiator = u32::from_le_bytes(hmat[offset + 12..offset + 16].try_into().unwrap());
+            let memory_pd = u32::from_le_bytes(hmat[offset + 16..offset + 20].try_into().unwrap());
+            assert_eq!(memory_pd, region.node_id);
+            if topo.llcs_in_node(region.node_id) > 0 {
+                assert_eq!(
+                    initiator, region.node_id,
+                    "CPU-bearing node {}: initiator must be self",
+                    region.node_id
+                );
+            } else {
+                assert_ne!(
+                    topo.llcs_in_node(initiator),
+                    0,
+                    "CXL node {}: initiator {} must be CPU-bearing",
+                    region.node_id,
+                    initiator
+                );
+            }
+            offset += 40;
+        }
+    }
+
+    #[test]
+    fn hmat_sllbi_latency_and_bandwidth() {
+        let topo = Topology::with_nodes(4, 1, &CXL_NODES);
+        let mem = test_mem(16);
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let l = setup_acpi(&mem, &topo, &layout).unwrap();
+        let hmat = read_table(&mem, l.hmat_addr);
+
+        let num_targets = layout.regions().len();
+        let mut offset = 40 + 40 * num_targets;
+
+        for expected_data_type in [0u8, 3u8] {
+            let hmat_type = u16::from_le_bytes(hmat[offset..offset + 2].try_into().unwrap());
+            assert_eq!(hmat_type, 1, "SLLBI type must be 1");
+            let length = u32::from_le_bytes(hmat[offset + 4..offset + 8].try_into().unwrap());
+            let data_type = hmat[offset + 9];
+            assert_eq!(data_type, expected_data_type);
+            let ni = u32::from_le_bytes(hmat[offset + 12..offset + 16].try_into().unwrap());
+            let nt = u32::from_le_bytes(hmat[offset + 16..offset + 20].try_into().unwrap());
+            assert_eq!(ni, topo.cpu_bearing_nodes());
+            assert_eq!(nt, num_targets as u32);
+            let base_unit = u64::from_le_bytes(hmat[offset + 24..offset + 32].try_into().unwrap());
+            if data_type == 0 {
+                assert_eq!(base_unit, 100_000, "latency base must be 100000 ps");
+            } else {
+                assert_eq!(base_unit, 10_240, "bandwidth base must be 10240 MB/s");
+            }
+            offset += length as usize;
+        }
+    }
+
+    #[test]
+    fn hmat_sllbi_cxl_entries_differ() {
+        let topo = Topology::with_nodes(4, 1, &CXL_NODES);
+        let mem = test_mem(16);
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let l = setup_acpi(&mem, &topo, &layout).unwrap();
+        let hmat = read_table(&mem, l.hmat_addr);
+
+        let num_targets = layout.regions().len();
+        let ni = topo.cpu_bearing_nodes() as usize;
+        let nt = num_targets;
+
+        // Skip to first SLLBI (latency) entry matrix.
+        let sllbi_offset = 40 + 40 * nt;
+        let matrix_offset = sllbi_offset + 32 + 4 * ni + 4 * nt;
+
+        // CXL target is the last region (node 2, memory-only).
+        // Read first initiator's entries for DRAM target 0 and CXL target 2.
+        let dram_entry =
+            u16::from_le_bytes(hmat[matrix_offset..matrix_offset + 2].try_into().unwrap());
+        let cxl_entry = u16::from_le_bytes(
+            hmat[matrix_offset + 2 * (nt - 1)..matrix_offset + 2 * nt]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(dram_entry, 1, "DRAM latency entry must be 1");
+        assert_eq!(cxl_entry, 3, "CXL latency entry must be 3");
+    }
+
+    #[test]
+    fn hmat_rsdt_xsdt_include_pointer() {
+        let topo = Topology::with_nodes(4, 1, &CXL_NODES);
+        let mem = test_mem(16);
+        let layout = NumaMemoryLayout::compute(&topo, 640, 0).unwrap();
+        let l = setup_acpi(&mem, &topo, &layout).unwrap();
+
+        // RSDT should have 5 entries (FADT, MADT, SRAT, SLIT, HMAT).
+        let rsdt = read_table(&mem, l.rsdt_addr);
+        let rsdt_entries = (rsdt.len() - 36) / 4;
+        assert_eq!(rsdt_entries, 5, "RSDT must have 5 table pointers with HMAT");
+        let hmat_ptr = u32::from_le_bytes(rsdt[36 + 16..36 + 20].try_into().unwrap());
+        assert_eq!(hmat_ptr, l.hmat_addr as u32);
+
+        // XSDT should have 5 entries.
+        let xsdt = read_table(&mem, l.xsdt_addr);
+        let xsdt_entries = (xsdt.len() - 36) / 8;
+        assert_eq!(xsdt_entries, 5, "XSDT must have 5 table pointers with HMAT");
+        let hmat_ptr64 = u64::from_le_bytes(xsdt[36 + 32..36 + 40].try_into().unwrap());
+        assert_eq!(hmat_ptr64, l.hmat_addr);
+    }
+
+    #[test]
+    fn no_hmat_rsdt_has_4_entries() {
+        let mem = test_mem(16);
+        let topo = Topology::new(2, 4, 2, 1);
+        let l = test_setup(&mem, &topo, 256, 0);
+        let rsdt = read_table(&mem, l.rsdt_addr);
+        let rsdt_entries = (rsdt.len() - 36) / 4;
+        assert_eq!(
+            rsdt_entries, 4,
+            "RSDT must have 4 table pointers without HMAT"
+        );
     }
 }

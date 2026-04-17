@@ -7,6 +7,7 @@ use crate::vmm::kvm::{
     GIC_REDIST_SIZE_PER_CPU, SERIAL_IRQ, SERIAL_MMIO_BASE, SERIAL_MMIO_SIZE, SERIAL2_IRQ,
     SERIAL2_MMIO_BASE, VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_MMIO_BASE,
 };
+use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
 use crate::vmm::virtio_console;
 
@@ -57,6 +58,7 @@ pub fn create_fdt(
     shm_size: u64,
     hw_cache_level: u32,
     guest_l1_unified: bool,
+    numa_layout: &NumaMemoryLayout,
 ) -> Result<Vec<u8>> {
     // SHM base address (top of guest DRAM minus SHM size).
     let shm_base = if shm_size > 0 {
@@ -92,7 +94,7 @@ pub fn create_fdt(
 
     // /memory — guest physical RAM. When numa_nodes > 1, one memory
     // node per NUMA node with disjoint address ranges and numa-node-id.
-    write_memory(&mut fdt, topo, memory_mb, shm_size)?;
+    write_memory(&mut fdt, topo, memory_mb, numa_layout)?;
 
     // /reserved-memory — SHM region marked reserved (no kernel
     // allocation) but kept in memblock.memory so /dev/mem maps it
@@ -181,16 +183,15 @@ fn write_chosen(
     Ok(())
 }
 
-fn write_memory(fdt: &mut FdtWriter, topo: &Topology, memory_mb: u32, shm_size: u64) -> Result<()> {
+fn write_memory(
+    fdt: &mut FdtWriter,
+    topo: &Topology,
+    memory_mb: u32,
+    numa_layout: &NumaMemoryLayout,
+) -> Result<()> {
     let mem_size = (memory_mb as u64) << 20;
 
     if topo.numa_nodes <= 1 {
-        // Single-NUMA: one memory node covering full DRAM including SHM.
-        // arm64 phys_mem_access_prot() maps addresses outside
-        // memblock.memory as Device-nGnRnE, which faults on paired
-        // loads (memcpy STP). Including SHM here puts its pages in
-        // memblock.memory so /dev/mem maps them cacheable.
-        // /reserved-memory prevents kernel allocation from the SHM region.
         let name = format!("memory@{DRAM_START:x}");
         let mem = fdt.begin_node(&name).context("begin memory")?;
         fdt.property_string("device_type", "memory")
@@ -207,37 +208,14 @@ fn write_memory(fdt: &mut FdtWriter, topo: &Topology, memory_mb: u32, shm_size: 
         .context("memory reg")?;
         fdt.end_node(mem).context("end memory")?;
     } else {
-        // Multi-NUMA: one memory node per NUMA node, each with
-        // numa-node-id. When explicit per-node memory is configured,
-        // use it; otherwise split evenly. The last node extends to
-        // cover the SHM region. SHM must be in memblock.memory so
-        // arm64 phys_mem_access_prot() maps it cacheable via
-        // /dev/mem. /reserved-memory prevents kernel allocation
-        // from SHM while keeping it in the linear map.
-        let usable_bytes = mem_size - shm_size;
-        let n = topo.numa_nodes as u64;
-        let uniform_per_node = (usable_bytes / n) & !0xFFF; // page-align down (4 KiB)
-
-        let mut base_offset: u64 = 0;
-        for node in 0..topo.numa_nodes {
-            let base = DRAM_START + base_offset;
-            let length = match topo.node_memory_mb(node) {
-                Some(mb) => {
-                    let node_bytes = (mb as u64) << 20;
-                    if node == topo.numa_nodes - 1 {
-                        node_bytes + shm_size
-                    } else {
-                        node_bytes
-                    }
-                }
-                None => {
-                    if node == topo.numa_nodes - 1 {
-                        mem_size - base_offset
-                    } else {
-                        uniform_per_node
-                    }
-                }
-            };
+        // Multi-NUMA: one memory node per NumaMemoryLayout region.
+        // The layout covers the full guest memory including SHM.
+        // /reserved-memory prevents kernel allocation from SHM
+        // while keeping it in memblock.memory for cacheable mapping.
+        let regions = numa_layout.regions();
+        for region in regions {
+            let base = region.gpa_start;
+            let length = region.size;
             let name = format!("memory@{base:x}");
             let mem = fdt.begin_node(&name).context("begin memory")?;
             fdt.property_string("device_type", "memory")
@@ -252,10 +230,9 @@ fn write_memory(fdt: &mut FdtWriter, topo: &Topology, memory_mb: u32, shm_size: 
                 ],
             )
             .context("memory reg")?;
-            fdt.property_u32("numa-node-id", node)
+            fdt.property_u32("numa-node-id", region.node_id)
                 .context("memory numa-node-id")?;
             fdt.end_node(mem).context("end memory")?;
-            base_offset += length;
         }
     }
 
@@ -566,11 +543,41 @@ mod tests {
         (0..count).map(|i| (1u64 << 31) | i as u64).collect()
     }
 
+    fn test_layout(topo: &Topology, mb: u32) -> NumaMemoryLayout {
+        NumaMemoryLayout::compute(topo, mb, DRAM_START).unwrap()
+    }
+
+    fn test_fdt(
+        topo: &Topology,
+        mpidrs: &[u64],
+        memory_mb: u32,
+        cmdline: &str,
+        initrd_addr: Option<u64>,
+        initrd_size: Option<u32>,
+        shm_size: u64,
+        hw_cache_level: u32,
+        guest_l1_unified: bool,
+    ) -> Result<Vec<u8>> {
+        let layout = test_layout(topo, memory_mb);
+        create_fdt(
+            topo,
+            mpidrs,
+            memory_mb,
+            cmdline,
+            initrd_addr,
+            initrd_size,
+            shm_size,
+            hw_cache_level,
+            guest_l1_unified,
+            &layout,
+        )
+    }
+
     #[test]
     fn create_fdt_minimal() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             256,
@@ -590,7 +597,7 @@ mod tests {
     fn create_fdt_with_initrd() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             256,
@@ -608,7 +615,7 @@ mod tests {
     fn create_fdt_with_shm() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             256,
@@ -633,7 +640,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             1024,
@@ -658,7 +665,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             512,
@@ -683,7 +690,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             512,
@@ -708,7 +715,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             1024,
@@ -856,7 +863,7 @@ mod tests {
     fn parse_dtb_props_paths_no_leading_slash() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             256,
@@ -920,7 +927,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             512,
@@ -945,7 +952,7 @@ mod tests {
             distances: None,
         };
         let mpidrs_smt = fake_mpidrs(topo_smt.total_cpus());
-        let dtb_smt = create_fdt(
+        let dtb_smt = test_fdt(
             &topo_smt,
             &mpidrs_smt,
             512,
@@ -971,7 +978,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             256,
@@ -1009,46 +1016,40 @@ mod tests {
         topo: &Topology,
         props: &[(String, String, Vec<u8>)],
         memory_mb: u32,
-        shm_size: u64,
+        _shm_size: u64,
     ) {
         let mem_size = (memory_mb as u64) << 20;
-        let usable_bytes = mem_size - shm_size;
-        let n = topo.numa_nodes as u64;
-        let per_node = (usable_bytes / n) & !0xFFF;
+        let layout = NumaMemoryLayout::compute(topo, memory_mb, DRAM_START).unwrap();
+        let regions = layout.regions();
 
         let mut prev_end: Option<u64> = None;
         let mut total_size: u64 = 0;
 
-        for node in 0..topo.numa_nodes {
-            let base = DRAM_START + node as u64 * per_node;
+        for (i, region) in regions.iter().enumerate() {
+            let base = region.gpa_start;
             let node_name = format!("memory@{base:x}");
 
-            // Verify numa-node-id.
             let numa_id = prop_u32(props, &node_name, "numa-node-id")
-                .unwrap_or_else(|| panic!("memory node {node}: missing numa-node-id"));
-            assert_eq!(numa_id, node, "memory node {node}: wrong numa-node-id");
+                .unwrap_or_else(|| panic!("memory region {i}: missing numa-node-id"));
+            assert_eq!(
+                numa_id, region.node_id,
+                "memory region {i}: wrong numa-node-id"
+            );
 
-            // Verify reg property: [base_hi, base_lo, size_hi, size_lo].
             let reg = prop_u32_array(props, &node_name, "reg")
-                .unwrap_or_else(|| panic!("memory node {node}: missing reg"));
-            assert_eq!(reg.len(), 4, "memory node {node}: reg must have 4 cells");
+                .unwrap_or_else(|| panic!("memory region {i}: missing reg"));
+            assert_eq!(reg.len(), 4, "memory region {i}: reg must have 4 cells");
 
             let reg_base = ((reg[0] as u64) << 32) | reg[1] as u64;
-            assert_eq!(reg_base, base, "memory node {node}: wrong base address");
+            assert_eq!(reg_base, base, "memory region {i}: wrong base address");
 
             let reg_size = ((reg[2] as u64) << 32) | reg[3] as u64;
-            let expected_size = if node == topo.numa_nodes - 1 {
-                mem_size - node as u64 * per_node
-            } else {
-                per_node
-            };
-            assert_eq!(reg_size, expected_size, "memory node {node}: wrong size");
+            assert_eq!(reg_size, region.size, "memory region {i}: wrong size");
 
-            // F4: contiguity — node N+1 base == node N base + node N size.
             if let Some(prev) = prev_end {
                 assert_eq!(
                     reg_base, prev,
-                    "memory node {node}: not contiguous (base {reg_base:#x} != prev end {prev:#x})"
+                    "memory region {i}: not contiguous (base {reg_base:#x} != prev end {prev:#x})"
                 );
             }
             prev_end = Some(reg_base + reg_size);
@@ -1056,7 +1057,6 @@ mod tests {
             total_size += reg_size;
         }
 
-        // F5: total memory across all nodes == mem_size.
         assert_eq!(
             total_size, mem_size,
             "total memory {total_size:#x} != mem_size {mem_size:#x}"
@@ -1077,7 +1077,7 @@ mod tests {
 
         // No-SHM case.
         let memory_mb: u32 = 512;
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             memory_mb,
@@ -1093,7 +1093,7 @@ mod tests {
 
         // F3: with-SHM case — last node absorbs SHM region.
         let shm_size: u64 = 0x10_0000;
-        let dtb_shm = create_fdt(
+        let dtb_shm = test_fdt(
             &topo,
             &mpidrs,
             memory_mb,
@@ -1119,7 +1119,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             1024,
@@ -1175,7 +1175,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             512,
@@ -1260,7 +1260,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = create_fdt(
+        let dtb = test_fdt(
             &topo,
             &mpidrs,
             256,

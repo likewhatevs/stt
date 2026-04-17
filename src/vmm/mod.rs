@@ -60,86 +60,6 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use crate::monitor;
 
-// ---------------------------------------------------------------------------
-// Shared hugepage memory allocation
-// ---------------------------------------------------------------------------
-
-/// Allocate guest memory backed by 2MB hugepages at the given base address.
-///
-/// Uses MmapRegionBuilder with MAP_HUGETLB to request hugepage-backed
-/// anonymous memory. Falls back to regular pages if hugepages fail.
-pub(crate) fn allocate_hugepage_memory(size: usize, base: GuestAddress) -> Result<GuestMemoryMmap> {
-    use vm_memory::mmap::{GuestRegionMmap, MmapRegionBuilder};
-
-    let needed_pages = size / (2 << 20);
-    let free_pages = host_topology::hugepages_free();
-    if free_pages < needed_pages as u64 {
-        eprintln!(
-            "performance_mode: WARNING: not enough hugepages \
-             (needed {} MB = {} pages, available {} pages). \
-             Using regular pages.",
-            size >> 20,
-            needed_pages,
-            free_pages,
-        );
-        return GuestMemoryMmap::<()>::from_ranges(&[(base, size)])
-            .context("allocate guest memory (hugepage fallback)");
-    }
-
-    let flags = libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_HUGETLB | libc::MAP_HUGE_2MB;
-
-    let region = MmapRegionBuilder::new(size)
-        .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
-        .with_mmap_flags(flags)
-        .with_hugetlbfs(true)
-        .build();
-
-    match region {
-        Ok(r) => {
-            // Pre-fault hugepages to detect allocation failures now rather
-            // than as cryptic guest-side "uncompression error" page faults.
-            let ret = unsafe {
-                libc::madvise(
-                    r.as_ptr() as *mut libc::c_void,
-                    r.size(),
-                    libc::MADV_POPULATE_WRITE,
-                )
-            };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                eprintln!(
-                    "performance_mode: WARNING: hugepage pre-fault failed ({err}), \
-                     not enough hugepages (needed: {} MB, available: {} pages). \
-                     Using regular pages.",
-                    size >> 20,
-                    free_pages,
-                );
-                return GuestMemoryMmap::<()>::from_ranges(&[(base, size)])
-                    .context("allocate guest memory (hugepage fallback)");
-            }
-            eprintln!(
-                "performance_mode: allocated {} MB with 2MB hugepages",
-                size >> 20
-            );
-            let guest_region = GuestRegionMmap::new(r, base)
-                .ok_or_else(|| anyhow::anyhow!("hugepage region overflow"))?;
-            GuestMemoryMmap::from_regions(vec![guest_region])
-                .context("create guest memory from hugepage region")
-        }
-        Err(e) => {
-            eprintln!(
-                "performance_mode: WARNING: hugepage allocation failed ({e}), \
-                 not enough hugepages (needed: {} MB, available: {} pages). \
-                 Using regular pages.",
-                size >> 20,
-                free_pages,
-            );
-            GuestMemoryMmap::<()>::from_ranges(&[(base, size)])
-                .context("allocate guest memory (hugepage fallback)")
-        }
-    }
-}
-
 /// Create a KVM VM with EINTR retry (up to 5 attempts, exponential backoff).
 ///
 /// KVM_CREATE_VM can return EINTR when a signal arrives mid-ioctl.
@@ -154,71 +74,6 @@ pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::
                 std::thread::sleep(std::time::Duration::from_micros(1 << attempts));
             }
             Err(e) => break Err(e).context("create VM"),
-        }
-    }
-}
-
-/// Allocate guest memory (hugepage or regular) and register it with KVM.
-///
-/// Shared between aarch64 and x86_64 `allocate_and_register_memory`
-/// implementations. `base` is the guest physical address where memory
-/// starts (DRAM_START on aarch64, 0 on x86_64).
-pub(crate) fn allocate_and_register_guest_memory(
-    vm_fd: &kvm_ioctls::VmFd,
-    memory_mb: u32,
-    base: GuestAddress,
-    use_hugepages: bool,
-    performance_mode: bool,
-) -> Result<GuestMemoryMmap> {
-    let mem_size = (memory_mb as u64) << 20;
-    let use_hugepages = use_hugepages
-        || (performance_mode
-            && host_topology::hugepages_free() >= host_topology::hugepages_needed(memory_mb));
-    let guest_mem = if use_hugepages {
-        allocate_hugepage_memory(mem_size as usize, base)?
-    } else {
-        GuestMemoryMmap::<()>::from_ranges(&[(base, mem_size as usize)])
-            .context("allocate guest memory")?
-    };
-
-    let host_addr = guest_mem
-        .get_host_address(base)
-        .context("get host address for guest memory")? as u64;
-    let mem_region = kvm_bindings::kvm_userspace_memory_region {
-        slot: 0,
-        guest_phys_addr: base.0,
-        memory_size: mem_size,
-        userspace_addr: host_addr,
-        flags: 0,
-    };
-    unsafe {
-        vm_fd
-            .set_user_memory_region(mem_region)
-            .context("set user memory region")?;
-    }
-
-    Ok(guest_mem)
-}
-
-/// Allocate guest memory for `new_inner`. When `memory_mb` is `None`
-/// (deferred mode), returns a 1-page placeholder not registered with
-/// KVM. When `Some`, allocates and registers the full memory region.
-pub(crate) fn allocate_initial_guest_memory(
-    vm_fd: &kvm_ioctls::VmFd,
-    memory_mb: Option<u32>,
-    base: GuestAddress,
-    use_hugepages: bool,
-    performance_mode: bool,
-) -> Result<GuestMemoryMmap> {
-    match memory_mb {
-        Some(mb) => {
-            allocate_and_register_guest_memory(vm_fd, mb, base, use_hugepages, performance_mode)
-        }
-        None => {
-            // Placeholder: 1 page. Not registered with KVM — no guest
-            // code runs until allocate_and_register_memory() is called.
-            GuestMemoryMmap::<()>::from_ranges(&[(base, 4096)])
-                .context("allocate placeholder guest memory")
         }
     }
 }
@@ -1761,17 +1616,11 @@ impl KtstrVm {
 
         // When memory is already allocated (non-deferred path), do mbind
         // and load kernel now. Deferred path does this in setup_memory.
-        let kernel_result = if let Some(mb) = self.memory_mb {
-            // mbind guest memory to NUMA node(s) of pinned vCPUs.
-            // With hugepages, pages may already be faulted from the
-            // allocating CPU's node. mbind is best-effort NUMA placement
-            // for pages not yet faulted; already-resident pages are not moved.
-            if self.performance_mode
-                && !self.mbind_nodes.is_empty()
-                && let Ok(host_addr) = vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE))
-            {
-                let mem_size = (mb as u64) << 20;
-                host_topology::mbind_to_nodes(host_addr, mem_size as usize, &self.mbind_nodes);
+        let kernel_result = if self.memory_mb.is_some() {
+            if self.performance_mode && !self.mbind_nodes.is_empty() {
+                let layout = vm.numa_layout.as_ref().unwrap();
+                let host_nodes = self.build_host_node_map(layout);
+                layout.mbind_regions(&vm.guest_mem, &host_nodes);
             }
 
             let t0 = Instant::now();
@@ -2066,6 +1915,26 @@ impl KtstrVm {
     }
 
     /// Resolve effective memory in MB from the actual guest memory allocation.
+    fn build_host_node_map(
+        &self,
+        numa_layout: &crate::vmm::numa_mem::NumaMemoryLayout,
+    ) -> Vec<Vec<usize>> {
+        let max_node = numa_layout
+            .regions()
+            .iter()
+            .map(|r| r.node_id)
+            .max()
+            .unwrap_or(0) as usize;
+        let mut map = vec![vec![]; max_node + 1];
+        for r in numa_layout.regions() {
+            let idx = r.node_id as usize;
+            if !map[idx].contains(&self.mbind_nodes[0]) {
+                map[idx] = self.mbind_nodes.clone();
+            }
+        }
+        map
+    }
+
     fn effective_memory_mb(&self, guest_mem: &GuestMemoryMmap) -> u32 {
         use vm_memory::GuestMemoryRegion;
         match self.memory_mb {
@@ -2228,7 +2097,7 @@ impl KtstrVm {
             // Deferred memory path: join initramfs first to learn its size,
             // then allocate memory, load kernel, and load initramfs — all in
             // one shot with no estimation.
-            let (initrd_addr, initrd_size, memory_mb) = match initramfs_handle {
+            let (initrd_addr, initrd_size, _memory_mb) = match initramfs_handle {
                 Some(handle) => self.join_compute_memory_and_load(vm, handle, INITRD_ADDR)?,
                 None => {
                     // No initramfs — allocate minimum memory.
@@ -2239,13 +2108,10 @@ impl KtstrVm {
                 }
             };
 
-            // mbind after allocation.
-            if self.performance_mode
-                && !self.mbind_nodes.is_empty()
-                && let Ok(host_addr) = vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE))
-            {
-                let mem_size = (memory_mb as u64) << 20;
-                host_topology::mbind_to_nodes(host_addr, mem_size as usize, &self.mbind_nodes);
+            if self.performance_mode && !self.mbind_nodes.is_empty() {
+                let layout = vm.numa_layout.as_ref().unwrap();
+                let host_nodes = self.build_host_node_map(layout);
+                layout.mbind_regions(&vm.guest_mem, &host_nodes);
             }
 
             // Load kernel into the freshly allocated memory.
@@ -2298,6 +2164,11 @@ impl KtstrVm {
                 shm_base, self.shm_size
             ));
         }
+        if self.topology.has_memory_only_nodes() {
+            cmdline.push_str(" numa_balancing=enable");
+        } else {
+            cmdline.push_str(" numa_balancing=0");
+        }
         if !self.cmdline_extra.is_empty() {
             cmdline.push(' ');
             cmdline.push_str(&self.cmdline_extra);
@@ -2325,11 +2196,13 @@ impl KtstrVm {
         }
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "shm_ring_init");
 
-        // Write topology tables (MP table + ACPI MADT).
         let t0 = Instant::now();
         mptable::setup_mptable(&vm.guest_mem, &self.topology)?;
-        let _acpi_layout =
-            acpi::setup_acpi(&vm.guest_mem, &self.topology, memory_mb, self.shm_size)?;
+        let _acpi_layout = acpi::setup_acpi(
+            &vm.guest_mem,
+            &self.topology,
+            vm.numa_layout.as_ref().unwrap(),
+        )?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
 
         Ok(kernel_result)
@@ -3372,6 +3245,11 @@ impl KtstrVm {
                 shm_base, self.shm_size
             ));
         }
+        if self.topology.has_memory_only_nodes() {
+            cmdline.push_str(" numa_balancing=enable");
+        } else {
+            cmdline.push_str(" numa_balancing=0");
+        }
         if !self.cmdline_extra.is_empty() {
             cmdline.push(' ');
             cmdline.push_str(&self.cmdline_extra);
@@ -3395,6 +3273,7 @@ impl KtstrVm {
             self.shm_size,
             hw_cache_level,
             guest_l1_unified,
+            vm.numa_layout.as_ref().unwrap(),
         )
         .context("create FDT")?;
         vm.guest_mem
