@@ -1413,7 +1413,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "6.14.2-tarball-x86_64", &meta);
-        let row = cli::format_entry_row(&entry, "abc123");
+        let row = cli::format_entry_row(&entry, "abc123", &[]);
         assert!(row.contains("6.14.2-tarball-x86_64"));
         assert!(row.contains("6.14.2"));
         assert!(row.contains("tarball"));
@@ -1427,7 +1427,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("old_hash".to_string()));
         let entry = store_test_entry(&cache, "stale-key", &meta);
-        let row = cli::format_entry_row(&entry, "new_hash");
+        let row = cli::format_entry_row(&entry, "new_hash", &[]);
         assert!(
             row.contains("stale kconfig"),
             "should show stale kconfig marker"
@@ -1440,7 +1440,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "match-key", &meta);
-        let row = cli::format_entry_row(&entry, "same");
+        let row = cli::format_entry_row(&entry, "same", &[]);
         assert!(
             !row.contains("stale kconfig"),
             "should not show stale marker when hashes match"
@@ -1453,7 +1453,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "no-hash-key", &meta);
-        let row = cli::format_entry_row(&entry, "anything");
+        let row = cli::format_entry_row(&entry, "anything", &[]);
         assert!(
             !row.contains("stale kconfig"),
             "should not show stale marker when entry has no hash"
@@ -1471,7 +1471,7 @@ mod tests {
             "2026-04-12T10:00:00Z".to_string(),
         );
         let entry = store_test_entry(&cache, "local-key", &meta);
-        let row = cli::format_entry_row(&entry, "hash");
+        let row = cli::format_entry_row(&entry, "hash", &[]);
         assert!(row.contains("-"), "missing version should show dash");
     }
 
@@ -1480,7 +1480,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let entry = store_corrupt_entry(&cache, "corrupt-key");
-        let row = cli::format_entry_row(&entry, "hash");
+        let row = cli::format_entry_row(&entry, "hash", &[]);
         assert!(row.contains("corrupt-key"));
         assert!(row.contains("corrupt metadata"));
     }

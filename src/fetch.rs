@@ -181,8 +181,8 @@ fn patch_level(version: &str) -> Option<u32> {
     }
 }
 
-/// Fetch releases.json from kernel.org and return stable releases.
-fn fetch_releases() -> Result<Vec<(String, String)>, String> {
+/// Fetch releases.json from kernel.org and return (moniker, version) pairs.
+pub(crate) fn fetch_releases() -> Result<Vec<(String, String)>, String> {
     let url = "https://www.kernel.org/releases.json";
     let response = reqwest::blocking::get(url).map_err(|e| format!("fetch {url}: {e}"))?;
     if !response.status().is_success() {

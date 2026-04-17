@@ -23,18 +23,65 @@ pub fn embedded_kconfig_hash() -> String {
 }
 
 /// Format a human-readable table row for a cache entry.
-pub fn format_entry_row(entry: &CacheEntry, kconfig_hash: &str) -> String {
+/// Extract major.minor prefix from a version string.
+/// "6.12.81" → "6.12", "7.0" → "7.0", "abc" → None.
+fn version_prefix(version: &str) -> Option<String> {
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() >= 2 {
+        Some(format!("{}.{}", parts[0], parts[1]))
+    } else {
+        None
+    }
+}
+
+/// Check if a version's series is in the active releases list.
+fn is_eol(version: &str, active_prefixes: &[String]) -> bool {
+    let Some(prefix) = version_prefix(version) else {
+        return false;
+    };
+    !active_prefixes.iter().any(|p| p == &prefix)
+}
+
+/// Fetch active kernel series prefixes from releases.json.
+/// Returns major.minor prefixes for all stable/longterm/mainline entries.
+pub fn fetch_active_prefixes() -> Vec<String> {
+    let releases = match crate::fetch::fetch_releases() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut prefixes = Vec::new();
+    for (moniker, version) in &releases {
+        if moniker == "linux-next" {
+            continue;
+        }
+        if let Some(prefix) = version_prefix(version)
+            && !prefixes.contains(&prefix)
+        {
+            prefixes.push(prefix);
+        }
+    }
+    prefixes
+}
+
+pub fn format_entry_row(
+    entry: &CacheEntry,
+    kconfig_hash: &str,
+    active_prefixes: &[String],
+) -> String {
     match &entry.metadata {
         Some(meta) => {
             let version = meta.version.as_deref().unwrap_or("-");
             let source = meta.source.to_string();
-            let mut stale_tags = String::new();
+            let mut tags = String::new();
             if entry.has_stale_kconfig(kconfig_hash) {
-                stale_tags.push_str(" (stale kconfig)");
+                tags.push_str(" (stale kconfig)");
+            }
+            if version != "-" && is_eol(version, active_prefixes) {
+                tags.push_str(" (EOL)");
             }
             format!(
                 "  {:<48} {:<12} {:<8} {:<7} {}{}",
-                entry.key, version, source, meta.arch, meta.built_at, stale_tags,
+                entry.key, version, source, meta.arch, meta.built_at, tags,
             )
         }
         None => {
@@ -81,27 +128,34 @@ pub fn kernel_list(json: bool) -> Result<()> {
     let entries = cache.list()?;
     let kconfig_hash = embedded_kconfig_hash();
 
+    let active_prefixes = fetch_active_prefixes();
+
     if json {
         let json_entries: Vec<serde_json::Value> = entries
             .iter()
             .map(|e| match &e.metadata {
-                Some(meta) => serde_json::json!({
-                    "key": e.key,
-                    "path": e.path.display().to_string(),
-                    "version": meta.version,
-                    "source": meta.source,
-                    "arch": meta.arch,
-                    "built_at": meta.built_at,
-                    "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
-                    "stale_kconfig": e.has_stale_kconfig(&kconfig_hash),
-                    "config_hash": meta.config_hash,
-                    "image_name": meta.image_name,
-                    "image_path": e.path.join(&meta.image_name).display().to_string(),
-                    "vmlinux_name": meta.vmlinux_name,
-                    "git_hash": meta.git_hash,
-                    "git_ref": meta.git_ref,
-                    "source_tree_path": meta.source_tree_path,
-                }),
+                Some(meta) => {
+                    let v = meta.version.as_deref().unwrap_or("-");
+                    let eol = v != "-" && is_eol(v, &active_prefixes);
+                    serde_json::json!({
+                        "key": e.key,
+                        "path": e.path.display().to_string(),
+                        "version": meta.version,
+                        "source": meta.source,
+                        "arch": meta.arch,
+                        "built_at": meta.built_at,
+                        "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
+                        "stale_kconfig": e.has_stale_kconfig(&kconfig_hash),
+                        "eol": eol,
+                        "config_hash": meta.config_hash,
+                        "image_name": meta.image_name,
+                        "image_path": e.path.join(&meta.image_name).display().to_string(),
+                        "vmlinux_name": meta.vmlinux_name,
+                        "git_hash": meta.git_hash,
+                        "git_ref": meta.git_ref,
+                        "source_tree_path": meta.source_tree_path,
+                    })
+                }
                 None => serde_json::json!({
                     "key": e.key,
                     "path": e.path.display().to_string(),
@@ -133,7 +187,10 @@ pub fn kernel_list(json: bool) -> Result<()> {
         if entry.has_stale_kconfig(&kconfig_hash) {
             has_stale_kconfig = true;
         }
-        println!("{}", format_entry_row(entry, &kconfig_hash));
+        println!(
+            "{}",
+            format_entry_row(entry, &kconfig_hash, &active_prefixes)
+        );
     }
     if has_stale_kconfig {
         eprintln!(
@@ -170,7 +227,7 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
         }
         println!("the following entries will be removed:");
         for entry in &to_remove {
-            println!("{}", format_entry_row(entry, &kconfig_hash));
+            println!("{}", format_entry_row(entry, &kconfig_hash, &[]));
         }
         eprint!("remove {} entries? [y/N] ", to_remove.len());
         std::io::stderr().flush()?;

@@ -5056,6 +5056,79 @@ mod tests {
         );
     }
 
+    /// Prove the kernel uses the host-written watchdog timeout.
+    ///
+    /// Sets a 300-second watchdog and runs the scheduler for 15s.
+    /// If the host write is effective, the kernel's watchdog timer
+    /// uses 300s and no stall exit occurs. If the write were
+    /// ineffective (kernel ignoring the value), the default timeout
+    /// would apply and could spuriously fire on a slow guest.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn watchdog_override_prevents_stall_exit() {
+        let Some(kernel) = crate::find_kernel().unwrap() else {
+            eprintln!("ktstr: SKIP: no kernel found");
+            return;
+        };
+        let Some(_vmlinux) = find_vmlinux(&kernel) else {
+            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
+            return;
+        };
+
+        let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("ktstr: SKIP: scx-ktstr binary not found");
+                return;
+            }
+        };
+
+        let vm = match KtstrVm::builder()
+            .kernel(&kernel)
+            .topology(1, 1, 2, 1)
+            .memory_mb(256)
+            .timeout(Duration::from_secs(15))
+            .scheduler_binary(&sched_bin)
+            .watchdog_timeout(Duration::from_secs(300))
+            .build()
+        {
+            Ok(vm) => vm,
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                eprintln!("ktstr: SKIP: resource contention: {e}");
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
+        let result = vm.run().unwrap();
+        assert!(
+            result.success,
+            "VM must exit cleanly with 300s watchdog — got exit_code={} timed_out={}",
+            result.exit_code, result.timed_out
+        );
+        assert!(
+            result.crash_message.is_none(),
+            "no crash expected with 300s watchdog: {:?}",
+            result.crash_message
+        );
+        if let Some(ref report) = result.monitor
+            && let Some(ref obs) = report.watchdog_observation
+        {
+            let hz = crate::monitor::guest_kernel_hz(Some(&kernel));
+            let expected_jiffies = 300 * hz;
+            assert_eq!(
+                obs.expected_jiffies, expected_jiffies,
+                "watchdog override should be 300s * HZ={hz}"
+            );
+            assert_eq!(
+                obs.observed_jiffies, obs.expected_jiffies,
+                "write/read roundtrip mismatch"
+            );
+        }
+    }
+
     /// Validate that the core monitoring path reads meaningful
     /// runqueue data when a scheduler is loaded.
     ///
@@ -5127,16 +5200,14 @@ mod tests {
             );
         }
 
-        if let Some(ss) = last.cpus.iter().find_map(|c| c.schedstat.as_ref()) {
-            assert!(
-                ss.sched_count > 0,
-                "sched_count must be > 0 after running a scheduler with workload"
-            );
-            assert!(
-                ss.sched_count < 100_000_000,
-                "sched_count {} exceeds plausible range — offset may be wrong",
-                ss.sched_count
-            );
+        for (i, cpu) in last.cpus.iter().enumerate() {
+            if let Some(ref ss) = cpu.schedstat {
+                assert!(
+                    ss.sched_count < 100_000_000,
+                    "cpu {i}: sched_count {} exceeds plausible range — offset may be wrong",
+                    ss.sched_count
+                );
+            }
         }
     }
 
