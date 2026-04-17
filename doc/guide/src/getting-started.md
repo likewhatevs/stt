@@ -110,13 +110,10 @@ for gauntlet expansion and budget-driven test selection.
 
 ## Kernel discovery
 
-Tests require a bootable Linux kernel. Discovery happens in two
-layers. The test harness first calls `resolve_test_kernel()`, which
-honours `KTSTR_TEST_KERNEL` (step 1); on miss, it delegates to
-`find_kernel()`, which runs the remaining steps.
+Tests require a bootable Linux kernel. The test harness checks these
+locations in order:
 
-1. `KTSTR_TEST_KERNEL` environment variable (direct image path). Used
-   by `resolve_test_kernel()` only.
+1. `KTSTR_TEST_KERNEL` environment variable (direct image path).
 2. `KTSTR_KERNEL` environment variable, parsed as one of three forms:
    - Path: search that directory for `arch/<arch>/boot/<image>`
    - Version (e.g. `6.14.2`): look up the version in XDG cache
