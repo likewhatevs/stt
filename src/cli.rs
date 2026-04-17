@@ -866,9 +866,15 @@ pub fn resolve_cached_kernel(
     use crate::kernel_path::KernelId;
     match id {
         KernelId::Version(ver) => {
+            // Major.minor prefix (e.g. "6.14") → resolve to latest patch.
+            let resolved = if ver.matches('.').count() < 2 && !ver.contains("-rc") {
+                crate::fetch::fetch_version_for_prefix(ver).map_err(|e| anyhow::anyhow!("{e}"))?
+            } else {
+                ver.clone()
+            };
             let cache = crate::cache::CacheDir::new()?;
             let (arch, _) = crate::fetch::arch_info();
-            let cache_key = format!("{ver}-tarball-{arch}-kc{}", crate::cache_key_suffix());
+            let cache_key = format!("{resolved}-tarball-{arch}-kc{}", crate::cache_key_suffix());
             if let Some(entry) = cache.lookup(&cache_key) {
                 entry.metadata.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("cached entry {cache_key} has corrupt metadata")
@@ -883,10 +889,8 @@ pub fn resolve_cached_kernel(
                 })?;
                 return Ok(entry.path);
             }
-            bail!(
-                "kernel version {ver} not found in cache. \
-                 Run `{cli_label} kernel build {ver}` first."
-            )
+            // Cache miss: download and build the requested version.
+            download_and_cache_version(&resolved, cli_label)
         }
         KernelId::CacheKey(key) => {
             let cache = crate::cache::CacheDir::new()?;
@@ -984,9 +988,8 @@ pub fn resolve_kernel_image(
 /// Auto-download, build, and cache the latest stable kernel.
 ///
 /// Called when no --kernel is specified and no kernel is found via
-/// cache or filesystem. Downloads the latest stable tarball from
-/// kernel.org and delegates to [`kernel_build_pipeline`] for
-/// configure, build, validate, and cache. `cli_label` prefixes
+/// cache or filesystem. Resolves the latest stable version and
+/// delegates to [`download_and_cache_version`]. `cli_label` prefixes
 /// status output (e.g. `"ktstr"`, `"cargo ktstr"`).
 pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
     status(&format!(
@@ -997,32 +1000,41 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
     let ver = crate::fetch::fetch_latest_stable_version().map_err(|e| anyhow::anyhow!("{e}"))?;
     sp.finish(format!("Latest stable: {ver}"));
 
-    let (arch, image_name) = crate::fetch::arch_info();
-    let cache_key = format!("{ver}-tarball-{arch}-kc{}", crate::cache_key_suffix());
+    let cache_dir = download_and_cache_version(&ver, cli_label)?;
+    let (_, image_name) = crate::fetch::arch_info();
+    Ok(cache_dir.join(image_name))
+}
+
+/// Download a specific kernel version, build it, and store in the
+/// cache. Returns the cache entry directory path (NOT the image path).
+///
+/// Checks the cache one more time with the resolved version to cover
+/// races and prefix-resolved entries. Delegates to
+/// [`kernel_build_pipeline`] for configure/build/validate/cache.
+fn download_and_cache_version(version: &str, cli_label: &str) -> Result<std::path::PathBuf> {
+    let (arch, _) = crate::fetch::arch_info();
+    let cache_key = format!("{version}-tarball-{arch}-kc{}", crate::cache_key_suffix());
 
     // Check cache one more time with the resolved version.
     if let Ok(cache) = crate::cache::CacheDir::new()
         && let Some(entry) = cache.lookup(&cache_key)
-        && let Some(ref meta) = entry.metadata
+        && entry.metadata.is_some()
     {
-        let image = entry.path.join(&meta.image_name);
-        if image.exists() {
-            return Ok(image);
-        }
+        return Ok(entry.path);
     }
 
     let tmp_dir = tempfile::TempDir::new()?;
 
     let sp = Spinner::start("Downloading kernel...");
-    let acquired =
-        crate::fetch::download_tarball(&ver, tmp_dir.path()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let acquired = crate::fetch::download_tarball(version, tmp_dir.path())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     sp.finish("Downloaded");
 
     let cache = crate::cache::CacheDir::new()?;
     let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false)?;
 
     match result.entry {
-        Some(entry) => Ok(entry.path.join(image_name)),
+        Some(entry) => Ok(entry.path),
         None => bail!(
             "kernel built but cache store failed — cannot return image from temporary directory"
         ),
