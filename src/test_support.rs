@@ -81,6 +81,13 @@ pub struct SidecarResult {
     /// unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kvm_stats: Option<crate::vmm::KvmStatsTotals>,
+    /// Effective sysctls active during this test run, recorded as raw
+    /// `sysctl.key=value` cmdline strings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sysctls: Vec<String>,
+    /// Effective kernel command-line args active during this test run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kargs: Vec<String>,
 }
 
 /// Scan a directory for ktstr sidecar JSON files. Recurses one level
@@ -3986,6 +3993,18 @@ fn write_sidecar(
         SchedulerSpec::Path(p) => p,
         SchedulerSpec::KernelBuiltin { .. } => "kernel",
     };
+    let sysctls: Vec<String> = entry
+        .scheduler
+        .sysctls
+        .iter()
+        .map(|s| format!("sysctl.{}={}", s.key, s.value))
+        .collect();
+    let kargs: Vec<String> = entry
+        .scheduler
+        .kargs
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
         topology: topo,
@@ -3997,6 +4016,8 @@ fn write_sidecar(
         work_type: work_type.to_string(),
         verifier_stats: vm_result.verifier_stats.clone(),
         kvm_stats: vm_result.kvm_stats.clone(),
+        sysctls,
+        kargs,
     };
     let path = dir.join(format!("{}.ktstr.json", entry.name));
     if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
@@ -4934,6 +4955,8 @@ mod tests {
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
             kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
         };
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -4970,6 +4993,8 @@ mod tests {
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
             kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -5265,6 +5290,8 @@ mod tests {
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
             kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(tmp.join("test_x.ktstr.json"), &json).unwrap();
@@ -5292,6 +5319,8 @@ mod tests {
             work_type: "CpuSpin".to_string(),
             verifier_stats: vec![],
             kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(sub.join("nested_test.ktstr.json"), &json).unwrap();
@@ -5336,6 +5365,8 @@ mod tests {
             work_type: "Bursty".to_string(),
             verifier_stats: vec![],
             kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -6161,6 +6192,8 @@ mod tests {
             work_type: "CpuSpin".to_string(),
             verifier_stats: vstats,
             kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
         }
     }
 
