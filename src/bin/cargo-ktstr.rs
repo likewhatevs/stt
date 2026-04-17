@@ -10,15 +10,16 @@ use ktstr::fetch;
 use ktstr::remote_cache;
 
 /// Help text shared by test/coverage --kernel (verifier uses its
-/// own due to file-path acceptance). Raw image files are rejected
-/// here; version and cache-key forms require the entry to already
-/// be cached (run `cargo ktstr kernel build` first). Shell uses
-/// its own help because it accepts image files and has a different
-/// no-match error path.
+/// own due to file-path acceptance). Raw image files are not
+/// supported here; version and cache-key forms require the entry
+/// to already be cached (run `cargo ktstr kernel build` first).
+/// Shell uses its own help because it accepts image files and has
+/// a different no-match error path.
 const KERNEL_IDENTIFIER_HELP: &str = "Kernel identifier: a source directory path (e.g. `../linux`), a version \
      (`6.14.2`), or a cache key (see `cargo ktstr kernel list`). Raw \
-     image files are rejected here; version/cache-key forms require \
-     the entry to already be cached (run `cargo ktstr kernel build` first).";
+     image files are not supported here; version/cache-key forms \
+     require the entry to already be cached (run `cargo ktstr kernel \
+     build` first).";
 
 #[derive(Parser)]
 #[command(name = "cargo-ktstr", bin_name = "cargo")]
