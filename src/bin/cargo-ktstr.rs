@@ -401,7 +401,7 @@ fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
 
 /// Resolve a kernel identifier to a bootable image path.
 ///
-/// Uses `resolve_cached_kernel_with_remote` for Version/CacheKey
+/// Uses `ktstr::cli::resolve_cached_kernel` for Version/CacheKey
 /// lookups so GHA remote cache is checked when enabled.
 fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
     use ktstr::kernel_path::KernelId;
