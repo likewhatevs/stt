@@ -66,11 +66,10 @@ directory itself.
 
 ## Timeout protection
 
-All cgroup filesystem writes use a 2-second timeout via
-`write_with_timeout()`. The write runs in a spawned thread; if it does
-not complete within the timeout, the caller gets an error. This prevents
-test hangs when cgroup operations block in the kernel (e.g. during
-scheduler reconfigurations).
+All cgroup filesystem writes use a 2-second timeout. The write runs
+in a spawned thread; if it does not complete within the timeout, the
+caller gets an error. This prevents test hangs when cgroup operations
+block in the kernel (e.g. during scheduler reconfigurations).
 
 ## Usage in scenarios
 

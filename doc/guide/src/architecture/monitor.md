@@ -95,8 +95,8 @@ return uninitialized data. Two layers handle this:
   `DSQ_PLAUSIBILITY_CEILING` (10,000) via `sample_looks_valid()`.
 
 - **Threshold evaluation** (`MonitorThresholds::evaluate`): checks all
-  samples globally via `data_looks_valid()`. If all `rq_clock` values
-  are identical across every CPU and sample, or any sample exceeds the
+  samples globally for plausibility. If all `rq_clock` values are
+  identical across every CPU and sample, or any sample exceeds the
   plausibility ceiling, the entire report is passed as "not yet
   initialized" — no per-threshold checks run.
 

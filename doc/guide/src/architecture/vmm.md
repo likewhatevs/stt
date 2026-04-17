@@ -43,7 +43,7 @@ The VMM builds a cpio initramfs containing:
 - Optional scheduler binary (as `/scheduler`)
 - Shared library dependencies (resolved via ELF DT_NEEDED parsing)
 
-The initramfs is cached based on a `BaseKey` derived from the binary
+The initramfs is cached based on a cache key derived from the binary
 contents. A compressed SHM segment enables COW overlay into guest
 memory, sharing physical pages across concurrent VMs.
 
@@ -60,8 +60,8 @@ memory ring buffer carries scenario markers (`MSG_TYPE_SCENARIO_START`,
 `MSG_TYPE_SCENARIO_END`), test results (`MSG_TYPE_TEST_RESULT`), exit
 codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`),
 scheduler exit notifications (`MSG_TYPE_SCHED_EXIT`), guest crash
-payloads (`MSG_TYPE_CRASH`), and profraw coverage data
-(`MSG_TYPE_PROFRAW`). Each entry has a CRC32 for integrity checking.
+payloads (`MSG_TYPE_CRASH`), and profraw coverage data. Each entry
+has a CRC32 for integrity checking.
 
 ## Performance mode
 
@@ -88,7 +88,7 @@ dispatches the test function, then reboots.
 The role is determined at runtime:
 
 - **PID 1 detection**: when running as PID 1, the `#[ctor]` function
-  `ktstr_test_early_dispatch()` calls `ktstr_guest_init()` which handles
+  `ktstr_test_early_dispatch()` runs the guest init path, which handles
   the full guest lifecycle.
 - **`#[ktstr_test]` host dispatch**: a `#[ctor::ctor]` function
   (`ktstr_test_early_dispatch`) runs before `main()` in any binary
@@ -110,5 +110,5 @@ that built it.
 4. Set up serial devices (COM1 for console, COM2 for results).
 5. Boot the kernel.
 6. Kernel starts `/init` (the test binary).
-7. PID 1 detected: `ktstr_guest_init()` mounts filesystems, starts
-   the scheduler, dispatches the test function, and reboots.
+7. PID 1 detected: the guest init path mounts filesystems, starts the
+   scheduler, dispatches the test function, and reboots.

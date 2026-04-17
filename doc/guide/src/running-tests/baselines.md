@@ -28,7 +28,7 @@ against them.
 Each test writes a `SidecarResult` JSON file containing the test name,
 topology, scheduler, work type, pass/fail, per-cgroup stats, monitor
 summary, stimulus events, verifier stats, and KVM stats. Files are named with a `.ktstr.` infix for
-discovery. `collect_sidecars()` reads all sidecar files from a
+discovery. `cargo ktstr test-stats` reads all sidecar files from a
 directory (recursing one level for gauntlet per-job subdirectories).
 
 See also: [`KTSTR_SIDECAR_DIR`](../reference/environment-variables.md).
