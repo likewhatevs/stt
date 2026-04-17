@@ -328,7 +328,8 @@ pub struct Scheduler {
     /// Scheduler-wide assertion overrides merged on top of
     /// `Assert::default_checks()` and below each per-entry `assert`.
     pub assert: crate::assert::Assert,
-    /// Cgroup parent path. Must begin with `/` (e.g. `"/ktstr"`).
+    /// Cgroup parent path. Must begin with `/` and must not be `"/"`
+    /// alone (that is the cgroup root). Example: `"/ktstr"`.
     /// When set, the init creates `/sys/fs/cgroup{path}` before
     /// starting the scheduler, and `--cell-parent-cgroup {path}` is
     /// injected into scheduler args.
@@ -420,8 +421,17 @@ impl Scheduler {
     }
 
     /// Set cgroup parent path. See the [`cgroup_parent`](field@Self::cgroup_parent)
-    /// field for path format requirements (must begin with `/`).
+    /// field for path format requirements (must begin with `/`, must
+    /// not be `"/"` alone).
     pub const fn cgroup_parent(mut self, path: &'static str) -> Self {
+        assert!(
+            !path.is_empty() && path.as_bytes()[0] == b'/',
+            "Scheduler.cgroup_parent must begin with '/' (e.g. \"/ktstr\")"
+        );
+        assert!(
+            path.len() > 1,
+            "Scheduler.cgroup_parent must not be \"/\" alone (that is the cgroup root)"
+        );
         self.cgroup_parent = Some(path);
         self
     }
@@ -762,6 +772,17 @@ pub static KTSTR_TESTS: [KtstrTestEntry];
 /// Look up a registered test function by name.
 pub fn find_test(name: &str) -> Option<&'static KtstrTestEntry> {
     KTSTR_TESTS.iter().find(|e| e.name == name)
+}
+
+/// Validate the `cgroup_parent` leading-slash invariant at runtime.
+///
+/// Defense-in-depth for struct-literal construction that bypasses the
+/// `Scheduler::cgroup_parent()` builder (which validates at const time).
+fn validate_cgroup_parent(path: &str) {
+    assert!(
+        path.starts_with('/') && path.len() > 1,
+        "Scheduler.cgroup_parent must begin with '/' and not be \"/\" alone (got \"{path}\")"
+    );
 }
 
 /// Validate that `required_flags` and `excluded_flags` on an entry
@@ -1599,6 +1620,7 @@ fn run_ktstr_test_inner(
     // per-test extra_sched_args + flag-derived args.
     let mut sched_args: Vec<String> = Vec::new();
     if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
+        validate_cgroup_parent(cgroup_path);
         sched_args.push("--cell-parent-cgroup".to_string());
         sched_args.push(cgroup_path.to_string());
     }
@@ -2251,6 +2273,7 @@ fn attempt_auto_repro(
     {
         let mut args: Vec<String> = Vec::new();
         if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
+            validate_cgroup_parent(cgroup_path);
             args.push("--cell-parent-cgroup".to_string());
             args.push(cgroup_path.to_string());
         }
