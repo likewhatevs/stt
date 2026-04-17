@@ -14,6 +14,27 @@ use crate::runner::RunConfig;
 use crate::scenario::{Scenario, flags};
 use crate::workload::WorkType;
 
+/// Help text for `--kernel` in contexts that reject raw image files
+/// (test, coverage, `ktstr shell`). Matches `KernelResolvePolicy {
+/// accept_raw_image: false, .. }`.
+pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
+     path (e.g. `../linux`), a version (`6.14.2`, or major.minor prefix \
+     `6.14` for latest patch), or a cache key (see `kernel list`). Raw \
+     image files are rejected. Source directories auto-build (can be slow \
+     on a fresh tree); versions auto-download from kernel.org on cache \
+     miss.";
+
+/// Help text for `--kernel` in contexts that accept raw image files
+/// (verifier, `cargo ktstr shell`). Matches `KernelResolvePolicy {
+/// accept_raw_image: true, .. }`.
+pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
+     path (e.g. `../linux`), a raw image file (`bzImage` / `Image`), a \
+     version (`6.14.2`, or major.minor prefix `6.14` for latest patch), \
+     or a cache key (see `kernel list`). Source directories auto-build \
+     (can be slow on a fresh tree); versions auto-download from kernel.org \
+     on cache miss. When absent, resolves via cache then filesystem, \
+     falling back to downloading the latest stable kernel.";
+
 /// ktstr.kconfig embedded at compile time.
 pub const EMBEDDED_KCONFIG: &str = crate::EMBEDDED_KCONFIG;
 

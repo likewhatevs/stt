@@ -5,19 +5,9 @@ use std::process::Command;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cache::{CacheDir, CacheEntry};
 use ktstr::cli;
-
+use ktstr::cli::{KERNEL_HELP_NO_RAW, KERNEL_HELP_RAW_OK};
 use ktstr::fetch;
 use ktstr::remote_cache;
-
-/// Help text shared by test/coverage --kernel. Raw image files are
-/// not supported here; versions auto-download from kernel.org on
-/// cache miss; cache keys must already be cached. Verifier and
-/// shell use their own help because they accept image files.
-const KERNEL_IDENTIFIER_HELP: &str = "Kernel identifier: a source directory path (e.g. `../linux`), a version \
-     (`6.14.2`, or major.minor prefix `6.14` for latest patch), or a cache \
-     key (see `cargo ktstr kernel list`). Raw image files are not supported \
-     here. Versions auto-download from kernel.org on cache miss; cache keys \
-     must already be cached.";
 
 #[derive(Parser)]
 #[command(name = "cargo-ktstr", bin_name = "cargo")]
@@ -52,7 +42,7 @@ enum KtstrCommand {
     },
     /// Build the kernel (if needed) and run tests via cargo nextest.
     Test {
-        #[arg(long, help = KERNEL_IDENTIFIER_HELP)]
+        #[arg(long, help = KERNEL_HELP_NO_RAW)]
         kernel: Option<String>,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -60,7 +50,7 @@ enum KtstrCommand {
     },
     /// Build the kernel (if needed) and run tests with coverage via cargo llvm-cov nextest.
     Coverage {
-        #[arg(long, help = KERNEL_IDENTIFIER_HELP)]
+        #[arg(long, help = KERNEL_HELP_NO_RAW)]
         kernel: Option<String>,
         /// Arguments passed through to cargo llvm-cov nextest.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -90,14 +80,7 @@ enum KtstrCommand {
         /// Path to pre-built scheduler binary (alternative to --scheduler).
         #[arg(long, conflicts_with = "scheduler")]
         scheduler_bin: Option<PathBuf>,
-        /// Kernel identifier: a source directory path (e.g. `../linux`),
-        /// a raw image file (`bzImage` / `Image`), a version (`6.14.2`,
-        /// or major.minor prefix `6.14` for latest patch), or a cache
-        /// key (see `cargo ktstr kernel list`). Source directories
-        /// auto-build; versions auto-download from kernel.org on cache
-        /// miss. When absent, resolves via cache then filesystem,
-        /// falling back to downloading the latest stable kernel.
-        #[arg(long)]
+        #[arg(long, help = KERNEL_HELP_RAW_OK)]
         kernel: Option<String>,
         /// Print raw verifier output without formatting.
         #[arg(long)]
@@ -130,15 +113,7 @@ enum KtstrCommand {
     /// structure. Dynamically-linked ELF binaries get automatic shared
     /// library resolution via ELF DT_NEEDED parsing.
     Shell {
-        /// Kernel identifier: a source directory path (e.g. `../linux`),
-        /// a raw image file (`bzImage` / `Image`), a version (`6.14.2`,
-        /// or major.minor prefix `6.14` for latest patch), or a cache
-        /// key (see `cargo ktstr kernel list`). Source directories
-        /// auto-build (can be slow on a fresh tree); versions
-        /// auto-download from kernel.org on cache miss. When absent,
-        /// resolves via cache then filesystem, falling back to
-        /// downloading the latest stable kernel from kernel.org.
-        #[arg(long)]
+        #[arg(long, help = KERNEL_HELP_RAW_OK)]
         kernel: Option<String>,
         /// Virtual topology as "numa_nodes,llcs,cores,threads".
         #[arg(long, default_value = "1,1,1,1")]
