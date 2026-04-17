@@ -3827,6 +3827,7 @@ pub struct KtstrVmBuilder {
     watchdog_timeout: Option<Duration>,
     bpf_map_write: Option<BpfMapWriteParams>,
     performance_mode: bool,
+    no_perf_mode: bool,
     sched_enable_cmds: Vec<String>,
     sched_disable_cmds: Vec<String>,
     include_files: Vec<(String, PathBuf)>,
@@ -3858,6 +3859,7 @@ impl Default for KtstrVmBuilder {
             watchdog_timeout: Some(Duration::from_secs(4)),
             bpf_map_write: None,
             performance_mode: false,
+            no_perf_mode: false,
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
@@ -4037,6 +4039,14 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Skip flock topology reservation and force `performance_mode=false`
+    /// (disables pinning, RT scheduling, hugepages, NUMA mbind, KVM exit
+    /// suppression). For shared runners or unprivileged containers.
+    pub fn no_perf_mode(mut self, enabled: bool) -> Self {
+        self.no_perf_mode = enabled;
+        self
+    }
+
     /// Shell commands run inside the guest before the scenario to
     /// switch on a kernel-builtin scheduler (mirrors
     /// `SchedulerSpec::KernelBuiltin::enable`).
@@ -4092,7 +4102,13 @@ impl KtstrVmBuilder {
     /// `ResourceContention`, which callers typically treat as a
     /// skip rather than a failure).
     pub fn build(mut self) -> Result<KtstrVm> {
-        let (pinning_plan, mbind_nodes, cpu_locks) = if self.performance_mode {
+        if self.no_perf_mode {
+            self.performance_mode = false;
+        }
+
+        let (pinning_plan, mbind_nodes, cpu_locks) = if self.no_perf_mode {
+            (None, Vec::new(), Vec::new())
+        } else if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
             let pinned_cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
             let nodes = host_topo.numa_nodes_for_cpus(&pinned_cpus);
@@ -4187,7 +4203,8 @@ impl KtstrVmBuilder {
             return Err(anyhow::Error::new(host_topology::ResourceContention {
                 reason: format!(
                     "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
-                     but only {} host CPUs available",
+                     but only {} host CPUs available\n  \
+                     hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation",
                     total_reserved,
                     reserved,
                     llcs_needed,
@@ -4267,7 +4284,10 @@ fn acquire_slot_with_locks(
     }
 
     Err(anyhow::Error::new(host_topology::ResourceContention {
-        reason: format!("all {max_slots} LLC slots busy"),
+        reason: format!(
+            "all {max_slots} LLC slots busy\n  \
+             hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
+        ),
     }))
 }
 

@@ -204,3 +204,38 @@ LLC group it maps to. The validation sums the actual CPU count of
 each LLC group and checks the total (plus service CPU) fits within
 the host's online CPUs. If validation fails, the build returns an
 error (tests skip with `ResourceContention`).
+
+## Disabling performance mode
+
+The `--no-perf-mode` flag (or `KTSTR_NO_PERF_MODE=1` env var) forces
+`performance_mode=false` and skips flock topology reservation. This
+disables all performance mode features:
+
+- **flock topology reservation** -- VMs no longer acquire exclusive
+  CPU or LLC lock files. Multiple VMs may share the same CPUs without
+  contention errors.
+- **vCPU pinning** -- vCPU, watchdog, and monitor threads are not
+  pinned to specific host CPUs via `sched_setaffinity`.
+- **RT scheduling** -- vCPU, watchdog, and monitor threads are not
+  promoted to `SCHED_FIFO`. They run at normal scheduling priority.
+- **Hugepages** -- guest memory uses regular pages.
+- **NUMA mbind** -- no NUMA memory binding (no pinning plan to
+  derive target nodes from).
+- **KVM exit suppression** (x86_64) -- PAUSE and HLT VM exits are
+  not disabled.
+- **KVM_HINTS_REALTIME CPUID** (x86_64) -- not set; guest uses PV
+  spinlocks and standard cpuidle.
+
+This is useful on shared CI runners, unprivileged containers, or
+hosts where topology reservation is unavailable or undesirable.
+
+Available via:
+
+- `ktstr run --no-perf-mode`
+- `cargo ktstr test --no-perf-mode`
+- `cargo ktstr coverage --no-perf-mode`
+- `KTSTR_NO_PERF_MODE=1` (any value; presence is sufficient)
+
+The env var is read by every VM builder call site (test harness,
+auto-repro, verifier, shell). The CLI flags set the env var before
+test execution so library consumers inherit it.

@@ -43,6 +43,12 @@ enum KtstrCommand {
     Test {
         #[arg(long, help = KERNEL_HELP_NO_RAW)]
         kernel: Option<String>,
+        /// Disable all performance mode features (flock, pinning, RT
+        /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
+        /// For shared runners or unprivileged containers.
+        /// Also settable via KTSTR_NO_PERF_MODE env var.
+        #[arg(long)]
+        no_perf_mode: bool,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -51,6 +57,12 @@ enum KtstrCommand {
     Coverage {
         #[arg(long, help = KERNEL_HELP_NO_RAW)]
         kernel: Option<String>,
+        /// Disable all performance mode features (flock, pinning, RT
+        /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
+        /// For shared runners or unprivileged containers.
+        /// Also settable via KTSTR_NO_PERF_MODE env var.
+        #[arg(long)]
+        no_perf_mode: bool,
         /// Arguments passed through to cargo llvm-cov nextest.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -229,11 +241,15 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
+fn run_test(kernel: Option<String>, no_perf_mode: bool, args: Vec<String>) -> Result<(), String> {
     use ktstr::kernel_path::KernelId;
 
     let mut cmd = Command::new("cargo");
     cmd.args(["nextest", "run"]).args(&args);
+
+    if no_perf_mode {
+        cmd.env("KTSTR_NO_PERF_MODE", "1");
+    }
 
     if let Some(ref val) = kernel {
         match KernelId::parse(val) {
@@ -259,11 +275,19 @@ fn run_test(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
     Err(format!("exec cargo nextest run: {err}"))
 }
 
-fn run_coverage(kernel: Option<String>, args: Vec<String>) -> Result<(), String> {
+fn run_coverage(
+    kernel: Option<String>,
+    no_perf_mode: bool,
+    args: Vec<String>,
+) -> Result<(), String> {
     use ktstr::kernel_path::KernelId;
 
     let mut cmd = Command::new("cargo");
     cmd.args(["llvm-cov", "nextest"]).args(&args);
+
+    if no_perf_mode {
+        cmd.env("KTSTR_NO_PERF_MODE", "1");
+    }
 
     if let Some(ref val) = kernel {
         match KernelId::parse(val) {
@@ -746,8 +770,16 @@ fn main() {
             run_completions(shell, &binary);
             Ok(())
         }
-        KtstrCommand::Test { kernel, args } => run_test(kernel, args),
-        KtstrCommand::Coverage { kernel, args } => run_coverage(kernel, args),
+        KtstrCommand::Test {
+            kernel,
+            no_perf_mode,
+            args,
+        } => run_test(kernel, no_perf_mode, args),
+        KtstrCommand::Coverage {
+            kernel,
+            no_perf_mode,
+            args,
+        } => run_coverage(kernel, no_perf_mode, args),
         KtstrCommand::Verifier {
             scheduler,
             scheduler_bin,

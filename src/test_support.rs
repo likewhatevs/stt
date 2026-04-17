@@ -1234,6 +1234,14 @@ fn run_named_test(test_name: &str) -> i32 {
         return run_host_only_test(entry);
     }
 
+    if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
+        eprintln!(
+            "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+            bare_name,
+        );
+        return 0;
+    }
+
     if entry.bpf_map_write.is_some()
         && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
@@ -1332,6 +1340,14 @@ fn run_gauntlet_test(rest: &str) -> i32 {
             return 1;
         }
     };
+
+    if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
+        eprintln!(
+            "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+            test_name,
+        );
+        return 0;
+    }
 
     if entry.bpf_map_write.is_some()
         && let Ok(kernel) = resolve_test_kernel()
@@ -1610,6 +1626,13 @@ fn run_ktstr_test_inner(
     topo: Option<&TopoOverride>,
     active_flags: &[String],
 ) -> Result<AssertResult> {
+    if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
+        eprintln!(
+            "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+            entry.name,
+        );
+        return Ok(AssertResult::pass());
+    }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
     let scheduler = resolve_scheduler(&entry.scheduler.binary)?;
@@ -1653,6 +1676,7 @@ fn run_ktstr_test_inner(
         }
     };
 
+    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&ktstr_bin)
@@ -1662,7 +1686,8 @@ fn run_ktstr_test_inner(
         .shm_size(KTSTR_TEST_SHM_SIZE)
         .run_args(&guest_args)
         .timeout(Duration::from_secs(60))
-        .performance_mode(entry.performance_mode);
+        .performance_mode(entry.performance_mode)
+        .no_perf_mode(no_perf_mode);
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
     let merged_assert = crate::assert::Assert::default_checks()
@@ -2354,6 +2379,7 @@ fn attempt_auto_repro(
         }
     };
 
+    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
     let mut builder = vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
@@ -2362,7 +2388,8 @@ fn attempt_auto_repro(
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
         .run_args(&guest_args)
-        .timeout(Duration::from_secs(60));
+        .timeout(Duration::from_secs(60))
+        .no_perf_mode(no_perf_mode);
 
     if let Some(sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);

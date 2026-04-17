@@ -54,6 +54,7 @@ running ktstr.
 | `--auto-repro` | off | Rerun a crashing scenario with probes attached. |
 | `--kernel-dir PATH` | -- | Kernel build directory; used for DWARF source location lookup in probe output (requires `--repro` or `--auto-repro`). |
 | `--work-type NAME` | per-scenario | Override the work type for all cgroups. Case-sensitive; see list below. |
+| `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 
 **Work types (for `--work-type`):** `CpuSpin`, `YieldHeavy`, `Mixed`,
 `IoSync`, `Bursty`, `PipeIo`, `FutexPingPong`, `CachePressure`,

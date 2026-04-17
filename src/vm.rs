@@ -84,13 +84,15 @@ pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
         guest_args.push("/scheduler".into());
     }
 
+    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
     let t = &cfg.topology;
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&ktstr_bin)
         .topology(t.numa_nodes, t.llcs, t.cores_per_llc, t.threads_per_core)
         .memory_mb(u32::try_from(cfg.memory_mb).context("memory_mb exceeds u32::MAX")?)
-        .run_args(&guest_args);
+        .run_args(&guest_args)
+        .no_perf_mode(no_perf_mode);
 
     if let Some(ref sb) = sched_bin {
         builder = builder.scheduler_binary(sb);

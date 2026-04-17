@@ -479,7 +479,10 @@ pub fn acquire_cpu_locks(
     }
 
     Err(anyhow::Error::new(ResourceContention {
-        reason: format!("no {count} consecutive CPUs available"),
+        reason: format!(
+            "no {count} consecutive CPUs available\n  \
+             hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
+        ),
     }))
 }
 

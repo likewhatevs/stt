@@ -431,6 +431,12 @@ Common causes:
 - **Fewer CPUs**: gauntlet topology presets up to 252 CPUs may
   exceed the runner's capacity. Use smaller topologies.
 - **No kernel**: set `KTSTR_TEST_KERNEL` in the CI environment.
+- **No CAP_SYS_NICE or rtprio**: performance-mode tests require
+  `CAP_SYS_NICE` or an rtprio limit for RT scheduling, and enough
+  host CPUs for exclusive LLC reservation. Pass `--no-perf-mode`
+  (or set `KTSTR_NO_PERF_MODE=1`) to disable all performance mode
+  features. Tests with `performance_mode=true` are skipped entirely
+  under `--no-perf-mode`.
 - **Debug thresholds**: CI often runs debug builds. Debug builds use
   relaxed thresholds (3000ms gap, 35% spread) but may still hit
   limits on slow runners. See

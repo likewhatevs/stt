@@ -474,6 +474,7 @@ pub fn collect_verifier_output(
 
     let sched_args: Vec<String> = extra_sched_args.to_vec();
 
+    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
     let vm = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
@@ -482,6 +483,7 @@ pub fn collect_verifier_output(
         .topology(1, 1, 1, 1)
         .memory_mb(2048)
         .timeout(std::time::Duration::from_secs(120))
+        .no_perf_mode(no_perf_mode)
         .build()
         .context("build verifier VM")?;
 

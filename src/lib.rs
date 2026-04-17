@@ -573,6 +573,7 @@ pub fn run_shell(
         }
     }
 
+    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&payload)
@@ -580,7 +581,8 @@ pub fn run_shell(
         .cmdline(&cmdline)
         .include_files(owned_includes)
         .busybox(true)
-        .dmesg(dmesg);
+        .dmesg(dmesg)
+        .no_perf_mode(no_perf_mode);
 
     if let Some(cmd) = exec {
         builder = builder.exec_cmd(cmd.to_string());

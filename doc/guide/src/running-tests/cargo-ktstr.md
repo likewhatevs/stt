@@ -25,6 +25,11 @@ patch versions like `6.14.2` and major.minor prefixes like `6.14`).
 Cache keys resolve from the cache only — they error if not cached
 (run `cargo ktstr kernel list` to see available keys).
 
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kernel ID` | auto | Kernel identifier: path, version, or cache key. |
+| `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
+
 ### What it does (path mode only)
 
 These steps run only when `--kernel` is a source directory path.
@@ -65,6 +70,11 @@ cargo ktstr coverage --kernel ../linux                             # local sourc
 cargo ktstr coverage --kernel 6.14.2                               # version (auto-downloads on miss)
 cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 ```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kernel ID` | auto | Kernel identifier: path, version, or cache key. |
+| `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 
 Requires `cargo-llvm-cov` and the `llvm-tools-preview` rustup
 component:

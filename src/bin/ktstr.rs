@@ -70,6 +70,13 @@ enum Command {
         /// FutexPingPong, CachePressure, CacheYield, CachePipe, FutexFanOut.
         #[arg(long)]
         work_type: Option<String>,
+
+        /// Disable all performance mode features (flock, pinning, RT
+        /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
+        /// For shared runners or unprivileged containers.
+        /// Also settable via KTSTR_NO_PERF_MODE env var.
+        #[arg(long)]
+        no_perf_mode: bool,
     },
     /// List available scenarios.
     List {
@@ -352,7 +359,12 @@ fn main() -> Result<()> {
             auto_repro,
             kernel_dir,
             work_type,
+            no_perf_mode,
         } => {
+            if no_perf_mode {
+                unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
+            }
+
             let parent_cgroup = format!("/sys/fs/cgroup/ktstr-{}", std::process::id());
 
             // Guard cleans up auto-generated cgroups on exit (pass or fail).
