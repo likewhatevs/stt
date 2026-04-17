@@ -16,6 +16,10 @@ pub enum WorkType {
     CachePipe { size_kb: usize, burst_iters: u64 },
     FutexFanOut { fan_out: usize, spin_iters: u64 },
     Sequence { first: Phase, rest: Vec<Phase> },
+    ForkExit,
+    NiceSweep,
+    AffinityChurn { spin_iters: u64 },
+    PolicyChurn { spin_iters: u64 },
 }
 ```
 
@@ -23,7 +27,8 @@ Parameterized variants have convenience constructors:
 `WorkType::bursty(50, 100)`, `WorkType::pipe_io(1024)`,
 `WorkType::futex_ping_pong(1024)`, `WorkType::cache_pressure(32, 64)`,
 `WorkType::cache_yield(32, 64)`, `WorkType::cache_pipe(32, 1024)`,
-`WorkType::futex_fan_out(4, 1024)`.
+`WorkType::futex_fan_out(4, 1024)`,
+`WorkType::affinity_churn(1024)`, `WorkType::policy_churn(1024)`.
 
 ## Choosing a work type
 
@@ -36,6 +41,10 @@ Parameterized variants have convenience constructors:
 | Cache-aware scheduling | `CachePressure`, `CacheYield` |
 | Fan-out wake storms | `FutexFanOut` |
 | Mixed real-world patterns | `Sequence` |
+| Task creation/destruction pressure | `ForkExit` |
+| Priority reweighting / nice dynamics | `NiceSweep` |
+| Rapid CPU migration / affinity churn | `AffinityChurn` |
+| Scheduling class transitions | `PolicyChurn` |
 
 ## Variants
 
@@ -106,6 +115,32 @@ WorkType::Sequence {
 }
 ```
 
+**`ForkExit`** -- rapid fork+`_exit` cycling. Each iteration forks a
+child that immediately calls `_exit(0)`. The parent `waitpid`s then
+repeats. Exercises `wake_up_new_task`, `do_exit`, and
+`wait_task_zombie`.
+
+**`NiceSweep`** -- cycles the worker's nice level from -20 to 19
+across iterations. Each iteration: 512-iteration spin burst,
+`setpriority(PRIO_PROCESS, 0, nice_val)`, then `sched_yield`. Exercises
+`reweight_task` and dynamic priority reweighting. Skips negative nice values
+when `CAP_SYS_NICE` is absent. Resets nice to 0 before exit. Records
+per-yield wake latency.
+
+**`AffinityChurn`** -- rapid self-directed CPU affinity changes. Each
+iteration: `spin_iters` spin burst, `sched_setaffinity` to a random CPU
+from the effective cpuset, then `sched_yield`. Exercises
+`affine_move_task` and `migration_cpu_stop`. Records per-yield wake
+latency.
+
+**`PolicyChurn`** -- cycles through scheduling policies each iteration.
+Each iteration: `spin_iters` spin burst, `sched_setscheduler` to the
+next policy in the sequence, then `sched_yield`. Cycles through
+`SCHED_OTHER`, `SCHED_BATCH`, `SCHED_IDLE` (and `SCHED_FIFO`/`SCHED_RR`
+with priority 1 when `CAP_SYS_NICE` is available). Exercises
+`__sched_setscheduler` and scheduling class transitions. Resets to
+`SCHED_OTHER` before exit. Records per-yield wake latency.
+
 ## Grouped work types
 
 `PipeIo`, `FutexPingPong`, and `CachePipe` require `num_workers`
@@ -126,6 +161,8 @@ futex wait/wake.
 - `CacheYield`: `size_kb=32`, `stride=64`
 - `CachePipe`: `size_kb=32`, `burst_iters=1024`
 - `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
+- `AffinityChurn`: `spin_iters=1024`
+- `PolicyChurn`: `spin_iters=1024`
 
 ## String lookup
 

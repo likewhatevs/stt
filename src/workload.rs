@@ -2,7 +2,7 @@
 //!
 //! Workers are `fork()`ed processes (not threads) so each can be placed
 //! in its own cgroup. Key types:
-//! - [`WorkType`] -- what each worker does (CPU spin, yield, I/O, bursty, pipe)
+//! - [`WorkType`] -- what each worker does
 //! - [`WorkloadConfig`] -- spawn configuration (count, affinity, work type, policy)
 //! - [`WorkloadHandle`] -- RAII handle to spawned workers
 //! - [`WorkerReport`] -- per-worker telemetry collected after stop
@@ -146,6 +146,26 @@ pub enum WorkType {
     /// Compound work pattern: loop through phases in order, repeat.
     /// Each phase runs for its duration before the next starts.
     Sequence { first: Phase, rest: Vec<Phase> },
+    /// Rapid fork+_exit cycling. Each iteration forks a child that
+    /// immediately calls _exit(0). Parent waitpid's then repeats.
+    /// Exercises wake_up_new_task, do_exit, wait_task_zombie.
+    ForkExit,
+    /// Cycle nice level from -20 to 19 across iterations. Each
+    /// iteration: spin_burst → setpriority → yield. Exercises
+    /// reweight_task and dynamic priority reweighting. Skips negative
+    /// nice values when CAP_SYS_NICE is absent.
+    NiceSweep,
+    /// Rapid self-directed sched_setaffinity to random CPUs from the
+    /// effective cpuset. Each iteration: spin_burst → pick random CPU
+    /// → sched_setaffinity → yield. Exercises affine_move_task and
+    /// migration_cpu_stop.
+    AffinityChurn { spin_iters: u64 },
+    /// Cycle through scheduling policies each iteration. Each iteration:
+    /// spin_burst → sched_setscheduler to next policy → yield. Cycles
+    /// SCHED_OTHER → SCHED_BATCH → SCHED_IDLE (and SCHED_FIFO/SCHED_RR
+    /// when CAP_SYS_NICE is available). Exercises __sched_setscheduler
+    /// and scheduling class transitions.
+    PolicyChurn { spin_iters: u64 },
 }
 
 impl WorkType {
@@ -166,6 +186,10 @@ impl WorkType {
         "CachePipe",
         "FutexFanOut",
         "Sequence",
+        "ForkExit",
+        "NiceSweep",
+        "AffinityChurn",
+        "PolicyChurn",
     ];
 
     /// PascalCase name of this variant, matching [`ALL_NAMES`](Self::ALL_NAMES).
@@ -183,6 +207,10 @@ impl WorkType {
             WorkType::CachePipe { .. } => "CachePipe",
             WorkType::FutexFanOut { .. } => "FutexFanOut",
             WorkType::Sequence { .. } => "Sequence",
+            WorkType::ForkExit => "ForkExit",
+            WorkType::NiceSweep => "NiceSweep",
+            WorkType::AffinityChurn { .. } => "AffinityChurn",
+            WorkType::PolicyChurn { .. } => "PolicyChurn",
         }
     }
 
@@ -217,6 +245,10 @@ impl WorkType {
                 fan_out: 4,
                 spin_iters: 1024,
             }),
+            "ForkExit" => Some(WorkType::ForkExit),
+            "NiceSweep" => Some(WorkType::NiceSweep),
+            "AffinityChurn" => Some(WorkType::AffinityChurn { spin_iters: 1024 }),
+            "PolicyChurn" => Some(WorkType::PolicyChurn { spin_iters: 1024 }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
         }
@@ -293,6 +325,16 @@ impl WorkType {
             fan_out,
             spin_iters,
         }
+    }
+
+    /// Rapid self-directed affinity changes with `spin_iters` CPU work between.
+    pub fn affinity_churn(spin_iters: u64) -> Self {
+        WorkType::AffinityChurn { spin_iters }
+    }
+
+    /// Cycle scheduling policies with `spin_iters` CPU work between switches.
+    pub fn policy_churn(spin_iters: u64) -> Self {
+        WorkType::PolicyChurn { spin_iters }
     }
 }
 
@@ -484,8 +526,8 @@ pub struct WorkerReport {
     /// When the longest gap happened (ms from start).
     pub max_gap_at_ms: u64,
     /// Per-wakeup latency samples (ns). Populated for blocking work types
-    /// (FutexPingPong, FutexFanOut, CachePipe, Bursty, CacheYield, PipeIo,
-    /// IoSync, Sequence with Sleep, Yield, or Io phases).
+    /// (Bursty, PipeIo, FutexPingPong, FutexFanOut, CacheYield, CachePipe,
+    /// IoSync, NiceSweep, AffinityChurn, Sequence with Sleep/Yield/Io phases).
     #[serde(default)]
     pub wake_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
@@ -1027,6 +1069,44 @@ fn worker_main(
     let mut wake_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut wake_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
+    // AffinityChurn: read effective cpuset once at start via sched_getaffinity.
+    let affinity_churn_cpus: Vec<usize> = if matches!(work_type, WorkType::AffinityChurn { .. }) {
+        let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpu_set)
+        };
+        if ret == 0 {
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|c| unsafe { libc::CPU_ISSET(*c, &cpu_set) })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    // PolicyChurn: build list of (policy, priority) pairs to cycle through.
+    // Non-RT policies always available; RT (FIFO/RR) only with CAP_SYS_NICE.
+    let policy_churn_policies: Vec<(i32, i32)> =
+        if matches!(work_type, WorkType::PolicyChurn { .. }) {
+            let mut policies = vec![
+                (libc::SCHED_OTHER, 0),
+                (libc::SCHED_BATCH, 0),
+                (libc::SCHED_IDLE, 0),
+            ];
+            let param = libc::sched_param { sched_priority: 1 };
+            let ret = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+            if ret == 0 {
+                // Restore to SCHED_OTHER before entering work loop.
+                let normal = libc::sched_param { sched_priority: 0 };
+                unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &normal) };
+                policies.push((libc::SCHED_FIFO, 1));
+                policies.push((libc::SCHED_RR, 1));
+            }
+            policies
+        } else {
+            Vec::new()
+        };
     // schedstat snapshot at work-loop start.
     let (ss_cpu_start, ss_delay_start, ss_ts_start) = read_schedstat();
 
@@ -1366,6 +1446,110 @@ fn worker_main(
                 }
                 iterations += 1;
             }
+            WorkType::ForkExit => {
+                let pid = unsafe { libc::fork() };
+                match pid {
+                    -1 => {
+                        work_units = work_units.wrapping_add(1);
+                        iterations += 1;
+                    }
+                    0 => {
+                        unsafe { libc::_exit(0) };
+                    }
+                    child => {
+                        let mut status = 0i32;
+                        unsafe { libc::waitpid(child, &mut status, 0) };
+                        work_units = work_units.wrapping_add(1);
+                        iterations += 1;
+                    }
+                }
+            }
+            WorkType::NiceSweep => {
+                // Determine allowed nice range. Negative nice requires
+                // CAP_SYS_NICE; probe once and clamp min_nice on EPERM.
+                let effective_min: i32 = {
+                    static PROBED_MIN: std::sync::atomic::AtomicI32 =
+                        std::sync::atomic::AtomicI32::new(i32::MIN);
+                    let cached = PROBED_MIN.load(Ordering::Relaxed);
+                    if cached != i32::MIN {
+                        cached
+                    } else {
+                        let ret = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, -20) };
+                        let min = if ret == -1 {
+                            // EPERM — unprivileged, sweep only non-negative
+                            0i32
+                        } else {
+                            // Succeeded — restore nice 0 and sweep full range
+                            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 0) };
+                            -20i32
+                        };
+                        PROBED_MIN.store(min, Ordering::Relaxed);
+                        min
+                    }
+                };
+                let range = (19 - effective_min + 1) as u64;
+                let nice_val = effective_min + (iterations % range) as i32;
+                spin_burst(&mut work_units, 512);
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice_val);
+                }
+                let before_yield = Instant::now();
+                std::thread::yield_now();
+                reservoir_push(
+                    &mut wake_latencies_ns,
+                    &mut wake_sample_count,
+                    before_yield.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
+                iterations += 1;
+            }
+            WorkType::AffinityChurn { spin_iters } => {
+                spin_burst(&mut work_units, spin_iters);
+                if !affinity_churn_cpus.is_empty() {
+                    use rand::RngExt;
+                    let idx = rand::rng().random_range(0..affinity_churn_cpus.len());
+                    let target = affinity_churn_cpus[idx];
+                    let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        libc::CPU_ZERO(&mut cpu_set);
+                        libc::CPU_SET(target, &mut cpu_set);
+                        libc::sched_setaffinity(
+                            0,
+                            std::mem::size_of::<libc::cpu_set_t>(),
+                            &cpu_set,
+                        );
+                    }
+                }
+                let before_yield = Instant::now();
+                std::thread::yield_now();
+                reservoir_push(
+                    &mut wake_latencies_ns,
+                    &mut wake_sample_count,
+                    before_yield.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
+                iterations += 1;
+            }
+            WorkType::PolicyChurn { spin_iters } => {
+                spin_burst(&mut work_units, spin_iters);
+                let idx = (iterations as usize) % policy_churn_policies.len().max(1);
+                let (pol, prio) = policy_churn_policies[idx];
+                let param = libc::sched_param {
+                    sched_priority: prio,
+                };
+                unsafe {
+                    libc::sched_setscheduler(0, pol, &param);
+                }
+                let before_yield = Instant::now();
+                std::thread::yield_now();
+                reservoir_push(
+                    &mut wake_latencies_ns,
+                    &mut wake_sample_count,
+                    before_yield.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
+                iterations += 1;
+            }
         }
 
         // Publish iteration count to shared memory for host-side sampling.
@@ -1411,6 +1595,17 @@ fn worker_main(
                 last_cpu = cpu;
             }
         }
+    }
+
+    // Reset nice to 0 so report serialization runs at default priority.
+    if matches!(work_type, WorkType::NiceSweep) {
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 0) };
+    }
+
+    // Reset to SCHED_OTHER so report serialization runs at normal policy.
+    if matches!(work_type, WorkType::PolicyChurn { .. }) {
+        let param = libc::sched_param { sched_priority: 0 };
+        unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) };
     }
 
     // Clean up persistent temp files.
@@ -1644,7 +1839,7 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        assert_eq!(WorkType::ALL_NAMES.len(), 12);
+        assert_eq!(WorkType::ALL_NAMES.len(), 16);
     }
 
     #[test]

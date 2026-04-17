@@ -886,5 +886,41 @@ pub fn all_scenarios() -> Vec<Scenario> {
             cgroup_works: vec![],
             action: Action::Custom(custom_fanout_wake),
         },
+        // Stress: task creation/destruction churn
+        s!(
+            "fork_exit_churn",
+            "stress",
+            "Rapid fork+exit cycling, task creation pressure",
+            2,
+            CpusetMode::None,
+            w(WorkType::ForkExit, SchedPolicy::Normal)
+        ),
+        // Stress: dynamic nice level changes
+        s!(
+            "nice_sweep",
+            "stress",
+            "Workers cycling nice levels, priority reweighting",
+            2,
+            CpusetMode::None,
+            w(WorkType::NiceSweep, SchedPolicy::Normal)
+        ),
+        // Stress: rapid affinity changes
+        s!(
+            "affinity_churn",
+            "stress",
+            "Workers rapidly changing own CPU affinity",
+            2,
+            CpusetMode::None,
+            w(WorkType::affinity_churn(1024), SchedPolicy::Normal)
+        ),
+        // Stress: scheduling policy cycling
+        s!(
+            "policy_churn",
+            "stress",
+            "Workers cycling scheduling policies mid-run",
+            2,
+            CpusetMode::None,
+            w(WorkType::policy_churn(1024), SchedPolicy::Normal)
+        ),
     ]
 }
