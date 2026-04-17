@@ -81,7 +81,19 @@ let def = CgroupDef::named("cg_0")
   (default: `Normal`). See [Work Types](work-types.md#scheduling-policies).
 - `.work(Work)` -- add a work group (multiple calls for concurrent groups).
 - `.affinity(AffinityKind)` -- set per-worker affinity (default: `Inherit`).
+- `.mem_policy(MemPolicy)` -- set NUMA memory placement policy
+  (default: `Default`). See [MemPolicy](mem-policy.md).
+- `.mpol_flags(MpolFlags)` -- set mode flags for `set_mempolicy(2)`
+  (default: `NONE`). See [MemPolicy](mem-policy.md#mpolflags).
 - `.swappable(bool)` -- opt into gauntlet work type override.
+
+### MemPolicy-cpuset validation
+
+When a cgroup has a cpuset, ktstr validates that the `MemPolicy`'s
+node set is covered by the NUMA nodes reachable from that cpuset. A
+`MemPolicy::Bind([1])` on a cgroup whose cpuset covers only NUMA
+node 0 fails at setup time. Policies without a node set (`Default`,
+`Local`) skip validation.
 
 ### Work type overrides and swappable
 

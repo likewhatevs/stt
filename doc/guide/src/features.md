@@ -31,7 +31,7 @@ available, event-counter sampling is silently disabled.
 
 Tests boot a real Linux kernel in a KVM virtual machine with
 configurable topology: NUMA nodes, LLCs, cores per LLC, threads per core.
-Multi-NUMA topologies produce NUMA domains via ACPI SRAT/SLIT
+Multi-NUMA topologies produce NUMA domains via ACPI SRAT/SLIT/HMAT
 tables on x86_64. On aarch64, CPU topology is described via FDT cpu
 nodes with MPIDR affinity. Both architectures are supported (24
 topology presets on x86_64, 14 on aarch64).

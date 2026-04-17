@@ -21,6 +21,7 @@
   - [Verification](concepts/verification.md)
   - [Ops and Steps](concepts/ops.md)
   - [TestTopology](concepts/topology.md)
+  - [MemPolicy](concepts/mem-policy.md)
   - [Performance Mode](concepts/performance-mode.md)
 - [Writing Tests](writing-tests.md)
   - [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md)

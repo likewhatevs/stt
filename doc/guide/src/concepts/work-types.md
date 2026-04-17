@@ -172,7 +172,7 @@ because they carry no captured state across the fork boundary. Closures
 are not supported. Cannot be constructed via `WorkType::from_name()`.
 
 ```rust,ignore
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use ktstr::workload::{WorkType, WorkerReport};
 
@@ -202,6 +202,8 @@ fn my_workload(stop: &AtomicBool) -> WorkerReport {
         schedstat_run_delay_ns: 0,
         schedstat_ctx_switches: 0,
         schedstat_cpu_time_ns: 0,
+        numa_pages: BTreeMap::new(),
+        vmstat_numa_pages_migrated: 0,
     }
 }
 
@@ -254,10 +256,15 @@ pub struct WorkloadConfig {
     pub affinity: AffinityMode,   // CPU affinity mode (None, Fixed, Random, SingleCpu)
     pub work_type: WorkType,      // What each worker does
     pub sched_policy: SchedPolicy, // Linux scheduling policy
+    pub mem_policy: MemPolicy,    // NUMA memory placement policy
+    pub mpol_flags: MpolFlags,    // Optional mode flags for set_mempolicy(2)
 }
 ```
 
-`Default`: 1 worker, no affinity, CpuSpin, Normal policy.
+`Default`: 1 worker, no affinity, CpuSpin, Normal policy, Default
+mem_policy, no mpol_flags.
+
+See [MemPolicy](mem-policy.md) for the NUMA memory placement API.
 
 ## Scheduling policies
 

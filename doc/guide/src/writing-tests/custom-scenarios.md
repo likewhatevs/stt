@@ -88,6 +88,16 @@ Key methods:
 - `cpus_in_llc(idx) -> &[usize]` -- CPUs in LLC at index.
 - `llc_aligned_cpuset(idx) -> BTreeSet<usize>` -- same as
   `cpus_in_llc` but returns a set.
+- `numa_aligned_cpuset(node) -> BTreeSet<usize>` -- CPUs in all
+  LLCs belonging to a NUMA node.
+- `numa_node_ids() -> &BTreeSet<usize>` -- NUMA node IDs.
+- `numa_nodes_for_cpuset(cpus) -> BTreeSet<usize>` -- NUMA nodes
+  covered by a CPU set.
+- `node_meminfo(node_id) -> Option<&NodeMemInfo>` -- per-node
+  memory info (total/free KiB).
+- `numa_distance(from, to) -> u8` -- inter-node NUMA distance.
+- `is_memory_only(node_id) -> bool` -- whether a node has RAM
+  but no CPUs (CXL).
 
 **`sched_pid`** -- scheduler process ID for liveness checks.
 

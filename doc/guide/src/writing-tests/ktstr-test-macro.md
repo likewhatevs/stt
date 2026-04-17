@@ -92,6 +92,9 @@ so most tests do not need to set `numa_nodes`. See
 | `max_wake_latency_cv` | inherited | Max wake latency coefficient of variation |
 | `min_iteration_rate` | inherited | Minimum iterations per wall-clock second per worker |
 | `max_migration_ratio` | inherited | Max migration ratio (migrations/iterations) per cgroup |
+| `min_page_locality` | inherited | Min fraction of pages on expected NUMA nodes (0.0-1.0) |
+| `max_cross_node_migration_ratio` | inherited | Max ratio of NUMA-migrated pages to total pages (0.0-1.0) |
+| `max_slow_tier_ratio` | inherited | Max fraction of pages on memory-only (CXL) nodes (0.0-1.0) |
 
 `not_starved = true` enables three distinct checks: starvation (any
 worker with zero work units), fairness spread (max-min off-CPU% below

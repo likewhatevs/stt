@@ -20,8 +20,9 @@ let result = vmm::KtstrVm::builder()
 
 The VM topology is specified as `(numa_nodes, llcs, cores_per_llc,
 threads_per_core)`. On x86_64, the VMM creates ACPI tables (MADT,
-SRAT) and MP tables. On aarch64, topology is expressed via FDT cpu
-nodes with MPIDR-derived `reg` properties.
+SRAT, SLIT, and HMAT when `numa_nodes > 1`) and MP tables. On
+aarch64, topology is expressed via FDT cpu nodes with MPIDR-derived
+`reg` properties.
 
 ```rust,ignore
 pub struct Topology {
@@ -29,11 +30,28 @@ pub struct Topology {
     pub cores_per_llc: u32,
     pub threads_per_core: u32,
     pub numa_nodes: u32,
+    pub nodes: Option<&'static [NumaNode]>,
+    pub distances: Option<&'static NumaDistance>,
 }
 ```
 
 `total_cpus()` = llcs * cores_per_llc * threads_per_core.
 `num_llcs()` = llcs.
+
+When `nodes` is `None` (the default), memory and LLCs are distributed
+uniformly across NUMA nodes with default 10/20 distances. When
+`Some`, each `NumaNode` specifies its LLC count, memory size, and
+optional HMAT attributes (`latency_ns`, `bandwidth_mbs`,
+`mem_side_cache`). A `NumaNode` with `llcs = 0` models a CXL
+memory-only node.
+
+`NumaDistance` is an NxN inter-node distance matrix. Diagonal entries
+must be 10, off-diagonal > 10, and the matrix must be symmetric (ACPI
+SLIT requirements).
+
+Use `Topology::new(numa_nodes, llcs, cores, threads)` for uniform
+topologies, or `Topology::with_nodes(cores, threads, &nodes)` for
+explicit per-node configuration.
 
 ## initramfs
 

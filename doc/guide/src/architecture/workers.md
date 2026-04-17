@@ -61,6 +61,8 @@ pub struct WorkerReport {
     pub schedstat_run_delay_ns: u64,
     pub schedstat_ctx_switches: u64,
     pub schedstat_cpu_time_ns: u64,
+    pub numa_pages: BTreeMap<usize, u64>,
+    pub vmstat_numa_pages_migrated: u64,
 }
 ```
 
@@ -99,10 +101,23 @@ start and end. Three fields:
 
 `iterations` counts outer-loop iterations.
 
+### NUMA fields
+
+**`numa_pages`**: per-NUMA-node page counts parsed from
+`/proc/self/numa_maps` after the workload completes. Keyed by node ID.
+Empty when numa_maps is unavailable.
+
+**`vmstat_numa_pages_migrated`**: delta of the `numa_pages_migrated`
+counter from `/proc/vmstat` between pre- and post-workload snapshots.
+Measures cross-node page migrations during the test.
+
+These fields feed the NUMA [verification
+checks](../concepts/verification.md#numa-checks).
+
 Custom workers produce their own `WorkerReport`. The framework does
 not populate any telemetry fields for Custom -- migration tracking,
-gap detection, schedstat deltas, and iteration counters are only
-present if the user's `run` function fills them.
+gap detection, schedstat deltas, NUMA page counts, and iteration
+counters are only present if the user's `run` function fills them.
 
 ## Work-conservation watchdog
 

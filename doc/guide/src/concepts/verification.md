@@ -68,6 +68,32 @@ memory (per-CPU runqueue structs via BTF offsets) and evaluates:
 Monitor thresholds use a sustained sample window (default: 5 samples).
 A violation must persist for N consecutive samples before failing.
 
+## NUMA checks
+
+When workers use a [`MemPolicy`](mem-policy.md), ktstr collects NUMA
+page placement data and checks it against thresholds:
+
+**Page locality** -- `assert_page_locality()` checks the fraction of
+pages residing on the expected NUMA node(s). Expected nodes are derived
+from the worker's `MemPolicy::node_set()` at evaluation time. Page
+counts come from `WorkerReport::numa_pages` (parsed from
+`/proc/self/numa_maps`). Returns 1.0 (vacuously local) when no pages
+are observed. Fails if the observed fraction falls below
+`min_page_locality`.
+
+**Cross-node migration** -- `assert_cross_node_migration()` checks
+the ratio of migrated pages to total allocated pages.
+`WorkerReport::vmstat_numa_pages_migrated` provides the delta of the
+`numa_pages_migrated` counter from `/proc/vmstat` over the work loop.
+Fails if the ratio exceeds `max_cross_node_migration_ratio`.
+
+**Slow-tier ratio** -- `max_slow_tier_ratio` checks the fraction of
+pages on memory-only NUMA nodes (CXL tiers). Fails if more than the
+specified fraction of pages land on memory-only nodes.
+
+None of these thresholds are set by default. Set via `Assert` setters
+or `#[ktstr_test]` attributes.
+
 ## Assert struct
 
 `Assert` is a composable configuration that carries both worker checks
@@ -98,6 +124,11 @@ pub struct Assert {
     pub sustained_samples: Option<usize>,
     pub max_fallback_rate: Option<f64>,
     pub max_keep_last_rate: Option<f64>,
+
+    // NUMA checks
+    pub min_page_locality: Option<f64>,
+    pub max_cross_node_migration_ratio: Option<f64>,
+    pub max_slow_tier_ratio: Option<f64>,
 }
 ```
 

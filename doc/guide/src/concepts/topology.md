@@ -45,6 +45,8 @@ pub struct TestTopology {
 **`from_system() -> Result<Self>`** -- reads sysfs
 (`/sys/devices/system/cpu/`) to discover the live topology. Reads LLC
 IDs, NUMA node IDs, core IDs, and cache sizes for each online CPU.
+Also scans `/sys/devices/system/node/` to discover memory-only nodes
+(CXL), reads per-node meminfo and inter-node distances.
 
 **`from_spec(numa_nodes, llcs, cores, threads) -> Self`** -- builds a
 topology from a VM spec. Parameters are big-to-little: NUMA nodes,
@@ -90,6 +92,38 @@ node, cache size, and core map.
 **`numa_aligned_cpuset(node) -> BTreeSet<usize>`** -- CPUs in all LLCs
 belonging to NUMA node `node`. Filters LLCs by `numa_node() == node`
 and collects their CPUs.
+
+**`numa_node_ids() -> &BTreeSet<usize>`** -- NUMA node IDs as a
+`BTreeSet`.
+
+**`numa_nodes_for_cpuset(cpus) -> BTreeSet<usize>`** -- NUMA nodes
+covered by the given CPU set. Returns the set of NUMA nodes that
+contain at least one LLC with a CPU in the given set.
+
+**`node_meminfo(node_id) -> Option<&NodeMemInfo>`** -- per-node
+memory info (total and free KiB). Returns `None` when the node ID
+is not present or meminfo is unavailable. `NodeMemInfo` has
+`total_kb`, `free_kb`, and `used_kb()` (saturating subtraction).
+
+**`numa_distance(from, to) -> u8`** -- inter-node NUMA distance.
+Returns 255 when either node ID is not present (matches the kernel's
+unreachable distance). For `from_spec()` topologies without explicit
+distances, returns 10 for local and 20 for remote.
+
+**`is_memory_only(node_id) -> bool`** -- whether the node is
+memory-only (has RAM but no CPUs). Typical for CXL-attached memory
+tiers.
+
+## Construction from VM topology
+
+**`from_vm_topology(topo) -> Self`** -- build a `TestTopology` from a
+`Topology` (the VMM's topology spec). Populates LLCs, NUMA nodes,
+distances, per-node memory info, and memory-only node flags.
+
+**`from_vm_topology_with_memory(topo, total_memory_mb) -> Self`** --
+same as `from_vm_topology` but accepts an optional total memory size
+for uniform topologies. When `Some`, divides memory evenly across
+nodes to populate `NodeMemInfo`. When `None`, memory info is omitted.
 
 ## Cpuset generation
 
