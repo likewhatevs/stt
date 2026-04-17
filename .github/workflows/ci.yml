@@ -52,6 +52,8 @@ jobs:
           restore-keys: ktstr-kernels-x64-${{ matrix.kernel-version }}-
       - name: Build test kernel
         run: cargo run --bin cargo-ktstr -- ktstr kernel build ${{ matrix.kernel-version }}
+      - name: Build scx-ktstr binary
+        run: cargo build -p scx-ktstr
       - run: cargo nextest run --workspace --profile ci --features integration
         env:
           KTSTR_KERNEL: ${{ matrix.kernel-version }}
@@ -89,6 +91,8 @@ jobs:
           restore-keys: ktstr-kernels-arm64-
       - name: Build test kernel
         run: cargo run --bin cargo-ktstr -- ktstr kernel build
+      - name: Build scx-ktstr binary
+        run: cargo build -p scx-ktstr
       - run: cargo nextest run --workspace --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
