@@ -366,7 +366,10 @@ fn derive_scheduler_topology() {
 /// Verify scheduler cgroup_parent.
 #[test]
 fn derive_scheduler_cgroup_parent() {
-    assert_eq!(TEST_DERIVE.cgroup_parent, Some("/test"));
+    assert_eq!(
+        TEST_DERIVE.cgroup_parent,
+        Some(ktstr::test_support::CgroupPath::new("/test"))
+    );
 }
 
 /// Verify scheduler sched_args.

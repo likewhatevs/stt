@@ -298,6 +298,53 @@ impl Sysctl {
     }
 }
 
+/// Validated cgroup parent path.
+///
+/// Wraps a `&'static str` that is guaranteed to start with `/` and not
+/// be `"/"` alone. Construct via [`CgroupPath::new`] (which const-panics
+/// on invalid input) or the [`Scheduler::cgroup_parent`] builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CgroupPath(&'static str);
+
+impl CgroupPath {
+    /// Const constructor. Panics at compile time (or const-eval time)
+    /// if `path` does not start with `/` or is `"/"` alone.
+    pub const fn new(path: &'static str) -> Self {
+        assert!(
+            !path.is_empty() && path.as_bytes()[0] == b'/',
+            "CgroupPath must begin with '/' (e.g. \"/ktstr\")"
+        );
+        assert!(
+            path.len() > 1,
+            "CgroupPath must not be \"/\" alone (that is the cgroup root)"
+        );
+        Self(path)
+    }
+
+    /// The raw path string (e.g. `"/ktstr"`).
+    pub const fn as_str(&self) -> &'static str {
+        self.0
+    }
+
+    /// The full sysfs cgroup directory (e.g. `"/sys/fs/cgroup/ktstr"`).
+    pub fn sysfs_path(&self) -> String {
+        format!("/sys/fs/cgroup{}", self.0)
+    }
+}
+
+impl std::ops::Deref for CgroupPath {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CgroupPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
 /// Definition of a scheduler for the test framework.
 ///
 /// Captures everything the framework needs to know about a scheduler:
@@ -329,10 +376,10 @@ pub struct Scheduler {
     pub assert: crate::assert::Assert,
     /// Cgroup parent path. Must begin with `/` and must not be `"/"`
     /// alone (that is the cgroup root). Example: `"/ktstr"`.
-    /// When set, the init creates `/sys/fs/cgroup{path}` before
-    /// starting the scheduler, and `--cell-parent-cgroup {path}` is
-    /// injected into scheduler args.
-    pub cgroup_parent: Option<&'static str>,
+    /// When set, the init creates the sysfs directory before starting
+    /// the scheduler, and `--cell-parent-cgroup {path}` is injected
+    /// into scheduler args.
+    pub cgroup_parent: Option<CgroupPath>,
     /// Scheduler CLI args, prepended before per-test `extra_sched_args`.
     pub sched_args: &'static [&'static str],
     /// Default VM topology for tests using this scheduler. Tests inherit
@@ -423,15 +470,7 @@ impl Scheduler {
     /// field for path format requirements (must begin with `/`, must
     /// not be `"/"` alone).
     pub const fn cgroup_parent(mut self, path: &'static str) -> Self {
-        assert!(
-            !path.is_empty() && path.as_bytes()[0] == b'/',
-            "Scheduler.cgroup_parent must begin with '/' (e.g. \"/ktstr\")"
-        );
-        assert!(
-            path.len() > 1,
-            "Scheduler.cgroup_parent must not be \"/\" alone (that is the cgroup root)"
-        );
-        self.cgroup_parent = Some(path);
+        self.cgroup_parent = Some(CgroupPath::new(path));
         self
     }
 
@@ -771,17 +810,6 @@ pub static KTSTR_TESTS: [KtstrTestEntry];
 /// Look up a registered test function by name.
 pub fn find_test(name: &str) -> Option<&'static KtstrTestEntry> {
     KTSTR_TESTS.iter().find(|e| e.name == name)
-}
-
-/// Validate the `cgroup_parent` leading-slash invariant at runtime.
-///
-/// Defense-in-depth for struct-literal construction that bypasses the
-/// `Scheduler::cgroup_parent()` builder (which validates at const time).
-fn validate_cgroup_parent(path: &str) {
-    assert!(
-        path.starts_with('/') && path.len() > 1,
-        "Scheduler.cgroup_parent must begin with '/' and not be \"/\" alone (got \"{path}\")"
-    );
 }
 
 /// Validate that `required_flags` and `excluded_flags` on an entry
@@ -1615,8 +1643,7 @@ fn run_ktstr_test_inner(
     }
 
     let mut sched_args: Vec<String> = Vec::new();
-    if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
-        validate_cgroup_parent(cgroup_path);
+    if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
         sched_args.push("--cell-parent-cgroup".to_string());
         sched_args.push(cgroup_path.to_string());
     }
@@ -2266,8 +2293,7 @@ fn attempt_auto_repro(
 
     {
         let mut args: Vec<String> = Vec::new();
-        if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
-            validate_cgroup_parent(cgroup_path);
+        if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
             args.push("--cell-parent-cgroup".to_string());
             args.push(cgroup_path.to_string());
         }
