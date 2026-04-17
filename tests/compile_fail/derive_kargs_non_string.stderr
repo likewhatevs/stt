@@ -1,0 +1,5 @@
+error: expected string literal in kargs
+ --> tests/compile_fail/derive_kargs_non_string.rs:2:36
+  |
+2 | #[scheduler(name = "bad", kargs = [42])]
+  |                                    ^^

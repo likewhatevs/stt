@@ -1,0 +1,5 @@
+error: expected string literal in flag args
+ --> tests/compile_fail/derive_flag_args_non_string.rs:5:20
+  |
+5 |     #[flag(args = [42])]
+  |                    ^^

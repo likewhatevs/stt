@@ -1,0 +1,5 @@
+error: expected string literal in sched_args
+ --> tests/compile_fail/derive_sched_args_non_string.rs:2:41
+  |
+2 | #[scheduler(name = "bad", sched_args = [42])]
+  |                                         ^^
