@@ -106,7 +106,6 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
             sidecars.push(sc);
         }
     }
-    // Recurse one level for gauntlet per-job subdirectories.
     for sub in subdirs {
         if let Ok(entries) = std::fs::read_dir(&sub) {
             for entry in entries.flatten() {
@@ -1556,7 +1555,6 @@ fn run_ktstr_test_inner(
         entry.name.to_string(),
     ];
 
-    // Build cmdline: base args + sysctls (as sysctl.key=value) + kargs.
     let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
     for s in entry.scheduler.sysctls {
         cmdline_parts.push(format!("sysctl.{}={}", s.key, s.value));
@@ -1616,8 +1614,6 @@ fn run_ktstr_test_inner(
         builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
     }
 
-    // Merge scheduler args: cgroup_parent injection + scheduler sched_args +
-    // per-test extra_sched_args + flag-derived args.
     let mut sched_args: Vec<String> = Vec::new();
     if let Some(cgroup_path) = entry.scheduler.cgroup_parent {
         validate_cgroup_parent(cgroup_path);
@@ -2224,7 +2220,6 @@ fn attempt_auto_repro(
         probe_arg,
     ];
 
-    // Build cmdline: base args + sysctls + kargs (same as first VM).
     let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
     for s in entry.scheduler.sysctls {
         cmdline_parts.push(format!("sysctl.{}={}", s.key, s.value));
@@ -2269,7 +2264,6 @@ fn attempt_auto_repro(
         builder = builder.scheduler_binary(sched_path);
     }
 
-    // Merge scheduler args: cgroup_parent + scheduler sched_args + per-test.
     {
         let mut args: Vec<String> = Vec::new();
         if let Some(cgroup_path) = entry.scheduler.cgroup_parent {

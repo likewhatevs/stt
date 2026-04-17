@@ -112,7 +112,6 @@ fn download_stable_tarball(
         .unpack(dest_dir)
         .map_err(|e| format!("extract tarball: {e}"))?;
 
-    // Tarballs extract to linux-{version}/ subdirectory.
     let source_dir = dest_dir.join(format!("linux-{version}"));
     if !source_dir.is_dir() {
         return Err(format!(
@@ -146,7 +145,6 @@ fn download_rc_tarball(version: &str, dest_dir: &Path, cli_label: &str) -> Resul
         .unpack(dest_dir)
         .map_err(|e| format!("extract tarball: {e}"))?;
 
-    // RC tarballs extract to linux-{version}/ subdirectory.
     let source_dir = dest_dir.join(format!("linux-{version}"));
     if !source_dir.is_dir() {
         return Err(format!(
@@ -401,7 +399,6 @@ pub fn git_clone(
         )
         .map_err(|e| format!("checkout: {e}"))?;
 
-    // Extract the short commit hash from HEAD.
     let repo = gix::open(&clone_dir).map_err(|e| format!("open cloned repo: {e}"))?;
     let head = repo.head_id().map_err(|e| format!("read HEAD: {e}"))?;
     let short_hash = format!("{}", head).chars().take(7).collect::<String>();

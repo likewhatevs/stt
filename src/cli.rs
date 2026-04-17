@@ -563,7 +563,6 @@ pub fn kernel_build_pipeline(
     let source_dir = &acquired.source_dir;
     let (arch, image_name) = crate::fetch::arch_info();
 
-    // Clean step (local source only).
     if clean {
         if !is_local_source {
             eprintln!(
@@ -575,7 +574,6 @@ pub fn kernel_build_pipeline(
         }
     }
 
-    // Configure.
     if !has_sched_ext(source_dir) {
         let sp = Spinner::start("Configuring kernel...");
         let result = configure_kernel(source_dir, EMBEDDED_KCONFIG);
@@ -587,7 +585,6 @@ pub fn kernel_build_pipeline(
         result?;
     }
 
-    // Build.
     let sp = Spinner::start("Building kernel...");
     let result = make_kernel_with_output(source_dir, Some(&sp));
     if result.is_err() {
@@ -657,7 +654,6 @@ pub fn kernel_build_pipeline(
         });
     }
 
-    // Compute config hash.
     let config_path = source_dir.join(".config");
     let config_hash = if config_path.exists() {
         let data = std::fs::read(&config_path)?;
