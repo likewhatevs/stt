@@ -45,8 +45,8 @@ fn verbose() -> bool {
 /// Test result sidecar written to KTSTR_SIDECAR_DIR for post-run analysis.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SidecarResult {
-    /// Fully qualified test name (matches `KtstrTestEntry::name` and
-    /// the nextest path).
+    /// Fully qualified test name (matches `KtstrTestEntry::name`,
+    /// the bare function name without the `ktstr/` nextest prefix).
     pub test_name: String,
     /// Rendered topology label (e.g. `1n2l4c1t`) for the variant this
     /// sidecar describes.
@@ -1042,7 +1042,7 @@ fn list_tests_all(ignored_only: bool) {
         }
 
         if !ignored_only || is_ignored(entry) {
-            println!("{}: test", entry.name);
+            println!("ktstr/{}: test", entry.name);
         }
 
         // Host-only tests run on the host without a VM -- gauntlet
@@ -1114,7 +1114,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
         // Base test
         if !ignored_only || base_ignored {
             candidates.push(TestCandidate {
-                name: format!("{}: test", entry.name),
+                name: format!("ktstr/{}: test", entry.name),
                 features: extract_features(entry, &base_topo, &[], false, entry.name),
                 estimated_secs: estimate_duration(entry, &base_topo),
             });
@@ -1186,14 +1186,16 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
 
 /// Parse a nextest-style test name and run it.
 ///
-/// Handles both base tests (`entry.name`) and gauntlet variants
-/// (`gauntlet/{name}/{preset}/{profile}`). Returns an exit code.
+/// Handles base tests (`ktstr/{name}`), gauntlet variants
+/// (`gauntlet/{name}/{preset}/{profile}`), and bare names
+/// (backward compat). Returns an exit code.
 fn run_named_test(test_name: &str) -> i32 {
     if let Some(rest) = test_name.strip_prefix("gauntlet/") {
         return run_gauntlet_test(rest);
     }
 
-    let entry = match find_test(test_name) {
+    let bare_name = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
+    let entry = match find_test(bare_name) {
         Some(e) => e,
         None => {
             eprintln!("unknown test: {test_name}");
@@ -1363,7 +1365,9 @@ pub fn analyze_sidecars(dir: Option<&std::path::Path>) -> String {
 /// Called automatically by [`ktstr_test_early_dispatch`] when running
 /// under nextest. Not intended for direct use.
 ///
-/// - `--list --format terse`: output `name: test\n` for each test.
+/// - `--list --format terse`: output `ktstr/{name}: test\n` for base
+///   tests and `gauntlet/{name}/{preset}/{profile}: test\n` for
+///   gauntlet variants.
 /// - `--exact NAME --nocapture`: run the named test, exit 0/1.
 pub fn ktstr_main() -> ! {
     let args: Vec<String> = std::env::args().collect();
