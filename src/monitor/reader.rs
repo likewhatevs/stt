@@ -333,12 +333,21 @@ pub(crate) fn read_event_stats(
     ev: &ScxEventOffsets,
 ) -> ScxEventCounters {
     let base = pcpu_pa + ev.event_stats_off as u64;
+    let read_opt = |off: Option<usize>| off.map(|o| mem.read_i64(base, o)).unwrap_or(0);
     ScxEventCounters {
         select_cpu_fallback: mem.read_i64(base, ev.ev_select_cpu_fallback),
         dispatch_local_dsq_offline: mem.read_i64(base, ev.ev_dispatch_local_dsq_offline),
         dispatch_keep_last: mem.read_i64(base, ev.ev_dispatch_keep_last),
         enq_skip_exiting: mem.read_i64(base, ev.ev_enq_skip_exiting),
         enq_skip_migration_disabled: mem.read_i64(base, ev.ev_enq_skip_migration_disabled),
+        reenq_immed: read_opt(ev.ev_reenq_immed),
+        reenq_local_repeat: read_opt(ev.ev_reenq_local_repeat),
+        refill_slice_dfl: read_opt(ev.ev_refill_slice_dfl),
+        bypass_duration: read_opt(ev.ev_bypass_duration),
+        bypass_dispatch: read_opt(ev.ev_bypass_dispatch),
+        bypass_activate: read_opt(ev.ev_bypass_activate),
+        insert_not_owned: read_opt(ev.ev_insert_not_owned),
+        sub_bypass_dispatch: read_opt(ev.ev_sub_bypass_dispatch),
     }
 }
 
@@ -1235,6 +1244,14 @@ mod tests {
             ev_dispatch_keep_last: 16,
             ev_enq_skip_exiting: 24,
             ev_enq_skip_migration_disabled: 32,
+            ev_reenq_immed: None,
+            ev_reenq_local_repeat: None,
+            ev_refill_slice_dfl: None,
+            ev_bypass_duration: None,
+            ev_bypass_dispatch: None,
+            ev_bypass_activate: None,
+            ev_insert_not_owned: None,
+            ev_sub_bypass_dispatch: None,
         }
     }
 
@@ -1284,6 +1301,23 @@ mod tests {
         let stats = read_event_stats(&mem, 0, &ev);
         assert_eq!(stats.select_cpu_fallback, 0);
         assert_eq!(stats.dispatch_local_dsq_offline, 0);
+    }
+
+    #[test]
+    fn read_event_stats_optional_fields() {
+        let mut ev = test_event_offsets();
+        // Place bypass_activate at offset 40 (after the 5 mandatory fields).
+        ev.ev_bypass_activate = Some(40);
+        let mut buf = [0u8; 48];
+        let val: i64 = 999;
+        buf[40..48].copy_from_slice(&val.to_ne_bytes());
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let stats = read_event_stats(&mem, 0, &ev);
+        assert_eq!(stats.bypass_activate, 999);
+        // Fields without offsets remain 0.
+        assert_eq!(stats.reenq_immed, 0);
+        assert_eq!(stats.bypass_duration, 0);
+        assert_eq!(stats.sub_bypass_dispatch, 0);
     }
 
     #[test]

@@ -122,6 +122,30 @@ pub struct ScxEventOffsets {
     pub ev_enq_skip_exiting: usize,
     /// Offset of `SCX_EV_ENQ_SKIP_MIGRATION_DISABLED` within `struct scx_event_stats`.
     pub ev_enq_skip_migration_disabled: usize,
+    /// Offset of `SCX_EV_REENQ_IMMED` within `struct scx_event_stats`.
+    /// None on kernels that predate this field.
+    pub ev_reenq_immed: Option<usize>,
+    /// Offset of `SCX_EV_REENQ_LOCAL_REPEAT` within `struct scx_event_stats`.
+    /// None on kernels that predate this field.
+    pub ev_reenq_local_repeat: Option<usize>,
+    /// Offset of `SCX_EV_REFILL_SLICE_DFL` within `struct scx_event_stats`.
+    /// None on kernels that predate this field.
+    pub ev_refill_slice_dfl: Option<usize>,
+    /// Offset of `SCX_EV_BYPASS_DURATION` within `struct scx_event_stats`.
+    /// None on kernels that predate this field.
+    pub ev_bypass_duration: Option<usize>,
+    /// Offset of `SCX_EV_BYPASS_DISPATCH` within `struct scx_event_stats`.
+    /// None on kernels that predate this field.
+    pub ev_bypass_dispatch: Option<usize>,
+    /// Offset of `SCX_EV_BYPASS_ACTIVATE` within `struct scx_event_stats`.
+    /// None on kernels that predate this field.
+    pub ev_bypass_activate: Option<usize>,
+    /// Offset of `SCX_EV_INSERT_NOT_OWNED` within `struct scx_event_stats`.
+    /// None on kernels that predate this field.
+    pub ev_insert_not_owned: Option<usize>,
+    /// Offset of `SCX_EV_SUB_BYPASS_DISPATCH` within `struct scx_event_stats`.
+    /// None on kernels that predate this field.
+    pub ev_sub_bypass_dispatch: Option<usize>,
 }
 
 impl KernelOffsets {
@@ -223,6 +247,24 @@ fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
         "SCX_EV_ENQ_SKIP_MIGRATION_DISABLED",
     )?;
 
+    let ev_reenq_immed = member_byte_offset(btf, &event_stats_struct, "SCX_EV_REENQ_IMMED").ok();
+    let ev_reenq_local_repeat =
+        member_byte_offset(btf, &event_stats_struct, "SCX_EV_REENQ_LOCAL_REPEAT").ok();
+    let ev_refill_slice_dfl =
+        member_byte_offset(btf, &event_stats_struct, "SCX_EV_REFILL_SLICE_DFL")
+            .or_else(|_| member_byte_offset(btf, &event_stats_struct, "SCX_EV_ENQ_SLICE_DFL"))
+            .ok();
+    let ev_bypass_duration =
+        member_byte_offset(btf, &event_stats_struct, "SCX_EV_BYPASS_DURATION").ok();
+    let ev_bypass_dispatch =
+        member_byte_offset(btf, &event_stats_struct, "SCX_EV_BYPASS_DISPATCH").ok();
+    let ev_bypass_activate =
+        member_byte_offset(btf, &event_stats_struct, "SCX_EV_BYPASS_ACTIVATE").ok();
+    let ev_insert_not_owned =
+        member_byte_offset(btf, &event_stats_struct, "SCX_EV_INSERT_NOT_OWNED").ok();
+    let ev_sub_bypass_dispatch =
+        member_byte_offset(btf, &event_stats_struct, "SCX_EV_SUB_BYPASS_DISPATCH").ok();
+
     Ok(ScxEventOffsets {
         percpu_ptr_off,
         event_stats_off,
@@ -231,6 +273,14 @@ fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
         ev_dispatch_keep_last,
         ev_enq_skip_exiting,
         ev_enq_skip_migration_disabled,
+        ev_reenq_immed,
+        ev_reenq_local_repeat,
+        ev_refill_slice_dfl,
+        ev_bypass_duration,
+        ev_bypass_dispatch,
+        ev_bypass_activate,
+        ev_insert_not_owned,
+        ev_sub_bypass_dispatch,
     })
 }
 
@@ -914,13 +964,28 @@ mod tests {
         // Event offsets are optional — only assert if present.
         if let Some(ev) = &offsets.event_offsets {
             // All event counter fields are s64, so offsets must differ.
-            let all = [
+            let mut all = vec![
                 ev.ev_select_cpu_fallback,
                 ev.ev_dispatch_local_dsq_offline,
                 ev.ev_dispatch_keep_last,
                 ev.ev_enq_skip_exiting,
                 ev.ev_enq_skip_migration_disabled,
             ];
+            for off in [
+                ev.ev_reenq_immed,
+                ev.ev_reenq_local_repeat,
+                ev.ev_refill_slice_dfl,
+                ev.ev_bypass_duration,
+                ev.ev_bypass_dispatch,
+                ev.ev_bypass_activate,
+                ev.ev_insert_not_owned,
+                ev.ev_sub_bypass_dispatch,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                all.push(off);
+            }
             for i in 0..all.len() {
                 for j in (i + 1)..all.len() {
                     assert_ne!(all[i], all[j], "event counter offsets must be distinct");

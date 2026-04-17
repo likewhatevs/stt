@@ -1780,6 +1780,7 @@ mod tests {
                     keep_last_rate: 0.2,
                     total_enq_skip_exiting: 0,
                     total_enq_skip_migration_disabled: 0,
+                    ..Default::default()
                 }),
                 schedstat_deltas: None,
                 prog_stats_deltas: None,

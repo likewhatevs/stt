@@ -15,7 +15,10 @@ from the guest kernel. It reads per-CPU runqueue structures to extract:
 - `local_dsq_depth` -- scx local dispatch queue depth
 - `scx_flags` -- sched_ext flags for each CPU
 - scx event counters (fallback, keep-last, offline dispatch,
-  skip-exiting, skip-migration-disabled)
+  skip-exiting, skip-migration-disabled, reenq-immed,
+  reenq-local-repeat, refill-slice-dfl, bypass-duration,
+  bypass-dispatch, bypass-activate, insert-not-owned,
+  sub-bypass-dispatch)
 
 When `CONFIG_SCHEDSTATS` is enabled, the monitor also reads per-CPU
 `struct rq` schedstat fields (run_delay, pcount, sched_count,

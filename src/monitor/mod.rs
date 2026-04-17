@@ -484,6 +484,30 @@ pub struct ScxEventCounters {
     pub enq_skip_exiting: i64,
     /// `SCX_EV_ENQ_SKIP_MIGRATION_DISABLED`: enqueue skipped because migration is disabled.
     pub enq_skip_migration_disabled: i64,
+    /// `SCX_EV_REENQ_IMMED`: task re-enqueued because CPU was unavailable for immediate execution.
+    #[serde(default)]
+    pub reenq_immed: i64,
+    /// `SCX_EV_REENQ_LOCAL_REPEAT`: recursive local DSQ re-enqueue from `SCX_ENQ_IMMED` race.
+    #[serde(default)]
+    pub reenq_local_repeat: i64,
+    /// `SCX_EV_REFILL_SLICE_DFL`: time slice refilled with `SCX_SLICE_DFL`.
+    #[serde(default)]
+    pub refill_slice_dfl: i64,
+    /// `SCX_EV_BYPASS_DURATION`: total bypass mode duration in nanoseconds.
+    #[serde(default)]
+    pub bypass_duration: i64,
+    /// `SCX_EV_BYPASS_DISPATCH`: tasks dispatched during bypass mode.
+    #[serde(default)]
+    pub bypass_dispatch: i64,
+    /// `SCX_EV_BYPASS_ACTIVATE`: bypass mode activations.
+    #[serde(default)]
+    pub bypass_activate: i64,
+    /// `SCX_EV_INSERT_NOT_OWNED`: attempts to insert a non-owned task into a DSQ.
+    #[serde(default)]
+    pub insert_not_owned: i64,
+    /// `SCX_EV_SUB_BYPASS_DISPATCH`: tasks from bypassing descendants scheduled from sub_bypass_dsq.
+    #[serde(default)]
+    pub sub_bypass_dispatch: i64,
 }
 
 /// Aggregated monitor statistics from a set of samples.
@@ -579,6 +603,30 @@ pub struct ScxEventDeltas {
     pub total_enq_skip_exiting: i64,
     /// Total enq_skip_migration_disabled events.
     pub total_enq_skip_migration_disabled: i64,
+    /// Total reenq_immed events.
+    #[serde(default)]
+    pub total_reenq_immed: i64,
+    /// Total reenq_local_repeat events.
+    #[serde(default)]
+    pub total_reenq_local_repeat: i64,
+    /// Total refill_slice_dfl events.
+    #[serde(default)]
+    pub total_refill_slice_dfl: i64,
+    /// Total bypass_duration in nanoseconds.
+    #[serde(default)]
+    pub total_bypass_duration: i64,
+    /// Total bypass_dispatch events.
+    #[serde(default)]
+    pub total_bypass_dispatch: i64,
+    /// Total bypass_activate events.
+    #[serde(default)]
+    pub total_bypass_activate: i64,
+    /// Total insert_not_owned events.
+    #[serde(default)]
+    pub total_insert_not_owned: i64,
+    /// Total sub_bypass_dispatch events.
+    #[serde(default)]
+    pub total_sub_bypass_dispatch: i64,
 }
 
 impl MonitorSummary {
@@ -762,6 +810,14 @@ impl MonitorSummary {
             keep_last_rate,
             total_enq_skip_exiting: delta(|e| e.enq_skip_exiting),
             total_enq_skip_migration_disabled: delta(|e| e.enq_skip_migration_disabled),
+            total_reenq_immed: delta(|e| e.reenq_immed),
+            total_reenq_local_repeat: delta(|e| e.reenq_local_repeat),
+            total_refill_slice_dfl: delta(|e| e.refill_slice_dfl),
+            total_bypass_duration: delta(|e| e.bypass_duration),
+            total_bypass_dispatch: delta(|e| e.bypass_dispatch),
+            total_bypass_activate: delta(|e| e.bypass_activate),
+            total_insert_not_owned: delta(|e| e.insert_not_owned),
+            total_sub_bypass_dispatch: delta(|e| e.sub_bypass_dispatch),
         })
     }
 
@@ -2551,6 +2607,7 @@ mod tests {
                     dispatch_keep_last: kl,
                     enq_skip_exiting: exit,
                     enq_skip_migration_disabled: migdis,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }],

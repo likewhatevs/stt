@@ -2141,6 +2141,40 @@ fn format_monitor_section(
             ev.keep_last_rate,
             ev.total_dispatch_offline,
         ));
+        let mut extra = Vec::new();
+        if ev.total_reenq_immed != 0 {
+            extra.push(format!("reenq_immed={}", ev.total_reenq_immed));
+        }
+        if ev.total_reenq_local_repeat != 0 {
+            extra.push(format!(
+                "reenq_local_repeat={}",
+                ev.total_reenq_local_repeat
+            ));
+        }
+        if ev.total_refill_slice_dfl != 0 {
+            extra.push(format!("refill_slice_dfl={}", ev.total_refill_slice_dfl));
+        }
+        if ev.total_bypass_activate != 0 {
+            extra.push(format!("bypass_activate={}", ev.total_bypass_activate));
+        }
+        if ev.total_bypass_dispatch != 0 {
+            extra.push(format!("bypass_dispatch={}", ev.total_bypass_dispatch));
+        }
+        if ev.total_bypass_duration != 0 {
+            extra.push(format!("bypass_duration={}ns", ev.total_bypass_duration));
+        }
+        if ev.total_insert_not_owned != 0 {
+            extra.push(format!("insert_not_owned={}", ev.total_insert_not_owned));
+        }
+        if ev.total_sub_bypass_dispatch != 0 {
+            extra.push(format!(
+                "sub_bypass_dispatch={}",
+                ev.total_sub_bypass_dispatch
+            ));
+        }
+        if !extra.is_empty() {
+            lines.push(format!("events+: {}", extra.join(" ")));
+        }
     }
 
     if let Some(ref ss) = s.schedstat_deltas {
@@ -4982,6 +5016,7 @@ mod tests {
                     keep_last_rate: 0.2,
                     total_enq_skip_exiting: 0,
                     total_enq_skip_migration_disabled: 0,
+                    ..Default::default()
                 }),
                 schedstat_deltas: None,
                 ..Default::default()
