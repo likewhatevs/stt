@@ -72,6 +72,10 @@ jobs:
 
   test-arm64:
     runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel-version: ['6.12', '7.0']
     env:
       RUSTC_WRAPPER: ""
       KTSTR_GHA_CACHE: "1"
@@ -87,16 +91,20 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cache/ktstr/kernels
-          key: ktstr-kernels-arm64-${{ hashFiles('ktstr.kconfig') }}
-          restore-keys: ktstr-kernels-arm64-
+          key: ktstr-kernels-arm64-${{ matrix.kernel-version }}-${{ hashFiles('ktstr.kconfig') }}
+          restore-keys: ktstr-kernels-arm64-${{ matrix.kernel-version }}-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr -- ktstr kernel build
+        run: cargo run --bin cargo-ktstr -- ktstr kernel build ${{ matrix.kernel-version }}
       - name: Build scx-ktstr binary
         run: cargo build -p scx-ktstr
       - run: cargo nextest run --workspace --profile ci --features integration
+        env:
+          KTSTR_KERNEL: ${{ matrix.kernel-version }}
       - name: Test statistics
         if: ${{ !cancelled() }}
         run: cargo run --bin cargo-ktstr -- ktstr test-stats
+        env:
+          KTSTR_KERNEL: ${{ matrix.kernel-version }}
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
