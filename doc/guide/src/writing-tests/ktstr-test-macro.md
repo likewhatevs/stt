@@ -162,11 +162,8 @@ example.
 | `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
 | `bpf_map_write = CONST` | `None` | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads |
 
-`KtstrTestEntry` also carries a `host_only` field, but it is not an
-accepted `#[ktstr_test]` attribute: the macro always emits
-`host_only: false`. Tests that run on the host instead of inside a
-VM must be registered manually via a `KtstrTestEntry` literal added
-to `KTSTR_TESTS`.
+Set `host_only = true` to run the test function directly on the host
+instead of inside a VM. The default is `false`.
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
 what `performance_mode` enables, prerequisites, and validation behavior.

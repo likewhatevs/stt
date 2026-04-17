@@ -45,10 +45,8 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `scheduler = PATH` — path to a `const Scheduler` (default
 ///     `Scheduler::EEVDF`, which runs without an scx scheduler)
 ///   - `auto_repro = bool` (default: `true`)
-///
-/// Fields that only exist on manually constructed `KtstrTestEntry`
-/// literals (e.g. `host_only`) are NOT accepted by this macro and
-/// will error as unknown attributes.
+///   - `host_only = bool` (default: `false`) — run the test function
+///     on the host instead of inside a VM
 #[proc_macro_attribute]
 pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -109,6 +107,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut workers_per_cgroup: u32 = 2;
     let mut bpf_map_write: Option<syn::Path> = None;
     let mut expect_err: bool = false;
+    let mut host_only: bool = false;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -157,7 +156,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         bpf_map_write = Some(p);
                     }
                     "auto_repro" | "not_starved" | "isolation" | "performance_mode"
-                    | "requires_smt" | "expect_err" | "fail_on_stall" => {
+                    | "requires_smt" | "expect_err" | "fail_on_stall" | "host_only" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -183,6 +182,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                             "expect_err" => expect_err = lit_bool.value(),
                             "fail_on_stall" => fail_on_stall = Some(lit_bool.value()),
+                            "host_only" => host_only = lit_bool.value(),
                             _ => unreachable!(),
                         }
                     }
@@ -780,7 +780,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             duration: ::std::time::Duration::from_secs(#duration_s),
             workers_per_cgroup: #workers_per_cgroup,
             expect_err: #expect_err,
-            host_only: false,
+            host_only: #host_only,
         };
 
         #[test]

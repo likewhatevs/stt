@@ -29,6 +29,14 @@ fn default_attrs_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+/// ktstr_test with host_only = true to verify the macro accepts the
+/// attribute and wires it into KtstrTestEntry.host_only.
+#[ktstr_test(host_only = true)]
+fn host_only_attr_compile(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
 /// Verify resolve_func_ip returns a real nonzero address inside the VM.
 /// On the host, kptr_restrict or kernel lockdown hides addresses.
 #[cfg(feature = "integration")]
@@ -88,6 +96,14 @@ fn entry_default_fields() {
     assert_eq!(entry.constraints.max_llcs, Some(12));
     assert_eq!(entry.constraints.max_numa_nodes, Some(1));
     assert_eq!(entry.constraints.max_cpus, Some(192));
+    assert!(!entry.host_only);
+}
+
+/// Verify that host_only = true is threaded into KtstrTestEntry.
+#[test]
+fn entry_host_only_attr() {
+    let entry = ktstr::test_support::find_test("host_only_attr_compile").unwrap();
+    assert!(entry.host_only);
 }
 
 /// Scheduler with the flags referenced by flags_attrs_compile.
