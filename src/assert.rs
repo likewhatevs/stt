@@ -4,6 +4,13 @@
 //! - [`AssertResult`] -- pass/fail status with diagnostics and statistics
 //! - [`Assert`] -- composable assertion config (worker + monitor checks)
 //! - [`ScenarioStats`] / [`CgroupStats`] -- aggregated telemetry
+//! - [`NumaMapsEntry`] -- parsed `/proc/self/numa_maps` VMA entry
+//!
+//! NUMA assertion functions:
+//! - [`parse_numa_maps`] -- parse numa_maps content into per-VMA entries
+//! - [`page_locality`] -- compute page locality fraction from entries
+//! - [`parse_vmstat_numa_pages_migrated`] -- extract vmstat migration counter
+//! - [`assert_page_locality`] / [`assert_cross_node_migration`] -- threshold checks
 //!
 //! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->
 //! `Scheduler.assert` -> per-test `assert`.
@@ -13,6 +20,99 @@
 
 use crate::workload::WorkerReport;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Per-VMA entry parsed from `/proc/self/numa_maps`.
+#[derive(Debug, Clone, Default)]
+pub struct NumaMapsEntry {
+    /// Virtual address of the VMA.
+    pub addr: u64,
+    /// Per-node page counts (node_id -> page_count).
+    pub node_pages: BTreeMap<usize, u64>,
+}
+
+/// Parse `/proc/self/numa_maps` content into per-VMA entries.
+///
+/// Each line has the format:
+///   `<hex_addr> <policy> [key=val ...]`
+/// where per-node page counts appear as `N<node>=<count>`.
+pub fn parse_numa_maps(content: &str) -> Vec<NumaMapsEntry> {
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let addr = match parts.next().and_then(|s| u64::from_str_radix(s, 16).ok()) {
+            Some(a) => a,
+            None => continue,
+        };
+        // Skip policy field.
+        let _ = parts.next();
+
+        let mut entry = NumaMapsEntry {
+            addr,
+            ..Default::default()
+        };
+
+        for token in parts {
+            if let Some(rest) = token.strip_prefix('N')
+                && let Some((node_str, count_str)) = rest.split_once('=')
+                && let (Ok(node), Ok(count)) = (node_str.parse::<usize>(), count_str.parse::<u64>())
+            {
+                *entry.node_pages.entry(node).or_insert(0) += count;
+            }
+        }
+
+        if !entry.node_pages.is_empty() {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// Compute page locality fraction from parsed numa_maps entries.
+///
+/// Returns the fraction of pages residing on any node in
+/// `expected_nodes` (0.0-1.0). Returns 1.0 when no pages are observed
+/// (vacuously local). The expected node set is derived from the
+/// worker's [`MemPolicy`](crate::workload::MemPolicy) at evaluation
+/// time.
+pub fn page_locality(entries: &[NumaMapsEntry], expected_nodes: &BTreeSet<usize>) -> f64 {
+    let mut total: u64 = 0;
+    let mut local: u64 = 0;
+    for entry in entries {
+        for (&node, &count) in &entry.node_pages {
+            total += count;
+            if expected_nodes.contains(&node) {
+                local += count;
+            }
+        }
+    }
+    if total > 0 {
+        local as f64 / total as f64
+    } else {
+        1.0
+    }
+}
+
+/// Extract `numa_pages_migrated` from `/proc/vmstat` content.
+///
+/// Returns `None` if the counter is not present. The counter is
+/// cumulative; callers diff pre- and post-workload snapshots to
+/// get migration count during the test.
+pub fn parse_vmstat_numa_pages_migrated(content: &str) -> Option<u64> {
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("numa_pages_migrated") {
+            let rest = rest.trim();
+            if let Ok(v) = rest.parse::<u64>() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
 
 fn gap_threshold_ms() -> u64 {
     // Unoptimized debug builds have higher scheduling overhead.
@@ -98,6 +198,15 @@ pub struct CgroupStats {
     /// Worst schedstat run delay across workers (microseconds).
     #[serde(default)]
     pub worst_run_delay_us: f64,
+    /// Fraction of pages on the expected NUMA node(s) (0.0-1.0).
+    /// Derived from `/proc/self/numa_maps` and the worker's
+    /// [`MemPolicy`](crate::workload::MemPolicy).
+    #[serde(default)]
+    pub page_locality: f64,
+    /// Cross-node page migration ratio from `/proc/vmstat`
+    /// `numa_pages_migrated` delta divided by total allocated pages.
+    #[serde(default)]
+    pub cross_node_migration_ratio: f64,
     /// Extensible metrics for the generic comparison pipeline.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
@@ -141,6 +250,12 @@ pub struct ScenarioStats {
     /// Worst schedstat run delay across all cgroups (microseconds).
     #[serde(default)]
     pub worst_run_delay_us: f64,
+    /// Worst (lowest) page locality fraction across cgroups.
+    #[serde(default)]
+    pub worst_page_locality: f64,
+    /// Worst (highest) cross-node migration ratio across cgroups.
+    #[serde(default)]
+    pub worst_cross_node_migration_ratio: f64,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -206,6 +321,19 @@ impl AssertResult {
         // mean_run_delay: take worst across cgroups for scenario-level stat.
         if other.stats.mean_run_delay_us > self.stats.mean_run_delay_us {
             self.stats.mean_run_delay_us = other.stats.mean_run_delay_us;
+        }
+        // NUMA: worst page locality is the lowest non-zero value.
+        if other.stats.worst_page_locality > 0.0
+            && (self.stats.worst_page_locality == 0.0
+                || other.stats.worst_page_locality < self.stats.worst_page_locality)
+        {
+            self.stats.worst_page_locality = other.stats.worst_page_locality;
+        }
+        if other.stats.worst_cross_node_migration_ratio
+            > self.stats.worst_cross_node_migration_ratio
+        {
+            self.stats.worst_cross_node_migration_ratio =
+                other.stats.worst_cross_node_migration_ratio;
         }
         // Merge extensible metrics: take worst (max) value per key.
         for (k, v) in &other.stats.ext_metrics {
@@ -359,6 +487,55 @@ impl AssertPlan {
     }
 }
 
+/// Check NUMA page locality against threshold.
+///
+/// `observed` is the fraction of pages on expected nodes (0.0-1.0).
+/// `total_pages` and `local_pages` are included in diagnostics.
+pub fn assert_page_locality(
+    observed: f64,
+    min_locality: Option<f64>,
+    total_pages: u64,
+    local_pages: u64,
+) -> AssertResult {
+    let mut r = AssertResult::pass();
+    if let Some(threshold) = min_locality
+        && observed < threshold
+    {
+        r.passed = false;
+        r.details.push(format!(
+            "page locality {observed:.4} below threshold {threshold:.4} ({local_pages}/{total_pages} pages local)",
+        ));
+    }
+    r
+}
+
+/// Check cross-node page migration ratio against threshold.
+///
+/// `migrated_pages` is the delta of `/proc/vmstat` `numa_pages_migrated`
+/// between pre- and post-workload snapshots. `total_pages` is the total
+/// allocated pages from numa_maps.
+pub fn assert_cross_node_migration(
+    migrated_pages: u64,
+    total_pages: u64,
+    max_ratio: Option<f64>,
+) -> AssertResult {
+    let mut r = AssertResult::pass();
+    if let Some(threshold) = max_ratio {
+        let ratio = if total_pages > 0 {
+            migrated_pages as f64 / total_pages as f64
+        } else {
+            0.0
+        };
+        if ratio > threshold {
+            r.passed = false;
+            r.details.push(format!(
+                "cross-node migration ratio {ratio:.4} exceeds threshold {threshold:.4} ({migrated_pages}/{total_pages} pages migrated)",
+            ));
+        }
+    }
+    r
+}
+
 impl Default for AssertPlan {
     fn default() -> Self {
         Self::new()
@@ -462,6 +639,18 @@ pub struct Assert {
     /// Max `keep_last` rate (events/sec). Fails if the scx event
     /// counter delta over the run exceeds this rate.
     pub max_keep_last_rate: Option<f64>,
+
+    // NUMA checks
+    /// Minimum fraction of pages on the expected NUMA node(s) (0.0-1.0).
+    /// Expected nodes are derived from the worker's
+    /// [`MemPolicy`](crate::workload::MemPolicy) at evaluation time.
+    /// Fails if the observed locality fraction falls below this.
+    pub min_page_locality: Option<f64>,
+    /// Maximum ratio of NUMA-node-migrated pages to total allocated
+    /// pages (0.0-1.0). Distinct from [`max_migration_ratio`](Self::max_migration_ratio)
+    /// which measures CPU migrations per iteration. Fails if the
+    /// observed migration ratio exceeds this.
+    pub max_cross_node_migration_ratio: Option<f64>,
 }
 
 impl Assert {
@@ -483,6 +672,8 @@ impl Assert {
         sustained_samples: None,
         max_fallback_rate: None,
         max_keep_last_rate: None,
+        min_page_locality: None,
+        max_cross_node_migration_ratio: None,
     };
 
     /// Default checks: not_starved enabled, monitor thresholds
@@ -507,6 +698,8 @@ impl Assert {
             sustained_samples: Some(MonitorThresholds::DEFAULT.sustained_samples),
             max_fallback_rate: Some(MonitorThresholds::DEFAULT.max_fallback_rate),
             max_keep_last_rate: Some(MonitorThresholds::DEFAULT.max_keep_last_rate),
+            min_page_locality: None,
+            max_cross_node_migration_ratio: None,
         }
     }
 
@@ -593,6 +786,16 @@ impl Assert {
         self
     }
 
+    pub const fn min_page_locality(mut self, v: f64) -> Self {
+        self.min_page_locality = Some(v);
+        self
+    }
+
+    pub const fn max_cross_node_migration_ratio(mut self, v: f64) -> Self {
+        self.max_cross_node_migration_ratio = Some(v);
+        self
+    }
+
     /// True when any worker-level check field is `Some`.
     pub const fn has_worker_checks(&self) -> bool {
         self.not_starved.is_some()
@@ -605,6 +808,8 @@ impl Assert {
             || self.max_wake_latency_cv.is_some()
             || self.min_iteration_rate.is_some()
             || self.max_migration_ratio.is_some()
+            || self.min_page_locality.is_some()
+            || self.max_cross_node_migration_ratio.is_some()
     }
 
     /// Merge `other` on top of `self`. Each `Some` field in `other`
@@ -679,6 +884,14 @@ impl Assert {
                 Some(v) => Some(v),
                 None => self.max_keep_last_rate,
             },
+            min_page_locality: match other.min_page_locality {
+                Some(v) => Some(v),
+                None => self.min_page_locality,
+            },
+            max_cross_node_migration_ratio: match other.max_cross_node_migration_ratio {
+                Some(v) => Some(v),
+                None => self.max_cross_node_migration_ratio,
+            },
         }
     }
 
@@ -705,6 +918,35 @@ impl Assert {
         cpuset: Option<&BTreeSet<usize>>,
     ) -> AssertResult {
         self.worker_plan().assert_cgroup(reports, cpuset)
+    }
+
+    /// Run NUMA page locality check.
+    ///
+    /// `observed` is the fraction of pages on expected nodes (0.0-1.0).
+    /// `total_pages` and `local_pages` are for diagnostics.
+    pub fn assert_page_locality(
+        &self,
+        observed: f64,
+        total_pages: u64,
+        local_pages: u64,
+    ) -> AssertResult {
+        assert_page_locality(observed, self.min_page_locality, total_pages, local_pages)
+    }
+
+    /// Run cross-node migration ratio check.
+    ///
+    /// `migrated_pages` is the `/proc/vmstat` `numa_pages_migrated` delta.
+    /// `total_pages` is total allocated pages from numa_maps.
+    pub fn assert_cross_node_migration(
+        &self,
+        migrated_pages: u64,
+        total_pages: u64,
+    ) -> AssertResult {
+        assert_cross_node_migration(
+            migrated_pages,
+            total_pages,
+            self.max_cross_node_migration_ratio,
+        )
     }
 
     /// Extract `MonitorThresholds` for monitor-side evaluation.
@@ -875,6 +1117,8 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         total_iterations: total_iters,
         mean_run_delay_us: mean_run_delay,
         worst_run_delay_us: worst_run_delay,
+        page_locality: 0.0,
+        cross_node_migration_ratio: 0.0,
         ext_metrics: BTreeMap::new(),
     };
 
@@ -919,6 +1163,8 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         total_iterations: cg.total_iterations,
         mean_run_delay_us: cg.mean_run_delay_us,
         worst_run_delay_us: cg.worst_run_delay_us,
+        worst_page_locality: 0.0,
+        worst_cross_node_migration_ratio: 0.0,
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg],
     };
@@ -1128,6 +1374,8 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
             schedstat_cpu_time_ns: 0,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         }
     }
 
@@ -2224,6 +2472,8 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
             schedstat_cpu_time_ns: 0,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         }
     }
 
@@ -2597,5 +2847,366 @@ mod tests {
         assert_eq!(merged.isolation, Some(true));
         // defaults: monitor fields survive all layers.
         assert_eq!(merged.fail_on_stall, Some(true));
+    }
+
+    // -- numa_maps parsing tests --
+
+    #[test]
+    fn parse_numa_maps_basic() {
+        let content = "\
+00400000 default file=/bin/cat mapped=10 N0=8 N1=2
+00600000 default anon=5 N0=3 N1=2";
+        let entries = parse_numa_maps(content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].addr, 0x00400000);
+        assert_eq!(entries[0].node_pages[&0], 8);
+        assert_eq!(entries[0].node_pages[&1], 2);
+        assert_eq!(entries[1].addr, 0x00600000);
+        assert_eq!(entries[1].node_pages[&0], 3);
+        assert_eq!(entries[1].node_pages[&1], 2);
+    }
+
+    #[test]
+    fn parse_numa_maps_empty() {
+        assert!(parse_numa_maps("").is_empty());
+    }
+
+    #[test]
+    fn parse_numa_maps_no_node_fields() {
+        let content = "00400000 default file=/bin/cat mapped=10";
+        let entries = parse_numa_maps(content);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_numa_maps_single_node() {
+        let content = "7f000000 default anon=100 N0=100";
+        let entries = parse_numa_maps(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].node_pages[&0], 100);
+        assert_eq!(entries[0].node_pages.len(), 1);
+    }
+
+    #[test]
+    fn parse_numa_maps_high_node_ids() {
+        let content = "7f000000 default N0=10 N3=20 N7=5";
+        let entries = parse_numa_maps(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].node_pages[&0], 10);
+        assert_eq!(entries[0].node_pages[&3], 20);
+        assert_eq!(entries[0].node_pages[&7], 5);
+    }
+
+    #[test]
+    fn parse_numa_maps_malformed_lines() {
+        let content = "\
+not_hex default N0=10
+00400000 default N0=10
+ default N0=5";
+        let entries = parse_numa_maps(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].addr, 0x00400000);
+    }
+
+    // -- page_locality tests --
+
+    #[test]
+    fn page_locality_all_local() {
+        let entries = vec![NumaMapsEntry {
+            addr: 0x1000,
+            node_pages: [(0, 100)].into_iter().collect(),
+        }];
+        let expected: BTreeSet<usize> = [0].into_iter().collect();
+        let loc = page_locality(&entries, &expected);
+        assert!((loc - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn page_locality_mixed_nodes() {
+        let entries = vec![NumaMapsEntry {
+            addr: 0x1000,
+            node_pages: [(0, 80), (1, 20)].into_iter().collect(),
+        }];
+        let expected: BTreeSet<usize> = [0].into_iter().collect();
+        let loc = page_locality(&entries, &expected);
+        assert!((loc - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn page_locality_multi_expected_nodes() {
+        let entries = vec![NumaMapsEntry {
+            addr: 0x1000,
+            node_pages: [(0, 40), (1, 40), (2, 20)].into_iter().collect(),
+        }];
+        let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let loc = page_locality(&entries, &expected);
+        assert!((loc - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn page_locality_empty_entries() {
+        let expected: BTreeSet<usize> = [0].into_iter().collect();
+        let loc = page_locality(&[], &expected);
+        assert!((loc - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn page_locality_no_local_pages() {
+        let entries = vec![NumaMapsEntry {
+            addr: 0x1000,
+            node_pages: [(1, 50)].into_iter().collect(),
+        }];
+        let expected: BTreeSet<usize> = [0].into_iter().collect();
+        let loc = page_locality(&entries, &expected);
+        assert!((loc - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn page_locality_empty_expected_set() {
+        let entries = vec![NumaMapsEntry {
+            addr: 0x1000,
+            node_pages: [(0, 50)].into_iter().collect(),
+        }];
+        let loc = page_locality(&entries, &BTreeSet::new());
+        assert!((loc - 0.0).abs() < f64::EPSILON);
+    }
+
+    // -- assert_page_locality tests --
+
+    #[test]
+    fn assert_page_locality_pass() {
+        let r = assert_page_locality(0.9, Some(0.8), 100, 90);
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    #[test]
+    fn assert_page_locality_fail() {
+        let r = assert_page_locality(0.5, Some(0.8), 100, 50);
+        assert!(!r.passed);
+        assert!(r.details.iter().any(|d| d.contains("page locality")));
+    }
+
+    #[test]
+    fn assert_page_locality_no_threshold() {
+        let r = assert_page_locality(0.1, None, 100, 10);
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn assert_page_locality_exact_threshold() {
+        let r = assert_page_locality(0.8, Some(0.8), 100, 80);
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    // -- Assert NUMA builder and merge tests --
+
+    #[test]
+    fn assert_min_page_locality_setter() {
+        let v = Assert::NONE.min_page_locality(0.9);
+        assert_eq!(v.min_page_locality, Some(0.9));
+    }
+
+    #[test]
+    fn assert_merge_numa_fields() {
+        let base = Assert::NONE.min_page_locality(0.9);
+        let merged = base.merge(&Assert::NONE);
+        assert_eq!(merged.min_page_locality, Some(0.9));
+    }
+
+    #[test]
+    fn assert_merge_numa_override() {
+        let base = Assert::NONE.min_page_locality(0.9);
+        let other = Assert::NONE.min_page_locality(0.5);
+        assert_eq!(base.merge(&other).min_page_locality, Some(0.5));
+    }
+
+    #[test]
+    fn assert_numa_has_worker_checks() {
+        assert!(Assert::NONE.min_page_locality(0.8).has_worker_checks());
+    }
+
+    #[test]
+    fn assert_page_locality_method_pass() {
+        let a = Assert::NONE.min_page_locality(0.8);
+        let r = a.assert_page_locality(0.9, 100, 90);
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    #[test]
+    fn assert_page_locality_method_fail() {
+        let a = Assert::NONE.min_page_locality(0.95);
+        let r = a.assert_page_locality(0.8, 100, 80);
+        assert!(!r.passed);
+    }
+
+    // -- ScenarioStats NUMA merge tests --
+
+    #[test]
+    fn assert_result_merge_numa_worst_page_locality() {
+        let mut a = AssertResult::pass();
+        a.stats.worst_page_locality = 0.9;
+        let mut b = AssertResult::pass();
+        b.stats.worst_page_locality = 0.7;
+        a.merge(b);
+        assert!((a.stats.worst_page_locality - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn assert_result_merge_numa_zero_locality_ignored() {
+        let mut a = AssertResult::pass();
+        a.stats.worst_page_locality = 0.9;
+        let b = AssertResult::pass();
+        a.merge(b);
+        assert!((a.stats.worst_page_locality - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cgroup_stats_numa_defaults() {
+        let c = CgroupStats::default();
+        assert_eq!(c.page_locality, 0.0);
+        assert_eq!(c.cross_node_migration_ratio, 0.0);
+    }
+
+    #[test]
+    fn scenario_stats_numa_defaults() {
+        let s = ScenarioStats::default();
+        assert_eq!(s.worst_page_locality, 0.0);
+        assert_eq!(s.worst_cross_node_migration_ratio, 0.0);
+    }
+
+    // -- parse_vmstat_numa_pages_migrated tests --
+
+    #[test]
+    fn parse_vmstat_present() {
+        let content = "\
+nr_free_pages 12345
+numa_hit 100
+numa_pages_migrated 42
+numa_miss 5";
+        assert_eq!(parse_vmstat_numa_pages_migrated(content), Some(42));
+    }
+
+    #[test]
+    fn parse_vmstat_absent() {
+        let content = "nr_free_pages 12345\nnuma_hit 100";
+        assert_eq!(parse_vmstat_numa_pages_migrated(content), None);
+    }
+
+    #[test]
+    fn parse_vmstat_zero() {
+        let content = "numa_pages_migrated 0";
+        assert_eq!(parse_vmstat_numa_pages_migrated(content), Some(0));
+    }
+
+    #[test]
+    fn parse_vmstat_large_value() {
+        let content = "numa_pages_migrated 9999999999";
+        assert_eq!(parse_vmstat_numa_pages_migrated(content), Some(9999999999));
+    }
+
+    #[test]
+    fn parse_vmstat_empty() {
+        assert_eq!(parse_vmstat_numa_pages_migrated(""), None);
+    }
+
+    #[test]
+    fn parse_vmstat_malformed_value() {
+        let content = "numa_pages_migrated abc";
+        assert_eq!(parse_vmstat_numa_pages_migrated(content), None);
+    }
+
+    // -- assert_cross_node_migration tests --
+
+    #[test]
+    fn assert_cross_node_migration_pass() {
+        let r = assert_cross_node_migration(5, 100, Some(0.1));
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    #[test]
+    fn assert_cross_node_migration_fail() {
+        let r = assert_cross_node_migration(20, 100, Some(0.1));
+        assert!(!r.passed);
+        assert!(r.details.iter().any(|d| d.contains("cross-node migration")));
+    }
+
+    #[test]
+    fn assert_cross_node_migration_no_threshold() {
+        let r = assert_cross_node_migration(50, 100, None);
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn assert_cross_node_migration_exact_threshold() {
+        let r = assert_cross_node_migration(10, 100, Some(0.1));
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    #[test]
+    fn assert_cross_node_migration_zero_pages() {
+        let r = assert_cross_node_migration(0, 0, Some(0.1));
+        assert!(r.passed, "zero total pages should pass");
+    }
+
+    // -- Assert cross-node migration builder/merge --
+
+    #[test]
+    fn assert_max_cross_node_migration_ratio_setter() {
+        let v = Assert::NONE.max_cross_node_migration_ratio(0.05);
+        assert_eq!(v.max_cross_node_migration_ratio, Some(0.05));
+    }
+
+    #[test]
+    fn assert_merge_cross_node_migration() {
+        let base = Assert::NONE.max_cross_node_migration_ratio(0.1);
+        let other = Assert::NONE.max_cross_node_migration_ratio(0.05);
+        assert_eq!(
+            base.merge(&other).max_cross_node_migration_ratio,
+            Some(0.05)
+        );
+    }
+
+    #[test]
+    fn assert_merge_cross_node_migration_preserves() {
+        let base = Assert::NONE.max_cross_node_migration_ratio(0.1);
+        assert_eq!(
+            base.merge(&Assert::NONE).max_cross_node_migration_ratio,
+            Some(0.1)
+        );
+    }
+
+    #[test]
+    fn assert_cross_node_migration_has_worker_checks() {
+        assert!(
+            Assert::NONE
+                .max_cross_node_migration_ratio(0.1)
+                .has_worker_checks()
+        );
+    }
+
+    #[test]
+    fn assert_cross_node_migration_method_pass() {
+        let a = Assert::NONE.max_cross_node_migration_ratio(0.1);
+        let r = a.assert_cross_node_migration(5, 100);
+        assert!(r.passed, "{:?}", r.details);
+    }
+
+    #[test]
+    fn assert_cross_node_migration_method_fail() {
+        let a = Assert::NONE.max_cross_node_migration_ratio(0.05);
+        let r = a.assert_cross_node_migration(20, 100);
+        assert!(!r.passed);
+    }
+
+    // -- ScenarioStats cross-node migration merge --
+
+    #[test]
+    fn assert_result_merge_worst_cross_node_migration() {
+        let mut a = AssertResult::pass();
+        a.stats.worst_cross_node_migration_ratio = 0.05;
+        let mut b = AssertResult::pass();
+        b.stats.worst_cross_node_migration_ratio = 0.15;
+        a.merge(b);
+        assert!((a.stats.worst_cross_node_migration_ratio - 0.15).abs() < f64::EPSILON);
     }
 }

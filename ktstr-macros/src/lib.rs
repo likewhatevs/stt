@@ -84,6 +84,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut max_wake_latency_cv: Option<f64> = None;
     let mut min_iteration_rate: Option<f64> = None;
     let mut max_migration_ratio: Option<f64> = None;
+    let mut min_page_locality: Option<f64> = None;
+    let mut max_cross_node_migration_ratio: Option<f64> = None;
     let mut extra_sched_args: Vec<String> = Vec::new();
     let mut required_flags: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut excluded_flags: Vec<proc_macro2::TokenStream> = Vec::new();
@@ -349,7 +351,9 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "min_work_rate"
                     | "max_wake_latency_cv"
                     | "min_iteration_rate"
-                    | "max_migration_ratio" => {
+                    | "max_migration_ratio"
+                    | "min_page_locality"
+                    | "max_cross_node_migration_ratio" => {
                         let lit_float = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Float(lf),
@@ -377,6 +381,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "max_wake_latency_cv" => max_wake_latency_cv = Some(v),
                             "min_iteration_rate" => min_iteration_rate = Some(v),
                             "max_migration_ratio" => max_migration_ratio = Some(v),
+                            "min_page_locality" => min_page_locality = Some(v),
+                            "max_cross_node_migration_ratio" => {
+                                max_cross_node_migration_ratio = Some(v)
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -454,7 +462,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only"),
+                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only"),
                         )
                         .to_compile_error()
                         .into();
@@ -647,6 +655,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let wake_cv_tokens = option_tokens(&max_wake_latency_cv);
     let iter_rate_tokens = option_tokens(&min_iteration_rate);
     let mig_ratio_tokens = option_tokens(&max_migration_ratio);
+    let page_locality_tokens = option_tokens(&min_page_locality);
+    let cross_node_mig_tokens = option_tokens(&max_cross_node_migration_ratio);
 
     let bpf_map_write_tokens = match &bpf_map_write {
         Some(p) => quote! { Some(&#p) },
@@ -772,6 +782,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 sustained_samples: #sustained_tokens,
                 max_fallback_rate: #fallback_rate_tokens,
                 max_keep_last_rate: #keep_last_rate_tokens,
+                min_page_locality: #page_locality_tokens,
+                max_cross_node_migration_ratio: #cross_node_mig_tokens,
             },
             extra_sched_args: &[#(#extra_sched_args),*],
             required_flags: &[#(#required_flags),*],

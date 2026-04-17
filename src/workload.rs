@@ -18,7 +18,7 @@
 //! chapters of the guide.
 
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -747,6 +747,13 @@ pub struct WorkerReport {
     /// Delta of /proc/self/schedstat field 1 (cpu_time) over the work loop.
     #[serde(default)]
     pub schedstat_cpu_time_ns: u64,
+    /// Per-NUMA-node page counts from `/proc/self/numa_maps` after workload.
+    /// Keyed by node ID. Empty when numa_maps is unavailable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub numa_pages: BTreeMap<usize, u64>,
+    /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop.
+    #[serde(default)]
+    pub vmstat_numa_pages_migrated: u64,
 }
 
 /// PID of the scheduler process. Workers kill it on stall to trigger dump.
@@ -1197,6 +1204,8 @@ impl WorkloadHandle {
                     schedstat_run_delay_ns: 0,
                     schedstat_ctx_switches: 0,
                     schedstat_cpu_time_ns: 0,
+                    numa_pages: BTreeMap::new(),
+                    vmstat_numa_pages_migrated: 0,
                 });
             }
         }
@@ -1344,6 +1353,13 @@ fn worker_main(
     } else {
         0
     };
+
+    // Guest-side /proc/vmstat: system-wide in the guest, but the VM is
+    // a controlled environment with no other significant processes, so
+    // the delta is attributable to this workload. Same rationale as
+    // /proc/self/schedstat below. Host-side reading would require
+    // accessing the guest kernel's vmstat via GuestMem or BPF.
+    let vmstat_migrated_start = read_vmstat_numa_pages_migrated();
 
     // schedstat snapshot at work-loop start.
     let (ss_cpu_start, ss_delay_start, ss_ts_start) = read_schedstat();
@@ -1962,6 +1978,11 @@ fn worker_main(
     // schedstat snapshot at work-loop end; compute deltas.
     let (ss_cpu_end, ss_delay_end, ss_ts_end) = read_schedstat();
 
+    // NUMA: read numa_maps and vmstat after workload.
+    let numa_pages = read_numa_maps_pages();
+    let vmstat_migrated_end = read_vmstat_numa_pages_migrated();
+    let vmstat_migrated_delta = vmstat_migrated_end.saturating_sub(vmstat_migrated_start);
+
     WorkerReport {
         tid,
         work_units,
@@ -1979,6 +2000,8 @@ fn worker_main(
         schedstat_run_delay_ns: ss_delay_end.saturating_sub(ss_delay_start),
         schedstat_ctx_switches: ss_ts_end.saturating_sub(ss_ts_start),
         schedstat_cpu_time_ns: ss_cpu_end.saturating_sub(ss_cpu_start),
+        numa_pages,
+        vmstat_numa_pages_migrated: vmstat_migrated_delta,
     }
 }
 
@@ -2122,6 +2145,32 @@ fn read_schedstat() -> (u64, u64, u64) {
     (cpu_time, run_delay, timeslices)
 }
 
+/// Aggregate per-node page counts from `/proc/self/numa_maps`.
+/// Returns empty map on failure.
+fn read_numa_maps_pages() -> BTreeMap<usize, u64> {
+    let content = match std::fs::read_to_string("/proc/self/numa_maps") {
+        Ok(c) => c,
+        Err(_) => return BTreeMap::new(),
+    };
+    let entries = crate::assert::parse_numa_maps(&content);
+    let mut totals: BTreeMap<usize, u64> = BTreeMap::new();
+    for entry in &entries {
+        for (&node, &count) in &entry.node_pages {
+            *totals.entry(node).or_insert(0) += count;
+        }
+    }
+    totals
+}
+
+/// Read `numa_pages_migrated` from `/proc/vmstat`. Returns 0 on failure.
+fn read_vmstat_numa_pages_migrated() -> u64 {
+    let content = match std::fs::read_to_string("/proc/vmstat") {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    crate::assert::parse_vmstat_numa_pages_migrated(&content).unwrap_or(0)
+}
+
 fn thread_cpu_time_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -2260,6 +2309,8 @@ mod tests {
             schedstat_run_delay_ns: 500_000,
             schedstat_ctx_switches: 20,
             schedstat_cpu_time_ns: 4_000_000_000,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -2562,6 +2613,8 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
             schedstat_cpu_time_ns: 0,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -2587,6 +2640,8 @@ mod tests {
             schedstat_run_delay_ns: u64::MAX,
             schedstat_ctx_switches: u64::MAX,
             schedstat_cpu_time_ns: u64::MAX,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -2976,6 +3031,8 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
             schedstat_cpu_time_ns: 0,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         };
         let s = format!("{:?}", r);
         assert!(s.contains("42"), "must show tid value");
@@ -3026,6 +3083,8 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
             schedstat_cpu_time_ns: 0,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         };
         assert_eq!(r.off_cpu_ns, r.wall_time_ns - r.cpu_time_ns);
     }
@@ -3879,6 +3938,8 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
             schedstat_cpu_time_ns: 0,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         }
     }
 
@@ -3925,6 +3986,8 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
             schedstat_cpu_time_ns: 0,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
         }
     }
 
