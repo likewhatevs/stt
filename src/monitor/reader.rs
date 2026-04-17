@@ -505,7 +505,7 @@ pub(crate) fn read_sched_domain_tree(
 /// Resolve per-CPU physical addresses for event counter reads.
 ///
 /// Reads `*scx_root` to find the active `scx_sched` struct, then reads
-/// the percpu pointer at `scx_sched_pcpu_off` within it. On 6.18+ this
+/// the percpu pointer at `percpu_ptr_off` within it. On 6.18+ this
 /// is `scx_sched.pcpu` (pointing to `scx_sched_pcpu`); on 6.16-6.17 it
 /// is `scx_sched.event_stats_cpu` (pointing directly to `scx_event_stats`).
 /// Computes each CPU's PA via `__per_cpu_offset`.
@@ -524,7 +524,7 @@ pub(crate) fn resolve_event_pcpu_pas(
     }
 
     let scx_sched_pa = super::symbols::kva_to_pa(scx_sched_kva, page_offset);
-    let pcpu_kva = mem.read_u64(scx_sched_pa, ev.scx_sched_pcpu_off);
+    let pcpu_kva = mem.read_u64(scx_sched_pa, ev.percpu_ptr_off);
     if pcpu_kva == 0 {
         return None;
     }
@@ -1228,7 +1228,7 @@ mod tests {
 
     fn test_event_offsets() -> ScxEventOffsets {
         ScxEventOffsets {
-            scx_sched_pcpu_off: 0,
+            percpu_ptr_off: 0,
             event_stats_off: 0,
             ev_select_cpu_fallback: 0,
             ev_dispatch_local_dsq_offline: 8,

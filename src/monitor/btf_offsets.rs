@@ -78,10 +78,13 @@ pub struct KernelOffsets {
 }
 
 /// Byte offsets for overriding `scx_sched.watchdog_timeout` from the host.
+/// Applies to 7.1+ kernels where `watchdog_timeout` is a field on the
+/// runtime-allocated `scx_sched` struct. On 6.16-7.0 the timeout is a
+/// file-scope static (`scx_watchdog_timeout`), handled separately via
+/// [`super::reader::WatchdogOverride::StaticGlobal`].
 ///
-/// The watchdog timeout lives inside the runtime-allocated `scx_sched`
-/// struct pointed to by the `scx_root` global. The host reads
-/// `*scx_root` to find the struct, then writes jiffies at this offset.
+/// The host reads `*scx_root` to find the struct, then writes jiffies
+/// at this offset.
 #[derive(Debug, Clone)]
 pub struct ScxWatchdogOffsets {
     /// Offset of `watchdog_timeout` within `struct scx_sched`.
@@ -104,7 +107,7 @@ pub struct ScxEventOffsets {
     /// Offset of the percpu pointer within `struct scx_sched`.
     /// On 6.18+: offset of `pcpu` (`__percpu *scx_sched_pcpu`).
     /// On 6.16-6.17: offset of `event_stats_cpu` (`__percpu *scx_event_stats`).
-    pub scx_sched_pcpu_off: usize,
+    pub percpu_ptr_off: usize,
     /// Offset of `event_stats` within the per-CPU struct.
     /// On 6.18+: offset within `struct scx_sched_pcpu`.
     /// On 6.16-6.17: 0 (the percpu pointer points directly to the stats).
@@ -190,7 +193,7 @@ fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
         });
 
     // Try 6.16-6.17 path: scx_sched.event_stats_cpu -> scx_event_stats directly.
-    let (scx_sched_pcpu_off, event_stats_off, event_stats_struct) = match pcpu_path {
+    let (percpu_ptr_off, event_stats_off, event_stats_struct) = match pcpu_path {
         Some(resolved) => resolved,
         None => {
             let (esc_off, esc_member) =
@@ -198,6 +201,7 @@ fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
                     .context("btf: neither scx_sched.pcpu nor scx_sched.event_stats_cpu found")?;
             let stats_struct = resolve_member_struct(btf, &esc_member)
                 .context("btf: resolve type of scx_sched.event_stats_cpu")?;
+            // 0: the percpu pointer targets scx_event_stats directly.
             (esc_off, 0, stats_struct)
         }
     };
@@ -220,7 +224,7 @@ fn resolve_event_offsets(btf: &Btf) -> Result<ScxEventOffsets> {
     )?;
 
     Ok(ScxEventOffsets {
-        scx_sched_pcpu_off,
+        percpu_ptr_off,
         event_stats_off,
         ev_select_cpu_fallback,
         ev_dispatch_local_dsq_offline,
@@ -1149,7 +1153,7 @@ mod tests {
         );
 
         if let Some(ref ev) = offsets.event_offsets {
-            assert!(ev.scx_sched_pcpu_off > 0);
+            assert!(ev.percpu_ptr_off > 0);
         }
 
         if let Some(ref wd) = offsets.watchdog_offsets {
