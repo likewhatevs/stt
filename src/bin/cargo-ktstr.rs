@@ -340,7 +340,7 @@ fn kernel_build(
     } else {
         // Tarball download: explicit version, prefix, or latest stable.
         let ver = match version {
-            Some(v) if v.matches('.').count() < 2 && !v.contains("-rc") => {
+            Some(v) if fetch::is_major_minor_prefix(&v) => {
                 // Major.minor prefix (e.g., "6.12") — resolve latest patch.
                 fetch::fetch_version_for_prefix(&v)?
             }

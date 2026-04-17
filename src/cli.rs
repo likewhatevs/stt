@@ -867,7 +867,7 @@ pub fn resolve_cached_kernel(
     match id {
         KernelId::Version(ver) => {
             // Major.minor prefix (e.g. "6.14") → resolve to latest patch.
-            let resolved = if ver.matches('.').count() < 2 && !ver.contains("-rc") {
+            let resolved = if crate::fetch::is_major_minor_prefix(ver) {
                 crate::fetch::fetch_version_for_prefix(ver).map_err(|e| anyhow::anyhow!("{e}"))?
             } else {
                 ver.clone()

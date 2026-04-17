@@ -257,6 +257,18 @@ fn version_tuple(version: &str) -> Option<(u32, u32, u32)> {
     }
 }
 
+/// Return true when `s` is a kernel major.minor prefix like
+/// `"6.14"` (as opposed to a full patch version `"6.14.2"` or an rc
+/// tag `"6.15-rc3"`). Callers use this to decide whether the input
+/// needs prefix resolution via [`fetch_version_for_prefix`].
+///
+/// Accepts any string with fewer than 2 dots and no `-rc` substring,
+/// so `"7"` (single-segment) and `""` both return true. This matches
+/// the historical inline check used by kernel-build dispatchers.
+pub fn is_major_minor_prefix(s: &str) -> bool {
+    s.matches('.').count() < 2 && !s.contains("-rc")
+}
+
 /// Resolve the highest version matching a prefix.
 ///
 /// E.g., "6.12" → "6.12.81", "6" → "6.19.12" (highest 6.x.y).
@@ -486,6 +498,34 @@ mod tests {
             (arch == "x86_64" && image == "bzImage") || (arch == "aarch64" && image == "Image"),
             "unexpected arch/image: {arch}/{image}"
         );
+    }
+
+    // -- is_major_minor_prefix --
+
+    #[test]
+    fn is_major_minor_prefix_accepts_two_segment() {
+        assert!(is_major_minor_prefix("6.14"));
+        assert!(is_major_minor_prefix("7.0"));
+    }
+
+    #[test]
+    fn is_major_minor_prefix_rejects_patch_version() {
+        assert!(!is_major_minor_prefix("6.14.2"));
+        assert!(!is_major_minor_prefix("5.4.0"));
+    }
+
+    #[test]
+    fn is_major_minor_prefix_rejects_rc_tag() {
+        assert!(!is_major_minor_prefix("6.15-rc3"));
+        assert!(!is_major_minor_prefix("6.14-rc1"));
+    }
+
+    #[test]
+    fn is_major_minor_prefix_historical_edge_cases() {
+        // Historical behavior: accepts single-segment and empty inputs.
+        // Callers are expected to gate upstream.
+        assert!(is_major_minor_prefix("7"));
+        assert!(is_major_minor_prefix(""));
     }
 
     // -- major_version --
