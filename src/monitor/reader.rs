@@ -1,10 +1,12 @@
 //! Guest physical memory access and monitor sampling loop.
 //!
-//! [`GuestMem`] wraps a host pointer to the start of guest DRAM and
+//! [`GuestMem`] wraps host pointers to guest DRAM regions and
 //! provides bounds-checked volatile reads and writes for scalar types;
-//! `read_bytes` uses `copy_nonoverlapping` for bulk copies. It also implements
-//! 4-level and 5-level x86-64 page table walks and 3-level aarch64 walks
-//! (64KB granule) for vmalloc'd addresses.
+//! `read_bytes` uses `copy_nonoverlapping` for bulk copies. Multi-region
+//! NUMA layouts are supported: each read/write resolves the target
+//! region via binary search. It also implements 4-level and 5-level
+//! x86-64 page table walks and 3-level aarch64 walks (64KB granule)
+//! for vmalloc'd addresses.
 //!
 //! The monitor loop (`monitor_loop`) periodically reads per-CPU
 //! runqueue state from guest memory and collects `MonitorSample`s.
@@ -20,16 +22,40 @@ use super::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Per-NUMA-node host memory region within a GuestMem.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemRegion {
+    /// Host pointer to the start of this region's mapping.
+    pub(crate) host_ptr: *mut u8,
+    /// DRAM-relative offset where this region starts.
+    pub(crate) offset: u64,
+    /// Size in bytes.
+    pub(crate) size: u64,
+}
+
 /// Host pointer to the start of guest DRAM. Offsets passed to read/write
 /// methods are DRAM-relative (x86_64: GPA 0, aarch64: GPA DRAM_START).
 ///
-/// SAFETY: The pointer is valid for the lifetime of the KVM VM (GuestMemoryMmap
-/// owns the mmap and outlives all threads).
+/// Carries per-NUMA-node region info (one region for single-node,
+/// multiple for multi-node topologies). Each read/write resolves
+/// the target region via binary search. With contiguous MAP_FIXED VA
+/// (the current allocation strategy), the resolved pointer is
+/// identical to `base.add(offset)`.
+///
+/// SAFETY: The pointer is valid for the lifetime of the KVM VM.
+/// `ReservationGuard` owns the VA reservation (munmaps on drop);
+/// per-node `MmapRegion`s have `owned=false` and do not munmap.
+/// The guard outlives all threads that hold a `GuestMem`.
 pub struct GuestMem {
     base: *mut u8,
     size: u64,
+    regions: Vec<MemRegion>,
 }
 
+// SAFETY: `base` and `MemRegion::host_ptr` point into a KVM mmap'd
+// region whose lifetime is guaranteed by `ReservationGuard`. Reads
+// and writes use volatile ops; concurrent access is acceptable
+// because the monitor is a best-effort sampler of guest-owned data.
 unsafe impl Send for GuestMem {}
 unsafe impl Sync for GuestMem {}
 
@@ -40,12 +66,90 @@ impl GuestMem {
     /// `size` is the mapped length in bytes. Callers are responsible
     /// for ensuring the mapping outlives the returned `GuestMem`.
     pub fn new(base: *mut u8, size: u64) -> Self {
-        Self { base, size }
+        Self {
+            base,
+            size,
+            regions: vec![MemRegion {
+                host_ptr: base,
+                offset: 0,
+                size,
+            }],
+        }
+    }
+
+    /// Build a multi-region GuestMem from a NUMA memory layout.
+    ///
+    /// Each `NodeRegion` in the layout becomes a `MemRegion` with its
+    /// host pointer resolved via `GuestMemoryMmap::get_host_address`.
+    /// DRAM-relative offsets are computed by subtracting
+    /// `layout.dram_base()` from each region's `gpa_start`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `get_host_address` fails for any region in the
+    /// layout. This indicates the `GuestMemoryMmap` was not built
+    /// from the same layout — a programming error in the caller.
+    pub(crate) fn from_layout(
+        layout: &crate::vmm::numa_mem::NumaMemoryLayout,
+        guest_mem: &vm_memory::GuestMemoryMmap,
+    ) -> Self {
+        use vm_memory::GuestMemory;
+
+        let dram_base = layout.dram_base();
+        let total_size = layout.total_bytes();
+        let mut regions = Vec::with_capacity(layout.regions().len());
+        let mut base_ptr: Option<*mut u8> = None;
+
+        for nr in layout.regions() {
+            let host_ptr = guest_mem
+                .get_host_address(vm_memory::GuestAddress(nr.gpa_start))
+                .unwrap();
+            if base_ptr.is_none() {
+                base_ptr = Some(host_ptr);
+            }
+            regions.push(MemRegion {
+                host_ptr,
+                offset: nr.gpa_start - dram_base,
+                size: nr.size,
+            });
+        }
+
+        let base = base_ptr.unwrap();
+        Self {
+            base,
+            size: total_size,
+            regions,
+        }
     }
 
     /// Raw pointer to the start of guest DRAM.
     pub fn base_ptr(&self) -> *const u8 {
         self.base
+    }
+
+    /// Per-node memory regions.
+    pub(crate) fn regions(&self) -> &[MemRegion] {
+        &self.regions
+    }
+
+    /// Resolve a DRAM-relative byte offset to a host pointer.
+    ///
+    /// Binary-searches the sorted region list. Returns `None` if the
+    /// offset falls outside all regions.
+    fn resolve_ptr(&self, offset: u64) -> Option<*mut u8> {
+        let idx = self
+            .regions
+            .partition_point(|r| r.offset <= offset)
+            .checked_sub(1)?;
+        let r = &self.regions[idx];
+        let local = offset - r.offset;
+        if local < r.size {
+            // SAFETY: `local < r.size` ensures the offset is within
+            // the mmap'd region that `host_ptr` points to.
+            Some(unsafe { r.host_ptr.add(local as usize) })
+        } else {
+            None
+        }
     }
 
     /// Read a u32 at DRAM offset `pa + offset`.
@@ -54,7 +158,10 @@ impl GuestMem {
         if addr + 4 > self.size {
             return 0;
         }
-        unsafe { std::ptr::read_volatile(self.base.add(addr as usize) as *const u32) }
+        match self.resolve_ptr(addr) {
+            Some(ptr) => unsafe { std::ptr::read_volatile(ptr as *const u32) },
+            None => 0,
+        }
     }
 
     /// Read a u64 at DRAM offset `pa + offset`.
@@ -63,7 +170,10 @@ impl GuestMem {
         if addr + 8 > self.size {
             return 0;
         }
-        unsafe { std::ptr::read_volatile(self.base.add(addr as usize) as *const u64) }
+        match self.resolve_ptr(addr) {
+            Some(ptr) => unsafe { std::ptr::read_volatile(ptr as *const u64) },
+            None => 0,
+        }
     }
 
     /// Read an i64 at DRAM offset `pa + offset`.
@@ -77,7 +187,9 @@ impl GuestMem {
         if addr + 1 > self.size {
             return;
         }
-        unsafe { std::ptr::write_volatile(self.base.add(addr as usize), val) }
+        if let Some(ptr) = self.resolve_ptr(addr) {
+            unsafe { std::ptr::write_volatile(ptr, val) }
+        }
     }
 
     /// Write a u64 at DRAM offset `pa + offset`.
@@ -86,7 +198,9 @@ impl GuestMem {
         if addr + 8 > self.size {
             return;
         }
-        unsafe { std::ptr::write_volatile(self.base.add(addr as usize) as *mut u64, val) }
+        if let Some(ptr) = self.resolve_ptr(addr) {
+            unsafe { std::ptr::write_volatile(ptr as *mut u64, val) }
+        }
     }
 
     /// Read a u8 at DRAM offset `pa + offset`.
@@ -95,7 +209,10 @@ impl GuestMem {
         if addr + 1 > self.size {
             return 0;
         }
-        unsafe { std::ptr::read_volatile(self.base.add(addr as usize)) }
+        match self.resolve_ptr(addr) {
+            Some(ptr) => unsafe { std::ptr::read_volatile(ptr) },
+            None => 0,
+        }
     }
 
     /// Read `len` bytes from DRAM offset `pa` into `buf`.
@@ -107,10 +224,15 @@ impl GuestMem {
             return 0;
         }
         let avail = (self.size - pa).min(len) as usize;
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.base.add(pa as usize), buf.as_mut_ptr(), avail);
+        match self.resolve_ptr(pa) {
+            Some(ptr) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), avail);
+                }
+                avail
+            }
+            None => 0,
         }
-        avail
     }
 
     /// Write a u32 at DRAM offset `pa + offset`.
@@ -119,7 +241,9 @@ impl GuestMem {
         if addr + 4 > self.size {
             return;
         }
-        unsafe { std::ptr::write_volatile(self.base.add(addr as usize) as *mut u32, val) }
+        if let Some(ptr) = self.resolve_ptr(addr) {
+            unsafe { std::ptr::write_volatile(ptr as *mut u32, val) }
+        }
     }
 
     /// Translate a kernel virtual address to guest physical address via

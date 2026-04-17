@@ -2349,15 +2349,19 @@ impl KtstrVm {
 
         // Build GuestMem for the watchdog's graceful shutdown handshake.
         let wd_shm = if self.shm_size > 0 {
-            vm.guest_mem
-                .get_host_address(GuestAddress(DRAM_BASE))
-                .ok()
-                .map(|host_base| {
+            let mem = match vm.numa_layout.as_ref() {
+                Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
+                None => {
+                    let host_base = vm
+                        .guest_mem
+                        .get_host_address(GuestAddress(DRAM_BASE))
+                        .unwrap();
                     let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
-                    let mem = monitor::reader::GuestMem::new(host_base, mem_size);
-                    let shm_base = mem_size - self.shm_size;
-                    (mem, shm_base)
-                })
+                    monitor::reader::GuestMem::new(host_base, mem_size)
+                }
+            };
+            let shm_base = mem.size() - self.shm_size;
+            Some((mem, shm_base))
         } else {
             None
         };
@@ -2544,12 +2548,18 @@ impl KtstrVm {
             return Ok(None);
         };
 
-        let host_base = vm
-            .guest_mem
-            .get_host_address(GuestAddress(DRAM_BASE))
-            .unwrap();
-        let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
-        let mem = monitor::reader::GuestMem::new(host_base, mem_size);
+        let mem = match vm.numa_layout.as_ref() {
+            Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
+            None => {
+                let host_base = vm
+                    .guest_mem
+                    .get_host_address(GuestAddress(DRAM_BASE))
+                    .unwrap();
+                let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
+                monitor::reader::GuestMem::new(host_base, mem_size)
+            }
+        };
+        let mem_size = mem.size();
         let num_cpus = self.topology.total_cpus();
         let kill_clone = kill.clone();
         let dump_trigger =
@@ -2734,12 +2744,17 @@ impl KtstrVm {
             return Ok(None);
         };
 
-        let host_base = vm
-            .guest_mem
-            .get_host_address(GuestAddress(DRAM_BASE))
-            .unwrap();
-        let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
-        let mem = monitor::reader::GuestMem::new(host_base, mem_size);
+        let mem = match vm.numa_layout.as_ref() {
+            Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
+            None => {
+                let host_base = vm
+                    .guest_mem
+                    .get_host_address(GuestAddress(DRAM_BASE))
+                    .unwrap();
+                let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
+                monitor::reader::GuestMem::new(host_base, mem_size)
+            }
+        };
         let kill_clone = kill.clone();
         let params = params.clone();
         let shm_size = self.shm_size;
@@ -3068,12 +3083,17 @@ impl KtstrVm {
             Some(v) => v,
             None => return Vec::new(),
         };
-        let host_base = match vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE)) {
-            Ok(ptr) => ptr,
-            Err(_) => return Vec::new(),
+        let mem = match vm.numa_layout.as_ref() {
+            Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
+            None => {
+                let host_base = match vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE)) {
+                    Ok(ptr) => ptr,
+                    Err(_) => return Vec::new(),
+                };
+                let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
+                monitor::reader::GuestMem::new(host_base, mem_size)
+            }
         };
-        let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
-        let mem = monitor::reader::GuestMem::new(host_base, mem_size);
         let kernel = match monitor::guest::GuestKernel::new(&mem, &vmlinux) {
             Ok(k) => k,
             Err(_) => return Vec::new(),
