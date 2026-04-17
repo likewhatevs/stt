@@ -328,9 +328,10 @@ pub struct Scheduler {
     /// Scheduler-wide assertion overrides merged on top of
     /// `Assert::default_checks()` and below each per-entry `assert`.
     pub assert: crate::assert::Assert,
-    /// Cgroup parent path. When set, the init creates
-    /// `/sys/fs/cgroup/{path}` before starting the scheduler, and
-    /// `--cell-parent-cgroup {path}` is injected into scheduler args.
+    /// Cgroup parent path. Must begin with `/` (e.g. `"/ktstr"`).
+    /// When set, the init creates `/sys/fs/cgroup{path}` before
+    /// starting the scheduler, and `--cell-parent-cgroup {path}` is
+    /// injected into scheduler args.
     pub cgroup_parent: Option<&'static str>,
     /// Scheduler CLI args, prepended before per-test `extra_sched_args`.
     pub sched_args: &'static [&'static str],
