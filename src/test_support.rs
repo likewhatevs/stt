@@ -571,11 +571,12 @@ pub struct TopologyConstraints {
 
 impl TopologyConstraints {
     /// Conservative default constraints: single NUMA node, 1-12 LLCs,
-    /// no SMT requirement, 1-192 CPUs. Accepts the common single-node
-    /// gauntlet presets ktstr ships while rejecting the multi-NUMA
-    /// presets (numa2-*, numa4-*) and any exotic topologies tests
-    /// rarely exercise by default. Test authors that want multi-NUMA
-    /// coverage must raise `max_numa_nodes` explicitly.
+    /// no SMT requirement, 1-192 CPUs. Accepts most single-node
+    /// gauntlet presets ktstr ships while rejecting multi-NUMA presets
+    /// (numa2-*, numa4-*) and the scale-boundary single-node presets
+    /// that exceed the CPU/LLC caps (near-max-llc, max-cpu, and their
+    /// -nosmt variants). Test authors that want broader coverage must
+    /// raise `max_numa_nodes`, `max_llcs`, or `max_cpus` explicitly.
     pub const DEFAULT: TopologyConstraints = TopologyConstraints {
         min_numa_nodes: 1,
         max_numa_nodes: Some(1),
