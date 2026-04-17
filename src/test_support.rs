@@ -1669,18 +1669,15 @@ fn run_ktstr_test_inner(
     }
     let cmdline_extra = cmdline_parts.join(" ");
 
-    let (numa_nodes, llcs, cores, threads, memory_mb) = match topo {
-        Some(t) => (t.numa_nodes, t.llcs, t.cores, t.threads, t.memory_mb),
+    let (vm_topology, memory_mb) = match topo {
+        Some(t) => (
+            vmm::Topology::new(t.numa_nodes, t.llcs, t.cores, t.threads),
+            t.memory_mb,
+        ),
         None => {
             let cpus = entry.topology.total_cpus();
             let mem = (cpus * 64).max(256).max(entry.memory_mb);
-            (
-                entry.topology.numa_nodes,
-                entry.topology.llcs,
-                entry.topology.cores_per_llc,
-                entry.topology.threads_per_core,
-                mem,
-            )
+            (entry.topology, mem)
         }
     };
 
@@ -1688,7 +1685,7 @@ fn run_ktstr_test_inner(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
         .init_binary(&ktstr_bin)
-        .topology(numa_nodes, llcs, cores, threads)
+        .with_topology(vm_topology)
         .memory_deferred_min(memory_mb)
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
@@ -1856,10 +1853,7 @@ fn run_ktstr_test_inner(
         &result,
         &merged_assert,
         &stimulus_events,
-        numa_nodes,
-        llcs,
-        cores,
-        threads,
+        &vm_topology,
         &repro_fn,
     )
 }
@@ -1876,10 +1870,7 @@ fn evaluate_vm_result(
     result: &vmm::VmResult,
     merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
-    numa_nodes: u32,
-    llcs: u32,
-    cores: u32,
-    threads: u32,
+    topo: &Topology,
     repro_fn: &dyn Fn(&str) -> Option<String>,
 ) -> Result<AssertResult> {
     // Build timeline from stimulus events + monitor samples.
@@ -1909,14 +1900,6 @@ fn evaluate_vm_result(
         })
         .unwrap_or_default();
 
-    let topo = Topology {
-        numa_nodes,
-        llcs,
-        cores_per_llc: cores,
-        threads_per_core: threads,
-        nodes: None,
-        distances: None,
-    };
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
         topology: Some(format!("{topo} ({} cpus)", topo.total_cpus())),
@@ -2374,18 +2357,15 @@ fn attempt_auto_repro(
     }
     let cmdline_extra = cmdline_parts.join(" ");
 
-    let (numa_nodes, llcs, cores, threads, memory_mb) = match topo {
-        Some(t) => (t.numa_nodes, t.llcs, t.cores, t.threads, t.memory_mb),
+    let (vm_topology, memory_mb) = match topo {
+        Some(t) => (
+            vmm::Topology::new(t.numa_nodes, t.llcs, t.cores, t.threads),
+            t.memory_mb,
+        ),
         None => {
             let cpus = entry.topology.total_cpus();
             let mem = (cpus * 64).max(256).max(entry.memory_mb);
-            (
-                entry.topology.numa_nodes,
-                entry.topology.llcs,
-                entry.topology.cores_per_llc,
-                entry.topology.threads_per_core,
-                mem,
-            )
+            (entry.topology, mem)
         }
     };
 
@@ -2393,7 +2373,7 @@ fn attempt_auto_repro(
     let mut builder = vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
-        .topology(numa_nodes, llcs, cores, threads)
+        .with_topology(vm_topology)
         .memory_deferred_min(memory_mb)
         .cmdline(&cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
@@ -4148,6 +4128,8 @@ mod tests {
     /// Serializes tests that mutate env vars.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    const EVAL_TOPO: Topology = Topology::new(1, 1, 2, 1);
+
     // Register a test entry in the distributed slice for unit testing find_test.
     fn __ktstr_inner_unit_test_dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -5690,7 +5672,7 @@ mod tests {
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5716,7 +5698,7 @@ mod tests {
         let entry = sched_entry("__eval_sched_dies__");
         let result = make_vm_result("", "boot ok", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5739,7 +5721,7 @@ mod tests {
         let entry = sched_entry("__eval_sched_log__");
         let result = make_vm_result(&sched_log, "", -1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5772,7 +5754,7 @@ mod tests {
             repro_called.store(true, std::sync::atomic::Ordering::Relaxed);
             Some("repro data".to_string())
         };
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &repro_fn)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &repro_fn)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5805,7 +5787,7 @@ mod tests {
                     .to_string(),
             )
         };
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &repro_fn)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &repro_fn)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5829,7 +5811,7 @@ mod tests {
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5861,7 +5843,7 @@ mod tests {
             false,
         );
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5880,7 +5862,7 @@ mod tests {
         let entry = sched_entry("__eval_dump__");
         let result = make_vm_result("", dump_line, -1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5901,7 +5883,7 @@ mod tests {
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
         assert!(
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro,).is_ok(),
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro,).is_ok(),
             "passing AssertResult should return Ok",
         );
     }
@@ -5915,7 +5897,7 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
                 .unwrap_err()
         );
         assert!(msg.contains("failed:"), "got: {msg}");
@@ -5934,7 +5916,7 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
                 .unwrap_err()
         );
         assert!(msg.contains("worker 0 stuck 5000ms"), "got: {msg}");
@@ -5954,7 +5936,7 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
                 .unwrap_err()
         );
         assert!(msg.contains(error_line), "got: {msg}");
@@ -5970,7 +5952,7 @@ mod tests {
         let entry = sched_entry("__eval_timeout_fp__");
         let result = make_vm_result(&output, "", 0, true);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -5993,7 +5975,7 @@ mod tests {
         let entry = sched_entry("__eval_no_result_fp__");
         let result = make_vm_result(&output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -6017,7 +5999,7 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
                 .unwrap_err()
         );
         assert!(msg.starts_with("ktstr_test"), "got: {msg}");
@@ -6086,7 +6068,7 @@ mod tests {
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
                 .unwrap_err()
         );
         assert!(
@@ -6106,7 +6088,7 @@ mod tests {
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -6173,7 +6155,7 @@ mod tests {
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -6189,7 +6171,7 @@ mod tests {
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -6206,7 +6188,7 @@ mod tests {
         let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\ngarbage";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -6223,7 +6205,7 @@ mod tests {
         let output = "KTSTR_INIT_STARTED\nPANIC: panicked at src/foo.rs:42: assertion failed";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("guest crashed:"), "got: {msg}");
@@ -6236,7 +6218,7 @@ mod tests {
         let output = "PANIC: panicked at src/bar.rs:10: index out of bounds";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("guest crashed:"), "got: {msg}");
@@ -6253,7 +6235,7 @@ mod tests {
         let mut result = make_vm_result(output, "", 1, false);
         result.crash_message = Some(shm_crash.to_string());
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -6423,7 +6405,7 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
                 .unwrap_err()
         );
         assert!(msg.contains("--- diagnostics ---"), "got: {msg}");
@@ -6466,7 +6448,7 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
                 .unwrap_err()
         );
         assert!(msg.contains("--- monitor ---"), "got: {msg}");
@@ -6537,7 +6519,7 @@ mod tests {
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], 1, 1, 2, 1, &no_repro)
+            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
                 .unwrap_err()
         );
         assert!(

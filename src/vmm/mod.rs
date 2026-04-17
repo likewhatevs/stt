@@ -17,6 +17,7 @@
 pub mod console;
 pub mod host_topology;
 pub mod initramfs;
+pub(crate) mod numa_mem;
 pub(crate) mod rust_init;
 pub mod shm_ring;
 pub mod topology;
@@ -3924,17 +3925,25 @@ impl KtstrVmBuilder {
         self
     }
 
-    /// Set the virtual CPU topology (big-to-little:
+    /// Set a uniform virtual CPU topology (big-to-little:
     /// `numa_nodes, llcs, cores_per_llc, threads_per_core`).
+    ///
+    /// Produces a topology with uniform LLC/memory distribution and
+    /// default 10/20 NUMA distances. For per-node configuration
+    /// (asymmetric memory, CXL nodes, custom distances), use
+    /// [`with_topology`](Self::with_topology).
     pub fn topology(mut self, numa_nodes: u32, llcs: u32, cores: u32, threads: u32) -> Self {
-        self.topology = Topology {
-            llcs,
-            cores_per_llc: cores,
-            threads_per_core: threads,
-            numa_nodes,
-            nodes: None,
-            distances: None,
-        };
+        self.topology = Topology::new(numa_nodes, llcs, cores, threads);
+        self
+    }
+
+    /// Set a pre-constructed topology with full per-node configuration.
+    ///
+    /// Accepts a [`Topology`] built via [`Topology::with_nodes`] and
+    /// optionally [`Topology::with_distances`], preserving per-node
+    /// memory sizes, CXL memory-only nodes, and custom distance matrices.
+    pub fn with_topology(mut self, topo: Topology) -> Self {
+        self.topology = topo;
         self
     }
 
@@ -4901,33 +4910,21 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "invalid Topology")]
     fn builder_rejects_zero_llcs() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let result = KtstrVmBuilder::default()
-            .kernel(&exe)
-            .topology(1, 0, 2, 2)
-            .build();
-        assert!(result.is_err(), "llcs=0 should fail validation");
+        KtstrVmBuilder::default().topology(1, 0, 2, 2);
     }
 
     #[test]
+    #[should_panic(expected = "invalid Topology")]
     fn builder_rejects_zero_cores() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let result = KtstrVmBuilder::default()
-            .kernel(&exe)
-            .topology(1, 2, 0, 2)
-            .build();
-        assert!(result.is_err(), "cores=0 should fail validation");
+        KtstrVmBuilder::default().topology(1, 2, 0, 2);
     }
 
     #[test]
+    #[should_panic(expected = "invalid Topology")]
     fn builder_rejects_zero_threads() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let result = KtstrVmBuilder::default()
-            .kernel(&exe)
-            .topology(1, 2, 2, 0)
-            .build();
-        assert!(result.is_err(), "threads=0 should fail validation");
+        KtstrVmBuilder::default().topology(1, 2, 2, 0);
     }
 
     #[test]
