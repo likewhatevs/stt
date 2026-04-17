@@ -21,6 +21,14 @@ Workers wait on a pipe for a "start" signal after fork:
 This ensures workers run inside their target cgroup from the first
 instruction of their workload.
 
+### Custom work types
+
+`WorkType::Custom` workers follow the same two-phase start (fork,
+cgroup placement, start signal), and the framework applies affinity
+and scheduling policy before handing control to the user function.
+After setup, the `run` function pointer takes over entirely --
+the framework work loop is bypassed.
+
 ## Stop protocol
 
 Workers install a SIGUSR1 handler that sets an atomic `STOP` flag. The
@@ -88,6 +96,11 @@ start and end. Three fields:
 
 `iterations` counts outer-loop iterations.
 
+Custom workers produce their own `WorkerReport`. The framework does
+not populate any telemetry fields for Custom -- migration tracking,
+gap detection, schedstat deltas, and iteration counters are only
+present if the user's `run` function fills them.
+
 ## Work-conservation watchdog
 
 Workers send SIGUSR2 to the scheduler when stuck > 2 seconds. The
@@ -96,7 +109,8 @@ detects as a scheduler death and captures the sched_ext dump from
 dmesg.
 
 In repro mode, the watchdog is disabled to keep the scheduler alive
-for BPF probe assertions.
+for BPF probe assertions. The watchdog does not fire for Custom
+workers because they bypass the framework work loop.
 
 ## RAII cleanup
 

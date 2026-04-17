@@ -19,6 +19,7 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Scenario-level affinity intent for a group of workers.
@@ -166,13 +167,25 @@ pub enum WorkType {
     /// when CAP_SYS_NICE is available). Exercises __sched_setscheduler
     /// and scheduling class transitions.
     PolicyChurn { spin_iters: u64 },
+    /// User-supplied work function. The function receives a reference to
+    /// the stop flag and returns a [`WorkerReport`] when signaled.
+    /// Function pointers are fork-safe (`Copy`), so `Custom` works with
+    /// the fork-based worker model without serialization.
+    ///
+    /// `name` identifies this work type in logs and sidecar metadata.
+    /// [`from_name`](Self::from_name) returns `None` for custom names.
+    Custom {
+        name: &'static str,
+        run: fn(&AtomicBool) -> WorkerReport,
+    },
 }
 
 impl WorkType {
-    /// PascalCase names for all variants, matching the enum arm names.
+    /// PascalCase names for all built-in variants, matching the enum arm names.
     ///
-    /// Includes `"Sequence"` even though [`from_name`](Self::from_name)
-    /// cannot construct it (sequences require explicit phases).
+    /// Includes `"Sequence"` and `"Custom"` even though
+    /// [`from_name`](Self::from_name) cannot construct them (sequences
+    /// require explicit phases; custom requires a function pointer).
     pub const ALL_NAMES: &[&'static str] = &[
         "CpuSpin",
         "YieldHeavy",
@@ -190,9 +203,12 @@ impl WorkType {
         "NiceSweep",
         "AffinityChurn",
         "PolicyChurn",
+        "Custom",
     ];
 
     /// PascalCase name of this variant, matching [`ALL_NAMES`](Self::ALL_NAMES).
+    /// For [`Custom`](Self::Custom), returns the user-provided `name`
+    /// field instead.
     pub fn name(&self) -> &'static str {
         match self {
             WorkType::CpuSpin => "CpuSpin",
@@ -211,12 +227,14 @@ impl WorkType {
             WorkType::NiceSweep => "NiceSweep",
             WorkType::AffinityChurn { .. } => "AffinityChurn",
             WorkType::PolicyChurn { .. } => "PolicyChurn",
+            WorkType::Custom { name, .. } => name,
         }
     }
 
     /// Look up a variant by PascalCase name and return it with default
-    /// parameters. Returns `None` for unknown names and for `"Sequence"`
-    /// (which requires explicit phases).
+    /// parameters. Returns `None` for unknown names, `"Sequence"`
+    /// (requires explicit phases), and `"Custom"` (requires a function
+    /// pointer).
     pub fn from_name(s: &str) -> Option<WorkType> {
         match s {
             "CpuSpin" => Some(WorkType::CpuSpin),
@@ -335,6 +353,16 @@ impl WorkType {
     /// Cycle scheduling policies with `spin_iters` CPU work between switches.
     pub fn policy_churn(spin_iters: u64) -> Self {
         WorkType::PolicyChurn { spin_iters }
+    }
+
+    /// User-supplied work function with a display name.
+    ///
+    /// `run` receives a reference to the stop flag (set by SIGUSR1) and
+    /// must return a [`WorkerReport`] when the flag becomes `true`. The
+    /// framework handles fork, cgroup placement, affinity, scheduling
+    /// policy, and signal setup; `run` owns only the work loop.
+    pub fn custom(name: &'static str, run: fn(&AtomicBool) -> WorkerReport) -> Self {
+        WorkType::Custom { name, run }
     }
 }
 
@@ -1029,7 +1057,6 @@ impl Drop for WorkloadHandle {
 }
 
 use std::os::unix::io::FromRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -1070,6 +1097,12 @@ fn worker_main(
     let mut wake_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
     // AffinityChurn: read effective cpuset once at start via sched_getaffinity.
+    // Custom: delegate entirely to the user function. Affinity and
+    // sched_policy are already applied above.
+    if let WorkType::Custom { run, .. } = &work_type {
+        return run(&STOP);
+    }
+
     let affinity_churn_cpus: Vec<usize> = if matches!(work_type, WorkType::AffinityChurn { .. }) {
         let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         let ret = unsafe {
@@ -1550,6 +1583,7 @@ fn worker_main(
                 );
                 iterations += 1;
             }
+            WorkType::Custom { .. } => unreachable!("handled by early return"),
         }
 
         // Publish iteration count to shared memory for host-side sampling.
@@ -1822,8 +1856,8 @@ mod tests {
     #[test]
     fn work_type_name_roundtrip() {
         for &name in WorkType::ALL_NAMES {
-            // Sequence has no default from_name; tested separately.
-            if name == "Sequence" {
+            // Sequence and Custom have no default from_name.
+            if name == "Sequence" || name == "Custom" {
                 assert!(WorkType::from_name(name).is_none());
                 continue;
             }
@@ -1839,7 +1873,7 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        assert_eq!(WorkType::ALL_NAMES.len(), 16);
+        assert_eq!(WorkType::ALL_NAMES.len(), 17);
     }
 
     #[test]
@@ -3479,5 +3513,95 @@ mod tests {
         let reports = h.stop_and_collect();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].work_units > 0);
+    }
+
+    // -- Custom work type tests --
+
+    fn stub_custom_fn(_stop: &AtomicBool) -> WorkerReport {
+        WorkerReport {
+            tid: 0,
+            work_units: 0,
+            cpu_time_ns: 0,
+            wall_time_ns: 0,
+            off_cpu_ns: 0,
+            migration_count: 0,
+            cpus_used: BTreeSet::new(),
+            migrations: vec![],
+            max_gap_ms: 0,
+            max_gap_cpu: 0,
+            max_gap_at_ms: 0,
+            wake_latencies_ns: vec![],
+            iterations: 0,
+            schedstat_run_delay_ns: 0,
+            schedstat_ctx_switches: 0,
+            schedstat_cpu_time_ns: 0,
+        }
+    }
+
+    #[test]
+    fn custom_name_returns_label() {
+        let wt = WorkType::custom("my_work", stub_custom_fn);
+        assert_eq!(wt.name(), "my_work");
+    }
+
+    #[test]
+    fn custom_from_name_returns_none() {
+        assert!(WorkType::from_name("Custom").is_none());
+    }
+
+    #[test]
+    fn custom_group_size_is_none() {
+        let wt = WorkType::custom("x", stub_custom_fn);
+        assert_eq!(wt.worker_group_size(), None);
+    }
+
+    fn custom_spin_fn(stop: &AtomicBool) -> WorkerReport {
+        let tid = unsafe { libc::getpid() } as u32;
+        let start = Instant::now();
+        let mut work_units = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            work_units = std::hint::black_box(work_units.wrapping_add(1));
+            std::hint::spin_loop();
+        }
+        let wall_time_ns = start.elapsed().as_nanos() as u64;
+        WorkerReport {
+            tid,
+            work_units,
+            cpu_time_ns: 0,
+            wall_time_ns,
+            off_cpu_ns: 0,
+            migration_count: 0,
+            cpus_used: BTreeSet::new(),
+            migrations: vec![],
+            max_gap_ms: 0,
+            max_gap_cpu: 0,
+            max_gap_at_ms: 0,
+            wake_latencies_ns: vec![],
+            iterations: work_units,
+            schedstat_run_delay_ns: 0,
+            schedstat_ctx_switches: 0,
+            schedstat_cpu_time_ns: 0,
+        }
+    }
+
+    #[test]
+    fn spawn_custom_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            affinity: AffinityMode::None,
+            work_type: WorkType::custom("test_spin", custom_spin_fn),
+            sched_policy: SchedPolicy::Normal,
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].work_units > 0,
+            "Custom worker did no work: work_units={}",
+            reports[0].work_units
+        );
+        assert!(reports[0].wall_time_ns > 0);
     }
 }

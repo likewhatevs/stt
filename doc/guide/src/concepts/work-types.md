@@ -20,6 +20,7 @@ pub enum WorkType {
     NiceSweep,
     AffinityChurn { spin_iters: u64 },
     PolicyChurn { spin_iters: u64 },
+    Custom { name: &'static str, run: fn(&AtomicBool) -> WorkerReport },
 }
 ```
 
@@ -28,7 +29,8 @@ Parameterized variants have convenience constructors:
 `WorkType::futex_ping_pong(1024)`, `WorkType::cache_pressure(32, 64)`,
 `WorkType::cache_yield(32, 64)`, `WorkType::cache_pipe(32, 1024)`,
 `WorkType::futex_fan_out(4, 1024)`,
-`WorkType::affinity_churn(1024)`, `WorkType::policy_churn(1024)`.
+`WorkType::affinity_churn(1024)`, `WorkType::policy_churn(1024)`,
+`WorkType::custom("my_work", my_fn)`.
 
 ## Choosing a work type
 
@@ -45,6 +47,7 @@ Parameterized variants have convenience constructors:
 | Priority reweighting / nice dynamics | `NiceSweep` |
 | Rapid CPU migration / affinity churn | `AffinityChurn` |
 | Scheduling class transitions | `PolicyChurn` |
+| Arbitrary user-defined workload | `Custom` |
 
 ## Variants
 
@@ -141,6 +144,57 @@ with priority 1 when `CAP_SYS_NICE` is available). Exercises
 `__sched_setscheduler` and scheduling class transitions. Resets to
 `SCHED_OTHER` before exit. Records per-yield wake latency.
 
+**`Custom`** -- user-supplied work function. The `run` function pointer
+receives a reference to the stop flag (`&AtomicBool`, set by SIGUSR1)
+and returns a `WorkerReport` when the flag becomes `true`. The
+framework handles fork, cgroup placement, affinity, scheduling policy,
+and signal setup; the user function owns the work loop and all
+`WorkerReport` field population. Framework telemetry (migration
+tracking, gap detection, schedstat deltas, iteration counter updates)
+is not provided -- the user function is responsible for any telemetry
+it needs.
+
+Function pointers (`fn(&AtomicBool) -> WorkerReport`) are fork-safe
+because they carry no captured state across the fork boundary. Closures
+are not supported. Cannot be constructed via `WorkType::from_name()`.
+
+```rust,ignore
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use ktstr::workload::{WorkType, WorkerReport};
+
+fn my_workload(stop: &AtomicBool) -> WorkerReport {
+    let tid = unsafe { libc::getpid() } as u32;
+    let start = std::time::Instant::now();
+    let mut work_units = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        // ... custom work ...
+        work_units += 1;
+    }
+    let wall_time_ns = start.elapsed().as_nanos() as u64;
+    WorkerReport {
+        tid,
+        work_units,
+        cpu_time_ns: 0,
+        wall_time_ns,
+        off_cpu_ns: 0,
+        migration_count: 0,
+        cpus_used: BTreeSet::new(),
+        migrations: vec![],
+        max_gap_ms: 0,
+        max_gap_cpu: 0,
+        max_gap_at_ms: 0,
+        wake_latencies_ns: vec![],
+        iterations: work_units,
+        schedstat_run_delay_ns: 0,
+        schedstat_ctx_switches: 0,
+        schedstat_cpu_time_ns: 0,
+    }
+}
+
+let wt = WorkType::custom("my_workload", my_workload);
+```
+
 ## Grouped work types
 
 `PipeIo`, `FutexPingPong`, and `CachePipe` require `num_workers`
@@ -167,9 +221,11 @@ futex wait/wake.
 ## String lookup
 
 `WorkType::from_name()` accepts PascalCase names matching the enum
-variants (e.g. `"CpuSpin"`, `"FutexPingPong"`).
+variants (e.g. `"CpuSpin"`, `"FutexPingPong"`). `Sequence` and `Custom`
+return `None` because they require explicit construction parameters.
 `WorkType::ALL_NAMES` lists every variant name. `WorkType::name()`
-returns the PascalCase name for a given value.
+returns the PascalCase name for a given value; for `Custom`, it returns
+the user-provided `name` field.
 
 ## WorkloadConfig
 
