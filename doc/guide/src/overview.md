@@ -70,8 +70,8 @@ devices, no PCI. The device model is two serial ports (COM1 for kernel
 console, COM2 for application I/O) and a shared-memory ring buffer.
 
 **Direct access over tooling layers** -- the host-side monitor reads
-guest memory directly via BTF-resolved struct offsets to observe
-scheduler state. No BPF instrumentation inside the guest, no observer
+guest memory directly via BTF (BPF Type Format)-resolved struct
+offsets to observe scheduler state. No BPF instrumentation inside the guest, no observer
 effects on scheduling decisions. See [Monitor](architecture/monitor.md)
 for details on BTF resolution and guest memory introspection.
 

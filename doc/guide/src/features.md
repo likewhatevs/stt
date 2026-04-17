@@ -316,8 +316,12 @@ See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
 <details>
 <summary><b>Remote kernel cache</b> — GHA cache backend for cross-run kernel sharing</summary>
 
-GHA cache backend for CI kernel sharing. Non-fatal on failure; local
-cache is authoritative.
+GHA cache backend for CI kernel sharing. When `KTSTR_GHA_CACHE=1`
+and `ACTIONS_CACHE_URL` are set, version and cache-key resolution
+checks the remote cache after a local-cache miss before falling back
+to download (for versions) or erroring (for cache keys). Explicit
+`cargo ktstr kernel build` invocations push successful builds to the
+remote. Non-fatal on failure; local cache is authoritative.
 
 </details>
 
