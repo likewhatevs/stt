@@ -319,7 +319,7 @@ pub struct Scheduler {
     pub sysctls: &'static [Sysctl],
     /// Extra guest kernel command-line arguments appended when booting
     /// the VM. This is the GUEST KERNEL cmdline, not the scheduler
-    /// binary's CLI — use [`sched_args`](Self::sched_args) for that.
+    /// binary's CLI — use [`sched_args`](field@Self::sched_args) for that.
     ///
     /// Do not override the kargs ktstr injects itself (`nokaslr`,
     /// `console=`, `loglevel=`, `init=`): those break guest-side init
