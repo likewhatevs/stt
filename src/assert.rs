@@ -363,6 +363,7 @@ pub(crate) struct AssertPlan {
     pub(crate) min_iteration_rate: Option<f64>,
     pub(crate) max_migration_ratio: Option<f64>,
     pub(crate) min_page_locality: Option<f64>,
+    pub(crate) max_cross_node_migration_ratio: Option<f64>,
     pub(crate) max_slow_tier_ratio: Option<f64>,
 }
 
@@ -380,6 +381,7 @@ impl AssertPlan {
             min_iteration_rate: None,
             max_migration_ratio: None,
             min_page_locality: None,
+            max_cross_node_migration_ratio: None,
             max_slow_tier_ratio: None,
         }
     }
@@ -513,6 +515,18 @@ impl AssertPlan {
                         Some(min_locality),
                         total,
                         local,
+                    ));
+                }
+            }
+        }
+        if let Some(max_ratio) = self.max_cross_node_migration_ratio {
+            for w in reports {
+                let total: u64 = w.numa_pages.values().sum();
+                if total > 0 {
+                    r.merge(assert_cross_node_migration(
+                        w.vmstat_numa_pages_migrated,
+                        total,
+                        Some(max_ratio),
                     ));
                 }
             }
@@ -1008,6 +1022,7 @@ impl Assert {
             min_iteration_rate: self.min_iteration_rate,
             max_migration_ratio: self.max_migration_ratio,
             min_page_locality: self.min_page_locality,
+            max_cross_node_migration_ratio: self.max_cross_node_migration_ratio,
             max_slow_tier_ratio: self.max_slow_tier_ratio,
         }
     }
@@ -2779,6 +2794,7 @@ mod tests {
             min_iteration_rate: None,
             max_migration_ratio: None,
             min_page_locality: None,
+            max_cross_node_migration_ratio: None,
             max_slow_tier_ratio: None,
         };
         let reports = [rpt_with_latencies(
@@ -2810,6 +2826,7 @@ mod tests {
             min_iteration_rate: None,
             max_migration_ratio: Some(0.05),
             min_page_locality: None,
+            max_cross_node_migration_ratio: None,
             max_slow_tier_ratio: None,
         };
         let r = plan.assert_cgroup(&[w], None, None);
@@ -2835,6 +2852,7 @@ mod tests {
             min_iteration_rate: None,
             max_migration_ratio: Some(0.05),
             min_page_locality: None,
+            max_cross_node_migration_ratio: None,
             max_slow_tier_ratio: None,
         };
         let r = plan.assert_cgroup(&[w], None, None);
@@ -2855,6 +2873,7 @@ mod tests {
             min_iteration_rate: Some(1000.0),
             max_migration_ratio: None,
             min_page_locality: None,
+            max_cross_node_migration_ratio: None,
             max_slow_tier_ratio: None,
         };
         let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
