@@ -1698,11 +1698,7 @@ mod tests {
     #[test]
     fn create_initramfs_base_includes_extra_shared_libs() {
         let exe = crate::resolve_current_exe().unwrap();
-        let sched = std::path::PathBuf::from("target/debug/scx-ktstr");
-        if !sched.exists() {
-            eprintln!("skipping: scx-ktstr not built");
-            return;
-        }
+        let sched = crate::test_support::require_binary("scx-ktstr");
         let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
         let base = create_initramfs_base(&exe, &extras, &[], false).unwrap();
         let s = String::from_utf8_lossy(&base);
@@ -1892,10 +1888,12 @@ mod tests {
         // Create a FIFO.
         let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
         let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
-        if rc != 0 {
-            eprintln!("skipping: mkfifo failed");
-            return;
-        }
+        assert_eq!(
+            rc,
+            0,
+            "ktstr: mkfifo({}) failed -- test infrastructure broken",
+            fifo_path.display(),
+        );
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/pipe", fifo_path.as_path())];
         let result = create_initramfs_base(&exe, &[], &includes, true);

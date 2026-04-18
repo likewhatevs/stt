@@ -19,9 +19,11 @@ target/
 ```
 
 Each subdirectory is keyed `{kernel}-{git_short}`, where `{kernel}`
-is the kernel version detected from `KTSTR_KERNEL` (or `unknown`
-when no kernel is set) and `{git_short}` is the short commit hash
-baked in by `build.rs`.
+is the kernel version resolved from the directory `KTSTR_KERNEL`
+points at — first the `version` field in its `metadata.json`, else
+the content of `include/config/kernel.release`, else `unknown` (when
+`KTSTR_KERNEL` is unset or neither file yields a version) — and
+`{git_short}` is the short commit hash baked in by `build.rs`.
 
 Override the parent directory with `KTSTR_SIDECAR_DIR` (used as-is
 when set, no key suffix).

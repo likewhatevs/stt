@@ -932,13 +932,7 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let offsets = match KernelOffsets::from_vmlinux(&path) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
-                return;
-            }
-        };
+        let offsets = crate::test_support::require_kernel_offsets(&path);
         assert_ne!(
             offsets.rq_nr_running, offsets.rq_clock,
             "rq_nr_running and rq_clock offsets must be distinct"
@@ -954,13 +948,7 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let offsets = match KernelOffsets::from_vmlinux(&path) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
-                return;
-            }
-        };
+        let offsets = crate::test_support::require_kernel_offsets(&path);
         // Event offsets are optional — only assert if present.
         if let Some(ev) = &offsets.event_offsets {
             // All event counter fields are s64, so offsets must differ.
@@ -1000,13 +988,7 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let offsets = match KernelOffsets::from_vmlinux(&path) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
-                return;
-            }
-        };
+        let offsets = crate::test_support::require_kernel_offsets(&path);
         // Schedstat offsets are optional — only assert if present.
         if let Some(ss) = &offsets.schedstat_offsets {
             // rq_sched_info must be at a nonzero offset (it's not the first
@@ -1050,13 +1032,7 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let offsets = match KernelOffsets::from_vmlinux(&path) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
-                return;
-            }
-        };
+        let offsets = crate::test_support::require_kernel_offsets(&path);
         // Sched domain offsets are optional — only assert if present.
         if let Some(sd) = &offsets.sched_domain_offsets {
             // sd fields must be at distinct nonzero offsets (none is the
@@ -1148,13 +1124,12 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let offsets = match BpfMapOffsets::from_vmlinux(&path) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
-                return;
-            }
-        };
+        let offsets = BpfMapOffsets::from_vmlinux(&path).unwrap_or_else(|e| {
+            panic!(
+                "ktstr: BpfMapOffsets resolution from {} failed: {e:#}",
+                path.display(),
+            )
+        });
         // All offsets should be nonzero in a real kernel BTF.
         assert!(offsets.map_name > 0);
         assert!(offsets.map_type > 0);
@@ -1175,13 +1150,12 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let offsets = match BpfProgOffsets::from_vmlinux(&path) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
-                return;
-            }
-        };
+        let offsets = BpfProgOffsets::from_vmlinux(&path).unwrap_or_else(|e| {
+            panic!(
+                "ktstr: BpfProgOffsets resolution from {} failed: {e:#}",
+                path.display(),
+            )
+        });
         assert!(offsets.prog_aux > 0);
         assert!(offsets.aux_verified_insns > 0);
         assert!(offsets.aux_name > 0);

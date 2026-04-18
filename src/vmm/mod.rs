@@ -4980,19 +4980,17 @@ mod tests {
         let kernel = crate::test_support::require_kernel();
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        // Architecture-dependent symbols (scx_root, KernelOffsets BTF
-        // fields) gate skips before paying for a VM boot on kernels
-        // that can't satisfy the invariant. The vmlinux symtab itself
-        // is required infrastructure, not a skip condition.
+        // Kernel-version-dependent fields (watchdog_offsets) gate
+        // skips before paying for a VM boot on kernels that can't
+        // satisfy the invariant. The vmlinux symtab, BTF, and scx_root
+        // symbol are required infrastructure for every sched_ext test
+        // kernel, not skip conditions.
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
-        if syms.scx_root.is_none() {
-            eprintln!("ktstr: SKIP: scx_root symbol not found in vmlinux");
-            return;
-        }
-        let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
-            eprintln!("ktstr: SKIP: KernelOffsets BTF resolution failed");
-            return;
-        };
+        assert!(
+            syms.scx_root.is_some(),
+            "ktstr: scx_root symbol missing from vmlinux -- test kernel lacks sched_ext"
+        );
+        let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.watchdog_offsets.is_none() {
             eprintln!("ktstr: SKIP: watchdog_offsets not resolved from BTF");
             return;
@@ -5199,14 +5197,11 @@ mod tests {
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
-        if syms.scx_root.is_none() {
-            eprintln!("ktstr: SKIP: scx_root symbol not found in vmlinux");
-            return;
-        }
-        let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
-            eprintln!("ktstr: SKIP: KernelOffsets BTF resolution failed");
-            return;
-        };
+        assert!(
+            syms.scx_root.is_some(),
+            "ktstr: scx_root symbol missing from vmlinux -- test kernel lacks sched_ext"
+        );
+        let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.event_offsets.is_none() {
             eprintln!("ktstr: SKIP: event_offsets not resolved from BTF");
             return;
@@ -5312,10 +5307,7 @@ mod tests {
         let kernel = crate::test_support::require_kernel();
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
-            eprintln!("ktstr: SKIP: KernelOffsets BTF resolution failed");
-            return;
-        };
+        let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.sched_domain_offsets.is_none() {
             eprintln!("ktstr: SKIP: sched_domain_offsets not resolved from BTF");
             return;

@@ -237,7 +237,7 @@ cumulative worker iteration counts.
 <summary><b>Statistical regression detection</b> — Polars-powered analysis across combinatoric test matrices</summary>
 
 [Polars](https://pola.rs)-powered aggregation computes scheduling
-metrics across runs. Baseline save/compare with dual-gate
+metrics across runs. Run-to-run compare with dual-gate
 significance thresholds (absolute and relative) catches regressions
 that single-run assertions miss.
 

@@ -725,7 +725,7 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 ///   `{CARGO_TARGET_DIR or "target"}/ktstr/`.
 ///
 /// `cargo ktstr stats` doesn't itself run a kernel, so it can't
-/// reconstruct the `{kernel}-{git}` key the test process used; the
+/// reconstruct the `{kernel}-{git_short}` key the test process used; the
 /// mtime fallback mirrors "show me the report from my last test run."
 ///
 /// Returns an empty report with a warning on stderr when no sidecars

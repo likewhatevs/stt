@@ -1,7 +1,7 @@
-//! Gauntlet analysis and baseline comparison.
+//! Gauntlet analysis and run-to-run comparison.
 //!
 //! Collects per-scenario results into a [`polars`] DataFrame for
-//! statistical analysis, regression detection, and baseline save/compare
+//! statistical analysis, regression detection, and run-to-run compare
 //! workflows.
 
 use std::collections::BTreeMap;
@@ -183,7 +183,7 @@ pub struct VmRunResult {
     pub monitor_data: Option<GauntletMonitorData>,
 }
 
-/// Per-scenario result row for gauntlet analysis and baseline comparison.
+/// Per-scenario result row for gauntlet analysis and run-to-run comparison.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GauntletRow {
     pub scenario: String,
@@ -226,7 +226,7 @@ pub struct GauntletRow {
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
-/// Convert a SidecarResult to a GauntletRow for baseline comparison.
+/// Convert a SidecarResult to a GauntletRow for run-to-run comparison.
 pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
     GauntletRow {
         scenario: sc.test_name.clone(),
@@ -1296,6 +1296,13 @@ pub fn list_runs() -> anyhow::Result<()> {
 /// each metric's built-in `default_rel` is used instead (falling back
 /// to 0.10 for unknown metrics).
 ///
+/// Rows where either side's sidecar has `passed=false` are skipped
+/// from the regression math: a failed scenario's metrics reflect the
+/// failure mode, not the scheduler's behavior. The skip count is
+/// reported in the summary line. Sidecar writes are unfiltered -- the
+/// bare `stats` command (and any consumer reading the run directory
+/// directly) still sees every scenario regardless of pass/fail.
+///
 /// Returns 0 on no regressions, 1 if regressions detected.
 pub fn compare_runs(
     a: &str,
@@ -1329,6 +1336,7 @@ pub fn compare_runs(
     let mut regressions = 0u32;
     let mut improvements = 0u32;
     let mut unchanged = 0u32;
+    let mut skipped_failed = 0u32;
 
     println!(
         "{:<30} {:<34} {:>10} {:>10} {:>10}  VERDICT",
@@ -1348,6 +1356,17 @@ pub fn compare_runs(
             .iter()
             .find(|r| (&r.scenario, &r.topology, &r.work_type) == key_b);
         let Some(row_a) = row_a else { continue };
+
+        // Drop failed-scenario rows from the regression math. A failed
+        // scenario's metrics reflect the failure mode (short run, stalled
+        // workload, missing samples), not the scheduler's behavior, so
+        // comparing them produces noise. Sidecars are still written for
+        // both pass and fail outcomes -- the bare `stats` command shows
+        // everything; only `stats compare` filters here.
+        if !row_a.passed || !row_b.passed {
+            skipped_failed += 1;
+            continue;
+        }
 
         for metric_name in &compare_metrics {
             let val_a = row_metric_value(row_a, metric_name);
@@ -1403,10 +1422,18 @@ pub fn compare_runs(
     }
 
     println!();
-    println!(
-        "summary: {} regressions, {} improvements, {} unchanged",
-        regressions, improvements, unchanged,
-    );
+    if skipped_failed > 0 {
+        println!(
+            "summary: {} regressions, {} improvements, {} unchanged \
+             ({} scenario(s) skipped because one or both runs failed)",
+            regressions, improvements, unchanged, skipped_failed,
+        );
+    } else {
+        println!(
+            "summary: {} regressions, {} improvements, {} unchanged",
+            regressions, improvements, unchanged,
+        );
+    }
 
     Ok(if regressions > 0 { 1 } else { 0 })
 }
@@ -2394,8 +2421,8 @@ mod tests {
     fn compare_runs_synthetic_regression_and_improvement() {
         use crate::test_support;
         let tmp = tempfile::TempDir::new().unwrap();
-        let dir_a = tmp.path().join("baselines").join("baseline-a");
-        let dir_b = tmp.path().join("baselines").join("baseline-b");
+        let dir_a = tmp.path().join("runs").join("run-a");
+        let dir_b = tmp.path().join("runs").join("run-b");
         std::fs::create_dir_all(&dir_a).unwrap();
         std::fs::create_dir_all(&dir_b).unwrap();
 

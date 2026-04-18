@@ -1380,7 +1380,8 @@ fn run_gauntlet_test(rest: &str) -> i32 {
 /// Collect sidecar JSON files and return the full gauntlet analysis.
 ///
 /// When `dir` is `Some`, reads sidecars from that directory. Otherwise
-/// uses the default sidecar directory (see [`default_sidecar_dir`]).
+/// uses the default sidecar directory (`KTSTR_SIDECAR_DIR` override, or
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`).
 ///
 /// Returns the concatenated output of `analyze_rows`, verifier stats,
 /// callback profile, and KVM stats. Returns an empty string when no
@@ -4057,14 +4058,10 @@ fn resolve_cgroup_root(args: &[String]) -> String {
 /// Resolve the sidecar output directory for the current test process.
 ///
 /// Override: `KTSTR_SIDECAR_DIR` (used as-is when non-empty).
-/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git}/`,
+/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`,
 /// where `{kernel}` is the version detected from `KTSTR_KERNEL`'s
 /// metadata (or `"unknown"` when no kernel is set / detection fails)
-/// and `{git}` is the short commit hash baked in by `build.rs`.
-pub fn default_sidecar_dir() -> PathBuf {
-    sidecar_dir()
-}
-
+/// and `{git_short}` is the short commit hash baked in by `build.rs`.
 fn sidecar_dir() -> PathBuf {
     if let Ok(d) = std::env::var("KTSTR_SIDECAR_DIR")
         && !d.is_empty()
@@ -4092,7 +4089,7 @@ pub fn runs_root() -> PathBuf {
 ///
 /// Used by bare `cargo ktstr stats` (no subcommand) when
 /// `KTSTR_SIDECAR_DIR` isn't set: the stats command doesn't itself
-/// run a kernel, so it can't reconstruct the `{kernel}-{git}` key
+/// run a kernel, so it can't reconstruct the `{kernel}-{git_short}` key
 /// that the test process used. Picking the newest subdirectory by
 /// mtime mirrors "show me the report from my last test run."
 pub fn newest_run_dir() -> Option<PathBuf> {
@@ -4188,6 +4185,22 @@ pub(crate) fn require_kernel_symbols(
     })
 }
 
+/// Resolve [`crate::monitor::btf_offsets::KernelOffsets`] from a vmlinux
+/// or panic. BTF resolution is required for any host-side kernel
+/// struct introspection; a vmlinux whose BTF fails to parse is an
+/// infrastructure failure, not a test-skip condition.
+#[cfg(test)]
+pub(crate) fn require_kernel_offsets(
+    vmlinux_path: &std::path::Path,
+) -> crate::monitor::btf_offsets::KernelOffsets {
+    crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
+        panic!(
+            "ktstr: KernelOffsets resolution from {} failed: {e:#}",
+            vmlinux_path.display(),
+        )
+    })
+}
+
 /// Detect kernel version from KTSTR_KERNEL env var or cache metadata.
 fn detect_kernel_version() -> Option<String> {
     let kernel_dir = std::env::var("KTSTR_KERNEL").ok()?;
@@ -4276,7 +4289,9 @@ fn generate_run_id() -> String {
 
 /// Write a sidecar JSON file for post-run analysis.
 ///
-/// Output goes to [`default_sidecar_dir`].
+/// Output goes to the current run's sidecar directory
+/// (`KTSTR_SIDECAR_DIR` override, or
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`).
 fn write_sidecar(
     entry: &KtstrTestEntry,
     vm_result: &vmm::VmResult,

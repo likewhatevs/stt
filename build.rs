@@ -145,7 +145,7 @@ int main(void) {{
     // Git info for output directory keying and display. Bounded to
     // ktstr's own manifest dir — never walks upward into a consuming
     // project's repository. When ktstr is consumed as a path-dep or
-    // registry crate without its own .git, all three vars fall back
+    // registry crate without its own .git, both vars fall back
     // to "unknown".
     let mut short_hash = String::from("unknown");
     let mut full_hash = String::from("unknown");
