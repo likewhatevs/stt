@@ -177,23 +177,36 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-For multi-phase scenarios with dynamic topology changes, use
-`Step::with_defs` and `execute_steps`. `Step::with_defs` pairs a list
-of `CgroupDef`s with a `HoldSpec` that controls how long the step
-runs. `HoldSpec::FULL` holds for the entire scenario duration.
+`execute_defs` is a convenience wrapper that creates a single step
+holding for the full duration -- use it when all cgroups run
+concurrently for one phase. Use `execute_steps` when you need
+multiple phases (e.g., adding cgroups mid-test or changing cpusets
+between phases).
+
+`Step::with_defs` pairs a list of `CgroupDef`s with a `HoldSpec` that
+controls how long the step runs. This example starts two cgroups, then
+adds a third mid-test:
 
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1)]
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step::with_defs(
-        vec![
-            CgroupDef::named("cg_0").workers(2),
-            CgroupDef::named("cg_1").workers(2),
-        ],
-        HoldSpec::FULL,
-    )];
+    let steps = vec![
+        // Phase 1: two cgroups for the first half.
+        Step::with_defs(
+            vec![
+                CgroupDef::named("cg_0").workers(2),
+                CgroupDef::named("cg_1").workers(2),
+            ],
+            HoldSpec::Frac(0.5),
+        ),
+        // Phase 2: add a third cgroup for the remaining half.
+        Step::with_defs(
+            vec![CgroupDef::named("cg_2").workers(2)],
+            HoldSpec::Frac(0.5),
+        ),
+    ];
     execute_steps(ctx, steps)
 }
 ```
