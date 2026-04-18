@@ -70,12 +70,10 @@ pub struct Ctx<'a> {
 
 **`cgroups`** -- create/remove cgroups, set cpusets, move tasks.
 `move_task(name, tid)` moves a single task. `move_tasks(name, &tids)`
-moves each task in a slice with bounded EBUSY retry (3 attempts,
-100ms backoff) to ride out transient rejections from sched_ext
-`cgroup_prep_move` callbacks, and tolerates ESRCH when a task exits
-between listing and migration.
+moves each task in a slice, retrying transient failures and tolerating
+tasks that exit during migration.
 
-**`topo`** -- query CPU topology (LLCs, NUMA nodes, total CPUs).
+**`topo`** -- query CPU topology (LLCs, NUMA nodes, memory info, distances).
 Key methods:
 
 - `all_cpus() -> &[usize]` -- all CPU IDs, sorted.
@@ -86,8 +84,7 @@ Key methods:
 - `split_by_llc() -> Vec<BTreeSet<usize>>` -- one BTreeSet per LLC.
 - `num_llcs()`, `total_cpus()`, `num_numa_nodes()` -- counts.
 - `cpus_in_llc(idx) -> &[usize]` -- CPUs in LLC at index.
-- `llc_aligned_cpuset(idx) -> BTreeSet<usize>` -- same as
-  `cpus_in_llc` but returns a set.
+- `llc_aligned_cpuset(idx) -> BTreeSet<usize>` -- CPUs in LLC at index.
 - `numa_aligned_cpuset(node) -> BTreeSet<usize>` -- CPUs in all
   LLCs belonging to a NUMA node.
 - `numa_node_ids() -> &BTreeSet<usize>` -- NUMA node IDs.
