@@ -312,9 +312,9 @@ impl CacheDir {
     /// the boot image for BTF and symbol table access.
     ///
     /// `config_path`: optional path to the kernel `.config`. When
-    /// present, cached alongside the image so `guest_kernel_hz` can
-    /// resolve CONFIG_HZ without IKCONFIG (which lives in `.rodata`
-    /// and is stripped from the cached vmlinux).
+    /// present, cached alongside the image as a fallback source for
+    /// `guest_kernel_hz` when the cached vmlinux is missing or lacks
+    /// IKCONFIG (CONFIG_IKCONFIG=n builds).
     ///
     /// `metadata`: descriptor to serialize as `metadata.json`.
     ///
