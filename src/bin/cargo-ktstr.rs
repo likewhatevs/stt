@@ -1484,7 +1484,7 @@ mod tests {
     #[test]
     fn format_entry_row_with_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "6.14.2-tarball-x86_64", &meta);
         let row = cli::format_entry_row(&entry, "abc123", &[]);
@@ -1498,7 +1498,7 @@ mod tests {
     #[test]
     fn format_entry_row_stale_kconfig() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("old_hash".to_string()));
         let entry = store_test_entry(&cache, "stale-key", &meta);
         let row = cli::format_entry_row(&entry, "new_hash", &[]);
@@ -1511,7 +1511,7 @@ mod tests {
     #[test]
     fn format_entry_row_matching_kconfig() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "match-key", &meta);
         let row = cli::format_entry_row(&entry, "same", &[]);
@@ -1524,7 +1524,7 @@ mod tests {
     #[test]
     fn format_entry_row_no_kconfig_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "no-hash-key", &meta);
         let row = cli::format_entry_row(&entry, "anything", &[]);
@@ -1537,7 +1537,7 @@ mod tests {
     #[test]
     fn format_entry_row_no_version() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = KernelMetadata::new(
             ktstr::cache::KernelSource::Local {
                 source_tree_path: None,
@@ -1560,7 +1560,7 @@ mod tests {
     #[test]
     fn has_stale_kconfig_different_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("old".to_string()));
         let entry = store_test_entry(&cache, "stale", &meta);
         assert!(entry.has_stale_kconfig("new"));
@@ -1569,7 +1569,7 @@ mod tests {
     #[test]
     fn has_stale_kconfig_same_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "fresh", &meta);
         assert!(!entry.has_stale_kconfig("same"));
@@ -1578,7 +1578,7 @@ mod tests {
     #[test]
     fn has_stale_kconfig_no_hash_in_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "no-hash", &meta);
         assert!(!entry.has_stale_kconfig("anything"));

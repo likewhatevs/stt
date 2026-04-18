@@ -176,7 +176,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
                         "eol": eol,
                         "config_hash": meta.config_hash,
                         "image_name": meta.image_name,
-                        "image_path": entry.path.join(&meta.image_name).display().to_string(),
+                        "image_path": entry.image_path().display().to_string(),
                         "has_vmlinux": meta.has_vmlinux,
                     })
                 }
@@ -678,10 +678,7 @@ pub fn kernel_build_pipeline(
     let entry = match cache.store(&acquired.cache_key, &artifacts, &metadata) {
         Ok(entry) => {
             success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
-            eprintln!(
-                "{cli_label}: image: {}",
-                entry.path.join(image_name).display()
-            );
+            eprintln!("{cli_label}: image: {}", entry.image_path().display());
             if crate::remote_cache::is_enabled() {
                 crate::remote_cache::remote_store(&entry, cli_label);
             }
@@ -1201,7 +1198,6 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
 
     let acquired =
         crate::fetch::local_source(path, cli_label).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (_, image_name) = crate::fetch::arch_info();
     let cache_key = acquired.cache_key.clone();
 
     // Clean trees: cache lookup before build.
@@ -1210,7 +1206,7 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
         && let Ok(cache) = crate::cache::CacheDir::new()
         && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
     {
-        let image = entry.path.join(&entry.metadata.image_name);
+        let image = entry.image_path();
         if image.exists() {
             success(&format!("{cli_label}: using cached kernel {cache_key}"));
             return Ok(image);
@@ -1222,7 +1218,7 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
 
     // Prefer the cached image path (stable across rebuilds).
     match result.entry {
-        Some(entry) => Ok(entry.path.join(image_name)),
+        Some(entry) => Ok(entry.image_path()),
         None => Ok(result.image_path),
     }
 }

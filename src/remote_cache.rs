@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn remote_cache_pack_unpack_roundtrip() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
@@ -392,7 +392,7 @@ mod tests {
         assert!(!packed.is_empty());
 
         let tmp2 = tempfile::TempDir::new().unwrap();
-        let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
+        let cache2 = CacheDir::with_root(tmp2.path().join("cache"));
         let restored = unpack_and_store(&cache2, "test-key", &packed).unwrap();
 
         assert_eq!(restored.key, "test-key");
@@ -416,7 +416,7 @@ mod tests {
         // pack_entry must not include it — the tar carries only
         // metadata.json + image + optional vmlinux.
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn remote_cache_pack_produces_valid_tar() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn remote_cache_pack_is_zstd_compressed() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
@@ -486,7 +486,7 @@ mod tests {
         // Verify backward compatibility: unpack_and_store accepts
         // uncompressed tar data (entries written before zstd was added).
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         let mut archive = tar::Builder::new(Vec::new());
         let meta = test_metadata();
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn remote_cache_unpack_rejects_missing_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         let mut archive = tar::Builder::new(Vec::new());
         let data = b"kernel image";
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn remote_cache_unpack_rejects_missing_image() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         let mut archive = tar::Builder::new(Vec::new());
         let meta = test_metadata();
@@ -586,7 +586,7 @@ mod tests {
         let _g2 = EnvVarGuard::remove("ACTIONS_CACHE_URL");
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn remote_cache_source_tree_path_sanitized_on_roundtrip() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
@@ -629,7 +629,7 @@ mod tests {
         let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
 
         let tmp2 = tempfile::TempDir::new().unwrap();
-        let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
+        let cache2 = CacheDir::with_root(tmp2.path().join("cache"));
         let restored = unpack_and_store(&cache2, "stp-key", &packed).unwrap();
 
         let restored_meta = &restored.metadata;
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn remote_cache_pack_with_git_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
@@ -667,7 +667,7 @@ mod tests {
         let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
 
         let tmp2 = tempfile::TempDir::new().unwrap();
-        let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
+        let cache2 = CacheDir::with_root(tmp2.path().join("cache"));
         let restored = unpack_and_store(&cache2, "git-key", &packed).unwrap();
 
         let rmeta = &restored.metadata;

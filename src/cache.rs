@@ -336,10 +336,11 @@ impl CacheDir {
 
     /// Open a cache directory at a specific path.
     ///
-    /// Only sets the root path; does not create the directory.
-    /// Used by tests and callers that need an explicit cache location.
-    pub fn with_root(root: PathBuf) -> anyhow::Result<Self> {
-        Ok(CacheDir { root })
+    /// Only sets the root path; does not create the directory — the
+    /// constructor is infallible. Used by tests and callers that need
+    /// an explicit cache location.
+    pub fn with_root(root: PathBuf) -> Self {
+        CacheDir { root }
     }
 
     /// Resolve the default cache root path without side effects.
@@ -749,7 +750,7 @@ impl StrippedVmlinux {
 /// Returns a [`StrippedVmlinux`] handle that owns the backing temp
 /// directory; the caller must keep it alive until consumers (e.g.
 /// [`CacheDir::store`]) have copied the file.
-pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<StrippedVmlinux> {
+pub(crate) fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<StrippedVmlinux> {
     let raw =
         fs::read(vmlinux_path).map_err(|e| anyhow::anyhow!("read vmlinux for stripping: {e}"))?;
     let original_size = raw.len();
@@ -1125,7 +1126,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("kernels");
         assert!(!root.exists());
-        let cache = CacheDir::with_root(root.clone()).unwrap();
+        let cache = CacheDir::with_root(root.clone());
         // Resolution must not create the directory — store() does it
         // lazily on first write.
         assert!(!root.exists());
@@ -1137,7 +1138,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("never-created");
         assert!(!root.exists());
-        let cache = CacheDir::with_root(root).unwrap();
+        let cache = CacheDir::with_root(root);
         let entries = cache.list().unwrap();
         assert!(entries.is_empty());
     }
@@ -1147,7 +1148,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("lazy-root");
         assert!(!root.exists());
-        let cache = CacheDir::with_root(root.clone()).unwrap();
+        let cache = CacheDir::with_root(root.clone());
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
@@ -1170,7 +1171,7 @@ mod tests {
     #[test]
     fn cache_dir_list_empty() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
         let entries = cache.list().unwrap();
         assert!(entries.is_empty());
     }
@@ -1178,7 +1179,7 @@ mod tests {
     #[test]
     fn cache_dir_store_and_lookup() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
 
         // Create a fake kernel image.
         let src_dir = TempDir::new().unwrap();
@@ -1204,14 +1205,14 @@ mod tests {
     #[test]
     fn cache_dir_lookup_missing() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
         assert!(cache.lookup("nonexistent").is_none());
     }
 
     #[test]
     fn cache_dir_lookup_corrupt_metadata() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
 
         // Create entry dir with image but corrupt metadata.
         let entry_dir = tmp.path().join("bad-entry");
@@ -1228,7 +1229,7 @@ mod tests {
     #[test]
     fn cache_dir_lookup_missing_image() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
 
         // Create entry dir with valid metadata but no image file.
         let entry_dir = tmp.path().join("no-image");
@@ -1244,7 +1245,7 @@ mod tests {
     #[test]
     fn cache_dir_store_overwrites_existing() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
 
@@ -1279,7 +1280,7 @@ mod tests {
     #[test]
     fn cache_dir_list_sorted_newest_first() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
 
@@ -1317,7 +1318,7 @@ mod tests {
     #[test]
     fn cache_dir_list_includes_corrupt_entries() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
 
         // Create a valid entry.
         let src_dir = TempDir::new().unwrap();
@@ -1344,7 +1345,7 @@ mod tests {
     #[test]
     fn cache_dir_list_skips_tmp_dirs() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
 
         // Create a .tmp- directory (in-progress store).
         let tmp_dir = tmp.path().join(".tmp-in-progress-12345");
@@ -1357,7 +1358,7 @@ mod tests {
     #[test]
     fn cache_dir_list_skips_regular_files() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
 
         // Create a regular file in the cache root.
         fs::write(tmp.path().join("stray-file.txt"), b"stray").unwrap();
@@ -1369,7 +1370,7 @@ mod tests {
     #[test]
     fn cache_dir_clean_all() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
 
@@ -1391,7 +1392,7 @@ mod tests {
     #[test]
     fn cache_dir_clean_keep_n() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
 
@@ -1429,7 +1430,7 @@ mod tests {
     #[test]
     fn cache_dir_clean_keep_more_than_exist() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
 
@@ -1449,7 +1450,7 @@ mod tests {
     #[test]
     fn cache_dir_clean_empty_cache() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
         let removed = cache.clean_all().unwrap();
         assert_eq!(removed, 0);
     }
@@ -1614,7 +1615,7 @@ mod tests {
     #[test]
     fn cache_dir_store_rejects_image_name_traversal() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let mut meta = test_metadata("6.14.2");
@@ -1634,7 +1635,7 @@ mod tests {
     #[test]
     fn cache_dir_store_tmp_prefix_key_rejected() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
@@ -1651,7 +1652,7 @@ mod tests {
     #[test]
     fn cache_dir_lookup_tmp_prefix_returns_none() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
         assert!(cache.lookup(".tmp-sneaky").is_none());
     }
 
@@ -1660,7 +1661,7 @@ mod tests {
     #[test]
     fn cache_dir_store_empty_key_rejected() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
@@ -1677,14 +1678,14 @@ mod tests {
     #[test]
     fn cache_dir_lookup_empty_key_returns_none() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
         assert!(cache.lookup("").is_none());
     }
 
     #[test]
     fn cache_dir_store_path_traversal_rejected() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
@@ -1701,7 +1702,7 @@ mod tests {
     #[test]
     fn cache_dir_lookup_path_traversal_returns_none() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
         assert!(cache.lookup("../escape").is_none());
         assert!(cache.lookup("foo/../bar").is_none());
     }
@@ -1709,7 +1710,7 @@ mod tests {
     #[test]
     fn cache_dir_store_slash_in_key_rejected() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
@@ -1726,7 +1727,7 @@ mod tests {
     #[test]
     fn cache_dir_store_whitespace_only_key_rejected() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
@@ -1745,7 +1746,7 @@ mod tests {
     #[test]
     fn cache_dir_clean_keep_n_with_mixed_entries() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
 
@@ -1786,7 +1787,7 @@ mod tests {
     fn cache_dir_store_cleans_stale_tmp() {
         let tmp = TempDir::new().unwrap();
         let cache_root = tmp.path().join("cache");
-        let cache = CacheDir::with_root(cache_root.clone()).unwrap();
+        let cache = CacheDir::with_root(cache_root.clone());
 
         // Create a stale .tmp- directory simulating a prior crash.
         let stale_tmp = cache_root.join(format!(".tmp-mykey-{}", std::process::id()));
@@ -1809,7 +1810,7 @@ mod tests {
     #[test]
     fn cache_dir_store_with_vmlinux() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let vmlinux = src_dir.path().join("vmlinux");
@@ -1836,7 +1837,7 @@ mod tests {
     #[test]
     fn cache_dir_store_without_vmlinux() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
@@ -1857,7 +1858,7 @@ mod tests {
         // the stored vmlinux must reflect the strip (smaller than
         // source, no .debug_* sections).
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let vmlinux = create_strip_test_fixture(src_dir.path());
@@ -1898,7 +1899,7 @@ mod tests {
         // copying the raw bytes. has_vmlinux stays true so consumers
         // still see it.
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let vmlinux = src_dir.path().join("vmlinux");
@@ -1924,7 +1925,7 @@ mod tests {
         // source file is still there after store() (no move, no
         // truncate).
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let vmlinux = create_strip_test_fixture(src_dir.path());
@@ -1949,7 +1950,7 @@ mod tests {
     #[test]
     fn cache_dir_store_preserves_original_image() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
@@ -1967,7 +1968,7 @@ mod tests {
     #[test]
     fn cache_entry_image_path_joins_key_with_image_name() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let entry = cache
@@ -1984,7 +1985,7 @@ mod tests {
     #[test]
     fn cache_entry_vmlinux_path_some_when_stored() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let vmlinux = create_strip_test_fixture(src_dir.path());
@@ -2003,7 +2004,7 @@ mod tests {
     #[test]
     fn cache_entry_vmlinux_path_none_when_not_stored() {
         let tmp = TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let entry = cache

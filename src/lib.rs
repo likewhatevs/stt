@@ -379,7 +379,7 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 let arch = std::env::consts::ARCH;
                 let key = format!("{ver}-tarball-{arch}-kc{}", cache_key_suffix());
                 if let Some(entry) = cache.lookup(&key) {
-                    return Ok(Some(entry.path.join(&entry.metadata.image_name)));
+                    return Ok(Some(entry.image_path()));
                 }
                 // Version not in cache — skip general cache scan to
                 // avoid returning a different kernel version.
@@ -393,7 +393,7 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                     )
                 })?;
                 if let Some(entry) = cache.lookup(key) {
-                    return Ok(Some(entry.path.join(&entry.metadata.image_name)));
+                    return Ok(Some(entry.image_path()));
                 }
                 // Explicit cache key not found — skip general cache scan.
                 skip_cache_scan = true;
@@ -417,7 +417,7 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
             if entry.has_stale_kconfig(&kc_hash) {
                 continue;
             }
-            let image = entry.path.join(&entry.metadata.image_name);
+            let image = entry.image_path();
             if !image.exists() {
                 continue;
             }
@@ -427,8 +427,7 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
             // caches built by a strip pipeline that dropped data
             // sections would pass the image-exists check but fail
             // downstream when the monitor initializes.
-            let vmlinux = entry.path.join("vmlinux");
-            if vmlinux.exists()
+            if let Some(vmlinux) = entry.vmlinux_path()
                 && let Err(e) = monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux)
             {
                 tracing::warn!(
