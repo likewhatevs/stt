@@ -1621,11 +1621,11 @@ mod tests {
     #[test]
     fn parse_btf_known_kernel_func() {
         if !std::path::Path::new("/sys/kernel/btf/vmlinux").exists() {
-            return;
+            skip!("/sys/kernel/btf/vmlinux not present");
         }
         let funcs = parse_btf_functions(&["do_exit"], None);
         if funcs.is_empty() {
-            return;
+            skip!("BTF load returned no functions — host BTF may lack do_exit");
         }
         assert_eq!(funcs[0].name, "do_exit");
         assert!(!funcs[0].params.is_empty());
