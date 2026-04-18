@@ -6,9 +6,8 @@ use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 
-/// Apply disjoint cpusets to two initially unconstrained cgroups mid-run.
-pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![
+fn cgroup_cpuset_apply_midrun_steps(ctx: &Ctx) -> Vec<Step> {
+    vec![
         Step::with_defs(
             vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
             HoldSpec::Fixed(ctx.settle + ctx.duration / 2),
@@ -20,9 +19,12 @@ pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
             ],
             HoldSpec::Frac(0.5),
         ),
-    ];
+    ]
+}
 
-    execute_steps(ctx, steps)
+/// Apply disjoint cpusets to two initially unconstrained cgroups mid-run.
+pub fn custom_cgroup_cpuset_apply_midrun(ctx: &Ctx) -> Result<AssertResult> {
+    execute_steps(ctx, cgroup_cpuset_apply_midrun_steps(ctx))
 }
 
 /// Clear disjoint cpusets from two cgroups mid-run.
@@ -44,13 +46,8 @@ pub fn custom_cgroup_cpuset_clear_midrun(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-/// Three-phase cpuset resize: 50/50, 25/75, 75/25.
-pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
-    if ctx.topo.all_cpus().len() < 4 {
-        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
-    }
-
-    let steps = vec![
+fn cgroup_cpuset_resize_steps(ctx: &Ctx) -> Vec<Step> {
+    vec![
         Step::with_defs(
             vec![
                 CgroupDef::named("cg_0").with_cpuset(CpusetSpec::range(0.0, 0.5)),
@@ -72,9 +69,15 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
             ],
             HoldSpec::Frac(1.0 / 3.0),
         ),
-    ];
+    ]
+}
 
-    execute_steps(ctx, steps)
+/// Three-phase cpuset resize: 50/50, 25/75, 75/25.
+pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
+    if ctx.topo.all_cpus().len() < 4 {
+        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
+    }
+    execute_steps(ctx, cgroup_cpuset_resize_steps(ctx))
 }
 
 /// Swap disjoint cpuset assignments between two cgroups twice.
@@ -220,4 +223,80 @@ pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     ];
 
     execute_steps(ctx, steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ops::Setup;
+    use super::*;
+    use crate::cgroup::CgroupManager;
+    use crate::topology::TestTopology;
+    use std::time::Duration;
+
+    fn ctx_for_test<'a>(cgroups: &'a CgroupManager, topo: &'a TestTopology) -> Ctx<'a> {
+        Ctx {
+            cgroups,
+            topo,
+            duration: Duration::from_secs(6),
+            workers_per_cgroup: 2,
+            sched_pid: 1,
+            settle: Duration::from_millis(100),
+            work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
+        }
+    }
+
+    #[test]
+    fn apply_midrun_builds_two_phase_steps() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let steps = cgroup_cpuset_apply_midrun_steps(&ctx);
+        assert_eq!(steps.len(), 2, "setup + apply phases");
+
+        match &steps[0].setup {
+            Setup::Defs(defs) => assert_eq!(defs.len(), 2, "two cgroups defined in phase 1"),
+            Setup::Factory(_) => panic!("phase 1 should use static Defs"),
+        }
+        assert!(
+            steps[0].ops.is_empty(),
+            "phase 1 has setup only, no mid-step ops"
+        );
+
+        assert!(matches!(steps[0].hold, HoldSpec::Fixed(_)));
+        let phase2_ops = &steps[1].ops;
+        assert_eq!(phase2_ops.len(), 2, "set_cpuset once per cgroup");
+        for op in phase2_ops {
+            assert!(matches!(op, Op::SetCpuset { .. }));
+        }
+        assert!(matches!(steps[1].hold, HoldSpec::Frac(f) if (f - 0.5).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn resize_builds_three_phase_range_progression() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let steps = cgroup_cpuset_resize_steps(&ctx);
+        assert_eq!(steps.len(), 3);
+        // Phase 1: static defs with initial range split.
+        match &steps[0].setup {
+            Setup::Defs(defs) => {
+                assert_eq!(defs.len(), 2);
+                assert!(defs[0].cpuset.is_some());
+                assert!(defs[1].cpuset.is_some());
+            }
+            Setup::Factory(_) => panic!("phase 1 should use static Defs"),
+        }
+        // Phases 2 and 3: each reassigns cpusets on both cgroups.
+        for step in &steps[1..] {
+            assert_eq!(step.ops.len(), 2);
+            for op in &step.ops {
+                assert!(matches!(op, Op::SetCpuset { .. }));
+            }
+        }
+    }
 }

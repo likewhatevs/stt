@@ -9,46 +9,46 @@ use std::collections::BTreeSet;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// One cgroup per CPU, each with a single pinned worker. Stresses
-/// the scheduler with up to 64 cgroups on disjoint single-CPU cpusets.
-pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
-    fn per_cpu_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
-        let all = ctx.topo.all_cpus();
-        let n = (all.len() - 1).min(64);
-        (0..n)
-            .map(|i| {
-                CgroupDef::named(format!("many_{i}"))
-                    .with_cpuset(CpusetSpec::exact([all[i]]))
-                    .workers(1)
-            })
-            .collect()
-    }
+fn per_cpu_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
+    let all = ctx.topo.all_cpus();
+    let n = (all.len() - 1).min(64);
+    (0..n)
+        .map(|i| {
+            CgroupDef::named(format!("many_{i}"))
+                .with_cpuset(CpusetSpec::exact([all[i]]))
+                .workers(1)
+        })
+        .collect()
+}
 
-    let steps = vec![Step {
+fn cgroup_per_cpu_steps(ctx: &Ctx) -> Vec<Step> {
+    vec![Step {
         setup: Setup::Factory(per_cpu_defs),
         ops: vec![],
         hold: HoldSpec::Fixed(Duration::from_secs(1) + ctx.duration),
-    }];
-
-    execute_steps(ctx, steps)
+    }]
 }
 
-/// Exhaust cgroup slots with empty cpuset-pinned cgroups, remove half,
-/// then create replacement cgroups with workers to test slot reuse.
-pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
-    fn reuse_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
-        let all = ctx.topo.all_cpus();
-        let n = (all.len() - 1).min(15);
-        let half = n / 2;
-        (0..half)
-            .map(|i| {
-                CgroupDef::named(format!("reuse_{i}"))
-                    .with_cpuset(CpusetSpec::exact([all[i % all.len()]]))
-                    .workers(1)
-            })
-            .collect()
-    }
+/// One cgroup per CPU, each with a single pinned worker. Stresses
+/// the scheduler with up to 64 cgroups on disjoint single-CPU cpusets.
+pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
+    execute_steps(ctx, cgroup_per_cpu_steps(ctx))
+}
 
+fn reuse_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
+    let all = ctx.topo.all_cpus();
+    let n = (all.len() - 1).min(15);
+    let half = n / 2;
+    (0..half)
+        .map(|i| {
+            CgroupDef::named(format!("reuse_{i}"))
+                .with_cpuset(CpusetSpec::exact([all[i % all.len()]]))
+                .workers(1)
+        })
+        .collect()
+}
+
+fn cgroup_exhaust_reuse_steps(ctx: &Ctx) -> Vec<Step> {
     let all = ctx.topo.all_cpus();
     let n = (all.len() - 1).min(15);
     let half = n / 2;
@@ -71,7 +71,7 @@ pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
         remove_ops.push(Op::remove_cgroup(format!("exhaust_{i}")));
     }
 
-    let steps = vec![
+    vec![
         // Phase 1: create N exhaust cgroups (no workers — they just occupy slots).
         Step::new(exhaust_ops, HoldSpec::Fixed(Duration::from_secs(1))),
         // Phase 2: remove first half.
@@ -82,9 +82,13 @@ pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
             ops: vec![],
             hold: HoldSpec::Fixed(ctx.duration),
         },
-    ];
+    ]
+}
 
-    execute_steps(ctx, steps)
+/// Exhaust cgroup slots with empty cpuset-pinned cgroups, remove half,
+/// then create replacement cgroups with workers to test slot reuse.
+pub fn custom_cgroup_exhaust_reuse(ctx: &Ctx) -> Result<AssertResult> {
+    execute_steps(ctx, cgroup_exhaust_reuse_steps(ctx))
 }
 
 /// Per-CPU pinned workers + custom gap assertion (max_gap_ms > 1500).
@@ -305,4 +309,95 @@ pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<AssertResult> {
     r.merge(assert::assert_not_starved(&h0.stop_and_collect()));
     r.merge(assert::assert_not_starved(&h1.stop_and_collect()));
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cgroup::CgroupManager;
+    use crate::topology::TestTopology;
+
+    fn ctx_for_test<'a>(cgroups: &'a CgroupManager, topo: &'a TestTopology) -> Ctx<'a> {
+        Ctx {
+            cgroups,
+            topo,
+            duration: Duration::from_secs(2),
+            workers_per_cgroup: 1,
+            sched_pid: 1,
+            settle: Duration::from_millis(100),
+            work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
+        }
+    }
+
+    #[test]
+    fn per_cpu_factory_produces_cgroup_per_cpu_capped_at_64() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let steps = cgroup_per_cpu_steps(&ctx);
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].ops.is_empty());
+        let factory = match steps[0].setup {
+            Setup::Factory(f) => f,
+            Setup::Defs(_) => panic!("per_cpu should use Factory setup"),
+        };
+        let defs = factory(&ctx);
+        // n = (all_cpus - 1).min(64) with 4 CPUs → 3 defs.
+        assert_eq!(defs.len(), 3);
+        for (i, d) in defs.iter().enumerate() {
+            assert_eq!(d.name, format!("many_{i}"));
+            assert!(d.cpuset.is_some());
+            assert_eq!(d.works[0].num_workers, Some(1));
+        }
+    }
+
+    #[test]
+    fn exhaust_reuse_builds_three_phases_with_matching_add_remove_counts() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_spec(1, 1, 8, 1);
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let steps = cgroup_exhaust_reuse_steps(&ctx);
+        assert_eq!(steps.len(), 3);
+
+        // Phase 1: n = (8-1).min(15) = 7 cgroups, each paired AddCgroup+SetCpuset.
+        let adds = steps[0]
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::AddCgroup { .. }))
+            .count();
+        let sets = steps[0]
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::SetCpuset { .. }))
+            .count();
+        assert_eq!(adds, 7);
+        assert_eq!(sets, 7);
+        assert_eq!(steps[0].ops.len(), 14);
+
+        // Phase 2: remove first half (7/2 = 3).
+        let removes = steps[1]
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::RemoveCgroup { .. }))
+            .count();
+        assert_eq!(removes, 3);
+        assert_eq!(steps[1].ops.len(), 3);
+
+        // Phase 3: factory-built defs, no ops.
+        assert!(steps[2].ops.is_empty());
+        let factory = match steps[2].setup {
+            Setup::Factory(f) => f,
+            Setup::Defs(_) => panic!("phase 3 should use Factory setup"),
+        };
+        let defs = factory(&ctx);
+        // half = 7/2 = 3 replacement cgroups.
+        assert_eq!(defs.len(), 3);
+        for d in &defs {
+            assert_eq!(d.works[0].num_workers, Some(1));
+        }
+    }
 }
