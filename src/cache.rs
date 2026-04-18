@@ -2,9 +2,10 @@
 //!
 //! Manages a local cache of built kernel images under an XDG-compliant
 //! directory. Each cached kernel is a directory containing the boot
-//! image, optionally a stripped vmlinux ELF (BTF + symbol table)
-//! and `.config` (for CONFIG_HZ resolution), plus a `metadata.json`
-//! descriptor.
+//! image, optionally a stripped vmlinux ELF (symbol table, BTF, and
+//! the section headers that monitor/probe code reads) and `.config`
+//! (fallback CONFIG_HZ source for kernels without IKCONFIG), plus a
+//! `metadata.json` descriptor.
 //!
 //! # Cache location
 //!
@@ -95,9 +96,12 @@ pub struct KernelMetadata {
     /// Path to the source tree on disk (local builds only).
     #[serde(default)]
     pub source_tree_path: Option<PathBuf>,
-    /// Filename of the cached vmlinux ELF (BTF + symbol table).
-    /// DWARF debug sections are stripped before caching.
-    /// `None` when vmlinux was not available at cache time.
+    /// Filename of the cached vmlinux ELF. The vmlinux is stripped
+    /// before caching: symbol tables, BTF, `.rodata` (IKCONFIG blob),
+    /// and the section headers monitor/probe code references are
+    /// preserved; DWARF, code-section bytes, and most data-section
+    /// bytes are dropped. See [`strip_vmlinux_debug`] for the full
+    /// policy. `None` when vmlinux was not available at cache time.
     #[serde(default)]
     pub vmlinux_name: Option<String>,
 }
@@ -360,7 +364,8 @@ impl CacheDir {
             false
         };
 
-        // Copy .config (CONFIG_HZ resolution for stripped vmlinux).
+        // Copy .config (fallback CONFIG_HZ source when the cached
+        // vmlinux lacks IKCONFIG).
         if let Some(cfg) = config_path {
             fs::copy(cfg, tmp_dir.join(".config"))
                 .map_err(|e| anyhow::anyhow!("copy .config to cache: {e}"))?;
@@ -499,12 +504,15 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
     serde_json::from_str(&contents).ok()
 }
 
-/// Sections whose bytes are preserved in the cached vmlinux.
-/// Everything not in this list or [`VMLINUX_ZERO_DATA_SECTIONS`] is
-/// deleted (non-code) or has its bytes dropped via SHT_NOBITS (code).
-/// Keep-list is safer than a remove-list: new debug or data sections
-/// added by future compiler/kernel versions are stripped automatically
-/// without updating this list.
+/// Sections whose source bytes are preserved verbatim in the cached
+/// vmlinux. Entries that start as `SHT_NOBITS` (`.bss`) have no
+/// bytes to preserve but the section header is kept so symbols
+/// pointing at them survive. Everything not in this list or
+/// [`VMLINUX_ZERO_DATA_SECTIONS`] is deleted (non-code) or has its
+/// bytes dropped via SHT_NOBITS (code). Keep-list is safer than a
+/// remove-list: new debug or data sections added by future
+/// compiler/kernel versions are stripped automatically without
+/// updating this list.
 const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
     b"",          // null section (index 0)
     b".BTF",      // BPF Type Format — probe field resolution
@@ -512,14 +520,18 @@ const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
     b".strtab",   // symbol string table
     b".shstrtab", // section header string table (structural)
     b".rodata",   // IKCONFIG gzip blob read by read_hz_from_ikconfig
-    b".bss",      // already SHT_NOBITS — holds swapper_pg_dir, scx_root
+    b".bss",      // already SHT_NOBITS — holds scx_root (uninitialized globals)
 ];
 
-/// Data sections whose headers are kept (so symbols with `st_shndx`
-/// pointing at them survive `Builder::delete_orphans`) but whose
-/// bytes are dropped via SHT_NOBITS + zero-length data. Monitor code
-/// reads symbol addresses (`st_value`) from these, never the backing
-/// bytes — guest memory is the source of truth.
+/// Data sections whose bytes are dropped (converted to SHT_NOBITS +
+/// zero-length data) while their headers and addresses are preserved.
+/// Monitor code reads only symbol addresses (`st_value`) from these,
+/// never the backing bytes — guest memory is the source of truth.
+/// Keeping the header lets symbols with `st_shndx` pointing at them
+/// survive `Builder::delete_orphans`.
+///
+/// Contrast with [`VMLINUX_KEEP_SECTIONS`]: that list preserves
+/// source bytes; this one discards them.
 const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
     b".data",         // holds init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
     b".data..percpu", // holds runqueues (per-CPU runqueue template)
