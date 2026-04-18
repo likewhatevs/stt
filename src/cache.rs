@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 /// or `{"type": "local", "source_tree_path": ...}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "type")]
+#[non_exhaustive]
 pub enum KernelSource {
     /// Downloaded tarball from kernel.org (version / prefix / EOL
     /// probe paths).
@@ -58,10 +59,10 @@ pub enum KernelSource {
     /// Shallow clone of a git URL at a caller-specified ref.
     Git {
         /// Git commit hash of the kernel source (short form).
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         hash: Option<String>,
         /// Git ref used for checkout (branch, tag, or ref spec).
-        #[serde(default, rename = "ref")]
+        #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
         git_ref: Option<String>,
     },
     /// Build of a local on-disk kernel source tree.
@@ -192,6 +193,7 @@ impl<'a> CacheArtifacts<'a> {
 /// Comparison between a cache entry's kconfig hash and a current
 /// reference hash. Returned by [`CacheEntry::kconfig_status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KconfigStatus {
     /// Entry was built with the current kconfig — nothing to do.
     Matches,
@@ -267,6 +269,7 @@ impl CacheEntry {
 /// (with parsed metadata) from corrupt ones (unreadable or
 /// unparseable metadata) so callers don't have to re-check `Option`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ListedEntry {
     /// Valid cache entry with parsed metadata.
     Valid(CacheEntry),
@@ -733,7 +736,7 @@ fn is_zero_data_section(name: &[u8]) -> bool {
 /// [`CacheDir::store`] (or equivalent consumer) before the handle
 /// goes out of scope.
 #[derive(Debug)]
-pub struct StrippedVmlinux {
+pub(crate) struct StrippedVmlinux {
     _tmp: tempfile::TempDir,
     path: PathBuf,
 }

@@ -16,8 +16,19 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use btf_rs::{Btf, Type};
 
-/// Load BTF from a path. Handles both raw BTF (/sys/kernel/btf/vmlinux)
-/// and ELF files (vmlinux) by extracting the .BTF section.
+/// Load BTF from a path. Accepts two input shapes:
+///
+/// - Raw BTF (e.g. `/sys/kernel/btf/vmlinux`) — identified by the
+///   leading 0x9FEB magic bytes, parsed via `Btf::from_bytes`.
+/// - ELF vmlinux — parsed via `goblin::elf::Elf`; the `.BTF`
+///   section bytes are extracted and handed to `Btf::from_bytes`.
+///
+/// Any other input is rejected with an error. The previous fallback
+/// to `Btf::from_file` on non-ELF non-raw-BTF input was removed
+/// because `Btf::from_file` only recognizes raw BTF anyway (it would
+/// reject the same bytes this function already tried) and its error
+/// message obscured the real cause — callers now see a clear
+/// "not recognized as raw BTF or ELF" diagnostic.
 pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     let data = std::fs::read(path).context("read file")?;
     // Try raw BTF first (starts with BTF magic 0x9FEB)
@@ -40,8 +51,10 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
         }
         bail!("vmlinux ELF has no .BTF section");
     }
-    // Fallback: try btf-rs directly
-    Btf::from_file(path).map_err(|e| anyhow::anyhow!("{e}"))
+    bail!(
+        "{}: not recognized as raw BTF (missing 0x9FEB magic) or ELF vmlinux",
+        path.display()
+    )
 }
 
 /// Byte offsets of kernel struct fields needed for host-side rq monitoring.

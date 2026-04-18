@@ -139,6 +139,13 @@ pub struct FieldSpec {
 
 /// Resolve struct field offsets from BTF for a single function.
 ///
+/// `vmlinux_path` accepts either a raw BTF blob (e.g.
+/// `/sys/kernel/btf/vmlinux`) or an ELF vmlinux — both formats are
+/// recognized by [`crate::monitor::btf_offsets::load_btf_from_path`].
+/// `None` falls back to the host's `/sys/kernel/btf/vmlinux`, which
+/// is the host kernel's BTF and does not match the guest kernel
+/// under test; a warning is emitted in that case.
+///
 /// Handles both STRUCT_FIELDS entries (curated fields with known output
 /// keys) and auto-discovered fields from [`discover_vmlinux_struct_fields`]
 /// (stored in `BtfParam::auto_fields`). STRUCT_FIELDS entries consume
@@ -476,6 +483,13 @@ fn resolve_pointed_struct(
 }
 
 /// Parse BTF from vmlinux for kernel function signatures.
+///
+/// `vmlinux_path` accepts either a raw BTF blob (e.g.
+/// `/sys/kernel/btf/vmlinux`) or an ELF vmlinux — both formats are
+/// recognized by [`crate::monitor::btf_offsets::load_btf_from_path`].
+/// `None` falls back to the host's `/sys/kernel/btf/vmlinux`, which
+/// is the host kernel's BTF and does not match the guest kernel
+/// under test; a warning is emitted in that case.
 ///
 /// Resolves parameter types via btf-rs, following PTR/CONST/VOLATILE/TYPEDEF
 /// chains to identify struct pointers. Records `struct_name` for types

@@ -160,7 +160,10 @@ pub fn derive_kernel_dir(image: &std::path::Path) -> Option<std::path::PathBuf> 
     }
 
     let parent = canon.parent()?;
-    if parent.join("vmlinux").exists() {
+    // is_file (not exists) matches cache::prefer_source_tree_for_dwarf's
+    // sibling probe, so a `vmlinux` directory or symlink-to-directory
+    // cannot satisfy either check.
+    if parent.join("vmlinux").is_file() {
         return Some(parent.to_path_buf());
     }
 
