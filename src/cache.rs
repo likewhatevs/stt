@@ -1773,8 +1773,7 @@ mod tests {
         // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
         // not an ELF), which strip_vmlinux_debug cannot parse.
         if path.starts_with("/sys/") {
-            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot strip debug");
-            return;
+            skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
         }
         let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
         let syms = crate::monitor::symbols::KernelSymbols::from_vmlinux(&stripped_path).unwrap();
@@ -1824,8 +1823,7 @@ mod tests {
             None => return,
         };
         if path.starts_with("/sys/") {
-            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot strip debug");
-            return;
+            skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
         }
         let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
         let data = fs::read(&stripped_path).unwrap();
@@ -1857,8 +1855,7 @@ mod tests {
             None => return,
         };
         if path.starts_with("/sys/") {
-            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot strip debug");
-            return;
+            skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
         }
         // Skip if the source vmlinux has no `schedule` symbol -- that
         // means it was already stripped by an older build of ktstr
@@ -1872,12 +1869,11 @@ mod tests {
             .iter()
             .any(|s| s.st_value != 0 && source_elf.strtab.get_at(s.st_name) == Some("schedule"));
         if !source_has_schedule {
-            eprintln!(
-                "ktstr: SKIP: source vmlinux has no `schedule` symbol \
+            skip!(
+                "source vmlinux has no `schedule` symbol \
                  (already stripped by older ktstr) -- rebuild the kernel \
                  cache to exercise this test"
             );
-            return;
         }
 
         let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();

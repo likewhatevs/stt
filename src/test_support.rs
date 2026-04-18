@@ -4115,8 +4115,10 @@ pub fn newest_run_dir() -> Option<PathBuf> {
 // findable is the failure mode these helpers exist to prevent.
 //
 // For genuine skips (raw BTF at /sys/kernel/btf/vmlinux, host without
-// the architectural dependency the test exercises), keep the existing
-// `eprintln!("ktstr: SKIP: ..."); return;` pattern.
+// the architectural dependency the test exercises), call the crate's
+// `skip!("reason: {detail}")` macro (see `src/test_macros.rs`). It
+// emits the canonical `ktstr: SKIP: ...` line and returns from the
+// test.
 
 /// Resolve a kernel image path or panic with an actionable message.
 ///

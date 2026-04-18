@@ -1170,10 +1170,7 @@ mod tests {
         };
         let offsets = match KernelOffsets::from_vmlinux(&path) {
             Ok(o) => o,
-            Err(e) => {
-                eprintln!("ktstr: SKIP: vmlinux BTF resolution failed: {e}");
-                return;
-            }
+            Err(e) => skip!("vmlinux BTF resolution failed: {e}"),
         };
 
         assert_ne!(

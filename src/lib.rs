@@ -145,6 +145,10 @@
 )]
 mod bpf_skel;
 
+#[cfg(test)]
+#[macro_use]
+mod test_macros;
+
 pub mod cache;
 pub mod cgroup;
 

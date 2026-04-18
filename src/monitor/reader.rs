@@ -2755,10 +2755,7 @@ mod tests {
     fn btf_offsets_couple_with_rq_reader() {
         let path = match crate::monitor::find_test_vmlinux() {
             Some(p) => p,
-            None => {
-                eprintln!("ktstr: SKIP: no test vmlinux available");
-                return;
-            }
+            None => skip!("no test vmlinux available"),
         };
         let offsets = crate::test_support::require_kernel_offsets(&path);
 

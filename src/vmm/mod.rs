@@ -4336,37 +4336,6 @@ impl Drop for TerminalRawGuard {
 mod tests {
     use super::*;
 
-    /// Emit a canonical `ktstr: SKIP: ...` message and return from the
-    /// caller. Centralizes the prefix so every test in this module
-    /// reports skips in a single grep-able format.
-    macro_rules! skip {
-        ($($arg:tt)*) => {{
-            eprintln!("ktstr: SKIP: {}", format_args!($($arg)*));
-            return;
-        }};
-    }
-
-    /// Evaluate a `Result`-returning builder (or any `anyhow::Result`
-    /// expression) and either unwrap the value or skip gracefully on
-    /// `host_topology::ResourceContention`. Any other error panics
-    /// with `{e:#}`. Replaces the recurring `match ... build() { Ok =>
-    /// v, Err(e) if ResourceContention => skip!(...), Err(e) =>
-    /// panic!(...) }` boilerplate.
-    macro_rules! skip_on_contention {
-        ($expr:expr) => {
-            match $expr {
-                Ok(v) => v,
-                Err(e)
-                    if e.downcast_ref::<host_topology::ResourceContention>()
-                        .is_some() =>
-                {
-                    skip!("resource contention: {e}");
-                }
-                Err(e) => panic!("{e:#}"),
-            }
-        };
-    }
-
     #[test]
     fn builder_default() {
         let b = KtstrVmBuilder::default();

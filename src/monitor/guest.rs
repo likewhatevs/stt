@@ -458,8 +458,7 @@ mod tests {
         // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
         // not an ELF), which GuestKernel cannot parse.
         if path.starts_with("/sys/") {
-            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot parse symbols");
-            return;
+            skip!("vmlinux is raw BTF (not ELF), cannot parse symbols");
         }
         // Allocate a buffer large enough for text_kva_to_pa reads.
         // GuestKernel::new reads page_offset_base and pgtable_l5_enabled
@@ -470,8 +469,7 @@ mod tests {
             Ok(k) => k,
             Err(e) => {
                 // init_top_pgt missing in some kernel configs.
-                eprintln!("ktstr: SKIP: GuestKernel::new failed: {e}");
-                return;
+                skip!("GuestKernel::new failed: {e}");
             }
         };
         assert!(

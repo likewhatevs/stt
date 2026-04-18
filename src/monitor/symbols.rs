@@ -240,8 +240,7 @@ mod tests {
         // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
         // not an ELF), which KernelSymbols cannot parse.
         if path.starts_with("/sys/") {
-            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot parse symbols");
-            return;
+            skip!("vmlinux is raw BTF (not ELF), cannot parse symbols");
         }
         let syms = KernelSymbols::from_vmlinux(&path).unwrap();
         assert_ne!(syms.runqueues, 0);

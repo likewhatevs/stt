@@ -1226,8 +1226,7 @@ mod tests {
             None => return,
         };
         if path.starts_with("/sys/") {
-            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot parse symbols");
-            return;
+            skip!("vmlinux is raw BTF (not ELF), cannot parse symbols");
         }
         let func_names = vec![(0u32, "schedule".to_string())];
         let result = resolve_addrs_from_elf(&path, &func_names);
