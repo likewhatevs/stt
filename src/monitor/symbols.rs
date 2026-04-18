@@ -246,7 +246,7 @@ mod tests {
         assert_ne!(syms.per_cpu_offset, 0);
         // runqueues is a per-cpu symbol — its st_value is a section-
         // relative offset within .data..percpu (sh_addr=0), not a
-        // kernel VA. per_cpu_offset is a kernel-VA symbol in .rodata
+        // kernel VA. per_cpu_offset is a kernel-VA data symbol
         // and is what should land in the upper half.
         assert!(syms.per_cpu_offset > 0xffff_0000_0000_0000);
     }

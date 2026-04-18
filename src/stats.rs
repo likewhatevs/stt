@@ -2525,6 +2525,8 @@ mod tests {
         );
     }
 
+    // -- parse_label proptests --
+
     proptest::proptest! {
         #[test]
         fn prop_parse_label_never_panics(s in "\\PC{0,50}") {
