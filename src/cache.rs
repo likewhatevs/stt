@@ -20,8 +20,8 @@
 //! $CACHE_ROOT/
 //!   6.14.2-tarball-x86_64-kc{kconfig_hash}/
 //!     bzImage           # kernel boot image
-//!     vmlinux           # stripped ELF (BTF + symbol table, optional)
-//!     .config           # kernel config (CONFIG_HZ, optional)
+//!     vmlinux           # stripped ELF (optional, see strip_vmlinux_debug)
+//!     .config           # kernel config (IKCONFIG fallback, optional)
 //!     metadata.json     # KernelMetadata descriptor
 //!   local-deadbee-x86_64-kc{kconfig_hash}/
 //!     bzImage
@@ -311,9 +311,11 @@ impl CacheDir {
     ///
     /// `image_path`: path to the kernel boot image to cache.
     ///
-    /// `vmlinux_path`: optional path to the vmlinux ELF (stripped of
-    /// DWARF debug sections). When present, vmlinux is copied alongside
-    /// the boot image for BTF and symbol table access.
+    /// `vmlinux_path`: optional path to a pre-stripped vmlinux ELF
+    /// (typically the output of [`strip_vmlinux_debug`]). When present,
+    /// vmlinux is copied verbatim alongside the boot image for monitor
+    /// and probe code to read symbol addresses, BTF type info, and
+    /// `.rodata` IKCONFIG.
     ///
     /// `config_path`: optional path to the kernel `.config`. When
     /// present, cached alongside the image as a fallback source for
@@ -355,7 +357,7 @@ impl CacheDir {
         fs::copy(image_path, &image_dest)
             .map_err(|e| anyhow::anyhow!("copy kernel image to cache: {e}"))?;
 
-        // Copy vmlinux (BTF + symbol table for monitor and probe).
+        // Copy the pre-stripped vmlinux verbatim.
         let has_vmlinux = if let Some(vmlinux) = vmlinux_path {
             fs::copy(vmlinux, tmp_dir.join("vmlinux"))
                 .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
@@ -665,10 +667,10 @@ fn neutralize_alloc_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// tables, BTF, `.shstrtab`, `.rodata` for IKCONFIG, `.bss` already
 /// SHT_NOBITS).
 ///
-/// Sections in [`VMLINUX_ZERO_DATA_SECTIONS`] (`.data`,
-/// `.data..percpu`) have their headers preserved but bytes dropped
-/// via `SHT_NOBITS` + zero-length data. Monitor code reads symbol
-/// addresses (`st_value`) from these, never the backing bytes.
+/// Sections in [`VMLINUX_ZERO_DATA_SECTIONS`] have their headers
+/// preserved but bytes dropped via `SHT_NOBITS` + zero-length data.
+/// Monitor code reads symbol addresses (`st_value`) from these, never
+/// the backing bytes.
 ///
 /// Code sections (`SHF_EXECINSTR`: `.text`, `.init.text`,
 /// `.exit.text`, `.text.hot`, `.altinstr_replacement`, etc.) receive
