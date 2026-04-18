@@ -161,7 +161,8 @@ coverage:
 incompatible with coverage instrumentation. Requires
 `llvm-tools-preview` rustup component and `cargo-llvm-cov`. Pass
 `--exclude-from-report <crate>` to exclude scheduler crates from
-coverage reports.
+coverage reports (the example excludes `scx-ktstr`, the project's
+own test fixture scheduler).
 
 ## Test statistics
 
@@ -180,7 +181,8 @@ collected even on test failure.
 
 ## aarch64
 
-aarch64 runners use the same workflow as x64 with three differences:
+aarch64 runners use the same workflow as x64. Copy the x64 workflow
+above and apply these three differences:
 
 - Runner labels: `[self-hosted, Linux, kvm, kernel-build, ARM64]`
   (adjust to match your runner pool).
