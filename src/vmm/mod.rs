@@ -5269,11 +5269,10 @@ mod tests {
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.sched_domain_offsets.is_none() {
             skip!(
-                "sched_domain BTF fields not found \
-                 (on modern kernels this typically means the sched_domain \
-                 struct was not emitted to BTF because no SMP code \
-                 referenced it; on pre-6.17 kernels CONFIG_SMP=n also \
-                 removes the rq.sd field)"
+                "sched_domain BTF fields not found: rq.sd or \
+                 struct sched_domain is absent from this kernel's BTF, \
+                 typically a CONFIG_SMP=n build \
+                 (pre-6.17 kernels also gate rq.sd itself on CONFIG_SMP)"
             );
         }
 
