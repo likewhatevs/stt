@@ -1286,33 +1286,36 @@ pub fn list_runs() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One significant per-metric delta produced by [`compare_rows`].
+/// One significant per-metric finding produced by [`compare_rows`].
+///
+/// Each finding represents a single (scenario, topology, metric) tuple
+/// whose A/B delta cleared both the absolute and relative gates.
+/// `metric_name` keys into [`METRICS`]; consumers needing polarity or
+/// display unit look it up via [`metric_def`].
 #[derive(Debug, Clone)]
-pub struct MetricDelta {
+pub struct Finding {
     pub scenario: String,
     pub topology: String,
-    pub work_type: String,
-    pub metric: &'static str,
+    pub metric_name: &'static str,
     pub val_a: f64,
     pub val_b: f64,
     pub delta: f64,
     pub is_regression: bool,
-    pub display_unit: &'static str,
 }
 
 /// Aggregate result of comparing two row sets via [`compare_rows`].
 ///
-/// `regressions` and `improvements` count significant deltas in
-/// `deltas`; `unchanged` counts metrics that fell below the dual gate;
-/// `skipped_failed` counts scenarios where either side has
-/// `passed=false`.
+/// `regressions` and `improvements` count significant entries in
+/// `findings`; `unchanged` counts metrics that fell below the dual
+/// gate; `skipped_failed` counts paired scenarios where either side
+/// has `passed=false`.
 #[derive(Debug, Clone, Default)]
-pub struct ComparisonResult {
+pub struct CompareReport {
     pub regressions: u32,
     pub improvements: u32,
     pub unchanged: u32,
     pub skipped_failed: u32,
-    pub deltas: Vec<MetricDelta>,
+    pub findings: Vec<Finding>,
 }
 
 /// Compare two row sets metric-by-metric.
@@ -1338,8 +1341,8 @@ pub(crate) fn compare_rows(
     rows_b: &[GauntletRow],
     filter: Option<&str>,
     threshold: Option<f64>,
-) -> ComparisonResult {
-    let mut result = ComparisonResult::default();
+) -> CompareReport {
+    let mut report = CompareReport::default();
 
     for row_b in rows_b {
         let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
@@ -1355,7 +1358,7 @@ pub(crate) fn compare_rows(
         let Some(row_a) = row_a else { continue };
 
         if !row_a.passed || !row_b.passed {
-            result.skipped_failed += 1;
+            report.skipped_failed += 1;
             continue;
         }
 
@@ -1379,7 +1382,7 @@ pub(crate) fn compare_rows(
             };
 
             if delta.abs() < m.default_abs || rel_delta < rel_thresh {
-                result.unchanged += 1;
+                report.unchanged += 1;
                 continue;
             }
 
@@ -1389,25 +1392,23 @@ pub(crate) fn compare_rows(
                 delta < 0.0
             };
             if is_regression {
-                result.regressions += 1;
+                report.regressions += 1;
             } else {
-                result.improvements += 1;
+                report.improvements += 1;
             }
-            result.deltas.push(MetricDelta {
+            report.findings.push(Finding {
                 scenario: row_b.scenario.clone(),
                 topology: row_b.topology.clone(),
-                work_type: row_b.work_type.clone(),
-                metric: m.name,
+                metric_name: m.name,
                 val_a,
                 val_b,
                 delta,
                 is_regression,
-                display_unit: m.display_unit,
             });
         }
     }
 
-    result
+    report
 }
 
 /// Compare two test runs and report regressions.
@@ -1446,41 +1447,44 @@ pub fn compare_runs(
     let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
     let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
 
-    let result = compare_rows(&rows_a, &rows_b, filter, threshold);
+    let report = compare_rows(&rows_a, &rows_b, filter, threshold);
 
     println!(
         "{:<30} {:<34} {:>10} {:>10} {:>10}  VERDICT",
         "TEST", "METRIC", a, b, "DELTA"
     );
     println!("{}", "-".repeat(112));
-    for d in &result.deltas {
-        let verdict = if d.is_regression {
+    for f in &report.findings {
+        let verdict = if f.is_regression {
             "\x1b[31mREGRESSION\x1b[0m"
         } else {
             "\x1b[32mimprovement\x1b[0m"
         };
-        let label = format!("{}/{}", d.scenario, d.topology);
+        let unit = metric_def(f.metric_name)
+            .map(|d| d.display_unit)
+            .unwrap_or("");
+        let label = format!("{}/{}", f.scenario, f.topology);
         println!(
             "{:<30} {:<34} {:>10.2} {:>10.2} {:>+10.2}{:<2} {}",
-            label, d.metric, d.val_a, d.val_b, d.delta, d.display_unit, verdict,
+            label, f.metric_name, f.val_a, f.val_b, f.delta, unit, verdict,
         );
     }
 
     println!();
-    if result.skipped_failed > 0 {
+    if report.skipped_failed > 0 {
         println!(
             "summary: {} regressions, {} improvements, {} unchanged \
              ({} scenario(s) skipped because one or both runs failed)",
-            result.regressions, result.improvements, result.unchanged, result.skipped_failed,
+            report.regressions, report.improvements, report.unchanged, report.skipped_failed,
         );
     } else {
         println!(
             "summary: {} regressions, {} improvements, {} unchanged",
-            result.regressions, result.improvements, result.unchanged,
+            report.regressions, report.improvements, report.unchanged,
         );
     }
 
-    Ok(if result.regressions > 0 { 1 } else { 0 })
+    Ok(if report.regressions > 0 { 1 } else { 0 })
 }
 
 /// Extract a named metric value from a GauntletRow.
@@ -2441,7 +2445,7 @@ mod tests {
             res.unchanged, 1,
             "worst_spread should be classified unchanged"
         );
-        assert!(res.deltas.is_empty());
+        assert!(res.findings.is_empty());
 
         // Confirm the rel gate alone is not enough: spread 10 -> 14 has
         // rel 0.40 (>= 0.25) but abs delta 4.0 (< 5.0), still unchanged.
@@ -2471,10 +2475,10 @@ mod tests {
         );
         assert_eq!(res.improvements, 0);
         assert_eq!(res.skipped_failed, 0);
-        let metrics: Vec<&str> = res.deltas.iter().map(|d| d.metric).collect();
+        let metrics: Vec<&str> = res.findings.iter().map(|d| d.metric_name).collect();
         assert!(metrics.contains(&"worst_spread"));
         assert!(metrics.contains(&"total_iterations"));
-        for d in &res.deltas {
+        for d in &res.findings {
             assert!(d.is_regression, "all reported deltas should be regressions");
             assert_eq!(d.scenario, "test1");
             assert_eq!(d.topology, "tiny-1llc");
@@ -2484,7 +2488,7 @@ mod tests {
         let res_imp = compare_rows(&rows_b, &rows_a, None, Some(10.0));
         assert_eq!(res_imp.regressions, 0);
         assert_eq!(res_imp.improvements, 2);
-        for d in &res_imp.deltas {
+        for d in &res_imp.findings {
             assert!(!d.is_regression);
         }
     }
@@ -2497,9 +2501,9 @@ mod tests {
         let rows_b = vec![cmp_row("t", "tiny-1llc", true, 0.0, 500)];
         let res = compare_rows(&rows_a, &rows_b, None, None);
         let iters_delta = res
-            .deltas
+            .findings
             .iter()
-            .find(|d| d.metric == "total_iterations")
+            .find(|d| d.metric_name == "total_iterations")
             .expect("total_iterations should produce a delta");
         assert!(
             iters_delta.is_regression,
@@ -2515,18 +2519,18 @@ mod tests {
         let rows_b2 = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
         let res_up = compare_rows(&rows_a2, &rows_b2, None, None);
         let spread_up = res_up
-            .deltas
+            .findings
             .iter()
-            .find(|d| d.metric == "worst_spread")
+            .find(|d| d.metric_name == "worst_spread")
             .expect("worst_spread should produce a delta");
         assert!(spread_up.is_regression, "spread increase is a regression");
         assert_eq!(spread_up.delta, 20.0);
 
         let res_down = compare_rows(&rows_b2, &rows_a2, None, None);
         let spread_down = res_down
-            .deltas
+            .findings
             .iter()
-            .find(|d| d.metric == "worst_spread")
+            .find(|d| d.metric_name == "worst_spread")
             .expect("worst_spread should produce a delta");
         assert!(
             !spread_down.is_regression,
@@ -2562,7 +2566,7 @@ mod tests {
         // test_ok regresses on worst_spread and total_iterations only.
         assert_eq!(res.regressions, 2);
         assert_eq!(res.improvements, 0);
-        for d in &res.deltas {
+        for d in &res.findings {
             assert_eq!(d.scenario, "test_ok");
         }
     }
@@ -2582,8 +2586,8 @@ mod tests {
         ];
         let res = compare_rows(&rows_a, &rows_b, Some("alpha"), None);
         assert_eq!(res.regressions, 1, "only alpha row should compare");
-        assert_eq!(res.deltas.len(), 1);
-        assert_eq!(res.deltas[0].scenario, "alpha");
+        assert_eq!(res.findings.len(), 1);
+        assert_eq!(res.findings[0].scenario, "alpha");
 
         // Filter on topology substring is also honored.
         let res_topo = compare_rows(&rows_a, &rows_b, Some("tiny"), None);
@@ -2606,9 +2610,9 @@ mod tests {
         let rows_b = vec![cmp_row("t", "tiny-1llc", true, 106.0, 0)];
         let res_default = compare_rows(&rows_a, &rows_b, None, None);
         let spread_default = res_default
-            .deltas
+            .findings
             .iter()
-            .find(|d| d.metric == "worst_spread");
+            .find(|d| d.metric_name == "worst_spread");
         assert!(
             spread_default.is_none(),
             "default rel 0.25 must classify 6% change as unchanged"
@@ -2618,9 +2622,9 @@ mod tests {
         // rel 0.06 >= 0.05, both gates fire → regression.
         let res_override = compare_rows(&rows_a, &rows_b, None, Some(5.0));
         let spread_override = res_override
-            .deltas
+            .findings
             .iter()
-            .find(|d| d.metric == "worst_spread")
+            .find(|d| d.metric_name == "worst_spread")
             .expect("override 5% must surface 6% spread change");
         assert!(spread_override.is_regression);
         assert_eq!(spread_override.delta, 6.0);
@@ -2632,7 +2636,10 @@ mod tests {
         let rows_b_small = vec![cmp_row("t", "tiny-1llc", true, 1.5, 0)];
         let res_small = compare_rows(&rows_a_small, &rows_b_small, None, Some(1.0));
         assert!(
-            !res_small.deltas.iter().any(|d| d.metric == "worst_spread"),
+            !res_small
+                .findings
+                .iter()
+                .any(|d| d.metric_name == "worst_spread"),
             "abs gate must still block tiny absolute moves"
         );
     }

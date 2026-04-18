@@ -4166,8 +4166,12 @@ pub(crate) fn require_vmlinux(kernel_path: &std::path::Path) -> std::path::PathB
 /// infrastructure failure -- the workspace is broken, not the test.
 #[cfg(test)]
 pub(crate) fn require_binary(package: &str) -> std::path::PathBuf {
-    crate::build_and_find_binary(package)
-        .unwrap_or_else(|e| panic!("ktstr: build of `{package}` failed: {e:#}"))
+    crate::build_and_find_binary(package).unwrap_or_else(|e| {
+        panic!(
+            "ktstr: build of `{package}` failed: {e:#}. \
+             Run `cargo build -p {package}` to reproduce and diagnose."
+        )
+    })
 }
 
 /// Resolve [`crate::monitor::symbols::KernelSymbols`] from a vmlinux
@@ -4179,7 +4183,7 @@ pub(crate) fn require_kernel_symbols(
 ) -> crate::monitor::symbols::KernelSymbols {
     crate::monitor::symbols::KernelSymbols::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
         panic!(
-            "ktstr: KernelSymbols resolution from {} failed: {e:#}",
+            "ktstr: kernel symbol resolution from {} failed: {e:#}",
             vmlinux_path.display(),
         )
     })
@@ -4195,7 +4199,10 @@ pub(crate) fn require_kernel_offsets(
 ) -> crate::monitor::btf_offsets::KernelOffsets {
     crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
         panic!(
-            "ktstr: KernelOffsets resolution from {} failed: {e:#}",
+            "ktstr: kernel BTF resolution from {} failed: {e:#}. \
+             The kernel must be built with CONFIG_DEBUG_INFO_BTF=y; \
+             rebuild with `cargo ktstr kernel build --force` if the \
+             cache entry was produced without BTF.",
             vmlinux_path.display(),
         )
     })
