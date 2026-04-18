@@ -35,7 +35,7 @@ pub struct MetricDef {
 /// Note: `AssertResult::merge` always takes the max value per metric
 /// (ext_metrics). For `higher_is_worse: false` metrics (total_iterations,
 /// page_locality), merge produces the best case, not the worst. The
-/// comparison system (`baseline_compare`) uses `higher_is_worse`
+/// comparison system ([`compare_runs`]) uses `higher_is_worse`
 /// correctly for delta direction regardless of merge behavior.
 pub static METRICS: &[MetricDef] = &[
     MetricDef {
@@ -1245,64 +1245,20 @@ pub fn analyze_gauntlet(results: &[VmRunResult]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Baseline serialization and A/B comparison
+// Test-run enumeration and A/B comparison
 // ---------------------------------------------------------------------------
 
-/// Resolve the baselines directory under the ktstr cache.
+/// List the test-run directories under
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/`.
 ///
-/// Follows the same XDG convention as the kernel cache:
-/// `KTSTR_CACHE_DIR/../baselines/`, `$XDG_CACHE_HOME/ktstr/baselines/`,
-/// or `$HOME/.cache/ktstr/baselines/`.
-fn baselines_root() -> anyhow::Result<std::path::PathBuf> {
-    use std::path::PathBuf;
-    if let Ok(dir) = std::env::var("KTSTR_CACHE_DIR")
-        && !dir.is_empty()
-    {
-        let p = PathBuf::from(dir);
-        let parent = p.parent().unwrap_or(&p);
-        return Ok(parent.join("baselines"));
-    }
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
-        && !xdg.is_empty()
-    {
-        return Ok(PathBuf::from(xdg).join("ktstr").join("baselines"));
-    }
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow::anyhow!("HOME not set; cannot resolve baselines directory"))?;
-    Ok(PathBuf::from(home)
-        .join(".cache")
-        .join("ktstr")
-        .join("baselines"))
-}
-
-/// Save sidecars to the baselines directory.
-///
-/// Baseline key: `{kernel_version}-{repo_commit}`.
-pub fn save_baseline(sidecars: &[crate::test_support::SidecarResult]) -> anyhow::Result<String> {
+/// Each subdirectory is one run keyed `{kernel}-{git_short}`. The
+/// sidecar JSON files inside it are the run's results -- there is no
+/// separate "baselines" cache; runs ARE baselines.
+pub fn list_runs() -> anyhow::Result<()> {
     use std::fs;
-    let root = baselines_root()?;
-    let kernel_ver = sidecars
-        .iter()
-        .find_map(|s| s.kernel_version.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-    let commit = crate::GIT_HASH;
-    let key = format!("{kernel_ver}-{commit}");
-    let dir = root.join(&key);
-    fs::create_dir_all(&dir)?;
-    for sc in sidecars {
-        let json = serde_json::to_string_pretty(sc)?;
-        let path = dir.join(format!("{}.ktstr.json", sc.test_name));
-        fs::write(&path, json)?;
-    }
-    Ok(key)
-}
-
-/// List saved baselines.
-pub fn baseline_list() -> anyhow::Result<()> {
-    use std::fs;
-    let root = baselines_root()?;
+    let root = crate::test_support::runs_root();
     if !root.exists() {
-        eprintln!("no baselines found");
+        eprintln!("no runs found at {}", root.display());
         return Ok(());
     }
     let mut entries: Vec<_> = fs::read_dir(&root)?
@@ -1311,7 +1267,7 @@ pub fn baseline_list() -> anyhow::Result<()> {
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
-    println!("{:<40} {:>6}  DATE", "KEY", "TESTS");
+    println!("{:<40} {:>6}  DATE", "RUN", "TESTS");
     println!("{}", "-".repeat(60));
     for entry in &entries {
         let key = entry.file_name();
@@ -1330,37 +1286,39 @@ pub fn baseline_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Compare two baselines and report regressions.
+/// Compare two test runs and report regressions.
 ///
-/// `threshold` is a relative percentage (e.g. `Some(10.0)` for 10%).
-/// Deltas whose relative magnitude is below `threshold / 100.0` are
-/// treated as unchanged. When `None`, each metric's built-in
-/// `default_rel` is used instead (falling back to 0.10 for unknown
-/// metrics).
+/// `a` and `b` are run keys (subdirectory names under
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/`) -- the same keys printed by
+/// [`list_runs`]. `threshold` is a relative percentage
+/// (e.g. `Some(10.0)` for 10%). Deltas whose relative magnitude is
+/// below `threshold / 100.0` are treated as unchanged. When `None`,
+/// each metric's built-in `default_rel` is used instead (falling back
+/// to 0.10 for unknown metrics).
 ///
 /// Returns 0 on no regressions, 1 if regressions detected.
-pub fn baseline_compare(
+pub fn compare_runs(
     a: &str,
     b: &str,
     filter: Option<&str>,
     threshold: Option<f64>,
 ) -> anyhow::Result<i32> {
-    let root = baselines_root()?;
+    let root = crate::test_support::runs_root();
     let dir_a = root.join(a);
     let dir_b = root.join(b);
     if !dir_a.exists() {
-        anyhow::bail!("baseline '{a}' not found");
+        anyhow::bail!("run '{a}' not found under {}", root.display());
     }
     if !dir_b.exists() {
-        anyhow::bail!("baseline '{b}' not found");
+        anyhow::bail!("run '{b}' not found under {}", root.display());
     }
     let sidecars_a = crate::test_support::collect_sidecars(&dir_a);
     let sidecars_b = crate::test_support::collect_sidecars(&dir_b);
     if sidecars_a.is_empty() {
-        anyhow::bail!("baseline '{a}' has no sidecar data");
+        anyhow::bail!("run '{a}' has no sidecar data");
     }
     if sidecars_b.is_empty() {
-        anyhow::bail!("baseline '{b}' has no sidecar data");
+        anyhow::bail!("run '{b}' has no sidecar data");
     }
 
     let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
@@ -2381,10 +2339,10 @@ mod tests {
         assert_eq!(row_metric_value(&row, "missing_ext"), 0.0);
     }
 
-    // -- baseline_compare tests --
+    // -- compare_runs tests --
 
     #[test]
-    fn baseline_compare_dual_gate_both_must_trigger() {
+    fn compare_runs_dual_gate_both_must_trigger() {
         use crate::test_support;
         let make_sidecar = |name: &str, spread: f64| test_support::SidecarResult {
             test_name: name.to_string(),
@@ -2433,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_compare_synthetic_regression_and_improvement() {
+    fn compare_runs_synthetic_regression_and_improvement() {
         use crate::test_support;
         let tmp = tempfile::TempDir::new().unwrap();
         let dir_a = tmp.path().join("baselines").join("baseline-a");
@@ -2539,7 +2497,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_compare_higher_is_worse_inversion() {
+    fn compare_runs_higher_is_worse_inversion() {
         let def_iters = metric_def("total_iterations").unwrap();
         assert!(!def_iters.higher_is_worse);
         let delta = -100.0;

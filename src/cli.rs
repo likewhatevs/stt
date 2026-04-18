@@ -719,14 +719,27 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 
 /// Read sidecar JSON files and return the gauntlet analysis report.
 ///
-/// Reads from the default sidecar directory (KTSTR_SIDECAR_DIR or
-/// `target/ktstr/{branch}-{hash}/`).
+/// Source directory:
+/// - `KTSTR_SIDECAR_DIR` if set, else
+/// - the most recently modified subdirectory under
+///   `{CARGO_TARGET_DIR or "target"}/ktstr/`.
+///
+/// `cargo ktstr stats` doesn't itself run a kernel, so it can't
+/// reconstruct the `{kernel}-{git}` key the test process used; the
+/// mtime fallback mirrors "show me the report from my last test run."
 ///
 /// Returns an empty report with a warning on stderr when no sidecars
 /// are found. This is not an error -- regular test runs that skip
 /// gauntlet tests produce no sidecar files.
 pub fn print_stats_report() -> String {
-    let report = crate::test_support::analyze_sidecars(None);
+    let dir = match std::env::var("KTSTR_SIDECAR_DIR") {
+        Ok(d) if !d.is_empty() => Some(std::path::PathBuf::from(d)),
+        _ => crate::test_support::newest_run_dir(),
+    };
+    let report = match dir.as_deref() {
+        Some(d) => crate::test_support::analyze_sidecars(Some(d)),
+        None => String::new(),
+    };
     if report.is_empty() {
         eprintln!("cargo ktstr: no sidecar data found (skipped)");
         return String::new();
@@ -734,31 +747,14 @@ pub fn print_stats_report() -> String {
     report
 }
 
-/// Auto-save sidecars as a baseline.
-pub fn auto_save_baseline() -> Result<()> {
-    let sidecars =
-        crate::test_support::collect_sidecars(&crate::test_support::default_sidecar_dir());
-    if sidecars.is_empty() {
-        return Ok(());
-    }
-    let key = crate::stats::save_baseline(&sidecars)?;
-    eprintln!("cargo ktstr: baseline saved as {key}");
-    Ok(())
+/// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
+pub fn list_runs() -> Result<()> {
+    crate::stats::list_runs()
 }
 
-/// List saved baselines.
-pub fn baseline_list() -> Result<()> {
-    crate::stats::baseline_list()
-}
-
-/// Compare two baselines and report regressions.
-pub fn baseline_compare(
-    a: &str,
-    b: &str,
-    filter: Option<&str>,
-    threshold: Option<f64>,
-) -> Result<i32> {
-    crate::stats::baseline_compare(a, b, filter, threshold)
+/// Compare two test runs and report regressions.
+pub fn compare_runs(a: &str, b: &str, filter: Option<&str>, threshold: Option<f64>) -> Result<i32> {
+    crate::stats::compare_runs(a, b, filter, threshold)
 }
 
 /// Pre-flight check for /dev/kvm availability and permissions.

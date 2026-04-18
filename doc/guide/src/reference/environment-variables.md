@@ -12,7 +12,7 @@ Environment variables that control ktstr behavior.
 | `KTSTR_GHA_CACHE` | Set to `"1"` to enable remote kernel cache via GitHub Actions cache service. Requires `ACTIONS_CACHE_URL` (set by the GHA runner). Local cache is always authoritative; remote failures are non-fatal. | None (disabled) |
 | `KTSTR_SCHEDULER` | Path to a scheduler binary for `SchedulerSpec::Name`. See [Troubleshooting](../troubleshooting.md#scheduler-not-found) for search order. | Auto-discovered |
 | `KTSTR_BUDGET_SECS` | Time budget in seconds for greedy test selection during `--list`. Must be positive. See [Running Tests](../running-tests.md). | None (all tests listed) |
-| `KTSTR_SIDECAR_DIR` | Directory for per-test result sidecar JSON files. See [Baselines](../running-tests/baselines.md). | `target/ktstr/` |
+| `KTSTR_SIDECAR_DIR` | Directory for per-test result sidecar JSON files. Used as-is when set, no key suffix. See [Runs](../running-tests/runs.md). | `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/` |
 | `KTSTR_NO_PERF_MODE` | Force `performance_mode=false` and skip flock topology reservation. Disables all performance mode features (pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Presence is sufficient (any value). See [Performance Mode](../concepts/performance-mode.md#disabling-performance-mode). Also settable via `--no-perf-mode` CLI flag. | None (disabled) |
 | `KTSTR_VERBOSE` | Set to `"1"` for verbose VM console output (`earlyprintk`, `loglevel=7`). | None |
 | `RUST_BACKTRACE` | Gates verbose diagnostic output on failure. Also enables verbose VM console output (same as `KTSTR_VERBOSE=1`) when set to `"1"` or `"full"`. Propagated to the guest. | None |

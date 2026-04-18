@@ -9,7 +9,7 @@
 - [Running Tests](running-tests.md)
   - [Single Scenario](running-tests/single-scenario.md)
   - [Gauntlet](running-tests/gauntlet.md)
-  - [Baselines](running-tests/baselines.md)
+  - [Runs](running-tests/runs.md)
   - [ktstr](running-tests/ktstr.md)
   - [cargo-ktstr](running-tests/cargo-ktstr.md)
   - [Auto-Repro](running-tests/auto-repro.md)

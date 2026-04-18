@@ -33,7 +33,7 @@ KTSTR_SIDECAR_DIR=./current cargo nextest run --workspace
 ## Compare results
 
 Diff the sidecar JSON files between the two directories. See
-[Baselines](../running-tests/baselines.md) for the sidecar format.
+[Runs](../running-tests/runs.md) for the sidecar format.
 
 Sanity-check that the two runs produced the same test set (same file
 count and same test names):

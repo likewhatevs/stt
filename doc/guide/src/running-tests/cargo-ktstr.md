@@ -238,17 +238,19 @@ cargo ktstr completions fish > ~/.config/fish/completions/cargo-ktstr.fish
 
 ## stats
 
-Sidecar analysis and baseline comparison.
+Sidecar analysis and run-to-run comparison. See
+[Runs](runs.md) for the directory layout.
 
 ```sh
-cargo ktstr stats                          # print gauntlet analysis
-cargo ktstr stats list                     # list saved baselines
-cargo ktstr stats compare <a> <b>          # compare two baselines
+cargo ktstr stats                          # print analysis of newest run
+cargo ktstr stats list                     # list runs
+cargo ktstr stats compare <a> <b>          # compare two runs
 cargo ktstr stats compare <a> <b> -E filt  # compare with filter
 ```
 
-When invoked without a subcommand, prints gauntlet analysis from
-sidecar JSON files:
+When invoked without a subcommand, prints gauntlet analysis from the
+most recent run directory under `{CARGO_TARGET_DIR or "target"}/ktstr/`
+(or `KTSTR_SIDECAR_DIR` when set):
 
 - **Gauntlet analysis** -- outlier detection, per-scenario/flags/topology
   dimension summaries, stimulus cross-tab.
@@ -261,12 +263,13 @@ sidecar JSON files:
 
 ### list
 
-Scan `~/.cache/ktstr/baselines/` and print a table of saved baselines
-with key, test count, and date.
+Print a table of run directories under
+`{CARGO_TARGET_DIR or "target"}/ktstr/` with run key, test count,
+and date.
 
 ### compare
 
-Load two baseline directories, join on (scenario, topology, work_type),
+Load two run directories, join on (scenario, topology, work_type),
 compute per-metric deltas using `MetricDef` polarity and
 thresholds from the unified metric registry, and print colored output
 (red = regression, green = improvement). Exits non-zero on regression.
@@ -281,11 +284,12 @@ thresholds from the unified metric registry, and print colored output
 Run tests first to generate sidecar JSON files:
 
 ```sh
-cargo nextest run --workspace        # generates target/ktstr/{branch}-{hash}/*.json
-cargo ktstr stats                    # reads them
+cargo nextest run --workspace        # generates target/ktstr/{kernel}-{hash}/*.json
+cargo ktstr stats                    # reads the newest run
 ```
 
-Set `KTSTR_SIDECAR_DIR` to override the default sidecar directory.
+Set `KTSTR_SIDECAR_DIR` to override the sidecar directory; otherwise
+the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{hash}/`.
 
 ## Install
 

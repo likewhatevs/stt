@@ -57,17 +57,16 @@ enum KtstrCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Print sidecar analysis and auto-save sidecars as a baseline.
+    /// Print sidecar analysis from the most recent test run.
     ///
-    /// Reads sidecar JSON from `cargo ktstr test` and prints gauntlet
-    /// analysis, BPF verifier stats, callback profile, and KVM stats.
-    /// When sidecars are found, also saves them as a baseline.
+    /// Reads sidecar JSON files from the newest subdirectory under
+    /// `{CARGO_TARGET_DIR or "target"}/ktstr/` (overridable with
+    /// `KTSTR_SIDECAR_DIR`) and prints gauntlet analysis, BPF
+    /// verifier stats, callback profile, and KVM stats. Each test
+    /// run is its own subdirectory keyed `{kernel}-{git_short}`;
+    /// the runs ARE the baselines.
     ///
-    /// Baselines stored at (first match):
-    /// `$KTSTR_CACHE_DIR/../baselines/`, `$XDG_CACHE_HOME/ktstr/baselines/`,
-    /// or `~/.cache/ktstr/baselines/`.
-    ///
-    /// Use `list` to see saved baselines; `compare <a> <b>` to diff two.
+    /// Use `list` to see runs; `compare <a> <b>` to diff two.
     Stats {
         #[command(subcommand)]
         command: Option<StatsCommand>,
@@ -147,13 +146,13 @@ enum KtstrCommand {
 
 #[derive(Subcommand)]
 enum StatsCommand {
-    /// List saved baselines.
+    /// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
     List,
-    /// Compare two baselines and report regressions.
+    /// Compare two test runs and report regressions.
     Compare {
-        /// Baseline key A (from `cargo ktstr stats list`).
+        /// Run key A (from `cargo ktstr stats list`).
         a: String,
-        /// Baseline key B (from `cargo ktstr stats list`).
+        /// Run key B (from `cargo ktstr stats list`).
         b: String,
         /// Substring filter. Matches against scenario, topology, work_type.
         #[arg(short = 'E', long)]
@@ -332,19 +331,16 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             if !output.is_empty() {
                 print!("{output}");
             }
-            if let Err(e) = cli::auto_save_baseline() {
-                eprintln!("cargo ktstr: baseline save: {e:#}");
-            }
             Ok(())
         }
-        Some(StatsCommand::List) => cli::baseline_list().map_err(|e| format!("{e:#}")),
+        Some(StatsCommand::List) => cli::list_runs().map_err(|e| format!("{e:#}")),
         Some(StatsCommand::Compare {
             a,
             b,
             filter,
             threshold,
         }) => {
-            let exit = cli::baseline_compare(a, b, filter.as_deref(), *threshold)
+            let exit = cli::compare_runs(a, b, filter.as_deref(), *threshold)
                 .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {
                 std::process::exit(exit);

@@ -1380,8 +1380,7 @@ fn run_gauntlet_test(rest: &str) -> i32 {
 /// Collect sidecar JSON files and return the full gauntlet analysis.
 ///
 /// When `dir` is `Some`, reads sidecars from that directory. Otherwise
-/// uses the default sidecar directory (`KTSTR_SIDECAR_DIR` or
-/// `target/ktstr/{branch}-{hash}/`).
+/// uses the default sidecar directory (see [`default_sidecar_dir`]).
 ///
 /// Returns the concatenated output of `analyze_rows`, verifier stats,
 /// callback profile, and KVM stats. Returns an empty string when no
@@ -4055,11 +4054,13 @@ fn resolve_cgroup_root(args: &[String]) -> String {
     "/sys/fs/cgroup/ktstr".to_string()
 }
 
-/// Resolve the sidecar output directory.
+/// Resolve the sidecar output directory for the current test process.
 ///
-/// Uses `KTSTR_SIDECAR_DIR` if set, otherwise defaults to
-/// `target/ktstr/{branch}-{hash}/`.
-/// Default sidecar directory for test output.
+/// Override: `KTSTR_SIDECAR_DIR` (used as-is when non-empty).
+/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git}/`,
+/// where `{kernel}` is the version detected from `KTSTR_KERNEL`'s
+/// metadata (or `"unknown"` when no kernel is set / detection fails)
+/// and `{git}` is the short commit hash baked in by `build.rs`.
 pub fn default_sidecar_dir() -> PathBuf {
     sidecar_dir()
 }
@@ -4070,11 +4071,38 @@ fn sidecar_dir() -> PathBuf {
     {
         return PathBuf::from(d);
     }
-    PathBuf::from(format!(
-        "target/ktstr/{}-{}",
-        crate::GIT_BRANCH,
-        crate::GIT_HASH,
-    ))
+    let kernel = detect_kernel_version().unwrap_or_else(|| "unknown".to_string());
+    runs_root().join(format!("{kernel}-{}", crate::GIT_HASH))
+}
+
+/// Resolve the parent directory that holds all test-run subdirectories.
+///
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/`. Used by `cargo ktstr stats`
+/// to enumerate runs without needing to reconstruct a specific run key.
+pub fn runs_root() -> PathBuf {
+    let target = std::env::var("CARGO_TARGET_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    target.join("ktstr")
+}
+
+/// Find the most recently modified run directory under [`runs_root`].
+///
+/// Used by bare `cargo ktstr stats` (no subcommand) when
+/// `KTSTR_SIDECAR_DIR` isn't set: the stats command doesn't itself
+/// run a kernel, so it can't reconstruct the `{kernel}-{git}` key
+/// that the test process used. Picking the newest subdirectory by
+/// mtime mirrors "show me the report from my last test run."
+pub fn newest_run_dir() -> Option<PathBuf> {
+    let root = runs_root();
+    let entries = std::fs::read_dir(&root).ok()?;
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
 }
 
 /// Detect kernel version from KTSTR_KERNEL env var or cache metadata.
@@ -4165,8 +4193,7 @@ fn generate_run_id() -> String {
 
 /// Write a sidecar JSON file for post-run analysis.
 ///
-/// Output goes to `KTSTR_SIDECAR_DIR` if set, otherwise to
-/// `target/ktstr/{branch}-{hash}/`.
+/// Output goes to [`default_sidecar_dir`].
 fn write_sidecar(
     entry: &KtstrTestEntry,
     vm_result: &vmm::VmResult,
@@ -5587,12 +5614,20 @@ mod tests {
     fn write_sidecar_defaults_to_target_dir_without_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         let key = "KTSTR_SIDECAR_DIR";
+        let kernel_key = "KTSTR_KERNEL";
+        let target_key = "CARGO_TARGET_DIR";
         let prev = std::env::var(key).ok();
+        let prev_kernel = std::env::var(kernel_key).ok();
+        let prev_target = std::env::var(target_key).ok();
         // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe { std::env::remove_var(key) };
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(kernel_key);
+            std::env::remove_var(target_key);
+        };
 
         let dir = sidecar_dir();
-        let expected = format!("target/ktstr/{}-{}", crate::GIT_BRANCH, crate::GIT_HASH);
+        let expected = format!("target/ktstr/unknown-{}", crate::GIT_HASH);
         assert_eq!(dir, PathBuf::from(&expected));
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -5626,9 +5661,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
 
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            match prev_kernel {
+                Some(v) => std::env::set_var(kernel_key, v),
+                None => std::env::remove_var(kernel_key),
+            }
+            match prev_target {
+                Some(v) => std::env::set_var(target_key, v),
+                None => std::env::remove_var(target_key),
+            }
         }
     }
 
