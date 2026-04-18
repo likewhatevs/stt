@@ -18,8 +18,6 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
