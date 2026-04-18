@@ -2149,12 +2149,14 @@ mod tests {
     }
 
     /// Build a minimal ELF covering every strip dispatch branch:
-    /// `.text` (code, bytes dropped via SHT_NOBITS), `.BTF` (kept
-    /// whole), `.BTF.ext` + `.debug_*` (deleted), and the three
-    /// zero-data sections (`.data`, `.data..percpu`, `.init.data`,
-    /// bytes dropped via SHT_NOBITS). Each bytes-dropped section
-    /// has a symbol pointing at an in-bounds offset so tests can
-    /// assert the symbols survive `Builder::delete_orphans`.
+    /// `.text` (code, bytes dropped via SHT_NOBITS), `.BTF` and
+    /// `.rodata` (kept whole via the keep-list predicate), `.bss`
+    /// (keep-list, already SHT_NOBITS), `.BTF.ext` + `.debug_*`
+    /// (deleted), and the zero-data sections (`.data`,
+    /// `.data..percpu`, `.init.data`; bytes dropped via SHT_NOBITS).
+    /// Each bytes-dropped section has a symbol pointing at an
+    /// in-bounds offset so tests can assert the symbols survive
+    /// `Builder::delete_orphans`.
     fn create_strip_test_fixture(dir: &Path) -> PathBuf {
         use object::write;
         let mut obj = write::Object::new(
@@ -2179,6 +2181,34 @@ mod tests {
         // .BTF — kept by both keep-list and fallback.
         let btf_id = obj.add_section(Vec::new(), b".BTF".to_vec(), object::SectionKind::Metadata);
         obj.append_section_data(btf_id, &[0xEB; 256], 1);
+        // .rodata — kept by keep-list (IKCONFIG gzip blob at runtime).
+        // Bytes are preserved verbatim so read_hz_from_ikconfig can scan
+        // for the IKCFG_ST marker; fixture stores an opaque payload.
+        let rodata_id = obj.add_section(
+            Vec::new(),
+            b".rodata".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        obj.append_section_data(rodata_id, &[0xCA; 512], 1);
+        // .bss — kept by keep-list; already SHT_NOBITS on any real
+        // kernel build. object::write emits it without backing bytes
+        // when `kind = UninitializedData`, matching real-vmlinux layout.
+        let bss_id = obj.add_section(
+            Vec::new(),
+            b".bss".to_vec(),
+            object::SectionKind::UninitializedData,
+        );
+        obj.append_section_bss(bss_id, 256, 8);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_bss_symbol".to_vec(),
+            value: 0x0,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(bss_id),
+            flags: object::SymbolFlags::None,
+        });
         // .BTF.ext — deleted by keep-list (no consumer).
         let btf_ext_id = obj.add_section(
             Vec::new(),
@@ -2271,7 +2301,20 @@ mod tests {
             .iter()
             .filter_map(|s| source_elf.shdr_strtab.get_at(s.sh_name))
             .collect();
-        for name in [".debug_info", ".debug_str", ".BTF.ext", ".BTF"] {
+        // Positive control covers every section the post-strip
+        // assertions inspect — kept, dropped, or deleted. A future
+        // fixture regression that silently omits any of these would
+        // make the corresponding post-strip check vacuous.
+        for name in [
+            ".debug_info",
+            ".debug_str",
+            ".BTF.ext",
+            ".BTF",
+            ".rodata",
+            ".bss",
+            ".symtab",
+            ".strtab",
+        ] {
             assert!(
                 source_section_names.contains(&name),
                 "fixture missing expected section {name}"
@@ -2308,17 +2351,11 @@ mod tests {
             !section_names.contains(&".BTF.ext"),
             "should not contain .BTF.ext"
         );
-        // .BTF preserved (in keep-list).
-        assert!(section_names.contains(&".BTF"), "should preserve .BTF");
-        // .symtab preserved (in keep-list).
-        assert!(
-            section_names.contains(&".symtab"),
-            "should preserve .symtab"
-        );
-        assert!(
-            section_names.contains(&".strtab"),
-            "should preserve .strtab"
-        );
+        // Keep-list sections preserved (names from all three consumer
+        // modules plus structural).
+        for name in [".BTF", ".rodata", ".bss", ".symtab", ".strtab"] {
+            assert!(section_names.contains(&name), "should preserve {name}");
+        }
     }
 
     #[test]
@@ -2350,12 +2387,40 @@ mod tests {
     fn strip_vmlinux_debug_zeros_data_sections() {
         let src = TempDir::new().unwrap();
         let vmlinux = create_strip_test_fixture(src.path());
+
+        // Pre-strip positive control: every zero-data section must
+        // start with a non-SHT_NOBITS type AND non-zero sh_size. If
+        // the fixture ever emits them as empty or already-SHT_NOBITS,
+        // the post-strip assertions below become tautological and
+        // would pass even if the strip pipeline regressed.
+        use goblin::elf::section_header::SHT_NOBITS;
+        let source_data = fs::read(&vmlinux).unwrap();
+        let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
+        for name_bytes in crate::monitor::symbols::VMLINUX_ZERO_DATA_SECTIONS
+            .iter()
+            .chain(SPECULATIVE_ZERO_DATA_SECTIONS.iter())
+        {
+            let name = std::str::from_utf8(name_bytes).unwrap();
+            let sh = source_elf
+                .section_headers
+                .iter()
+                .find(|s| source_elf.shdr_strtab.get_at(s.sh_name) == Some(name))
+                .unwrap_or_else(|| panic!("fixture missing expected {name}"));
+            assert_ne!(
+                sh.sh_type, SHT_NOBITS,
+                "fixture {name} must start non-SHT_NOBITS so the strip is observable"
+            );
+            assert!(
+                sh.sh_size > 0,
+                "fixture {name} must start with nonzero sh_size"
+            );
+        }
+
         let stripped = strip_vmlinux_debug(&vmlinux).unwrap();
         let stripped_path = stripped.path();
         let data = fs::read(stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
 
-        use goblin::elf::section_header::SHT_NOBITS;
         let find_section = |name: &str| {
             elf.section_headers
                 .iter()
@@ -2410,6 +2475,46 @@ mod tests {
         );
     }
 
+    /// `strip_debug_prefix` is the fallback path `strip_vmlinux_debug`
+    /// hits when the keep-list strip errors out. Exercise it
+    /// directly on the synthetic fixture so the success path has
+    /// coverage independent of the keep-list branch.
+    #[test]
+    fn strip_debug_prefix_removes_debug_and_preserves_rest() {
+        let src = TempDir::new().unwrap();
+        let vmlinux = create_strip_test_fixture(src.path());
+        let raw = fs::read(&vmlinux).unwrap();
+        let processed = neutralize_alloc_relocs(&raw).unwrap();
+
+        let stripped = strip_debug_prefix(&processed).unwrap();
+        let elf = goblin::elf::Elf::parse(&stripped).unwrap();
+        let names: Vec<&str> = elf
+            .section_headers
+            .iter()
+            .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+
+        // .debug_* and .comment deleted.
+        assert!(
+            !names.contains(&".debug_info"),
+            "fallback should remove .debug_info"
+        );
+        assert!(
+            !names.contains(&".debug_str"),
+            "fallback should remove .debug_str"
+        );
+        // Every other section the fixture carries survives — unlike
+        // the keep-list path, the fallback does not partition by
+        // consumer. In particular `.BTF.ext` (which keep-list would
+        // delete) remains.
+        for name in [".BTF", ".BTF.ext", ".text", ".data", ".rodata", ".symtab"] {
+            assert!(
+                names.contains(&name),
+                "fallback must preserve {name}, got sections {names:?}"
+            );
+        }
+    }
+
     #[test]
     fn strip_vmlinux_debug_nonexistent_file() {
         let result = strip_vmlinux_debug(Path::new("/nonexistent/vmlinux"));
@@ -2438,6 +2543,13 @@ mod tests {
         let stripped = strip_vmlinux_debug(&path).unwrap();
         let stripped_path = stripped.path();
         let syms = crate::monitor::symbols::KernelSymbols::from_vmlinux(stripped_path).unwrap();
+        // `runqueues` and `per_cpu_offset` are required non-Option
+        // fields on KernelSymbols; `from_vmlinux` bails via
+        // `Context::context` if either symbol is absent or zero
+        // (`sym_addr` filters `st_value != 0`). Reaching the unwrap
+        // above therefore guarantees both are nonzero. These asserts
+        // are defensive against a future regression that loosens the
+        // sym_addr filter or adds a non-error-on-missing path.
         assert_ne!(
             syms.runqueues, 0,
             "runqueues symbol missing from stripped vmlinux"
@@ -2500,25 +2612,51 @@ mod tests {
             has_symbol(&stripped_elf, "swapper_pg_dir"),
             "strip changed raw-symtab swapper_pg_dir presence"
         );
+    }
 
-        // Guards against a regression where strip_vmlinux_debug returns
-        // Ok but produces output close to the source size. Skip when
-        // source lacks .debug_info — without DWARF to drop, strip's
-        // savings may not exceed the header overhead and the inequality
-        // no longer meaningfully checks the strip path.
+    /// Guards against a regression where `strip_vmlinux_debug` returns
+    /// `Ok` but produces output close to the source size — e.g. if
+    /// `.debug_*` removal is silently skipped.
+    ///
+    /// Skipped when the source vmlinux carries no `.debug_info`,
+    /// which is the signature of an already-stripped input: ktstr's
+    /// own cache path caches pre-stripped vmlinuxes, and CI that
+    /// points this test at a cache-produced vmlinux would see the
+    /// DWARF sections already gone. Running strip over an
+    /// already-stripped ELF produces output the same size as the
+    /// input (the keep-list partition is idempotent once DWARF is
+    /// gone), so the `<` inequality no longer observes the strip.
+    /// Rebuild the source-tree vmlinux to exercise this test.
+    #[test]
+    fn strip_vmlinux_debug_shrinks_when_source_has_debug_info() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+        };
+        if path.starts_with("/sys/") {
+            skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
+        }
+        let source_data = fs::read(&path).unwrap();
+        let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
         let source_has_debug = source_elf
             .section_headers
             .iter()
             .any(|sh| source_elf.shdr_strtab.get_at(sh.sh_name) == Some(".debug_info"));
-        if source_has_debug {
-            let source_size = fs::metadata(&path).unwrap().len();
-            let stripped_size = fs::metadata(stripped_path).unwrap().len();
-            assert!(
-                stripped_size < source_size,
-                "stripped vmlinux ({stripped_size} bytes) should be smaller than \
-                 source ({source_size} bytes)"
+        if !source_has_debug {
+            skip!(
+                "source vmlinux has no .debug_info — already stripped \
+                 (cached copy or distro-stripped); rebuild source tree \
+                 to exercise the size-shrink path"
             );
         }
+
+        let stripped = strip_vmlinux_debug(&path).unwrap();
+        let source_size = fs::metadata(&path).unwrap().len();
+        let stripped_size = fs::metadata(stripped.path()).unwrap().len();
+        assert!(
+            stripped_size < source_size,
+            "stripped vmlinux ({stripped_size} bytes) should be smaller than \
+             source ({source_size} bytes)"
+        );
     }
 
     #[test]
