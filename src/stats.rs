@@ -39,77 +39,77 @@ pub struct MetricDef {
 /// correctly for delta direction regardless of merge behavior.
 pub static METRICS: &[MetricDef] = &[
     MetricDef {
-        name: "spread",
+        name: "worst_spread",
         higher_is_worse: true,
         default_abs: 5.0,
         default_rel: 0.25,
         display_unit: "%",
     },
     MetricDef {
-        name: "gap_ms",
+        name: "worst_gap_ms",
         higher_is_worse: true,
         default_abs: 500.0,
         default_rel: 0.50,
         display_unit: "ms",
     },
     MetricDef {
-        name: "migrations",
+        name: "total_migrations",
         higher_is_worse: true,
         default_abs: 10.0,
         default_rel: 0.30,
         display_unit: "",
     },
     MetricDef {
-        name: "migration_ratio",
+        name: "worst_migration_ratio",
         higher_is_worse: true,
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
     },
     MetricDef {
-        name: "imbalance",
+        name: "max_imbalance_ratio",
         higher_is_worse: true,
         default_abs: 1.0,
         default_rel: 0.25,
         display_unit: "x",
     },
     MetricDef {
-        name: "dsq_depth",
+        name: "max_dsq_depth",
         higher_is_worse: true,
         default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
     },
     MetricDef {
-        name: "stalls",
+        name: "stall_count",
         higher_is_worse: true,
         default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "",
     },
     MetricDef {
-        name: "fallback",
+        name: "total_fallback",
         higher_is_worse: true,
         default_abs: 5.0,
         default_rel: 0.30,
         display_unit: "/s",
     },
     MetricDef {
-        name: "keep_last",
+        name: "total_keep_last",
         higher_is_worse: true,
         default_abs: 5.0,
         default_rel: 0.30,
         display_unit: "/s",
     },
     MetricDef {
-        name: "p99_wake_lat_us",
+        name: "p99_wake_latency_us",
         higher_is_worse: true,
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
     },
     MetricDef {
-        name: "median_wake_lat_us",
+        name: "median_wake_latency_us",
         higher_is_worse: true,
         default_abs: 20.0,
         default_rel: 0.25,
@@ -144,14 +144,14 @@ pub static METRICS: &[MetricDef] = &[
         display_unit: "\u{00b5}s",
     },
     MetricDef {
-        name: "page_locality",
+        name: "worst_page_locality",
         higher_is_worse: false,
         default_abs: 0.05,
         default_rel: 0.10,
         display_unit: "",
     },
     MetricDef {
-        name: "cross_node_migration_ratio",
+        name: "worst_cross_node_migration_ratio",
         higher_is_worse: true,
         default_abs: 0.05,
         default_rel: 0.20,
@@ -1382,10 +1382,10 @@ pub fn baseline_compare(
     let mut unchanged = 0u32;
 
     println!(
-        "{:<30} {:<12} {:>10} {:>10} {:>10}  VERDICT",
+        "{:<30} {:<34} {:>10} {:>10} {:>10}  VERDICT",
         "TEST", "METRIC", a, b, "DELTA"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(112));
 
     for row_b in &rows_b {
         let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
@@ -1447,7 +1447,7 @@ pub fn baseline_compare(
             let unit = def.map(|d| d.display_unit).unwrap_or("");
             let label = format!("{}/{}", row_b.scenario, row_b.topology);
             println!(
-                "{:<30} {:<12} {:>10.2} {:>10.2} {:>+10.2}{:<2} {}",
+                "{:<30} {:<34} {:>10.2} {:>10.2} {:>+10.2}{:<2} {}",
                 label, metric_name, val_a, val_b, delta, unit, verdict,
             );
         }
@@ -1465,23 +1465,23 @@ pub fn baseline_compare(
 /// Extract a named metric value from a GauntletRow.
 fn row_metric_value(row: &GauntletRow, name: &str) -> f64 {
     match name {
-        "spread" => row.spread,
-        "gap_ms" => row.gap_ms as f64,
-        "migrations" => row.migrations as f64,
-        "migration_ratio" => row.migration_ratio,
-        "imbalance" => row.imbalance_ratio,
-        "dsq_depth" => row.max_dsq_depth as f64,
-        "stalls" => row.stall_count as f64,
-        "fallback" => row.fallback_count as f64,
-        "keep_last" => row.keep_last_count as f64,
-        "p99_wake_lat_us" => row.p99_wake_latency_us,
-        "median_wake_lat_us" => row.median_wake_latency_us,
+        "worst_spread" => row.spread,
+        "worst_gap_ms" => row.gap_ms as f64,
+        "total_migrations" => row.migrations as f64,
+        "worst_migration_ratio" => row.migration_ratio,
+        "max_imbalance_ratio" => row.imbalance_ratio,
+        "max_dsq_depth" => row.max_dsq_depth as f64,
+        "stall_count" => row.stall_count as f64,
+        "total_fallback" => row.fallback_count as f64,
+        "total_keep_last" => row.keep_last_count as f64,
+        "p99_wake_latency_us" => row.p99_wake_latency_us,
+        "median_wake_latency_us" => row.median_wake_latency_us,
         "wake_latency_cv" => row.wake_latency_cv,
         "total_iterations" => row.total_iterations as f64,
         "mean_run_delay_us" => row.mean_run_delay_us,
         "worst_run_delay_us" => row.worst_run_delay_us,
-        "page_locality" => row.page_locality,
-        "cross_node_migration_ratio" => row.cross_node_migration_ratio,
+        "worst_page_locality" => row.page_locality,
+        "worst_cross_node_migration_ratio" => row.cross_node_migration_ratio,
         _ => row.ext_metrics.get(name).copied().unwrap_or(0.0),
     }
 }
@@ -2313,8 +2313,8 @@ mod tests {
 
     #[test]
     fn metric_def_known() {
-        let d = metric_def("spread").unwrap();
-        assert_eq!(d.name, "spread");
+        let d = metric_def("worst_spread").unwrap();
+        assert_eq!(d.name, "worst_spread");
         assert!(d.higher_is_worse);
         assert_eq!(d.display_unit, "%");
     }
@@ -2360,23 +2360,26 @@ mod tests {
         row.worst_run_delay_us = 200.0;
         row.page_locality = 0.8;
         row.cross_node_migration_ratio = 0.1;
-        assert_eq!(row_metric_value(&row, "spread"), 42.0);
-        assert_eq!(row_metric_value(&row, "gap_ms"), 100.0);
-        assert_eq!(row_metric_value(&row, "migrations"), 7.0);
-        assert_eq!(row_metric_value(&row, "migration_ratio"), 0.3);
-        assert_eq!(row_metric_value(&row, "imbalance"), 2.0);
-        assert_eq!(row_metric_value(&row, "dsq_depth"), 5.0);
-        assert_eq!(row_metric_value(&row, "stalls"), 3.0);
-        assert_eq!(row_metric_value(&row, "fallback"), 11.0);
-        assert_eq!(row_metric_value(&row, "keep_last"), 4.0);
-        assert_eq!(row_metric_value(&row, "p99_wake_lat_us"), 99.0);
-        assert_eq!(row_metric_value(&row, "median_wake_lat_us"), 50.0);
+        assert_eq!(row_metric_value(&row, "worst_spread"), 42.0);
+        assert_eq!(row_metric_value(&row, "worst_gap_ms"), 100.0);
+        assert_eq!(row_metric_value(&row, "total_migrations"), 7.0);
+        assert_eq!(row_metric_value(&row, "worst_migration_ratio"), 0.3);
+        assert_eq!(row_metric_value(&row, "max_imbalance_ratio"), 2.0);
+        assert_eq!(row_metric_value(&row, "max_dsq_depth"), 5.0);
+        assert_eq!(row_metric_value(&row, "stall_count"), 3.0);
+        assert_eq!(row_metric_value(&row, "total_fallback"), 11.0);
+        assert_eq!(row_metric_value(&row, "total_keep_last"), 4.0);
+        assert_eq!(row_metric_value(&row, "p99_wake_latency_us"), 99.0);
+        assert_eq!(row_metric_value(&row, "median_wake_latency_us"), 50.0);
         assert_eq!(row_metric_value(&row, "wake_latency_cv"), 0.5);
         assert_eq!(row_metric_value(&row, "total_iterations"), 1000.0);
         assert_eq!(row_metric_value(&row, "mean_run_delay_us"), 25.0);
         assert_eq!(row_metric_value(&row, "worst_run_delay_us"), 200.0);
-        assert_eq!(row_metric_value(&row, "page_locality"), 0.8);
-        assert_eq!(row_metric_value(&row, "cross_node_migration_ratio"), 0.1);
+        assert_eq!(row_metric_value(&row, "worst_page_locality"), 0.8);
+        assert_eq!(
+            row_metric_value(&row, "worst_cross_node_migration_ratio"),
+            0.1
+        );
     }
 
     #[test]
@@ -2415,9 +2418,10 @@ mod tests {
         let row_a = sidecar_to_row(&make_sidecar("test_a", 10.0));
         let row_b = sidecar_to_row(&make_sidecar("test_a", 12.0));
 
-        let def = metric_def("spread").unwrap();
-        let delta = row_metric_value(&row_b, "spread") - row_metric_value(&row_a, "spread");
-        let val_a = row_metric_value(&row_a, "spread");
+        let def = metric_def("worst_spread").unwrap();
+        let delta =
+            row_metric_value(&row_b, "worst_spread") - row_metric_value(&row_a, "worst_spread");
+        let val_a = row_metric_value(&row_a, "worst_spread");
         let rel_delta = if val_a.abs() > f64::EPSILON {
             (delta / val_a).abs()
         } else {
@@ -2558,7 +2562,7 @@ mod tests {
             "negative delta on higher_is_worse=false should be regression"
         );
 
-        let def_spread = metric_def("spread").unwrap();
+        let def_spread = metric_def("worst_spread").unwrap();
         assert!(def_spread.higher_is_worse);
         let delta_pos = 10.0;
         let is_regression_pos = if def_spread.higher_is_worse {
