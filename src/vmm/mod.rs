@@ -4582,6 +4582,7 @@ mod tests {
                     if e.downcast_ref::<host_topology::ResourceContention>()
                         .is_some() =>
                 {
+                    eprintln!("ktstr: SKIP: {label}: resource contention: {e}");
                     continue;
                 }
                 Err(e) => panic!("{e:#}"),
@@ -5582,7 +5583,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                // flock contention under parallel testing — skip.
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("performance_mode=false should not validate host topology: {e:#}",),
         }
@@ -5647,8 +5648,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                // Host lacks resources (e.g. not enough CPUs across
-                // LLCs) — skip, not fail.
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("valid topology with performance_mode should build: {e:#}",),
         }
