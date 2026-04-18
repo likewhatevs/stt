@@ -499,29 +499,32 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
     serde_json::from_str(&contents).ok()
 }
 
-/// Sections kept when stripping vmlinux for cache. Everything else
-/// is deleted. Keep-list is safer than a remove-list: new debug or
-/// data sections added by future compiler/kernel versions are
-/// stripped automatically without updating this list.
-///
-/// Data sections must be kept because monitor symbols (runqueues,
-/// __per_cpu_offset, map_idr, prog_idr, init_top_pgt, scx_root, etc.)
-/// reference them via `st_shndx`. Deleting the referenced section
-/// drops the symbol from the output even when the section's bytes
-/// themselves are unused at read time — monitor reads symbol
-/// addresses, not the data bytes.
+/// Sections whose bytes are preserved in the cached vmlinux.
+/// Everything not in this list or [`VMLINUX_ZERO_DATA_SECTIONS`] is
+/// deleted (non-code) or has its bytes dropped via SHT_NOBITS (code).
+/// Keep-list is safer than a remove-list: new debug or data sections
+/// added by future compiler/kernel versions are stripped automatically
+/// without updating this list.
 const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
-    b"",              // null section (index 0)
-    b".BTF",          // BPF Type Format — probe field resolution
-    b".BTF.ext",      // BTF extension data
-    b".symtab",       // symbol table — monitor address resolution
-    b".strtab",       // symbol string table
-    b".shstrtab",     // section header string table (structural)
-    b".rodata",       // holds page_offset_base, __per_cpu_offset, __pgtable_l5_enabled
-    b".data",         // holds init_top_pgt, map_idr, prog_idr
-    b".bss",          // holds swapper_pg_dir, scx_root (uninitialized globals)
+    b"",           // null section (index 0)
+    b".BTF",       // BPF Type Format — probe field resolution
+    b".BTF.ext",   // BTF extension data
+    b".symtab",    // symbol table — monitor address resolution
+    b".strtab",    // symbol string table
+    b".shstrtab",  // section header string table (structural)
+    b".rodata",    // IKCONFIG gzip blob read by read_hz_from_ikconfig
+    b".bss",       // already SHT_NOBITS — holds swapper_pg_dir, scx_root
+    b".init.data", // holds init-time data some kernels use for page tables
+];
+
+/// Data sections whose headers are kept (so symbols with `st_shndx`
+/// pointing at them survive `Builder::delete_orphans`) but whose
+/// bytes are dropped via SHT_NOBITS + zero-length data. Monitor code
+/// reads symbol addresses (`st_value`) from these, never the backing
+/// bytes — guest memory is the source of truth.
+const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
+    b".data",         // holds init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
     b".data..percpu", // holds runqueues (per-CPU runqueue template)
-    b".init.data",    // holds init-time data some kernels use for page tables
 ];
 
 /// Strip vmlinux for caching: drop code and debug sections, keep
@@ -645,23 +648,28 @@ fn neutralize_alloc_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Keep-list strip: delete all sections not in VMLINUX_KEEP_SECTIONS.
+/// Keep-list strip: three-way partition of ELF sections.
 ///
-/// Data-bearing sections that hold monitor-referenced symbols
-/// (`.rodata`, `.data`, `.bss`, `.data..percpu`, `.init.data`) must
-/// be kept so the symbol table entries pointing at them survive the
-/// rewrite. Code sections (any section with `SHF_EXECINSTR`, e.g.
-/// `.text`, `.init.text`, `.exit.text`, `.text.hot`, `.altinstr_replacement`)
-/// have their bytes dropped via `SHT_NOBITS` + zero-length data, but
-/// the section header is preserved so that the ~115k function symbols
+/// Sections in [`VMLINUX_KEEP_SECTIONS`] keep their bytes (symbol
+/// tables, BTF, `.shstrtab`, `.rodata` for IKCONFIG, `.bss` already
+/// SHT_NOBITS).
+///
+/// Sections in [`VMLINUX_ZERO_DATA_SECTIONS`] (`.data`,
+/// `.data..percpu`) have their headers preserved but bytes dropped
+/// via `SHT_NOBITS` + zero-length data. Monitor code reads symbol
+/// addresses (`st_value`) from these, never the backing bytes.
+///
+/// Code sections (`SHF_EXECINSTR`: `.text`, `.init.text`,
+/// `.exit.text`, `.text.hot`, `.altinstr_replacement`, etc.) receive
+/// the same SHT_NOBITS treatment so that ~115k function symbols
 /// pointing into them (`schedule`, `__schedule`, etc.) survive
-/// `Builder::delete_orphans` -- the auto-pass at the top of
-/// `Builder::write` that flags any symbol whose section was deleted.
-/// Without this preservation, the cached vmlinux loses every
-/// function symbol and `resolve_addrs_from_elf` returns an empty
-/// vec for any kernel function lookup, breaking the auto-repro
-/// probe pipeline that resolves event addresses from the cached
-/// vmlinux at `probe::output::format_events`.
+/// `Builder::delete_orphans` — the auto-pass at the top of
+/// `Builder::write` that drops any symbol whose section was deleted.
+/// Without this, `resolve_addrs_from_elf` (probe/output.rs) returns
+/// an empty vec for any kernel function lookup.
+///
+/// Everything else is deleted outright (DWARF `.debug_*`, relocation
+/// sections, etc.).
 ///
 /// After stripping, verifies the result has a non-empty symbol table.
 /// Returns an error to trigger the fallback to `strip_debug_prefix`
@@ -670,7 +678,13 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut builder = object::build::elf::Builder::read(data)
         .map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
     for section in builder.sections.iter_mut() {
-        if VMLINUX_KEEP_SECTIONS.contains(&section.name.as_slice()) {
+        let name = section.name.as_slice();
+        if VMLINUX_KEEP_SECTIONS.contains(&name) {
+            continue;
+        }
+        if VMLINUX_ZERO_DATA_SECTIONS.contains(&name) {
+            section.sh_type = object::elf::SHT_NOBITS;
+            section.data = object::build::elf::SectionData::UninitializedData(0);
             continue;
         }
         let is_code = section.sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0;
