@@ -111,17 +111,37 @@ See the [getting started guide](https://likewhatevs.github.io/ktstr/guide/gettin
 
 ## Quick start
 
+### Write a test
+
+Declare cgroups and workers as data. No scheduler setup required:
+
+```rust
+use ktstr::prelude::*;
+
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+fn two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("cg_0").workers(2),
+        CgroupDef::named("cg_1").workers(2),
+    ])
+}
+```
+
+Each test boots a KVM VM, creates the declared cgroups and workers,
+runs the workload, and checks for starvation and fairness. For
+canned scenarios, see `scenarios::steady` in the
+[getting started guide](https://likewhatevs.github.io/ktstr/guide/getting-started.html).
+
 ### Define a scheduler
 
-Use `#[derive(Scheduler)]` to declare the scheduler binary, default
-topology, and feature flags:
+To test a custom sched_ext scheduler, use `#[derive(Scheduler)]` to
+declare the binary, default topology, and feature flags:
 
 ```rust
 use ktstr::prelude::*;
 
 #[derive(Scheduler)]
 #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(1, 2, 4, 1))]
-#[allow(dead_code)]
 enum MySchedFlag {
     #[flag(args = ["--enable-llc"])]
     Llc,
@@ -132,21 +152,11 @@ enum MySchedFlag {
 
 This generates a `const MY_SCHED: Scheduler` and per-variant flag
 constants. Tests referencing `MY_SCHED` inherit its topology and
-flags. Without a scheduler, tests run under EEVDF. The topology
-macro argument requires `llcs` to be an exact multiple of
-`numa_nodes`; `topology(1, 2, 4, 1)` (2 LLCs, 1 NUMA node) is fine,
-`topology(2, 3, ...)` is rejected at compile time.
-
-### Write a test
-
-Declare cgroups and workloads as data with `CgroupDef` and
-`execute_defs`:
+flags. Add `scheduler = MY_SCHED` to `#[ktstr_test]` to use it:
 
 ```rust
-use ktstr::prelude::*;
-
 #[ktstr_test(scheduler = MY_SCHED)]
-fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
+fn sched_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("cg_0").workers(2),
         CgroupDef::named("cg_1").workers(2),
@@ -154,8 +164,14 @@ fn basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-For multi-step scenarios with dynamic topology changes, use
-`execute_steps` with `Step` and `HoldSpec`:
+The topology macro argument requires `llcs` to be an exact multiple
+of `numa_nodes`; `topology(1, 2, 4, 1)` (2 LLCs, 1 NUMA node) is
+fine, `topology(2, 3, ...)` is rejected at compile time.
+
+### Multi-step scenarios
+
+For dynamic topology changes, use `execute_steps` with `Step` and
+`HoldSpec`:
 
 ```rust
 use ktstr::prelude::*;
