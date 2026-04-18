@@ -82,8 +82,11 @@ it does not build or run on other platforms.
 
 **Optional:**
 
-- [cargo-nextest](https://nexte.st/) -- enables gauntlet expansion;
-  `cargo test` works without it for base topology.
+- [cargo-nextest](https://nexte.st/) -- nextest runs each test as a
+  separate process, letting a `#[ctor]` hook intercept its
+  `--list`/`--exact` protocol to expand `#[ktstr_test]` entries across
+  topology presets and flag profiles. `cargo test` uses an in-process
+  harness where the hook falls through, so only the base topology runs.
 - Test kernel: Linux 6.12+ with sched_ext for scheduler tests;
   `cargo ktstr kernel build` fetches and caches one. See
   [Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels).
