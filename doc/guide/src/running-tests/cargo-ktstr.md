@@ -266,14 +266,14 @@ with key, test count, and date.
 
 ### compare
 
-Load two baseline directories, join on (test_name, topology, flags,
-work_type), compute per-metric deltas using `MetricDef` polarity and
+Load two baseline directories, join on (scenario, topology, work_type),
+compute per-metric deltas using `MetricDef` polarity and
 thresholds from the unified metric registry, and print colored output
 (red = regression, green = improvement). Exits non-zero on regression.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-E FILTER` | -- | Substring filter applied to `test_name topology flags work_type`. |
+| `-E FILTER` | -- | Substring filter applied to `scenario topology work_type`. |
 | `--threshold PCT` | `10.0` | Relative significance threshold (percentage). Deltas below this percentage are treated as unchanged regardless of direction. Overrides the per-metric `default_rel`. |
 
 ### Prerequisites

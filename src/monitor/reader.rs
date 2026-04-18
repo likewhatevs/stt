@@ -721,7 +721,7 @@ pub(crate) struct DumpTrigger {
 ///   `scx_sched` struct, then write at the BTF-resolved offset.
 ///   Re-derefs each iteration because `scx_sched` is reallocated on
 ///   scheduler (re)load.
-/// - 6.16-7.0 (`StaticGlobal`): write directly to the PA of the
+/// - pre-7.1 (`StaticGlobal`): write directly to the PA of the
 ///   `scx_watchdog_timeout` static global. No deref needed — the
 ///   address is fixed for the kernel's lifetime.
 pub(crate) enum WatchdogOverride {
@@ -736,7 +736,7 @@ pub(crate) enum WatchdogOverride {
         /// Runtime `PAGE_OFFSET` for KVA-to-PA translation.
         page_offset: u64,
     },
-    /// 6.16-7.0 path: write directly to the static global's PA.
+    /// Pre-7.1 path: write directly to the static global's PA.
     StaticGlobal {
         /// PA of the `scx_watchdog_timeout` static global (text mapping).
         watchdog_timeout_pa: u64,

@@ -70,7 +70,7 @@ so most tests do not need to set `numa_nodes`. See
 |---|---|---|
 | `scheduler = CONST` | `Scheduler::EEVDF` | Rust const path to a `Scheduler` definition |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
-| `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on 6.16-7.0 kernels. When neither path is available the override silently no-ops. |
+| `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 
 ### Verification
 

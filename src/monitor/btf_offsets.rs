@@ -79,9 +79,9 @@ pub struct KernelOffsets {
 
 /// Byte offsets for overriding `scx_sched.watchdog_timeout` from the host.
 /// Applies to 7.1+ kernels where `watchdog_timeout` is a field on the
-/// runtime-allocated `scx_sched` struct. On 6.16-7.0 the timeout is a
-/// file-scope static (`scx_watchdog_timeout`), handled separately via
-/// [`super::reader::WatchdogOverride::StaticGlobal`].
+/// runtime-allocated `scx_sched` struct. On pre-7.1 kernels the timeout
+/// is a file-scope static (`scx_watchdog_timeout`), handled separately
+/// via [`super::reader::WatchdogOverride::StaticGlobal`].
 ///
 /// The host reads `*scx_root` to find the struct, then writes jiffies
 /// at this offset.
