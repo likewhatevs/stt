@@ -4346,6 +4346,27 @@ mod tests {
         }};
     }
 
+    /// Evaluate a `Result`-returning builder (or any `anyhow::Result`
+    /// expression) and either unwrap the value or skip gracefully on
+    /// `host_topology::ResourceContention`. Any other error panics
+    /// with `{e:#}`. Replaces the recurring `match ... build() { Ok =>
+    /// v, Err(e) if ResourceContention => skip!(...), Err(e) =>
+    /// panic!(...) }` boilerplate.
+    macro_rules! skip_on_contention {
+        ($expr:expr) => {
+            match $expr {
+                Ok(v) => v,
+                Err(e)
+                    if e.downcast_ref::<host_topology::ResourceContention>()
+                        .is_some() =>
+                {
+                    skip!("resource contention: {e}");
+                }
+                Err(e) => panic!("{e:#}"),
+            }
+        };
+    }
+
     #[test]
     fn builder_default() {
         let b = KtstrVmBuilder::default();
@@ -4533,23 +4554,15 @@ mod tests {
     fn boot_kernel_produces_output() {
         let kernel = crate::test_support::require_kernel();
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 1, 1, 1)
-            .memory_mb(256)
-            .timeout(Duration::from_secs(10))
-            .cmdline("loglevel=7")
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 1, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(10))
+                .cmdline("loglevel=7")
+                .build()
+        );
         let result = vm.run().unwrap();
         assert!(
             result.stderr.contains("Linux") || result.stderr.contains("Booting"),
@@ -4563,23 +4576,15 @@ mod tests {
     fn boot_kernel_smp_topology() {
         let kernel = crate::test_support::require_kernel();
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 2, 2, 1) // 4 CPUs
-            .memory_mb(256)
-            .timeout(Duration::from_secs(10))
-            .cmdline("loglevel=7")
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 2, 2, 1) // 4 CPUs
+                .memory_mb(256)
+                .timeout(Duration::from_secs(10))
+                .cmdline("loglevel=7")
+                .build()
+        );
         let result = vm.run().unwrap();
         assert!(!result.stderr.is_empty(), "no console output from SMP boot");
     }
@@ -4913,22 +4918,14 @@ mod tests {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 1, 2, 1)
-            .memory_mb(256)
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(10))
+                .build()
+        );
         let result = vm.run().unwrap();
         let Some(ref report) = result.monitor else {
             return;
@@ -5007,24 +5004,16 @@ mod tests {
 
         let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 1, 1, 1)
-            .memory_mb(256)
-            .timeout(Duration::from_secs(10))
-            .scheduler_binary(&sched_bin)
-            .watchdog_timeout(Duration::from_secs(TIMEOUT_SECS))
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 1, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(10))
+                .scheduler_binary(&sched_bin)
+                .watchdog_timeout(Duration::from_secs(TIMEOUT_SECS))
+                .build()
+        );
         let result = vm.run().unwrap();
         let report = result.monitor.as_ref().expect(
             "ktstr: monitor report missing — require_kernel_offsets, scx_root, and \
@@ -5065,24 +5054,16 @@ mod tests {
 
         let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 1, 2, 1)
-            .memory_mb(256)
-            .timeout(Duration::from_secs(15))
-            .scheduler_binary(&sched_bin)
-            .watchdog_timeout(Duration::from_secs(300))
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(15))
+                .scheduler_binary(&sched_bin)
+                .watchdog_timeout(Duration::from_secs(300))
+                .build()
+        );
         let result = vm.run().unwrap();
         assert!(
             result.success,
@@ -5131,23 +5112,15 @@ mod tests {
 
         let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 1, 2, 1)
-            .memory_mb(256)
-            .timeout(Duration::from_secs(15))
-            .scheduler_binary(&sched_bin)
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(15))
+                .scheduler_binary(&sched_bin)
+                .build()
+        );
         let result = vm.run().unwrap();
         let report = result.monitor.as_ref().expect(
             "ktstr: monitor report missing — require_kernel_offsets resolved at \
@@ -5216,23 +5189,15 @@ mod tests {
 
         let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 1, 2, 1)
-            .memory_mb(256)
-            .timeout(Duration::from_secs(15))
-            .scheduler_binary(&sched_bin)
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(15))
+                .scheduler_binary(&sched_bin)
+                .build()
+        );
         let result = vm.run().unwrap();
         let report = result.monitor.as_ref().expect(
             "ktstr: monitor report missing — require_kernel_offsets, scx_root, and \
@@ -5318,22 +5283,14 @@ mod tests {
             skip!("sched_domain_offsets not resolved from BTF");
         }
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 1, 2, 1)
-            .memory_mb(256)
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(10))
+                .build()
+        );
         let result = vm.run().unwrap();
         let report = result.monitor.as_ref().expect(
             "ktstr: monitor report missing — require_kernel_offsets and \
@@ -5732,42 +5689,26 @@ mod tests {
         if host_topo.total_cpus() < 3 {
             skip!("need >= 3 host CPUs for performance_mode test");
         }
-        let vm = match KtstrVmBuilder::default()
-            .kernel(&exe)
-            .topology(1, 1, 2, 1)
-            .performance_mode(true)
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVmBuilder::default()
+                .kernel(&exe)
+                .topology(1, 1, 2, 1)
+                .performance_mode(true)
+                .build()
+        );
         assert!(vm.performance_mode);
     }
 
     #[test]
     fn builder_performance_mode_false_preserves_in_vm() {
         let exe = crate::resolve_current_exe().unwrap();
-        let vm = match KtstrVmBuilder::default()
-            .kernel(&exe)
-            .topology(1, 1, 1, 1)
-            .performance_mode(false)
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVmBuilder::default()
+                .kernel(&exe)
+                .topology(1, 1, 1, 1)
+                .performance_mode(false)
+                .build()
+        );
         assert!(!vm.performance_mode);
     }
 
@@ -5890,23 +5831,15 @@ mod tests {
             skip!("no aarch64 Image found (only compressed vmlinuz available)");
         };
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 1, 1, 1)
-            .memory_mb(256)
-            .timeout(Duration::from_secs(10))
-            .cmdline("loglevel=7")
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 1, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(10))
+                .cmdline("loglevel=7")
+                .build()
+        );
         let result = vm.run().unwrap();
         assert!(
             result.stderr.contains("Linux") || result.stderr.contains("Booting"),
@@ -5922,23 +5855,15 @@ mod tests {
             skip!("no aarch64 Image found");
         };
 
-        let vm = match KtstrVm::builder()
-            .kernel(&kernel)
-            .topology(1, 2, 2, 1) // 4 CPUs
-            .memory_mb(256)
-            .timeout(Duration::from_secs(10))
-            .cmdline("loglevel=7")
-            .build()
-        {
-            Ok(vm) => vm,
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                skip!("resource contention: {e}");
-            }
-            Err(e) => panic!("{e:#}"),
-        };
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 2, 2, 1) // 4 CPUs
+                .memory_mb(256)
+                .timeout(Duration::from_secs(10))
+                .cmdline("loglevel=7")
+                .build()
+        );
         let result = vm.run().unwrap();
         assert!(!result.stderr.is_empty(), "no console output from SMP boot");
     }
