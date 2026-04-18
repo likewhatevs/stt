@@ -149,3 +149,5 @@ CONFIG_IKCONFIG_PROC=y
 # CONFIG_INPUT is not set
 # CONFIG_FB is not set
 # CONFIG_VGA_CONSOLE is not set
+
+# strip: SHT_NOBITS for code sections (8826d5d)
