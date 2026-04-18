@@ -195,7 +195,6 @@ pub struct GauntletRow {
     pub spread: f64,
     pub gap_ms: u64,
     pub migrations: u64,
-    #[serde(default)]
     pub migration_ratio: f64,
     // Monitor fields (host-side telemetry from guest memory reads).
     pub imbalance_ratio: f64,
@@ -204,22 +203,14 @@ pub struct GauntletRow {
     pub fallback_count: i64,
     pub keep_last_count: i64,
     // Benchmarking fields.
-    #[serde(default)]
     pub p99_wake_latency_us: f64,
-    #[serde(default)]
     pub median_wake_latency_us: f64,
-    #[serde(default)]
     pub wake_latency_cv: f64,
-    #[serde(default)]
     pub total_iterations: u64,
-    #[serde(default)]
     pub mean_run_delay_us: f64,
-    #[serde(default)]
     pub worst_run_delay_us: f64,
     // NUMA fields.
-    #[serde(default)]
     pub page_locality: f64,
-    #[serde(default)]
     pub cross_node_migration_ratio: f64,
     // Timeline degradation fields.
     pub worst_degradation_op: String,
