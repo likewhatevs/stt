@@ -138,12 +138,29 @@ pub struct FieldSpec {
 /// Handles chained pointer dereferences (e.g. `->cpus_ptr->bits[0]`)
 /// by reading through intermediate pointers.
 pub fn resolve_field_specs(btf_func: &BtfFunc, vmlinux_path: Option<&str>) -> Vec<FieldSpec> {
-    let btf_path = vmlinux_path.unwrap_or("/sys/kernel/btf/vmlinux");
+    let btf_path = match vmlinux_path {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "resolve_field_specs: no vmlinux_path; falling back to host \
+                 /sys/kernel/btf/vmlinux — host/guest kernel mismatch will \
+                 produce wrong field offsets"
+            );
+            "/sys/kernel/btf/vmlinux"
+        }
+    };
     let btf = match crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(btf_path))
     {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(%e, path = btf_path, "resolve_field_specs: failed to load BTF");
+            tracing::error!(
+                %e,
+                path = btf_path,
+                func = %btf_func.name,
+                "resolve_field_specs: BTF parse failed; returning empty Vec \
+                 (caller will receive no field specs — distinct from an empty \
+                 result due to no struct fields matching)"
+            );
             return Vec::new();
         }
     };
@@ -459,12 +476,29 @@ fn resolve_pointed_struct(
 pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> Vec<BtfFunc> {
     use btf_rs::{BtfType, Type};
 
-    let btf_path = vmlinux_path.unwrap_or("/sys/kernel/btf/vmlinux");
+    let btf_path = match vmlinux_path {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "parse_btf_functions: no vmlinux_path; falling back to host \
+                 /sys/kernel/btf/vmlinux — host/guest kernel mismatch will \
+                 produce wrong function signatures"
+            );
+            "/sys/kernel/btf/vmlinux"
+        }
+    };
     let btf = match crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(btf_path))
     {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(%e, path = btf_path, "btf: failed to load");
+            tracing::error!(
+                %e,
+                path = btf_path,
+                requested = func_names.len(),
+                "parse_btf_functions: BTF parse failed; returning empty Vec \
+                 (caller will receive no function signatures — distinct from \
+                 an empty result due to no func names matching)"
+            );
             return Vec::new();
         }
     };
@@ -602,6 +636,15 @@ pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> V
         }
     }
 
+    if !func_names.is_empty() && results.is_empty() {
+        tracing::warn!(
+            requested = func_names.len(),
+            path = btf_path,
+            "parse_btf_functions: none of the requested function names \
+             resolved in BTF — distinct from a parse failure (which logs at \
+             error level)"
+        );
+    }
     tracing::debug!(n = results.len(), "btf: parsed function signatures");
     results
 }
