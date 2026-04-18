@@ -47,7 +47,9 @@ pub(crate) struct KernelSymbols {
     /// `resolve_page_offset`.
     pub page_offset_base_kva: Option<u64>,
     /// Kernel virtual address of `scx_root` (pointer to active scx_sched).
-    /// None if the symbol is absent (kernel without sched_ext).
+    /// None when the symbol is absent: pre-6.16 kernels with sched_ext
+    /// (older `scx_ops` API predates `scx_root`), and kernels built
+    /// without sched_ext.
     pub scx_root: Option<u64>,
     /// Kernel virtual address of the top-level page table.
     /// `init_top_pgt` (older kernels) or `swapper_pg_dir` (newer kernels).
