@@ -16,6 +16,7 @@ use crate::vmm::shm_ring;
 /// Each entry describes polarity (`higher_is_worse`), dual-gate
 /// significance thresholds (`default_abs`, `default_rel`), and a
 /// display unit string for formatted output.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricDef {
     pub name: &'static str,
     pub higher_is_worse: bool,
@@ -1288,15 +1289,21 @@ pub fn list_runs() -> anyhow::Result<()> {
 
 /// One significant per-metric finding produced by [`compare_rows`].
 ///
-/// Each finding represents a single (scenario, topology, metric) tuple
-/// whose A/B delta cleared both the absolute and relative gates.
-/// `metric_name` keys into [`METRICS`]; consumers needing polarity or
-/// display unit look it up via [`metric_def`].
-#[derive(Debug, Clone)]
-pub struct Finding {
+/// Each finding represents a single (scenario, topology, work_type,
+/// metric) tuple whose A/B delta cleared both the absolute and
+/// relative gates. The pairing key inside [`compare_rows`] is
+/// `(scenario, topology, work_type)`; carrying `work_type` here lets
+/// consumers disambiguate two findings that share scenario+topology
+/// but were measured under different workloads. `metric` is the
+/// registry entry the comparison ran against; consumers read
+/// polarity, display unit, and name through it directly without
+/// re-looking up [`metric_def`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct Finding {
     pub scenario: String,
     pub topology: String,
-    pub metric_name: &'static str,
+    pub work_type: String,
+    pub metric: &'static MetricDef,
     pub val_a: f64,
     pub val_b: f64,
     pub delta: f64,
@@ -1307,10 +1314,10 @@ pub struct Finding {
 ///
 /// `regressions` and `improvements` count significant entries in
 /// `findings`; `unchanged` counts metrics that fell below the dual
-/// gate; `skipped_failed` counts paired scenarios where either side
-/// has `passed=false`.
-#[derive(Debug, Clone, Default)]
-pub struct CompareReport {
+/// gate; `skipped_failed` counts paired (scenario, topology, work_type)
+/// row pairs where either side has `passed=false`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct CompareReport {
     pub regressions: u32,
     pub improvements: u32,
     pub unchanged: u32,
@@ -1399,7 +1406,8 @@ pub(crate) fn compare_rows(
             report.findings.push(Finding {
                 scenario: row_b.scenario.clone(),
                 topology: row_b.topology.clone(),
-                metric_name: m.name,
+                work_type: row_b.work_type.clone(),
+                metric: m,
                 val_a,
                 val_b,
                 delta,
@@ -1460,13 +1468,10 @@ pub fn compare_runs(
         } else {
             "\x1b[32mimprovement\x1b[0m"
         };
-        let unit = metric_def(f.metric_name)
-            .map(|d| d.display_unit)
-            .unwrap_or("");
-        let label = format!("{}/{}", f.scenario, f.topology);
+        let label = format!("{}/{}/{}", f.scenario, f.topology, f.work_type);
         println!(
             "{:<30} {:<34} {:>10.2} {:>10.2} {:>+10.2}{:<2} {}",
-            label, f.metric_name, f.val_a, f.val_b, f.delta, unit, verdict,
+            label, f.metric.name, f.val_a, f.val_b, f.delta, f.metric.display_unit, verdict,
         );
     }
 
@@ -1474,7 +1479,8 @@ pub fn compare_runs(
     if report.skipped_failed > 0 {
         println!(
             "summary: {} regressions, {} improvements, {} unchanged \
-             ({} scenario(s) skipped because one or both runs failed)",
+             ({} (scenario, topology) row pair(s) skipped because one \
+             or both runs failed)",
             report.regressions, report.improvements, report.unchanged, report.skipped_failed,
         );
     } else {
@@ -2475,7 +2481,7 @@ mod tests {
         );
         assert_eq!(res.improvements, 0);
         assert_eq!(res.skipped_failed, 0);
-        let metrics: Vec<&str> = res.findings.iter().map(|d| d.metric_name).collect();
+        let metrics: Vec<&str> = res.findings.iter().map(|d| d.metric.name).collect();
         assert!(metrics.contains(&"worst_spread"));
         assert!(metrics.contains(&"total_iterations"));
         for d in &res.findings {
@@ -2503,7 +2509,7 @@ mod tests {
         let iters_delta = res
             .findings
             .iter()
-            .find(|d| d.metric_name == "total_iterations")
+            .find(|d| d.metric.name == "total_iterations")
             .expect("total_iterations should produce a delta");
         assert!(
             iters_delta.is_regression,
@@ -2521,7 +2527,7 @@ mod tests {
         let spread_up = res_up
             .findings
             .iter()
-            .find(|d| d.metric_name == "worst_spread")
+            .find(|d| d.metric.name == "worst_spread")
             .expect("worst_spread should produce a delta");
         assert!(spread_up.is_regression, "spread increase is a regression");
         assert_eq!(spread_up.delta, 20.0);
@@ -2530,7 +2536,7 @@ mod tests {
         let spread_down = res_down
             .findings
             .iter()
-            .find(|d| d.metric_name == "worst_spread")
+            .find(|d| d.metric.name == "worst_spread")
             .expect("worst_spread should produce a delta");
         assert!(
             !spread_down.is_regression,
@@ -2589,9 +2595,13 @@ mod tests {
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].scenario, "alpha");
 
-        // Filter on topology substring is also honored.
+        // Filter on topology substring is also honored. Both rows
+        // share the "tiny-1llc" topology and only worst_spread crosses
+        // both gates (10 -> 30 with default_abs=5.0, default_rel=0.25),
+        // so each row contributes exactly one finding.
         let res_topo = compare_rows(&rows_a, &rows_b, Some("tiny"), None);
-        assert!(res_topo.regressions >= 2, "both rows match 'tiny' topology");
+        assert_eq!(res_topo.regressions, 2, "both rows match 'tiny' topology");
+        assert_eq!(res_topo.findings.len(), 2);
 
         // Non-matching filter yields no comparisons at all.
         let res_none = compare_rows(&rows_a, &rows_b, Some("nomatch"), None);
@@ -2612,7 +2622,7 @@ mod tests {
         let spread_default = res_default
             .findings
             .iter()
-            .find(|d| d.metric_name == "worst_spread");
+            .find(|d| d.metric.name == "worst_spread");
         assert!(
             spread_default.is_none(),
             "default rel 0.25 must classify 6% change as unchanged"
@@ -2624,7 +2634,7 @@ mod tests {
         let spread_override = res_override
             .findings
             .iter()
-            .find(|d| d.metric_name == "worst_spread")
+            .find(|d| d.metric.name == "worst_spread")
             .expect("override 5% must surface 6% spread change");
         assert!(spread_override.is_regression);
         assert_eq!(spread_override.delta, 6.0);
@@ -2639,9 +2649,69 @@ mod tests {
             !res_small
                 .findings
                 .iter()
-                .any(|d| d.metric_name == "worst_spread"),
+                .any(|d| d.metric.name == "worst_spread"),
             "abs gate must still block tiny absolute moves"
         );
+    }
+
+    /// `compare_rows` uses `Iterator::find` to locate the A-side
+    /// match for each B-side row, so when `rows_a` contains two
+    /// entries with the same `(scenario, topology, work_type)` key
+    /// the first one wins. Lock that contract in: the second
+    /// duplicate must be ignored even though it would change the
+    /// verdict.
+    #[test]
+    fn compare_rows_duplicate_key_first_match_wins() {
+        // First A-side entry has spread=10 (would yield a regression
+        // against B's 30). Second has spread=29 (would be unchanged).
+        // The result must reflect the first entry only.
+        let rows_a = vec![
+            cmp_row("t", "tiny-1llc", true, 10.0, 0),
+            cmp_row("t", "tiny-1llc", true, 29.0, 0),
+        ];
+        let rows_b = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
+        let res = compare_rows(&rows_a, &rows_b, None, None);
+        assert_eq!(res.regressions, 1, "first match (spread=10) must win");
+        let spread = res
+            .findings
+            .iter()
+            .find(|d| d.metric.name == "worst_spread")
+            .expect("worst_spread regression should fire");
+        assert_eq!(
+            spread.val_a, 10.0,
+            "val_a must come from the first matching row"
+        );
+        assert_eq!(spread.delta, 20.0);
+    }
+
+    /// Filtering is applied before the failed-row gate. A failed row
+    /// that the filter excludes never reaches the `passed` check, so
+    /// `skipped_failed` stays at zero -- the failure on the filtered
+    /// row is invisible by design.
+    #[test]
+    fn compare_rows_filter_excludes_failed_from_skip_count() {
+        let rows_a = vec![
+            cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
+            cmp_row("beta", "tiny-1llc", false, 10.0, 0),
+        ];
+        let rows_b = vec![
+            cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
+            cmp_row("beta", "tiny-1llc", true, 30.0, 0),
+        ];
+        // Without a filter, beta's failed row contributes
+        // skipped_failed=1.
+        let unfiltered = compare_rows(&rows_a, &rows_b, None, None);
+        assert_eq!(unfiltered.skipped_failed, 1);
+        assert_eq!(unfiltered.regressions, 1, "alpha still regresses");
+
+        // Filtering to "alpha" excludes beta entirely; the failed row
+        // is filtered out before the passed gate runs, so
+        // skipped_failed=0.
+        let filtered = compare_rows(&rows_a, &rows_b, Some("alpha"), None);
+        assert_eq!(filtered.skipped_failed, 0);
+        assert_eq!(filtered.regressions, 1);
+        assert_eq!(filtered.findings.len(), 1);
+        assert_eq!(filtered.findings[0].scenario, "alpha");
     }
 
     // -- parse_label proptests --
