@@ -109,31 +109,34 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
         Err(_) => return sidecars,
     };
     let mut subdirs = Vec::new();
+    let try_load = |path: &std::path::Path, out: &mut Vec<SidecarResult>| {
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            return;
+        }
+        if !path.to_str().is_some_and(|s| s.contains(".ktstr.")) {
+            return;
+        }
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        match serde_json::from_str::<SidecarResult>(&data) {
+            Ok(sc) => out.push(sc),
+            Err(e) => eprintln!("ktstr: skipping {}: {e}", path.display()),
+        }
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
             subdirs.push(path);
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("json")
-            && path.to_str().is_some_and(|s| s.contains(".ktstr."))
-            && let Ok(data) = std::fs::read_to_string(&path)
-            && let Ok(sc) = serde_json::from_str::<SidecarResult>(&data)
-        {
-            sidecars.push(sc);
-        }
+        try_load(&path, &mut sidecars);
     }
     for sub in subdirs {
         if let Ok(entries) = std::fs::read_dir(&sub) {
             for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("json")
-                    && path.to_str().is_some_and(|s| s.contains(".ktstr."))
-                    && let Ok(data) = std::fs::read_to_string(&path)
-                    && let Ok(sc) = serde_json::from_str::<SidecarResult>(&data)
-                {
-                    sidecars.push(sc);
-                }
+                try_load(&entry.path(), &mut sidecars);
             }
         }
     }
