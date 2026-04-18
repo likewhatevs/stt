@@ -525,21 +525,19 @@ const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
     b".data..percpu", // holds runqueues (per-CPU runqueue template)
 ];
 
-/// Strip vmlinux for caching: drop code and debug sections, keep
-/// symbol table, BTF, and the data sections monitor symbols
-/// reference.
+/// Strip vmlinux for caching. Sections fall into three groups:
+/// bytes preserved ([`VMLINUX_KEEP_SECTIONS`] — symbol tables, BTF,
+/// `.rodata` for IKCONFIG, `.bss`, `.shstrtab`), header-only via
+/// SHT_NOBITS ([`VMLINUX_ZERO_DATA_SECTIONS`] plus all code sections,
+/// so symbols with `st_shndx` pointing at them survive), and deleted
+/// (everything else — DWARF `.debug_*`, relocations, etc.). See
+/// [`strip_keep_list`] for the dispatch detail.
 ///
-/// Uses a keep-list ([`VMLINUX_KEEP_SECTIONS`]): all sections not
-/// in the list are deleted. This removes DWARF debug info, `.text`,
-/// and other sections unused by the monitor. The cached vmlinux is
-/// read for symbol addresses (`.symtab`) and BTF type info (`.BTF`);
-/// the data sections themselves are kept because the object-crate
-/// ELF builder drops symbols whose referenced section has been
-/// deleted.
-///
-/// DWARF from the build tree (not the cache) is used by blazesym
-/// for probe source locations — stripping the cached copy does not
-/// affect that path.
+/// The cached vmlinux is consumed by monitor and probe code for
+/// symbol addresses (`.symtab`) and BTF type info (`.BTF`). DWARF
+/// from the build tree (not the cache) is used by blazesym for probe
+/// source locations — stripping the cached copy does not affect that
+/// path.
 ///
 /// If the keep-list strip fails (e.g. `Builder::read` encounters
 /// an unsupported ELF feature), falls back to removing only
