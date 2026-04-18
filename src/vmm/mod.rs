@@ -4980,13 +4980,14 @@ mod tests {
         let kernel = crate::test_support::require_kernel();
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        // Kernel-version-dependent fields gate skips before paying
-        // for a VM boot on kernels that can't satisfy the invariant.
-        // scx_root is a 7.0+ symbol; 6.14 kernels have sched_ext but
-        // use scx_ops, so its absence means pre-7.0, not "no sched_ext".
+        // Version-dependent skips, in order of check cost. scx_root
+        // is a 7.0+ symbol; 6.14 kernels have sched_ext but use the
+        // older scx_ops API, so its absence means "pre-7.0 SCX API,"
+        // not "no sched_ext." watchdog_offsets depends on BTF field
+        // layout that only exists on kernels exposing scx_sched.
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
-            eprintln!("ktstr: SKIP: scx_root not present (pre-7.0 kernel)");
+            eprintln!("ktstr: SKIP: scx_root not present (pre-7.0 kernel, uses older SCX API)");
             return;
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
@@ -5205,7 +5206,7 @@ mod tests {
 
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
-            eprintln!("ktstr: SKIP: scx_root not present (pre-7.0 kernel)");
+            eprintln!("ktstr: SKIP: scx_root not present (pre-7.0 kernel, uses older SCX API)");
             return;
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
