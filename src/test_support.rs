@@ -4345,13 +4345,17 @@ fn write_sidecar(
     }
 }
 
+/// Serializes tests that mutate env vars. Shared across every `#[cfg(test)]`
+/// module in the crate: nextest runs tests in parallel within a binary, and
+/// `std::env::set_var` is process-wide, so any test that mutates an env var
+/// must hold this mutex for its full save/mutate/restore window.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vmm::shm_ring::parse_shm_params_from_str;
-
-    /// Serializes tests that mutate env vars.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const EVAL_TOPO: Topology = Topology::new(1, 1, 2, 1);
 

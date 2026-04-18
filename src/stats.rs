@@ -1286,22 +1286,137 @@ pub fn list_runs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One significant per-metric delta produced by [`compare_rows`].
+#[derive(Debug, Clone)]
+pub struct MetricDelta {
+    pub scenario: String,
+    pub topology: String,
+    pub work_type: String,
+    pub metric: &'static str,
+    pub val_a: f64,
+    pub val_b: f64,
+    pub delta: f64,
+    pub is_regression: bool,
+    pub display_unit: &'static str,
+}
+
+/// Aggregate result of comparing two row sets via [`compare_rows`].
+///
+/// `regressions` and `improvements` count significant deltas in
+/// `deltas`; `unchanged` counts metrics that fell below the dual gate;
+/// `skipped_failed` counts scenarios where either side has
+/// `passed=false`.
+#[derive(Debug, Clone, Default)]
+pub struct ComparisonResult {
+    pub regressions: u32,
+    pub improvements: u32,
+    pub unchanged: u32,
+    pub skipped_failed: u32,
+    pub deltas: Vec<MetricDelta>,
+}
+
+/// Compare two row sets metric-by-metric.
+///
+/// Pure function: no I/O, no globals. Pairs `rows_a` and `rows_b` by
+/// `(scenario, topology, work_type)`. When `filter` is `Some(s)`, a
+/// row is included only if `s` appears as a substring of the joined
+/// `"scenario topology work_type"` key. Rows missing on the A side
+/// are dropped silently. Rows where either side's `passed` is false
+/// are dropped from the regression math and counted as
+/// `skipped_failed`: a failed scenario's metrics reflect the failure
+/// mode (short run, stalled workload, missing samples), not the
+/// scheduler's behavior.
+///
+/// `threshold` is a relative percentage (e.g. `Some(10.0)` for 10%).
+/// Deltas whose relative magnitude is below `threshold / 100.0` are
+/// treated as unchanged. When `None`, each metric's built-in
+/// `default_rel` is used. The absolute gate always uses the metric's
+/// `default_abs`. A delta must clear both gates to count as
+/// significant.
+pub(crate) fn compare_rows(
+    rows_a: &[GauntletRow],
+    rows_b: &[GauntletRow],
+    filter: Option<&str>,
+    threshold: Option<f64>,
+) -> ComparisonResult {
+    let mut result = ComparisonResult::default();
+
+    for row_b in rows_b {
+        let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
+        if let Some(f) = filter {
+            let joined = format!("{} {} {}", key_b.0, key_b.1, key_b.2);
+            if !joined.contains(f) {
+                continue;
+            }
+        }
+        let row_a = rows_a
+            .iter()
+            .find(|r| (&r.scenario, &r.topology, &r.work_type) == key_b);
+        let Some(row_a) = row_a else { continue };
+
+        if !row_a.passed || !row_b.passed {
+            result.skipped_failed += 1;
+            continue;
+        }
+
+        for m in METRICS {
+            let val_a = row_metric_value(row_a, m.name);
+            let val_b = row_metric_value(row_b, m.name);
+            if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
+                continue;
+            }
+
+            let rel_thresh = match threshold {
+                Some(t) => t / 100.0,
+                None => m.default_rel,
+            };
+
+            let delta = val_b - val_a;
+            let rel_delta = if val_a.abs() > f64::EPSILON {
+                (delta / val_a).abs()
+            } else {
+                0.0
+            };
+
+            if delta.abs() < m.default_abs || rel_delta < rel_thresh {
+                result.unchanged += 1;
+                continue;
+            }
+
+            let is_regression = if m.higher_is_worse {
+                delta > 0.0
+            } else {
+                delta < 0.0
+            };
+            if is_regression {
+                result.regressions += 1;
+            } else {
+                result.improvements += 1;
+            }
+            result.deltas.push(MetricDelta {
+                scenario: row_b.scenario.clone(),
+                topology: row_b.topology.clone(),
+                work_type: row_b.work_type.clone(),
+                metric: m.name,
+                val_a,
+                val_b,
+                delta,
+                is_regression,
+                display_unit: m.display_unit,
+            });
+        }
+    }
+
+    result
+}
+
 /// Compare two test runs and report regressions.
 ///
 /// `a` and `b` are run keys (subdirectory names under
 /// `{CARGO_TARGET_DIR or "target"}/ktstr/`) -- the same keys printed by
-/// [`list_runs`]. `threshold` is a relative percentage
-/// (e.g. `Some(10.0)` for 10%). Deltas whose relative magnitude is
-/// below `threshold / 100.0` are treated as unchanged. When `None`,
-/// each metric's built-in `default_rel` is used instead (falling back
-/// to 0.10 for unknown metrics).
-///
-/// Rows where either side's sidecar has `passed=false` are skipped
-/// from the regression math: a failed scenario's metrics reflect the
-/// failure mode, not the scheduler's behavior. The skip count is
-/// reported in the summary line. Sidecar writes are unfiltered -- the
-/// bare `stats` command (and any consumer reading the run directory
-/// directly) still sees every scenario regardless of pass/fail.
+/// [`list_runs`]. Resolves run directories, loads sidecars, converts
+/// to rows, and delegates dual-gate comparison to [`compare_rows`].
+/// Prints a per-delta table and a summary line.
 ///
 /// Returns 0 on no regressions, 1 if regressions detected.
 pub fn compare_runs(
@@ -1331,111 +1446,41 @@ pub fn compare_runs(
     let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
     let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
 
-    let compare_metrics: Vec<&str> = METRICS.iter().map(|m| m.name).collect();
-
-    let mut regressions = 0u32;
-    let mut improvements = 0u32;
-    let mut unchanged = 0u32;
-    let mut skipped_failed = 0u32;
+    let result = compare_rows(&rows_a, &rows_b, filter, threshold);
 
     println!(
         "{:<30} {:<34} {:>10} {:>10} {:>10}  VERDICT",
         "TEST", "METRIC", a, b, "DELTA"
     );
     println!("{}", "-".repeat(112));
-
-    for row_b in &rows_b {
-        let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
-        if let Some(f) = filter {
-            let joined = format!("{} {} {}", key_b.0, key_b.1, key_b.2);
-            if !joined.contains(f) {
-                continue;
-            }
-        }
-        let row_a = rows_a
-            .iter()
-            .find(|r| (&r.scenario, &r.topology, &r.work_type) == key_b);
-        let Some(row_a) = row_a else { continue };
-
-        // Drop failed-scenario rows from the regression math. A failed
-        // scenario's metrics reflect the failure mode (short run, stalled
-        // workload, missing samples), not the scheduler's behavior, so
-        // comparing them produces noise. Sidecars are still written for
-        // both pass and fail outcomes -- the bare `stats` command shows
-        // everything; only `stats compare` filters here.
-        if !row_a.passed || !row_b.passed {
-            skipped_failed += 1;
-            continue;
-        }
-
-        for metric_name in &compare_metrics {
-            let val_a = row_metric_value(row_a, metric_name);
-            let val_b = row_metric_value(row_b, metric_name);
-            if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
-                continue;
-            }
-
-            let def = metric_def(metric_name);
-            let rel_thresh = match threshold {
-                Some(t) => t / 100.0,
-                None => def.map(|d| d.default_rel).unwrap_or(0.10),
-            };
-            let (abs_thresh, higher_is_worse) = match def {
-                Some(d) => (d.default_abs, d.higher_is_worse),
-                None => (1.0, true),
-            };
-
-            let delta = val_b - val_a;
-            let rel_delta = if val_a.abs() > f64::EPSILON {
-                (delta / val_a).abs()
-            } else {
-                0.0
-            };
-
-            let abs_significant = delta.abs() >= abs_thresh;
-            let rel_significant = rel_delta >= rel_thresh;
-            if !abs_significant || !rel_significant {
-                unchanged += 1;
-                continue;
-            }
-
-            let is_regression = if higher_is_worse {
-                delta > 0.0
-            } else {
-                delta < 0.0
-            };
-            let verdict = if is_regression {
-                regressions += 1;
-                "\x1b[31mREGRESSION\x1b[0m"
-            } else {
-                improvements += 1;
-                "\x1b[32mimprovement\x1b[0m"
-            };
-
-            let unit = def.map(|d| d.display_unit).unwrap_or("");
-            let label = format!("{}/{}", row_b.scenario, row_b.topology);
-            println!(
-                "{:<30} {:<34} {:>10.2} {:>10.2} {:>+10.2}{:<2} {}",
-                label, metric_name, val_a, val_b, delta, unit, verdict,
-            );
-        }
+    for d in &result.deltas {
+        let verdict = if d.is_regression {
+            "\x1b[31mREGRESSION\x1b[0m"
+        } else {
+            "\x1b[32mimprovement\x1b[0m"
+        };
+        let label = format!("{}/{}", d.scenario, d.topology);
+        println!(
+            "{:<30} {:<34} {:>10.2} {:>10.2} {:>+10.2}{:<2} {}",
+            label, d.metric, d.val_a, d.val_b, d.delta, d.display_unit, verdict,
+        );
     }
 
     println!();
-    if skipped_failed > 0 {
+    if result.skipped_failed > 0 {
         println!(
             "summary: {} regressions, {} improvements, {} unchanged \
              ({} scenario(s) skipped because one or both runs failed)",
-            regressions, improvements, unchanged, skipped_failed,
+            result.regressions, result.improvements, result.unchanged, result.skipped_failed,
         );
     } else {
         println!(
             "summary: {} regressions, {} improvements, {} unchanged",
-            regressions, improvements, unchanged,
+            result.regressions, result.improvements, result.unchanged,
         );
     }
 
-    Ok(if regressions > 0 { 1 } else { 0 })
+    Ok(if result.regressions > 0 { 1 } else { 0 })
 }
 
 /// Extract a named metric value from a GauntletRow.
@@ -2366,189 +2411,229 @@ mod tests {
         assert_eq!(row_metric_value(&row, "missing_ext"), 0.0);
     }
 
-    // -- compare_runs tests --
+    // -- compare_rows tests --
 
-    #[test]
-    fn compare_runs_dual_gate_both_must_trigger() {
-        use crate::test_support;
-        let make_sidecar = |name: &str, spread: f64| test_support::SidecarResult {
-            test_name: name.to_string(),
-            topology: "1n1l2c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            passed: true,
-            stats: ScenarioStats {
-                worst_spread: spread,
-                ..Default::default()
-            },
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-        };
-        let row_a = sidecar_to_row(&make_sidecar("test_a", 10.0));
-        let row_b = sidecar_to_row(&make_sidecar("test_a", 12.0));
-
-        let def = metric_def("worst_spread").unwrap();
-        let delta =
-            row_metric_value(&row_b, "worst_spread") - row_metric_value(&row_a, "worst_spread");
-        let val_a = row_metric_value(&row_a, "worst_spread");
-        let rel_delta = if val_a.abs() > f64::EPSILON {
-            (delta / val_a).abs()
-        } else {
-            0.0
-        };
-        let abs_significant = delta.abs() >= def.default_abs;
-        let rel_significant = rel_delta >= def.default_rel;
-
-        assert_eq!(delta, 2.0);
-        assert!(
-            !abs_significant,
-            "abs delta 2.0 < default_abs 5.0, should not be significant"
-        );
-        assert!(
-            !rel_significant || !abs_significant,
-            "dual gate: both must trigger for significance"
-        );
+    /// Build a row matching the sidecar-derived schema: empty `flags`,
+    /// `replica = 1`, `work_type = "CpuSpin"`, all metrics zeroed
+    /// except `spread` and `total_iterations`.
+    fn cmp_row(scenario: &str, topo: &str, passed: bool, spread: f64, iters: u64) -> GauntletRow {
+        let mut r = make_row(scenario, "", topo, passed, spread);
+        r.gap_ms = 0;
+        r.migrations = 0;
+        r.imbalance_ratio = 0.0;
+        r.max_dsq_depth = 0;
+        r.total_iterations = iters;
+        r
     }
 
     #[test]
-    fn compare_runs_synthetic_regression_and_improvement() {
-        use crate::test_support;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir_a = tmp.path().join("runs").join("run-a");
-        let dir_b = tmp.path().join("runs").join("run-b");
-        std::fs::create_dir_all(&dir_a).unwrap();
-        std::fs::create_dir_all(&dir_b).unwrap();
+    fn compare_rows_dual_gate_both_must_trigger() {
+        // worst_spread default_abs=5.0, default_rel=0.25.
+        // 10 -> 12: abs delta 2.0 < 5.0 (abs gate fails); rel 0.20 < 0.25
+        // (rel gate also fails). Result: 0 regressions, 0 improvements,
+        // unchanged for worst_spread.
+        let rows_a = vec![cmp_row("test_a", "tiny-1llc", true, 10.0, 0)];
+        let rows_b = vec![cmp_row("test_a", "tiny-1llc", true, 12.0, 0)];
+        let res = compare_rows(&rows_a, &rows_b, None, None);
+        assert_eq!(res.regressions, 0, "abs gate must block 2.0 < 5.0");
+        assert_eq!(res.improvements, 0);
+        assert_eq!(
+            res.unchanged, 1,
+            "worst_spread should be classified unchanged"
+        );
+        assert!(res.deltas.is_empty());
 
-        let make_sidecar = |name: &str, spread: f64, iters: u64| -> test_support::SidecarResult {
-            test_support::SidecarResult {
-                test_name: name.to_string(),
-                topology: "1n1l2c1t".to_string(),
-                scheduler: "eevdf".to_string(),
-                passed: true,
-                stats: ScenarioStats {
-                    worst_spread: spread,
-                    total_iterations: iters,
-                    ..Default::default()
-                },
-                monitor: None,
-                stimulus_events: vec![],
-                work_type: "CpuSpin".to_string(),
-                verifier_stats: vec![],
-                kvm_stats: None,
-                sysctls: vec![],
-                kargs: vec![],
-                kernel_version: None,
-                timestamp: String::new(),
-                run_id: String::new(),
-            }
-        };
+        // Confirm the rel gate alone is not enough: spread 10 -> 14 has
+        // rel 0.40 (>= 0.25) but abs delta 4.0 (< 5.0), still unchanged.
+        let rows_b2 = vec![cmp_row("test_a", "tiny-1llc", true, 14.0, 0)];
+        let res2 = compare_rows(&rows_a, &rows_b2, None, None);
+        assert_eq!(
+            res2.regressions, 0,
+            "rel-only is insufficient: abs gate must also fire"
+        );
+        assert_eq!(res2.unchanged, 1);
+    }
 
-        let sc_a = make_sidecar("test1", 10.0, 1000);
-        let sc_b_regress = make_sidecar("test1", 30.0, 500);
-
-        std::fs::write(
-            dir_a.join("test1.ktstr.json"),
-            serde_json::to_string(&sc_a).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            dir_b.join("test1.ktstr.json"),
-            serde_json::to_string(&sc_b_regress).unwrap(),
-        )
-        .unwrap();
-
-        let sidecars_a = test_support::collect_sidecars(&dir_a);
-        let sidecars_b = test_support::collect_sidecars(&dir_b);
-        assert_eq!(sidecars_a.len(), 1);
-        assert_eq!(sidecars_b.len(), 1);
-
-        let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
-        let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
-
-        let compare_metrics: Vec<&str> = METRICS.iter().map(|m| m.name).collect();
-        let threshold = 10.0;
-        let rel_thresh = threshold / 100.0;
-        let mut regressions = 0u32;
-
-        for row_b in &rows_b {
-            let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
-            let row_a = rows_a
-                .iter()
-                .find(|r| (&r.scenario, &r.topology, &r.work_type) == key_b);
-            let Some(row_a) = row_a else { continue };
-
-            for metric_name in &compare_metrics {
-                let val_a = row_metric_value(row_a, metric_name);
-                let val_b = row_metric_value(row_b, metric_name);
-                if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
-                    continue;
-                }
-                let def = metric_def(metric_name);
-                let (abs_thresh, higher_is_worse) = match def {
-                    Some(d) => (d.default_abs, d.higher_is_worse),
-                    None => (1.0, true),
-                };
-                let delta = val_b - val_a;
-                let rel_delta = if val_a.abs() > f64::EPSILON {
-                    (delta / val_a).abs()
-                } else {
-                    0.0
-                };
-                let abs_significant = delta.abs() >= abs_thresh;
-                let rel_significant = rel_delta >= rel_thresh;
-                if !abs_significant || !rel_significant {
-                    continue;
-                }
-                let is_regression = if higher_is_worse {
-                    delta > 0.0
-                } else {
-                    delta < 0.0
-                };
-                if is_regression {
-                    regressions += 1;
-                }
-            }
+    #[test]
+    fn compare_rows_synthetic_regression_and_improvement() {
+        // spread 10 -> 30: abs delta 20.0 >= 5.0, rel 2.0 >= 0.10 →
+        // regression (higher_is_worse).
+        // total_iterations 1000 -> 500: abs delta 500 >= 100, rel 0.5
+        // >= 0.10, higher_is_worse=false so decrease is a regression.
+        // Net: 2 regressions, 0 improvements; one MetricDelta per
+        // significant metric.
+        let rows_a = vec![cmp_row("test1", "tiny-1llc", true, 10.0, 1000)];
+        let rows_b = vec![cmp_row("test1", "tiny-1llc", true, 30.0, 500)];
+        let res = compare_rows(&rows_a, &rows_b, None, Some(10.0));
+        assert_eq!(
+            res.regressions, 2,
+            "spread up + iterations down both regress"
+        );
+        assert_eq!(res.improvements, 0);
+        assert_eq!(res.skipped_failed, 0);
+        let metrics: Vec<&str> = res.deltas.iter().map(|d| d.metric).collect();
+        assert!(metrics.contains(&"worst_spread"));
+        assert!(metrics.contains(&"total_iterations"));
+        for d in &res.deltas {
+            assert!(d.is_regression, "all reported deltas should be regressions");
+            assert_eq!(d.scenario, "test1");
+            assert_eq!(d.topology, "tiny-1llc");
         }
 
-        assert!(
-            regressions >= 2,
-            "spread 10->30 and total_iterations 1000->500 should both be regressions"
-        );
+        // Reverse direction: improvements should also surface.
+        let res_imp = compare_rows(&rows_b, &rows_a, None, Some(10.0));
+        assert_eq!(res_imp.regressions, 0);
+        assert_eq!(res_imp.improvements, 2);
+        for d in &res_imp.deltas {
+            assert!(!d.is_regression);
+        }
     }
 
     #[test]
-    fn compare_runs_higher_is_worse_inversion() {
-        let def_iters = metric_def("total_iterations").unwrap();
-        assert!(!def_iters.higher_is_worse);
-        let delta = -100.0;
-        let is_regression = if def_iters.higher_is_worse {
-            delta > 0.0
-        } else {
-            delta < 0.0
-        };
+    fn compare_rows_higher_is_worse_inversion() {
+        // total_iterations is higher_is_worse=false. A drop of 1000 ->
+        // 500 must be reported as a regression, not an improvement.
+        let rows_a = vec![cmp_row("t", "tiny-1llc", true, 0.0, 1000)];
+        let rows_b = vec![cmp_row("t", "tiny-1llc", true, 0.0, 500)];
+        let res = compare_rows(&rows_a, &rows_b, None, None);
+        let iters_delta = res
+            .deltas
+            .iter()
+            .find(|d| d.metric == "total_iterations")
+            .expect("total_iterations should produce a delta");
         assert!(
-            is_regression,
-            "negative delta on higher_is_worse=false should be regression"
+            iters_delta.is_regression,
+            "iterations decrease is a regression"
+        );
+        assert_eq!(iters_delta.delta, -500.0);
+        assert_eq!(res.regressions, 1);
+        assert_eq!(res.improvements, 0);
+
+        // worst_spread is higher_is_worse=true. An increase must be a
+        // regression; a decrease must be an improvement.
+        let rows_a2 = vec![cmp_row("t", "tiny-1llc", true, 10.0, 0)];
+        let rows_b2 = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
+        let res_up = compare_rows(&rows_a2, &rows_b2, None, None);
+        let spread_up = res_up
+            .deltas
+            .iter()
+            .find(|d| d.metric == "worst_spread")
+            .expect("worst_spread should produce a delta");
+        assert!(spread_up.is_regression, "spread increase is a regression");
+        assert_eq!(spread_up.delta, 20.0);
+
+        let res_down = compare_rows(&rows_b2, &rows_a2, None, None);
+        let spread_down = res_down
+            .deltas
+            .iter()
+            .find(|d| d.metric == "worst_spread")
+            .expect("worst_spread should produce a delta");
+        assert!(
+            !spread_down.is_regression,
+            "spread decrease is an improvement"
+        );
+        assert_eq!(spread_down.delta, -20.0);
+    }
+
+    /// Rows where either side has `passed=false` are dropped from the
+    /// regression math. A failed scenario's metrics reflect the failure
+    /// mode (short run, stalled workload, missing samples), not
+    /// scheduler behavior.
+    #[test]
+    fn compare_rows_skips_failed_scenarios() {
+        // Three scenarios, all with the same metric movement. Only
+        // test_ok (passed on both sides) should be eligible for the
+        // regression math; the other two are counted as skipped_failed.
+        let rows_a = vec![
+            cmp_row("test_ok", "tiny-1llc", true, 10.0, 1000),
+            cmp_row("test_failed_b", "tiny-1llc", true, 10.0, 1000),
+            cmp_row("test_failed_a", "tiny-1llc", false, 10.0, 1000),
+        ];
+        let rows_b = vec![
+            cmp_row("test_ok", "tiny-1llc", true, 30.0, 500),
+            cmp_row("test_failed_b", "tiny-1llc", false, 30.0, 500),
+            cmp_row("test_failed_a", "tiny-1llc", true, 30.0, 500),
+        ];
+        let res = compare_rows(&rows_a, &rows_b, None, Some(10.0));
+        assert_eq!(
+            res.skipped_failed, 2,
+            "test_failed_a and test_failed_b skip"
+        );
+        // test_ok regresses on worst_spread and total_iterations only.
+        assert_eq!(res.regressions, 2);
+        assert_eq!(res.improvements, 0);
+        for d in &res.deltas {
+            assert_eq!(d.scenario, "test_ok");
+        }
+    }
+
+    #[test]
+    fn compare_rows_filter_substring() {
+        // Two scenarios in each run. Filter "alpha" must match the
+        // alpha row (substring of the joined "scenario topology
+        // work_type" key) and exclude the beta row.
+        let rows_a = vec![
+            cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
+            cmp_row("beta", "tiny-1llc", true, 10.0, 0),
+        ];
+        let rows_b = vec![
+            cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
+            cmp_row("beta", "tiny-1llc", true, 30.0, 0),
+        ];
+        let res = compare_rows(&rows_a, &rows_b, Some("alpha"), None);
+        assert_eq!(res.regressions, 1, "only alpha row should compare");
+        assert_eq!(res.deltas.len(), 1);
+        assert_eq!(res.deltas[0].scenario, "alpha");
+
+        // Filter on topology substring is also honored.
+        let res_topo = compare_rows(&rows_a, &rows_b, Some("tiny"), None);
+        assert!(res_topo.regressions >= 2, "both rows match 'tiny' topology");
+
+        // Non-matching filter yields no comparisons at all.
+        let res_none = compare_rows(&rows_a, &rows_b, Some("nomatch"), None);
+        assert_eq!(res_none.regressions, 0);
+        assert_eq!(res_none.improvements, 0);
+        assert_eq!(res_none.unchanged, 0);
+        assert_eq!(res_none.skipped_failed, 0);
+    }
+
+    #[test]
+    fn compare_rows_threshold_override() {
+        // worst_spread default_rel=0.25, default_abs=5.0. Move 100 ->
+        // 106: abs delta 6.0 >= 5.0 (abs gate passes); rel 0.06 < 0.25
+        // (default rel fails) → unchanged with default thresholds.
+        let rows_a = vec![cmp_row("t", "tiny-1llc", true, 100.0, 0)];
+        let rows_b = vec![cmp_row("t", "tiny-1llc", true, 106.0, 0)];
+        let res_default = compare_rows(&rows_a, &rows_b, None, None);
+        let spread_default = res_default
+            .deltas
+            .iter()
+            .find(|d| d.metric == "worst_spread");
+        assert!(
+            spread_default.is_none(),
+            "default rel 0.25 must classify 6% change as unchanged"
         );
 
-        let def_spread = metric_def("worst_spread").unwrap();
-        assert!(def_spread.higher_is_worse);
-        let delta_pos = 10.0;
-        let is_regression_pos = if def_spread.higher_is_worse {
-            delta_pos > 0.0
-        } else {
-            delta_pos < 0.0
-        };
+        // Override threshold to 5% (Some(5.0) → rel_thresh 0.05). Now
+        // rel 0.06 >= 0.05, both gates fire → regression.
+        let res_override = compare_rows(&rows_a, &rows_b, None, Some(5.0));
+        let spread_override = res_override
+            .deltas
+            .iter()
+            .find(|d| d.metric == "worst_spread")
+            .expect("override 5% must surface 6% spread change");
+        assert!(spread_override.is_regression);
+        assert_eq!(spread_override.delta, 6.0);
+
+        // The override does NOT loosen the abs gate. Move 1.0 -> 1.5:
+        // abs delta 0.5 < 5.0; even threshold=1% (rel_thresh 0.01)
+        // can't promote it to significant.
+        let rows_a_small = vec![cmp_row("t", "tiny-1llc", true, 1.0, 0)];
+        let rows_b_small = vec![cmp_row("t", "tiny-1llc", true, 1.5, 0)];
+        let res_small = compare_rows(&rows_a_small, &rows_b_small, None, Some(1.0));
         assert!(
-            is_regression_pos,
-            "positive delta on higher_is_worse=true should be regression"
+            !res_small.deltas.iter().any(|d| d.metric == "worst_spread"),
+            "abs gate must still block tiny absolute moves"
         );
     }
 
