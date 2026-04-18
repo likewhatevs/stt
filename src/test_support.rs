@@ -4208,6 +4208,42 @@ pub(crate) fn require_kernel_offsets(
     })
 }
 
+/// Resolve [`crate::monitor::btf_offsets::BpfMapOffsets`] from a vmlinux
+/// or panic. A vmlinux whose BTF fails to yield BPF map offsets is an
+/// infrastructure failure, not a test-skip condition.
+#[cfg(test)]
+pub(crate) fn require_bpf_map_offsets(
+    vmlinux_path: &std::path::Path,
+) -> crate::monitor::btf_offsets::BpfMapOffsets {
+    crate::monitor::btf_offsets::BpfMapOffsets::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
+        panic!(
+            "ktstr: BpfMapOffsets resolution from {} failed: {e:#}. \
+             The kernel must be built with CONFIG_DEBUG_INFO_BTF=y; \
+             rebuild with `cargo ktstr kernel build --force` if the \
+             cache entry was produced without BTF.",
+            vmlinux_path.display(),
+        )
+    })
+}
+
+/// Resolve [`crate::monitor::btf_offsets::BpfProgOffsets`] from a vmlinux
+/// or panic. A vmlinux whose BTF fails to yield BPF program offsets is
+/// an infrastructure failure, not a test-skip condition.
+#[cfg(test)]
+pub(crate) fn require_bpf_prog_offsets(
+    vmlinux_path: &std::path::Path,
+) -> crate::monitor::btf_offsets::BpfProgOffsets {
+    crate::monitor::btf_offsets::BpfProgOffsets::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
+        panic!(
+            "ktstr: BpfProgOffsets resolution from {} failed: {e:#}. \
+             The kernel must be built with CONFIG_DEBUG_INFO_BTF=y; \
+             rebuild with `cargo ktstr kernel build --force` if the \
+             cache entry was produced without BTF.",
+            vmlinux_path.display(),
+        )
+    })
+}
+
 /// Detect kernel version from KTSTR_KERNEL env var or cache metadata.
 fn detect_kernel_version() -> Option<String> {
     let kernel_dir = std::env::var("KTSTR_KERNEL").ok()?;

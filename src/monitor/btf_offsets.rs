@@ -1124,12 +1124,7 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let offsets = BpfMapOffsets::from_vmlinux(&path).unwrap_or_else(|e| {
-            panic!(
-                "ktstr: BpfMapOffsets resolution from {} failed: {e:#}",
-                path.display(),
-            )
-        });
+        let offsets = crate::test_support::require_bpf_map_offsets(&path);
         // All offsets should be nonzero in a real kernel BTF.
         assert!(offsets.map_name > 0);
         assert!(offsets.map_type > 0);
@@ -1150,12 +1145,7 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let offsets = BpfProgOffsets::from_vmlinux(&path).unwrap_or_else(|e| {
-            panic!(
-                "ktstr: BpfProgOffsets resolution from {} failed: {e:#}",
-                path.display(),
-            )
-        });
+        let offsets = crate::test_support::require_bpf_prog_offsets(&path);
         assert!(offsets.prog_aux > 0);
         assert!(offsets.aux_verified_insns > 0);
         assert!(offsets.aux_name > 0);
