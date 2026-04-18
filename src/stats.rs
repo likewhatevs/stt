@@ -1315,13 +1315,18 @@ pub(crate) struct Finding {
 /// `regressions` and `improvements` count significant entries in
 /// `findings`; `unchanged` counts metrics that fell below the dual
 /// gate; `skipped_failed` counts paired (scenario, topology, work_type)
-/// row pairs where either side has `passed=false`.
+/// row pairs where either side has `passed=false`. `new_in_b`
+/// counts B-side rows whose key has no match on the A side; the
+/// converse is `removed_from_a`. The filter (when set) applies to
+/// every counter, so excluded rows do not contribute.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct CompareReport {
     pub regressions: u32,
     pub improvements: u32,
     pub unchanged: u32,
     pub skipped_failed: u32,
+    pub new_in_b: u32,
+    pub removed_from_a: u32,
     pub findings: Vec<Finding>,
 }
 
@@ -1330,12 +1335,20 @@ pub(crate) struct CompareReport {
 /// Pure function: no I/O, no globals. Pairs `rows_a` and `rows_b` by
 /// `(scenario, topology, work_type)`. When `filter` is `Some(s)`, a
 /// row is included only if `s` appears as a substring of the joined
-/// `"scenario topology work_type"` key. Rows missing on the A side
-/// are dropped silently. Rows where either side's `passed` is false
-/// are dropped from the regression math and counted as
-/// `skipped_failed`: a failed scenario's metrics reflect the failure
-/// mode (short run, stalled workload, missing samples), not the
-/// scheduler's behavior.
+/// `"scenario topology work_type"` key.
+///
+/// Row-pair accounting:
+/// - B-side rows with no A-side match are counted in `new_in_b`.
+/// - A-side rows with no B-side match are counted in `removed_from_a`
+///   (a separate pass over `rows_a`).
+/// - Paired rows where either side has `passed=false` are dropped
+///   from the regression math and counted in `skipped_failed`: a
+///   failed scenario's metrics reflect the failure mode (short run,
+///   stalled workload, missing samples), not the scheduler's
+///   behavior.
+///
+/// The filter (when set) applies to every counter -- excluded rows
+/// never reach the matching, pass, or metric stages.
 ///
 /// `threshold` is a relative percentage (e.g. `Some(10.0)` for 10%).
 /// Deltas whose relative magnitude is below `threshold / 100.0` are
@@ -1362,7 +1375,10 @@ pub(crate) fn compare_rows(
         let row_a = rows_a
             .iter()
             .find(|r| (&r.scenario, &r.topology, &r.work_type) == key_b);
-        let Some(row_a) = row_a else { continue };
+        let Some(row_a) = row_a else {
+            report.new_in_b += 1;
+            continue;
+        };
 
         if !row_a.passed || !row_b.passed {
             report.skipped_failed += 1;
@@ -1413,6 +1429,25 @@ pub(crate) fn compare_rows(
                 delta,
                 is_regression,
             });
+        }
+    }
+
+    // Second pass: A-side rows whose key has no match on the B side.
+    // Filter applies here too, so rows excluded by the filter never
+    // count as removed.
+    for row_a in rows_a {
+        let key_a = (&row_a.scenario, &row_a.topology, &row_a.work_type);
+        if let Some(f) = filter {
+            let joined = format!("{} {} {}", key_a.0, key_a.1, key_a.2);
+            if !joined.contains(f) {
+                continue;
+            }
+        }
+        let exists_in_b = rows_b
+            .iter()
+            .any(|r| (&r.scenario, &r.topology, &r.work_type) == key_a);
+        if !exists_in_b {
+            report.removed_from_a += 1;
         }
     }
 
@@ -1476,17 +1511,27 @@ pub fn compare_runs(
     }
 
     println!();
+    println!(
+        "summary: {} regressions, {} improvements, {} unchanged",
+        report.regressions, report.improvements, report.unchanged,
+    );
     if report.skipped_failed > 0 {
         println!(
-            "summary: {} regressions, {} improvements, {} unchanged \
-             ({} (scenario, topology) row pair(s) skipped because one \
-             or both runs failed)",
-            report.regressions, report.improvements, report.unchanged, report.skipped_failed,
+            "  {} (scenario, topology, work_type) row pair(s) skipped \
+             because one or both runs failed",
+            report.skipped_failed,
         );
-    } else {
+    }
+    if report.new_in_b > 0 {
         println!(
-            "summary: {} regressions, {} improvements, {} unchanged",
-            report.regressions, report.improvements, report.unchanged,
+            "  {} row(s) new in '{}' (no matching key in '{}')",
+            report.new_in_b, b, a,
+        );
+    }
+    if report.removed_from_a > 0 {
+        println!(
+            "  {} row(s) removed from '{}' (no matching key in '{}')",
+            report.removed_from_a, a, b,
         );
     }
 
@@ -2716,6 +2761,53 @@ mod tests {
         assert_eq!(filtered.regressions, 1);
         assert_eq!(filtered.findings.len(), 1);
         assert_eq!(filtered.findings[0].scenario, "alpha");
+    }
+
+    /// `new_in_b` counts B-side rows whose key has no match on the A
+    /// side; `removed_from_a` counts the converse. Both are needed so
+    /// schema drift between two runs (a renamed scenario, an added
+    /// topology preset, a removed work_type) is visible in the
+    /// summary instead of silently dropped.
+    #[test]
+    fn compare_rows_tracks_new_and_removed_rows() {
+        // alpha exists in both -> regression.
+        // beta exists only in B -> new_in_b=1.
+        // gamma exists only in A -> removed_from_a=1.
+        let rows_a = vec![
+            cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
+            cmp_row("gamma", "tiny-1llc", true, 10.0, 0),
+        ];
+        let rows_b = vec![
+            cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
+            cmp_row("beta", "tiny-1llc", true, 30.0, 0),
+        ];
+        let res = compare_rows(&rows_a, &rows_b, None, None);
+        assert_eq!(res.regressions, 1, "alpha regresses on worst_spread");
+        assert_eq!(res.new_in_b, 1, "beta is new on B side");
+        assert_eq!(res.removed_from_a, 1, "gamma is removed on B side");
+        assert_eq!(res.skipped_failed, 0);
+    }
+
+    /// The filter applies to every counter, including `new_in_b` and
+    /// `removed_from_a`. An excluded row never reaches matching, so
+    /// it contributes to no counter at all.
+    #[test]
+    fn compare_rows_filter_applies_to_new_and_removed_counters() {
+        let rows_a = vec![
+            cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
+            cmp_row("gamma", "tiny-1llc", true, 10.0, 0),
+        ];
+        let rows_b = vec![
+            cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
+            cmp_row("beta", "tiny-1llc", true, 30.0, 0),
+        ];
+
+        // Filter to "alpha" -- beta and gamma are excluded by the
+        // substring filter on both passes.
+        let res = compare_rows(&rows_a, &rows_b, Some("alpha"), None);
+        assert_eq!(res.regressions, 1);
+        assert_eq!(res.new_in_b, 0, "beta is filtered out, not new");
+        assert_eq!(res.removed_from_a, 0, "gamma is filtered out, not removed");
     }
 
     // -- parse_label proptests --
