@@ -4980,16 +4980,15 @@ mod tests {
         let kernel = crate::test_support::require_kernel();
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        // Kernel-version-dependent fields (watchdog_offsets) gate
-        // skips before paying for a VM boot on kernels that can't
-        // satisfy the invariant. The vmlinux symtab, BTF, and scx_root
-        // symbol are required infrastructure for every sched_ext test
-        // kernel, not skip conditions.
+        // Kernel-version-dependent fields gate skips before paying
+        // for a VM boot on kernels that can't satisfy the invariant.
+        // scx_root is a 7.0+ symbol; 6.14 kernels have sched_ext but
+        // use scx_ops, so its absence means pre-7.0, not "no sched_ext".
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
-        assert!(
-            syms.scx_root.is_some(),
-            "ktstr: scx_root symbol missing from vmlinux -- test kernel lacks sched_ext"
-        );
+        if syms.scx_root.is_none() {
+            eprintln!("ktstr: SKIP: scx_root not present (pre-7.0 kernel)");
+            return;
+        }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.watchdog_offsets.is_none() {
             eprintln!("ktstr: SKIP: watchdog_offsets not resolved from BTF");
@@ -5205,10 +5204,10 @@ mod tests {
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
-        assert!(
-            syms.scx_root.is_some(),
-            "ktstr: scx_root symbol missing from vmlinux -- test kernel lacks sched_ext"
-        );
+        if syms.scx_root.is_none() {
+            eprintln!("ktstr: SKIP: scx_root not present (pre-7.0 kernel)");
+            return;
+        }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.event_offsets.is_none() {
             eprintln!("ktstr: SKIP: event_offsets not resolved from BTF");
