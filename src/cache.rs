@@ -1666,7 +1666,13 @@ mod tests {
 
     // -- strip_vmlinux_debug --
 
-    /// Build a minimal ELF with .BTF, .text, .debug_*, and symtab.
+    /// Build a minimal ELF covering every strip dispatch branch:
+    /// `.text` (code, bytes dropped via SHT_NOBITS), `.BTF` (kept
+    /// whole), `.BTF.ext` + `.debug_*` (deleted), and the three
+    /// VMLINUX_ZERO_DATA_SECTIONS entries (`.data`, `.data..percpu`,
+    /// `.init.data`, bytes dropped via SHT_NOBITS). Each bytes-dropped
+    /// section has a symbol pointing at it so tests can assert the
+    /// symbols survive `Builder::delete_orphans`.
     fn create_elf_with_debug(dir: &Path) -> PathBuf {
         use object::write;
         let mut obj = write::Object::new(
@@ -1674,11 +1680,11 @@ mod tests {
             object::Architecture::X86_64,
             object::Endianness::Little,
         );
-        // .text — loadable code (not in keep-list, stripped by keep-list path).
+        // .text — loadable code (not in keep-list, bytes dropped by keep-list path).
         let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
         obj.append_section_data(text_id, &[0xCC; 64], 1);
         // Symbol so .symtab and .strtab are generated.
-        let sym_id = obj.add_symbol(write::Symbol {
+        let _ = obj.add_symbol(write::Symbol {
             name: b"test_symbol".to_vec(),
             value: 0x1000,
             size: 8,
@@ -1688,10 +1694,16 @@ mod tests {
             section: write::SymbolSection::Section(text_id),
             flags: object::SymbolFlags::None,
         });
-        let _ = sym_id;
         // .BTF — kept by both keep-list and fallback.
         let btf_id = obj.add_section(Vec::new(), b".BTF".to_vec(), object::SectionKind::Metadata);
         obj.append_section_data(btf_id, &[0xEB; 256], 1);
+        // .BTF.ext — deleted by keep-list (no consumer).
+        let btf_ext_id = obj.add_section(
+            Vec::new(),
+            b".BTF.ext".to_vec(),
+            object::SectionKind::Metadata,
+        );
+        obj.append_section_data(btf_ext_id, &[0xE1; 128], 1);
         // .debug_info — always stripped.
         let debug_id = obj.add_section(
             Vec::new(),
@@ -1706,6 +1718,53 @@ mod tests {
             object::SectionKind::Debug,
         );
         obj.append_section_data(debug_str_id, &[0xBB; 2048], 1);
+        // .data — bytes dropped via SHT_NOBITS; symbol must survive.
+        let data_id = obj.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
+        obj.append_section_data(data_id, &[0xDD; 512], 8);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_data_symbol".to_vec(),
+            value: 0x2000,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(data_id),
+            flags: object::SymbolFlags::None,
+        });
+        // .data..percpu — bytes dropped via SHT_NOBITS; symbol must survive.
+        let percpu_id = obj.add_section(
+            Vec::new(),
+            b".data..percpu".to_vec(),
+            object::SectionKind::Data,
+        );
+        obj.append_section_data(percpu_id, &[0xCC; 256], 8);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_percpu_symbol".to_vec(),
+            value: 0x3000,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(percpu_id),
+            flags: object::SymbolFlags::None,
+        });
+        // .init.data — bytes dropped via SHT_NOBITS; symbol must survive.
+        let initdata_id = obj.add_section(
+            Vec::new(),
+            b".init.data".to_vec(),
+            object::SectionKind::Data,
+        );
+        obj.append_section_data(initdata_id, &[0x11; 1024], 8);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_initdata_symbol".to_vec(),
+            value: 0x4000,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(initdata_id),
+            flags: object::SymbolFlags::None,
+        });
 
         let data = obj.write().unwrap();
         let path = dir.join("vmlinux");
@@ -1743,6 +1802,11 @@ mod tests {
             !section_names.contains(&".debug_str"),
             "should not contain .debug_str"
         );
+        // .BTF.ext removed (no consumer).
+        assert!(
+            !section_names.contains(&".BTF.ext"),
+            "should not contain .BTF.ext"
+        );
         // .BTF preserved (in keep-list).
         assert!(section_names.contains(&".BTF"), "should preserve .BTF");
         // .symtab preserved (in keep-list).
@@ -1774,6 +1838,60 @@ mod tests {
             .iter()
             .any(|s| elf.strtab.get_at(s.st_name) == Some("test_symbol"));
         assert!(found, "stripped ELF should contain test_symbol in symtab");
+    }
+
+    /// Data sections in [`VMLINUX_ZERO_DATA_SECTIONS`] must come out
+    /// as SHT_NOBITS with sh_size == 0, and symbols pointing at them
+    /// must survive. Runs on the synthetic fixture so it exercises
+    /// the keep-list path in CI environments without a real vmlinux.
+    #[test]
+    fn strip_vmlinux_debug_zeros_data_sections() {
+        let src = TempDir::new().unwrap();
+        let vmlinux = create_elf_with_debug(src.path());
+        let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
+        let data = fs::read(&stripped_path).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+
+        use goblin::elf::section_header::SHT_NOBITS;
+        let find_section = |name: &str| {
+            elf.section_headers
+                .iter()
+                .find(|s| elf.shdr_strtab.get_at(s.sh_name) == Some(name))
+                .unwrap_or_else(|| panic!("section {name} missing from stripped ELF"))
+        };
+        for name in [".data", ".data..percpu", ".init.data"] {
+            let sh = find_section(name);
+            assert_eq!(
+                sh.sh_type, SHT_NOBITS,
+                "section {name} should be SHT_NOBITS after strip, got sh_type={}",
+                sh.sh_type
+            );
+            assert_eq!(
+                sh.sh_size, 0,
+                "section {name} should have sh_size == 0 after strip, got {}",
+                sh.sh_size
+            );
+        }
+
+        // Symbols pointing at the zeroed sections must survive
+        // Builder::delete_orphans.
+        let has_sym = |name: &str| {
+            elf.syms
+                .iter()
+                .any(|s| elf.strtab.get_at(s.st_name) == Some(name))
+        };
+        assert!(
+            has_sym("test_data_symbol"),
+            "test_data_symbol dropped by strip"
+        );
+        assert!(
+            has_sym("test_percpu_symbol"),
+            "test_percpu_symbol dropped by strip"
+        );
+        assert!(
+            has_sym("test_initdata_symbol"),
+            "test_initdata_symbol dropped by strip"
+        );
     }
 
     #[test]
@@ -1840,6 +1958,46 @@ mod tests {
             source_syms.prog_idr.is_some(),
             syms.prog_idr.is_some(),
             "strip changed prog_idr presence"
+        );
+        assert_eq!(
+            source_syms.scx_watchdog_timeout.is_some(),
+            syms.scx_watchdog_timeout.is_some(),
+            "strip changed scx_watchdog_timeout presence"
+        );
+
+        // KernelSymbols.init_top_pgt collapses init_top_pgt OR
+        // swapper_pg_dir via or_else. Check both names directly against
+        // the raw symbol table so a regression that keeps one while
+        // dropping the other is caught.
+        let source_data = fs::read(&path).unwrap();
+        let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
+        let stripped_data = fs::read(&stripped_path).unwrap();
+        let stripped_elf = goblin::elf::Elf::parse(&stripped_data).unwrap();
+        let has_sym = |elf: &goblin::elf::Elf, name: &str| {
+            elf.syms
+                .iter()
+                .any(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
+        };
+        assert_eq!(
+            has_sym(&source_elf, "init_top_pgt"),
+            has_sym(&stripped_elf, "init_top_pgt"),
+            "strip changed init_top_pgt presence"
+        );
+        assert_eq!(
+            has_sym(&source_elf, "swapper_pg_dir"),
+            has_sym(&stripped_elf, "swapper_pg_dir"),
+            "strip changed swapper_pg_dir presence"
+        );
+
+        // The strip should shrink the file. Guards against a
+        // regression that silently falls through to a path that
+        // caches the unstripped vmlinux.
+        let source_size = fs::metadata(&path).unwrap().len();
+        let stripped_size = fs::metadata(&stripped_path).unwrap().len();
+        assert!(
+            stripped_size < source_size,
+            "stripped vmlinux ({stripped_size} bytes) should be smaller than \
+             source ({source_size} bytes)"
         );
     }
 
