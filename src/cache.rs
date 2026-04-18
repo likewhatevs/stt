@@ -596,8 +596,8 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
 ///
 /// Cache entries carry vmlinux stripped of `.debug_*` sections
 /// (see [`strip_vmlinux_debug`]), so pointing blazesym at the cache
-/// directory gives no file:line. `SourceType::Local` entries record
-/// the original build tree via [`KernelMetadata::source_tree_path`];
+/// directory gives no file:line. [`KernelSource::Local`] entries record
+/// the original build tree in the variant's `source_tree_path` field;
 /// when it is populated and the tree still has an unstripped vmlinux
 /// on disk, this helper returns that path so callers can route
 /// blazesym there instead.
@@ -605,9 +605,10 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
 /// Returns `None` when:
 /// - `dir` has no `metadata.json` (not a cache entry, e.g. a build-tree root).
 /// - Metadata parse fails.
-/// - `source_tree_path` is `None` (tarball/git entries — the source
-///   was a tarball or shallow clone that may no longer be on disk).
-/// - `source_tree_path` exists but has no `vmlinux` file (tree deleted
+/// - `metadata.source` is not [`KernelSource::Local`] (tarball/git entries
+///   — no original source tree to route to).
+/// - `source_tree_path` is `None` on a Local entry (tree location not recorded).
+/// - `source_tree_path` is set but has no `vmlinux` file (tree deleted
 ///   or rebuilt without saving vmlinux).
 ///
 /// In any of those cases callers should fall back to the cache
@@ -669,6 +670,7 @@ const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
 /// stripped-vmlinux path via [`path`](Self::path) to pass into
 /// [`CacheDir::store`] (or equivalent consumer) before the handle
 /// goes out of scope.
+#[derive(Debug)]
 pub struct StrippedVmlinux {
     _tmp: tempfile::TempDir,
     path: PathBuf,

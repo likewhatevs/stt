@@ -143,7 +143,7 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
 /// file:line resolution works only for build-tree paths where the
 /// unstripped vmlinux is still present, or when the caller layers
 /// `cache::prefer_source_tree_for_dwarf` on top to re-route
-/// `SourceType::Local` entries at their original source tree.
+/// `cache::KernelSource::Local` entries at their original source tree.
 #[allow(dead_code)]
 pub fn derive_kernel_dir(image: &std::path::Path) -> Option<std::path::PathBuf> {
     let canon = std::fs::canonicalize(image).ok()?;
