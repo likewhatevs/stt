@@ -248,9 +248,12 @@ cargo ktstr stats compare <a> <b>          # compare two runs
 cargo ktstr stats compare <a> <b> -E filt  # compare with filter
 ```
 
-When invoked without a subcommand, prints gauntlet analysis from the
-most recent run directory under `{CARGO_TARGET_DIR or "target"}/ktstr/`
-(or `KTSTR_SIDECAR_DIR` when set):
+When invoked without a subcommand, prints gauntlet analysis from
+either the most recent run directory under
+`{CARGO_TARGET_DIR or "target"}/ktstr/` (newest by mtime) or the
+explicit directory in `KTSTR_SIDECAR_DIR` when that variable is
+set. With `KTSTR_SIDECAR_DIR` set, that directory is the sidecar
+source directly -- there is no newest-subdirectory walk under it:
 
 - **Gauntlet analysis** -- outlier detection, per-scenario/flags/topology
   dimension summaries, stimulus cross-tab.
@@ -265,23 +268,19 @@ most recent run directory under `{CARGO_TARGET_DIR or "target"}/ktstr/`
 
 Print a table of run directories under
 `{CARGO_TARGET_DIR or "target"}/ktstr/` with run key, test count,
-and date. `KTSTR_SIDECAR_DIR` is **not** consulted -- runs written
-to a custom path via that variable are invisible here.
+and date.
 
 ### compare
 
-Load two run directories from
-`{CARGO_TARGET_DIR or "target"}/ktstr/`, join on
-`(scenario, topology, work_type)`, compute per-metric deltas using
-`MetricDef` polarity and thresholds from the unified metric
-registry, and print colored output (red = regression, green =
-improvement). Exits non-zero on regression. Like `list`, this
-subcommand ignores `KTSTR_SIDECAR_DIR`.
+Load two run directories, join on (scenario, topology, work_type),
+compute per-metric deltas using `MetricDef` polarity and
+thresholds from the unified metric registry, and print colored output
+(red = regression, green = improvement). Exits non-zero on regression.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-E FILTER` | -- | Substring filter applied to `scenario topology work_type`. |
-| `--threshold PCT` | per-metric `default_rel` | Relative significance threshold as a percentage. Overrides each metric's `default_rel` from the `MetricDef` registry. The absolute gate (`default_abs`) is independent and is **not** affected by this flag; deltas must clear both gates to count as significant. Omit to use each metric's built-in defaults. |
+| `--threshold PCT` | per-metric `default_rel` | Relative significance threshold in percent. The comparison is dual-gated: a delta must exceed both `--threshold` (relative gate) and the metric's `default_abs` (absolute gate) to count as a regression or improvement. `--threshold` overrides the per-metric `default_rel` only; the absolute gate is always per-metric and cannot be tuned from the CLI. When omitted, each metric's built-in `default_rel` applies (0.10 fallback for unknown metrics). |
 
 ### Prerequisites
 
@@ -292,12 +291,8 @@ cargo nextest run --workspace        # generates target/ktstr/{kernel}-{git_shor
 cargo ktstr stats                    # reads the newest run
 ```
 
-Sidecars default to
-`{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`. Set
-`KTSTR_SIDECAR_DIR` only when you need bare `cargo ktstr stats` to
-read from a custom flat directory; the `list` and `compare`
-subcommands always enumerate `target/ktstr/` and do not see runs
-written to a custom path.
+Set `KTSTR_SIDECAR_DIR` to override the sidecar directory; otherwise
+the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`.
 
 ## Install
 

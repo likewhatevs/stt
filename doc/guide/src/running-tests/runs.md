@@ -25,17 +25,13 @@ the content of `include/config/kernel.release`, else `unknown` (when
 `KTSTR_KERNEL` is unset or neither file yields a version) — and
 `{git_short}` is the short commit hash baked in by `build.rs`.
 
-Set `KTSTR_SIDECAR_DIR` to write sidecars into a custom flat
-directory instead of the keyed `{kernel}-{git_short}/` subdir under
-`{CARGO_TARGET_DIR or "target"}/ktstr/`. The path is used as-is --
-no kernel-key suffix is appended, so a single directory holds the
-sidecars from one run.
-
-Bare `cargo ktstr stats` honors `KTSTR_SIDECAR_DIR` when set; the
-`cargo ktstr stats list` and `cargo ktstr stats compare`
-subcommands always enumerate `{CARGO_TARGET_DIR or "target"}/ktstr/`
-and ignore this variable. Runs written to a custom
-`KTSTR_SIDECAR_DIR` are invisible to those subcommands.
+`KTSTR_SIDECAR_DIR` overrides the *sidecar* directory itself
+(used as-is, no key suffix), not the parent. The override only
+affects where new sidecars are written and what bare
+`cargo ktstr stats` reads. `cargo ktstr stats list` and
+`cargo ktstr stats compare` always enumerate
+`{CARGO_TARGET_DIR or "target"}/ktstr/` regardless of
+`KTSTR_SIDECAR_DIR`.
 
 ## Workflow
 
