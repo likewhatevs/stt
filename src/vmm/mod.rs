@@ -4337,8 +4337,8 @@ mod tests {
     use super::*;
 
     /// Emit a canonical `ktstr: SKIP: ...` message and return from the
-    /// caller. Centralizes the prefix so every VM-backed test reports
-    /// skips in a single grep-able format.
+    /// caller. Centralizes the prefix so every test in this module
+    /// reports skips in a single grep-able format.
     macro_rules! skip {
         ($($arg:tt)*) => {{
             eprintln!("ktstr: SKIP: {}", format_args!($($arg)*));
