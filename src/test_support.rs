@@ -4105,6 +4105,93 @@ pub fn newest_run_dir() -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
+// ---------------------------------------------------------------------------
+// Test infrastructure requirements
+// ---------------------------------------------------------------------------
+//
+// `require_*` helpers turn missing test infrastructure into a panic with
+// an actionable message instead of a silent skip. Use them when a test
+// is meaningless without the resource -- a missing kernel, vmlinux,
+// scheduler binary, or kernel-symbol resolution means the harness is
+// misconfigured, not that the test should pass quietly. CI silently
+// passing 100 "tests" that all early-returned because no kernel was
+// findable is the failure mode these helpers exist to prevent.
+//
+// For genuine skips (raw BTF at /sys/kernel/btf/vmlinux, host without
+// the architectural dependency the test exercises), keep the existing
+// `eprintln!("ktstr: SKIP: ..."); return;` pattern.
+
+/// Resolve a kernel image path or panic with an actionable message.
+///
+/// Wraps [`crate::find_kernel`]: an `Err` (KTSTR_KERNEL points at a
+/// path with no kernel image, cache lookup failed) and a successful
+/// `Ok(None)` (no kernel discoverable) both panic. Tests that boot a
+/// VM cannot proceed without a kernel; silently skipping turns CI
+/// breakage into a green run.
+#[cfg(test)]
+#[allow(dead_code, reason = "call sites added in follow-up commits")]
+pub(crate) fn require_kernel() -> std::path::PathBuf {
+    match crate::find_kernel() {
+        Ok(Some(p)) => p,
+        Ok(None) => panic!(
+            "ktstr: test requires a kernel but none was found. \
+             Set KTSTR_KERNEL to a kernel source dir / version / cache key, \
+             place a built kernel under ./linux or ../linux, or run \
+             `cargo ktstr kernel build` to populate the cache."
+        ),
+        Err(e) => panic!("ktstr: kernel resolution failed: {e:#}"),
+    }
+}
+
+/// Resolve a vmlinux path next to a kernel image or panic.
+///
+/// `kernel_path` is the value returned by [`require_kernel`]. The
+/// vmlinux is required for symbol address lookup, BTF, and probe
+/// source resolution -- a kernel image without vmlinux means the
+/// cache entry is corrupt or the build was incomplete, which is an
+/// infrastructure failure rather than a legitimate skip.
+#[cfg(test)]
+#[allow(dead_code, reason = "call sites added in follow-up commits")]
+pub(crate) fn require_vmlinux(kernel_path: &std::path::Path) -> std::path::PathBuf {
+    crate::vmm::find_vmlinux(kernel_path).unwrap_or_else(|| {
+        panic!(
+            "ktstr: no vmlinux found alongside {}. The cache entry or \
+             kernel build is incomplete. Rebuild with `cargo ktstr kernel \
+             build --force` or point KTSTR_KERNEL at a directory that \
+             contains both the kernel image and `vmlinux`.",
+            kernel_path.display(),
+        )
+    })
+}
+
+/// Build a workspace package and return its binary path, or panic.
+///
+/// Wraps [`crate::build_and_find_binary`]. A failed build or missing
+/// artifact for a required scheduler binary (e.g. `scx-ktstr`) is an
+/// infrastructure failure -- the workspace is broken, not the test.
+#[cfg(test)]
+#[allow(dead_code, reason = "call sites added in follow-up commits")]
+pub(crate) fn require_binary(package: &str) -> std::path::PathBuf {
+    crate::build_and_find_binary(package)
+        .unwrap_or_else(|e| panic!("ktstr: build of `{package}` failed: {e:#}"))
+}
+
+/// Resolve [`crate::monitor::symbols::KernelSymbols`] from a vmlinux
+/// or panic. The symbol table is required for any host-side memory
+/// introspection; an unparseable vmlinux is an infrastructure failure.
+#[cfg(test)]
+#[allow(dead_code, reason = "call sites added in follow-up commits")]
+pub(crate) fn require_kernel_symbols(
+    vmlinux_path: &std::path::Path,
+) -> crate::monitor::symbols::KernelSymbols {
+    crate::monitor::symbols::KernelSymbols::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
+        panic!(
+            "ktstr: KernelSymbols resolution from {} failed: {e:#}",
+            vmlinux_path.display(),
+        )
+    })
+}
+
 /// Detect kernel version from KTSTR_KERNEL env var or cache metadata.
 fn detect_kernel_version() -> Option<String> {
     let kernel_dir = std::env::var("KTSTR_KERNEL").ok()?;
