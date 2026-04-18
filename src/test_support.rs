@@ -6950,7 +6950,7 @@ mod tests {
         assert!(config_file_parts(&entry).is_none());
     }
 
-    // -- now_iso8601 / days_to_ymd tests --
+    // -- now_iso8601 / days_to_ymd / is_leap tests --
 
     #[test]
     fn days_to_ymd_epoch() {

@@ -2381,7 +2381,7 @@ mod tests {
         assert_eq!(row_metric_value(&row, "missing_ext"), 0.0);
     }
 
-    // -- baseline_compare dual-gate threshold tests --
+    // -- baseline_compare tests --
 
     #[test]
     fn baseline_compare_dual_gate_both_must_trigger() {
