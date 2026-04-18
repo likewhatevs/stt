@@ -113,6 +113,22 @@ enum KtstrCommand {
         #[arg(long, default_value = "cargo")]
         binary: String,
     },
+    /// Clean up leftover ktstr cgroups.
+    ///
+    /// Without `--parent-cgroup`, scans `/sys/fs/cgroup` for the default
+    /// ktstr parents (`ktstr` and `ktstr-<pid>`, the paths that `ktstr
+    /// run` and the in-process test harness create) and rmdirs each.
+    /// `ktstr-<pid>` directories whose pid is still a running ktstr or
+    /// cargo-ktstr process are skipped, so a concurrent cleanup run
+    /// doesn't yank an active run's cgroup.
+    Cleanup {
+        /// Parent cgroup path. When set, cleans only this path and
+        /// leaves the parent directory in place; when omitted, scans
+        /// `/sys/fs/cgroup` for the default ktstr parents
+        /// (`ktstr/` and `ktstr-<pid>/`) and rmdirs each.
+        #[arg(long)]
+        parent_cgroup: Option<String>,
+    },
     /// Boot an interactive shell in a KVM virtual machine.
     ///
     /// Launches a VM with busybox and drops into a shell. Files and
@@ -854,6 +870,9 @@ fn main() {
                 cli::kernel_clean(keep, force).map_err(|e| format!("{e:#}"))
             }
         },
+        KtstrCommand::Cleanup { parent_cgroup } => {
+            cli::cleanup(parent_cgroup).map_err(|e| format!("{e:#}"))
+        }
     };
 
     if let Err(e) = result {

@@ -243,62 +243,6 @@ enum KernelCommand {
     },
 }
 
-/// List cgroup directories that `ktstr cleanup` targets by default:
-/// `/sys/fs/cgroup/ktstr` (test-harness parent) and any
-/// `/sys/fs/cgroup/ktstr-<pid>` left behind by a `ktstr run` that
-/// crashed or was SIGKILLed.
-///
-/// Returns only entries that exist and are directories. Silently
-/// returns empty when `/sys/fs/cgroup` isn't a cgroup v2 mount.
-/// Skips `ktstr-<pid>` directories whose pid still owns a live
-/// ktstr (or cargo-ktstr) process, so a concurrent `cleanup` run
-/// doesn't rmdir an active run's cgroup out from under it.
-fn default_cleanup_parents() -> Vec<PathBuf> {
-    let root = Path::new("/sys/fs/cgroup");
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(ty) = entry.file_type() else { continue };
-        if !ty.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name == "ktstr" {
-            out.push(entry.path());
-            continue;
-        }
-        if let Some(pid_str) = name.strip_prefix("ktstr-")
-            && !pid_str.is_empty()
-            && pid_str.bytes().all(|b| b.is_ascii_digit())
-        {
-            if is_ktstr_pid_alive(pid_str) {
-                eprintln!("ktstr: skipping {} (live process)", entry.path().display());
-                continue;
-            }
-            out.push(entry.path());
-        }
-    }
-    out.sort();
-    out
-}
-
-/// Return true when `/proc/{pid}/comm` identifies a live ktstr or
-/// cargo-ktstr process. Returns false on any read error (pid exited,
-/// non-Linux host, /proc not mounted) so the caller treats the cgroup
-/// as cleanable.
-fn is_ktstr_pid_alive(pid: &str) -> bool {
-    let comm_path = format!("/proc/{pid}/comm");
-    let Ok(comm) = std::fs::read_to_string(&comm_path) else {
-        return false;
-    };
-    let comm = comm.trim();
-    comm == "ktstr" || comm == "cargo-ktstr"
-}
-
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
 struct CgroupGuard {
     path: String,
@@ -505,39 +449,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Cleanup { parent_cgroup } => match parent_cgroup {
-            Some(path) => {
-                if !Path::new(&path).exists() {
-                    anyhow::bail!("cgroup path not found: {path}");
-                }
-                let cgroups = CgroupManager::new(&path);
-                cgroups.cleanup_all()?;
-                println!("cleaned up {path}");
-            }
-            None => {
-                let parents = default_cleanup_parents();
-                if parents.is_empty() {
-                    println!("no leftover cgroups found");
-                } else {
-                    for path in parents {
-                        let cgroups = CgroupManager::new(path.to_str().unwrap_or_default());
-                        if let Err(e) = cgroups.cleanup_all() {
-                            eprintln!("ktstr: cleanup_all failed on {}: {e}", path.display());
-                            continue;
-                        }
-                        match std::fs::remove_dir(&path) {
-                            Ok(()) => println!("cleaned up {}", path.display()),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                println!("cleaned up {}", path.display());
-                            }
-                            Err(e) => {
-                                eprintln!("ktstr: failed to remove {}: {e}", path.display());
-                            }
-                        }
-                    }
-                }
-            }
-        },
+        Command::Cleanup { parent_cgroup } => cli::cleanup(parent_cgroup)?,
 
         Command::Kernel { command } => match command {
             KernelCommand::List { json } => cli::kernel_list(json)?,

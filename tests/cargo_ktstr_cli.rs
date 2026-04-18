@@ -109,6 +109,25 @@ fn help_completions() {
         .stdout(predicate::str::contains("possible values: bash"));
 }
 
+#[test]
+fn help_cleanup() {
+    cargo_ktstr()
+        .args(["cleanup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--parent-cgroup"))
+        .stdout(predicate::str::contains("leftover"));
+}
+
+#[test]
+fn help_lists_cleanup_subcommand() {
+    cargo_ktstr()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleanup"));
+}
+
 // -- error cases --
 
 #[test]

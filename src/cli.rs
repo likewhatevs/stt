@@ -792,6 +792,110 @@ pub fn check_kvm() -> Result<()> {
     Ok(())
 }
 
+/// List cgroup directories that `ktstr cleanup` / `cargo ktstr cleanup`
+/// target by default: `/sys/fs/cgroup/ktstr` (test-harness parent) and
+/// any `/sys/fs/cgroup/ktstr-<pid>` left behind by a `ktstr run` that
+/// crashed or was SIGKILLed.
+///
+/// Returns only entries that exist and are directories. Silently
+/// returns empty when `/sys/fs/cgroup` isn't a cgroup v2 mount. Skips
+/// `ktstr-<pid>` directories whose pid still owns a live ktstr (or
+/// cargo-ktstr) process, so a concurrent cleanup run doesn't rmdir an
+/// active run's cgroup out from under it.
+pub fn default_cleanup_parents() -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(ty) = entry.file_type() else { continue };
+        if !ty.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == "ktstr" {
+            out.push(entry.path());
+            continue;
+        }
+        if let Some(pid_str) = name.strip_prefix("ktstr-")
+            && !pid_str.is_empty()
+            && pid_str.bytes().all(|b| b.is_ascii_digit())
+        {
+            if is_ktstr_pid_alive(pid_str) {
+                eprintln!("ktstr: skipping {} (live process)", entry.path().display());
+                continue;
+            }
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Return true when `/proc/{pid}/comm` identifies a live ktstr or
+/// cargo-ktstr process. Returns false on any read error (pid exited,
+/// non-Linux host, /proc not mounted) so the caller treats the cgroup
+/// as cleanable.
+pub fn is_ktstr_pid_alive(pid: &str) -> bool {
+    let comm_path = format!("/proc/{pid}/comm");
+    let Ok(comm) = std::fs::read_to_string(&comm_path) else {
+        return false;
+    };
+    let comm = comm.trim();
+    comm == "ktstr" || comm == "cargo-ktstr"
+}
+
+/// Reap leftover ktstr cgroup directories.
+///
+/// With `parent_cgroup` set, cleans only that path and leaves the
+/// directory itself in place (matches `CgroupManager::cleanup_all`
+/// semantics: purge children, keep parent). With `parent_cgroup` as
+/// `None`, scans `/sys/fs/cgroup` for the default ktstr parents
+/// reported by [`default_cleanup_parents`] and rmdirs each after
+/// cleaning. Per-directory failures print to stderr and do not halt
+/// the remaining sweep.
+pub fn cleanup(parent_cgroup: Option<String>) -> Result<()> {
+    use crate::cgroup::CgroupManager;
+
+    match parent_cgroup {
+        Some(path) => {
+            if !std::path::Path::new(&path).exists() {
+                bail!("cgroup path not found: {path}");
+            }
+            let cgroups = CgroupManager::new(&path);
+            cgroups.cleanup_all()?;
+            println!("cleaned up {path}");
+        }
+        None => {
+            let parents = default_cleanup_parents();
+            if parents.is_empty() {
+                println!("no leftover cgroups found");
+            } else {
+                for path in parents {
+                    let cgroups = CgroupManager::new(path.to_str().unwrap_or_default());
+                    if let Err(e) = cgroups.cleanup_all() {
+                        eprintln!("ktstr: cleanup_all failed on {}: {e}", path.display());
+                        continue;
+                    }
+                    match std::fs::remove_dir(&path) {
+                        Ok(()) => println!("cleaned up {}", path.display()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            println!("cleaned up {}", path.display());
+                        }
+                        Err(e) => {
+                            eprintln!("ktstr: failed to remove {}: {e}", path.display());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Search PATH for a bare executable name.
 fn resolve_in_path(name: &std::path::Path) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
