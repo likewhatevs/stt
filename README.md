@@ -38,9 +38,10 @@ automates this:
   handles the rest.
 - **Automated assertions** -- checks for starvation, cgroup
   isolation violations, and CPU time fairness. No manual inspection.
-- **Gauntlet** -- one `#[ktstr_test]` expands into hundreds of
-  topology x flag-profile variants. No custom harness needed.
-  Budget-aware CI selection.
+- **[Gauntlet](https://likewhatevs.github.io/ktstr/guide/running-tests/gauntlet.html)** --
+  one `#[ktstr_test]` expands across the cross-product of topology
+  presets (4-252 vCPUs, 1-15 LLCs, optional SMT and multi-NUMA) and
+  scheduler flag profiles, filtered by per-test constraints.
 - **Host-side introspection** -- reads kernel state and BPF maps
   from guest memory without guest-side instrumentation.
 - **Auto-repro** -- on failure, reruns the scenario with BPF probes
