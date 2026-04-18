@@ -1666,14 +1666,13 @@ mod tests {
 
     // -- strip_vmlinux_debug --
 
-    /// Check whether `elf` has a symbol with the given name. When
-    /// `require_value` is true, additionally requires `st_value != 0`
-    /// — mirrors the production [`KernelSymbols::sym_addr`]
-    /// (symbols.rs:87) filter that rejects undefined/absent symbols.
-    fn has_symbol(elf: &goblin::elf::Elf, name: &str, require_value: bool) -> bool {
-        elf.syms.iter().any(|s| {
-            (!require_value || s.st_value != 0) && elf.strtab.get_at(s.st_name) == Some(name)
-        })
+    /// Check whether `elf` has a defined symbol with the given name.
+    /// Mirrors the production `KernelSymbols::sym_addr` filter by
+    /// requiring `st_value != 0` to reject undefined/absent symbols.
+    fn has_symbol(elf: &goblin::elf::Elf, name: &str) -> bool {
+        elf.syms
+            .iter()
+            .any(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
     }
 
     /// Build a minimal ELF covering every strip dispatch branch:
@@ -1844,7 +1843,7 @@ mod tests {
         // name. End-to-end symbol preservation on real vmlinuxes is
         // covered by the *_preserves_monitor_symbols tests below.
         assert!(
-            has_symbol(&elf, "test_symbol", true),
+            has_symbol(&elf, "test_symbol"),
             "stripped ELF should contain test_symbol in symtab"
         );
     }
@@ -1899,15 +1898,15 @@ mod tests {
         // Fixture symbol values are 0x2000/0x3000/0x4000 (nonzero),
         // so the production-matching require_value filter applies.
         assert!(
-            has_symbol(&elf, "test_data_symbol", true),
+            has_symbol(&elf, "test_data_symbol"),
             "test_data_symbol dropped by strip"
         );
         assert!(
-            has_symbol(&elf, "test_percpu_symbol", true),
+            has_symbol(&elf, "test_percpu_symbol"),
             "test_percpu_symbol dropped by strip"
         );
         assert!(
-            has_symbol(&elf, "test_initdata_symbol", true),
+            has_symbol(&elf, "test_initdata_symbol"),
             "test_initdata_symbol dropped by strip"
         );
     }
@@ -1992,13 +1991,13 @@ mod tests {
         let stripped_data = fs::read(&stripped_path).unwrap();
         let stripped_elf = goblin::elf::Elf::parse(&stripped_data).unwrap();
         assert_eq!(
-            has_symbol(&source_elf, "init_top_pgt", true),
-            has_symbol(&stripped_elf, "init_top_pgt", true),
+            has_symbol(&source_elf, "init_top_pgt"),
+            has_symbol(&stripped_elf, "init_top_pgt"),
             "strip changed init_top_pgt presence"
         );
         assert_eq!(
-            has_symbol(&source_elf, "swapper_pg_dir", true),
-            has_symbol(&stripped_elf, "swapper_pg_dir", true),
+            has_symbol(&source_elf, "swapper_pg_dir"),
+            has_symbol(&stripped_elf, "swapper_pg_dir"),
             "strip changed swapper_pg_dir presence"
         );
 
@@ -2035,11 +2034,11 @@ mod tests {
         let data = fs::read(&stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
         assert!(
-            has_symbol(&elf, "map_idr", true),
+            has_symbol(&elf, "map_idr"),
             "map_idr symbol missing from stripped vmlinux"
         );
         assert!(
-            has_symbol(&elf, "prog_idr", true),
+            has_symbol(&elf, "prog_idr"),
             "prog_idr symbol missing from stripped vmlinux"
         );
     }
@@ -2065,7 +2064,7 @@ mod tests {
         // entry was rebuilt.
         let source_data = fs::read(&path).unwrap();
         let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
-        if !has_symbol(&source_elf, "schedule", true) {
+        if !has_symbol(&source_elf, "schedule") {
             skip!(
                 "source vmlinux has no `schedule` symbol \
                  (already stripped by older ktstr) -- rebuild the kernel \
@@ -2077,7 +2076,7 @@ mod tests {
         let data = fs::read(&stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
         assert!(
-            has_symbol(&elf, "schedule", true),
+            has_symbol(&elf, "schedule"),
             "schedule function symbol dropped by strip"
         );
     }
