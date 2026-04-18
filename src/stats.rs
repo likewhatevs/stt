@@ -12,9 +12,9 @@ use crate::timeline::Timeline;
 use crate::vmm::shm_ring;
 
 /// How multiple rows sharing a pairing key collapse into one
-/// value during comparison. See
-/// [`cross-test-stats-comparison`](crate) design for the
-/// rule per metric.
+/// value during comparison. The rule per metric is set on
+/// [`MetricDef::aggregate`]; see
+/// `doc/design/cross-test-stats-comparison.md` for the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Aggregator {
     /// Arithmetic mean of per-row values.
@@ -38,9 +38,11 @@ pub enum Aggregator {
 /// matching rows to one value when the comparison pairing key
 /// collapses them.
 ///
-/// The `accessor` field is skipped in serde output — `fn`
-/// pointers are not serializable and the function identity is
-/// reconstructable from `name` via [`metric_def`].
+/// The `accessor` field is skipped in serde output because `fn`
+/// pointers are not serializable. If a `Deserialize` impl is
+/// added later, callers must re-hydrate the accessor by looking
+/// up `name` via [`metric_def`] — the static `METRICS` table is
+/// the authoritative source of the function identity.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricDef {
     pub name: &'static str,
@@ -2535,17 +2537,18 @@ mod tests {
     }
 
     #[test]
-    fn metric_def_read_ext_metrics_when_registered() {
-        // Simulate an ext_metric whose name collides with a built-in
-        // field: the accessor wins, ext_metrics is the fallback only
-        // when the accessor returns None. Use a built-in name with no
-        // explicit ext_metrics entry.
-        let row = make_row("a", "f", "t", true, 5.0);
+    fn metric_def_read_prefers_accessor_over_ext_metrics() {
+        // When a name is in METRICS, the built-in accessor wins.
+        // Even if ext_metrics carries a colliding entry for the
+        // same name, MetricDef::read returns the accessor's value
+        // — built-in fields are the authoritative source.
+        let mut row = make_row("a", "f", "t", true, 5.0);
+        row.ext_metrics.insert("worst_spread".into(), 999.0);
         assert_eq!(read_metric(&row, "worst_spread"), Some(5.0));
 
-        // User ext_metric accessed directly via ext_metrics map
-        // (no MetricDef entry; lookup via metric_def returns None).
-        let mut row = row;
+        // User ext_metrics with no matching MetricDef are reachable
+        // via the direct ext_metrics map; metric_def returns None
+        // for unregistered names.
         row.ext_metrics.insert("custom_metric".into(), 77.0);
         assert!(metric_def("custom_metric").is_none());
         assert_eq!(row.ext_metrics.get("custom_metric").copied(), Some(77.0));
