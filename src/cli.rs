@@ -725,7 +725,7 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 /// Returns an empty report with a warning on stderr when no sidecars
 /// are found. This is not an error -- regular test runs that skip
 /// gauntlet tests produce no sidecar files.
-pub fn run_test_stats() -> String {
+pub fn print_stats_report() -> String {
     let report = crate::test_support::analyze_sidecars(None);
     if report.is_empty() {
         eprintln!("cargo ktstr: no sidecar data found (skipped)");
@@ -1590,7 +1590,7 @@ mod tests {
         assert_eq!(args, vec!["-j16", "KCFLAGS=-Wno-error"]);
     }
 
-    // -- analyze_sidecars (library API used by run_test_stats) --
+    // -- analyze_sidecars (library API used by print_stats_report) --
 
     #[test]
     fn cli_analyze_sidecars_empty_dir() {
