@@ -273,9 +273,13 @@ cargo ktstr completions bash                               # shell completions
 
 ### Host-side CLI
 
-`ktstr` runs scenarios on the host (outside VMs) under whatever
-scheduler is already active, and manages cached kernel images. Every
-`ktstr kernel ...` subcommand is identical to the corresponding
+`ktstr` runs scenarios directly on the host under whatever scheduler
+is already active -- no VM, just the real
+hardware. This complements `#[ktstr_test]` library tests, which boot
+a KVM VM per test with a controlled virtual topology for reproducible
+results.
+
+Every `ktstr kernel ...` subcommand is identical to the corresponding
 `cargo ktstr kernel ...`.
 
 ```sh
