@@ -58,8 +58,6 @@ jobs:
       - name: Test statistics
         if: ${{ !cancelled() }}
         run: cargo ktstr test-stats
-        env:
-          KTSTR_KERNEL: ${{ matrix.kernel-version }}
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
@@ -99,8 +97,6 @@ jobs:
       - name: Test statistics
         if: ${{ !cancelled() }}
         run: cargo ktstr test-stats
-        env:
-          KTSTR_KERNEL: ${{ matrix.kernel-version }}
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
