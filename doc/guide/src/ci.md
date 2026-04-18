@@ -171,10 +171,10 @@ Collect test statistics after the test run:
 ```yaml
 - name: Test statistics
   if: ${{ !cancelled() }}
-  run: cargo ktstr test-stats
+  run: cargo ktstr stats
 ```
 
-`test-stats` reads sidecar JSON files from `target/ktstr/{branch}-{hash}/`
+`stats` reads sidecar JSON files from `target/ktstr/{branch}-{hash}/`
 and prints gauntlet analysis, BPF verifier stats, callback profiles,
 and KVM stats. The `if: !cancelled()` condition ensures stats are
 collected even on test failure.

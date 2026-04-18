@@ -2,7 +2,7 @@
 
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test`, `coverage`,
-`test-stats`, `kernel`, `verifier`, `completions`, `shell`.
+`stats`, `kernel`, `verifier`, `completions`, `shell`.
 
 ## test
 
@@ -236,17 +236,20 @@ cargo ktstr completions fish > ~/.config/fish/completions/cargo-ktstr.fish
 | `SHELL` | Shell to generate completions for (`bash`, `zsh`, `fish`, `elvish`, `powershell`). |
 | `--binary NAME` | Binary name for completions. Default: `cargo`. |
 
-## test-stats
+## stats
 
-Print gauntlet analysis from sidecar JSON files produced by ktstr
-tests.
+Sidecar analysis and baseline comparison.
 
 ```sh
-cargo ktstr test-stats                     # default sidecar directory
-cargo ktstr test-stats --dir path/to/dir   # explicit directory
+cargo ktstr stats                          # print gauntlet analysis (default sidecar dir)
+cargo ktstr stats --dir path/to/dir        # explicit sidecar directory
+cargo ktstr stats list                     # list saved baselines
+cargo ktstr stats compare <a> <b>          # compare two baselines
+cargo ktstr stats compare <a> <b> -E filt  # compare with filter
 ```
 
-The output includes:
+When invoked without a subcommand, prints gauntlet analysis from
+sidecar JSON files:
 
 - **Gauntlet analysis** -- outlier detection, per-scenario/flags/topology
   dimension summaries, stimulus cross-tab.
@@ -257,13 +260,29 @@ The output includes:
 - **KVM stats** -- cross-VM averages for exits, halt polling, host
   preemptions.
 
+### list
+
+Scan `~/.cache/ktstr/baselines/` and print a table of saved baselines
+with key, test count, and date.
+
+### compare
+
+Load two baseline directories, join on (test_name, topology, flags,
+work_type), compute per-metric deltas using `MetricDef` polarity and
+thresholds from the unified metric registry, and print colored output
+(red = regression, green = improvement). Exits non-zero on regression.
+
+| Flag | Description |
+|------|-------------|
+| `-E FILTER` | Substring filter applied to `test_name topology flags work_type`. |
+
 ### Prerequisites
 
 Run tests first to generate sidecar JSON files:
 
 ```sh
 cargo nextest run --workspace        # generates target/ktstr/{branch}-{hash}/*.json
-cargo ktstr test-stats               # reads them
+cargo ktstr stats                    # reads them
 ```
 
 Set `KTSTR_SIDECAR_DIR` to override the default sidecar directory.

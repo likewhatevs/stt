@@ -67,11 +67,13 @@ enum KtstrCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Print gauntlet analysis from sidecar JSON files.
-    TestStats {
+    /// Sidecar analysis and baseline comparison.
+    Stats {
+        #[command(subcommand)]
+        command: Option<StatsCommand>,
         /// Path to the sidecar directory. Defaults to KTSTR_SIDECAR_DIR
         /// or target/ktstr/{branch}-{hash}/.
-        #[arg(long)]
+        #[arg(long, global = true)]
         dir: Option<PathBuf>,
     },
     /// Manage cached kernel images.
@@ -144,6 +146,23 @@ enum KtstrCommand {
         /// The VM exits after the command completes.
         #[arg(long)]
         exec: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StatsCommand {
+    /// List saved baselines.
+    List,
+    /// Compare two baselines and report regressions.
+    Compare {
+        /// Baseline key A (from `cargo ktstr stats list`).
+        a: String,
+        /// Baseline key B (from `cargo ktstr stats list`).
+        b: String,
+        /// Filter expression (nextest-style -E). Matches against
+        /// test_name, topology, scheduler, work_type.
+        #[arg(short = 'E', long)]
+        filter: Option<String>,
     },
 }
 
@@ -307,12 +326,28 @@ fn run_coverage(
     Err(format!("exec cargo llvm-cov nextest: {err}"))
 }
 
-fn test_stats(dir: &Option<PathBuf>) -> Result<(), String> {
-    let output = cli::run_test_stats(dir.as_deref());
-    if !output.is_empty() {
-        print!("{output}");
+fn run_stats(command: &Option<StatsCommand>, dir: &Option<PathBuf>) -> Result<(), String> {
+    match command {
+        None => {
+            let output = cli::run_test_stats(dir.as_deref());
+            if !output.is_empty() {
+                print!("{output}");
+            }
+            if let Err(e) = cli::auto_save_baseline(dir.as_deref()) {
+                eprintln!("cargo ktstr: baseline save: {e:#}");
+            }
+            Ok(())
+        }
+        Some(StatsCommand::List) => cli::baseline_list().map_err(|e| format!("{e:#}")),
+        Some(StatsCommand::Compare { a, b, filter }) => {
+            let exit =
+                cli::baseline_compare(a, b, filter.as_deref()).map_err(|e| format!("{e:#}"))?;
+            if exit != 0 {
+                std::process::exit(exit);
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Acquire source, configure, build, and cache a kernel image.
@@ -792,7 +827,10 @@ fn main() {
             all_profiles,
             profiles,
         ),
-        KtstrCommand::TestStats { ref dir } => test_stats(dir),
+        KtstrCommand::Stats {
+            ref command,
+            ref dir,
+        } => run_stats(command, dir),
         KtstrCommand::Shell {
             kernel,
             topology,
@@ -958,6 +996,55 @@ mod tests {
                 assert_eq!(include_files.len(), 2);
             }
             _ => panic!("expected Shell"),
+        }
+    }
+
+    // -- try_get_matches_from: stats subcommand --
+
+    #[test]
+    fn parse_stats_bare() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "stats"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_stats_list() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_stats_compare() {
+        let m =
+            Cargo::try_parse_from(["cargo", "ktstr", "stats", "compare", "6.14-abc", "6.15-def"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_stats_compare_with_filter() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "a",
+            "b",
+            "-E",
+            "cgroup_steady",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::Compare { a, b, filter, .. }),
+                ..
+            } => {
+                assert_eq!(a, "a");
+                assert_eq!(b, "b");
+                assert_eq!(filter.as_deref(), Some("cgroup_steady"));
+            }
+            _ => panic!("expected Stats Compare"),
         }
     }
 

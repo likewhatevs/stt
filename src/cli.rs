@@ -735,6 +735,29 @@ pub fn run_test_stats(dir: Option<&std::path::Path>) -> String {
     report
 }
 
+/// Auto-save sidecars as a baseline.
+pub fn auto_save_baseline(dir: Option<&std::path::Path>) -> Result<()> {
+    let sidecars = crate::test_support::collect_sidecars(
+        dir.unwrap_or(&crate::test_support::default_sidecar_dir()),
+    );
+    if sidecars.is_empty() {
+        return Ok(());
+    }
+    let key = crate::stats::save_baseline(&sidecars)?;
+    eprintln!("cargo ktstr: baseline saved as {key}");
+    Ok(())
+}
+
+/// List saved baselines.
+pub fn baseline_list() -> Result<()> {
+    crate::stats::baseline_list()
+}
+
+/// Compare two baselines and report regressions.
+pub fn baseline_compare(a: &str, b: &str, filter: Option<&str>) -> Result<i32> {
+    crate::stats::baseline_compare(a, b, filter)
+}
+
 /// Pre-flight check for /dev/kvm availability and permissions.
 pub fn check_kvm() -> Result<()> {
     use std::path::Path;

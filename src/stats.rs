@@ -11,32 +11,158 @@ use polars::prelude::*;
 use crate::timeline::Timeline;
 use crate::vmm::shm_ring;
 
-/// Definition of an extensible metric for the generic comparison pipeline.
+/// Definition of a metric for the comparison pipeline.
 ///
-/// Each entry describes a metric that can be populated via `ext_metrics`
-/// on stats types. The pipeline uses `higher_is_worse` to determine
-/// regression direction, and `default_abs`/`default_rel` for dual-gate
-/// significance thresholds.
+/// Each entry describes polarity (`higher_is_worse`), dual-gate
+/// significance thresholds (`default_abs`, `default_rel`), and a
+/// display unit string for formatted output.
 pub struct MetricDef {
     pub name: &'static str,
     pub higher_is_worse: bool,
     pub default_abs: f64,
     pub default_rel: f64,
+    pub display_unit: &'static str,
 }
 
-/// Registry of extensible metrics processed by the comparison pipeline.
+/// Unified metric registry covering all built-in and extensible metrics.
 ///
-/// Typed fields (spread, gap_ms, etc.) remain as primary metrics. Entries
-/// here are processed for any metric populated in `ext_metrics`.
+/// The comparison pipeline uses `higher_is_worse` to determine regression
+/// direction, `default_abs`/`default_rel` for dual-gate significance
+/// thresholds, and `display_unit` for formatted output. Per-test
+/// assertion overrides can still use their own thresholds; this registry
+/// is the source of truth for polarity and display.
 ///
-/// All entries must have `higher_is_worse: true` until
-/// `AssertResult::merge` supports per-metric merge direction.
-pub static EXTENSIBLE_METRICS: &[MetricDef] = &[MetricDef {
-    name: "migration_ratio",
-    higher_is_worse: true,
-    default_abs: 0.05,
-    default_rel: 0.20,
-}];
+/// Note: `AssertResult::merge` always takes the max value per metric
+/// (ext_metrics). For `higher_is_worse: false` metrics (total_iterations,
+/// page_locality), merge produces the best case, not the worst. The
+/// comparison system (`baseline_compare`) uses `higher_is_worse`
+/// correctly for delta direction regardless of merge behavior.
+pub static METRICS: &[MetricDef] = &[
+    MetricDef {
+        name: "spread",
+        higher_is_worse: true,
+        default_abs: 5.0,
+        default_rel: 0.25,
+        display_unit: "%",
+    },
+    MetricDef {
+        name: "gap_ms",
+        higher_is_worse: true,
+        default_abs: 500.0,
+        default_rel: 0.50,
+        display_unit: "ms",
+    },
+    MetricDef {
+        name: "migrations",
+        higher_is_worse: true,
+        default_abs: 10.0,
+        default_rel: 0.30,
+        display_unit: "",
+    },
+    MetricDef {
+        name: "migration_ratio",
+        higher_is_worse: true,
+        default_abs: 0.05,
+        default_rel: 0.20,
+        display_unit: "",
+    },
+    MetricDef {
+        name: "imbalance",
+        higher_is_worse: true,
+        default_abs: 1.0,
+        default_rel: 0.25,
+        display_unit: "x",
+    },
+    MetricDef {
+        name: "dsq_depth",
+        higher_is_worse: true,
+        default_abs: 10.0,
+        default_rel: 0.50,
+        display_unit: "",
+    },
+    MetricDef {
+        name: "stalls",
+        higher_is_worse: true,
+        default_abs: 1.0,
+        default_rel: 0.50,
+        display_unit: "",
+    },
+    MetricDef {
+        name: "fallback",
+        higher_is_worse: true,
+        default_abs: 5.0,
+        default_rel: 0.30,
+        display_unit: "/s",
+    },
+    MetricDef {
+        name: "keep_last",
+        higher_is_worse: true,
+        default_abs: 5.0,
+        default_rel: 0.30,
+        display_unit: "/s",
+    },
+    MetricDef {
+        name: "p99_wake_lat_us",
+        higher_is_worse: true,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+    },
+    MetricDef {
+        name: "median_wake_lat_us",
+        higher_is_worse: true,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+    },
+    MetricDef {
+        name: "wake_latency_cv",
+        higher_is_worse: true,
+        default_abs: 0.10,
+        default_rel: 0.25,
+        display_unit: "",
+    },
+    MetricDef {
+        name: "total_iterations",
+        higher_is_worse: false,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+    },
+    MetricDef {
+        name: "mean_run_delay_us",
+        higher_is_worse: true,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+    },
+    MetricDef {
+        name: "worst_run_delay_us",
+        higher_is_worse: true,
+        default_abs: 100.0,
+        default_rel: 0.50,
+        display_unit: "\u{00b5}s",
+    },
+    MetricDef {
+        name: "page_locality",
+        higher_is_worse: false,
+        default_abs: 0.05,
+        default_rel: 0.10,
+        display_unit: "",
+    },
+    MetricDef {
+        name: "cross_node_migration_ratio",
+        higher_is_worse: true,
+        default_abs: 0.05,
+        default_rel: 0.20,
+        display_unit: "",
+    },
+];
+
+/// Look up a metric definition by name.
+pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
+    METRICS.iter().find(|m| m.name == name)
+}
 
 /// Monitor data preserved from a gauntlet VM run for timeline analysis.
 #[derive(Debug, Clone)]
@@ -387,6 +513,8 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let total_iters: Vec<f64> = rows.iter().map(|r| r.total_iterations as f64).collect();
     let mean_run_delay: Vec<f64> = rows.iter().map(|r| r.mean_run_delay_us).collect();
     let worst_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_run_delay_us).collect();
+    let page_locality: Vec<f64> = rows.iter().map(|r| r.page_locality).collect();
+    let cross_node_mig: Vec<f64> = rows.iter().map(|r| r.cross_node_migration_ratio).collect();
     let worst_deg_op: Vec<&str> = rows
         .iter()
         .map(|r| r.worst_degradation_op.as_str())
@@ -419,6 +547,8 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "total_iterations" => &total_iters,
         "mean_run_delay_us" => &mean_run_delay,
         "worst_run_delay_us" => &worst_run_delay,
+        "page_locality" => &page_locality,
+        "cross_node_migration_ratio" => &cross_node_mig,
         "worst_deg_op" => &worst_deg_op,
         "imbalance_delta" => &imbalance_delta,
         "dsq_delta" => &dsq_delta,
@@ -1133,6 +1263,225 @@ pub fn analyze_gauntlet(results: &[VmRunResult]) -> String {
 // Baseline serialization and A/B comparison
 // ---------------------------------------------------------------------------
 
+/// Resolve the baselines directory under the ktstr cache.
+///
+/// Follows the same XDG convention as the kernel cache:
+/// `KTSTR_CACHE_DIR/../baselines/`, `$XDG_CACHE_HOME/ktstr/baselines/`,
+/// or `$HOME/.cache/ktstr/baselines/`.
+fn baselines_root() -> anyhow::Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(dir) = std::env::var("KTSTR_CACHE_DIR")
+        && !dir.is_empty()
+    {
+        let p = PathBuf::from(dir);
+        let parent = p.parent().unwrap_or(&p);
+        return Ok(parent.join("baselines"));
+    }
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
+        && !xdg.is_empty()
+    {
+        return Ok(PathBuf::from(xdg).join("ktstr").join("baselines"));
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow::anyhow!("HOME not set; cannot resolve baselines directory"))?;
+    Ok(PathBuf::from(home)
+        .join(".cache")
+        .join("ktstr")
+        .join("baselines"))
+}
+
+/// Save sidecars to the baselines directory.
+///
+/// Baseline key: `{kernel_version}-{repo_commit}`.
+pub fn save_baseline(sidecars: &[crate::test_support::SidecarResult]) -> anyhow::Result<String> {
+    use std::fs;
+    let root = baselines_root()?;
+    let kernel_ver = sidecars
+        .iter()
+        .find_map(|s| s.kernel_version.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let commit = crate::GIT_HASH;
+    let key = format!("{kernel_ver}-{commit}");
+    let dir = root.join(&key);
+    fs::create_dir_all(&dir)?;
+    for sc in sidecars {
+        let json = serde_json::to_string_pretty(sc)?;
+        let path = dir.join(format!("{}.ktstr.json", sc.test_name));
+        fs::write(&path, json)?;
+    }
+    Ok(key)
+}
+
+/// List saved baselines.
+pub fn baseline_list() -> anyhow::Result<()> {
+    use std::fs;
+    let root = baselines_root()?;
+    if !root.exists() {
+        eprintln!("no baselines found");
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(&root)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    println!("{:<40} {:>6}  DATE", "KEY", "TESTS");
+    println!("{}", "-".repeat(60));
+    for entry in &entries {
+        let key = entry.file_name();
+        let key_str = key.to_string_lossy();
+        let sidecars = crate::test_support::collect_sidecars(&entry.path());
+        let count = sidecars.len();
+        let date = sidecars
+            .iter()
+            .map(|s| s.timestamp.as_str())
+            .filter(|t| !t.is_empty())
+            .min()
+            .unwrap_or("-")
+            .to_string();
+        println!("{:<40} {:>6}  {}", key_str, count, date);
+    }
+    Ok(())
+}
+
+/// Compare two baselines and report regressions.
+///
+/// Returns 0 on no regressions, 1 if regressions detected.
+pub fn baseline_compare(a: &str, b: &str, filter: Option<&str>) -> anyhow::Result<i32> {
+    let root = baselines_root()?;
+    let dir_a = root.join(a);
+    let dir_b = root.join(b);
+    if !dir_a.exists() {
+        anyhow::bail!("baseline '{a}' not found");
+    }
+    if !dir_b.exists() {
+        anyhow::bail!("baseline '{b}' not found");
+    }
+    let sidecars_a = crate::test_support::collect_sidecars(&dir_a);
+    let sidecars_b = crate::test_support::collect_sidecars(&dir_b);
+    if sidecars_a.is_empty() {
+        anyhow::bail!("baseline '{a}' has no sidecar data");
+    }
+    if sidecars_b.is_empty() {
+        anyhow::bail!("baseline '{b}' has no sidecar data");
+    }
+
+    let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
+    let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
+
+    let compare_metrics: Vec<&str> = METRICS.iter().map(|m| m.name).collect();
+
+    let mut regressions = 0u32;
+    let mut improvements = 0u32;
+    let mut unchanged = 0u32;
+
+    println!(
+        "{:<30} {:<12} {:>10} {:>10} {:>10}  VERDICT",
+        "TEST", "METRIC", a, b, "DELTA"
+    );
+    println!("{}", "-".repeat(90));
+
+    for row_b in &rows_b {
+        let key_b = (
+            &row_b.scenario,
+            &row_b.topology,
+            &row_b.flags,
+            &row_b.work_type,
+        );
+        if let Some(f) = filter {
+            let joined = format!("{} {} {} {}", key_b.0, key_b.1, key_b.2, key_b.3);
+            if !joined.contains(f) {
+                continue;
+            }
+        }
+        let row_a = rows_a
+            .iter()
+            .find(|r| (&r.scenario, &r.topology, &r.flags, &r.work_type) == key_b);
+        let Some(row_a) = row_a else { continue };
+
+        for metric_name in &compare_metrics {
+            let val_a = row_metric_value(row_a, metric_name);
+            let val_b = row_metric_value(row_b, metric_name);
+            if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
+                continue;
+            }
+
+            let def = metric_def(metric_name);
+            let (abs_thresh, rel_thresh, higher_is_worse) = match def {
+                Some(d) => (d.default_abs, d.default_rel, d.higher_is_worse),
+                None => (1.0, 0.10, true),
+            };
+
+            let delta = val_b - val_a;
+            let rel_delta = if val_a.abs() > f64::EPSILON {
+                (delta / val_a).abs()
+            } else {
+                0.0
+            };
+
+            let abs_significant = delta.abs() >= abs_thresh;
+            let rel_significant = rel_delta >= rel_thresh;
+            if !abs_significant || !rel_significant {
+                unchanged += 1;
+                continue;
+            }
+
+            let is_regression = if higher_is_worse {
+                delta > 0.0
+            } else {
+                delta < 0.0
+            };
+            let verdict = if is_regression {
+                regressions += 1;
+                "\x1b[31mREGRESSION\x1b[0m"
+            } else {
+                improvements += 1;
+                "\x1b[32mimprovement\x1b[0m"
+            };
+
+            let unit = def.map(|d| d.display_unit).unwrap_or("");
+            let label = format!("{}/{}", row_b.scenario, row_b.topology);
+            println!(
+                "{:<30} {:<12} {:>10.2} {:>10.2} {:>+10.2}{:<2} {}",
+                label, metric_name, val_a, val_b, delta, unit, verdict,
+            );
+        }
+    }
+
+    println!();
+    println!(
+        "summary: {} regressions, {} improvements, {} unchanged",
+        regressions, improvements, unchanged,
+    );
+
+    Ok(if regressions > 0 { 1 } else { 0 })
+}
+
+/// Extract a named metric value from a GauntletRow.
+fn row_metric_value(row: &GauntletRow, name: &str) -> f64 {
+    match name {
+        "spread" => row.spread,
+        "gap_ms" => row.gap_ms as f64,
+        "migrations" => row.migrations as f64,
+        "migration_ratio" => row.migration_ratio,
+        "imbalance" => row.imbalance_ratio,
+        "dsq_depth" => row.max_dsq_depth as f64,
+        "stalls" => row.stall_count as f64,
+        "fallback" => row.fallback_count as f64,
+        "keep_last" => row.keep_last_count as f64,
+        "p99_wake_lat_us" => row.p99_wake_latency_us,
+        "median_wake_lat_us" => row.median_wake_latency_us,
+        "wake_latency_cv" => row.wake_latency_cv,
+        "total_iterations" => row.total_iterations as f64,
+        "mean_run_delay_us" => row.mean_run_delay_us,
+        "worst_run_delay_us" => row.worst_run_delay_us,
+        "page_locality" => row.page_locality,
+        "cross_node_migration_ratio" => row.cross_node_migration_ratio,
+        _ => row.ext_metrics.get(name).copied().unwrap_or(0.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1205,7 +1554,7 @@ mod tests {
         let rows = extract_rows(&results);
         let df = build_dataframe(&rows).unwrap();
         assert_eq!(df.height(), 2);
-        assert_eq!(df.width(), 27);
+        assert_eq!(df.width(), 29);
     }
 
     #[test]
@@ -1805,6 +2154,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "my_test");
@@ -1838,6 +2190,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "eevdf_test");
@@ -1875,6 +2230,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.stall_count, 0);

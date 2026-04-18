@@ -88,6 +88,19 @@ pub struct SidecarResult {
     /// Effective kernel command-line args active during this test run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kargs: Vec<String>,
+    /// Kernel version string (e.g. `"6.14.2"`). Populated from the VM's
+    /// `/proc/version` or the cache entry metadata; `None` for host-only
+    /// tests or when the version could not be determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_version: Option<String>,
+    /// ISO 8601 timestamp of when this test run started.
+    #[serde(default)]
+    pub timestamp: String,
+    /// Unique identifier for the test run. Derived from the repo commit
+    /// hash and a monotonic counter to distinguish runs within the same
+    /// build.
+    #[serde(default)]
+    pub run_id: String,
 }
 
 /// Scan a directory for ktstr sidecar JSON files. Recurses one level
@@ -1907,7 +1920,9 @@ fn evaluate_vm_result(
         parse_assert_result_shm(result.shm_data.as_ref()).or_else(|_| parse_assert_result(output))
     {
         // Write sidecar before checking pass/fail so both outcomes are captured.
-        write_sidecar(entry, result, stimulus_events, &verify_result, "CpuSpin");
+        let args: Vec<String> = std::env::args().collect();
+        let work_type = extract_work_type_arg(&args).unwrap_or_else(|| "CpuSpin".to_string());
+        write_sidecar(entry, result, stimulus_events, &verify_result, &work_type);
 
         if !verify_result.passed {
             let details = verify_result.details.join("\n  ");
@@ -4044,6 +4059,11 @@ fn resolve_cgroup_root(args: &[String]) -> String {
 ///
 /// Uses `KTSTR_SIDECAR_DIR` if set, otherwise defaults to
 /// `target/ktstr/{branch}-{hash}/`.
+/// Default sidecar directory for test output.
+pub fn default_sidecar_dir() -> PathBuf {
+    sidecar_dir()
+}
+
 fn sidecar_dir() -> PathBuf {
     if let Ok(d) = std::env::var("KTSTR_SIDECAR_DIR")
         && !d.is_empty()
@@ -4055,6 +4075,92 @@ fn sidecar_dir() -> PathBuf {
         crate::GIT_BRANCH,
         crate::GIT_HASH,
     ))
+}
+
+/// Detect kernel version from KTSTR_KERNEL env var or cache metadata.
+fn detect_kernel_version() -> Option<String> {
+    let kernel_dir = std::env::var("KTSTR_KERNEL").ok()?;
+    let p = std::path::Path::new(&kernel_dir);
+    let meta_path = p.join("metadata.json");
+    if let Ok(data) = std::fs::read_to_string(&meta_path)
+        && let Ok(meta) = serde_json::from_str::<crate::cache::KernelMetadata>(&data)
+    {
+        return meta.version;
+    }
+    let ver_path = p.join("include/config/kernel.release");
+    if let Ok(v) = std::fs::read_to_string(ver_path) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// ISO 8601 timestamp.
+fn now_iso8601() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let days = secs / 86400;
+    let day_secs = secs % 86400;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let mut y = 1970;
+    let mut remaining = days;
+    loop {
+        let leap = is_leap(y);
+        let year_days = if leap { 366 } else { 365 };
+        if remaining < year_days {
+            break;
+        }
+        remaining -= year_days;
+        y += 1;
+    }
+    let leap = is_leap(y);
+    let month_days: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut mo = 1u64;
+    for &md in &month_days {
+        if remaining < md {
+            break;
+        }
+        remaining -= md;
+        mo += 1;
+    }
+    (y, mo, remaining + 1)
+}
+
+fn is_leap(y: u64) -> bool {
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+/// Generate a run ID from git hash + monotonic counter.
+fn generate_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{n}", crate::GIT_HASH)
 }
 
 /// Write a sidecar JSON file for post-run analysis.
@@ -4101,6 +4207,9 @@ fn write_sidecar(
         kvm_stats: vm_result.kvm_stats.clone(),
         sysctls,
         kargs,
+        kernel_version: detect_kernel_version(),
+        timestamp: now_iso8601(),
+        run_id: generate_run_id(),
     };
     let path = dir.join(format!("{}.ktstr.json", entry.name));
     if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
@@ -5043,6 +5152,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         };
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -5081,6 +5193,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -5378,6 +5493,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(tmp.join("test_x.ktstr.json"), &json).unwrap();
@@ -5407,6 +5525,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(sub.join("nested_test.ktstr.json"), &json).unwrap();
@@ -5453,6 +5574,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -6283,6 +6407,9 @@ mod tests {
             kvm_stats: None,
             sysctls: vec![],
             kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
         }
     }
 

@@ -57,7 +57,7 @@ jobs:
       - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
-        run: cargo ktstr test-stats
+        run: cargo ktstr stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
@@ -96,7 +96,7 @@ jobs:
       - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
-        run: cargo ktstr test-stats
+        run: cargo ktstr stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
