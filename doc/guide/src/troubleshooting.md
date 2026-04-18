@@ -306,14 +306,14 @@ PipeIo requires num_workers divisible by 2, got 3
 ```
 
 Grouped work types (`PipeIo`, `FutexPingPong`, `CachePipe`,
-`FutexFanOut`) require `num_workers` divisible by their group size.
-`WorkType::worker_group_size()` returns the divisor.
+`FutexFanOut`, `SchBench`) require `num_workers` divisible by their
+group size. `WorkType::worker_group_size()` returns the divisor.
 
 **Fixes:**
 
 - Set `CgroupDef::workers(n)` to a value divisible by the work
   type's group size (2 for pipe/futex pairs, `fan_out + 1` for
-  FutexFanOut).
+  FutexFanOut and SchBench).
 - Use an ungrouped work type (`CpuSpin`, `Mixed`, `Bursty`,
   `IoSync`, `YieldHeavy`) if worker count flexibility is needed.
 
@@ -334,6 +334,8 @@ or a missing kernel image file.
 - Rebuild: `cargo ktstr kernel build --force 6.14.2`
 - Override the cache directory via `KTSTR_CACHE_DIR` if the default
   location is on a problematic filesystem.
+- See [`cargo ktstr kernel clean`](running-tests/cargo-ktstr.md#kernel-clean)
+  for all cleanup options.
 
 ## Cache directory not found
 
@@ -363,7 +365,8 @@ happens after updating ktstr (which may change the kconfig fragment).
 
 Rebuilds happen automatically on the next `cargo ktstr kernel build`
 for stale entries. Use `--force` to override the cache for other
-reasons.
+reasons. See [`cargo ktstr kernel list`](running-tests/cargo-ktstr.md#kernel-list)
+for the full listing output.
 
 ## Kernel auto-download failures
 

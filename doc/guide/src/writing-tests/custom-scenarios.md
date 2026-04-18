@@ -27,19 +27,14 @@ fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 
 ## Helper functions
 
-**`setup_cgroups(ctx, n, wl)`** -- creates N cgroups, spawns workers in
-each, starts them. Returns `Result<(Vec<WorkloadHandle>, CgroupGroup<'a>)>`. The
-`CgroupGroup` is an RAII guard that removes cgroups on drop.
-
-> **Warning:** `let _ = CgroupGroup::new(...)` drops immediately -- the
-> guard is destroyed at the end of the statement, not the end of the
-> scope. Always bind to a named variable (`let _guard = ...`) to keep
-> cgroups alive for the duration of the test.
+**`setup_cgroups(ctx, n, wl)`** -- creates N cgroups, spawns workers,
+returns `(Vec<WorkloadHandle>, CgroupGroup)`. See
+[CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
 
 **`collect_all(handles, checks)`** -- stops all workers, collects reports,
-runs `checks.assert_cgroup()` when worker-level checks are configured,
-otherwise falls back to `assert_not_starved()`. Merges results: if any
-worker group fails, the overall result fails.
+runs worker-level checks when configured, otherwise falls back to
+`assert_not_starved()`. Merges results: if any worker group fails, the
+overall result fails.
 
 **`dfl_wl(ctx)`** -- creates a `WorkloadConfig` with
 `ctx.workers_per_cgroup` workers and default settings.
@@ -68,33 +63,13 @@ pub struct Ctx<'a> {
 }
 ```
 
-**`cgroups`** -- create/remove cgroups, set cpusets, move tasks.
-`move_task(name, tid)` moves a single task. `move_tasks(name, &tids)`
-moves each task in a slice, retrying transient failures and tolerating
-tasks that exit during migration.
+**`cgroups`** -- create/remove cgroups, set cpusets, move tasks. See
+[CgroupManager](../architecture/cgroup-manager.md) for method details.
 
-**`topo`** -- query CPU topology (LLCs, NUMA nodes, memory info, distances).
-Key methods:
-
-- `all_cpus() -> &[usize]` -- all CPU IDs, sorted.
-- `all_cpuset() -> BTreeSet<usize>` -- all CPU IDs as a set.
-- `usable_cpus() -> &[usize]` -- all CPUs except the last (reserved
-  for root cgroup) when topology has >2 CPUs.
-- `usable_cpuset() -> BTreeSet<usize>` -- usable CPUs as a set.
-- `split_by_llc() -> Vec<BTreeSet<usize>>` -- one BTreeSet per LLC.
-- `num_llcs()`, `total_cpus()`, `num_numa_nodes()` -- counts.
-- `cpus_in_llc(idx) -> &[usize]` -- CPUs in LLC at index.
-- `llc_aligned_cpuset(idx) -> BTreeSet<usize>` -- CPUs in LLC at index.
-- `numa_aligned_cpuset(node) -> BTreeSet<usize>` -- CPUs in all
-  LLCs belonging to a NUMA node.
-- `numa_node_ids() -> &BTreeSet<usize>` -- NUMA node IDs.
-- `numa_nodes_for_cpuset(cpus) -> BTreeSet<usize>` -- NUMA nodes
-  covered by a CPU set.
-- `node_meminfo(node_id) -> Option<&NodeMemInfo>` -- per-node
-  memory info (total/free KiB).
-- `numa_distance(from, to) -> u8` -- inter-node NUMA distance.
-- `is_memory_only(node_id) -> bool` -- whether a node has RAM
-  but no CPUs (CXL).
+**`topo`** -- query CPU topology (LLCs, NUMA nodes, memory info,
+distances). Provides CPU enumeration, LLC/NUMA partitioning, cpuset
+generation, and inter-node distance queries. See
+[TestTopology](../concepts/topology.md) for the full API reference.
 
 **`sched_pid`** -- scheduler process ID for liveness checks.
 
@@ -110,22 +85,4 @@ collection, or use `execute_steps_with()` for ops-based scenarios. See
 
 ## Registering a custom scenario (ktstr contributors only)
 
-This section applies to contributing scenarios to ktstr's internal
-catalog. External test suites call scenario functions directly from
-`#[ktstr_test]` -- no registration needed.
-
-Add it to `all_scenarios()` in `src/scenario/catalog.rs`:
-
-```rust,ignore
-Scenario {
-    name: "my_scenario",
-    category: "dynamic",
-    description: "Test dynamic cgroup resizing",
-    required_flags: &[],
-    excluded_flags: &[],
-    num_cgroups: 0,
-    cpuset_mode: CpusetMode::None,
-    cgroup_works: vec![],
-    action: Action::Custom(my_custom_scenario),
-}
-```
+See [Write a Dynamic Scenario: Registering](../recipes/dynamic-scenario.md#registering-ktstr-contributors-only).
