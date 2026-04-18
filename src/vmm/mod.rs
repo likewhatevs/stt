@@ -4521,10 +4521,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_produces_output() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
@@ -4555,10 +4552,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_smp_topology() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
@@ -4590,10 +4584,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn bench_boot_time() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
 
         for (label, llcs, cores, threads, mem) in [("1cpu", 1, 1, 1, 256), ("4cpu", 2, 2, 1, 512)] {
             let start = Instant::now();
@@ -4911,14 +4902,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
-        let Some(_vmlinux) = find_vmlinux(&kernel) else {
-            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
+        let _vmlinux = crate::test_support::require_vmlinux(&kernel);
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
@@ -4992,22 +4977,14 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn watchdog_timeout_override_lands_in_guest_memory() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
-        let Some(vmlinux) = find_vmlinux(&kernel) else {
-            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
+        let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        // Gate on the two kernel-dependent resolutions so we skip
-        // before paying for a VM boot on kernels that can't satisfy
-        // the invariant.
-        let Ok(syms) = crate::monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux) else {
-            eprintln!("ktstr: SKIP: KernelSymbols resolution failed");
-            return;
-        };
+        // Architecture-dependent symbols (scx_root, KernelOffsets BTF
+        // fields) gate skips before paying for a VM boot on kernels
+        // that can't satisfy the invariant. The vmlinux symtab itself
+        // is required infrastructure, not a skip condition.
+        let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
             eprintln!("ktstr: SKIP: scx_root symbol not found in vmlinux");
             return;
@@ -5025,13 +5002,7 @@ mod tests {
         let hz = crate::monitor::guest_kernel_hz(Some(&kernel));
         let expected_jiffies = TIMEOUT_SECS * hz;
 
-        let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("ktstr: SKIP: scx-ktstr binary not found");
-                return;
-            }
-        };
+        let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
@@ -5087,22 +5058,10 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn watchdog_override_prevents_stall_exit() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
-        let Some(_vmlinux) = find_vmlinux(&kernel) else {
-            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
+        let _vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("ktstr: SKIP: scx-ktstr binary not found");
-                return;
-            }
-        };
+        let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
@@ -5160,22 +5119,10 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn monitor_reads_runqueue_data_with_scheduler() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
-        let Some(_vmlinux) = find_vmlinux(&kernel) else {
-            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
+        let _vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("ktstr: SKIP: scx-ktstr binary not found");
-                return;
-            }
-        };
+        let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
@@ -5248,19 +5195,10 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn event_counters_populated_with_scheduler() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
-        let Some(vmlinux) = find_vmlinux(&kernel) else {
-            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
+        let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
-        let Ok(syms) = crate::monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux) else {
-            eprintln!("ktstr: SKIP: KernelSymbols resolution failed");
-            return;
-        };
+        let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
             eprintln!("ktstr: SKIP: scx_root symbol not found in vmlinux");
             return;
@@ -5274,13 +5212,7 @@ mod tests {
             return;
         }
 
-        let sched_bin = match crate::build_and_find_binary("scx-ktstr") {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("ktstr: SKIP: scx-ktstr binary not found");
-                return;
-            }
-        };
+        let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
         let vm = match KtstrVm::builder()
             .kernel(&kernel)
@@ -5377,14 +5309,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn sched_domain_data_populated() {
-        let Some(kernel) = crate::find_kernel().unwrap() else {
-            eprintln!("ktstr: SKIP: no kernel found");
-            return;
-        };
-        let Some(vmlinux) = find_vmlinux(&kernel) else {
-            eprintln!("ktstr: SKIP: no vmlinux found alongside kernel");
-            return;
-        };
+        let kernel = crate::test_support::require_kernel();
+        let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
         let Ok(offsets) = crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(&vmlinux) else {
             eprintln!("ktstr: SKIP: KernelOffsets BTF resolution failed");
