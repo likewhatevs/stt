@@ -1,8 +1,7 @@
 use super::stack::StackFunction;
 
 /// ELF sections the probe BTF loader reads from a vmlinux ELF
-/// (`parse_btf_known_kernel_func`, `resolve_field_specs`, and
-/// related entry points).
+/// ([`parse_btf_functions`] and [`resolve_field_specs`]).
 ///
 /// The cached-vmlinux strip pipeline
 /// ([`crate::cache::strip_vmlinux_debug`]) preserves these bytes
