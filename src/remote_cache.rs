@@ -78,8 +78,11 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
 
     // Null out source_tree_path before serializing — it contains
     // local filesystem paths that must not leak to remote storage.
+    // For non-Local source variants there's nothing to sanitize.
     let mut meta_sanitized = metadata.clone();
-    meta_sanitized.source_tree_path = None;
+    if let crate::cache::KernelSource::Local { source_tree_path } = &mut meta_sanitized.source {
+        *source_tree_path = None;
+    }
 
     // Add metadata.json.
     let meta_json = serde_json::to_string_pretty(&meta_sanitized)
@@ -253,8 +256,15 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
         None
     };
 
+    let mut artifacts = crate::cache::CacheArtifacts::new(&tmp_image);
+    if let Some(v) = vmlinux_ref {
+        artifacts = artifacts.with_vmlinux(v);
+    }
+    if let Some(c) = config_ref {
+        artifacts = artifacts.with_config(c);
+    }
     cache
-        .store(cache_key, &tmp_image, vmlinux_ref, config_ref, &meta)
+        .store(cache_key, &artifacts, &meta)
         .map_err(|e| format!("local cache store: {e}"))
 }
 
@@ -307,13 +317,8 @@ pub fn remote_lookup(cache: &CacheDir, cache_key: &str, cli_label: &str) -> Opti
 /// `cli_label` prefixes diagnostic output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 pub fn remote_store(entry: &CacheEntry, cli_label: &str) {
-    let meta = match &entry.metadata {
-        Some(m) => m,
-        None => {
-            eprintln!("{cli_label}: remote cache store skipped: no metadata");
-            return;
-        }
-    };
+    // CacheEntry guarantees metadata presence; no need to branch.
+    let meta = &entry.metadata;
 
     let op = match create_operator() {
         Ok(op) => op,
@@ -344,11 +349,11 @@ pub fn remote_store(entry: &CacheEntry, cli_label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{CacheDir, KernelMetadata, SourceType};
+    use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
 
     fn test_metadata() -> KernelMetadata {
         KernelMetadata::new(
-            SourceType::Tarball,
+            KernelSource::Tarball,
             "x86_64".to_string(),
             "bzImage".to_string(),
             "2026-04-12T10:00:00Z".to_string(),
@@ -416,9 +421,11 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("test-key", &image, None, None, &meta).unwrap();
+        let entry = cache
+            .store("test-key", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
 
-        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+        let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
         assert!(!packed.is_empty());
 
         let tmp2 = tempfile::TempDir::new().unwrap();
@@ -426,11 +433,11 @@ mod tests {
         let restored = unpack_and_store(&cache2, "test-key", &packed).unwrap();
 
         assert_eq!(restored.key, "test-key");
-        let restored_meta = restored.metadata.unwrap();
+        let restored_meta = &restored.metadata;
         assert_eq!(restored_meta.version.as_deref(), Some("6.14.2"));
         assert_eq!(restored_meta.arch, "x86_64");
         assert_eq!(restored_meta.image_name, "bzImage");
-        assert_eq!(restored_meta.source, SourceType::Tarball);
+        assert_eq!(restored_meta.source, KernelSource::Tarball);
 
         let restored_image = restored.path.join("bzImage");
         let original_content = std::fs::read(&image).unwrap();
@@ -450,10 +457,14 @@ mod tests {
         std::fs::write(&config, config_content).unwrap();
         let meta = test_metadata();
         let entry = cache
-            .store("config-key", &image, None, Some(&config), &meta)
+            .store(
+                "config-key",
+                &CacheArtifacts::new(&image).with_config(&config),
+                &meta,
+            )
             .unwrap();
 
-        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+        let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
 
         let tmp2 = tempfile::TempDir::new().unwrap();
         let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
@@ -478,9 +489,11 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("valid-tar", &image, None, None, &meta).unwrap();
+        let entry = cache
+            .store("valid-tar", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
 
-        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+        let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
 
         // pack_entry returns zstd-compressed data; decompress before
         // validating tar contents.
@@ -498,9 +511,11 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = test_metadata();
-        let entry = cache.store("zstd-key", &image, None, None, &meta).unwrap();
+        let entry = cache
+            .store("zstd-key", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
 
-        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+        let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
         assert!(
             packed.len() >= 4 && packed[..4] == ZSTD_MAGIC,
             "packed data should start with zstd magic"
@@ -541,7 +556,7 @@ mod tests {
 
         let restored = unpack_and_store(&cache, "raw-tar-key", &raw_tar).unwrap();
         assert_eq!(restored.key, "raw-tar-key");
-        let rmeta = restored.metadata.unwrap();
+        let rmeta = &restored.metadata;
         assert_eq!(rmeta.version.as_deref(), Some("6.14.2"));
     }
 
@@ -617,10 +632,10 @@ mod tests {
         let image = create_fake_image(src.path());
         let meta = test_metadata();
         let entry = cache
-            .store("test-entry", &image, None, None, &meta)
+            .store("test-entry", &CacheArtifacts::new(&image), &meta)
             .unwrap();
 
-        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap());
+        let packed = pack_entry(&entry.path, &entry.metadata);
         assert!(packed.is_ok());
     }
 
@@ -633,21 +648,39 @@ mod tests {
 
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
-        let meta =
-            test_metadata().with_source_tree_path(Some(std::path::PathBuf::from("/tmp/linux-src")));
-        assert!(meta.source_tree_path.is_some());
+        let meta = KernelMetadata::new(
+            KernelSource::Local {
+                source_tree_path: Some(std::path::PathBuf::from("/tmp/linux-src")),
+            },
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        assert!(matches!(
+            meta.source,
+            KernelSource::Local {
+                source_tree_path: Some(_)
+            }
+        ));
 
-        let entry = cache.store("stp-key", &image, None, None, &meta).unwrap();
+        let entry = cache
+            .store("stp-key", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
 
-        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+        let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
 
         let tmp2 = tempfile::TempDir::new().unwrap();
         let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
         let restored = unpack_and_store(&cache2, "stp-key", &packed).unwrap();
 
-        let restored_meta = restored.metadata.unwrap();
+        let restored_meta = &restored.metadata;
         assert!(
-            restored_meta.source_tree_path.is_none(),
+            matches!(
+                restored_meta.source,
+                KernelSource::Local {
+                    source_tree_path: None
+                }
+            ),
             "source_tree_path must be stripped during pack"
         );
     }
@@ -660,25 +693,33 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
         let meta = KernelMetadata::new(
-            SourceType::Git,
+            KernelSource::Git {
+                hash: Some("a1b2c3d".to_string()),
+                git_ref: Some("v6.15-rc3".to_string()),
+            },
             "x86_64".to_string(),
             "bzImage".to_string(),
             "2026-04-12T12:00:00Z".to_string(),
-        )
-        .with_git_hash(Some("a1b2c3d".to_string()))
-        .with_git_ref(Some("v6.15-rc3".to_string()));
+        );
 
-        let entry = cache.store("git-key", &image, None, None, &meta).unwrap();
-        let packed = pack_entry(&entry.path, entry.metadata.as_ref().unwrap()).unwrap();
+        let entry = cache
+            .store("git-key", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
 
         let tmp2 = tempfile::TempDir::new().unwrap();
         let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
         let restored = unpack_and_store(&cache2, "git-key", &packed).unwrap();
 
-        let rmeta = restored.metadata.unwrap();
-        assert_eq!(rmeta.source, SourceType::Git);
-        assert_eq!(rmeta.git_hash.as_deref(), Some("a1b2c3d"));
-        assert_eq!(rmeta.git_ref.as_deref(), Some("v6.15-rc3"));
+        let rmeta = &restored.metadata;
+        assert!(matches!(
+            rmeta.source,
+            KernelSource::Git {
+                hash: Some(ref h),
+                git_ref: Some(ref r),
+            }
+            if h == "a1b2c3d" && r == "v6.15-rc3"
+        ));
     }
 
     // -- EnvVarGuard (same pattern as cache.rs tests) --

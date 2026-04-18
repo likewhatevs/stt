@@ -1461,7 +1461,7 @@ mod tests {
 
     fn test_metadata() -> KernelMetadata {
         KernelMetadata::new(
-            ktstr::cache::SourceType::Tarball,
+            ktstr::cache::KernelSource::Tarball,
             "x86_64".to_string(),
             "bzImage".to_string(),
             "2026-04-12T10:00:00Z".to_string(),
@@ -1474,19 +1474,8 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let image = src.path().join(&meta.image_name);
         std::fs::write(&image, b"fake kernel").unwrap();
-        cache.store(key, &image, None, None, meta).unwrap()
-    }
-
-    /// Create a corrupt entry (directory exists but no valid metadata).
-    fn store_corrupt_entry(cache: &CacheDir, key: &str) -> CacheEntry {
-        let dir = cache.root().join(key);
-        std::fs::create_dir_all(&dir).unwrap();
-        // list() returns entries with metadata: None for corrupt dirs.
         cache
-            .list()
-            .unwrap()
-            .into_iter()
-            .find(|e| e.key == key)
+            .store(key, &ktstr::cache::CacheArtifacts::new(&image), meta)
             .unwrap()
     }
 
@@ -1550,7 +1539,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let meta = KernelMetadata::new(
-            ktstr::cache::SourceType::Local,
+            ktstr::cache::KernelSource::Local {
+                source_tree_path: None,
+            },
             "x86_64".to_string(),
             "bzImage".to_string(),
             "2026-04-12T10:00:00Z".to_string(),
@@ -1560,15 +1551,9 @@ mod tests {
         assert!(row.contains("-"), "missing version should show dash");
     }
 
-    #[test]
-    fn format_entry_row_corrupt_metadata() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
-        let entry = store_corrupt_entry(&cache, "corrupt-key");
-        let row = cli::format_entry_row(&entry, "hash", &[]);
-        assert!(row.contains("corrupt-key"));
-        assert!(row.contains("corrupt metadata"));
-    }
+    // Corrupt-entry formatting moved inline into the caller iteration
+    // in cli::kernel_list, so no test on format_entry_row covers it;
+    // the helper itself now takes only the valid CacheEntry shape.
 
     // -- has_stale_kconfig (via CacheEntry method) --
 
@@ -1599,13 +1584,9 @@ mod tests {
         assert!(!entry.has_stale_kconfig("anything"));
     }
 
-    #[test]
-    fn has_stale_kconfig_no_metadata() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
-        let entry = store_corrupt_entry(&cache, "corrupt");
-        assert!(!entry.has_stale_kconfig("anything"));
-    }
+    // Corrupt entries no longer surface as CacheEntry — they are
+    // ListedEntry::Corrupt with no metadata-bearing struct — so
+    // has_stale_kconfig isn't reachable from that state.
 
     // -- embedded_kconfig_hash --
 

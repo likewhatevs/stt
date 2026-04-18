@@ -42,25 +42,42 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Kernel source type recorded in cache metadata.
+/// How a cached kernel's source was acquired, with per-variant
+/// payload (git details for `Git`, source-tree path for `Local`).
+///
+/// Serialized as `{"type": "tarball"}`, `{"type": "git", "hash": ..., "ref": ...}`,
+/// or `{"type": "local", "source_tree_path": ...}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SourceType {
+#[serde(rename_all = "lowercase", tag = "type")]
+pub enum KernelSource {
     /// Downloaded tarball from kernel.org (version / prefix / EOL
     /// probe paths).
     Tarball,
     /// Shallow clone of a git URL at a caller-specified ref.
-    Git,
+    Git {
+        /// Git commit hash of the kernel source (short form).
+        #[serde(default)]
+        hash: Option<String>,
+        /// Git ref used for checkout (branch, tag, or ref spec).
+        #[serde(default, rename = "ref")]
+        git_ref: Option<String>,
+    },
     /// Build of a local on-disk kernel source tree.
-    Local,
+    Local {
+        /// Path to the source tree on disk. `None` when the tree has
+        /// been sanitized for remote cache transport or is otherwise
+        /// unavailable.
+        #[serde(default)]
+        source_tree_path: Option<PathBuf>,
+    },
 }
 
-impl fmt::Display for SourceType {
+impl fmt::Display for KernelSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SourceType::Tarball => f.write_str("tarball"),
-            SourceType::Git => f.write_str("git"),
-            SourceType::Local => f.write_str("local"),
+            KernelSource::Tarball => f.write_str("tarball"),
+            KernelSource::Git { .. } => f.write_str("git"),
+            KernelSource::Local { .. } => f.write_str("local"),
         }
     }
 }
@@ -73,8 +90,8 @@ pub struct KernelMetadata {
     /// `None` for local builds without a version tag.
     #[serde(default)]
     pub version: Option<String>,
-    /// How the kernel source was acquired.
-    pub source: SourceType,
+    /// How the kernel source was acquired, with per-source payload.
+    pub source: KernelSource,
     /// Target architecture (e.g. "x86_64", "aarch64").
     pub arch: String,
     /// Boot image filename (e.g. "bzImage", "Image").
@@ -87,31 +104,19 @@ pub struct KernelMetadata {
     /// CRC32 of ktstr.kconfig at build time.
     #[serde(default)]
     pub ktstr_kconfig_hash: Option<String>,
-    /// Git commit hash of the kernel source (short form).
+    /// Whether a stripped vmlinux ELF was cached alongside the image.
+    /// When true, the entry directory contains a `vmlinux` file; see
+    /// [`strip_vmlinux_debug`] for the strip policy.
     #[serde(default)]
-    pub git_hash: Option<String>,
-    /// Git ref used for checkout (branch, tag, or ref spec).
-    #[serde(default)]
-    pub git_ref: Option<String>,
-    /// Path to the source tree on disk (local builds only).
-    #[serde(default)]
-    pub source_tree_path: Option<PathBuf>,
-    /// Filename of the cached vmlinux ELF. The vmlinux is stripped
-    /// before caching: symbol tables, BTF, `.rodata` (IKCONFIG blob),
-    /// and the section headers monitor/probe code references are
-    /// preserved; DWARF, code-section bytes, and most data-section
-    /// bytes are dropped. See [`strip_vmlinux_debug`] for the full
-    /// policy. `None` when vmlinux was not available at cache time.
-    #[serde(default)]
-    pub vmlinux_name: Option<String>,
+    pub has_vmlinux: bool,
 }
 
 impl KernelMetadata {
     /// Create a new KernelMetadata with required fields.
     ///
-    /// Optional fields default to `None`. Use struct update syntax
-    /// within the crate or setter methods to populate them.
-    pub fn new(source: SourceType, arch: String, image_name: String, built_at: String) -> Self {
+    /// Optional fields default to `None` / `false`. Use setter methods
+    /// to populate them.
+    pub fn new(source: KernelSource, arch: String, image_name: String, built_at: String) -> Self {
         KernelMetadata {
             version: None,
             source,
@@ -120,10 +125,7 @@ impl KernelMetadata {
             config_hash: None,
             built_at,
             ktstr_kconfig_hash: None,
-            git_hash: None,
-            git_ref: None,
-            source_tree_path: None,
-            vmlinux_name: None,
+            has_vmlinux: false,
         }
     }
 
@@ -144,31 +146,75 @@ impl KernelMetadata {
         self.ktstr_kconfig_hash = hash;
         self
     }
+}
 
-    /// Set the git commit hash (short form).
-    pub fn with_git_hash(mut self, hash: Option<String>) -> Self {
-        self.git_hash = hash;
+/// Bundle of cache artifacts for [`CacheDir::store`].
+///
+/// Groups the image plus optional sidecars (vmlinux ELF, kernel
+/// `.config`) so the store signature stays legible as new artifacts
+/// are added. Callers pass by reference; the bundle is copy-out only
+/// — the cache reads paths and copies contents.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CacheArtifacts<'a> {
+    /// Path to the kernel boot image (bzImage or Image).
+    pub image: &'a Path,
+    /// Optional path to a pre-stripped vmlinux ELF
+    /// (typically the output of [`strip_vmlinux_debug`]).
+    pub vmlinux: Option<&'a Path>,
+    /// Optional path to the kernel `.config` (IKCONFIG fallback).
+    pub config: Option<&'a Path>,
+}
+
+impl<'a> CacheArtifacts<'a> {
+    /// Create an artifact bundle with only the required image.
+    pub fn new(image: &'a Path) -> Self {
+        CacheArtifacts {
+            image,
+            vmlinux: None,
+            config: None,
+        }
+    }
+
+    /// Attach a pre-stripped vmlinux ELF.
+    pub fn with_vmlinux(mut self, vmlinux: &'a Path) -> Self {
+        self.vmlinux = Some(vmlinux);
         self
     }
 
-    /// Set the git ref used for checkout.
-    pub fn with_git_ref(mut self, git_ref: Option<String>) -> Self {
-        self.git_ref = git_ref;
+    /// Attach a kernel `.config` for CONFIG_HZ fallback resolution.
+    pub fn with_config(mut self, config: &'a Path) -> Self {
+        self.config = Some(config);
         self
     }
+}
 
-    /// Set the source tree path (local builds only).
-    pub fn with_source_tree_path(mut self, path: Option<std::path::PathBuf>) -> Self {
-        self.source_tree_path = path;
-        self
-    }
+/// Comparison between a cache entry's kconfig hash and a current
+/// reference hash. Returned by [`CacheEntry::kconfig_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KconfigStatus {
+    /// Entry was built with the current kconfig — nothing to do.
+    Matches,
+    /// Entry was built with a different kconfig. `cached` and
+    /// `current` name the two hashes for diagnostics.
+    Stale {
+        /// Hash recorded in the cache entry.
+        cached: String,
+        /// Hash the caller compared against.
+        current: String,
+    },
+    /// Entry has no kconfig hash recorded (pre-tracking cache
+    /// format). Treat as unknown; do not assume stale.
+    Untracked,
 }
 
 // Re-export KernelId from kernel_path (canonical definition, std-only).
 pub use crate::kernel_path::KernelId;
 
-/// A cached kernel entry returned by [`CacheDir::lookup`],
-/// [`CacheDir::store`], and [`CacheDir::list`].
+/// A cached kernel entry returned by [`CacheDir::lookup`] and
+/// [`CacheDir::store`]. Metadata is always present — entries with
+/// missing or corrupt metadata surface as [`ListedEntry::Corrupt`]
+/// via [`CacheDir::list`] instead.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct CacheEntry {
@@ -176,20 +222,74 @@ pub struct CacheEntry {
     pub key: String,
     /// Path to the cache entry directory.
     pub path: PathBuf,
-    /// Deserialized metadata, if the metadata file is valid.
-    pub metadata: Option<KernelMetadata>,
+    /// Deserialized metadata. Always present on a [`CacheEntry`].
+    pub metadata: KernelMetadata,
 }
 
 impl CacheEntry {
-    /// Check if this entry was built with a different kconfig than `current_hash`.
-    ///
-    /// Returns `false` when metadata is missing or the entry has no
-    /// recorded kconfig hash (pre-kconfig-tracking entries).
+    /// Compare this entry's kconfig hash against `current_hash`.
+    pub fn kconfig_status(&self, current_hash: &str) -> KconfigStatus {
+        match self.metadata.ktstr_kconfig_hash.as_deref() {
+            None => KconfigStatus::Untracked,
+            Some(h) if h == current_hash => KconfigStatus::Matches,
+            Some(h) => KconfigStatus::Stale {
+                cached: h.to_string(),
+                current: current_hash.to_string(),
+            },
+        }
+    }
+
+    /// Convenience: true when [`kconfig_status`](Self::kconfig_status)
+    /// is [`KconfigStatus::Stale`]. `Untracked` returns false.
     pub fn has_stale_kconfig(&self, current_hash: &str) -> bool {
-        self.metadata
-            .as_ref()
-            .and_then(|m| m.ktstr_kconfig_hash.as_deref())
-            .is_some_and(|h| h != current_hash)
+        matches!(
+            self.kconfig_status(current_hash),
+            KconfigStatus::Stale { .. }
+        )
+    }
+}
+
+/// Entry yielded by [`CacheDir::list`]. Distinguishes valid entries
+/// (with parsed metadata) from corrupt ones (unreadable or
+/// unparseable metadata) so callers don't have to re-check `Option`.
+#[derive(Debug)]
+pub enum ListedEntry {
+    /// Valid cache entry with parsed metadata.
+    Valid(CacheEntry),
+    /// Entry directory exists but metadata.json is missing or
+    /// fails to parse.
+    Corrupt {
+        /// Cache key (directory name).
+        key: String,
+        /// Path to the (corrupt) entry directory.
+        path: PathBuf,
+    },
+}
+
+impl ListedEntry {
+    /// Cache key (directory name) for either variant.
+    pub fn key(&self) -> &str {
+        match self {
+            ListedEntry::Valid(e) => &e.key,
+            ListedEntry::Corrupt { key, .. } => key,
+        }
+    }
+
+    /// Path to the entry directory for either variant.
+    pub fn path(&self) -> &Path {
+        match self {
+            ListedEntry::Valid(e) => &e.path,
+            ListedEntry::Corrupt { path, .. } => path,
+        }
+    }
+
+    /// Borrow the valid [`CacheEntry`] payload, or `None` for
+    /// [`ListedEntry::Corrupt`].
+    pub fn as_valid(&self) -> Option<&CacheEntry> {
+        match self {
+            ListedEntry::Valid(e) => Some(e),
+            ListedEntry::Corrupt { .. } => None,
+        }
     }
 }
 
@@ -246,13 +346,9 @@ impl CacheDir {
         if !entry_dir.is_dir() {
             return None;
         }
-        let metadata = read_metadata(&entry_dir);
+        let metadata = read_metadata(&entry_dir)?;
         // Entry must have a kernel image file.
-        let image_exists = metadata
-            .as_ref()
-            .map(|m| entry_dir.join(&m.image_name).exists())
-            .unwrap_or(false);
-        if !image_exists {
+        if !entry_dir.join(&metadata.image_name).exists() {
             return None;
         }
         Some(CacheEntry {
@@ -262,12 +358,11 @@ impl CacheDir {
         })
     }
 
-    /// List all cached kernel entries, sorted by build time (newest first).
-    ///
-    /// Entries with missing or corrupt metadata are included with
-    /// `metadata: None`. The caller decides how to handle them.
-    pub fn list(&self) -> anyhow::Result<Vec<CacheEntry>> {
-        let mut entries = Vec::new();
+    /// List all cached kernel entries, sorted by build time (newest
+    /// first). Entries with missing or corrupt metadata surface as
+    /// [`ListedEntry::Corrupt`] at the end of the Vec.
+    pub fn list(&self) -> anyhow::Result<Vec<ListedEntry>> {
+        let mut entries: Vec<ListedEntry> = Vec::new();
         let read_dir = match fs::read_dir(&self.root) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
@@ -287,18 +382,20 @@ impl CacheDir {
             if name.starts_with(".tmp-") {
                 continue;
             }
-            let metadata = read_metadata(&path);
-            entries.push(CacheEntry {
-                key: name,
-                path,
-                metadata,
-            });
+            match read_metadata(&path) {
+                Some(metadata) => entries.push(ListedEntry::Valid(CacheEntry {
+                    key: name,
+                    path,
+                    metadata,
+                })),
+                None => entries.push(ListedEntry::Corrupt { key: name, path }),
+            }
         }
-        // Sort by built_at descending (newest first). Entries without
-        // metadata sort last.
+        // Sort by built_at descending (newest first). Corrupt entries
+        // have no timestamp and sort last.
         entries.sort_by(|a, b| {
-            let a_time = a.metadata.as_ref().map(|m| m.built_at.as_str());
-            let b_time = b.metadata.as_ref().map(|m| m.built_at.as_str());
+            let a_time = a.as_valid().map(|e| e.metadata.built_at.as_str());
+            let b_time = b.as_valid().map(|e| e.metadata.built_at.as_str());
             b_time.cmp(&a_time)
         });
         Ok(entries)
@@ -309,20 +406,13 @@ impl CacheDir {
     /// `cache_key`: directory name for the entry (e.g.
     /// `6.14.2-tarball-x86_64-kc{kconfig_hash}`).
     ///
-    /// `image_path`: path to the kernel boot image to cache.
+    /// `artifacts`: required image plus optional vmlinux and `.config`
+    /// sidecars. See [`CacheArtifacts`].
     ///
-    /// `vmlinux_path`: optional path to a pre-stripped vmlinux ELF
-    /// (typically the output of [`strip_vmlinux_debug`]). When present,
-    /// vmlinux is copied verbatim alongside the boot image for monitor
-    /// and probe code to read symbol addresses, BTF type info, and
-    /// `.rodata` IKCONFIG.
-    ///
-    /// `config_path`: optional path to the kernel `.config`. When
-    /// present, cached alongside the image as a fallback source for
-    /// `guest_kernel_hz` when the cached vmlinux is missing or lacks
-    /// IKCONFIG (CONFIG_IKCONFIG=n builds).
-    ///
-    /// `metadata`: descriptor to serialize as `metadata.json`.
+    /// `metadata`: descriptor to serialize as `metadata.json`. The
+    /// `has_vmlinux` field is overwritten based on whether
+    /// `artifacts.vmlinux` is present, so callers do not need to
+    /// pre-populate it.
     ///
     /// Files are copied (not moved) so the caller retains the
     /// originals. Writes atomically via a temporary directory that is
@@ -330,9 +420,7 @@ impl CacheDir {
     pub fn store(
         &self,
         cache_key: &str,
-        image_path: &Path,
-        vmlinux_path: Option<&Path>,
-        config_path: Option<&Path>,
+        artifacts: &CacheArtifacts<'_>,
         metadata: &KernelMetadata,
     ) -> anyhow::Result<CacheEntry> {
         validate_cache_key(cache_key)?;
@@ -354,11 +442,11 @@ impl CacheDir {
 
         // Copy boot image.
         let image_dest = tmp_dir.join(&metadata.image_name);
-        fs::copy(image_path, &image_dest)
+        fs::copy(artifacts.image, &image_dest)
             .map_err(|e| anyhow::anyhow!("copy kernel image to cache: {e}"))?;
 
         // Copy the pre-stripped vmlinux verbatim.
-        let has_vmlinux = if let Some(vmlinux) = vmlinux_path {
+        let has_vmlinux = if let Some(vmlinux) = artifacts.vmlinux {
             fs::copy(vmlinux, tmp_dir.join("vmlinux"))
                 .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
             true
@@ -368,18 +456,15 @@ impl CacheDir {
 
         // Copy .config (fallback CONFIG_HZ source when the cached
         // vmlinux lacks IKCONFIG).
-        if let Some(cfg) = config_path {
+        if let Some(cfg) = artifacts.config {
             fs::copy(cfg, tmp_dir.join(".config"))
                 .map_err(|e| anyhow::anyhow!("copy .config to cache: {e}"))?;
         }
 
-        // Write metadata (record vmlinux_name if vmlinux was stored).
+        // Write metadata. has_vmlinux reflects whether we actually
+        // stored a vmlinux sidecar, overriding whatever the caller set.
         let mut meta = metadata.clone();
-        meta.vmlinux_name = if has_vmlinux {
-            Some("vmlinux".to_string())
-        } else {
-            None
-        };
+        meta.has_vmlinux = has_vmlinux;
         let meta_json = serde_json::to_string_pretty(&meta)?;
         fs::write(tmp_dir.join("metadata.json"), meta_json)
             .map_err(|e| anyhow::anyhow!("write cache metadata: {e}"))?;
@@ -408,7 +493,7 @@ impl CacheDir {
         Ok(CacheEntry {
             key: cache_key.to_string(),
             path: final_dir,
-            metadata: Some(meta),
+            metadata: meta,
         })
     }
 
@@ -425,7 +510,7 @@ impl CacheDir {
         let to_remove = entries.into_iter().skip(skip).collect::<Vec<_>>();
         let count = to_remove.len();
         for entry in &to_remove {
-            fs::remove_dir_all(&entry.path)?;
+            fs::remove_dir_all(entry.path())?;
         }
         Ok(count)
     }
@@ -530,7 +615,10 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
 /// unrecoverable without re-downloading sources.
 pub fn prefer_source_tree_for_dwarf(dir: &Path) -> Option<PathBuf> {
     let metadata = read_metadata(dir)?;
-    let src_path = metadata.source_tree_path?;
+    let KernelSource::Local { source_tree_path } = metadata.source else {
+        return None;
+    };
+    let src_path = source_tree_path?;
     if src_path.join("vmlinux").is_file() {
         Some(src_path)
     } else {
@@ -574,6 +662,25 @@ const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
                       // symbols here
 ];
 
+/// Stripped vmlinux written to a temporary file.
+///
+/// Owns the backing [`tempfile::TempDir`] so the file stays alive
+/// until the caller drops the [`StrippedVmlinux`]. Callers read the
+/// stripped-vmlinux path via [`path`](Self::path) to pass into
+/// [`CacheDir::store`] (or equivalent consumer) before the handle
+/// goes out of scope.
+pub struct StrippedVmlinux {
+    _tmp: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl StrippedVmlinux {
+    /// Path to the stripped vmlinux file inside the owned temp dir.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Strip vmlinux for caching. Sections fall into three groups:
 /// bytes preserved ([`VMLINUX_KEEP_SECTIONS`] — symbol tables, BTF,
 /// `.rodata` for IKCONFIG, `.bss`, `.shstrtab`), header-only via
@@ -593,10 +700,10 @@ const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
 /// `.debug_*` sections, which preserves all other sections
 /// including those the symbol table references.
 ///
-/// Writes the stripped vmlinux to a temporary file and returns its
-/// path. The caller must keep the returned `TempDir` alive until
-/// `cache.store()` has copied the file.
-pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
+/// Returns a [`StrippedVmlinux`] handle that owns the backing temp
+/// directory; the caller must keep it alive until consumers (e.g.
+/// [`CacheDir::store`]) have copied the file.
+pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<StrippedVmlinux> {
     let raw =
         fs::read(vmlinux_path).map_err(|e| anyhow::anyhow!("read vmlinux for stripping: {e}"))?;
     let original_size = raw.len();
@@ -624,7 +731,10 @@ pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<(tempfile::Tem
         .map_err(|e| anyhow::anyhow!("create temp dir for stripped vmlinux: {e}"))?;
     let stripped_path = tmp_dir.path().join("vmlinux");
     fs::write(&stripped_path, &out).map_err(|e| anyhow::anyhow!("write stripped vmlinux: {e}"))?;
-    Ok((tmp_dir, stripped_path))
+    Ok(StrippedVmlinux {
+        _tmp: tmp_dir,
+        path: stripped_path,
+    })
 }
 
 /// Zero `sh_size` on every `SHT_REL`/`SHT_RELA` section that has the
@@ -816,16 +926,13 @@ mod tests {
     fn test_metadata(version: &str) -> KernelMetadata {
         KernelMetadata {
             version: Some(version.to_string()),
-            source: SourceType::Tarball,
+            source: KernelSource::Tarball,
             arch: "x86_64".to_string(),
             image_name: "bzImage".to_string(),
             config_hash: Some("abc123".to_string()),
             built_at: "2026-04-12T10:00:00Z".to_string(),
             ktstr_kconfig_hash: Some("def456".to_string()),
-            git_hash: None,
-            git_ref: None,
-            source_tree_path: None,
-            vmlinux_name: None,
+            has_vmlinux: false,
         }
     }
 
@@ -843,147 +950,126 @@ mod tests {
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.version.as_deref(), Some("6.14.2"));
-        assert_eq!(parsed.source, SourceType::Tarball);
+        assert_eq!(parsed.source, KernelSource::Tarball);
         assert_eq!(parsed.arch, "x86_64");
         assert_eq!(parsed.image_name, "bzImage");
         assert_eq!(parsed.config_hash.as_deref(), Some("abc123"));
         assert_eq!(parsed.built_at, "2026-04-12T10:00:00Z");
         assert_eq!(parsed.ktstr_kconfig_hash.as_deref(), Some("def456"));
-        assert!(parsed.git_hash.is_none());
-        assert!(parsed.git_ref.is_none());
-        assert!(parsed.source_tree_path.is_none());
+        assert!(!parsed.has_vmlinux);
     }
 
     #[test]
-    fn cache_metadata_serde_with_optional_fields() {
+    fn cache_metadata_serde_git_with_payload() {
         let meta = KernelMetadata {
             version: Some("6.15-rc3".to_string()),
-            source: SourceType::Git,
+            source: KernelSource::Git {
+                hash: Some("a1b2c3d".to_string()),
+                git_ref: Some("v6.15-rc3".to_string()),
+            },
             arch: "aarch64".to_string(),
             image_name: "Image".to_string(),
             config_hash: None,
             built_at: "2026-04-12T12:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
-            git_hash: Some("a1b2c3d".to_string()),
-            git_ref: Some("v6.15-rc3".to_string()),
-            source_tree_path: None,
-            vmlinux_name: None,
+            has_vmlinux: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.source, SourceType::Git);
-        assert_eq!(parsed.git_hash.as_deref(), Some("a1b2c3d"));
-        assert_eq!(parsed.git_ref.as_deref(), Some("v6.15-rc3"));
+        assert!(matches!(
+            parsed.source,
+            KernelSource::Git {
+                hash: Some(ref h),
+                git_ref: Some(ref r),
+            }
+            if h == "a1b2c3d" && r == "v6.15-rc3"
+        ));
     }
 
     #[test]
     fn cache_metadata_serde_local_with_source_tree() {
         let meta = KernelMetadata {
             version: Some("6.14.0".to_string()),
-            source: SourceType::Local,
+            source: KernelSource::Local {
+                source_tree_path: Some(PathBuf::from("/tmp/linux")),
+            },
             arch: "x86_64".to_string(),
             image_name: "bzImage".to_string(),
             config_hash: Some("fff000".to_string()),
             built_at: "2026-04-12T14:00:00Z".to_string(),
             ktstr_kconfig_hash: Some("aaa111".to_string()),
-            git_hash: Some("deadbeef".to_string()),
-            git_ref: None,
-            source_tree_path: Some(PathBuf::from("/tmp/linux")),
-            vmlinux_name: None,
+            has_vmlinux: true,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.source, SourceType::Local);
-        assert_eq!(parsed.source_tree_path, Some(PathBuf::from("/tmp/linux")));
+        assert!(matches!(
+            parsed.source,
+            KernelSource::Local {
+                source_tree_path: Some(ref p),
+            }
+            if p == &PathBuf::from("/tmp/linux")
+        ));
+        assert!(parsed.has_vmlinux);
     }
 
     #[test]
-    fn cache_metadata_deserialize_missing_optional_fields() {
+    fn cache_metadata_deserialize_tagged_tarball() {
+        // Minimal Tarball entry with optional fields absent.
         let json = r#"{
             "version": "6.14.2",
-            "source": "tarball",
+            "source": {"type": "tarball"},
             "arch": "x86_64",
             "image_name": "bzImage",
-            "config_hash": null,
-            "built_at": "2026-04-12T10:00:00Z",
-            "ktstr_kconfig_hash": null,
-            "git_hash": null,
-            "git_ref": null,
-            "source_tree_path": null
+            "built_at": "2026-04-12T10:00:00Z"
         }"#;
         let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.version.as_deref(), Some("6.14.2"));
+        assert_eq!(parsed.source, KernelSource::Tarball);
         assert!(parsed.config_hash.is_none());
+        assert!(parsed.ktstr_kconfig_hash.is_none());
+        assert!(!parsed.has_vmlinux);
     }
 
     #[test]
     fn cache_metadata_deserialize_null_version() {
         let json = r#"{
             "version": null,
-            "source": "local",
+            "source": {"type": "local", "source_tree_path": null},
             "arch": "x86_64",
             "image_name": "bzImage",
             "config_hash": null,
             "built_at": "2026-04-12T10:00:00Z",
-            "ktstr_kconfig_hash": null,
-            "git_hash": null,
-            "git_ref": null,
-            "source_tree_path": null
+            "ktstr_kconfig_hash": null
         }"#;
         let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.version.is_none());
-        assert_eq!(parsed.source, SourceType::Local);
+        assert!(matches!(
+            parsed.source,
+            KernelSource::Local {
+                source_tree_path: None
+            }
+        ));
     }
 
     #[test]
-    fn cache_metadata_deserialize_absent_optional_keys() {
-        // Optional field keys entirely absent from JSON (not null —
-        // absent). #[serde(default)] on Option<T> fields makes this
-        // work for forward compatibility when new fields are added.
-        let json = r#"{
-            "source": "tarball",
-            "arch": "x86_64",
-            "image_name": "bzImage",
-            "built_at": "2026-04-12T10:00:00Z"
-        }"#;
-        let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
-        assert!(parsed.version.is_none());
-        assert!(parsed.config_hash.is_none());
-        assert!(parsed.ktstr_kconfig_hash.is_none());
-        assert!(parsed.git_hash.is_none());
-        assert!(parsed.git_ref.is_none());
-        assert!(parsed.source_tree_path.is_none());
-        assert_eq!(parsed.source, SourceType::Tarball);
-        assert_eq!(parsed.arch, "x86_64");
-    }
-
-    #[test]
-    fn cache_metadata_deserialize_legacy_ktstr_git_hash() {
-        // Pre-existing metadata.json files may carry a ktstr_git_hash
-        // key from an older build. serde_json ignores unknown fields
-        // by default (no deny_unknown_fields), so legacy entries
-        // remain readable.
-        let json = r#"{
-            "source": "tarball",
-            "arch": "x86_64",
-            "image_name": "bzImage",
-            "built_at": "2026-04-12T10:00:00Z",
-            "ktstr_git_hash": "deadbeefcafef00d"
-        }"#;
-        let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.source, SourceType::Tarball);
-        assert_eq!(parsed.image_name, "bzImage");
-    }
-
-    #[test]
-    fn cache_metadata_source_type_serde() {
-        // Verify lowercase serialization.
-        let tarball = serde_json::to_string(&SourceType::Tarball).unwrap();
-        assert_eq!(tarball, "\"tarball\"");
-        let git = serde_json::to_string(&SourceType::Git).unwrap();
-        assert_eq!(git, "\"git\"");
-        let local = serde_json::to_string(&SourceType::Local).unwrap();
-        assert_eq!(local, "\"local\"");
+    fn kernel_source_serde_tagged_representation() {
+        // Verify the tagged JSON shape on each variant.
+        let t = serde_json::to_string(&KernelSource::Tarball).unwrap();
+        assert_eq!(t, r#"{"type":"tarball"}"#);
+        let g = serde_json::to_string(&KernelSource::Git {
+            hash: Some("abc".to_string()),
+            git_ref: Some("main".to_string()),
+        })
+        .unwrap();
+        assert!(g.contains(r#""type":"git""#));
+        assert!(g.contains(r#""hash":"abc""#));
+        assert!(g.contains(r#""ref":"main""#));
+        let l = serde_json::to_string(&KernelSource::Local {
+            source_tree_path: Some(PathBuf::from("/tmp/linux")),
+        })
+        .unwrap();
+        assert!(l.contains(r#""type":"local""#));
+        assert!(l.contains(r#""source_tree_path":"/tmp/linux""#));
     }
 
     // -- CacheDir --
@@ -1018,7 +1104,7 @@ mod tests {
 
         // Store.
         let entry = cache
-            .store("6.14.2-tarball-x86_64", &image, None, None, &meta)
+            .store("6.14.2-tarball-x86_64", &CacheArtifacts::new(&image), &meta)
             .unwrap();
         assert_eq!(entry.key, "6.14.2-tarball-x86_64");
         assert!(entry.path.join("bzImage").exists());
@@ -1029,9 +1115,7 @@ mod tests {
         assert!(found.is_some());
         let found = found.unwrap();
         assert_eq!(found.key, "6.14.2-tarball-x86_64");
-        assert!(found.metadata.is_some());
-        let found_meta = found.metadata.unwrap();
-        assert_eq!(found_meta.version.as_deref(), Some("6.14.2"));
+        assert_eq!(found.metadata.version.as_deref(), Some("6.14.2"));
     }
 
     #[test]
@@ -1086,7 +1170,11 @@ mod tests {
             ..test_metadata("6.14.2")
         };
         cache
-            .store("6.14.2-tarball-x86_64", &image, None, None, &meta1)
+            .store(
+                "6.14.2-tarball-x86_64",
+                &CacheArtifacts::new(&image),
+                &meta1,
+            )
             .unwrap();
 
         let meta2 = KernelMetadata {
@@ -1094,12 +1182,15 @@ mod tests {
             ..test_metadata("6.14.2")
         };
         cache
-            .store("6.14.2-tarball-x86_64", &image, None, None, &meta2)
+            .store(
+                "6.14.2-tarball-x86_64",
+                &CacheArtifacts::new(&image),
+                &meta2,
+            )
             .unwrap();
 
         let found = cache.lookup("6.14.2-tarball-x86_64").unwrap();
-        let found_meta = found.metadata.unwrap();
-        assert_eq!(found_meta.built_at, "2026-04-12T11:00:00Z");
+        assert_eq!(found.metadata.built_at, "2026-04-12T11:00:00Z");
     }
 
     #[test]
@@ -1123,15 +1214,21 @@ mod tests {
         };
 
         // Store in non-chronological order.
-        cache.store("old", &image, None, None, &meta_old).unwrap();
-        cache.store("new", &image, None, None, &meta_new).unwrap();
-        cache.store("mid", &image, None, None, &meta_mid).unwrap();
+        cache
+            .store("old", &CacheArtifacts::new(&image), &meta_old)
+            .unwrap();
+        cache
+            .store("new", &CacheArtifacts::new(&image), &meta_new)
+            .unwrap();
+        cache
+            .store("mid", &CacheArtifacts::new(&image), &meta_mid)
+            .unwrap();
 
         let entries = cache.list().unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].key, "new");
-        assert_eq!(entries[1].key, "mid");
-        assert_eq!(entries[2].key, "old");
+        assert_eq!(entries[0].key(), "new");
+        assert_eq!(entries[1].key(), "mid");
+        assert_eq!(entries[2].key(), "old");
     }
 
     #[test]
@@ -1143,7 +1240,9 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
-        cache.store("valid", &image, None, None, &meta).unwrap();
+        cache
+            .store("valid", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
 
         // Create a corrupt entry (no metadata).
         let bad_dir = tmp.path().join("corrupt");
@@ -1151,12 +1250,12 @@ mod tests {
 
         let entries = cache.list().unwrap();
         assert_eq!(entries.len(), 2);
-        // Valid entry has metadata.
-        let valid = entries.iter().find(|e| e.key == "valid").unwrap();
-        assert!(valid.metadata.is_some());
-        // Corrupt entry has no metadata.
-        let corrupt = entries.iter().find(|e| e.key == "corrupt").unwrap();
-        assert!(corrupt.metadata.is_none());
+        // Valid entry surfaces as ListedEntry::Valid.
+        let valid = entries.iter().find(|e| e.key() == "valid").unwrap();
+        assert!(valid.as_valid().is_some());
+        // Corrupt entry surfaces as ListedEntry::Corrupt.
+        let corrupt = entries.iter().find(|e| e.key() == "corrupt").unwrap();
+        assert!(corrupt.as_valid().is_none());
     }
 
     #[test]
@@ -1192,13 +1291,13 @@ mod tests {
         let image = create_fake_image(src_dir.path());
 
         cache
-            .store("a", &image, None, None, &test_metadata("6.14.0"))
+            .store("a", &CacheArtifacts::new(&image), &test_metadata("6.14.0"))
             .unwrap();
         cache
-            .store("b", &image, None, None, &test_metadata("6.14.1"))
+            .store("b", &CacheArtifacts::new(&image), &test_metadata("6.14.1"))
             .unwrap();
         cache
-            .store("c", &image, None, None, &test_metadata("6.14.2"))
+            .store("c", &CacheArtifacts::new(&image), &test_metadata("6.14.2"))
             .unwrap();
 
         let removed = cache.clean(None).unwrap();
@@ -1226,16 +1325,22 @@ mod tests {
             ..test_metadata("6.14.0")
         };
 
-        cache.store("old", &image, None, None, &meta_old).unwrap();
-        cache.store("new", &image, None, None, &meta_new).unwrap();
-        cache.store("mid", &image, None, None, &meta_mid).unwrap();
+        cache
+            .store("old", &CacheArtifacts::new(&image), &meta_old)
+            .unwrap();
+        cache
+            .store("new", &CacheArtifacts::new(&image), &meta_new)
+            .unwrap();
+        cache
+            .store("mid", &CacheArtifacts::new(&image), &meta_mid)
+            .unwrap();
 
         let removed = cache.clean(Some(1)).unwrap();
         assert_eq!(removed, 2);
 
         let remaining = cache.list().unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].key, "new");
+        assert_eq!(remaining[0].key(), "new");
     }
 
     #[test]
@@ -1246,7 +1351,11 @@ mod tests {
         let image = create_fake_image(src_dir.path());
 
         cache
-            .store("only", &image, None, None, &test_metadata("6.14.2"))
+            .store(
+                "only",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
             .unwrap();
 
         let removed = cache.clean(Some(5)).unwrap();
@@ -1429,7 +1538,7 @@ mod tests {
         meta.image_name = "../escape".to_string();
 
         let err = cache
-            .store("valid-key", &image, None, None, &meta)
+            .store("valid-key", &CacheArtifacts::new(&image), &meta)
             .unwrap_err();
         assert!(
             err.to_string().contains("image name"),
@@ -1448,7 +1557,7 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         let err = cache
-            .store(".tmp-sneaky", &image, None, None, &meta)
+            .store(".tmp-sneaky", &CacheArtifacts::new(&image), &meta)
             .unwrap_err();
         assert!(
             err.to_string().contains(".tmp-"),
@@ -1473,7 +1582,9 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("", &image, None, None, &meta).unwrap_err();
+        let err = cache
+            .store("", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
         assert!(
             err.to_string().contains("empty"),
             "expected empty-key error, got: {err}"
@@ -1496,7 +1607,7 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         let err = cache
-            .store("../escape", &image, None, None, &meta)
+            .store("../escape", &CacheArtifacts::new(&image), &meta)
             .unwrap_err();
         assert!(
             err.to_string().contains("path"),
@@ -1520,7 +1631,9 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("a/b", &image, None, None, &meta).unwrap_err();
+        let err = cache
+            .store("a/b", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
         assert!(
             err.to_string().contains("path separator"),
             "expected path-separator error, got: {err}"
@@ -1535,7 +1648,9 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let err = cache.store("   ", &image, None, None, &meta).unwrap_err();
+        let err = cache
+            .store("   ", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
         assert!(
             err.to_string().contains("empty"),
             "expected empty/whitespace error, got: {err}"
@@ -1560,8 +1675,12 @@ mod tests {
             built_at: "2026-04-10T10:00:00Z".to_string(),
             ..test_metadata("6.13.0")
         };
-        cache.store("new", &image, None, None, &meta_new).unwrap();
-        cache.store("old", &image, None, None, &meta_old).unwrap();
+        cache
+            .store("new", &CacheArtifacts::new(&image), &meta_new)
+            .unwrap();
+        cache
+            .store("old", &CacheArtifacts::new(&image), &meta_old)
+            .unwrap();
 
         // One corrupt entry (no metadata).
         let corrupt_dir = tmp.path().join("cache").join("corrupt");
@@ -1575,7 +1694,7 @@ mod tests {
 
         let remaining = cache.list().unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].key, "new");
+        assert_eq!(remaining[0].key(), "new");
     }
 
     // -- atomic write safety --
@@ -1596,7 +1715,9 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         // Store should succeed despite stale tmp dir.
-        let entry = cache.store("mykey", &image, None, None, &meta).unwrap();
+        let entry = cache
+            .store("mykey", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
         assert!(entry.path.join("bzImage").exists());
         // Stale tmp dir should be gone.
         assert!(!stale_tmp.exists());
@@ -1613,14 +1734,17 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         let entry = cache
-            .store("with-vmlinux", &image, Some(&vmlinux), None, &meta)
+            .store(
+                "with-vmlinux",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &meta,
+            )
             .unwrap();
         assert!(entry.path.join("bzImage").exists());
         assert!(entry.path.join("vmlinux").exists());
         assert!(entry.path.join("metadata.json").exists());
-        // Metadata records vmlinux_name.
-        let entry_meta = entry.metadata.unwrap();
-        assert_eq!(entry_meta.vmlinux_name.as_deref(), Some("vmlinux"));
+        // Metadata records has_vmlinux.
+        assert!(entry.metadata.has_vmlinux);
         // Original files still exist (copy, not move).
         assert!(image.exists());
         assert!(vmlinux.exists());
@@ -1635,14 +1759,13 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         let entry = cache
-            .store("no-vmlinux", &image, None, None, &meta)
+            .store("no-vmlinux", &CacheArtifacts::new(&image), &meta)
             .unwrap();
         assert!(entry.path.join("bzImage").exists());
         assert!(!entry.path.join("vmlinux").exists());
         assert!(entry.path.join("metadata.json").exists());
-        // Metadata has no vmlinux_name.
-        let entry_meta = entry.metadata.unwrap();
-        assert!(entry_meta.vmlinux_name.is_none());
+        // Metadata records absence of vmlinux.
+        assert!(!entry.metadata.has_vmlinux);
     }
 
     #[test]
@@ -1657,7 +1780,11 @@ mod tests {
         let meta = test_metadata("6.14.2");
 
         let entry = cache
-            .store("with-config", &image, None, Some(&config), &meta)
+            .store(
+                "with-config",
+                &CacheArtifacts::new(&image).with_config(&config),
+                &meta,
+            )
             .unwrap();
         assert!(entry.path.join("bzImage").exists());
         assert!(entry.path.join(".config").exists());
@@ -1677,7 +1804,9 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        let entry = cache.store("no-config", &image, None, None, &meta).unwrap();
+        let entry = cache
+            .store("no-config", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
         assert!(entry.path.join("bzImage").exists());
         assert!(!entry.path.join(".config").exists());
     }
@@ -1690,7 +1819,9 @@ mod tests {
         let image = create_fake_image(src_dir.path());
         let meta = test_metadata("6.14.2");
 
-        cache.store("key", &image, None, None, &meta).unwrap();
+        cache
+            .store("key", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
 
         // Original image must still exist (copy, not move).
         assert!(image.exists());
@@ -1711,16 +1842,15 @@ mod tests {
 
         let meta = KernelMetadata {
             version: Some("6.14.2".to_string()),
-            source: SourceType::Local,
+            source: KernelSource::Local {
+                source_tree_path: Some(src_tree.clone()),
+            },
             arch: "x86_64".to_string(),
             image_name: "bzImage".to_string(),
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
-            git_hash: None,
-            git_ref: None,
-            source_tree_path: Some(src_tree.clone()),
-            vmlinux_name: Some("vmlinux".to_string()),
+            has_vmlinux: true,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -1744,16 +1874,15 @@ mod tests {
 
         let meta = KernelMetadata {
             version: None,
-            source: SourceType::Local,
+            source: KernelSource::Local {
+                source_tree_path: Some(src_tree),
+            },
             arch: "x86_64".to_string(),
             image_name: "bzImage".to_string(),
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
-            git_hash: None,
-            git_ref: None,
-            source_tree_path: Some(src_tree),
-            vmlinux_name: None,
+            has_vmlinux: false,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -1775,16 +1904,13 @@ mod tests {
 
         let meta = KernelMetadata {
             version: Some("6.14.2".to_string()),
-            source: SourceType::Tarball,
+            source: KernelSource::Tarball,
             arch: "x86_64".to_string(),
             image_name: "bzImage".to_string(),
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
-            git_hash: None,
-            git_ref: None,
-            source_tree_path: None,
-            vmlinux_name: Some("vmlinux".to_string()),
+            has_vmlinux: true,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -1944,15 +2070,16 @@ mod tests {
             );
         }
 
-        let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
-        let stripped_size = fs::metadata(&stripped_path).unwrap().len();
+        let stripped = strip_vmlinux_debug(&vmlinux).unwrap();
+        let stripped_path = stripped.path();
+        let stripped_size = fs::metadata(stripped_path).unwrap().len();
 
         assert!(
             stripped_size < original_size,
             "stripped ({stripped_size}) should be smaller than original ({original_size})"
         );
 
-        let data = fs::read(&stripped_path).unwrap();
+        let data = fs::read(stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
         let section_names: Vec<&str> = elf
             .section_headers
@@ -1991,8 +2118,9 @@ mod tests {
         let src = TempDir::new().unwrap();
         let vmlinux = create_strip_test_fixture(src.path());
 
-        let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
-        let data = fs::read(&stripped_path).unwrap();
+        let stripped = strip_vmlinux_debug(&vmlinux).unwrap();
+        let stripped_path = stripped.path();
+        let data = fs::read(stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
 
         // Smoke check: stripping a synthetic ELF produces a readable
@@ -2014,8 +2142,9 @@ mod tests {
     fn strip_vmlinux_debug_zeros_data_sections() {
         let src = TempDir::new().unwrap();
         let vmlinux = create_strip_test_fixture(src.path());
-        let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
-        let data = fs::read(&stripped_path).unwrap();
+        let stripped = strip_vmlinux_debug(&vmlinux).unwrap();
+        let stripped_path = stripped.path();
+        let data = fs::read(stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
 
         use goblin::elf::section_header::SHT_NOBITS;
@@ -2094,8 +2223,9 @@ mod tests {
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
         }
-        let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
-        let syms = crate::monitor::symbols::KernelSymbols::from_vmlinux(&stripped_path).unwrap();
+        let stripped = strip_vmlinux_debug(&path).unwrap();
+        let stripped_path = stripped.path();
+        let syms = crate::monitor::symbols::KernelSymbols::from_vmlinux(stripped_path).unwrap();
         assert_ne!(
             syms.runqueues, 0,
             "runqueues symbol missing from stripped vmlinux"
@@ -2146,7 +2276,7 @@ mod tests {
         // dropping the other is caught.
         let source_data = fs::read(&path).unwrap();
         let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
-        let stripped_data = fs::read(&stripped_path).unwrap();
+        let stripped_data = fs::read(stripped_path).unwrap();
         let stripped_elf = goblin::elf::Elf::parse(&stripped_data).unwrap();
         assert_eq!(
             has_symbol(&source_elf, "init_top_pgt"),
@@ -2170,7 +2300,7 @@ mod tests {
             .any(|sh| source_elf.shdr_strtab.get_at(sh.sh_name) == Some(".debug_info"));
         if source_has_debug {
             let source_size = fs::metadata(&path).unwrap().len();
-            let stripped_size = fs::metadata(&stripped_path).unwrap().len();
+            let stripped_size = fs::metadata(stripped_path).unwrap().len();
             assert!(
                 stripped_size < source_size,
                 "stripped vmlinux ({stripped_size} bytes) should be smaller than \
@@ -2187,8 +2317,9 @@ mod tests {
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
         }
-        let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
-        let data = fs::read(&stripped_path).unwrap();
+        let stripped = strip_vmlinux_debug(&path).unwrap();
+        let stripped_path = stripped.path();
+        let data = fs::read(stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
         assert!(
             has_symbol(&elf, "map_idr"),
@@ -2228,8 +2359,9 @@ mod tests {
             );
         }
 
-        let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
-        let data = fs::read(&stripped_path).unwrap();
+        let stripped = strip_vmlinux_debug(&path).unwrap();
+        let stripped_path = stripped.path();
+        let data = fs::read(stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
         assert!(
             has_symbol(&elf, "schedule"),

@@ -100,26 +100,20 @@ pub fn format_entry_row(
     kconfig_hash: &str,
     active_prefixes: &[String],
 ) -> String {
-    match &entry.metadata {
-        Some(meta) => {
-            let version = meta.version.as_deref().unwrap_or("-");
-            let source = meta.source.to_string();
-            let mut tags = String::new();
-            if entry.has_stale_kconfig(kconfig_hash) {
-                tags.push_str(" (stale kconfig)");
-            }
-            if version != "-" && is_eol(version, active_prefixes) {
-                tags.push_str(" (EOL)");
-            }
-            format!(
-                "  {:<48} {:<12} {:<8} {:<7} {}{}",
-                entry.key, version, source, meta.arch, meta.built_at, tags,
-            )
-        }
-        None => {
-            format!("  {:<48} (corrupt metadata)", entry.key)
-        }
+    let meta = &entry.metadata;
+    let version = meta.version.as_deref().unwrap_or("-");
+    let source = meta.source.to_string();
+    let mut tags = String::new();
+    if entry.has_stale_kconfig(kconfig_hash) {
+        tags.push_str(" (stale kconfig)");
     }
+    if version != "-" && is_eol(version, active_prefixes) {
+        tags.push_str(" (EOL)");
+    }
+    format!(
+        "  {:<48} {:<12} {:<8} {:<7} {}{}",
+        entry.key, version, source, meta.arch, meta.built_at, tags,
+    )
 }
 
 /// Current time as ISO 8601 string (UTC, second precision).
@@ -165,32 +159,30 @@ pub fn kernel_list(json: bool) -> Result<()> {
     if json {
         let json_entries: Vec<serde_json::Value> = entries
             .iter()
-            .map(|e| match &e.metadata {
-                Some(meta) => {
+            .map(|e| match e {
+                crate::cache::ListedEntry::Valid(entry) => {
+                    let meta = &entry.metadata;
                     let v = meta.version.as_deref().unwrap_or("-");
                     let eol = v != "-" && is_eol(v, &active_prefixes);
                     serde_json::json!({
-                        "key": e.key,
-                        "path": e.path.display().to_string(),
+                        "key": entry.key,
+                        "path": entry.path.display().to_string(),
                         "version": meta.version,
                         "source": meta.source,
                         "arch": meta.arch,
                         "built_at": meta.built_at,
                         "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
-                        "stale_kconfig": e.has_stale_kconfig(&kconfig_hash),
+                        "stale_kconfig": entry.has_stale_kconfig(&kconfig_hash),
                         "eol": eol,
                         "config_hash": meta.config_hash,
                         "image_name": meta.image_name,
-                        "image_path": e.path.join(&meta.image_name).display().to_string(),
-                        "vmlinux_name": meta.vmlinux_name,
-                        "git_hash": meta.git_hash,
-                        "git_ref": meta.git_ref,
-                        "source_tree_path": meta.source_tree_path,
+                        "image_path": entry.path.join(&meta.image_name).display().to_string(),
+                        "has_vmlinux": meta.has_vmlinux,
                     })
                 }
-                None => serde_json::json!({
-                    "key": e.key,
-                    "path": e.path.display().to_string(),
+                crate::cache::ListedEntry::Corrupt { key, path } => serde_json::json!({
+                    "key": key,
+                    "path": path.display().to_string(),
                     "error": "corrupt metadata",
                 }),
             })
@@ -215,14 +207,21 @@ pub fn kernel_list(json: bool) -> Result<()> {
         "KEY", "VERSION", "SOURCE", "ARCH"
     );
     let mut has_stale_kconfig = false;
-    for entry in &entries {
-        if entry.has_stale_kconfig(&kconfig_hash) {
-            has_stale_kconfig = true;
+    for listed in &entries {
+        match listed {
+            crate::cache::ListedEntry::Valid(entry) => {
+                if entry.has_stale_kconfig(&kconfig_hash) {
+                    has_stale_kconfig = true;
+                }
+                println!(
+                    "{}",
+                    format_entry_row(entry, &kconfig_hash, &active_prefixes)
+                );
+            }
+            crate::cache::ListedEntry::Corrupt { key, .. } => {
+                println!("  {key:<48} (corrupt metadata)");
+            }
         }
-        println!(
-            "{}",
-            format_entry_row(entry, &kconfig_hash, &active_prefixes)
-        );
     }
     if has_stale_kconfig {
         eprintln!(
@@ -245,7 +244,7 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
 
     let kconfig_hash = embedded_kconfig_hash();
     let skip = keep.unwrap_or(0);
-    let to_remove: Vec<&CacheEntry> = entries.iter().skip(skip).collect();
+    let to_remove: Vec<&crate::cache::ListedEntry> = entries.iter().skip(skip).collect();
 
     if to_remove.is_empty() {
         println!("nothing to clean");
@@ -258,8 +257,15 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
             bail!("confirmation requires a terminal. Use --force to skip.");
         }
         println!("the following entries will be removed:");
-        for entry in &to_remove {
-            println!("{}", format_entry_row(entry, &kconfig_hash, &[]));
+        for listed in &to_remove {
+            match listed {
+                crate::cache::ListedEntry::Valid(entry) => {
+                    println!("{}", format_entry_row(entry, &kconfig_hash, &[]));
+                }
+                crate::cache::ListedEntry::Corrupt { key, .. } => {
+                    println!("  {key:<48} (corrupt metadata)");
+                }
+            }
         }
         eprint!("remove {} entries? [y/N] ", to_remove.len());
         std::io::stderr().flush()?;
@@ -274,14 +280,14 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
     let total = to_remove.len();
     let mut removed = 0usize;
     let mut last_err: Option<String> = None;
-    for entry in &to_remove {
-        match std::fs::remove_dir_all(&entry.path) {
+    for listed in &to_remove {
+        match std::fs::remove_dir_all(listed.path()) {
             Ok(()) => removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 removed += 1;
             }
             Err(e) => {
-                last_err = Some(format!("remove {}: {e}", entry.key));
+                last_err = Some(format!("remove {}: {e}", listed.key()));
             }
         }
     }
@@ -624,36 +630,41 @@ pub fn kernel_build_pipeline(
     let image_path = crate::kernel_path::find_image_in_dir(source_dir)
         .ok_or_else(|| anyhow::anyhow!("no kernel image found in {}", source_dir.display()))?;
     let vmlinux_path = source_dir.join("vmlinux");
-    let _stripped_dir;
-    let vmlinux_ref = if vmlinux_path.exists() {
+    // Bind the StrippedVmlinux handle (or unstripped fallback path)
+    // outside the conditional so the tempdir stays alive while
+    // cache.store() copies the file.
+    let (stripped, fallback_path): (
+        Option<crate::cache::StrippedVmlinux>,
+        Option<std::path::PathBuf>,
+    ) = if vmlinux_path.exists() {
         let orig_mb = std::fs::metadata(&vmlinux_path)
             .map(|m| m.len() as f64 / (1024.0 * 1024.0))
             .unwrap_or(0.0);
         match crate::cache::strip_vmlinux_debug(&vmlinux_path) {
-            Ok((dir, stripped_path)) => {
-                let stripped_mb = std::fs::metadata(&stripped_path)
+            Ok(s) => {
+                let stripped_mb = std::fs::metadata(s.path())
                     .map(|m| m.len() as f64 / (1024.0 * 1024.0))
                     .unwrap_or(0.0);
                 eprintln!(
                     "{cli_label}: caching vmlinux ({orig_mb:.0} MB -> {stripped_mb:.0} MB, debug stripped)"
                 );
-                _stripped_dir = Some(dir);
-                Some(stripped_path)
+                (Some(s), None)
             }
             Err(e) => {
                 eprintln!(
                     "{cli_label}: warning: vmlinux strip failed ({e:#}), caching unstripped ({orig_mb:.0} MB)"
                 );
-                _stripped_dir = None;
-                Some(vmlinux_path.clone())
+                (None, Some(vmlinux_path.clone()))
             }
         }
     } else {
         eprintln!("{cli_label}: warning: vmlinux not found, BTF will not be cached");
-        _stripped_dir = None;
-        None
+        (None, None)
     };
-    let vmlinux_ref = vmlinux_ref.as_deref();
+    let vmlinux_ref: Option<&Path> = stripped
+        .as_ref()
+        .map(|s| s.path())
+        .or(fallback_path.as_deref());
 
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
@@ -676,30 +687,24 @@ pub fn kernel_build_pipeline(
     let kconfig_hash = embedded_kconfig_hash();
 
     let metadata = crate::cache::KernelMetadata::new(
-        acquired.source_type.clone(),
+        acquired.kernel_source.clone(),
         arch.to_string(),
         image_name.to_string(),
         now_iso8601(),
     )
     .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
-    .with_ktstr_kconfig_hash(Some(kconfig_hash))
-    .with_git_hash(acquired.git_hash.clone())
-    .with_git_ref(acquired.git_ref.clone())
-    .with_source_tree_path(if is_local_source {
-        Some(acquired.source_dir.clone())
-    } else {
-        None
-    });
+    .with_ktstr_kconfig_hash(Some(kconfig_hash));
 
     let config_ref = config_path.exists().then_some(config_path.as_path());
-    let entry = match cache.store(
-        &acquired.cache_key,
-        &image_path,
-        vmlinux_ref,
-        config_ref,
-        &metadata,
-    ) {
+    let mut artifacts = crate::cache::CacheArtifacts::new(&image_path);
+    if let Some(v) = vmlinux_ref {
+        artifacts = artifacts.with_vmlinux(v);
+    }
+    if let Some(c) = config_ref {
+        artifacts = artifacts.with_config(c);
+    }
+    let entry = match cache.store(&acquired.cache_key, &artifacts, &metadata) {
         Ok(entry) => {
             success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
             eprintln!(
@@ -1065,9 +1070,7 @@ pub fn resolve_cached_kernel(
             let (arch, _) = crate::fetch::arch_info();
             let cache_key = format!("{resolved}-tarball-{arch}-kc{}", crate::cache_key_suffix());
             if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
-                entry.metadata.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("cached entry {cache_key} has corrupt metadata")
-                })?;
+                // lookup() returns Some only for valid-metadata entries.
                 return Ok(entry.path);
             }
             // Cache miss: download and build the requested version.
@@ -1076,10 +1079,6 @@ pub fn resolve_cached_kernel(
         KernelId::CacheKey(key) => {
             let cache = crate::cache::CacheDir::new()?;
             if let Some(entry) = cache_lookup(&cache, key, cli_label) {
-                entry
-                    .metadata
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("cached entry {key} has corrupt metadata"))?;
                 return Ok(entry.path);
             }
             bail!(
@@ -1191,7 +1190,6 @@ fn download_and_cache_version(version: &str, cli_label: &str) -> Result<std::pat
     // Check cache one more time with the resolved version.
     if let Ok(cache) = crate::cache::CacheDir::new()
         && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
-        && entry.metadata.is_some()
     {
         return Ok(entry.path);
     }
@@ -1240,9 +1238,8 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
     if !acquired.is_dirty
         && let Ok(cache) = crate::cache::CacheDir::new()
         && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
-        && let Some(ref meta) = entry.metadata
     {
-        let image = entry.path.join(&meta.image_name);
+        let image = entry.path.join(&entry.metadata.image_name);
         if image.exists() {
             success(&format!("{cli_label}: using cached kernel {cache_key}"));
             return Ok(image);

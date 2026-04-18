@@ -15,12 +15,9 @@ pub struct AcquiredSource {
     pub cache_key: String,
     /// Version string if known (e.g. "6.14.2", "6.15-rc3").
     pub version: Option<String>,
-    /// Git commit hash (short form) if available.
-    pub git_hash: Option<String>,
-    /// Git ref used for checkout, if applicable.
-    pub git_ref: Option<String>,
-    /// Source type for cache metadata.
-    pub source_type: crate::cache::SourceType,
+    /// How the source was acquired, with per-variant payload
+    /// (git hash/ref for `Git`, source tree path for `Local`).
+    pub kernel_source: crate::cache::KernelSource,
     /// Whether the source is a temporary directory that should be
     /// cleaned up after building.
     pub is_temp: bool,
@@ -231,9 +228,7 @@ pub fn download_tarball(
         source_dir,
         cache_key: format!("{version}-tarball-{arch}-kc{}", crate::cache_key_suffix()),
         version: Some(version.to_string()),
-        git_hash: None,
-        git_ref: None,
-        source_type: crate::cache::SourceType::Tarball,
+        kernel_source: crate::cache::KernelSource::Tarball,
         is_temp: true,
         is_dirty: false,
     })
@@ -469,9 +464,10 @@ pub fn git_clone(
         source_dir: clone_dir,
         cache_key,
         version: None,
-        git_hash: Some(short_hash),
-        git_ref: Some(git_ref.to_string()),
-        source_type: crate::cache::SourceType::Git,
+        kernel_source: crate::cache::KernelSource::Git {
+            hash: Some(short_hash),
+            git_ref: Some(git_ref.to_string()),
+        },
         is_temp: true,
         is_dirty: false,
     })
@@ -559,12 +555,12 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
     };
 
     Ok(AcquiredSource {
-        source_dir: canonical,
+        source_dir: canonical.clone(),
         cache_key,
         version: None,
-        git_hash: short_hash,
-        git_ref: None,
-        source_type: crate::cache::SourceType::Local,
+        kernel_source: crate::cache::KernelSource::Local {
+            source_tree_path: Some(canonical),
+        },
         is_temp: false,
         is_dirty,
     })

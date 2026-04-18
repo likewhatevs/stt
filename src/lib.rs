@@ -378,10 +378,8 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 })?;
                 let arch = std::env::consts::ARCH;
                 let key = format!("{ver}-tarball-{arch}-kc{}", cache_key_suffix());
-                if let Some(entry) = cache.lookup(&key)
-                    && let Some(ref meta) = entry.metadata
-                {
-                    return Ok(Some(entry.path.join(&meta.image_name)));
+                if let Some(entry) = cache.lookup(&key) {
+                    return Ok(Some(entry.path.join(&entry.metadata.image_name)));
                 }
                 // Version not in cache — skip general cache scan to
                 // avoid returning a different kernel version.
@@ -394,10 +392,8 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                          but cache directory could not be opened: {e}"
                     )
                 })?;
-                if let Some(entry) = cache.lookup(key)
-                    && let Some(ref meta) = entry.metadata
-                {
-                    return Ok(Some(entry.path.join(&meta.image_name)));
+                if let Some(entry) = cache.lookup(key) {
+                    return Ok(Some(entry.path.join(&entry.metadata.image_name)));
                 }
                 // Explicit cache key not found — skip general cache scan.
                 skip_cache_scan = true;
@@ -413,35 +409,36 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
         && let Ok(entries) = cache.list()
     {
         let kc_hash = kconfig_hash();
-        for entry in &entries {
-            if let Some(ref meta) = entry.metadata {
-                // Skip entries built with a different kconfig.
-                if entry.has_stale_kconfig(&kc_hash) {
-                    continue;
-                }
-                let image = entry.path.join(&meta.image_name);
-                if !image.exists() {
-                    continue;
-                }
-                // Guard: if a cached vmlinux is present but is missing
-                // the symbols monitor code requires, skip the entry so
-                // the caller falls through to a source tree. Older
-                // caches built by a strip pipeline that dropped data
-                // sections would pass the image-exists check but fail
-                // downstream when the monitor initializes.
-                let vmlinux = entry.path.join("vmlinux");
-                if vmlinux.exists()
-                    && let Err(e) = monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux)
-                {
-                    tracing::warn!(
-                        entry = %entry.path.display(),
-                        error = %e,
-                        "skipping cached kernel with unusable vmlinux"
-                    );
-                    continue;
-                }
-                return Ok(Some(image));
+        for listed in &entries {
+            let cache::ListedEntry::Valid(entry) = listed else {
+                continue;
+            };
+            // Skip entries built with a different kconfig.
+            if entry.has_stale_kconfig(&kc_hash) {
+                continue;
             }
+            let image = entry.path.join(&entry.metadata.image_name);
+            if !image.exists() {
+                continue;
+            }
+            // Guard: if a cached vmlinux is present but is missing
+            // the symbols monitor code requires, skip the entry so
+            // the caller falls through to a source tree. Older
+            // caches built by a strip pipeline that dropped data
+            // sections would pass the image-exists check but fail
+            // downstream when the monitor initializes.
+            let vmlinux = entry.path.join("vmlinux");
+            if vmlinux.exists()
+                && let Err(e) = monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux)
+            {
+                tracing::warn!(
+                    entry = %entry.path.display(),
+                    error = %e,
+                    "skipping cached kernel with unusable vmlinux"
+                );
+                continue;
+            }
+            return Ok(Some(image));
         }
     }
 
