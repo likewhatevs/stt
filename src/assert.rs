@@ -755,7 +755,18 @@ pub struct Assert {
 }
 
 impl Assert {
-    /// Empty assert — no checks enabled, all overrides None.
+    /// Identity element for [`Assert::merge`]: every field is `None`,
+    /// so neither side of a merge with `NONE` is altered.
+    ///
+    /// `NONE` is "no overrides," not "no checks." When used as a
+    /// per-test or per-scheduler value (`entry.assert`,
+    /// `scheduler.assert`), the runtime merge chain
+    /// `default_checks().merge(&scheduler.assert).merge(&entry.assert)`
+    /// still leaves [`default_checks`](Self::default_checks) intact,
+    /// so `not_starved` and the monitor thresholds keep firing. To
+    /// turn a default check off, override it explicitly with the
+    /// builder method (e.g. `not_starved = Some(false)` via
+    /// struct-update syntax) rather than reaching for `NONE`.
     pub const NONE: Assert = Assert {
         not_starved: None,
         isolation: None,
@@ -778,9 +789,16 @@ impl Assert {
         max_slow_tier_ratio: None,
     };
 
-    /// Default checks: not_starved enabled, monitor thresholds
-    /// from `MonitorThresholds::DEFAULT` (imbalance 4.0, dsq_depth 50,
+    /// Baseline of the runtime merge chain
+    /// `default_checks().merge(&scheduler.assert).merge(&entry.assert)`:
+    /// `not_starved` enabled and monitor thresholds populated from
+    /// [`MonitorThresholds::DEFAULT`] (imbalance 4.0, dsq_depth 50,
     /// stall on, sustained 5, fallback 200.0/s, keep_last 100.0/s).
+    ///
+    /// Because [`Assert::NONE`] is the merge identity, scheduler- or
+    /// per-test asserts that leave a default field as `None` inherit
+    /// it. To suppress a default check, override the field explicitly
+    /// (e.g. `not_starved: Some(false)`), not by switching to `NONE`.
     pub const fn default_checks() -> Assert {
         use crate::monitor::MonitorThresholds;
         Assert {
@@ -925,8 +943,12 @@ impl Assert {
     /// overrides the corresponding field in `self`; `None` fields
     /// inherit from `self`.
     ///
-    /// Use when composing scheduler-level and test-level overrides:
-    /// `Assert::default_checks().merge(&scheduler.assert).merge(&test.assert)`.
+    /// [`Assert::NONE`] is the two-sided identity: `x.merge(&NONE)`
+    /// and `NONE.merge(&x)` both yield `x`. The runtime composes
+    /// scheduler- and test-level overrides as
+    /// `Assert::default_checks().merge(&scheduler.assert).merge(&test.assert)`,
+    /// so a `NONE` at either override layer leaves the defaults
+    /// untouched -- which means "no override," not "no checks."
     pub const fn merge(&self, other: &Assert) -> Assert {
         Assert {
             not_starved: match other.not_starved {
@@ -2445,6 +2467,48 @@ mod tests {
         assert_eq!(merged.not_starved, Some(true));
         assert!(merged.max_imbalance_ratio.is_some());
         assert!(merged.fail_on_stall.is_some());
+    }
+
+    /// `Assert::NONE` is the two-sided identity for `merge`. The
+    /// right-identity case is covered above; this locks the
+    /// left-identity case so a `NONE.merge(&default_checks())` at
+    /// either order in the runtime chain produces the same defaults.
+    #[test]
+    fn assert_merge_none_is_left_identity() {
+        let merged = Assert::NONE.merge(&Assert::default_checks());
+        let baseline = Assert::default_checks();
+        assert_eq!(merged.not_starved, baseline.not_starved);
+        assert_eq!(merged.max_imbalance_ratio, baseline.max_imbalance_ratio);
+        assert_eq!(merged.max_local_dsq_depth, baseline.max_local_dsq_depth);
+        assert_eq!(merged.fail_on_stall, baseline.fail_on_stall);
+        assert_eq!(merged.sustained_samples, baseline.sustained_samples);
+        assert_eq!(merged.max_fallback_rate, baseline.max_fallback_rate);
+        assert_eq!(merged.max_keep_last_rate, baseline.max_keep_last_rate);
+        // Fields that default_checks leaves None remain None.
+        assert!(merged.max_gap_ms.is_none());
+        assert!(merged.isolation.is_none());
+    }
+
+    /// The runtime three-layer chain
+    /// `default_checks -> scheduler -> test` collapses to
+    /// `default_checks` when both override layers are `NONE`. This
+    /// proves the documented "NONE means no override, not no checks"
+    /// invariant end-to-end.
+    #[test]
+    fn assert_merge_runtime_chain_with_none_overrides_yields_defaults() {
+        let scheduler_assert = Assert::NONE;
+        let test_assert = Assert::NONE;
+        let merged = Assert::default_checks()
+            .merge(&scheduler_assert)
+            .merge(&test_assert);
+        let baseline = Assert::default_checks();
+        assert_eq!(merged.not_starved, baseline.not_starved);
+        assert_eq!(merged.max_imbalance_ratio, baseline.max_imbalance_ratio);
+        assert_eq!(merged.max_local_dsq_depth, baseline.max_local_dsq_depth);
+        assert_eq!(merged.fail_on_stall, baseline.fail_on_stall);
+        assert_eq!(merged.sustained_samples, baseline.sustained_samples);
+        assert_eq!(merged.max_fallback_rate, baseline.max_fallback_rate);
+        assert_eq!(merged.max_keep_last_rate, baseline.max_keep_last_rate);
     }
 
     #[test]
