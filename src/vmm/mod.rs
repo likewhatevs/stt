@@ -4971,9 +4971,9 @@ mod tests {
     ///
     /// Skips gracefully when: no host kernel available, no vmlinux for
     /// BTF, `scx_root` symbol or `scx_sched.watchdog_timeout` BTF field
-    /// missing, scheduler failed to attach, or the monitor report
-    /// wasn't produced. Real failure requires the override path to
-    /// silently stop writing — which is exactly what we want to catch.
+    /// missing, or the scheduler failed to attach. Real failure
+    /// requires the override path to silently stop writing — which is
+    /// exactly what we want to catch.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn watchdog_timeout_override_lands_in_guest_memory() {
