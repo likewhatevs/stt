@@ -506,14 +506,13 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
 /// added by future compiler/kernel versions are stripped automatically
 /// without updating this list.
 const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
-    b"",           // null section (index 0)
-    b".BTF",       // BPF Type Format — probe field resolution
-    b".symtab",    // symbol table — monitor address resolution
-    b".strtab",    // symbol string table
-    b".shstrtab",  // section header string table (structural)
-    b".rodata",    // IKCONFIG gzip blob read by read_hz_from_ikconfig
-    b".bss",       // already SHT_NOBITS — holds swapper_pg_dir, scx_root
-    b".init.data", // holds init-time data some kernels use for page tables
+    b"",          // null section (index 0)
+    b".BTF",      // BPF Type Format — probe field resolution
+    b".symtab",   // symbol table — monitor address resolution
+    b".strtab",   // symbol string table
+    b".shstrtab", // section header string table (structural)
+    b".rodata",   // IKCONFIG gzip blob read by read_hz_from_ikconfig
+    b".bss",      // already SHT_NOBITS — holds swapper_pg_dir, scx_root
 ];
 
 /// Data sections whose headers are kept (so symbols with `st_shndx`
