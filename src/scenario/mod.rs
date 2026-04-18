@@ -1349,19 +1349,25 @@ mod tests {
 
     #[test]
     fn process_alive_nonexistent_pid() {
-        // Read /proc/sys/kernel/pid_max and use pid_max - 1, which is
-        // valid as a PID value but extremely unlikely to be in use.
-        let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
-            .unwrap_or_else(|_| "4194304".into())
-            .trim()
-            .parse()
-            .unwrap_or(4194304);
-        // pid_max - 1 is a valid PID but should not be alive.
-        // In the astronomically unlikely case it IS alive, skip the test.
-        if process_alive(pid_max - 1) {
-            return;
+        // Fork a child that exits immediately, then waitpid to reap it.
+        // After reap the PID is returned to the kernel and process_alive
+        // must report false. Picking an arbitrary PID leaves a race
+        // where that PID could be in use by another process on the host;
+        // using a PID we just freed ourselves is deterministic.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
         }
-        assert!(!process_alive(pid_max - 1));
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            waited,
+            pid,
+            "waitpid failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(!process_alive(pid as u32));
     }
 
     #[test]
