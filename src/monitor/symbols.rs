@@ -32,7 +32,12 @@ pub(crate) const DEFAULT_PAGE_OFFSET: u64 = 0xffff_0000_0000_0000;
 /// Kernel symbol addresses extracted from vmlinux ELF.
 #[derive(Debug, Clone)]
 pub(crate) struct KernelSymbols {
-    /// Kernel virtual address of the `runqueues` per-CPU variable.
+    /// `.data..percpu` section-relative offset of the `runqueues`
+    /// per-CPU variable. Per-CPU symbols carry section offsets (not
+    /// kernel virtual addresses) in the vmlinux symtab because the
+    /// `.data..percpu` section has `sh_addr=0`. The kernel virtual
+    /// address for CPU `n` is `runqueues + per_cpu_offset[n]`; see
+    /// [`compute_rq_pas`].
     pub runqueues: u64,
     /// Kernel virtual address of the `__per_cpu_offset` array.
     pub per_cpu_offset: u64,
@@ -239,8 +244,11 @@ mod tests {
         let syms = KernelSymbols::from_vmlinux(&path).unwrap();
         assert_ne!(syms.runqueues, 0);
         assert_ne!(syms.per_cpu_offset, 0);
-        // runqueues should be in kernel VA space
-        assert!(syms.runqueues > 0xffff_0000_0000_0000);
+        // runqueues is a per-cpu symbol — its st_value is a section-
+        // relative offset within .data..percpu (sh_addr=0), not a
+        // kernel VA. per_cpu_offset is a kernel-VA symbol in .rodata
+        // and is what should land in the upper half.
+        assert!(syms.per_cpu_offset > 0xffff_0000_0000_0000);
     }
 
     #[test]
