@@ -967,7 +967,7 @@ pub fn run_probe_skeleton(
         let raw: &RbEvent = unsafe { &*(data.as_ptr() as *const RbEvent) };
 
         if raw.type_ == EVENT_TRIGGER {
-            triggered_clone.store(true, Ordering::Relaxed);
+            triggered_clone.store(true, Ordering::Release);
 
             let kstack_sz = (raw.kstack_sz as usize).min(32);
             let event = ProbeEvent {
@@ -1063,7 +1063,7 @@ pub fn run_probe_skeleton(
                     // No Phase B input yet; if trigger already fired,
                     // break immediately — the crash happened before
                     // Phase B could attach.
-                    if triggered.load(Ordering::Relaxed) {
+                    if triggered.load(Ordering::Acquire) {
                         tracing::debug!("trigger fired during Phase B wait, skipping fentry");
                         phase_b_done = true;
                         phase_b_rx = None;
@@ -1077,8 +1077,8 @@ pub fn run_probe_skeleton(
             }
         }
 
-        if triggered.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
-            diag.trigger_fired = triggered.load(Ordering::Relaxed);
+        if triggered.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
+            diag.trigger_fired = triggered.load(Ordering::Acquire);
 
             // Read BPF-side diagnostic counters from BSS.
             if let Some(bss) = skel.maps.bss_data.as_ref() {

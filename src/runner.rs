@@ -272,7 +272,7 @@ impl Runner {
                 if let Some((handle, func_names, bpf_locs, param_names, render_hints)) =
                     skeleton_handle.take()
                 {
-                    probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    probe_stop.store(true, std::sync::atomic::Ordering::Release);
                     handle
                         .join()
                         .ok()

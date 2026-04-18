@@ -91,7 +91,33 @@ pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::
 /// delay.
 ///
 /// Uses `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` which maps
-/// to `FUTEX_LOCK_PI` in the kernel.
+/// to `FUTEX_LOCK_PI` in the kernel. On systems where the kernel is
+/// built without `CONFIG_FUTEX_PI`, `setprotocol` returns `ENOTSUP`
+/// and the mutex degrades to the default `PTHREAD_PRIO_NONE` protocol
+/// — mutual exclusion is preserved, but priority inheritance is not
+/// active. PI is a performance hint, not a correctness invariant, so
+/// the degraded mode is safe for every caller in this crate.
+///
+/// # Panics
+///
+/// * `PiMutex::new` panics if `pthread_mutexattr_init` or
+///   `pthread_mutex_init` fails, or if
+///   `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` returns any
+///   nonzero value OTHER than `ENOTSUP` — the `ENOTSUP` case is
+///   logged and handled gracefully (see the degradation note above).
+///   The alternative on real init failures (a partially initialized
+///   mutex) would have undefined lock/unlock semantics.
+/// * `PiMutex::lock` panics if `pthread_mutex_lock` fails.
+///   Returning a guard on an unlocked mutex would let the caller
+///   obtain `&mut T` without exclusive access — a data race and
+///   undefined behaviour — so this mirrors `std::sync::Mutex`.
+/// * `PiMutexGuard::drop` calls `libc::abort()` if
+///   `pthread_mutex_unlock` fails (typical cause: `EPERM` — the
+///   current thread does not own the mutex, indicating a violated
+///   guard-ownership invariant elsewhere). Drop cannot propagate
+///   errors; releasing the `&mut T` contract on a still-locked
+///   mutex is worse than abort, because another thread could then
+///   observe the interior mutably while we also reference it.
 pub(crate) struct PiMutex<T> {
     inner: std::cell::UnsafeCell<T>,
     mutex: std::cell::UnsafeCell<libc::pthread_mutex_t>,
@@ -107,11 +133,32 @@ impl<T> PiMutex<T> {
     pub(crate) fn new(value: T) -> Self {
         unsafe {
             let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
-            libc::pthread_mutexattr_init(&mut attr);
-            libc::pthread_mutexattr_setprotocol(&mut attr, libc::PTHREAD_PRIO_INHERIT);
+            let rc = libc::pthread_mutexattr_init(&mut attr);
+            assert_eq!(rc, 0, "pthread_mutexattr_init failed: {rc}");
+            let rc = libc::pthread_mutexattr_setprotocol(&mut attr, libc::PTHREAD_PRIO_INHERIT);
+            // PI protocol is a performance hint, not a correctness
+            // invariant for ktstr — priority inversion on the host
+            // only matters when SCHED_FIFO threads are in play. On a
+            // kernel built without CONFIG_FUTEX_PI, `setprotocol`
+            // returns ENOTSUP; degrade silently to the default
+            // PRIO_NONE protocol instead of aborting startup. Any
+            // other nonzero rc is a programmer error (EINVAL from a
+            // bad attr pointer) and is still asserted.
+            if rc == libc::ENOTSUP {
+                tracing::warn!(
+                    "PTHREAD_PRIO_INHERIT unsupported (errno {}); PiMutex degrading to non-PI protocol",
+                    rc
+                );
+            } else {
+                assert_eq!(
+                    rc, 0,
+                    "pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) failed: {rc}"
+                );
+            }
             let mut mutex: libc::pthread_mutex_t = std::mem::zeroed();
-            libc::pthread_mutex_init(&mut mutex, &attr);
+            let rc = libc::pthread_mutex_init(&mut mutex, &attr);
             libc::pthread_mutexattr_destroy(&mut attr);
+            assert_eq!(rc, 0, "pthread_mutex_init failed: {rc}");
             PiMutex {
                 inner: std::cell::UnsafeCell::new(value),
                 mutex: std::cell::UnsafeCell::new(mutex),
@@ -123,7 +170,7 @@ impl<T> PiMutex<T> {
     pub(crate) fn lock(&self) -> PiMutexGuard<'_, T> {
         unsafe {
             let rc = libc::pthread_mutex_lock(self.mutex.get());
-            debug_assert_eq!(rc, 0, "pthread_mutex_lock failed: {rc}");
+            assert_eq!(rc, 0, "pthread_mutex_lock failed: {rc}");
         }
         PiMutexGuard { mutex: self }
     }
@@ -158,7 +205,10 @@ impl<T> Drop for PiMutexGuard<'_, T> {
     fn drop(&mut self) {
         unsafe {
             let rc = libc::pthread_mutex_unlock(self.mutex.mutex.get());
-            debug_assert_eq!(rc, 0, "pthread_mutex_unlock failed: {rc}");
+            if rc != 0 {
+                eprintln!("pthread_mutex_unlock failed: {rc}");
+                libc::abort();
+            }
         }
     }
 }
@@ -4266,39 +4316,75 @@ fn acquire_slot_with_locks(
 // ---------------------------------------------------------------------------
 
 /// Stdin fd for signal handler. Set by TerminalRawGuard::enter, cleared by Drop.
+///
+/// The signal handler's Acquire load on this fd is the single gate for
+/// touching `SAVED_TERMIOS`: the `fd >= 0` observation happens-after
+/// the Release stores of the termios pointer and INSTALLED flag.
 static SAVED_TERMIOS_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// Original termios for signal handler restore. Accessed only when
-/// SAVED_TERMIOS_FD >= 0. Written once by enter(), read by the signal
-/// handler and Drop. Not behind a lock because the signal handler must
-/// be async-signal-safe.
+/// Pointer to a boxed termios used by the signal handler for restore.
+/// Written exclusively by `TerminalRawGuard::enter` after the
+/// `SAVED_TERMIOS_INSTALLED` CAS succeeds; read by the signal handler.
+/// Drop does NOT free the backing allocation — a signal may be
+/// dispatched concurrently on another thread between our
+/// `SAVED_TERMIOS_FD = -1` store and the handler's Acquire load, and
+/// freeing would create a use-after-free.
 ///
-/// SAFETY: only one TerminalRawGuard can exist at a time (single interactive
-/// session). enter() writes before setting SAVED_TERMIOS_FD; Drop clears
-/// SAVED_TERMIOS_FD before reading. The signal handler only reads when
-/// SAVED_TERMIOS_FD >= 0, which guarantees the write has completed.
-static mut SAVED_TERMIOS: std::mem::MaybeUninit<libc::termios> = std::mem::MaybeUninit::uninit();
+/// The leak is bounded per enter/drop cycle: each successful
+/// `enter()` allocates exactly one `sizeof(libc::termios)` and Drop
+/// never frees it, so total process-lifetime allocation grows linearly
+/// with the number of raw-mode install cycles. In practice that count
+/// is small (each full `ktstr` invocation installs raw mode at most
+/// once for interactive I/O), so the leak is negligible — but it is
+/// O(N) in cycles, not O(1). If a future caller drives repeated
+/// enter/drop cycles in a tight loop, the leak becomes observable and
+/// a more sophisticated reclamation scheme (hazard pointer, epoch
+/// reclamation) would be required.
+static SAVED_TERMIOS: std::sync::atomic::AtomicPtr<libc::termios> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Single-writer guard for SAVED_TERMIOS. `enter()` performs a
+/// CAS(false → true) before any state installation; re-entry fails
+/// with an error rather than stomping a previously-installed termios
+/// (which would leak the prior pointer AND desynchronize the signal
+/// handler). Drop clears this so a subsequent `enter()` may install.
+static SAVED_TERMIOS_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Signal handler that restores terminal state then re-raises.
 /// Async-signal-safe: uses only libc::tcsetattr (POSIX async-signal-safe)
 /// and libc::raise. SA_RESETHAND restores SIG_DFL before entry, so the
 /// re-raised signal terminates normally.
 extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
+    // Gate 1: FD >= 0. Acquire-loads the fd stored last in enter(); if
+    // negative (never installed, or Drop already cleared it) we have
+    // nothing to restore and skip straight to re-raise.
     let fd = SAVED_TERMIOS_FD.load(std::sync::atomic::Ordering::Acquire);
     if fd >= 0 {
-        // SAFETY: SAVED_TERMIOS was written before SAVED_TERMIOS_FD was
-        // set to a non-negative value. SA_RESETHAND ensures this handler
-        // runs at most once per signal. addr_of! avoids creating a
-        // reference to the static mut (Rust 2024 edition requirement).
-        unsafe {
-            libc::tcsetattr(
-                fd,
-                libc::TCSANOW,
-                std::ptr::addr_of!(SAVED_TERMIOS).cast::<libc::termios>(),
-            );
+        // Gate 2: non-null termios pointer. The Acquire load pairs with
+        // the Release store in enter() (ordered before the FD store),
+        // so observing fd >= 0 implies a valid termios write
+        // happens-before the pointer load. Drop stores null here AFTER
+        // clearing FD, so a concurrent handler that saw fd >= 0 is
+        // guaranteed to observe a still-valid pointer (the leak policy
+        // on SAVED_TERMIOS ensures the allocation outlives any
+        // in-flight handler invocation).
+        //
+        // SA_RESETHAND ensures this handler runs at most once per
+        // delivered signal; we cannot race with ourselves on the same
+        // thread.
+        let ptr = SAVED_TERMIOS.load(std::sync::atomic::Ordering::Acquire);
+        if !ptr.is_null() {
+            // SAFETY: ptr was produced by Box::into_raw in enter() and
+            // is never freed (see SAVED_TERMIOS static doc). tcsetattr
+            // is POSIX async-signal-safe.
+            unsafe {
+                libc::tcsetattr(fd, libc::TCSANOW, ptr);
+            }
         }
     }
     // SA_RESETHAND already restored SIG_DFL; re-raise terminates.
+    // SAFETY: libc::raise is POSIX async-signal-safe.
     unsafe {
         libc::raise(sig);
     }
@@ -4323,24 +4409,54 @@ impl TerminalRawGuard {
         use nix::sys::termios::{self, SetArg};
         use std::os::unix::io::AsRawFd;
 
+        // Structural single-writer enforcement: only one
+        // TerminalRawGuard may hold the termios-restore statics at a
+        // time. CAS false → true before touching ANY terminal state,
+        // so a second concurrent enter() fails here instead of
+        // silently leaking the prior boxed termios.
+        if SAVED_TERMIOS_INSTALLED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            anyhow::bail!(
+                "TerminalRawGuard already installed; only one raw-mode guard may be live at a time"
+            );
+        }
+
         let fd = std::io::stdin().as_raw_fd();
         // SAFETY: stdin fd is valid for the lifetime of this process.
         let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) };
-        let original = termios::tcgetattr(borrowed).context("tcgetattr")?;
+        let original = match termios::tcgetattr(borrowed).context("tcgetattr") {
+            Ok(t) => t,
+            Err(e) => {
+                // Release the installation guard so a subsequent caller
+                // can try again; we haven't written any statics yet.
+                SAVED_TERMIOS_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
+        };
         let mut raw = original.clone();
         termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw).context("tcsetattr raw")?;
-
-        // Store original termios as libc::termios for the signal handler.
-        // Write SAVED_TERMIOS before setting SAVED_TERMIOS_FD so the
-        // handler sees a fully initialized struct.
-        // SAFETY: no concurrent writer — single interactive session.
-        // Use addr_of_mut! to avoid creating a reference to static mut
-        // (Rust 2024 edition requirement).
-        unsafe {
-            let ptr = std::ptr::addr_of_mut!(SAVED_TERMIOS);
-            (*ptr).write(original.clone().into());
+        if let Err(e) = termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw).context("tcsetattr raw")
+        {
+            SAVED_TERMIOS_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
+            return Err(e);
         }
+
+        // Leak the termios into the AtomicPtr. Drop does not free
+        // (see static doc on SAVED_TERMIOS) — a concurrent signal
+        // handler may still be reading the pointer when Drop runs.
+        let boxed: Box<libc::termios> = Box::new(original.clone().into());
+        let ptr = Box::into_raw(boxed);
+        // Store pointer and fd with Release so the handler's Acquire
+        // load of FD happens-after the pointer is visible. INSTALLED
+        // was already set by the CAS above.
+        SAVED_TERMIOS.store(ptr, std::sync::atomic::Ordering::Release);
         SAVED_TERMIOS_FD.store(fd, std::sync::atomic::Ordering::Release);
 
         // Install signal handlers with SA_RESETHAND. Matches the raw libc
@@ -4382,6 +4498,18 @@ impl Drop for TerminalRawGuard {
             nix::sys::termios::SetArg::TCSANOW,
             &self.original,
         );
+
+        // Clear the pointer and installation guard, but DO NOT free
+        // the boxed termios: a signal handler dispatched on another
+        // thread may still be executing between its Acquire load of
+        // SAVED_TERMIOS_FD (before the store above retired) and its
+        // subsequent load of SAVED_TERMIOS. Freeing here would create
+        // a use-after-free window. The leak is one termios per
+        // enter/drop cycle — total process-lifetime allocation grows
+        // O(N) in cycles, not O(1). See the SAVED_TERMIOS static doc
+        // for the full policy.
+        SAVED_TERMIOS.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        SAVED_TERMIOS_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
 
         // Restore previous signal handlers.
         unsafe {
@@ -5814,6 +5942,114 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(*m.lock(), 8000);
+    }
+
+    #[test]
+    fn pi_mutex_contention_10_threads_increments_correctly() {
+        // N-thread contention: 10 × 1000 increments through
+        // PiMutexGuard's DerefMut. If `lock()` ever returned a guard
+        // without holding the mutex (the pre-fix debug_assert bug in
+        // release builds), concurrent increments would race and the
+        // final count would be < 10_000. The unconditional assert
+        // panics on lock failure and the abort() in Drop panics on
+        // unlock failure, so any guard-violation surfaces loudly.
+        let m = Arc::new(PiMutex::new(0u64));
+        let threads: Vec<_> = (0..10)
+            .map(|_| {
+                let m = m.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        *m.lock() += 1;
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("worker thread panicked");
+        }
+        assert_eq!(*m.lock(), 10_000);
+    }
+
+    #[test]
+    fn terminal_raw_guard_double_enter_fails() {
+        // Allocate a pty pair and redirect stdin to the slave so
+        // TerminalRawGuard::enter()'s tcgetattr/tcsetattr calls see a
+        // real tty. Each nextest test runs in its own process, so
+        // dup2 on fd 0 is test-isolated.
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+        let saved_stdin = unsafe { libc::dup(0) };
+        assert!(saved_stdin >= 0);
+        assert_eq!(unsafe { libc::dup2(slave, 0) }, 0);
+
+        let first = TerminalRawGuard::enter().expect("first enter must succeed");
+        let second = TerminalRawGuard::enter();
+        let err_msg = match second {
+            Ok(_) => panic!("second concurrent enter must fail the INSTALLED CAS"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err_msg.contains("already installed"),
+            "error message should name the double-install condition, got: {err_msg}"
+        );
+        drop(first);
+        let third = TerminalRawGuard::enter()
+            .expect("third enter must succeed after Drop clears INSTALLED");
+        drop(third);
+
+        unsafe {
+            libc::dup2(saved_stdin, 0);
+            libc::close(saved_stdin);
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
+    #[test]
+    fn terminal_raw_guard_enter_drop_cycle() {
+        // Verify enter/drop can be repeated without getting stuck in
+        // the INSTALLED=true state. Each iteration allocates a fresh
+        // boxed termios (leaked by design — see the static doc on
+        // SAVED_TERMIOS) and transitions INSTALLED through
+        // false→true→false.
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+        let saved_stdin = unsafe { libc::dup(0) };
+        assert!(saved_stdin >= 0);
+        assert_eq!(unsafe { libc::dup2(slave, 0) }, 0);
+
+        for i in 0..3 {
+            let guard = TerminalRawGuard::enter()
+                .unwrap_or_else(|e| panic!("enter iteration {i} must succeed, got: {e}"));
+            drop(guard);
+        }
+
+        unsafe {
+            libc::dup2(saved_stdin, 0);
+            libc::close(saved_stdin);
+            libc::close(slave);
+            libc::close(master);
+        }
     }
 
     #[test]
