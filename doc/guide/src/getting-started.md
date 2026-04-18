@@ -53,73 +53,6 @@ Add ktstr as a dev-dependency:
 ktstr = { version = "0.4" }
 ```
 
-## Write a test
-
-Write a `#[ktstr_test]` function. The
-[`prelude`](https://likewhatevs.github.io/ktstr/api/ktstr/prelude/index.html)
-module re-exports the types you need.
-
-The simplest test uses a canned scenario:
-
-```rust,ignore
-use ktstr::prelude::*;
-
-#[ktstr_test(llcs = 1, cores = 2, threads = 1)]  // llcs = last-level caches
-fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    // `scenarios::steady` is a canned scenario: two cgroups of equal
-    // CPU-spin workers, no cpuset restrictions, run for the default
-    // duration.
-    scenarios::steady(ctx)
-}
-```
-
-For custom cgroup topology, declare cgroups with `CgroupDef` and run
-them with `execute_defs`. This is the most common custom test pattern:
-
-```rust,ignore
-use ktstr::prelude::*;
-
-#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
-fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    execute_defs(ctx, vec![
-        CgroupDef::named("cg_0").workers(4),
-        CgroupDef::named("cg_1")
-            .workers(2)
-            .work_type(WorkType::bursty(50, 100)),
-    ])
-}
-```
-
-For multi-phase scenarios with dynamic topology changes, use
-`Step::with_defs` and `execute_steps`:
-
-```rust,ignore
-use ktstr::prelude::*;
-
-#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
-fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step::with_defs(
-        vec![
-            CgroupDef::named("cg_0").workers(2),
-            CgroupDef::named("cg_1").workers(2),
-        ],
-        HoldSpec::FULL,
-    )];
-    execute_steps(ctx, steps)
-}
-```
-
-## Test binary setup
-
-No special setup is needed. `#[ktstr_test]` functions work with both
-`cargo test` and `cargo nextest run` out of the box. The ktstr ctor
-automatically intercepts nextest protocol args (`--list`, `--exact`)
-for gauntlet expansion and budget-driven test selection.
-
-- `cargo nextest run`: ctor intercepts, runs gauntlet-expanded tests.
-- `cargo test`: standard harness runs the `#[test]` wrappers (base
-  topology only, no gauntlet expansion).
-
 ## Kernel discovery
 
 Tests require a bootable Linux kernel. The test harness checks these
@@ -201,7 +134,73 @@ make -j$(nproc)
 `ktstr.kconfig` in the repo root contains a kernel config fragment
 tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
 
+## Write a test
+
+Create a file in your crate's `tests/` directory (e.g.
+`tests/sched_test.rs`) and write a `#[ktstr_test]` function. The
+[`prelude`](https://likewhatevs.github.io/ktstr/api/ktstr/prelude/index.html)
+module re-exports the types you need.
+
+The simplest test uses a canned scenario:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]  // llcs = last-level caches
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
+    // `scenarios::steady` is a canned scenario: two cgroups of equal
+    // CPU-spin workers, no cpuset restrictions, run for the default
+    // duration.
+    scenarios::steady(ctx)
+}
+```
+
+For custom cgroup topology, declare cgroups with `CgroupDef` and run
+them with `execute_defs`. This is the most common custom test pattern:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("cg_0").workers(4),
+        CgroupDef::named("cg_1")
+            .workers(2)
+            .work_type(WorkType::bursty(50, 100)),
+    ])
+}
+```
+
+For multi-phase scenarios with dynamic topology changes, use
+`Step::with_defs` and `execute_steps`:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
+    let steps = vec![Step::with_defs(
+        vec![
+            CgroupDef::named("cg_0").workers(2),
+            CgroupDef::named("cg_1").workers(2),
+        ],
+        HoldSpec::FULL,
+    )];
+    execute_steps(ctx, steps)
+}
+```
+
 ## Run
+
+No special setup is needed. `#[ktstr_test]` functions work with both
+`cargo test` and `cargo nextest run` out of the box. The ktstr ctor
+automatically intercepts nextest protocol args (`--list`, `--exact`)
+for gauntlet expansion and budget-driven test selection.
+
+- `cargo nextest run`: ctor intercepts, runs gauntlet-expanded tests.
+- `cargo test`: standard harness runs the `#[test]` wrappers (base
+  topology only, no gauntlet expansion).
 
 ```sh
 cargo nextest run
