@@ -630,41 +630,16 @@ pub fn kernel_build_pipeline(
     let image_path = crate::kernel_path::find_image_in_dir(source_dir)
         .ok_or_else(|| anyhow::anyhow!("no kernel image found in {}", source_dir.display()))?;
     let vmlinux_path = source_dir.join("vmlinux");
-    // Bind the StrippedVmlinux handle (or unstripped fallback path)
-    // outside the conditional so the tempdir stays alive while
-    // cache.store() copies the file.
-    let (stripped, fallback_path): (
-        Option<crate::cache::StrippedVmlinux>,
-        Option<std::path::PathBuf>,
-    ) = if vmlinux_path.exists() {
+    let vmlinux_ref = if vmlinux_path.exists() {
         let orig_mb = std::fs::metadata(&vmlinux_path)
             .map(|m| m.len() as f64 / (1024.0 * 1024.0))
             .unwrap_or(0.0);
-        match crate::cache::strip_vmlinux_debug(&vmlinux_path) {
-            Ok(s) => {
-                let stripped_mb = std::fs::metadata(s.path())
-                    .map(|m| m.len() as f64 / (1024.0 * 1024.0))
-                    .unwrap_or(0.0);
-                eprintln!(
-                    "{cli_label}: caching vmlinux ({orig_mb:.0} MB -> {stripped_mb:.0} MB, debug stripped)"
-                );
-                (Some(s), None)
-            }
-            Err(e) => {
-                eprintln!(
-                    "{cli_label}: warning: vmlinux strip failed ({e:#}), caching unstripped ({orig_mb:.0} MB)"
-                );
-                (None, Some(vmlinux_path.clone()))
-            }
-        }
+        eprintln!("{cli_label}: caching vmlinux ({orig_mb:.0} MB, will be stripped)");
+        Some(vmlinux_path.as_path())
     } else {
         eprintln!("{cli_label}: warning: vmlinux not found, BTF will not be cached");
-        (None, None)
+        None
     };
-    let vmlinux_ref: Option<&Path> = stripped
-        .as_ref()
-        .map(|s| s.path())
-        .or(fallback_path.as_deref());
 
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
@@ -696,13 +671,9 @@ pub fn kernel_build_pipeline(
     .with_config_hash(config_hash)
     .with_ktstr_kconfig_hash(Some(kconfig_hash));
 
-    let config_ref = config_path.exists().then_some(config_path.as_path());
     let mut artifacts = crate::cache::CacheArtifacts::new(&image_path);
     if let Some(v) = vmlinux_ref {
         artifacts = artifacts.with_vmlinux(v);
-    }
-    if let Some(c) = config_ref {
-        artifacts = artifacts.with_config(c);
     }
     let entry = match cache.store(&acquired.cache_key, &artifacts, &metadata) {
         Ok(entry) => {

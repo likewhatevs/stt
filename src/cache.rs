@@ -3,9 +3,11 @@
 //! Manages a local cache of built kernel images under an XDG-compliant
 //! directory. Each cached kernel is a directory containing the boot
 //! image, optionally a stripped vmlinux ELF (symbol table, BTF, and
-//! the section headers that monitor/probe code reads) and `.config`
-//! (fallback CONFIG_HZ source for kernels without IKCONFIG), plus a
-//! `metadata.json` descriptor.
+//! the section headers that monitor/probe code reads), and a
+//! `metadata.json` descriptor. `CONFIG_HZ` is recovered from the
+//! embedded IKCONFIG blob in the stripped vmlinux (ktstr.kconfig
+//! forces `CONFIG_IKCONFIG=y`), so no separate `.config` sidecar is
+//! cached.
 //!
 //! # Cache location
 //!
@@ -21,12 +23,10 @@
 //!   6.14.2-tarball-x86_64-kc{kconfig_hash}/
 //!     bzImage           # kernel boot image
 //!     vmlinux           # stripped ELF (optional, see strip_vmlinux_debug)
-//!     .config           # kernel config (IKCONFIG fallback, optional)
 //!     metadata.json     # KernelMetadata descriptor
 //!   local-deadbee-x86_64-kc{kconfig_hash}/
 //!     bzImage
 //!     vmlinux
-//!     .config
 //!     metadata.json
 //! ```
 //!
@@ -34,7 +34,9 @@
 //!
 //! [`CacheDir::store`] writes to a temporary directory inside the cache
 //! root, then atomically renames to the final path. Partial failures
-//! never leave corrupt entries.
+//! never leave corrupt entries. The cache root directory is created
+//! lazily on the first `store()`; `new()` and `with_root()` only
+//! resolve the path.
 
 use std::fmt;
 use std::fs;
@@ -150,20 +152,24 @@ impl KernelMetadata {
 
 /// Bundle of cache artifacts for [`CacheDir::store`].
 ///
-/// Groups the image plus optional sidecars (vmlinux ELF, kernel
-/// `.config`) so the store signature stays legible as new artifacts
-/// are added. Callers pass by reference; the bundle is copy-out only
-/// — the cache reads paths and copies contents.
+/// Groups the image plus optional sidecars so the store signature
+/// stays legible as new artifacts are added. Callers pass by
+/// reference; the bundle is copy-out only — the cache reads paths
+/// and copies contents.
+///
+/// The vmlinux path points at the raw (unstripped) ELF. `store()`
+/// strips it internally via [`strip_vmlinux_debug`] and writes the
+/// result, so callers do not need to run the strip pipeline
+/// themselves.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CacheArtifacts<'a> {
     /// Path to the kernel boot image (bzImage or Image).
     pub image: &'a Path,
-    /// Optional path to a pre-stripped vmlinux ELF
-    /// (typically the output of [`strip_vmlinux_debug`]).
+    /// Optional path to the raw (unstripped) vmlinux ELF. `store()`
+    /// strips it internally before caching — see
+    /// [`strip_vmlinux_debug`].
     pub vmlinux: Option<&'a Path>,
-    /// Optional path to the kernel `.config` (IKCONFIG fallback).
-    pub config: Option<&'a Path>,
 }
 
 impl<'a> CacheArtifacts<'a> {
@@ -172,19 +178,13 @@ impl<'a> CacheArtifacts<'a> {
         CacheArtifacts {
             image,
             vmlinux: None,
-            config: None,
         }
     }
 
-    /// Attach a pre-stripped vmlinux ELF.
+    /// Attach the raw (unstripped) vmlinux ELF. [`CacheDir::store`]
+    /// runs [`strip_vmlinux_debug`] on it before caching.
     pub fn with_vmlinux(mut self, vmlinux: &'a Path) -> Self {
         self.vmlinux = Some(vmlinux);
-        self
-    }
-
-    /// Attach a kernel `.config` for CONFIG_HZ fallback resolution.
-    pub fn with_config(mut self, config: &'a Path) -> Self {
-        self.config = Some(config);
         self
     }
 }
@@ -227,6 +227,20 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
+    /// Absolute path to the cached boot image
+    /// (`<entry>/<image_name>`).
+    pub fn image_path(&self) -> PathBuf {
+        self.path.join(&self.metadata.image_name)
+    }
+
+    /// Absolute path to the cached stripped vmlinux ELF, when one
+    /// was stored alongside the image. Returns `None` for entries
+    /// that were cached without a vmlinux (e.g. the source vmlinux
+    /// could not be read at build time).
+    pub fn vmlinux_path(&self) -> Option<PathBuf> {
+        self.metadata.has_vmlinux.then(|| self.path.join("vmlinux"))
+    }
+
     /// Compare this entry's kconfig hash against `current_hash`.
     pub fn kconfig_status(&self, current_hash: &str) -> KconfigStatus {
         match self.metadata.ktstr_kconfig_hash.as_deref() {
@@ -304,27 +318,36 @@ pub struct CacheDir {
 }
 
 impl CacheDir {
-    /// Open or create a cache directory.
+    /// Open a cache directory at the resolved root path.
     ///
     /// Resolution order:
     /// 1. `KTSTR_CACHE_DIR` environment variable
     /// 2. `$XDG_CACHE_HOME/ktstr/kernels/`
     /// 3. `$HOME/.cache/ktstr/kernels/`
     ///
-    /// Creates the directory tree if it does not exist.
+    /// Only resolves the path; does not create the directory.
+    /// [`store`](Self::store) creates the tree lazily on first write.
+    /// [`list`](Self::list) and [`lookup`](Self::lookup) handle a
+    /// nonexistent root as "no entries".
     pub fn new() -> anyhow::Result<Self> {
         let root = resolve_cache_root()?;
-        fs::create_dir_all(&root)?;
         Ok(CacheDir { root })
     }
 
     /// Open a cache directory at a specific path.
     ///
-    /// Creates the directory if it does not exist. Used by tests and
-    /// callers that need an explicit cache location.
+    /// Only sets the root path; does not create the directory.
+    /// Used by tests and callers that need an explicit cache location.
     pub fn with_root(root: PathBuf) -> anyhow::Result<Self> {
-        fs::create_dir_all(&root)?;
         Ok(CacheDir { root })
+    }
+
+    /// Resolve the default cache root path without side effects.
+    ///
+    /// Returns the path that [`new`](Self::new) would use, without
+    /// constructing a [`CacheDir`] or touching the filesystem.
+    pub fn resolve_root() -> anyhow::Result<PathBuf> {
+        resolve_cache_root()
     }
 
     /// Root directory of the cache.
@@ -406,8 +429,11 @@ impl CacheDir {
     /// `cache_key`: directory name for the entry (e.g.
     /// `6.14.2-tarball-x86_64-kc{kconfig_hash}`).
     ///
-    /// `artifacts`: required image plus optional vmlinux and `.config`
-    /// sidecars. See [`CacheArtifacts`].
+    /// `artifacts`: required image plus optional raw vmlinux. When
+    /// `artifacts.vmlinux` is set, `store()` runs
+    /// [`strip_vmlinux_debug`] internally; on strip failure it falls
+    /// back to caching the unstripped vmlinux (logged via
+    /// `tracing::warn!`). See [`CacheArtifacts`].
     ///
     /// `metadata`: descriptor to serialize as `metadata.json`. The
     /// `has_vmlinux` field is overwritten based on whether
@@ -416,7 +442,8 @@ impl CacheDir {
     ///
     /// Files are copied (not moved) so the caller retains the
     /// originals. Writes atomically via a temporary directory that is
-    /// renamed into place on success.
+    /// renamed into place on success. Creates the cache root lazily
+    /// if it does not yet exist.
     pub fn store(
         &self,
         cache_key: &str,
@@ -430,7 +457,8 @@ impl CacheDir {
             .root
             .join(format!(".tmp-{}-{}", cache_key, std::process::id()));
 
-        // Clean up any stale temp dir from a prior crash.
+        // Clean up any stale temp dir from a prior crash. create_dir_all
+        // on tmp_dir also creates self.root lazily on first store.
         if tmp_dir.exists() {
             fs::remove_dir_all(&tmp_dir)?;
         }
@@ -445,21 +473,29 @@ impl CacheDir {
         fs::copy(artifacts.image, &image_dest)
             .map_err(|e| anyhow::anyhow!("copy kernel image to cache: {e}"))?;
 
-        // Copy the pre-stripped vmlinux verbatim.
+        // Strip the raw vmlinux and copy the stripped result into the
+        // cache entry. If the strip pipeline errors (e.g. ELF too
+        // exotic for object::build::Builder), fall back to caching
+        // the unstripped vmlinux so downstream callers still get
+        // symbols and BTF — the size penalty is preferable to losing
+        // the vmlinux entirely.
         let has_vmlinux = if let Some(vmlinux) = artifacts.vmlinux {
-            fs::copy(vmlinux, tmp_dir.join("vmlinux"))
-                .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
+            let vmlinux_dest = tmp_dir.join("vmlinux");
+            match strip_vmlinux_debug(vmlinux) {
+                Ok(stripped) => {
+                    fs::copy(stripped.path(), &vmlinux_dest)
+                        .map_err(|e| anyhow::anyhow!("copy stripped vmlinux to cache: {e}"))?;
+                }
+                Err(e) => {
+                    tracing::warn!("vmlinux strip failed ({e:#}), caching unstripped",);
+                    fs::copy(vmlinux, &vmlinux_dest)
+                        .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
+                }
+            }
             true
         } else {
             false
         };
-
-        // Copy .config (fallback CONFIG_HZ source when the cached
-        // vmlinux lacks IKCONFIG).
-        if let Some(cfg) = artifacts.config {
-            fs::copy(cfg, tmp_dir.join(".config"))
-                .map_err(|e| anyhow::anyhow!("copy .config to cache: {e}"))?;
-        }
 
         // Write metadata. has_vmlinux reflects whether we actually
         // stored a vmlinux sidecar, overriding whatever the caller set.
@@ -497,17 +533,25 @@ impl CacheDir {
         })
     }
 
-    /// Remove cached entries, optionally keeping the N most recent.
-    ///
-    /// When `keep` is `Some(n)`, retains the `n` most recent entries
-    /// (by `built_at` timestamp). When `keep` is `None`, removes all
-    /// entries.
-    ///
-    /// Returns the number of entries removed.
-    pub fn clean(&self, keep: Option<usize>) -> anyhow::Result<usize> {
-        let entries = self.list()?;
-        let skip = keep.unwrap_or(0);
-        let to_remove = entries.into_iter().skip(skip).collect::<Vec<_>>();
+    /// Remove every cached entry. Returns the number of entries
+    /// removed.
+    pub fn clean_all(&self) -> anyhow::Result<usize> {
+        self.remove_entries(self.list()?)
+    }
+
+    /// Remove every cached entry except the `keep` most recent ones
+    /// (by `built_at` timestamp). `keep == 0` is equivalent to
+    /// [`clean_all`](Self::clean_all). Returns the number of entries
+    /// removed.
+    pub fn clean_keep(&self, keep: usize) -> anyhow::Result<usize> {
+        self.remove_entries(self.list()?.into_iter().skip(keep))
+    }
+
+    fn remove_entries<I: IntoIterator<Item = ListedEntry>>(
+        &self,
+        iter: I,
+    ) -> anyhow::Result<usize> {
+        let to_remove: Vec<_> = iter.into_iter().collect();
         let count = to_remove.len();
         for entry in &to_remove {
             fs::remove_dir_all(entry.path())?;
@@ -1077,13 +1121,50 @@ mod tests {
     // -- CacheDir --
 
     #[test]
-    fn cache_dir_with_root_creates_dir() {
+    fn cache_dir_with_root_does_not_create_dir() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("kernels");
         assert!(!root.exists());
         let cache = CacheDir::with_root(root.clone()).unwrap();
-        assert!(root.exists());
+        // Resolution must not create the directory — store() does it
+        // lazily on first write.
+        assert!(!root.exists());
         assert_eq!(cache.root(), root);
+    }
+
+    #[test]
+    fn cache_dir_list_returns_empty_for_nonexistent_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("never-created");
+        assert!(!root.exists());
+        let cache = CacheDir::with_root(root).unwrap();
+        let entries = cache.list().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn cache_dir_store_creates_root_lazily() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("lazy-root");
+        assert!(!root.exists());
+        let cache = CacheDir::with_root(root.clone()).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        cache
+            .store("key", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert!(root.exists(), "store() must create the cache root");
+    }
+
+    #[test]
+    fn cache_dir_resolve_root_returns_path() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path().to_str().unwrap());
+        let resolved = CacheDir::resolve_root().unwrap();
+        assert_eq!(resolved, tmp.path());
+        // Side-effect-free: calling resolve_root() must not create
+        // any directories beyond what the env var already pointed at.
     }
 
     #[test]
@@ -1302,7 +1383,7 @@ mod tests {
             .store("c", &CacheArtifacts::new(&image), &test_metadata("6.14.2"))
             .unwrap();
 
-        let removed = cache.clean(None).unwrap();
+        let removed = cache.clean_all().unwrap();
         assert_eq!(removed, 3);
         assert!(cache.list().unwrap().is_empty());
     }
@@ -1337,7 +1418,7 @@ mod tests {
             .store("mid", &CacheArtifacts::new(&image), &meta_mid)
             .unwrap();
 
-        let removed = cache.clean(Some(1)).unwrap();
+        let removed = cache.clean_keep(1).unwrap();
         assert_eq!(removed, 2);
 
         let remaining = cache.list().unwrap();
@@ -1360,7 +1441,7 @@ mod tests {
             )
             .unwrap();
 
-        let removed = cache.clean(Some(5)).unwrap();
+        let removed = cache.clean_keep(5).unwrap();
         assert_eq!(removed, 0);
         assert_eq!(cache.list().unwrap().len(), 1);
     }
@@ -1369,7 +1450,7 @@ mod tests {
     fn cache_dir_clean_empty_cache() {
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().to_path_buf()).unwrap();
-        let removed = cache.clean(None).unwrap();
+        let removed = cache.clean_all().unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -1691,7 +1772,7 @@ mod tests {
         // list() returns 3 entries. Corrupt entries (no built_at) sort
         // last. keep=1 should keep the newest valid entry and remove
         // the old valid + corrupt entries.
-        let removed = cache.clean(Some(1)).unwrap();
+        let removed = cache.clean_keep(1).unwrap();
         assert_eq!(removed, 2);
 
         let remaining = cache.list().unwrap();
@@ -1771,46 +1852,98 @@ mod tests {
     }
 
     #[test]
-    fn cache_dir_store_with_config() {
+    fn cache_dir_store_strips_vmlinux_internally() {
+        // Real ELF fixture: store() must run strip_vmlinux_debug and
+        // the stored vmlinux must reflect the strip (smaller than
+        // source, no .debug_* sections).
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
-        let config = src_dir.path().join(".config");
-        let config_content = b"CONFIG_HZ=1000\nCONFIG_SCHED_CLASS_EXT=y\n";
-        fs::write(&config, config_content).unwrap();
+        let vmlinux = create_strip_test_fixture(src_dir.path());
+        let source_size = fs::metadata(&vmlinux).unwrap().len();
         let meta = test_metadata("6.14.2");
 
         let entry = cache
             .store(
-                "with-config",
-                &CacheArtifacts::new(&image).with_config(&config),
+                "strip-in-store",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
                 &meta,
             )
             .unwrap();
-        assert!(entry.path.join("bzImage").exists());
-        assert!(entry.path.join(".config").exists());
-        assert!(entry.path.join("metadata.json").exists());
-        // Cached .config contents match original.
-        let cached = fs::read(entry.path.join(".config")).unwrap();
-        assert_eq!(cached, config_content);
-        // Original .config still exists (copy, not move).
-        assert!(config.exists());
+        let cached_vmlinux = entry.path.join("vmlinux");
+        let cached_size = fs::metadata(&cached_vmlinux).unwrap().len();
+        assert!(
+            cached_size < source_size,
+            "stored vmlinux ({cached_size} bytes) should be smaller \
+             than source ({source_size}) after internal strip"
+        );
+        let data = fs::read(&cached_vmlinux).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let section_names: Vec<&str> = elf
+            .section_headers
+            .iter()
+            .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+        assert!(
+            !section_names.contains(&".debug_info"),
+            "internal strip should have removed .debug_info"
+        );
+        assert!(entry.metadata.has_vmlinux);
     }
 
     #[test]
-    fn cache_dir_store_without_config() {
+    fn cache_dir_store_falls_back_when_strip_fails() {
+        // Unparseable vmlinux: strip errors, store() falls back to
+        // copying the raw bytes. has_vmlinux stays true so consumers
+        // still see it.
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
+        let vmlinux = src_dir.path().join("vmlinux");
+        let raw = b"not an ELF file";
+        fs::write(&vmlinux, raw).unwrap();
         let meta = test_metadata("6.14.2");
 
         let entry = cache
-            .store("no-config", &CacheArtifacts::new(&image), &meta)
+            .store(
+                "strip-fallback",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &meta,
+            )
             .unwrap();
-        assert!(entry.path.join("bzImage").exists());
-        assert!(!entry.path.join(".config").exists());
+        let cached = fs::read(entry.path.join("vmlinux")).unwrap();
+        assert_eq!(cached, raw, "fallback must copy raw bytes verbatim");
+        assert!(entry.metadata.has_vmlinux);
+    }
+
+    #[test]
+    fn cache_dir_store_preserves_original_vmlinux() {
+        // strip_vmlinux_debug reads the source path; verify the
+        // source file is still there after store() (no move, no
+        // truncate).
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let vmlinux = create_strip_test_fixture(src_dir.path());
+        let source_size = fs::metadata(&vmlinux).unwrap().len();
+        let meta = test_metadata("6.14.2");
+
+        cache
+            .store(
+                "preserve-src",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &meta,
+            )
+            .unwrap();
+        assert!(vmlinux.exists(), "source vmlinux must survive store()");
+        assert_eq!(
+            fs::metadata(&vmlinux).unwrap().len(),
+            source_size,
+            "source vmlinux size must not change"
+        );
     }
 
     #[test]
@@ -1827,6 +1960,60 @@ mod tests {
 
         // Original image must still exist (copy, not move).
         assert!(image.exists());
+    }
+
+    // -- CacheEntry accessors --
+
+    #[test]
+    fn cache_entry_image_path_joins_key_with_image_name() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let entry = cache
+            .store(
+                "key",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        assert_eq!(entry.image_path(), entry.path.join("bzImage"));
+        assert!(entry.image_path().exists());
+    }
+
+    #[test]
+    fn cache_entry_vmlinux_path_some_when_stored() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let vmlinux = create_strip_test_fixture(src_dir.path());
+        let entry = cache
+            .store(
+                "with-vml",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        let vml_path = entry.vmlinux_path().expect("vmlinux_path() should be Some");
+        assert_eq!(vml_path, entry.path.join("vmlinux"));
+        assert!(vml_path.exists());
+    }
+
+    #[test]
+    fn cache_entry_vmlinux_path_none_when_not_stored() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let entry = cache
+            .store(
+                "no-vml",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        assert!(entry.vmlinux_path().is_none());
     }
 
     // -- prefer_source_tree_for_dwarf --

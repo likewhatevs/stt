@@ -128,22 +128,6 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
             .map_err(|e| format!("tar append vmlinux: {e}"))?;
     }
 
-    // Add .config if present (CONFIG_HZ resolution).
-    let config_path = entry_dir.join(".config");
-    if let Ok(mut config_file) = std::fs::File::open(&config_path) {
-        let config_size = config_file
-            .metadata()
-            .map_err(|e| format!(".config metadata: {e}"))?
-            .len();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(config_size);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, ".config", &mut config_file)
-            .map_err(|e| format!("tar append .config: {e}"))?;
-    }
-
     let tar_bytes = archive
         .into_inner()
         .map_err(|e| format!("finalize tar: {e}"))?;
@@ -165,9 +149,12 @@ fn maybe_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Unpack a tar archive into a cache directory via CacheDir::store.
 ///
-/// Extracts metadata.json, the kernel image, vmlinux (if present),
-/// and .config (if present) from the tar blob, writes them to temp
-/// files, then stores via the local cache API for atomic placement.
+/// Extracts metadata.json, the kernel image, and vmlinux (if present)
+/// from the tar blob, writes them to temp files, then stores via the
+/// local cache API for atomic placement. The unpacked vmlinux was
+/// already stripped by the producer; `CacheDir::store` re-runs the
+/// strip pipeline (idempotent — the keep-list partition produces the
+/// same layout) and falls back to copying verbatim on error.
 fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<CacheEntry, String> {
     let tar_bytes = maybe_decompress(data)?;
     let mut archive = tar::Archive::new(tar_bytes.as_slice());
@@ -178,7 +165,6 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
     let mut metadata: Option<KernelMetadata> = None;
     let mut image_data: Option<(String, Vec<u8>)> = None;
     let mut vmlinux_data: Option<Vec<u8>> = None;
-    let mut config_data: Option<Vec<u8>> = None;
 
     for entry_result in entries {
         let mut entry = entry_result.map_err(|e| format!("tar entry: {e}"))?;
@@ -203,12 +189,6 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
                 .read_to_end(&mut data)
                 .map_err(|e| format!("read vmlinux from tar: {e}"))?;
             vmlinux_data = Some(data);
-        } else if path == ".config" {
-            let mut data = Vec::new();
-            entry
-                .read_to_end(&mut data)
-                .map_err(|e| format!("read .config from tar: {e}"))?;
-            config_data = Some(data);
         } else {
             let mut data = Vec::new();
             entry
@@ -222,7 +202,7 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
     let (_, img_bytes) =
         image_data.ok_or_else(|| "tar archive missing kernel image".to_string())?;
 
-    // Write image, vmlinux, and .config to temp files for CacheDir::store.
+    // Write image and vmlinux to temp files for CacheDir::store.
     let tmp_dir = tempfile::TempDir::new().map_err(|e| format!("create temp dir: {e}"))?;
     let tmp_image = tmp_dir.path().join(&meta.image_name);
     let mut f = std::fs::File::create(&tmp_image).map_err(|e| format!("create temp image: {e}"))?;
@@ -243,25 +223,9 @@ fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<Ca
         None
     };
 
-    let tmp_config_path;
-    let config_ref = if let Some(ref cfg_bytes) = config_data {
-        tmp_config_path = tmp_dir.path().join(".config");
-        let mut cf = std::fs::File::create(&tmp_config_path)
-            .map_err(|e| format!("create temp .config: {e}"))?;
-        cf.write_all(cfg_bytes)
-            .map_err(|e| format!("write temp .config: {e}"))?;
-        drop(cf);
-        Some(tmp_config_path.as_path())
-    } else {
-        None
-    };
-
     let mut artifacts = crate::cache::CacheArtifacts::new(&tmp_image);
     if let Some(v) = vmlinux_ref {
         artifacts = artifacts.with_vmlinux(v);
-    }
-    if let Some(c) = config_ref {
-        artifacts = artifacts.with_config(c);
     }
     cache
         .store(cache_key, &artifacts, &meta)
@@ -446,39 +410,35 @@ mod tests {
     }
 
     #[test]
-    fn remote_cache_pack_unpack_roundtrip_with_config() {
+    fn remote_cache_pack_entry_excludes_config_sidecar() {
+        // .config is not cached any more (IKCONFIG covers CONFIG_HZ
+        // for ktstr-built kernels). Even if an entry directory has a
+        // leftover .config on disk (e.g. from an older cache version),
+        // pack_entry must not include it — the tar carries only
+        // metadata.json + image + optional vmlinux.
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache")).unwrap();
-
         let src = tempfile::TempDir::new().unwrap();
         let image = create_fake_image(src.path());
-        let config = src.path().join(".config");
-        let config_content = b"CONFIG_HZ=1000\nCONFIG_SCHED_CLASS_EXT=y\n";
-        std::fs::write(&config, config_content).unwrap();
         let meta = test_metadata();
         let entry = cache
-            .store(
-                "config-key",
-                &CacheArtifacts::new(&image).with_config(&config),
-                &meta,
-            )
+            .store("legacy-config", &CacheArtifacts::new(&image), &meta)
             .unwrap();
+        // Simulate a leftover .config from an older cache version.
+        std::fs::write(entry.path.join(".config"), b"CONFIG_HZ=1000\n").unwrap();
 
         let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
-
-        let tmp2 = tempfile::TempDir::new().unwrap();
-        let cache2 = CacheDir::with_root(tmp2.path().join("cache")).unwrap();
-        let restored = unpack_and_store(&cache2, "config-key", &packed).unwrap();
-
-        assert_eq!(restored.key, "config-key");
-        // .config must exist in restored entry with original contents.
-        let restored_config = restored.path.join(".config");
+        let tar_bytes = maybe_decompress(&packed).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let paths: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            restored_config.exists(),
-            ".config missing from restored cache entry"
+            !paths.iter().any(|p| p == ".config"),
+            "pack_entry should not include .config, got {paths:?}"
         );
-        let restored_content = std::fs::read(&restored_config).unwrap();
-        assert_eq!(restored_content, config_content);
     }
 
     #[test]
