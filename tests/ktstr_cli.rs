@@ -21,7 +21,13 @@ fn help_lists_subcommands() {
 
 #[test]
 fn help_shell() {
-    ktstr().args(["shell", "--help"]).assert().success();
+    ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--topology"))
+        .stdout(predicate::str::contains("--memory-mb"));
 }
 
 #[test]
@@ -53,7 +59,13 @@ fn help_shell_shows_include_files() {
 
 #[test]
 fn help_kernel() {
-    ktstr().args(["kernel", "--help"]).assert().success();
+    ktstr()
+        .args(["kernel", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("clean"));
 }
 
 #[test]
@@ -61,7 +73,8 @@ fn help_kernel_list() {
     ktstr()
         .args(["kernel", "list", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("--json"));
 }
 
 #[test]
@@ -69,7 +82,12 @@ fn help_kernel_build() {
     ktstr()
         .args(["kernel", "build", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("--source"))
+        .stdout(predicate::str::contains("--git"))
+        .stdout(predicate::str::contains("--ref"))
+        .stdout(predicate::str::contains("--force"))
+        .stdout(predicate::str::contains("--clean"));
 }
 
 #[test]
@@ -77,7 +95,9 @@ fn help_kernel_clean() {
     ktstr()
         .args(["kernel", "clean", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("--keep"))
+        .stdout(predicate::str::contains("--force"));
 }
 
 // -- error cases --
@@ -275,7 +295,18 @@ fn completions_invalid_shell() {
 
 #[test]
 fn kernel_list_runs() {
-    ktstr().args(["kernel", "list"]).assert().success();
+    // Isolate from the user's real kernel cache so the assertion is
+    // deterministic. With an empty cache directory, `kernel list`
+    // prints the cache path header on stderr and a "no cached
+    // kernels" hint on stdout.
+    let tmp = tempfile::TempDir::new().unwrap();
+    ktstr()
+        .env("KTSTR_CACHE_DIR", tmp.path())
+        .args(["kernel", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no cached kernels"))
+        .stderr(predicate::str::contains("cache:"));
 }
 
 #[test]
