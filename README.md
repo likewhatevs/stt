@@ -151,6 +151,14 @@ enum MySchedFlag {
 }
 ```
 
+`binary = "scx_my_sched"` tells ktstr to auto-discover the scheduler
+binary in `target/{debug,release}/`, the directory containing the test
+binary, or an explicit path via `KTSTR_SCHEDULER` env var. If the
+scheduler is a `[[bin]]` target in the same workspace, `cargo build`
+places it there and discovery is automatic. The resolved binary is
+packed into the VM's initramfs. Tests without a `scheduler` attribute
+run under EEVDF (the kernel's default scheduler).
+
 `topology(numa_nodes, llcs, cores_per_llc, threads_per_core)` sets
 the VM's CPU topology -- `topology(1, 2, 4, 1)` creates 1 NUMA node,
 2 LLCs, 4 cores per LLC, 1 thread per core (8 vCPUs). Topologies
