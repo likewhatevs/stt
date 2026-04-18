@@ -4336,6 +4336,16 @@ impl Drop for TerminalRawGuard {
 mod tests {
     use super::*;
 
+    /// Emit a canonical `ktstr: SKIP: ...` message and return from the
+    /// caller. Centralizes the prefix so every VM-backed test reports
+    /// skips in a single grep-able format.
+    macro_rules! skip {
+        ($($arg:tt)*) => {{
+            eprintln!("ktstr: SKIP: {}", format_args!($($arg)*));
+            return;
+        }};
+    }
+
     #[test]
     fn builder_default() {
         let b = KtstrVmBuilder::default();
@@ -4536,8 +4546,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -4567,8 +4576,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -4917,8 +4925,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -4987,13 +4994,11 @@ mod tests {
         // layout that only exists on kernels exposing scx_sched.
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
-            eprintln!("ktstr: SKIP: scx_root not present (pre-6.16 kernel, uses older SCX API)");
-            return;
+            skip!("scx_root not present (pre-6.16 kernel, uses older SCX API)");
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.watchdog_offsets.is_none() {
-            eprintln!("ktstr: SKIP: watchdog_offsets not resolved from BTF");
-            return;
+            skip!("watchdog_offsets not resolved from BTF");
         }
 
         const TIMEOUT_SECS: u64 = 7;
@@ -5016,8 +5021,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -5030,10 +5034,9 @@ mod tests {
         let Some(obs) = &report.watchdog_observation else {
             // Scheduler never attached (scx_root stayed null for the
             // whole run). Not a watchdog regression — skip.
-            eprintln!(
-                "SKIP: watchdog_observation is None (scx_root stayed null; scheduler may not have attached)"
+            skip!(
+                "watchdog_observation is None (scx_root stayed null; scheduler may not have attached)"
             );
-            return;
         };
         assert_eq!(
             obs.expected_jiffies, expected_jiffies,
@@ -5076,8 +5079,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -5142,8 +5144,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -5206,13 +5207,11 @@ mod tests {
 
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
-            eprintln!("ktstr: SKIP: scx_root not present (pre-6.16 kernel, uses older SCX API)");
-            return;
+            skip!("scx_root not present (pre-6.16 kernel, uses older SCX API)");
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.event_offsets.is_none() {
-            eprintln!("ktstr: SKIP: event_offsets not resolved from BTF");
-            return;
+            skip!("event_offsets not resolved from BTF");
         }
 
         let sched_bin = crate::test_support::require_binary("scx-ktstr");
@@ -5230,8 +5229,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -5250,11 +5248,10 @@ mod tests {
         let last = report.samples.last().unwrap();
         let has_event_data = last.cpus.iter().any(|c| c.event_counters.is_some());
         if !has_event_data {
-            eprintln!(
-                "SKIP: event counters None despite resolved offsets — \
+            skip!(
+                "event counters None despite resolved offsets — \
                  scheduler may not have attached before monitor resolved PAs"
             );
-            return;
         }
 
         let any_nonzero = last.cpus.iter().any(|c| {
@@ -5318,8 +5315,7 @@ mod tests {
 
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.sched_domain_offsets.is_none() {
-            eprintln!("ktstr: SKIP: sched_domain_offsets not resolved from BTF");
-            return;
+            skip!("sched_domain_offsets not resolved from BTF");
         }
 
         let vm = match KtstrVm::builder()
@@ -5334,8 +5330,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -5710,8 +5705,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
         if host_topo.total_cpus() < 3 {
-            eprintln!("ktstr: SKIP: need >= 3 host CPUs for performance_mode test");
-            return;
+            skip!("need >= 3 host CPUs for performance_mode test");
         }
         let result = KtstrVmBuilder::default()
             .kernel(&exe)
@@ -5736,8 +5730,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
         if host_topo.total_cpus() < 3 {
-            eprintln!("ktstr: SKIP: need >= 3 host CPUs for performance_mode test");
-            return;
+            skip!("need >= 3 host CPUs for performance_mode test");
         }
         let vm = match KtstrVmBuilder::default()
             .kernel(&exe)
@@ -5750,8 +5743,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -5772,8 +5764,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -5785,8 +5776,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let host_topo = host_topology::HostTopology::from_sysfs().unwrap();
         if host_topo.total_cpus() < 3 {
-            eprintln!("ktstr: SKIP: need >= 3 host CPUs for performance_mode test");
-            return;
+            skip!("need >= 3 host CPUs for performance_mode test");
         }
         let vm = KtstrVmBuilder::default()
             .kernel(&exe)
@@ -5861,8 +5851,7 @@ mod tests {
         let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
         if rc != 0 {
             // No CAP_SYS_NICE — skip test.
-            eprintln!("skipping set_rt_priority test: no CAP_SYS_NICE");
-            return;
+            skip!("set_rt_priority test: no CAP_SYS_NICE");
         }
         // Verify it took effect.
         let policy = unsafe { libc::sched_getscheduler(0) };
@@ -5898,8 +5887,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn boot_kernel_produces_output_aarch64() {
         let Some(kernel) = find_aarch64_image() else {
-            eprintln!("skipping: no aarch64 Image found (only compressed vmlinuz available)");
-            return;
+            skip!("no aarch64 Image found (only compressed vmlinuz available)");
         };
 
         let vm = match KtstrVm::builder()
@@ -5915,8 +5903,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -5932,8 +5919,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn boot_kernel_smp_topology_aarch64() {
         let Some(kernel) = find_aarch64_image() else {
-            eprintln!("skipping: no aarch64 Image found");
-            return;
+            skip!("no aarch64 Image found");
         };
 
         let vm = match KtstrVm::builder()
@@ -5949,8 +5935,7 @@ mod tests {
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
             {
-                eprintln!("ktstr: SKIP: resource contention: {e}");
-                return;
+                skip!("resource contention: {e}");
             }
             Err(e) => panic!("{e:#}"),
         };
