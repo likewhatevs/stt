@@ -1680,9 +1680,9 @@ mod tests {
     /// whole), `.BTF.ext` + `.debug_*` (deleted), and the three
     /// VMLINUX_ZERO_DATA_SECTIONS entries (`.data`, `.data..percpu`,
     /// `.init.data`, bytes dropped via SHT_NOBITS). Each bytes-dropped
-    /// section has a symbol pointing at it so tests can assert the
-    /// symbols survive `Builder::delete_orphans`.
-    fn create_elf_with_debug(dir: &Path) -> PathBuf {
+    /// section has a symbol pointing at an in-bounds offset so tests
+    /// can assert the symbols survive `Builder::delete_orphans`.
+    fn create_strip_test_fixture(dir: &Path) -> PathBuf {
         use object::write;
         let mut obj = write::Object::new(
             object::BinaryFormat::Elf,
@@ -1694,8 +1694,8 @@ mod tests {
         obj.append_section_data(text_id, &[0xCC; 64], 1);
         // Symbol so .symtab and .strtab are generated.
         let _ = obj.add_symbol(write::Symbol {
-            name: b"test_symbol".to_vec(),
-            value: 0x1000,
+            name: b"test_text_symbol".to_vec(),
+            value: 0x10,
             size: 8,
             kind: object::SymbolKind::Data,
             scope: object::SymbolScope::Compilation,
@@ -1732,7 +1732,7 @@ mod tests {
         obj.append_section_data(data_id, &[0xDD; 512], 8);
         let _ = obj.add_symbol(write::Symbol {
             name: b"test_data_symbol".to_vec(),
-            value: 0x2000,
+            value: 0x20,
             size: 8,
             kind: object::SymbolKind::Data,
             scope: object::SymbolScope::Compilation,
@@ -1749,7 +1749,7 @@ mod tests {
         obj.append_section_data(percpu_id, &[0xCC; 256], 8);
         let _ = obj.add_symbol(write::Symbol {
             name: b"test_percpu_symbol".to_vec(),
-            value: 0x3000,
+            value: 0x30,
             size: 8,
             kind: object::SymbolKind::Data,
             scope: object::SymbolScope::Compilation,
@@ -1766,7 +1766,7 @@ mod tests {
         obj.append_section_data(initdata_id, &[0x11; 1024], 8);
         let _ = obj.add_symbol(write::Symbol {
             name: b"test_initdata_symbol".to_vec(),
-            value: 0x4000,
+            value: 0x40,
             size: 8,
             kind: object::SymbolKind::Data,
             scope: object::SymbolScope::Compilation,
@@ -1782,10 +1782,28 @@ mod tests {
     }
 
     #[test]
-    fn strip_vmlinux_debug_removes_debug_keeps_btf_symtab() {
+    fn strip_vmlinux_debug_applies_keep_list() {
         let src = TempDir::new().unwrap();
-        let vmlinux = create_elf_with_debug(src.path());
+        let vmlinux = create_strip_test_fixture(src.path());
         let original_size = fs::metadata(&vmlinux).unwrap().len();
+
+        // Positive control: the fixture must actually carry the
+        // sections this test asserts on. If object::write silently
+        // renames or drops one, the post-strip absence assertions
+        // would false-pass.
+        let source_data = fs::read(&vmlinux).unwrap();
+        let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
+        let source_section_names: Vec<&str> = source_elf
+            .section_headers
+            .iter()
+            .filter_map(|s| source_elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+        for name in [".debug_info", ".debug_str", ".BTF.ext", ".BTF"] {
+            assert!(
+                source_section_names.contains(&name),
+                "fixture missing expected section {name}"
+            );
+        }
 
         let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
         let stripped_size = fs::metadata(&stripped_path).unwrap().len();
@@ -1832,7 +1850,7 @@ mod tests {
     #[test]
     fn strip_vmlinux_debug_symtab_readable() {
         let src = TempDir::new().unwrap();
-        let vmlinux = create_elf_with_debug(src.path());
+        let vmlinux = create_strip_test_fixture(src.path());
 
         let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
         let data = fs::read(&stripped_path).unwrap();
@@ -1843,8 +1861,8 @@ mod tests {
         // name. End-to-end symbol preservation on real vmlinuxes is
         // covered by the *_preserves_monitor_symbols tests below.
         assert!(
-            has_symbol(&elf, "test_symbol"),
-            "stripped ELF should contain test_symbol in symtab"
+            has_symbol(&elf, "test_text_symbol"),
+            "stripped ELF should contain test_text_symbol in symtab"
         );
     }
 
@@ -1856,7 +1874,7 @@ mod tests {
     #[test]
     fn strip_vmlinux_debug_zeros_data_sections() {
         let src = TempDir::new().unwrap();
-        let vmlinux = create_elf_with_debug(src.path());
+        let vmlinux = create_strip_test_fixture(src.path());
         let (_dir, stripped_path) = strip_vmlinux_debug(&vmlinux).unwrap();
         let data = fs::read(&stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
@@ -1870,15 +1888,15 @@ mod tests {
         };
         let assert_nobits_empty = |name: &str| {
             let sh = find_section(name);
+            let sh_type = sh.sh_type;
+            let sh_size = sh.sh_size;
             assert_eq!(
-                sh.sh_type, SHT_NOBITS,
-                "section {name} should be SHT_NOBITS after strip, got sh_type={}",
-                sh.sh_type
+                sh_type, SHT_NOBITS,
+                "section {name} should be SHT_NOBITS after strip, got sh_type={sh_type}",
             );
             assert_eq!(
-                sh.sh_size, 0,
-                "section {name} should have sh_size == 0 after strip, got {}",
-                sh.sh_size
+                sh_size, 0,
+                "section {name} should have sh_size == 0 after strip, got {sh_size}",
             );
         };
 
@@ -1895,8 +1913,9 @@ mod tests {
         assert_nobits_empty(".text");
 
         // Symbols pointing at the zeroed data sections must survive.
-        // Fixture symbol values are 0x2000/0x3000/0x4000 (nonzero),
-        // so has_symbol's st_value != 0 filter matches them.
+        // Fixture symbol values are nonzero (0x20/0x30/0x40, within
+        // their section bounds), so has_symbol's st_value != 0 filter
+        // matches them.
         assert!(
             has_symbol(&elf, "test_data_symbol"),
             "test_data_symbol dropped by strip"
@@ -1928,9 +1947,8 @@ mod tests {
 
     #[test]
     fn strip_vmlinux_debug_preserves_monitor_symbols() {
-        let path = match crate::monitor::find_test_vmlinux() {
-            Some(p) => p,
-            None => return,
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
         };
         // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
         // not an ELF), which strip_vmlinux_debug cannot parse.
@@ -1947,15 +1965,16 @@ mod tests {
             syms.per_cpu_offset, 0,
             "__per_cpu_offset symbol missing from stripped vmlinux"
         );
-        assert!(
-            syms.init_top_pgt.is_some(),
-            "init_top_pgt/swapper_pg_dir symbol missing from stripped vmlinux"
-        );
         // For every optional symbol KernelSymbols tracks: presence must
         // survive the strip. A symbol that is absent from the source
         // vmlinux stays absent (kernel-config-dependent); a symbol that
         // is present must still be present.
         let source_syms = crate::monitor::symbols::KernelSymbols::from_vmlinux(&path).unwrap();
+        assert_eq!(
+            source_syms.init_top_pgt.is_some(),
+            syms.init_top_pgt.is_some(),
+            "strip changed init_top_pgt presence"
+        );
         assert_eq!(
             source_syms.page_offset_base_kva.is_some(),
             syms.page_offset_base_kva.is_some(),
@@ -2023,9 +2042,8 @@ mod tests {
 
     #[test]
     fn strip_vmlinux_debug_preserves_bpf_idr_symbols() {
-        let path = match crate::monitor::find_test_vmlinux() {
-            Some(p) => p,
-            None => return,
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
         };
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
@@ -2050,9 +2068,8 @@ mod tests {
     /// dropped by `Builder::delete_orphans`.
     #[test]
     fn strip_vmlinux_debug_preserves_function_symbols() {
-        let path = match crate::monitor::find_test_vmlinux() {
-            Some(p) => p,
-            None => return,
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
         };
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
