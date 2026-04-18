@@ -1,5 +1,106 @@
 # Troubleshooting
 
+## Build errors
+
+### clang not found
+
+```text
+error: failed to run custom build command for `ktstr`
+  ...
+  clang: No such file or directory
+```
+
+The BPF skeleton build (`libbpf-cargo`) invokes clang to compile
+`.bpf.c` sources. Install clang:
+
+- Debian/Ubuntu: `sudo apt install clang`
+- Fedora: `sudo dnf install clang`
+
+### pkg-config not found
+
+```text
+error: failed to run custom build command for `libbpf-sys`
+  ...
+  pkg-config: command not found
+```
+
+libbpf-sys uses pkg-config during its vendored build. Install it:
+
+- Debian/Ubuntu: `sudo apt install pkg-config`
+- Fedora: `sudo dnf install pkgconf`
+
+### autotools errors (autoconf, autopoint, aclocal)
+
+```text
+autoreconf: command not found
+aclocal: command not found
+autopoint: command not found
+```
+
+The vendored libbpf-sys build compiles bundled libelf and zlib from
+source using autotools. These libraries are not system dependencies
+-- they ship with libbpf-sys -- but the autotools toolchain is
+needed to build them. Install:
+
+- Debian/Ubuntu: `sudo apt install autoconf autopoint flex bison gawk`
+- Fedora: `sudo dnf install autoconf gettext-devel flex bison gawk`
+
+### make or gcc not found
+
+```text
+busybox build requires 'make' — install build-essential (Debian/Ubuntu) or base-devel (Fedora/Arch)
+busybox build requires 'gcc' — install build-essential (Debian/Ubuntu) or base-devel (Fedora/Arch)
+```
+
+The build script compiles busybox from source for guest shell mode.
+This requires make and gcc.
+
+- Debian/Ubuntu: `sudo apt install make gcc`
+- Fedora: `sudo dnf install make gcc`
+
+### BTF errors
+
+```text
+no BTF source found. Set KTSTR_KERNEL to a kernel build directory,
+or ensure /sys/kernel/btf/vmlinux exists.
+```
+
+build.rs generates `vmlinux.h` from kernel BTF data. It searches
+the kernel discovery chain (`KTSTR_KERNEL`, `./linux`, `../linux`,
+installed kernel) for a `vmlinux` file, falling back to
+`/sys/kernel/btf/vmlinux`. Most distros ship
+`/sys/kernel/btf/vmlinux` with CONFIG_DEBUG_INFO_BTF enabled.
+
+**Fixes:**
+
+- Verify BTF is available: `ls /sys/kernel/btf/vmlinux`
+- If missing, set `KTSTR_KERNEL` to a kernel build directory that
+  contains a `vmlinux` with BTF:
+  `export KTSTR_KERNEL=/path/to/linux`
+- Build a kernel with `CONFIG_DEBUG_INFO_BTF=y`.
+- Some minimal/cloud kernels strip BTF. Use a distro kernel or
+  build your own.
+
+### busybox download failure
+
+```text
+failed to obtain busybox source.
+  tarball (https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz): download: ...
+  git clone (https://github.com/mirror/busybox.git): ...
+  Check network connectivity. First build requires internet access.
+```
+
+build.rs downloads busybox source on first build (tarball first,
+git clone fallback). Subsequent builds use the cached binary in
+`$OUT_DIR`.
+
+**Fixes:**
+
+- Verify network connectivity to github.com.
+- If behind a proxy, set `HTTP_PROXY` / `HTTPS_PROXY`.
+- After a successful first build, no network access is needed
+  unless `cargo clean` removes the cached binary.
+
 ## /dev/kvm not accessible
 
 The host-side pre-flight emits one of the following, depending on
