@@ -2201,7 +2201,7 @@ mod tests {
         obj.append_section_bss(bss_id, 256, 8);
         let _ = obj.add_symbol(write::Symbol {
             name: b"test_bss_symbol".to_vec(),
-            value: 0x0,
+            value: 0x50,
             size: 8,
             kind: object::SymbolKind::Data,
             scope: object::SymbolScope::Compilation,
@@ -2370,11 +2370,18 @@ mod tests {
 
         // Smoke check: stripping a synthetic ELF produces a readable
         // symbol table whose strtab still contains our test symbol
-        // name. End-to-end symbol preservation on real vmlinuxes is
+        // names. End-to-end symbol preservation on real vmlinuxes is
         // covered by the *_preserves_monitor_symbols tests below.
         assert!(
             has_symbol(&elf, "test_text_symbol"),
             "stripped ELF should contain test_text_symbol in symtab"
+        );
+        // test_bss_symbol anchors .bss against Builder::delete_orphans.
+        // Queryable via has_symbol because its fixture st_value is
+        // nonzero (an in-bounds offset within .bss).
+        assert!(
+            has_symbol(&elf, "test_bss_symbol"),
+            "stripped ELF should contain test_bss_symbol in symtab"
         );
     }
 
@@ -2494,7 +2501,9 @@ mod tests {
             .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
             .collect();
 
-        // .debug_* and .comment deleted.
+        // .debug_* sections deleted. (.comment is also in the fallback's
+        // delete set but this fixture does not emit one, so it is not
+        // exercised here.)
         assert!(
             !names.contains(&".debug_info"),
             "fallback should remove .debug_info"
