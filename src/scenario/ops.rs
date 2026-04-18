@@ -650,9 +650,27 @@ impl CpusetSpec {
             CpusetSpec::Range {
                 start_frac,
                 end_frac,
+            } if !start_frac.is_finite() || !end_frac.is_finite() => Err(format!(
+                "Range start_frac ({start_frac}) or end_frac ({end_frac}) is not finite"
+            )),
+            CpusetSpec::Range {
+                start_frac,
+                end_frac,
+            } if *start_frac < 0.0 || *end_frac > 1.0 => Err(format!(
+                "Range fracs must lie in [0.0, 1.0]: start_frac={start_frac}, end_frac={end_frac}"
+            )),
+            CpusetSpec::Range {
+                start_frac,
+                end_frac,
             } if start_frac >= end_frac => Err(format!(
                 "Range start_frac ({start_frac}) >= end_frac ({end_frac})"
             )),
+            CpusetSpec::Overlap { frac, .. } if !frac.is_finite() => {
+                Err(format!("Overlap frac ({frac}) is not finite"))
+            }
+            CpusetSpec::Overlap { frac, .. } if *frac < 0.0 || *frac > 1.0 => {
+                Err(format!("Overlap frac ({frac}) must lie in [0.0, 1.0]"))
+            }
             CpusetSpec::Disjoint { of, .. } | CpusetSpec::Overlap { of, .. }
                 if usable.len() < *of =>
             {
@@ -668,12 +686,22 @@ impl CpusetSpec {
 
     /// Resolve to a concrete CPU set given the topology.
     ///
-    /// Out-of-range `Llc` and `Numa` indices are clamped to the
-    /// largest valid index and a `tracing::warn!` is emitted rather
-    /// than panicking. `validate` already rejects these inputs
-    /// upstream; `resolve` is intentionally lenient so a late-bound
-    /// topology mismatch degrades into a usable cpuset instead of a
-    /// crash.
+    /// **Callers MUST run [`validate`] first and propagate its error.**
+    /// `apply_setup` and `apply_ops::SetCpuset` do so via `anyhow::bail!`.
+    /// Among rejected inputs, `Disjoint`/`Overlap` with `of == 0` and
+    /// inverted `Range` fracs panic here (div-by-zero and slice OOB);
+    /// non-finite fracs and out-of-bounds `Overlap.frac` may produce
+    /// silently-wrong cpusets or panics depending on the value (e.g.
+    /// NaN saturates to 0, inverting a Range and triggering a slice
+    /// OOB). Validate rejects all of these before resolve runs.
+    ///
+    /// Out-of-range `Llc` and `Numa` indices are defensively clamped
+    /// to the largest valid index with a `tracing::warn!` rather than
+    /// panicking, so a late-bound topology mismatch (e.g. a scenario
+    /// authored against 4 LLCs run on a 2-LLC host after validate has
+    /// been skipped) degrades into a usable cpuset instead of a crash.
+    /// This defense-in-depth is for the Llc/Numa variants only; the
+    /// frac/partition variants rely on `validate`.
     pub fn resolve(&self, ctx: &Ctx) -> BTreeSet<usize> {
         let usable = ctx.topo.usable_cpus();
         match self {
@@ -975,7 +1003,11 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
         state.cgroups.add_cgroup_no_cpuset(&def.name)?;
         if let Some(ref cpuset_spec) = def.cpuset {
             if let Err(reason) = cpuset_spec.validate(ctx) {
-                tracing::warn!(cgroup = %def.name, reason, "CpusetSpec validation failed");
+                anyhow::bail!(
+                    "cgroup '{}': CpusetSpec validation failed: {}",
+                    def.name,
+                    reason
+                );
             }
             let resolved = cpuset_spec.resolve(ctx);
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
@@ -1039,7 +1071,11 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
             }
             Op::SetCpuset { cgroup, cpus } => {
                 if let Err(reason) = cpus.validate(ctx) {
-                    tracing::warn!(cgroup = %cgroup, reason, "CpusetSpec validation failed");
+                    anyhow::bail!(
+                        "cgroup '{}': CpusetSpec validation failed: {}",
+                        cgroup,
+                        reason
+                    );
                 }
                 let resolved = cpus.resolve(ctx);
                 ctx.cgroups.set_cpuset(cgroup, &resolved)?;
@@ -1102,7 +1138,9 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                                     let _ = handle.set_affinity(idx, cpus);
                                 }
                             }
-                            crate::workload::AffinityMode::Random { from, count } => {
+                            crate::workload::AffinityMode::Random { from, count }
+                                if !from.is_empty() =>
+                            {
                                 use rand::seq::IndexedRandom;
                                 let v: Vec<usize> = from.iter().copied().collect();
                                 for idx in 0..handle.tids().len() {
@@ -1111,6 +1149,11 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                                     let _ = handle.set_affinity(idx, &chosen);
                                 }
                             }
+                            // Empty Random pool: matches workload::resolve_affinity
+                            // — leave affinity unchanged rather than hand
+                            // sched_setaffinity an empty mask (which it
+                            // rejects with EINVAL).
+                            crate::workload::AffinityMode::Random { .. } => {}
                             crate::workload::AffinityMode::SingleCpu(cpu) => {
                                 let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
                                 for idx in 0..handle.tids().len() {
@@ -2075,6 +2118,96 @@ mod tests {
         };
         let err = spec.validate(&ctx).unwrap_err();
         assert!(err.contains("start_frac"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_rejects_nan() {
+        // Regression: IEEE 754 comparisons with NaN always return false, so
+        // `start_frac >= end_frac` failed to reject it. validate() now
+        // rejects non-finite fracs explicitly.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.8,
+            end_frac: f64::NAN,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_rejects_infinity() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.0,
+            end_frac: f64::INFINITY,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_rejects_negative() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: -0.5,
+            end_frac: 0.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("[0.0, 1.0]"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_rejects_above_one() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.5,
+            end_frac: 1.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("[0.0, 1.0]"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_rejects_nan_frac() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: f64::NAN,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_rejects_infinity_frac() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: f64::INFINITY,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_rejects_out_of_range_frac() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: 1.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("[0.0, 1.0]"), "got: {err}");
     }
 
     #[test]

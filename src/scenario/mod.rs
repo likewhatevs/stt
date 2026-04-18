@@ -713,8 +713,16 @@ pub fn resolve_affinity_for_cgroup(
         AffinityKind::Inherit => AffinityMode::None,
         AffinityKind::RandomSubset => {
             let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
-            let count = (pool.len() / 2).max(1);
-            AffinityMode::Random { from: pool, count }
+            if pool.is_empty() {
+                tracing::debug!(
+                    "RandomSubset: empty cpuset and empty topology pool, \
+                     falling back to AffinityMode::None"
+                );
+                AffinityMode::None
+            } else {
+                let count = (pool.len() / 2).max(1);
+                AffinityMode::Random { from: pool, count }
+            }
         }
         AffinityKind::LlcAligned => {
             let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
@@ -767,16 +775,35 @@ pub fn resolve_affinity_for_cgroup(
     }
 }
 
-/// Backward-compatible wrapper: resolves AffinityKind using a cgroup index
-/// into an array of cpusets. Used by [`run_scenario`] for data-driven
-/// [`Scenario`] definitions.
+/// Resolves [`AffinityKind`] using a cgroup index into an array of cpusets.
+/// Used by [`run_scenario`] for data-driven [`Scenario`] definitions.
+///
+/// If `cgroup_idx` is out of range for `cpusets`, falls back to resolving
+/// with no cpuset (as if `cpusets` were `None`). Debug builds `debug_assert`
+/// on the mismatch so the caller can catch the bug; release builds degrade
+/// gracefully instead of panicking on a slice OOB.
 fn resolve_affinity_kind(
     kind: &AffinityKind,
     cpusets: Option<&[BTreeSet<usize>]>,
     cgroup_idx: usize,
     topo: &TestTopology,
 ) -> AffinityMode {
-    let cpuset = cpusets.map(|cs| &cs[cgroup_idx]);
+    if let Some(cs) = cpusets {
+        debug_assert!(
+            cgroup_idx < cs.len(),
+            "cpusets/cgroup_idx mismatch: idx={} len={}",
+            cgroup_idx,
+            cs.len()
+        );
+        if cgroup_idx >= cs.len() {
+            tracing::warn!(
+                cgroup_idx,
+                cpusets_len = cs.len(),
+                "cgroup index out of range for cpusets array; falling back to unrestricted pool"
+            );
+        }
+    }
+    let cpuset = cpusets.and_then(|cs| cs.get(cgroup_idx));
     resolve_affinity_for_cgroup(kind, cpuset, topo)
 }
 
@@ -1270,6 +1297,51 @@ mod tests {
                 assert_eq!(count, 4); // half
             }
             other => panic!("expected Random, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_affinity_random_subset_empty_pool_is_none() {
+        // Regression: empty cpuset produced AffinityMode::Random { from: empty,
+        // count: 1 }, which previously produced an empty affinity mask
+        // rejected by sched_setaffinity with EINVAL. Must short-circuit
+        // to AffinityMode::None here.
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        let empty: BTreeSet<usize> = BTreeSet::new();
+        match resolve_affinity_for_cgroup(&AffinityKind::RandomSubset, Some(&empty), &t) {
+            AffinityMode::None => {}
+            other => panic!("expected None for empty cpuset, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "cpusets/cgroup_idx mismatch")]
+    fn resolve_affinity_kind_cgroup_idx_out_of_bounds_debug_asserts() {
+        // In debug builds, the `debug_assert!` in resolve_affinity_kind
+        // surfaces the caller bug. The release-mode fallback is covered
+        // by the sibling test below.
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1].into_iter().collect()];
+        let _ = resolve_affinity_kind(&AffinityKind::RandomSubset, Some(&cpusets), 5, &t);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn resolve_affinity_kind_cgroup_idx_out_of_bounds_falls_back() {
+        // Regression: cpusets.map(|cs| &cs[cgroup_idx]) panicked on OOB idx
+        // in release builds. New behavior: cs.get(idx) yields None →
+        // unrestricted pool (paired with a tracing::warn for visibility).
+        // Debug-mode behavior is covered by the sibling `#[should_panic]`
+        // test above; this verifies the release fallback contract.
+        let t = crate::topology::TestTopology::synthetic(4, 1);
+        let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1].into_iter().collect()];
+        match resolve_affinity_kind(&AffinityKind::RandomSubset, Some(&cpusets), 5, &t) {
+            AffinityMode::Random { from, count } => {
+                assert_eq!(from.len(), 4, "OOB idx falls back to full topology");
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected Random with full pool, got {:?}", other),
         }
     }
 

@@ -283,21 +283,26 @@ cgroup. Cgroup names are case-sensitive strings.
 ## CpusetSpec errors
 
 ```text
-CpusetSpec validation failed: not enough usable CPUs (4) for 8 partitions
-CpusetSpec validation failed: index 3 >= partition count 3
+cgroup 'cg_0': CpusetSpec validation failed: not enough usable CPUs (4) for 8 partitions
+cgroup 'cg_1': CpusetSpec validation failed: index 3 >= partition count 3
+cgroup 'cg_2': CpusetSpec validation failed: Range fracs must lie in [0.0, 1.0]: start_frac=-1, end_frac=0.5
 ```
 
 A `CpusetSpec` cannot produce a valid cpuset for the test topology.
-`execute_steps` logs a warning and proceeds (the resolved cpuset may
-be empty or unexpected).
+`execute_steps` treats this as a hard error and aborts the step so the
+downstream slicing/arithmetic in `CpusetSpec::resolve` is never reached
+with inputs that would panic.
 
 **Fixes:**
 
 - Guard with a topology check before creating the step:
   `if ctx.topo.usable_cpus().len() < needed { return Ok(AssertResult::skip(...)); }`
-- Use `CpusetSpec::validate(&ctx)` to check before resolve.
+- Call `CpusetSpec::validate(&ctx)` in your scenario builder so failures
+  surface before `execute_steps` runs.
 - Reduce the partition count or use `CpusetSpec::Llc` instead of
   `Disjoint` on topologies with fewer CPUs than partitions.
+- For `Range`/`Overlap`, keep fractions finite and inside `[0.0, 1.0]`;
+  `Range` additionally requires `start_frac < end_frac`.
 
 ## Worker count mismatches
 

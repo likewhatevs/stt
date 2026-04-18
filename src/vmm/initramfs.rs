@@ -4,7 +4,7 @@
 /// into a cpio archive for use as Linux initrd.
 /// Init setup is handled by Rust code in `vmm::rust_init`.
 use anyhow::{Context, Result};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -44,8 +44,36 @@ pub(crate) struct MissingLib {
 static LD_SO_CONF_PATHS: LazyLock<Vec<PathBuf>> =
     LazyLock::new(|| parse_ld_so_conf(Path::new("/etc/ld.so.conf")));
 
+/// Maximum recursion depth for ld.so.conf `include` chains. Guards against
+/// cyclic or pathologically deep include graphs.
+const LD_SO_CONF_MAX_DEPTH: usize = 16;
+
 /// Parse a single ld.so.conf-format file, recursing into `include` directives.
-fn parse_ld_so_conf_file(path: &Path, out: &mut Vec<PathBuf>) {
+/// Cycles are broken via a visited-set keyed on the canonicalized path
+/// (falling back to the raw path when canonicalize fails, e.g. ENOENT);
+/// the recursion also stops at [`LD_SO_CONF_MAX_DEPTH`].
+fn parse_ld_so_conf_file(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+    depth: usize,
+) {
+    if depth >= LD_SO_CONF_MAX_DEPTH {
+        tracing::warn!(
+            path = %path.display(),
+            max_depth = LD_SO_CONF_MAX_DEPTH,
+            "ld.so.conf include depth limit hit; truncating further includes"
+        );
+        return;
+    }
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(key) {
+        tracing::warn!(
+            path = %path.display(),
+            "ld.so.conf already-visited include file; skipping to avoid redundant or cyclic descent"
+        );
+        return;
+    }
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return,
@@ -77,7 +105,7 @@ fn parse_ld_so_conf_file(path: &Path, out: &mut Vec<PathBuf>) {
                         .collect();
                     paths.sort();
                     for p in paths {
-                        parse_ld_so_conf_file(&p, out);
+                        parse_ld_so_conf_file(&p, out, visited, depth + 1);
                     }
                 }
             }
@@ -93,7 +121,8 @@ fn parse_ld_so_conf_file(path: &Path, out: &mut Vec<PathBuf>) {
 /// Parse `/etc/ld.so.conf` and return all library search directories.
 fn parse_ld_so_conf(path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    parse_ld_so_conf_file(path, &mut paths);
+    let mut visited = HashSet::new();
+    parse_ld_so_conf_file(path, &mut paths, &mut visited, 0);
     paths
 }
 
@@ -2276,6 +2305,75 @@ mod tests {
     fn parse_ld_so_conf_nonexistent_returns_empty() {
         let paths = parse_ld_so_conf(Path::new("/nonexistent/ld.so.conf"));
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn parse_ld_so_conf_self_include_does_not_stack_overflow() {
+        // Regression: a config that includes itself previously recursed
+        // without bound and overflowed the stack. The visited-set (keyed on
+        // canonicalized path) must break the cycle on the second visit.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let self_conf = tmp.path().join("self.conf");
+        std::fs::write(
+            &self_conf,
+            format!("include {}/self.conf\n/usr/lib\n", tmp.path().display()),
+        )
+        .unwrap();
+        let paths = parse_ld_so_conf(&self_conf);
+        assert!(
+            paths.contains(&PathBuf::from("/usr/lib")),
+            "self-include must still parse the rest of the file: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn parse_ld_so_conf_mutual_include_does_not_stack_overflow() {
+        // Regression: a ↔ b include cycle previously recursed without bound.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("a.conf");
+        let b = tmp.path().join("b.conf");
+        std::fs::write(
+            &a,
+            format!("include {}/b.conf\n/usr/lib\n", tmp.path().display()),
+        )
+        .unwrap();
+        std::fs::write(&b, format!("include {}/a.conf\n", tmp.path().display())).unwrap();
+        let paths = parse_ld_so_conf(&a);
+        assert!(
+            paths.contains(&PathBuf::from("/usr/lib")),
+            "mutual include must still collect non-cycle directories: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn parse_ld_so_conf_long_chain_terminates() {
+        // Regression: a deep, acyclic include chain must terminate at
+        // LD_SO_CONF_MAX_DEPTH without stack exhaustion. The terminal file
+        // (only reachable past the depth limit) writes `/usr/lib`; its
+        // absence from the result proves the depth limit actually stopped
+        // descent rather than merely avoiding a crash.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain_len = LD_SO_CONF_MAX_DEPTH + 4;
+        for i in 0..chain_len {
+            let this = tmp.path().join(format!("link_{i}.conf"));
+            let next = tmp.path().join(format!("link_{}.conf", i + 1));
+            if i + 1 < chain_len {
+                std::fs::write(&this, format!("include {}\n", next.display())).unwrap();
+            } else {
+                std::fs::write(&this, "/usr/lib\n").unwrap();
+            }
+        }
+        let root = tmp.path().join("link_0.conf");
+        let paths = parse_ld_so_conf(&root);
+        assert!(
+            !paths.contains(&PathBuf::from("/usr/lib")),
+            "depth limit must prevent reading the terminal file at depth {} > {}: {:?}",
+            chain_len - 1,
+            LD_SO_CONF_MAX_DEPTH,
+            paths,
+        );
     }
 
     // -- glob_match tests --

@@ -2377,6 +2377,13 @@ fn resolve_affinity(mode: &AffinityMode) -> Result<Option<BTreeSet<usize>>> {
         AffinityMode::SingleCpu(cpu) => Ok(Some([*cpu].into_iter().collect())),
         AffinityMode::Random { from, count } => {
             use rand::seq::IndexedRandom;
+            if from.is_empty() {
+                tracing::debug!(
+                    count = count,
+                    "resolve_affinity: empty Random pool, leaving affinity unset"
+                );
+                return Ok(None);
+            }
             let pool: Vec<usize> = from.iter().copied().collect();
             let count = (*count).min(pool.len()).max(1);
             Ok(Some(
@@ -3408,6 +3415,16 @@ mod tests {
         let r = resolve_affinity(&AffinityMode::Random { from, count: 0 }).unwrap();
         // count is clamped to max(1), so should get 1 CPU
         assert_eq!(r.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resolve_affinity_random_empty_pool_is_none() {
+        // Regression: AffinityMode::Random { from: empty, count } previously
+        // produced an empty affinity mask rejected by sched_setaffinity
+        // with EINVAL. Empty pool must short-circuit to Ok(None).
+        let from: BTreeSet<usize> = BTreeSet::new();
+        let r = resolve_affinity(&AffinityMode::Random { from, count: 1 }).unwrap();
+        assert!(r.is_none(), "empty Random pool must resolve to no affinity");
     }
 
     // -- spawn and collect edge cases --

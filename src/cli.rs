@@ -1262,14 +1262,16 @@ fn warn(msg: &str) {
 /// ticks in the background, and disables stdin echo to prevent
 /// keypress jank. When stderr is not a TTY, skips all indicatif
 /// machinery and falls back to plain stderr writes.
-/// Call `finish` with a completion message or `clear` to remove.
-#[derive(Clone)]
+/// Call `finish` with a completion message or `clear` to remove;
+/// [`Drop`] also restores echo and clears the bar if the spinner
+/// is dropped early (panic or `?` propagation).
 pub struct Spinner {
     /// None when stderr is not a TTY — no indicatif overhead.
     pb: Option<indicatif::ProgressBar>,
     /// Saved termios for echo restore. None when stdin is not a tty
-    /// or when the spinner is inactive (non-TTY stderr).
-    saved_termios: Option<std::sync::Arc<std::sync::Mutex<libc::termios>>>,
+    /// or when the spinner is inactive (non-TTY stderr). Owned directly
+    /// (not Arc<Mutex>) because Spinner is not Clone.
+    saved_termios: Option<libc::termios>,
 }
 
 impl Spinner {
@@ -1311,7 +1313,7 @@ impl Spinner {
         }
     }
 
-    fn disable_echo() -> Option<std::sync::Arc<std::sync::Mutex<libc::termios>>> {
+    fn disable_echo() -> Option<libc::termios> {
         unsafe {
             let fd = libc::STDIN_FILENO;
             if libc::isatty(fd) == 0 {
@@ -1324,16 +1326,17 @@ impl Spinner {
             let saved = termios;
             termios.c_lflag &= !libc::ECHO;
             libc::tcsetattr(fd, libc::TCSANOW, &termios);
-            Some(std::sync::Arc::new(std::sync::Mutex::new(saved)))
+            Some(saved)
         }
     }
 
-    fn restore_echo(&self) {
-        if let Some(ref saved) = self.saved_termios
-            && let Ok(termios) = saved.lock()
-        {
+    /// Restore stdin echo if we disabled it, consuming `saved_termios`
+    /// via [`Option::take`]. Idempotent — `finish`, `clear`, and the
+    /// `Drop` impl all call this; only the first call has any effect.
+    fn teardown(&mut self) {
+        if let Some(termios) = self.saved_termios.take() {
             unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &*termios);
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios);
             }
         }
     }
@@ -1348,9 +1351,9 @@ impl Spinner {
     /// Finish the spinner, replacing it with a completion message.
     ///
     /// In non-TTY mode, prints the message to stderr directly.
-    pub fn finish(self, msg: impl Into<std::borrow::Cow<'static, str>>) {
-        self.restore_echo();
-        match self.pb {
+    pub fn finish(mut self, msg: impl Into<std::borrow::Cow<'static, str>>) {
+        self.teardown();
+        match self.pb.take() {
             Some(pb) => pb.finish_with_message(msg),
             None => eprintln!("{}", msg.into()),
         }
@@ -1380,9 +1383,25 @@ impl Spinner {
     /// Clear the spinner from the terminal.
     ///
     /// In non-TTY mode, this is a no-op.
-    pub fn clear(self) {
-        self.restore_echo();
-        if let Some(pb) = self.pb {
+    pub fn clear(mut self) {
+        self.teardown();
+        if let Some(pb) = self.pb.take() {
+            pb.finish_and_clear();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    /// Restore terminal echo and clear any live progress bar on drop.
+    ///
+    /// `finish` and `clear` call [`Self::teardown`] and take `self.pb`
+    /// via [`Option::take`], so this impl is a no-op after an explicit
+    /// end. When the spinner is dropped implicitly (panic, `?`
+    /// propagation, early return), this restores the termios saved in
+    /// [`Self::disable_echo`] so stdin is usable afterwards.
+    fn drop(&mut self) {
+        self.teardown();
+        if let Some(pb) = self.pb.take() {
             pb.finish_and_clear();
         }
     }
@@ -1392,6 +1411,35 @@ impl Spinner {
 mod tests {
     use super::*;
     use crate::scenario;
+
+    // -- Spinner Drop --
+
+    #[test]
+    fn spinner_drop_without_finish_does_not_panic_in_non_tty() {
+        // Regression: Spinner previously had no Drop impl so early return
+        // or panic leaked the disabled-ECHO termios. The added Drop must
+        // run cleanly even on the non-TTY path (pb is None, saved_termios
+        // is None) that nextest exercises under stderr capture.
+        let sp = Spinner::start("test");
+        drop(sp);
+    }
+
+    #[test]
+    fn spinner_finish_then_drop_is_idempotent() {
+        // finish() takes pb via Option::take so Drop's pb.take() sees None
+        // and is a no-op on the progress bar side. teardown() is
+        // idempotent because it consumes saved_termios via Option::take;
+        // the second call finds None and does nothing. This test
+        // exercises that lifecycle end-to-end.
+        let sp = Spinner::start("test");
+        sp.finish("done");
+    }
+
+    #[test]
+    fn spinner_clear_then_drop_is_idempotent() {
+        let sp = Spinner::start("test");
+        sp.clear();
+    }
 
     // -- resolve_flags --
 
