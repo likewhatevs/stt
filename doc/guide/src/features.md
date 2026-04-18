@@ -169,7 +169,7 @@ readiness gates between host and guest.
 </details>
 
 <details>
-<summary><b>12 work types</b> — configurable workload profiles for different scheduling pressures</summary>
+<summary><b>18 work types</b> — configurable workload profiles for different scheduling pressures</summary>
 
 Workers are `fork()`ed processes placed in cgroups:
 
@@ -180,11 +180,17 @@ Workers are `fork()`ed processes placed in cgroups:
 - `Bursty` — CPU burst then sleep (parameterized)
 - `PipeIo` — CPU burst then pipe exchange (cross-CPU wake placement)
 - `FutexPingPong` — paired futex wait/wake
-- `FutexFanOut` — 1:N fan-out wake (schbench-style)
+- `FutexFanOut` — 1:N fan-out wake
 - `CachePressure` — strided RMW sized to pressure L1
 - `CacheYield` — cache pressure + sched_yield
 - `CachePipe` — cache pressure + pipe exchange
 - `Sequence` — compound: loop through phases
+- `ForkExit` — rapid fork+_exit cycling
+- `NiceSweep` — cycle nice level from -20 to 19
+- `AffinityChurn` — rapid self-directed sched_setaffinity
+- `PolicyChurn` — cycle through scheduling policies
+- `SchBench` — schbench-style messenger/worker with matrix multiply
+- `Custom` — user-supplied work function
 
 See [Work Types](concepts/work-types.md).
 

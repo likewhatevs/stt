@@ -67,7 +67,9 @@ enum Command {
 
         /// Override work type for all cgroups. Case-sensitive.
         /// Valid: CpuSpin, YieldHeavy, Mixed, IoSync, Bursty, PipeIo,
-        /// FutexPingPong, CachePressure, CacheYield, CachePipe, FutexFanOut.
+        /// FutexPingPong, CachePressure, CacheYield, CachePipe,
+        /// FutexFanOut, ForkExit, NiceSweep, AffinityChurn, PolicyChurn,
+        /// SchBench.
         #[arg(long)]
         work_type: Option<String>,
 

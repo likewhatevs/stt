@@ -58,10 +58,11 @@ running ktstr.
 
 **Work types (for `--work-type`):** `CpuSpin`, `YieldHeavy`, `Mixed`,
 `IoSync`, `Bursty`, `PipeIo`, `FutexPingPong`, `CachePressure`,
-`CacheYield`, `CachePipe`, `FutexFanOut`. Names are matched
-case-sensitively. The `Sequence` work type exists in the library but
-is not constructible from `--work-type` because it requires explicit
-phases defined in Rust.
+`CacheYield`, `CachePipe`, `FutexFanOut`, `ForkExit`, `NiceSweep`,
+`AffinityChurn`, `PolicyChurn`, `SchBench`. Names are matched
+case-sensitively. `Sequence` and `Custom` exist in the library but
+are not constructible from `--work-type` (`Sequence` requires explicit
+phases; `Custom` requires a function pointer).
 
 ### list
 
