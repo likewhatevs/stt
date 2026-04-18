@@ -136,10 +136,14 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
 ///   resolution walk a cached kernel's stripped ELF.
 ///
 /// Returns `None` when neither layout matches or the input path
-/// doesn't canonicalize. The cached vmlinux for tarball/git source
-/// types has DWARF stripped, so even a Some result only recovers
-/// file:line for local-build cache entries whose source tree is
-/// still on disk (tracked separately in #25).
+/// doesn't canonicalize.
+///
+/// Cache entries carry stripped vmlinux (no DWARF) — `strip_vmlinux_debug`
+/// drops `.debug_*` on every cache entry regardless of source type.
+/// file:line resolution works only for build-tree paths where the
+/// unstripped vmlinux is still present. Routing cache entries at
+/// their original source tree via `source_tree_path` is the scope
+/// of #25.
 #[allow(dead_code)]
 pub fn derive_kernel_dir(image: &std::path::Path) -> Option<std::path::PathBuf> {
     let canon = std::fs::canonicalize(image).ok()?;
