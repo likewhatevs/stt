@@ -211,6 +211,27 @@ Requires `/dev/kvm`. See
 [Troubleshooting](troubleshooting.md#devkvm-not-accessible) if KVM
 is unavailable.
 
+Passing tests:
+
+```
+    PASS [  11.34s] my_crate::my_sched_tests ktstr/my_test
+```
+
+A failing test prints assertion details:
+
+```
+    FAIL [  12.05s] my_crate::my_sched_tests ktstr/my_test
+
+--- STDERR ---
+ktstr_test 'my_test' [topo=1n1l2c1t] failed:
+  stuck 3500ms on cpu1 at +1200ms
+
+--- stats ---
+4 workers, 2 cpus, 8 migrations, worst_spread=12.3%, worst_gap=3500ms
+  cg0: workers=2 cpus=2 spread=5.1% gap=3500ms migrations=4 iter=15230
+  cg1: workers=2 cpus=2 spread=12.3% gap=890ms migrations=4 iter=14870
+```
+
 ### Using cargo-ktstr
 
 `cargo ktstr test` handles kernel resolution and test execution in

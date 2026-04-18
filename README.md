@@ -219,6 +219,29 @@ cargo nextest run
 
 Requires `/dev/kvm`.
 
+Passing tests:
+
+```
+    PASS [  11.34s] my_crate::my_sched_tests ktstr/two_cgroups
+    PASS [  14.02s] my_crate::my_sched_tests ktstr/sched_two_cgroups
+    PASS [  13.87s] my_crate::my_sched_tests ktstr/cpuset_split
+```
+
+A failing test prints assertion details:
+
+```
+    FAIL [  12.05s] my_crate::my_sched_tests ktstr/two_cgroups
+
+--- STDERR ---
+ktstr_test 'two_cgroups' [topo=1n1l2c1t] failed:
+  stuck 3500ms on cpu1 at +1200ms
+
+--- stats ---
+4 workers, 2 cpus, 8 migrations, worst_spread=12.3%, worst_gap=3500ms
+  cg0: workers=2 cpus=2 spread=5.1% gap=3500ms migrations=4 iter=15230
+  cg1: workers=2 cpus=2 spread=12.3% gap=890ms migrations=4 iter=14870
+```
+
 ### Dev workflow
 
 These commands require `cargo install ktstr` (see [Installation](#installation)).
