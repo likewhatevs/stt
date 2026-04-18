@@ -13,10 +13,9 @@ examples.
 
 ktstr's runtime dispatches to per-kernel-version fallback paths for
 the watchdog timeout and event counters. CI explicitly exercises
-6.14 and 7.0 on both x86_64 and aarch64. On 7.0+ kernels the watchdog
-override uses `scx_sched.watchdog_timeout` via BTF detection; on
-6.16-6.19 kernels it uses the static `scx_watchdog_timeout` symbol;
-older kernels silently no-op.
+6.14 and 7.0 on both x86_64 and aarch64. On 7.1+ kernels the watchdog
+override uses `scx_sched.watchdog_timeout` via BTF detection;
+older kernels use the static `scx_watchdog_timeout` symbol.
 
 Event counters follow a different layout split: 6.18+ kernels
 (backported to 6.17.7+ stable) read via
@@ -108,9 +107,9 @@ Scenarios are composable sequences of
 [steps and ops](concepts/ops.md). You declare intent as data —
 the framework creates cgroups, assigns cpusets, spawns workers,
 sets scheduling policies, and manages affinity. 60+
-[canned scenarios](concepts/scenarios.md) across 9 submodules
+[canned scenarios](concepts/scenarios.md) across 10 submodules
 cover basic, cpuset, dynamic, stress, interaction, affinity,
-nested, performance, and composite patterns.
+nested, ops, performance, and scenarios patterns.
 
 **API types:**
 - `CgroupDef` — declarative cgroup: name + cpuset + workload(s)

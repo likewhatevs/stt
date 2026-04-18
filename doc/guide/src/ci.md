@@ -189,9 +189,9 @@ above and apply these three differences:
 - Runner labels: `[self-hosted, Linux, kvm, kernel-build, ARM64]`
   (adjust to match your runner pool).
 - Cache key prefix: `arm64` instead of `x64`.
-- `RUSTC_WRAPPER`: set to empty string. The x64 workflow inherits
-  `RUSTC_WRAPPER: sccache` from the top-level env; runners without
-  sccache installed will fail the build unless this is cleared.
+- `RUSTC_WRAPPER`: set to empty string unless sccache is installed
+  on the arm64 runner — the workflow's global `RUSTC_WRAPPER=sccache`
+  breaks builds when sccache is absent.
 
 ## Performance mode
 

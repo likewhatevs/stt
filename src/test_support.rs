@@ -68,7 +68,6 @@ pub struct SidecarResult {
     pub stimulus_events: Vec<StimulusEvent>,
     /// Work type label used for post-hoc filtering and A/B comparison
     /// (distinct from the `WorkType` enum — this is the text name).
-    #[serde(default = "crate::stats::default_work_type")]
     pub work_type: String,
     /// Per-BPF-program verifier statistics captured from the VM's
     /// scheduler (when one was loaded). Absent when no scheduler
@@ -94,12 +93,10 @@ pub struct SidecarResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,
     /// ISO 8601 timestamp of when this test run started.
-    #[serde(default)]
     pub timestamp: String,
     /// Unique identifier for the test run. Derived from the repo commit
     /// hash and a monotonic counter to distinguish runs within the same
     /// build.
-    #[serde(default)]
     pub run_id: String,
 }
 
@@ -6969,5 +6966,56 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         assert!(config_file_parts(&entry).is_none());
+    }
+
+    // -- now_iso8601 / days_to_ymd tests --
+
+    #[test]
+    fn days_to_ymd_epoch() {
+        let (y, m, d) = days_to_ymd(0);
+        assert_eq!((y, m, d), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_known_date() {
+        let (y, m, d) = days_to_ymd(18628);
+        assert_eq!((y, m, d), (2021, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_leap_day() {
+        let (y, m, d) = days_to_ymd(11016);
+        assert_eq!((y, m, d), (2000, 2, 29));
+    }
+
+    #[test]
+    fn is_leap_years() {
+        assert!(is_leap(2000));
+        assert!(is_leap(2024));
+        assert!(!is_leap(1900));
+        assert!(!is_leap(2023));
+    }
+
+    #[test]
+    fn now_iso8601_format() {
+        let ts = now_iso8601();
+        assert!(ts.ends_with('Z'));
+        assert!(ts.contains('T'));
+        assert_eq!(ts.len(), 20);
+    }
+
+    // -- generate_run_id tests --
+
+    #[test]
+    fn generate_run_id_contains_hash() {
+        let id = generate_run_id();
+        assert!(id.contains(crate::GIT_HASH));
+    }
+
+    #[test]
+    fn generate_run_id_monotonic() {
+        let id1 = generate_run_id();
+        let id2 = generate_run_id();
+        assert_ne!(id1, id2);
     }
 }

@@ -179,11 +179,11 @@ fn shell_invalid_topology() {
         .stderr(predicate::str::contains("invalid topology"));
 }
 
-// -- test-stats --
+// -- stats --
 
 #[test]
-fn test_stats_no_data() {
-    cargo_ktstr().args(["test-stats"]).assert().success();
+fn stats_no_data() {
+    cargo_ktstr().args(["stats"]).assert().success();
 }
 
 // -- kernel list --

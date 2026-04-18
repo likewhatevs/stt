@@ -2602,7 +2602,7 @@ impl KtstrVm {
                             page_offset,
                         });
                     }
-                    // 6.16-7.0 fallback: direct write to scx_watchdog_timeout static global.
+                    // Pre-7.1 fallback: direct write to scx_watchdog_timeout static global.
                     if let Some(wdt_kva) = symbols.scx_watchdog_timeout {
                         let watchdog_timeout_pa = monitor::symbols::text_kva_to_pa(wdt_kva);
                         return Some(monitor::reader::WatchdogOverride::StaticGlobal {

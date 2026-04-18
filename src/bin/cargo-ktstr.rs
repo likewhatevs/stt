@@ -67,7 +67,14 @@ enum KtstrCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Sidecar analysis and baseline comparison.
+    /// Print sidecar analysis and auto-save sidecars as a baseline.
+    ///
+    /// Reads sidecar JSON written by `cargo ktstr test` and prints
+    /// gauntlet analysis. When sidecars are found, also saves them
+    /// as a baseline under `~/.cache/ktstr/baselines/` (or
+    /// `KTSTR_CACHE_DIR` / `XDG_CACHE_HOME` if set).
+    ///
+    /// Use `list` to see saved baselines; `compare <a> <b>` to diff two.
     Stats {
         #[command(subcommand)]
         command: Option<StatsCommand>,
@@ -159,15 +166,13 @@ enum StatsCommand {
         a: String,
         /// Baseline key B (from `cargo ktstr stats list`).
         b: String,
-        /// Filter expression (nextest-style -E). Matches against
-        /// test_name, topology, scheduler, work_type.
+        /// Substring filter. Matches against scenario, topology, work_type.
         #[arg(short = 'E', long)]
         filter: Option<String>,
-        /// Relative significance threshold (percentage). Deltas below
-        /// this percentage are treated as unchanged regardless of
-        /// direction. Overrides the per-metric default_rel.
-        #[arg(long, default_value = "10.0")]
-        threshold: f64,
+        /// Relative significance threshold in percent (e.g. 10 for 10%).
+        /// Omit to use each metric's built-in default.
+        #[arg(long)]
+        threshold: Option<f64>,
     },
 }
 
@@ -1059,7 +1064,7 @@ mod tests {
                 assert_eq!(a, "a");
                 assert_eq!(b, "b");
                 assert_eq!(filter.as_deref(), Some("cgroup_steady"));
-                assert!((threshold - 10.0).abs() < f64::EPSILON);
+                assert!(threshold.is_none());
             }
             _ => panic!("expected Stats Compare"),
         }
@@ -1088,7 +1093,7 @@ mod tests {
                     }),
                 ..
             } => {
-                assert!((threshold - 5.0).abs() < f64::EPSILON);
+                assert_eq!(threshold, Some(5.0));
                 assert!(filter.is_none());
             }
             _ => panic!("expected Stats Compare"),

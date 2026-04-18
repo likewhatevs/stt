@@ -14,7 +14,7 @@ use ktstr::topology::TestTopology;
     name = "ktstr",
     about = "Run ktstr scheduler test scenarios on the host",
     after_help = "See also: `cargo ktstr` for cargo-integrated workflows \
-                  (test, coverage, verifier, test-stats)."
+                  (test, coverage, verifier, stats)."
 )]
 struct Cli {
     #[command(subcommand)]

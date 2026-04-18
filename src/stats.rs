@@ -183,18 +183,12 @@ pub struct VmRunResult {
     pub monitor_data: Option<GauntletMonitorData>,
 }
 
-/// Default work type name for serde deserialization.
-pub fn default_work_type() -> String {
-    "CpuSpin".to_string()
-}
-
 /// Per-scenario result row for gauntlet analysis and baseline comparison.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GauntletRow {
     pub scenario: String,
     pub flags: String,
     pub topology: String,
-    #[serde(default = "default_work_type")]
     pub work_type: String,
     pub replica: u32,
     pub passed: bool,
@@ -1347,16 +1341,18 @@ pub fn baseline_list() -> anyhow::Result<()> {
 
 /// Compare two baselines and report regressions.
 ///
-/// `threshold` is a relative percentage (e.g. 10.0 for 10%). Deltas
-/// whose relative magnitude is below `threshold / 100.0` are treated
-/// as unchanged, overriding the per-metric `default_rel`.
+/// `threshold` is a relative percentage (e.g. `Some(10.0)` for 10%).
+/// Deltas whose relative magnitude is below `threshold / 100.0` are
+/// treated as unchanged. When `None`, each metric's built-in
+/// `default_rel` is used instead (falling back to 0.10 for unknown
+/// metrics).
 ///
 /// Returns 0 on no regressions, 1 if regressions detected.
 pub fn baseline_compare(
     a: &str,
     b: &str,
     filter: Option<&str>,
-    threshold: f64,
+    threshold: Option<f64>,
 ) -> anyhow::Result<i32> {
     let root = baselines_root()?;
     let dir_a = root.join(a);
@@ -1392,21 +1388,16 @@ pub fn baseline_compare(
     println!("{}", "-".repeat(90));
 
     for row_b in &rows_b {
-        let key_b = (
-            &row_b.scenario,
-            &row_b.topology,
-            &row_b.flags,
-            &row_b.work_type,
-        );
+        let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
         if let Some(f) = filter {
-            let joined = format!("{} {} {} {}", key_b.0, key_b.1, key_b.2, key_b.3);
+            let joined = format!("{} {} {}", key_b.0, key_b.1, key_b.2);
             if !joined.contains(f) {
                 continue;
             }
         }
         let row_a = rows_a
             .iter()
-            .find(|r| (&r.scenario, &r.topology, &r.flags, &r.work_type) == key_b);
+            .find(|r| (&r.scenario, &r.topology, &r.work_type) == key_b);
         let Some(row_a) = row_a else { continue };
 
         for metric_name in &compare_metrics {
@@ -1417,7 +1408,10 @@ pub fn baseline_compare(
             }
 
             let def = metric_def(metric_name);
-            let rel_thresh = threshold / 100.0;
+            let rel_thresh = match threshold {
+                Some(t) => t / 100.0,
+                None => def.map(|d| d.default_rel).unwrap_or(0.10),
+            };
             let (abs_thresh, higher_is_worse) = match def {
                 Some(d) => (d.default_abs, d.higher_is_worse),
                 None => (1.0, true),
@@ -2110,13 +2104,6 @@ mod tests {
         );
     }
 
-    // -- default_work_type test --
-
-    #[test]
-    fn default_work_type_is_cpuspin() {
-        assert_eq!(default_work_type(), "CpuSpin");
-    }
-
     // -- sidecar_to_row tests --
 
     #[test]
@@ -2321,6 +2308,269 @@ mod tests {
     }
 
     // -- proptest --
+
+    // -- metric_def tests --
+
+    #[test]
+    fn metric_def_known() {
+        let d = metric_def("spread").unwrap();
+        assert_eq!(d.name, "spread");
+        assert!(d.higher_is_worse);
+        assert_eq!(d.display_unit, "%");
+    }
+
+    #[test]
+    fn metric_def_not_higher_is_worse() {
+        let d = metric_def("total_iterations").unwrap();
+        assert!(!d.higher_is_worse);
+    }
+
+    #[test]
+    fn metric_def_unknown() {
+        assert!(metric_def("nonexistent").is_none());
+    }
+
+    #[test]
+    fn metric_def_all_entries_unique() {
+        let mut names: Vec<&str> = METRICS.iter().map(|m| m.name).collect();
+        let len = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), len);
+    }
+
+    // -- row_metric_value tests --
+
+    #[test]
+    fn row_metric_value_named_fields() {
+        let mut row = make_row("a", "f", "t", true, 42.0);
+        row.gap_ms = 100;
+        row.migrations = 7;
+        row.migration_ratio = 0.3;
+        row.imbalance_ratio = 2.0;
+        row.max_dsq_depth = 5;
+        row.stall_count = 3;
+        row.fallback_count = 11;
+        row.keep_last_count = 4;
+        row.p99_wake_latency_us = 99.0;
+        row.median_wake_latency_us = 50.0;
+        row.wake_latency_cv = 0.5;
+        row.total_iterations = 1000;
+        row.mean_run_delay_us = 25.0;
+        row.worst_run_delay_us = 200.0;
+        row.page_locality = 0.8;
+        row.cross_node_migration_ratio = 0.1;
+        assert_eq!(row_metric_value(&row, "spread"), 42.0);
+        assert_eq!(row_metric_value(&row, "gap_ms"), 100.0);
+        assert_eq!(row_metric_value(&row, "migrations"), 7.0);
+        assert_eq!(row_metric_value(&row, "migration_ratio"), 0.3);
+        assert_eq!(row_metric_value(&row, "imbalance"), 2.0);
+        assert_eq!(row_metric_value(&row, "dsq_depth"), 5.0);
+        assert_eq!(row_metric_value(&row, "stalls"), 3.0);
+        assert_eq!(row_metric_value(&row, "fallback"), 11.0);
+        assert_eq!(row_metric_value(&row, "keep_last"), 4.0);
+        assert_eq!(row_metric_value(&row, "p99_wake_lat_us"), 99.0);
+        assert_eq!(row_metric_value(&row, "median_wake_lat_us"), 50.0);
+        assert_eq!(row_metric_value(&row, "wake_latency_cv"), 0.5);
+        assert_eq!(row_metric_value(&row, "total_iterations"), 1000.0);
+        assert_eq!(row_metric_value(&row, "mean_run_delay_us"), 25.0);
+        assert_eq!(row_metric_value(&row, "worst_run_delay_us"), 200.0);
+        assert_eq!(row_metric_value(&row, "page_locality"), 0.8);
+        assert_eq!(row_metric_value(&row, "cross_node_migration_ratio"), 0.1);
+    }
+
+    #[test]
+    fn row_metric_value_ext_metrics_fallback() {
+        let mut row = make_row("a", "f", "t", true, 5.0);
+        row.ext_metrics.insert("custom_metric".into(), 77.0);
+        assert_eq!(row_metric_value(&row, "custom_metric"), 77.0);
+        assert_eq!(row_metric_value(&row, "missing_ext"), 0.0);
+    }
+
+    // -- baseline_compare dual-gate threshold tests --
+
+    #[test]
+    fn baseline_compare_dual_gate_both_must_trigger() {
+        use crate::test_support;
+        let make_sidecar = |name: &str, spread: f64| test_support::SidecarResult {
+            test_name: name.to_string(),
+            topology: "1n1l2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: true,
+            stats: ScenarioStats {
+                worst_spread: spread,
+                ..Default::default()
+            },
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let row_a = sidecar_to_row(&make_sidecar("test_a", 10.0));
+        let row_b = sidecar_to_row(&make_sidecar("test_a", 12.0));
+
+        let def = metric_def("spread").unwrap();
+        let delta = row_metric_value(&row_b, "spread") - row_metric_value(&row_a, "spread");
+        let val_a = row_metric_value(&row_a, "spread");
+        let rel_delta = if val_a.abs() > f64::EPSILON {
+            (delta / val_a).abs()
+        } else {
+            0.0
+        };
+        let abs_significant = delta.abs() >= def.default_abs;
+        let rel_significant = rel_delta >= def.default_rel;
+
+        assert_eq!(delta, 2.0);
+        assert!(
+            !abs_significant,
+            "abs delta 2.0 < default_abs 5.0, should not be significant"
+        );
+        assert!(
+            !rel_significant || !abs_significant,
+            "dual gate: both must trigger for significance"
+        );
+    }
+
+    #[test]
+    fn baseline_compare_synthetic_regression_and_improvement() {
+        use crate::test_support;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir_a = tmp.path().join("baselines").join("baseline-a");
+        let dir_b = tmp.path().join("baselines").join("baseline-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let make_sidecar = |name: &str, spread: f64, iters: u64| -> test_support::SidecarResult {
+            test_support::SidecarResult {
+                test_name: name.to_string(),
+                topology: "1n1l2c1t".to_string(),
+                scheduler: "eevdf".to_string(),
+                passed: true,
+                stats: ScenarioStats {
+                    worst_spread: spread,
+                    total_iterations: iters,
+                    ..Default::default()
+                },
+                monitor: None,
+                stimulus_events: vec![],
+                work_type: "CpuSpin".to_string(),
+                verifier_stats: vec![],
+                kvm_stats: None,
+                sysctls: vec![],
+                kargs: vec![],
+                kernel_version: None,
+                timestamp: String::new(),
+                run_id: String::new(),
+            }
+        };
+
+        let sc_a = make_sidecar("test1", 10.0, 1000);
+        let sc_b_regress = make_sidecar("test1", 30.0, 500);
+
+        std::fs::write(
+            dir_a.join("test1.ktstr.json"),
+            serde_json::to_string(&sc_a).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir_b.join("test1.ktstr.json"),
+            serde_json::to_string(&sc_b_regress).unwrap(),
+        )
+        .unwrap();
+
+        let sidecars_a = test_support::collect_sidecars(&dir_a);
+        let sidecars_b = test_support::collect_sidecars(&dir_b);
+        assert_eq!(sidecars_a.len(), 1);
+        assert_eq!(sidecars_b.len(), 1);
+
+        let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
+        let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
+
+        let compare_metrics: Vec<&str> = METRICS.iter().map(|m| m.name).collect();
+        let threshold = 10.0;
+        let rel_thresh = threshold / 100.0;
+        let mut regressions = 0u32;
+
+        for row_b in &rows_b {
+            let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
+            let row_a = rows_a
+                .iter()
+                .find(|r| (&r.scenario, &r.topology, &r.work_type) == key_b);
+            let Some(row_a) = row_a else { continue };
+
+            for metric_name in &compare_metrics {
+                let val_a = row_metric_value(row_a, metric_name);
+                let val_b = row_metric_value(row_b, metric_name);
+                if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
+                    continue;
+                }
+                let def = metric_def(metric_name);
+                let (abs_thresh, higher_is_worse) = match def {
+                    Some(d) => (d.default_abs, d.higher_is_worse),
+                    None => (1.0, true),
+                };
+                let delta = val_b - val_a;
+                let rel_delta = if val_a.abs() > f64::EPSILON {
+                    (delta / val_a).abs()
+                } else {
+                    0.0
+                };
+                let abs_significant = delta.abs() >= abs_thresh;
+                let rel_significant = rel_delta >= rel_thresh;
+                if !abs_significant || !rel_significant {
+                    continue;
+                }
+                let is_regression = if higher_is_worse {
+                    delta > 0.0
+                } else {
+                    delta < 0.0
+                };
+                if is_regression {
+                    regressions += 1;
+                }
+            }
+        }
+
+        assert!(
+            regressions >= 2,
+            "spread 10->30 and total_iterations 1000->500 should both be regressions"
+        );
+    }
+
+    #[test]
+    fn baseline_compare_higher_is_worse_inversion() {
+        let def_iters = metric_def("total_iterations").unwrap();
+        assert!(!def_iters.higher_is_worse);
+        let delta = -100.0;
+        let is_regression = if def_iters.higher_is_worse {
+            delta > 0.0
+        } else {
+            delta < 0.0
+        };
+        assert!(
+            is_regression,
+            "negative delta on higher_is_worse=false should be regression"
+        );
+
+        let def_spread = metric_def("spread").unwrap();
+        assert!(def_spread.higher_is_worse);
+        let delta_pos = 10.0;
+        let is_regression_pos = if def_spread.higher_is_worse {
+            delta_pos > 0.0
+        } else {
+            delta_pos < 0.0
+        };
+        assert!(
+            is_regression_pos,
+            "positive delta on higher_is_worse=true should be regression"
+        );
+    }
 
     proptest::proptest! {
         #[test]
