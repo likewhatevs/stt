@@ -6,9 +6,8 @@
 //! both. Remote failures are non-fatal (logged as warnings).
 //!
 //! Cache entries are serialized as tar archives containing the kernel
-//! image, vmlinux (if present), .config (if present), and
-//! metadata.json, stored as a single blob per cache key in the GHA
-//! cache service.
+//! image, vmlinux (if present), and metadata.json, stored as a single
+//! blob per cache key in the GHA cache service.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -65,9 +64,9 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Pack a cache entry directory into a tar archive in memory.
 ///
-/// The tar contains the kernel image, vmlinux (if present), .config
-/// (if present), and metadata.json from the cache entry directory.
-/// Paths inside the tar are relative filenames (no directory prefix).
+/// The tar contains the kernel image, vmlinux (if present), and
+/// metadata.json from the cache entry directory. Paths inside the
+/// tar are relative filenames (no directory prefix).
 ///
 /// The tar is then compressed with zstd before upload.
 /// [`unpack_and_store`] detects the zstd magic number on download
