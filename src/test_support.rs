@@ -4126,6 +4126,7 @@ pub fn newest_run_dir() -> Option<PathBuf> {
 /// VM cannot proceed without a kernel; silently skipping turns CI
 /// breakage into a green run.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn require_kernel() -> std::path::PathBuf {
     match crate::find_kernel() {
         Ok(Some(p)) => p,
@@ -4147,6 +4148,7 @@ pub(crate) fn require_kernel() -> std::path::PathBuf {
 /// cache entry is corrupt or the build was incomplete, which is an
 /// infrastructure failure rather than a legitimate skip.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn require_vmlinux(kernel_path: &std::path::Path) -> std::path::PathBuf {
     crate::vmm::find_vmlinux(kernel_path).unwrap_or_else(|| {
         panic!(
@@ -4178,6 +4180,7 @@ pub(crate) fn require_binary(package: &str) -> std::path::PathBuf {
 /// or panic. The symbol table is required for any host-side memory
 /// introspection; an unparseable vmlinux is an infrastructure failure.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn require_kernel_symbols(
     vmlinux_path: &std::path::Path,
 ) -> crate::monitor::symbols::KernelSymbols {
