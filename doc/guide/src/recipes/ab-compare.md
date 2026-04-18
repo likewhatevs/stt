@@ -1,7 +1,10 @@
 # A/B Compare Branches
 
 Compare scheduler behavior between two branches by running the
-same `#[ktstr_test]` suite against each and diffing sidecar results.
+same `#[ktstr_test]` suite against each, then using
+`cargo ktstr stats compare` to diff per-metric results with
+dual-gate (absolute and relative) significance and exit non-zero
+on any regression.
 
 ## Setup worktrees
 
@@ -12,54 +15,72 @@ remote everywhere `scx` appears.
 ```sh
 cd ~/opensource/scx
 
-# Create worktree for the baseline branch
+# Create a worktree for the baseline branch.
 git worktree add ~/opensource/scx-main upstream/main
 ```
 
-## Run baseline with sidecars
+## Collect both runs into a shared run root
+
+Each `cargo nextest run --workspace` writes its sidecars into
+`target/ktstr/{kernel}-{ktstr_git_short}/`. The `{git_short}` half
+is baked in by ktstr's `build.rs` from ktstr's own repository, not
+the consumer's, so two worktrees of the same scheduler produce
+identical run keys and would overwrite each other in a shared
+`target/ktstr/`. Move each run out under a branch-tagged name
+before kicking off the next one.
+
+Do **not** set `KTSTR_SIDECAR_DIR`: `cargo ktstr stats list` and
+`cargo ktstr stats compare` always enumerate
+`{CARGO_TARGET_DIR or "target"}/ktstr/` and would not see runs
+written to a custom flat directory.
 
 ```sh
+mkdir -p ~/opensource/scx-runs/ktstr
+
+# Baseline.
 cd ~/opensource/scx-main
-KTSTR_SIDECAR_DIR=./baseline cargo nextest run --workspace
+cargo nextest run --workspace
+mv target/ktstr/* ~/opensource/scx-runs/ktstr/baseline
+
+# Experimental.
+cd ~/opensource/scx
+cargo nextest run --workspace
+mv target/ktstr/* ~/opensource/scx-runs/ktstr/current
 ```
 
-## Run experimental with sidecars
+Each `mv` renames the just-produced `{kernel}-{ktstr_git_short}/`
+subdirectory to a branch-tagged name (`baseline`, `current`) so
+both runs coexist under one root.
+
+## List and compare
+
+Point `cargo ktstr stats` at the shared run root via
+`CARGO_TARGET_DIR`:
 
 ```sh
 cd ~/opensource/scx
-KTSTR_SIDECAR_DIR=./current cargo nextest run --workspace
+CARGO_TARGET_DIR=~/opensource/scx-runs cargo ktstr stats list
+CARGO_TARGET_DIR=~/opensource/scx-runs cargo ktstr stats compare baseline current
 ```
 
-## Compare results
+`cargo ktstr stats compare` joins on
+`(scenario, topology, work_type)`, applies the dual-gate
+significance check from the unified `MetricDef` registry to every
+metric, and prints colored output (red = regression, green =
+improvement). Rows where either side has `passed=false` are
+dropped from the math and counted in the summary line. The exit
+code is non-zero when any regression is detected, so the command
+can gate CI directly.
 
-Diff the sidecar JSON files between the two directories. See
-[Runs](../running-tests/runs.md) for the sidecar format.
-
-Sanity-check that the two runs produced the same test set (same file
-count and same test names):
-
-```sh
-diff <(ls baseline | sort) <(ls current | sort)
-```
-
-Compare pass/fail verdicts for each test that appears in both runs:
-
-```sh
-for f in baseline/*.ktstr.json; do
-    name=$(basename "$f")
-    [ -f "current/$name" ] || continue
-    a=$(jq -r '.passed' "$f")
-    b=$(jq -r '.passed' "current/$name")
-    [ "$a" = "$b" ] || echo "$name: baseline=$a current=$b"
-done
-```
-
-For deeper field-by-field comparison (scheduler telemetry, latency
-percentiles, etc.), use `jq` to extract specific keys and diff those
-between matching sidecar pairs.
+Narrow the comparison with `-E SUBSTRING` (matches `scenario`,
+`topology`, and `work_type`); override the relative gate with
+`--threshold PCT`. The absolute gate from each `MetricDef` is
+unaffected by `--threshold` -- a delta must clear both gates to
+count as significant.
 
 ## Cleanup
 
 ```sh
 git worktree remove ~/opensource/scx-main
+rm -rf ~/opensource/scx-runs
 ```

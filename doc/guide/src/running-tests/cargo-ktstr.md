@@ -265,19 +265,23 @@ most recent run directory under `{CARGO_TARGET_DIR or "target"}/ktstr/`
 
 Print a table of run directories under
 `{CARGO_TARGET_DIR or "target"}/ktstr/` with run key, test count,
-and date.
+and date. `KTSTR_SIDECAR_DIR` is **not** consulted -- runs written
+to a custom path via that variable are invisible here.
 
 ### compare
 
-Load two run directories, join on (scenario, topology, work_type),
-compute per-metric deltas using `MetricDef` polarity and
-thresholds from the unified metric registry, and print colored output
-(red = regression, green = improvement). Exits non-zero on regression.
+Load two run directories from
+`{CARGO_TARGET_DIR or "target"}/ktstr/`, join on
+`(scenario, topology, work_type)`, compute per-metric deltas using
+`MetricDef` polarity and thresholds from the unified metric
+registry, and print colored output (red = regression, green =
+improvement). Exits non-zero on regression. Like `list`, this
+subcommand ignores `KTSTR_SIDECAR_DIR`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-E FILTER` | -- | Substring filter applied to `scenario topology work_type`. |
-| `--threshold PCT` | `10.0` | Relative significance threshold (percentage). Deltas below this percentage are treated as unchanged regardless of direction. Overrides the per-metric `default_rel`. |
+| `--threshold PCT` | per-metric `default_rel` | Relative significance threshold as a percentage. Overrides each metric's `default_rel` from the `MetricDef` registry. The absolute gate (`default_abs`) is independent and is **not** affected by this flag; deltas must clear both gates to count as significant. Omit to use each metric's built-in defaults. |
 
 ### Prerequisites
 
@@ -288,8 +292,12 @@ cargo nextest run --workspace        # generates target/ktstr/{kernel}-{git_shor
 cargo ktstr stats                    # reads the newest run
 ```
 
-Set `KTSTR_SIDECAR_DIR` to override the sidecar directory; otherwise
-the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`.
+Sidecars default to
+`{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`. Set
+`KTSTR_SIDECAR_DIR` only when you need bare `cargo ktstr stats` to
+read from a custom flat directory; the `list` and `compare`
+subcommands always enumerate `target/ktstr/` and do not see runs
+written to a custom path.
 
 ## Install
 

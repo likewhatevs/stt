@@ -2594,6 +2594,10 @@ mod tests {
         assert_eq!(res.regressions, 1, "only alpha row should compare");
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].scenario, "alpha");
+        // Finding carries work_type so two findings sharing
+        // scenario+topology under different workloads stay
+        // distinguishable.
+        assert_eq!(res.findings[0].work_type, "CpuSpin");
 
         // Filter on topology substring is also honored. Both rows
         // share the "tiny-1llc" topology and only worst_spread crosses
