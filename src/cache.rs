@@ -549,9 +549,11 @@ const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
 /// path. The caller must keep the returned `TempDir` alive until
 /// `cache.store()` has copied the file.
 pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
-    let data =
+    let raw =
         fs::read(vmlinux_path).map_err(|e| anyhow::anyhow!("read vmlinux for stripping: {e}"))?;
-    let original_size = data.len();
+    let original_size = raw.len();
+    let data = neutralize_alloc_relocs(&raw)
+        .map_err(|e| anyhow::anyhow!("preprocess vmlinux ELF: {e}"))?;
 
     let out = match strip_keep_list(&data) {
         Ok(buf) => buf,
@@ -575,6 +577,72 @@ pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<(tempfile::Tem
     let stripped_path = tmp_dir.path().join("vmlinux");
     fs::write(&stripped_path, &out).map_err(|e| anyhow::anyhow!("write stripped vmlinux: {e}"))?;
     Ok((tmp_dir, stripped_path))
+}
+
+/// Zero `sh_size` on every `SHT_REL`/`SHT_RELA` section that has the
+/// `SHF_ALLOC` flag set, returning a modified copy of the bytes.
+///
+/// Workaround for `object::build::elf::Builder::read`: the Builder
+/// treats any `SHF_ALLOC` relocation section as a dynamic-relocation
+/// section and parses each entry against an empty (zero-length)
+/// dynamic symbol table. Any entry referencing a non-null symbol
+/// index then trips the bounds check at `read_relocations_impl` and
+/// the whole read fails with `Invalid symbol index N in relocation
+/// section at index M`. Kernels built with `CONFIG_RELOCATABLE` +
+/// `CONFIG_RANDOMIZE_BASE` (any x86_64 defconfig + kASLR build) emit
+/// such sections (e.g. `.rela.dyn`-style entries for kASLR /
+/// static-call patching) so the Builder cannot parse the vmlinux
+/// at all -- both the keep-list strip and the debug-only fallback
+/// fail at parse time, and `strip_vmlinux_debug` returns an error
+/// that the cache build path silently swallows (caching the
+/// unstripped vmlinux), and the test path bubbles up as a panic.
+///
+/// Zeroing `sh_size` makes the Builder see these sections as empty,
+/// so the relocation walk finds no entries and the parse succeeds.
+/// The keep-list pass then deletes the sections by name like any
+/// other non-kept section. The output is identical to what we would
+/// have written if these sections had never been parsed.
+///
+/// No-op for ELFs that have no `SHF_ALLOC` relocation sections
+/// (returns the original bytes copied into a new `Vec`).
+fn neutralize_alloc_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let elf = goblin::elf::Elf::parse(data)
+        .map_err(|e| anyhow::anyhow!("parse vmlinux ELF for preprocess: {e}"))?;
+    let mut out = data.to_vec();
+    let shoff = elf.header.e_shoff as usize;
+    let shentsize = elf.header.e_shentsize as usize;
+    // sh_size byte offset and width within a section header entry.
+    // ELF64 section header layout: sh_name(4) sh_type(4) sh_flags(8)
+    // sh_addr(8) sh_offset(8) sh_size(8) ... -> sh_size at offset 32.
+    // ELF32 layout: sh_name(4) sh_type(4) sh_flags(4) sh_addr(4)
+    // sh_offset(4) sh_size(4) ... -> sh_size at offset 20.
+    let (sh_size_offset, sh_size_width) = if elf.is_64 { (32, 8) } else { (20, 4) };
+    use goblin::elf::section_header::{SHF_ALLOC, SHT_REL, SHT_RELA};
+    for (i, sh) in elf.section_headers.iter().enumerate() {
+        let is_rela = sh.sh_type == SHT_RELA || sh.sh_type == SHT_REL;
+        let is_alloc = sh.sh_flags & u64::from(SHF_ALLOC) != 0;
+        if !(is_rela && is_alloc) {
+            continue;
+        }
+        let entry_offset = shoff
+            .checked_add(
+                i.checked_mul(shentsize)
+                    .ok_or_else(|| anyhow::anyhow!("section header table overflow at index {i}"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("section header offset overflow at index {i}"))?;
+        let size_offset = entry_offset
+            .checked_add(sh_size_offset)
+            .ok_or_else(|| anyhow::anyhow!("sh_size offset overflow at index {i}"))?;
+        let size_end = size_offset
+            .checked_add(sh_size_width)
+            .ok_or_else(|| anyhow::anyhow!("sh_size end overflow at index {i}"))?;
+        if size_end > out.len() {
+            anyhow::bail!("sh_size at section header {i} extends past file end");
+        }
+        // Zero is endian-agnostic.
+        out[size_offset..size_end].fill(0);
+    }
+    Ok(out)
 }
 
 /// Keep-list strip: delete all sections not in VMLINUX_KEEP_SECTIONS.
