@@ -69,9 +69,9 @@ enum KtstrCommand {
     },
     /// Print sidecar analysis and auto-save sidecars as a baseline.
     ///
-    /// Reads sidecar JSON written by `cargo ktstr test` and prints
-    /// gauntlet analysis. When sidecars are found, also saves them
-    /// as a baseline.
+    /// Reads sidecar JSON from `cargo ktstr test` and prints gauntlet
+    /// analysis, BPF verifier stats, callback profile, and KVM stats.
+    /// When sidecars are found, also saves them as a baseline.
     ///
     /// Baselines stored at (first match):
     /// `$KTSTR_CACHE_DIR/../baselines/`, `$XDG_CACHE_HOME/ktstr/baselines/`,

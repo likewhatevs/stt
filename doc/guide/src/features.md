@@ -242,10 +242,10 @@ significance thresholds (absolute and relative) catches regressions
 that single-run assertions miss.
 
 **Metrics:**
-- `spread` — CPU time fairness (0.0 = perfect)
-- `gap_ms` — longest scheduling gap
-- `migrations` / `migration_ratio` — cross-CPU migration volume
-- `imbalance_ratio` — runqueue length imbalance
+- `worst_spread` — CPU time fairness (0.0 = perfect)
+- `worst_gap_ms` — longest scheduling gap
+- `total_migrations` / `worst_migration_ratio` — cross-CPU migration volume
+- `max_imbalance_ratio` — runqueue length imbalance
 - `p99_wake_latency_us` — tail wake-to-run latency
 - `mean_run_delay_us` — mean schedstat run delay
 - `total_iterations` — throughput
