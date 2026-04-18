@@ -28,8 +28,10 @@ fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 ## Helper functions
 
 **`setup_cgroups(ctx, n, wl)`** -- creates N cgroups, spawns workers,
-returns `(Vec<WorkloadHandle>, CgroupGroup)`. See
-[CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
+returns `Result<(Vec<`[`WorkloadHandle`](../architecture/workload-handle.md)`>, `[`CgroupGroup`](../architecture/cgroup-group.md)`)>`.
+Bind the `CgroupGroup` to a named variable (e.g. `_guard`) so it
+lives until end of scope.
+See [CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
 
 **`collect_all(handles, checks)`** -- stops all workers, collects reports,
 runs worker-level checks when configured, otherwise falls back to
@@ -39,11 +41,12 @@ overall result fails.
 **`dfl_wl(ctx)`** -- creates a `WorkloadConfig` with
 `ctx.workers_per_cgroup` workers and default settings.
 
-**`spawn_diverse(ctx, cgroup_names)`** -- spawns different work types
-across cgroups, rotating through (CpuSpin, Bursty{50ms burst /
-100ms sleep}, IoSync, Mixed, YieldHeavy). Each cgroup uses
-`ctx.workers_per_cgroup` workers except IoSync cgroups, which always
-use 2 workers so blocking IO does not drown the scenario.
+**`spawn_diverse(ctx, cgroup_names)`** -- spawns different
+[work types](../concepts/work-types.md) across cgroups, rotating
+through (CpuSpin, Bursty{50ms burst / 100ms sleep}, IoSync, Mixed,
+YieldHeavy). Each cgroup uses `ctx.workers_per_cgroup` workers except
+IoSync cgroups, which always use 2 workers so blocking IO does not
+drown the scenario.
 
 ## The Ctx struct
 

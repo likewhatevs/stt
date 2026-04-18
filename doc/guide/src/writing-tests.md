@@ -22,3 +22,5 @@ Run with `cargo nextest run`. See
 available attributes. Each test also generates gauntlet variants across
 topology presets and flag profiles. See
 [Gauntlet Tests](writing-tests/gauntlet-tests.md).
+For scenarios that need logic beyond what the ops system can express,
+see [Custom Scenarios](writing-tests/custom-scenarios.md).
