@@ -220,6 +220,15 @@ immediately create cgroups, spawn workers, run the workload, and
 return assertion results. `Ctx` provides the guest topology
 (`ctx.topo`) and cgroup management (`ctx.cgroups`).
 
+### What gets checked
+
+Every test automatically checks for worker starvation, scheduling
+fairness, scheduling gaps, and host-side runqueue health (including imbalance,
+stalls, dispatch queue depth). These defaults come from
+`Assert::default_checks()` and can be overridden per-scheduler or
+per-test. See [Verification](concepts/verification.md) for the full
+list of checks and thresholds.
+
 ## Run
 
 No special setup is needed. `#[ktstr_test]` functions work with both
