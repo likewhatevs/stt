@@ -4968,7 +4968,11 @@ mod tests {
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.watchdog_offsets.is_none() {
-            skip!("watchdog_offsets not resolved from BTF");
+            skip!(
+                "scx_sched.watchdog_timeout field not in BTF \
+                 (needs Linux 7.1+; pre-7.1 exposes watchdog timeout as a file-scope \
+                 scx_watchdog_timeout symbol handled separately)"
+            );
         }
 
         const TIMEOUT_SECS: u64 = 7;
@@ -4994,10 +4998,11 @@ mod tests {
              have succeeded. A None report here is a bug in monitor startup",
         );
         let Some(obs) = &report.watchdog_observation else {
-            // Scheduler never attached (scx_root stayed null for the
-            // whole run). Not a watchdog regression — skip.
+            // scx_root remained null for the whole run — the scheduler
+            // never attached. Not a watchdog regression — skip.
             skip!(
-                "watchdog_observation is None (scx_root stayed null; scheduler may not have attached)"
+                "watchdog observation missing — the scheduler did not attach \
+                 (scx_root remained null throughout the run)"
             );
         };
         assert_eq!(
@@ -5132,19 +5137,24 @@ mod tests {
         }
     }
 
-    /// Validate that scx event counters are populated on kernels
-    /// with post-refactor sched_ext (scx_sched_pcpu with embedded
-    /// event_stats).
+    /// Validate that scx event counters populate on scx_sched kernels
+    /// (Linux 6.16+). `event_offsets` resolves via either the 6.18+
+    /// `scx_sched.pcpu → scx_sched_pcpu.event_stats` path or the
+    /// 6.16–6.17 `scx_sched.event_stats_cpu` fallback; see
+    /// `resolve_event_offsets` in `crate::monitor::btf_offsets` for
+    /// the resolver that tries both.
     ///
     /// Gates on scx_root symbol presence and event_offsets BTF
-    /// resolution. On pre-refactor kernels where scx_sched lacks
-    /// the pcpu field, event_offsets is None and this test skips.
+    /// resolution. On pre-6.16 kernels (no scx_sched struct) or when
+    /// neither BTF path resolves, event_offsets is None and this test
+    /// skips.
     ///
-    /// Event PA resolution happens once at monitor start. If the
-    /// scheduler hasn't loaded by then (scx_root dereferences to
-    /// NULL), the monitor skips event counters for the entire run.
-    /// The test skips in that case rather than asserting, matching
-    /// the watchdog test's approach to scheduler-attach timing.
+    /// Event-counter physical-address resolution happens once at
+    /// monitor start. If the scheduler has not attached by then
+    /// (scx_root is still null), the monitor skips event counters
+    /// for the entire run. The test skips in that case rather than
+    /// asserting, matching the watchdog test's approach to
+    /// scheduler-attach timing.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn event_counters_populated_with_scheduler() {
@@ -5157,7 +5167,11 @@ mod tests {
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.event_offsets.is_none() {
-            skip!("event_offsets not resolved from BTF");
+            skip!(
+                "scx event-counter BTF fields not found \
+                 (need either scx_sched.pcpu→scx_sched_pcpu.event_stats [Linux 6.18+] \
+                 or scx_sched.event_stats_cpu [Linux 6.16–6.17])"
+            );
         }
 
         let sched_bin = crate::test_support::require_binary("scx-ktstr");
@@ -5187,8 +5201,9 @@ mod tests {
         let has_event_data = last.cpus.iter().any(|c| c.event_counters.is_some());
         if !has_event_data {
             skip!(
-                "event counters None despite resolved offsets — \
-                 scheduler may not have attached before monitor resolved PAs"
+                "event counters remained None despite resolved offsets — \
+                 the scheduler may not have attached before the monitor \
+                 resolved event-counter physical addresses"
             );
         }
 
@@ -5253,7 +5268,11 @@ mod tests {
 
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.sched_domain_offsets.is_none() {
-            skip!("sched_domain_offsets not resolved from BTF");
+            skip!(
+                "sched_domain BTF fields not found \
+                 (likely a kernel built with CONFIG_SMP=n; \
+                 need both the rq.sd field and the sched_domain struct in BTF)"
+            );
         }
 
         let vm = skip_on_contention!(
@@ -5764,7 +5783,7 @@ mod tests {
         let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
         if rc != 0 {
             // No CAP_SYS_NICE — skip test.
-            skip!("set_rt_priority test: no CAP_SYS_NICE");
+            skip!("no CAP_SYS_NICE capability available");
         }
         // Verify it took effect.
         let policy = unsafe { libc::sched_getscheduler(0) };
@@ -5800,7 +5819,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn boot_kernel_produces_output_aarch64() {
         let Some(kernel) = find_aarch64_image() else {
-            skip!("no aarch64 Image found (only compressed vmlinuz available)");
+            skip!("no aarch64 kernel image found");
         };
 
         let vm = skip_on_contention!(
@@ -5824,7 +5843,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn boot_kernel_smp_topology_aarch64() {
         let Some(kernel) = find_aarch64_image() else {
-            skip!("no aarch64 Image found");
+            skip!("no aarch64 kernel image found");
         };
 
         let vm = skip_on_contention!(
