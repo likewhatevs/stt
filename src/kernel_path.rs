@@ -141,9 +141,9 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
 /// Cache entries carry stripped vmlinux (no DWARF) — `strip_vmlinux_debug`
 /// drops `.debug_*` on every cache entry regardless of source type.
 /// file:line resolution works only for build-tree paths where the
-/// unstripped vmlinux is still present. Routing cache entries at
-/// their original source tree via `source_tree_path` is the scope
-/// of #25.
+/// unstripped vmlinux is still present, or when the caller layers
+/// `cache::prefer_source_tree_for_dwarf` on top to re-route
+/// `SourceType::Local` entries at their original source tree.
 #[allow(dead_code)]
 pub fn derive_kernel_dir(image: &std::path::Path) -> Option<std::path::PathBuf> {
     let canon = std::fs::canonicalize(image).ok()?;

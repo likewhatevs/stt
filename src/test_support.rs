@@ -2464,10 +2464,14 @@ fn attempt_auto_repro(
     // Extract probe JSON from the repro VM and format on the host with
     // kernel_dir so blazesym can resolve source locations via vmlinux
     // DWARF. derive_kernel_dir handles both build-tree and cache-entry
-    // layouts; cached kernels with DWARF stripped still won't recover
-    // file:line (tracked in #25).
-    let kernel_dir =
-        crate::kernel_path::derive_kernel_dir(kernel).and_then(|p| p.to_str().map(String::from));
+    // layouts; for Local cache entries whose source tree is still on
+    // disk, prefer_source_tree_for_dwarf re-routes blazesym to the
+    // unstripped vmlinux in the source tree. Tarball/git cache entries
+    // still can't recover file:line — stripped cache vmlinux is all
+    // we have.
+    let kernel_dir = crate::kernel_path::derive_kernel_dir(kernel)
+        .map(|dir| crate::cache::prefer_source_tree_for_dwarf(&dir).unwrap_or(dir))
+        .and_then(|p| p.to_str().map(String::from));
     let kernel_dir_str = kernel_dir.as_deref();
     let probe_section = extract_probe_output(&repro_result.output, kernel_dir_str);
 

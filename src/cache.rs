@@ -506,6 +506,38 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Re-route a cache-entry directory to its original source tree when
+/// blazesym DWARF access is required.
+///
+/// Cache entries carry vmlinux stripped of `.debug_*` sections
+/// (see [`strip_vmlinux_debug`]), so pointing blazesym at the cache
+/// directory gives no file:line. `SourceType::Local` entries record
+/// the original build tree via [`KernelMetadata::source_tree_path`];
+/// when it is populated and the tree still has an unstripped vmlinux
+/// on disk, this helper returns that path so callers can route
+/// blazesym there instead.
+///
+/// Returns `None` when:
+/// - `dir` has no `metadata.json` (not a cache entry, e.g. a build-tree root).
+/// - Metadata parse fails.
+/// - `source_tree_path` is `None` (tarball/git entries — the source
+///   was a tarball or shallow clone that may no longer be on disk).
+/// - `source_tree_path` exists but has no `vmlinux` file (tree deleted
+///   or rebuilt without saving vmlinux).
+///
+/// In any of those cases callers should fall back to the cache
+/// directory for symbol/BTF lookup — file:line is genuinely
+/// unrecoverable without re-downloading sources.
+pub fn prefer_source_tree_for_dwarf(dir: &Path) -> Option<PathBuf> {
+    let metadata = read_metadata(dir)?;
+    let src_path = metadata.source_tree_path?;
+    if src_path.join("vmlinux").is_file() {
+        Some(src_path)
+    } else {
+        None
+    }
+}
+
 /// Sections whose source bytes are preserved verbatim in the cached
 /// vmlinux. Entries that start as `SHT_NOBITS` (`.bss`) have no
 /// bytes to preserve but the section header is kept so symbols
@@ -1662,6 +1694,113 @@ mod tests {
 
         // Original image must still exist (copy, not move).
         assert!(image.exists());
+    }
+
+    // -- prefer_source_tree_for_dwarf --
+
+    #[test]
+    fn prefer_source_tree_local_with_vmlinux() {
+        // Local-source cache entry whose source tree is still on disk
+        // and has a vmlinux: helper returns the source tree path.
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        let src_tree = tmp.path().join("src");
+        fs::create_dir_all(&cache_entry).unwrap();
+        fs::create_dir_all(&src_tree).unwrap();
+        fs::write(src_tree.join("vmlinux"), b"fake-elf").unwrap();
+
+        let meta = KernelMetadata {
+            version: Some("6.14.2".to_string()),
+            source: SourceType::Local,
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            git_hash: None,
+            git_ref: None,
+            source_tree_path: Some(src_tree.clone()),
+            vmlinux_name: Some("vmlinux".to_string()),
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(prefer_source_tree_for_dwarf(&cache_entry), Some(src_tree));
+    }
+
+    #[test]
+    fn prefer_source_tree_local_without_vmlinux_in_tree() {
+        // Local-source cache entry but source tree lacks vmlinux:
+        // fall back to None so caller keeps the cache-entry path.
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        let src_tree = tmp.path().join("src");
+        fs::create_dir_all(&cache_entry).unwrap();
+        fs::create_dir_all(&src_tree).unwrap();
+        // No vmlinux in src_tree.
+
+        let meta = KernelMetadata {
+            version: None,
+            source: SourceType::Local,
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            git_hash: None,
+            git_ref: None,
+            source_tree_path: Some(src_tree),
+            vmlinux_name: None,
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(prefer_source_tree_for_dwarf(&cache_entry), None);
+    }
+
+    #[test]
+    fn prefer_source_tree_tarball_source_returns_none() {
+        // Tarball source entry has no source_tree_path — return None
+        // so caller uses the cache-entry directory (symbol lookup only,
+        // no file:line).
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        fs::create_dir_all(&cache_entry).unwrap();
+
+        let meta = KernelMetadata {
+            version: Some("6.14.2".to_string()),
+            source: SourceType::Tarball,
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            git_hash: None,
+            git_ref: None,
+            source_tree_path: None,
+            vmlinux_name: Some("vmlinux".to_string()),
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(prefer_source_tree_for_dwarf(&cache_entry), None);
+    }
+
+    #[test]
+    fn prefer_source_tree_no_metadata_returns_none() {
+        // Directory without metadata.json (e.g. a build-tree root, not
+        // a cache entry): return None, caller keeps its existing path.
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(prefer_source_tree_for_dwarf(tmp.path()), None);
     }
 
     // -- strip_vmlinux_debug --
