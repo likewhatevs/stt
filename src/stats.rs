@@ -235,8 +235,8 @@ pub struct GauntletRow {
     pub worst_keep_last_delta: f64,
     pub degradation_count: u32,
     /// Extensible metrics populated by scenarios and processed by the
-    /// generic comparison pipeline. Keyed by metric name (matching
-    /// `MetricDef::name` in `EXTENSIBLE_METRICS`).
+    /// comparison pipeline. Keyed by metric name; looked up via
+    /// [`metric_def`] when a matching entry exists in [`METRICS`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
 }
