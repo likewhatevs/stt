@@ -1896,7 +1896,7 @@ mod tests {
 
         // Symbols pointing at the zeroed data sections must survive.
         // Fixture symbol values are 0x2000/0x3000/0x4000 (nonzero),
-        // so the production-matching require_value filter applies.
+        // so has_symbol's st_value != 0 filter matches them.
         assert!(
             has_symbol(&elf, "test_data_symbol"),
             "test_data_symbol dropped by strip"
