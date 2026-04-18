@@ -191,6 +191,15 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
+### How it runs
+
+The framework boots a KVM VM with the requested topology and runs
+your test binary as the guest's init process. Your test function
+executes **inside the VM** -- `execute_defs` and `execute_steps`
+immediately create cgroups, spawn workers, run the workload, and
+return assertion results. `Ctx` provides the guest topology
+(`ctx.topo`) and cgroup management (`ctx.cgroups`).
+
 ## Run
 
 No special setup is needed. `#[ktstr_test]` functions work with both
