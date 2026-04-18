@@ -30,7 +30,8 @@ automates this:
 - **Clean slate** -- each test boots its own kernel in a KVM VM. No
   shared state between tests.
 - **Topology as code** -- `topology(1, 2, 4, 2)` gives you 1 NUMA
-  node, 2 LLCs, 4 cores, 2 threads. x86_64 and aarch64. The same
+  node, 2 LLCs (last-level caches), 4 cores/LLC, 2 threads. x86_64
+  and aarch64. The same
   test produces the same topology on any host.
 - **Declarative scenarios** -- tests declare cgroups, cpusets, and
   workloads as data (`CgroupDef`, `Step`, `Op`). The framework
@@ -149,6 +150,15 @@ enum MySchedFlag {
     Steal,
 }
 ```
+
+`topology(numa_nodes, llcs, cores_per_llc, threads_per_core)` sets
+the VM's CPU topology -- `topology(1, 2, 4, 1)` creates 1 NUMA node,
+2 LLCs, 4 cores per LLC, 1 thread per core (8 vCPUs). Topologies
+display as `NnNlNcNt` (e.g. `1n2l4c1t`). In `#[ktstr_test]`, use
+named attributes instead: `llcs = 2, cores = 4, threads = 1,
+numa_nodes = 1`. Unset dimensions inherit from the scheduler's
+topology. For non-uniform NUMA, see `Topology::with_nodes()` in the
+[topology guide](https://likewhatevs.github.io/ktstr/guide/concepts/topology.html).
 
 This generates a `const MY_SCHED: Scheduler` and per-variant flag
 constants. Tests referencing `MY_SCHED` inherit its topology and
