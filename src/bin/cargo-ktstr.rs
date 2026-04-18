@@ -81,10 +81,6 @@ enum KtstrCommand {
     Stats {
         #[command(subcommand)]
         command: Option<StatsCommand>,
-        /// Path to the sidecar directory. Defaults to KTSTR_SIDECAR_DIR
-        /// or target/ktstr/{branch}-{hash}/.
-        #[arg(long, global = true)]
-        dir: Option<PathBuf>,
     },
     /// Manage cached kernel images.
     Kernel {
@@ -339,14 +335,14 @@ fn run_coverage(
     Err(format!("exec cargo llvm-cov nextest: {err}"))
 }
 
-fn run_stats(command: &Option<StatsCommand>, dir: &Option<PathBuf>) -> Result<(), String> {
+fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
     match command {
         None => {
-            let output = cli::run_test_stats(dir.as_deref());
+            let output = cli::run_test_stats();
             if !output.is_empty() {
                 print!("{output}");
             }
-            if let Err(e) = cli::auto_save_baseline(dir.as_deref()) {
+            if let Err(e) = cli::auto_save_baseline() {
                 eprintln!("cargo ktstr: baseline save: {e:#}");
             }
             Ok(())
@@ -845,10 +841,7 @@ fn main() {
             all_profiles,
             profiles,
         ),
-        KtstrCommand::Stats {
-            ref command,
-            ref dir,
-        } => run_stats(command, dir),
+        KtstrCommand::Stats { ref command } => run_stats(command),
         KtstrCommand::Shell {
             kernel,
             topology,

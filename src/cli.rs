@@ -719,15 +719,14 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 
 /// Read sidecar JSON files and return the gauntlet analysis report.
 ///
-/// When `dir` is `Some`, reads from that directory. Otherwise uses
-/// the default sidecar directory (KTSTR_SIDECAR_DIR or
+/// Reads from the default sidecar directory (KTSTR_SIDECAR_DIR or
 /// `target/ktstr/{branch}-{hash}/`).
 ///
 /// Returns an empty report with a warning on stderr when no sidecars
 /// are found. This is not an error -- regular test runs that skip
 /// gauntlet tests produce no sidecar files.
-pub fn run_test_stats(dir: Option<&std::path::Path>) -> String {
-    let report = crate::test_support::analyze_sidecars(dir);
+pub fn run_test_stats() -> String {
+    let report = crate::test_support::analyze_sidecars(None);
     if report.is_empty() {
         eprintln!("cargo ktstr: no sidecar data found (skipped)");
         return String::new();
@@ -736,10 +735,9 @@ pub fn run_test_stats(dir: Option<&std::path::Path>) -> String {
 }
 
 /// Auto-save sidecars as a baseline.
-pub fn auto_save_baseline(dir: Option<&std::path::Path>) -> Result<()> {
-    let sidecars = crate::test_support::collect_sidecars(
-        dir.unwrap_or(&crate::test_support::default_sidecar_dir()),
-    );
+pub fn auto_save_baseline() -> Result<()> {
+    let sidecars =
+        crate::test_support::collect_sidecars(&crate::test_support::default_sidecar_dir());
     if sidecars.is_empty() {
         return Ok(());
     }
@@ -1592,18 +1590,19 @@ mod tests {
         assert_eq!(args, vec!["-j16", "KCFLAGS=-Wno-error"]);
     }
 
-    // -- run_test_stats --
+    // -- analyze_sidecars (library API used by run_test_stats) --
 
     #[test]
-    fn cli_test_stats_empty_dir() {
+    fn cli_analyze_sidecars_empty_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let result = run_test_stats(Some(tmp.path()));
+        let result = crate::test_support::analyze_sidecars(Some(tmp.path()));
         assert!(result.is_empty());
     }
 
     #[test]
-    fn cli_test_stats_nonexistent_dir() {
-        let result = run_test_stats(Some(std::path::Path::new("/nonexistent/path")));
+    fn cli_analyze_sidecars_nonexistent_dir() {
+        let result =
+            crate::test_support::analyze_sidecars(Some(std::path::Path::new("/nonexistent/path")));
         assert!(result.is_empty());
     }
 

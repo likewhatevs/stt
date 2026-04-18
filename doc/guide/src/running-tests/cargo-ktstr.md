@@ -241,8 +241,7 @@ cargo ktstr completions fish > ~/.config/fish/completions/cargo-ktstr.fish
 Sidecar analysis and baseline comparison.
 
 ```sh
-cargo ktstr stats                          # print gauntlet analysis (default sidecar dir)
-cargo ktstr stats --dir path/to/dir        # explicit sidecar directory
+cargo ktstr stats                          # print gauntlet analysis
 cargo ktstr stats list                     # list saved baselines
 cargo ktstr stats compare <a> <b>          # compare two baselines
 cargo ktstr stats compare <a> <b> -E filt  # compare with filter
@@ -287,10 +286,6 @@ cargo ktstr stats                    # reads them
 ```
 
 Set `KTSTR_SIDECAR_DIR` to override the default sidecar directory.
-
-| Flag | Description |
-|------|-------------|
-| `--dir PATH` | Path to the sidecar directory. Defaults to `KTSTR_SIDECAR_DIR` or `target/ktstr/{branch}-{hash}/`. |
 
 ## Deprecated: build-kernel
 
