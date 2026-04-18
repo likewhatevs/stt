@@ -46,7 +46,7 @@ both the host-side CLI (`ktstr`) and the dev workflow plugin
 
 ## Add the dependency
 
-Add ktstr as a dependency:
+Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]

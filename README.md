@@ -52,15 +52,26 @@ automates this:
 
 ## Installation
 
-```sh
-cargo install ktstr                   # both binaries (ktstr + cargo-ktstr)
-cargo install cargo-nextest           # recommended test runner (optional)
+Add ktstr as a dev-dependency:
+
+```toml
+[dev-dependencies]
+ktstr = { version = "0.4" }
 ```
 
-`ktstr` is the host-side CLI for running scenarios and managing cached
-kernel images (outside VMs). `cargo-ktstr` (included in the same crate)
-automates kernel configuration, building, and test execution in one
-command. `scx-ktstr` (the test fixture scheduler) is built automatically
+This is all test authors need -- run with
+[cargo-nextest](https://nexte.st/) or `cargo test`.
+The `anyhow::Result` referenced in examples below is re-exported
+through `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
+
+**Optional CLI tools** (`cargo install ktstr`) installs two binaries:
+
+- `ktstr` -- host-side CLI for running scenarios outside VMs and
+  managing cached kernel images
+- `cargo-ktstr` -- wraps `cargo nextest run` with kernel resolution,
+  coverage, verifier stats, and shell access
+
+`scx-ktstr` (the test fixture scheduler) is built automatically
 by the workspace and does not need a separate install.
 
 ## Setup
@@ -98,17 +109,6 @@ sudo apt install clang pkg-config make gcc autoconf autopoint flex bison gawk
 # Fedora
 sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 ```
-
-**Add to your crate**:
-
-```toml
-[dev-dependencies]
-ktstr = { version = "0.4" }
-```
-
-The `anyhow::Result` referenced in examples below is re-exported
-through `ktstr::prelude`; consumers do not need a separate `anyhow`
-dev-dependency for the shown code to compile.
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
 
@@ -221,6 +221,7 @@ Requires `/dev/kvm`.
 
 ### Dev workflow
 
+These commands require `cargo install ktstr` (see [Installation](#installation)).
 The frictionless loop is to build a cached kernel once and then run
 tests against the cache:
 
