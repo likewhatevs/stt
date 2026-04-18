@@ -535,6 +535,9 @@ const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
 const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
     b".data",         // holds init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
     b".data..percpu", // holds runqueues (per-CPU runqueue template)
+    b".init.data",    // no current consumer; header kept for symbol
+                      // survival if future kernels place monitored
+                      // symbols here
 ];
 
 /// Strip vmlinux for caching. Sections fall into three groups:
