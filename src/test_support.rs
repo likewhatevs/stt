@@ -3894,6 +3894,12 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
                 return Ok(Some(candidate));
             }
 
+            // 5. Build the scheduler package on demand.
+            match crate::build_and_find_binary(name) {
+                Ok(path) => return Ok(Some(path)),
+                Err(e) => eprintln!("ktstr: auto-build scheduler '{name}' failed: {e:#}"),
+            }
+
             anyhow::bail!(
                 "scheduler '{name}' not found. Set KTSTR_SCHEDULER or \
                  place it next to the test binary or in target/{{debug,release}}/"
