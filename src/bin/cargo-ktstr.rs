@@ -71,8 +71,11 @@ enum KtstrCommand {
     ///
     /// Reads sidecar JSON written by `cargo ktstr test` and prints
     /// gauntlet analysis. When sidecars are found, also saves them
-    /// as a baseline under `~/.cache/ktstr/baselines/` (or
-    /// `KTSTR_CACHE_DIR` / `XDG_CACHE_HOME` if set).
+    /// as a baseline.
+    ///
+    /// Baselines stored at (first match):
+    /// `$KTSTR_CACHE_DIR/../baselines/`, `$XDG_CACHE_HOME/ktstr/baselines/`,
+    /// or `~/.cache/ktstr/baselines/`.
     ///
     /// Use `list` to see saved baselines; `compare <a> <b>` to diff two.
     Stats {

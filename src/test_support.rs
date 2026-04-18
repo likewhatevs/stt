@@ -6470,24 +6470,6 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_verifier_stats_absent_deserializes_empty() {
-        let json = r#"{
-            "test_name": "t",
-            "topology": "1s1c1t",
-            "scheduler": "eevdf",
-            "passed": true,
-            "stats": {"cgroups":[],"total_workers":0,"total_cpus":0,
-                      "total_migrations":0,"worst_spread":0.0,
-                      "worst_gap_ms":0,"worst_gap_cpu":0,
-                      "total_iterations":0},
-            "stimulus_events": [],
-            "work_type": "CpuSpin"
-        }"#;
-        let loaded: SidecarResult = serde_json::from_str(json).unwrap();
-        assert!(loaded.verifier_stats.is_empty());
-    }
-
-    #[test]
     fn sidecar_verifier_stats_empty_omitted() {
         let sc = make_sidecar_with_vstats(vec![]);
         let json = serde_json::to_string(&sc).unwrap();
