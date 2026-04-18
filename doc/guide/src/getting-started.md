@@ -141,7 +141,9 @@ Create a file in your crate's `tests/` directory (e.g.
 [`prelude`](https://likewhatevs.github.io/ktstr/api/ktstr/prelude/index.html)
 module re-exports the types you need.
 
-The simplest test uses a canned scenario:
+The simplest test uses a canned scenario. `AssertResult` carries the
+pass/fail verdict, diagnostic messages, and per-cgroup statistics from
+the run.
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -156,7 +158,9 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 For custom cgroup topology, declare cgroups with `CgroupDef` and run
-them with `execute_defs`. This is the most common custom test pattern:
+them with `execute_defs`. A `CgroupDef` bundles the cgroup name,
+optional cpuset, and workload specification into a single declaration.
+This is the most common custom test pattern:
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -167,13 +171,16 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("cg_0").workers(4),
         CgroupDef::named("cg_1")
             .workers(2)
+            // bursty(50, 100): CPU burst for 50 ms, sleep for 100 ms, repeat.
             .work_type(WorkType::bursty(50, 100)),
     ])
 }
 ```
 
 For multi-phase scenarios with dynamic topology changes, use
-`Step::with_defs` and `execute_steps`:
+`Step::with_defs` and `execute_steps`. `Step::with_defs` pairs a list
+of `CgroupDef`s with a `HoldSpec` that controls how long the step
+runs. `HoldSpec::FULL` holds for the entire scenario duration.
 
 ```rust,ignore
 use ktstr::prelude::*;
