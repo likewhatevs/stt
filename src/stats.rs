@@ -191,6 +191,13 @@ pub struct GauntletRow {
     pub flags: String,
     pub topology: String,
     pub work_type: String,
+    /// Scheduler binary name carried from the source sidecar
+    /// (`SidecarResult::scheduler`). Empty when the row was built
+    /// from a [`VmRunResult`] via [`extract_rows`], because the
+    /// inline gauntlet label format does not embed the scheduler.
+    /// Surfaced through the substring filter in [`compare_rows`] so
+    /// users can narrow A/B comparisons by scheduler name.
+    pub scheduler: String,
     pub replica: u32,
     pub passed: bool,
     pub spread: f64,
@@ -234,6 +241,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         flags: String::new(),
         topology: sc.topology.clone(),
         work_type: sc.work_type.clone(),
+        scheduler: sc.scheduler.clone(),
         replica: 1,
         passed: sc.passed,
         spread: sc.stats.worst_spread,
@@ -433,6 +441,11 @@ pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
             flags: flags.to_string(),
             topology: topo.to_string(),
             work_type: work_type.to_string(),
+            // Scheduler isn't encoded in the gauntlet label format
+            // ("topology/scenario/flags[/work_type][#replica]") and
+            // VmRunResult does not carry it separately. Sidecar-based
+            // rows populate this via sidecar_to_row.
+            scheduler: String::new(),
             replica,
             passed: r.passed,
             spread: stats.map(|s| s.worst_spread).unwrap_or(0.0),
@@ -1335,7 +1348,11 @@ pub(crate) struct CompareReport {
 /// Pure function: no I/O, no globals. Pairs `rows_a` and `rows_b` by
 /// `(scenario, topology, work_type)`. When `filter` is `Some(s)`, a
 /// row is included only if `s` appears as a substring of the joined
-/// `"scenario topology work_type"` key.
+/// `"scenario topology scheduler work_type"` string. The scheduler
+/// is searchable via the filter but is not part of the pairing key,
+/// so the same scenario+topology+work_type pair compares correctly
+/// across different scheduler binaries when the filter does not
+/// constrain it.
 ///
 /// Row-pair accounting:
 /// - B-side rows with no A-side match are counted in `new_in_b`.
@@ -1367,7 +1384,10 @@ pub(crate) fn compare_rows(
     for row_b in rows_b {
         let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
         if let Some(f) = filter {
-            let joined = format!("{} {} {}", key_b.0, key_b.1, key_b.2);
+            let joined = format!(
+                "{} {} {} {}",
+                row_b.scenario, row_b.topology, row_b.scheduler, row_b.work_type,
+            );
             if !joined.contains(f) {
                 continue;
             }
@@ -1438,7 +1458,10 @@ pub(crate) fn compare_rows(
     for row_a in rows_a {
         let key_a = (&row_a.scenario, &row_a.topology, &row_a.work_type);
         if let Some(f) = filter {
-            let joined = format!("{} {} {}", key_a.0, key_a.1, key_a.2);
+            let joined = format!(
+                "{} {} {} {}",
+                row_a.scenario, row_a.topology, row_a.scheduler, row_a.work_type,
+            );
             if !joined.contains(f) {
                 continue;
             }
@@ -1713,6 +1736,7 @@ mod tests {
             flags: flags.into(),
             topology: topo.into(),
             work_type: "CpuSpin".into(),
+            scheduler: String::new(),
             replica: 1,
             passed,
             spread,
@@ -2626,7 +2650,7 @@ mod tests {
     fn compare_rows_filter_substring() {
         // Two scenarios in each run. Filter "alpha" must match the
         // alpha row (substring of the joined "scenario topology
-        // work_type" key) and exclude the beta row.
+        // scheduler work_type" string) and exclude the beta row.
         let rows_a = vec![
             cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
             cmp_row("beta", "tiny-1llc", true, 10.0, 0),
@@ -2761,6 +2785,31 @@ mod tests {
         assert_eq!(filtered.regressions, 1);
         assert_eq!(filtered.findings.len(), 1);
         assert_eq!(filtered.findings[0].scenario, "alpha");
+    }
+
+    /// The substring filter searches the joined "scenario topology
+    /// scheduler work_type" string, so a scheduler name uniquely
+    /// scopes the comparison even when scenarios and topologies
+    /// overlap. Without scheduler in the join string this would
+    /// require a less-precise substring (e.g. a scenario name).
+    #[test]
+    fn compare_rows_filter_substring_matches_scheduler() {
+        let mut a1 = cmp_row("test1", "tiny-1llc", true, 10.0, 0);
+        a1.scheduler = "scx_alpha".into();
+        let mut a2 = cmp_row("test2", "tiny-1llc", true, 10.0, 0);
+        a2.scheduler = "scx_beta".into();
+        let mut b1 = cmp_row("test1", "tiny-1llc", true, 30.0, 0);
+        b1.scheduler = "scx_alpha".into();
+        let mut b2 = cmp_row("test2", "tiny-1llc", true, 30.0, 0);
+        b2.scheduler = "scx_beta".into();
+
+        let res = compare_rows(&[a1, a2], &[b1, b2], Some("scx_alpha"), None);
+        assert_eq!(res.regressions, 1, "only the scx_alpha row compares");
+        assert_eq!(res.findings.len(), 1);
+        assert_eq!(res.findings[0].scenario, "test1");
+        // scx_beta rows are filtered out, not counted as new/removed.
+        assert_eq!(res.new_in_b, 0);
+        assert_eq!(res.removed_from_a, 0);
     }
 
     /// `new_in_b` counts B-side rows whose key has no match on the A

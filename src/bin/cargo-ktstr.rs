@@ -154,7 +154,8 @@ enum StatsCommand {
         a: String,
         /// Run key B (from `cargo ktstr stats list`).
         b: String,
-        /// Substring filter. Matches against scenario, topology, work_type.
+        /// Substring filter. Matches against scenario, topology,
+        /// scheduler, work_type.
         #[arg(short = 'E', long)]
         filter: Option<String>,
         /// Relative significance threshold in percent (e.g. 10 for 10%).

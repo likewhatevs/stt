@@ -279,7 +279,7 @@ thresholds from the unified metric registry, and print colored output
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-E FILTER` | -- | Substring filter applied to `scenario topology work_type`. |
+| `-E FILTER` | -- | Substring filter applied to `scenario topology scheduler work_type`. The scheduler is searchable via the filter but is not part of the pairing key, so the same `(scenario, topology, work_type)` pair still compares across different scheduler binaries when the filter does not constrain it. |
 | `--threshold PCT` | per-metric `default_rel` | Relative significance threshold in percent. The comparison is dual-gated: a delta must exceed both `--threshold` (relative gate) and the metric's `default_abs` (absolute gate) to count as a regression or improvement. `--threshold` overrides the per-metric `default_rel` only; the absolute gate is always per-metric and cannot be tuned from the CLI. When omitted, each metric's built-in `default_rel` applies (0.10 fallback for unknown metrics). |
 
 ### Prerequisites
