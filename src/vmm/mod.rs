@@ -4994,7 +4994,7 @@ mod tests {
         // `scx_sched.watchdog_timeout` is a struct field.
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
-            skip!("scx_root not present (pre-6.16 kernel, uses older SCX API); needs Linux 6.16+");
+            skip!("scx_root not present (needs Linux 6.16+ with sched_ext enabled)");
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.watchdog_offsets.is_none() {
@@ -5183,7 +5183,7 @@ mod tests {
 
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
-            skip!("scx_root not present (pre-6.16 kernel, uses older SCX API); needs Linux 6.16+");
+            skip!("scx_root not present (needs Linux 6.16+ with sched_ext enabled)");
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.event_offsets.is_none() {
