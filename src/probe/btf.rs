@@ -138,13 +138,12 @@ pub struct FieldSpec {
 /// Handles chained pointer dereferences (e.g. `->cpus_ptr->bits[0]`)
 /// by reading through intermediate pointers.
 pub fn resolve_field_specs(btf_func: &BtfFunc, vmlinux_path: Option<&str>) -> Vec<FieldSpec> {
-    use btf_rs::Btf;
-
     let btf_path = vmlinux_path.unwrap_or("/sys/kernel/btf/vmlinux");
-    let btf = match Btf::from_file(btf_path) {
+    let btf = match crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(btf_path))
+    {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(%e, path = btf_path, "resolve_field_specs: failed to parse BTF");
+            tracing::warn!(%e, path = btf_path, "resolve_field_specs: failed to load BTF");
             return Vec::new();
         }
     };
@@ -458,13 +457,14 @@ fn resolve_pointed_struct(
 /// Detects `char *` parameters (`is_string_ptr`) by chasing the type chain
 /// to an `Int` of size 1.
 pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> Vec<BtfFunc> {
-    use btf_rs::{Btf, BtfType, Type};
+    use btf_rs::{BtfType, Type};
 
     let btf_path = vmlinux_path.unwrap_or("/sys/kernel/btf/vmlinux");
-    let btf = match Btf::from_file(btf_path) {
+    let btf = match crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(btf_path))
+    {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(%e, path = btf_path, "btf: failed to parse");
+            tracing::warn!(%e, path = btf_path, "btf: failed to load");
             return Vec::new();
         }
     };
@@ -1861,5 +1861,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- parse_btf_functions / resolve_field_specs against ELF vmlinux --
+    //
+    // btf_rs::Btf::from_file only accepts raw-BTF magic and fails on an
+    // ELF vmlinux. The previous implementation swallowed that failure
+    // and silently returned an empty Vec. The regression guard: give
+    // both entry points an ELF vmlinux and assert they produce
+    // non-empty results.
+
+    #[test]
+    fn parse_btf_functions_accepts_elf_vmlinux() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+        };
+        if path.starts_with("/sys/") {
+            skip!("vmlinux is raw BTF, this test exercises the ELF path");
+        }
+        let funcs = parse_btf_functions(&["do_exit"], Some(path.to_str().unwrap()));
+        assert!(
+            !funcs.is_empty(),
+            "ELF vmlinux should yield a BtfFunc for do_exit"
+        );
+        assert_eq!(funcs[0].name, "do_exit");
+        assert!(
+            !funcs[0].params.is_empty(),
+            "do_exit should have at least one parameter resolved from BTF"
+        );
+    }
+
+    #[test]
+    fn resolve_field_specs_accepts_elf_vmlinux() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+        };
+        if path.starts_with("/sys/") {
+            skip!("vmlinux is raw BTF, this test exercises the ELF path");
+        }
+        // Minimal BtfFunc that maps a STRUCT_FIELDS-eligible param so
+        // resolve_field_specs has something to resolve against the BTF.
+        let func = BtfFunc {
+            name: "test_fn".to_string(),
+            params: vec![BtfParam {
+                name: "p".to_string(),
+                struct_name: Some("task_struct".to_string()),
+                is_ptr: true,
+                ..Default::default()
+            }],
+            is_variadic: false,
+        };
+        let specs = resolve_field_specs(&func, Some(path.to_str().unwrap()));
+        assert!(
+            !specs.is_empty(),
+            "task_struct STRUCT_FIELDS should resolve from ELF vmlinux BTF"
+        );
     }
 }
