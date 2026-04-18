@@ -11,11 +11,36 @@ use polars::prelude::*;
 use crate::timeline::Timeline;
 use crate::vmm::shm_ring;
 
+/// How multiple rows sharing a pairing key collapse into one
+/// value during comparison. See
+/// [`cross-test-stats-comparison`](crate) design for the
+/// rule per metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Aggregator {
+    /// Arithmetic mean of per-row values.
+    Mean,
+    /// Sum of per-row values.
+    Sum,
+    /// Largest per-row value.
+    Max,
+    /// Smallest per-row value.
+    Min,
+}
+
 /// Definition of a metric for the comparison pipeline.
 ///
 /// Each entry describes polarity (`higher_is_worse`), dual-gate
-/// significance thresholds (`default_abs`, `default_rel`), and a
-/// display unit string for formatted output.
+/// significance thresholds (`default_abs`, `default_rel`), a
+/// display unit string for formatted output, a row accessor
+/// (`accessor`) that returns the metric's value from a
+/// [`GauntletRow`] without a hand-maintained name→field match,
+/// and an [`Aggregator`] that describes how to reduce multiple
+/// matching rows to one value when the comparison pairing key
+/// collapses them.
+///
+/// The `accessor` field is skipped in serde output — `fn`
+/// pointers are not serializable and the function identity is
+/// reconstructable from `name` via [`metric_def`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricDef {
     pub name: &'static str,
@@ -23,6 +48,19 @@ pub struct MetricDef {
     pub default_abs: f64,
     pub default_rel: f64,
     pub display_unit: &'static str,
+    pub aggregate: Aggregator,
+    #[serde(skip)]
+    pub accessor: fn(&GauntletRow) -> Option<f64>,
+}
+
+impl MetricDef {
+    /// Read this metric's value from `row`. Consults the
+    /// accessor first (for built-in `GauntletRow` fields) and
+    /// falls back to `row.ext_metrics[self.name]` when the
+    /// accessor returns `None`.
+    pub fn read(&self, row: &GauntletRow) -> Option<f64> {
+        (self.accessor)(row).or_else(|| row.ext_metrics.get(self.name).copied())
+    }
 }
 
 /// Unified metric registry covering all built-in and extensible metrics.
@@ -45,6 +83,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 5.0,
         default_rel: 0.25,
         display_unit: "%",
+        aggregate: Aggregator::Max,
+        accessor: |r| Some(r.spread),
     },
     MetricDef {
         name: "worst_gap_ms",
@@ -52,6 +92,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 500.0,
         default_rel: 0.50,
         display_unit: "ms",
+        aggregate: Aggregator::Max,
+        accessor: |r| Some(r.gap_ms as f64),
     },
     MetricDef {
         name: "total_migrations",
@@ -59,6 +101,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 10.0,
         default_rel: 0.30,
         display_unit: "",
+        aggregate: Aggregator::Sum,
+        accessor: |r| Some(r.migrations as f64),
     },
     MetricDef {
         name: "worst_migration_ratio",
@@ -66,6 +110,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
+        aggregate: Aggregator::Max,
+        accessor: |r| Some(r.migration_ratio),
     },
     MetricDef {
         name: "max_imbalance_ratio",
@@ -73,6 +119,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 1.0,
         default_rel: 0.25,
         display_unit: "x",
+        aggregate: Aggregator::Max,
+        accessor: |r| Some(r.imbalance_ratio),
     },
     MetricDef {
         name: "max_dsq_depth",
@@ -80,6 +128,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
+        aggregate: Aggregator::Max,
+        accessor: |r| Some(r.max_dsq_depth as f64),
     },
     MetricDef {
         name: "stall_count",
@@ -87,6 +137,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "",
+        aggregate: Aggregator::Sum,
+        accessor: |r| Some(r.stall_count as f64),
     },
     MetricDef {
         name: "total_fallback",
@@ -94,6 +146,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 5.0,
         default_rel: 0.30,
         display_unit: "/s",
+        aggregate: Aggregator::Sum,
+        accessor: |r| Some(r.fallback_count as f64),
     },
     MetricDef {
         name: "total_keep_last",
@@ -101,6 +155,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 5.0,
         default_rel: 0.30,
         display_unit: "/s",
+        aggregate: Aggregator::Sum,
+        accessor: |r| Some(r.keep_last_count as f64),
     },
     MetricDef {
         name: "p99_wake_latency_us",
@@ -108,6 +164,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
+        aggregate: Aggregator::Mean,
+        accessor: |r| Some(r.p99_wake_latency_us),
     },
     MetricDef {
         name: "median_wake_latency_us",
@@ -115,6 +173,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 20.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
+        aggregate: Aggregator::Mean,
+        accessor: |r| Some(r.median_wake_latency_us),
     },
     MetricDef {
         name: "wake_latency_cv",
@@ -122,6 +182,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.10,
         default_rel: 0.25,
         display_unit: "",
+        aggregate: Aggregator::Mean,
+        accessor: |r| Some(r.wake_latency_cv),
     },
     MetricDef {
         name: "total_iterations",
@@ -129,6 +191,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 100.0,
         default_rel: 0.10,
         display_unit: "",
+        aggregate: Aggregator::Sum,
+        accessor: |r| Some(r.total_iterations as f64),
     },
     MetricDef {
         name: "mean_run_delay_us",
@@ -136,6 +200,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
+        aggregate: Aggregator::Mean,
+        accessor: |r| Some(r.mean_run_delay_us),
     },
     MetricDef {
         name: "worst_run_delay_us",
@@ -143,6 +209,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 100.0,
         default_rel: 0.50,
         display_unit: "\u{00b5}s",
+        aggregate: Aggregator::Max,
+        accessor: |r| Some(r.worst_run_delay_us),
     },
     MetricDef {
         name: "worst_page_locality",
@@ -150,6 +218,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.05,
         default_rel: 0.10,
         display_unit: "",
+        aggregate: Aggregator::Min,
+        accessor: |r| Some(r.page_locality),
     },
     MetricDef {
         name: "worst_cross_node_migration_ratio",
@@ -157,6 +227,8 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
+        aggregate: Aggregator::Max,
+        accessor: |r| Some(r.cross_node_migration_ratio),
     },
 ];
 
@@ -1406,8 +1478,8 @@ pub(crate) fn compare_rows(
         }
 
         for m in METRICS {
-            let val_a = row_metric_value(row_a, m.name);
-            let val_b = row_metric_value(row_b, m.name);
+            let val_a = m.read(row_a).unwrap_or(0.0);
+            let val_b = m.read(row_b).unwrap_or(0.0);
             if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
                 continue;
             }
@@ -1559,30 +1631,6 @@ pub fn compare_runs(
     }
 
     Ok(if report.regressions > 0 { 1 } else { 0 })
-}
-
-/// Extract a named metric value from a GauntletRow.
-fn row_metric_value(row: &GauntletRow, name: &str) -> f64 {
-    match name {
-        "worst_spread" => row.spread,
-        "worst_gap_ms" => row.gap_ms as f64,
-        "total_migrations" => row.migrations as f64,
-        "worst_migration_ratio" => row.migration_ratio,
-        "max_imbalance_ratio" => row.imbalance_ratio,
-        "max_dsq_depth" => row.max_dsq_depth as f64,
-        "stall_count" => row.stall_count as f64,
-        "total_fallback" => row.fallback_count as f64,
-        "total_keep_last" => row.keep_last_count as f64,
-        "p99_wake_latency_us" => row.p99_wake_latency_us,
-        "median_wake_latency_us" => row.median_wake_latency_us,
-        "wake_latency_cv" => row.wake_latency_cv,
-        "total_iterations" => row.total_iterations as f64,
-        "mean_run_delay_us" => row.mean_run_delay_us,
-        "worst_run_delay_us" => row.worst_run_delay_us,
-        "worst_page_locality" => row.page_locality,
-        "worst_cross_node_migration_ratio" => row.cross_node_migration_ratio,
-        _ => row.ext_metrics.get(name).copied().unwrap_or(0.0),
-    }
 }
 
 #[cfg(test)]
@@ -2439,10 +2487,14 @@ mod tests {
         assert_eq!(names.len(), len);
     }
 
-    // -- row_metric_value tests --
+    // -- MetricDef::read tests --
+
+    fn read_metric(row: &GauntletRow, name: &str) -> Option<f64> {
+        metric_def(name).expect("metric name").read(row)
+    }
 
     #[test]
-    fn row_metric_value_named_fields() {
+    fn metric_def_read_named_fields() {
         let mut row = make_row("a", "f", "t", true, 42.0);
         row.gap_ms = 100;
         row.migrations = 7;
@@ -2460,34 +2512,43 @@ mod tests {
         row.worst_run_delay_us = 200.0;
         row.page_locality = 0.8;
         row.cross_node_migration_ratio = 0.1;
-        assert_eq!(row_metric_value(&row, "worst_spread"), 42.0);
-        assert_eq!(row_metric_value(&row, "worst_gap_ms"), 100.0);
-        assert_eq!(row_metric_value(&row, "total_migrations"), 7.0);
-        assert_eq!(row_metric_value(&row, "worst_migration_ratio"), 0.3);
-        assert_eq!(row_metric_value(&row, "max_imbalance_ratio"), 2.0);
-        assert_eq!(row_metric_value(&row, "max_dsq_depth"), 5.0);
-        assert_eq!(row_metric_value(&row, "stall_count"), 3.0);
-        assert_eq!(row_metric_value(&row, "total_fallback"), 11.0);
-        assert_eq!(row_metric_value(&row, "total_keep_last"), 4.0);
-        assert_eq!(row_metric_value(&row, "p99_wake_latency_us"), 99.0);
-        assert_eq!(row_metric_value(&row, "median_wake_latency_us"), 50.0);
-        assert_eq!(row_metric_value(&row, "wake_latency_cv"), 0.5);
-        assert_eq!(row_metric_value(&row, "total_iterations"), 1000.0);
-        assert_eq!(row_metric_value(&row, "mean_run_delay_us"), 25.0);
-        assert_eq!(row_metric_value(&row, "worst_run_delay_us"), 200.0);
-        assert_eq!(row_metric_value(&row, "worst_page_locality"), 0.8);
+        assert_eq!(read_metric(&row, "worst_spread"), Some(42.0));
+        assert_eq!(read_metric(&row, "worst_gap_ms"), Some(100.0));
+        assert_eq!(read_metric(&row, "total_migrations"), Some(7.0));
+        assert_eq!(read_metric(&row, "worst_migration_ratio"), Some(0.3));
+        assert_eq!(read_metric(&row, "max_imbalance_ratio"), Some(2.0));
+        assert_eq!(read_metric(&row, "max_dsq_depth"), Some(5.0));
+        assert_eq!(read_metric(&row, "stall_count"), Some(3.0));
+        assert_eq!(read_metric(&row, "total_fallback"), Some(11.0));
+        assert_eq!(read_metric(&row, "total_keep_last"), Some(4.0));
+        assert_eq!(read_metric(&row, "p99_wake_latency_us"), Some(99.0));
+        assert_eq!(read_metric(&row, "median_wake_latency_us"), Some(50.0));
+        assert_eq!(read_metric(&row, "wake_latency_cv"), Some(0.5));
+        assert_eq!(read_metric(&row, "total_iterations"), Some(1000.0));
+        assert_eq!(read_metric(&row, "mean_run_delay_us"), Some(25.0));
+        assert_eq!(read_metric(&row, "worst_run_delay_us"), Some(200.0));
+        assert_eq!(read_metric(&row, "worst_page_locality"), Some(0.8));
         assert_eq!(
-            row_metric_value(&row, "worst_cross_node_migration_ratio"),
-            0.1
+            read_metric(&row, "worst_cross_node_migration_ratio"),
+            Some(0.1)
         );
     }
 
     #[test]
-    fn row_metric_value_ext_metrics_fallback() {
-        let mut row = make_row("a", "f", "t", true, 5.0);
+    fn metric_def_read_ext_metrics_when_registered() {
+        // Simulate an ext_metric whose name collides with a built-in
+        // field: the accessor wins, ext_metrics is the fallback only
+        // when the accessor returns None. Use a built-in name with no
+        // explicit ext_metrics entry.
+        let row = make_row("a", "f", "t", true, 5.0);
+        assert_eq!(read_metric(&row, "worst_spread"), Some(5.0));
+
+        // User ext_metric accessed directly via ext_metrics map
+        // (no MetricDef entry; lookup via metric_def returns None).
+        let mut row = row;
         row.ext_metrics.insert("custom_metric".into(), 77.0);
-        assert_eq!(row_metric_value(&row, "custom_metric"), 77.0);
-        assert_eq!(row_metric_value(&row, "missing_ext"), 0.0);
+        assert!(metric_def("custom_metric").is_none());
+        assert_eq!(row.ext_metrics.get("custom_metric").copied(), Some(77.0));
     }
 
     // -- compare_rows tests --
