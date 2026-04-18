@@ -2743,4 +2743,53 @@ mod tests {
         let arr = read_u32_array(&mem, 0, 0);
         assert_eq!(arr, [10, 20, 30]);
     }
+
+    /// End-to-end BTF-resolved offsets → reader readback.
+    ///
+    /// Parses `KernelOffsets` from the real test vmlinux (skipping when
+    /// no cached test kernel is available), writes known values at the
+    /// BTF-resolved field offsets in a synthetic byte buffer, and asserts
+    /// `read_rq_stats` returns exactly those values. Catches drift
+    /// between BTF parsing and reader field arithmetic.
+    #[test]
+    fn btf_offsets_couple_with_rq_reader() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => {
+                eprintln!("ktstr: SKIP: no test vmlinux available");
+                return;
+            }
+        };
+        let offsets = crate::test_support::require_kernel_offsets(&path);
+
+        let max_scalar_off = offsets.rq_clock + 8;
+        let max_scx_off = offsets.rq_scx + offsets.scx_rq_local_dsq + offsets.dsq_nr + 4;
+        let max_flags_off = offsets.rq_scx + offsets.scx_rq_flags + 4;
+        let size = max_scalar_off.max(max_scx_off).max(max_flags_off) + 64;
+        let mut buf = vec![0u8; size];
+
+        let nr_running: u32 = 0xDEAD_BEEF;
+        let scx_nr: u32 = 0x1234_5678;
+        let dsq_depth: u32 = 0x0BAD_F00D;
+        let clock: u64 = 0xCAFE_BABE_1357_9BDF;
+        let flags: u32 = 0xA5A5_A5A5;
+
+        buf[offsets.rq_nr_running..offsets.rq_nr_running + 4]
+            .copy_from_slice(&nr_running.to_ne_bytes());
+        buf[offsets.rq_clock..offsets.rq_clock + 8].copy_from_slice(&clock.to_ne_bytes());
+        let scx_nr_off = offsets.rq_scx + offsets.scx_rq_nr_running;
+        buf[scx_nr_off..scx_nr_off + 4].copy_from_slice(&scx_nr.to_ne_bytes());
+        let scx_flags_off = offsets.rq_scx + offsets.scx_rq_flags;
+        buf[scx_flags_off..scx_flags_off + 4].copy_from_slice(&flags.to_ne_bytes());
+        let dsq_off = offsets.rq_scx + offsets.scx_rq_local_dsq + offsets.dsq_nr;
+        buf[dsq_off..dsq_off + 4].copy_from_slice(&dsq_depth.to_ne_bytes());
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let snap = read_rq_stats(&mem, 0, &offsets);
+        assert_eq!(snap.nr_running, nr_running);
+        assert_eq!(snap.scx_nr_running, scx_nr);
+        assert_eq!(snap.local_dsq_depth, dsq_depth);
+        assert_eq!(snap.rq_clock, clock);
+        assert_eq!(snap.scx_flags, flags);
+    }
 }
