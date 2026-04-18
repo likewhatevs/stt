@@ -582,8 +582,18 @@ pub fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<(tempfile::Tem
 /// Data-bearing sections that hold monitor-referenced symbols
 /// (`.rodata`, `.data`, `.bss`, `.data..percpu`, `.init.data`) must
 /// be kept so the symbol table entries pointing at them survive the
-/// rewrite. Only debug sections, code sections, and sections unused
-/// by monitor lookups are dropped.
+/// rewrite. Code sections (any section with `SHF_EXECINSTR`, e.g.
+/// `.text`, `.init.text`, `.exit.text`, `.text.hot`, `.altinstr_replacement`)
+/// have their bytes dropped via `SHT_NOBITS` + zero-length data, but
+/// the section header is preserved so that the ~115k function symbols
+/// pointing into them (`schedule`, `__schedule`, etc.) survive
+/// `Builder::delete_orphans` -- the auto-pass at the top of
+/// `Builder::write` that flags any symbol whose section was deleted.
+/// Without this preservation, the cached vmlinux loses every
+/// function symbol and `resolve_addrs_from_elf` returns an empty
+/// vec for any kernel function lookup, breaking the auto-repro
+/// probe pipeline that resolves event addresses from the cached
+/// vmlinux at `probe::output::format_events`.
 ///
 /// After stripping, verifies the result has a non-empty symbol table.
 /// Returns an error to trigger the fallback to `strip_debug_prefix`
@@ -592,7 +602,14 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut builder = object::build::elf::Builder::read(data)
         .map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
     for section in builder.sections.iter_mut() {
-        if !VMLINUX_KEEP_SECTIONS.contains(&section.name.as_slice()) {
+        if VMLINUX_KEEP_SECTIONS.contains(&section.name.as_slice()) {
+            continue;
+        }
+        let is_code = section.sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0;
+        if is_code {
+            section.sh_type = object::elf::SHT_NOBITS;
+            section.data = object::build::elf::SectionData::UninitializedData(0);
+        } else {
             section.delete = true;
         }
     }
@@ -1757,6 +1774,55 @@ mod tests {
         assert!(
             has("prog_idr"),
             "prog_idr symbol missing from stripped vmlinux"
+        );
+    }
+
+    /// Function symbols (in `.text` and friends) must survive the
+    /// strip so `resolve_addrs_from_elf` can resolve event addresses
+    /// from the cached vmlinux. The strip preserves code-section
+    /// headers as `SHT_NOBITS` to keep these symbols from being
+    /// dropped by `Builder::delete_orphans`.
+    #[test]
+    fn strip_vmlinux_debug_preserves_function_symbols() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        if path.starts_with("/sys/") {
+            eprintln!("ktstr: SKIP: vmlinux is raw BTF (not ELF), cannot strip debug");
+            return;
+        }
+        // Skip if the source vmlinux has no `schedule` symbol -- that
+        // means it was already stripped by an older build of ktstr
+        // and no longer carries .text symbols. The test exercises
+        // strip-preserves behavior, not whether a particular cache
+        // entry was rebuilt.
+        let source_data = fs::read(&path).unwrap();
+        let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
+        let source_has_schedule = source_elf
+            .syms
+            .iter()
+            .any(|s| s.st_value != 0 && source_elf.strtab.get_at(s.st_name) == Some("schedule"));
+        if !source_has_schedule {
+            eprintln!(
+                "ktstr: SKIP: source vmlinux has no `schedule` symbol \
+                 (already stripped by older ktstr) -- rebuild the kernel \
+                 cache to exercise this test"
+            );
+            return;
+        }
+
+        let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
+        let data = fs::read(&stripped_path).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let has_func = |name: &str| {
+            elf.syms
+                .iter()
+                .any(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
+        };
+        assert!(
+            has_func("schedule"),
+            "schedule function symbol dropped by strip"
         );
     }
 
