@@ -5270,8 +5270,10 @@ mod tests {
         if offsets.sched_domain_offsets.is_none() {
             skip!(
                 "sched_domain BTF fields not found \
-                 (likely a kernel built with CONFIG_SMP=n; \
-                 need both the rq.sd field and the sched_domain struct in BTF)"
+                 (on modern kernels this typically means the sched_domain \
+                 struct was not emitted to BTF because no SMP code \
+                 referenced it; on pre-6.17 kernels CONFIG_SMP=n also \
+                 removes the rq.sd field)"
             );
         }
 
