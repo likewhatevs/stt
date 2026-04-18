@@ -726,17 +726,18 @@ impl MonitorSummary {
             let cpu_count = prev.cpus.len().min(curr.cpus.len());
             for cpu in 0..cpu_count {
                 let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
-                let cpu_time_advanced = match (
-                    curr.cpus[cpu].vcpu_cpu_time_ns,
+                // Delegate to the shared predicate so post-hoc
+                // evaluate() and reactive monitor_loop() cannot drift
+                // apart. `!preempted` == advanced (or unknown).
+                let preempted = reader::evaluate_preempted(
                     prev.cpus[cpu].vcpu_cpu_time_ns,
-                ) {
-                    (Some(curr_t), Some(prev_t)) => curr_t.saturating_sub(prev_t) >= threshold,
-                    _ => true,
-                };
+                    curr.cpus[cpu].vcpu_cpu_time_ns,
+                    threshold,
+                );
                 if curr.cpus[cpu].rq_clock != 0
                     && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
                     && !idle
-                    && cpu_time_advanced
+                    && !preempted
                 {
                     stall_detected = true;
                     break;
@@ -1118,17 +1119,15 @@ impl MonitorThresholds {
                 // indexes stall[cpu], prev.cpus[cpu], curr.cpus[cpu]
                 for cpu in 0..cpu_count {
                     let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
-                    let cpu_time_advanced = match (
-                        curr.cpus[cpu].vcpu_cpu_time_ns,
+                    let preempted = reader::evaluate_preempted(
                         prev.cpus[cpu].vcpu_cpu_time_ns,
-                    ) {
-                        (Some(curr_t), Some(prev_t)) => curr_t.saturating_sub(prev_t) >= threshold,
-                        _ => true,
-                    };
+                        curr.cpus[cpu].vcpu_cpu_time_ns,
+                        threshold,
+                    );
                     let is_stall = curr.cpus[cpu].rq_clock != 0
                         && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
                         && !idle
-                        && cpu_time_advanced;
+                        && !preempted;
                     stall[cpu].record(is_stall, curr.cpus[cpu].rq_clock as f64, i);
                 }
             }

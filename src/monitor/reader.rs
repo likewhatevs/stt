@@ -678,15 +678,43 @@ pub(crate) struct VcpuTiming {
 }
 
 impl VcpuTiming {
-    /// Read CPU time for each vCPU thread. Returns nanoseconds per vCPU.
-    fn read_cpu_times(&self) -> Vec<u64> {
+    /// Read CPU time for each vCPU thread. Returns `Some(ns)` per vCPU
+    /// on success, `None` when the per-thread clock could not be read.
+    ///
+    /// `None` propagates through `CpuSnapshot::vcpu_cpu_time_ns`.
+    /// Downstream stall detection (`evaluate_preempted`) treats a
+    /// `None` on either side of a pair as `preempted=false` — the
+    /// stall check falls through to `rq_clock` comparison and fires
+    /// if progress isn't observed there. This deliberately prefers
+    /// spurious alerts (better visibility) over missed stalls (silent
+    /// failure) when clock reads are unavailable. The previous bug
+    /// did the opposite: a silent `0` collided with `saturating_sub`
+    /// to fabricate "no delta", which looked like preemption and
+    /// suppressed every stall after the first clock-read failure.
+    ///
+    /// Emits a one-shot `tracing::warn` per vCPU (debounced via
+    /// `reported_err`) naming the failing syscall + errno so a user
+    /// can diagnose why stall gating has degraded to "no data".
+    fn read_cpu_times(&self, reported_err: &mut [bool]) -> Vec<Option<u64>> {
         self.pthreads
             .iter()
-            .map(|&pt| {
+            .enumerate()
+            .map(|(vcpu, &pt)| {
                 let mut clk: libc::clockid_t = 0;
                 let ret = unsafe { libc::pthread_getcpuclockid(pt, &mut clk) };
                 if ret != 0 {
-                    return 0;
+                    if let Some(slot) = reported_err.get_mut(vcpu)
+                        && !*slot
+                    {
+                        tracing::warn!(
+                            vcpu,
+                            ret,
+                            errno = std::io::Error::last_os_error().raw_os_error(),
+                            "pthread_getcpuclockid failed; stall gating unavailable for this vCPU"
+                        );
+                        *slot = true;
+                    }
+                    return None;
                 }
                 let mut ts = libc::timespec {
                     tv_sec: 0,
@@ -694,11 +722,65 @@ impl VcpuTiming {
                 };
                 let ret = unsafe { libc::clock_gettime(clk, &mut ts) };
                 if ret != 0 {
-                    return 0;
+                    if let Some(slot) = reported_err.get_mut(vcpu)
+                        && !*slot
+                    {
+                        tracing::warn!(
+                            vcpu,
+                            ret,
+                            errno = std::io::Error::last_os_error().raw_os_error(),
+                            "clock_gettime on pthread clock failed; stall gating unavailable for this vCPU"
+                        );
+                        *slot = true;
+                    }
+                    return None;
                 }
-                ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+                // CPU-time pthread clocks are cumulative nanoseconds
+                // and thus always non-negative; guard anyway so a
+                // negative tv_sec or tv_nsec from a hypothetical clock
+                // bug doesn't silently wrap through `as u64`.
+                if ts.tv_sec < 0 || ts.tv_nsec < 0 {
+                    if let Some(slot) = reported_err.get_mut(vcpu)
+                        && !*slot
+                    {
+                        tracing::warn!(
+                            vcpu,
+                            tv_sec = ts.tv_sec,
+                            tv_nsec = ts.tv_nsec,
+                            "negative clock_gettime result; stall gating unavailable for this vCPU"
+                        );
+                        *slot = true;
+                    }
+                    return None;
+                }
+                // Re-arm the error latch on a successful read so a
+                // transient failure doesn't permanently mute the log.
+                if let Some(slot) = reported_err.get_mut(vcpu) {
+                    *slot = false;
+                }
+                Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
             })
             .collect()
+    }
+}
+
+/// Decide whether a vCPU was preempted between two consecutive samples.
+///
+/// Returns `true` only when BOTH samples produced a valid reading
+/// (`Some`) and the delta falls strictly below `threshold_ns`. Any
+/// missing reading (`None` on either side) is treated as "no data" and
+/// returns `false` — the stall path must NEVER infer preemption from
+/// absent data, otherwise a clock-read failure would silently suppress
+/// every subsequent stall (the original bug).
+///
+/// Uses `saturating_sub` to tolerate non-monotonic reads across clock
+/// resolution edges; a non-monotonic sample yields delta=0, which is
+/// below any positive threshold, so `preempted=true` — matching the
+/// semantics of "the vCPU made no measurable progress".
+pub(crate) fn evaluate_preempted(prev: Option<u64>, curr: Option<u64>, threshold_ns: u64) -> bool {
+    match (prev, curr) {
+        (Some(p), Some(c)) => c.saturating_sub(p) < threshold_ns,
+        _ => false,
     }
 }
 
@@ -837,7 +919,10 @@ pub(crate) fn monitor_loop(
     let mut consecutive_stall = vec![0usize; rq_pas.len()];
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(rq_pas.len());
-    let mut prev_vcpu_times: Option<Vec<u64>> = None;
+    let mut prev_vcpu_times: Option<Vec<Option<u64>>> = None;
+    let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
+        .map(|vt| vec![false; vt.pthreads.len()])
+        .unwrap_or_default();
     let mut shm_entries: Vec<crate::vmm::shm_ring::ShmEntry> = Vec::new();
     let mut shm_drops: u64 = 0;
     let mut watchdog_observation: Option<super::WatchdogObservation> = None;
@@ -909,11 +994,12 @@ pub(crate) fn monitor_loop(
         }
 
         // Read vCPU CPU times and store in snapshots for post-hoc analysis.
-        let curr_vcpu_times = vcpu_timing.map(|vt| vt.read_cpu_times());
+        let curr_vcpu_times =
+            vcpu_timing.map(|vt| vt.read_cpu_times(&mut vcpu_timing_err_reported));
         if let Some(ref times) = curr_vcpu_times {
             for (i, cpu) in cpus.iter_mut().enumerate() {
                 if let Some(&t) = times.get(i) {
-                    cpu.vcpu_cpu_time_ns = Some(t);
+                    cpu.vcpu_cpu_time_ns = t;
                 }
             }
         }
@@ -958,10 +1044,18 @@ pub(crate) fn monitor_loop(
                 let n = prev.cpus.len().min(cpus.len());
                 for i in 0..n {
                     let idle = cpus[i].nr_running == 0 && prev.cpus[i].nr_running == 0;
+                    // Delegate to the shared pure predicate so reactive
+                    // and post-hoc stall paths cannot drift. A missing
+                    // read (None on either side) returns false ("no
+                    // evidence of preemption"), which keeps the stall
+                    // path firing on clock-read failure rather than
+                    // silently suppressing it — the original bug.
                     let preempted = match (&prev_vcpu_times, &curr_vcpu_times) {
-                        (Some(prev_t), Some(curr_t)) if i < prev_t.len() && i < curr_t.len() => {
-                            curr_t[i].saturating_sub(prev_t[i]) < preemption_threshold_ns
-                        }
+                        (Some(prev_t), Some(curr_t)) => evaluate_preempted(
+                            prev_t.get(i).copied().flatten(),
+                            curr_t.get(i).copied().flatten(),
+                            preemption_threshold_ns,
+                        ),
                         _ => false,
                     };
                     let is_stall = cpus[i].rq_clock != 0
@@ -1045,6 +1139,80 @@ pub(crate) fn monitor_loop(
 mod tests {
     use super::*;
     use std::os::unix::thread::JoinHandleExt;
+
+    const THRESHOLD_NS: u64 = 10_000_000;
+
+    #[test]
+    fn evaluate_preempted_both_none_is_not_preempted() {
+        assert!(!evaluate_preempted(None, None, THRESHOLD_NS));
+    }
+
+    #[test]
+    fn evaluate_preempted_first_read_failed_is_not_preempted() {
+        // Prev missing: we have no baseline, so the stall path must
+        // fire if other conditions match. Treating this as preempted
+        // would mask every first-sample stall.
+        assert!(!evaluate_preempted(None, Some(1_000_000_000), THRESHOLD_NS));
+    }
+
+    #[test]
+    fn evaluate_preempted_current_read_failed_is_not_preempted() {
+        // Curr missing: likewise no evidence of preemption. The bug
+        // this replaces would have returned `saturating_sub(big, 0)
+        // < threshold` = false, or `saturating_sub(0, big)` = 0 <
+        // threshold = true — both wrong.
+        assert!(!evaluate_preempted(Some(1_000_000_000), None, THRESHOLD_NS));
+    }
+
+    #[test]
+    fn evaluate_preempted_delta_below_threshold_is_preempted() {
+        // 1ms delta with 10ms threshold: vCPU barely ran — preempted.
+        assert!(evaluate_preempted(
+            Some(1_000_000_000),
+            Some(1_001_000_000),
+            THRESHOLD_NS,
+        ));
+    }
+
+    #[test]
+    fn evaluate_preempted_delta_at_threshold_is_not_preempted() {
+        // Exactly 10ms delta: not below threshold, so running, not preempted.
+        assert!(!evaluate_preempted(
+            Some(1_000_000_000),
+            Some(1_010_000_000),
+            THRESHOLD_NS,
+        ));
+    }
+
+    #[test]
+    fn evaluate_preempted_delta_above_threshold_is_not_preempted() {
+        assert!(!evaluate_preempted(
+            Some(1_000_000_000),
+            Some(2_000_000_000),
+            THRESHOLD_NS,
+        ));
+    }
+
+    #[test]
+    fn evaluate_preempted_non_monotonic_treated_as_no_progress() {
+        // saturating_sub of a reverse-going clock yields 0 < threshold,
+        // so "no measurable progress" maps to preempted=true. Documented
+        // invariant: never unwinds into a false not-preempted when the
+        // clock read jitters backwards.
+        assert!(evaluate_preempted(
+            Some(1_000_000_000),
+            Some(999_000_000),
+            THRESHOLD_NS,
+        ));
+    }
+
+    #[test]
+    fn evaluate_preempted_zero_threshold_never_preempted() {
+        // Degenerate case: with threshold=0, nothing is strictly below,
+        // so preempted is always false (stall path always fires).
+        assert!(!evaluate_preempted(Some(100), Some(100), 0));
+        assert!(!evaluate_preempted(Some(100), Some(200), 0));
+    }
 
     fn test_config() -> MonitorConfig<'static> {
         MonitorConfig {

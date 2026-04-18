@@ -1035,29 +1035,44 @@ pub(crate) fn shm_segment_name(content_hash: u64) -> String {
 /// Read-only mmap of a POSIX shared-memory segment. The mapping stays
 /// live until the struct is dropped, so callers can borrow the bytes
 /// without copying the entire base archive.
+///
+/// Holds the shared flock (`LOCK_SH`) for the lifetime of the mapping
+/// so that a concurrent writer cannot `ftruncate` the segment beneath
+/// us, which would cause `SIGBUS` on access to the truncated pages.
 pub(crate) struct MappedShm {
     ptr: *const u8,
     len: usize,
+    fd: std::os::unix::io::RawFd,
 }
 
 // SAFETY: The mmap is MAP_SHARED|PROT_READ over a shm segment whose
-// contents are immutable after the writer releases flock. The pointer
-// and length are valid for the lifetime of the mapping.
+// contents are held stable for the mapping's lifetime by a shared
+// flock retained in `fd`. The pointer and length are valid for the
+// lifetime of the mapping.
 unsafe impl Send for MappedShm {}
 unsafe impl Sync for MappedShm {}
 
 impl AsRef<[u8]> for MappedShm {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: ptr/len are set by a successful mmap in shm_load_base.
+        // SAFETY: ptr/len are set by a successful mmap in
+        // shm_load_base, and the SHM segment's contents are held
+        // stable for the mapping's lifetime by the shared flock
+        // retained in self.fd — a cooperating writer cannot
+        // ftruncate the segment out from under us.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
 impl Drop for MappedShm {
     fn drop(&mut self) {
-        // SAFETY: ptr/len are from mmap; munmap is safe to call once.
+        // SAFETY: ptr/len are from mmap; fd is from shm_open with
+        // LOCK_SH held. Release the mapping first, then the flock, then
+        // the fd — order matters so the lock protects the mapping right
+        // up until it is torn down.
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            libc::flock(self.fd, libc::LOCK_UN);
+            libc::close(self.fd);
         }
     }
 }
@@ -1066,10 +1081,20 @@ impl Drop for MappedShm {
 /// identified by `content_hash`. Returns a `MappedShm` that borrows
 /// the data without copying. Returns `None` on miss or error.
 ///
-/// Acquires a shared flock before mmap to ensure the writer has
-/// finished populating the segment. The lock is released after mmap
-/// completes -- the mapped pages are stable after that since writers
-/// use the same content-hash segment name (idempotent writes).
+/// Acquires a shared flock (`LOCK_SH`) before mmap and keeps it held
+/// for the lifetime of the returned `MappedShm`. A concurrent writer
+/// calls `ftruncate` under `LOCK_EX` in `shm_store` (and in
+/// `shm_write_and_release`, which also `ftruncate`s to 0 on mmap
+/// failure); holding `LOCK_SH` for the mapping's lifetime prevents
+/// either writer from truncating the segment out from under us, which
+/// would turn any access to the truncated pages into `SIGBUS`.
+///
+/// Note: `flock` is advisory — it only protects against other
+/// processes that also call `flock`. A process that writes the
+/// segment without taking `LOCK_EX` (e.g. `rm /dev/shm/…` + recreate
+/// by an unrelated tool) bypasses this scheme. All callers within
+/// this crate cooperate, which is the closed-world guarantee we
+/// rely on.
 pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
     let name = std::ffi::CString::new(shm_segment_name(content_hash)).ok()?;
     unsafe {
@@ -1078,7 +1103,9 @@ pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
             return None;
         }
 
-        // Shared lock -- blocks until any concurrent writer releases LOCK_EX.
+        // Shared lock -- blocks until any concurrent writer releases
+        // LOCK_EX. Held for the mapping's lifetime; released in
+        // MappedShm::drop.
         if libc::flock(fd, libc::LOCK_SH) != 0 {
             libc::close(fd);
             return None;
@@ -1102,35 +1129,53 @@ pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
             0,
         );
 
-        // Release lock and fd -- pages are stable.
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
-
         if ptr == libc::MAP_FAILED {
+            libc::flock(fd, libc::LOCK_UN);
+            libc::close(fd);
             return None;
         }
 
         Some(MappedShm {
             ptr: ptr as *const u8,
             len,
+            fd,
         })
     }
 }
 
-/// Store a base initramfs into the POSIX shared-memory segment
-/// identified by `content_hash`. Uses flock(LOCK_EX) for
-/// synchronization. The segment name encodes the content hash,
-/// so writes are idempotent -- concurrent writers produce
-/// identical content, and the last write wins harmlessly.
 /// Write `data` to a POSIX SHM segment identified by `name`.
 ///
-/// Creates the segment (O_CREAT | O_RDWR), takes an exclusive flock,
-/// truncates to `data.len()`, mmaps, copies, and cleans up.
+/// Creates (or opens existing) the segment with `O_CREAT | O_RDWR`,
+/// takes an exclusive flock, `ftruncate`s to `data.len()`, `mmap`s
+/// `PROT_WRITE | MAP_SHARED`, copies, and cleans up.
+///
+/// Concurrency: `LOCK_EX` blocks while any reader holds `LOCK_SH` on
+/// the same segment (e.g. a live `MappedShm` or `CowOverlayGuard`).
+/// The writer thus waits for in-flight VMs before truncating — which
+/// is what prevents the `SIGBUS` class of bug addressed by the
+/// reader-side flock lifetime in `shm_load_base` and `cow_overlay`.
+///
+/// Writes are content-addressed at the caller: callers hash `data`
+/// to form the segment name. When two callers write the same content
+/// to the same hash, the payload length and bytes are identical, so
+/// the second `ftruncate(same_len)` is a no-op on page contents and
+/// the second memcpy writes the same bytes. A third-party caller
+/// that writes DIFFERENT data to an already-used hash (e.g. the
+/// rename-test pattern) will overwrite — the store does not enforce
+/// idempotence itself.
 fn shm_store(name: &std::ffi::CStr, data: &[u8]) -> Result<()> {
     unsafe {
         let fd = libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644);
         anyhow::ensure!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
 
+        // Surfaces the wait explicitly: with readers holding LOCK_SH
+        // for VM lifetime, concurrent test runs can block here for
+        // seconds. Without this, the user sees silent hang.
+        tracing::info!(
+            segment = name.to_string_lossy().as_ref(),
+            data_len = data.len(),
+            "shm_store: waiting for LOCK_EX"
+        );
         if libc::flock(fd, libc::LOCK_EX) != 0 {
             libc::close(fd);
             anyhow::bail!("flock: {}", std::io::Error::last_os_error());
@@ -1224,30 +1269,106 @@ pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
     shm_store(&name, data)
 }
 
-/// COW-overlay `len` bytes from `shm_fd` at `host_addr` using
-/// MAP_PRIVATE | MAP_FIXED. The guest sees the SHM content but
-/// writes go to private anonymous pages (copy-on-write).
+/// RAII guard for a live COW-overlay mapping.
 ///
-/// Returns `true` on success, `false` on failure (caller should
-/// fall back to write_slice).
+/// A COW overlay is `MAP_PRIVATE | MAP_FIXED` onto guest memory from
+/// a SHM segment fd. `MAP_PRIVATE` pages are lazily read from the
+/// backing file on first access; if the SHM segment is truncated or
+/// unlinked-with-retruncate between `mmap` and the guest's first
+/// read, the access SIGBUSes (see Linux `filemap_fault` against
+/// `i_size`). Holding the fd with `LOCK_SH` for the mapping's
+/// lifetime blocks any cooperating writer from taking `LOCK_EX` and
+/// `ftruncate`ing the segment until after the mapping is torn down.
+///
+/// Drop order: the guard releases `LOCK_UN` and `close` only. The
+/// MAP_FIXED region itself is owned by the caller's VA reservation
+/// (e.g. `ReservationGuard` in the VMM) and is munmapped when that
+/// reservation drops — which must happen BEFORE this guard drops,
+/// so the lock protects the mapping right up until tear-down.
+pub(crate) struct CowOverlayGuard {
+    fd: std::os::unix::io::RawFd,
+}
+
+impl CowOverlayGuard {
+    fn new(fd: std::os::unix::io::RawFd) -> Self {
+        Self { fd }
+    }
+}
+
+// SAFETY: The fd is owned by this guard; no other code reads or
+// closes it. flock/close are thread-safe syscalls.
+unsafe impl Send for CowOverlayGuard {}
+unsafe impl Sync for CowOverlayGuard {}
+
+impl Drop for CowOverlayGuard {
+    fn drop(&mut self) {
+        // SAFETY: fd was obtained via shm_open in the COW overlay
+        // path; we own it and release LOCK_SH before close.
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+            libc::close(self.fd);
+        }
+    }
+}
+
+/// COW-overlay `len` bytes from `shm_fd` at `host_addr` using
+/// `MAP_PRIVATE | MAP_FIXED | MAP_POPULATE`. The guest sees the SHM
+/// content but writes go to private anonymous pages (copy-on-write).
+/// `MAP_POPULATE` pre-faults the pages so the initial accesses skip
+/// the filemap fault path; the lock guard still protects against
+/// truncate of pages that may be refaulted from the page cache
+/// (MAP_POPULATE alone is not sufficient — truncate invalidates the
+/// page cache via `unmap_mapping_range`).
+///
+/// On success, returns `Some(CowOverlayGuard)` — the guard owns
+/// `shm_fd` and holds `LOCK_SH` for the mapping's lifetime. The
+/// caller MUST keep the guard alive for as long as the MAP_FIXED
+/// mapping is in use (typically the VM lifetime) and drop the guard
+/// AFTER the VA region is munmapped.
+///
+/// On failure, returns `None` and CLOSES `shm_fd` (releasing
+/// `LOCK_SH`) so the caller does not need to clean it up.
+///
+/// # Safety
+///
+/// The caller MUST have validated that the entire range
+/// `[host_addr, host_addr + len)` lies within one contiguous guest
+/// memory region. `MAP_FIXED` unmaps whatever is already present
+/// across the full range and replaces it with the new mapping; if
+/// `len` extends past the region, `MAP_FIXED` silently corrupts
+/// unrelated host mappings (kernel-defined behaviour at the mmap
+/// layer) and violates Rust's aliasing invariants at the process
+/// level. The caller is also responsible for ensuring `shm_fd` is a
+/// valid, open file descriptor with `LOCK_SH` already held (the
+/// guard inherits both).
 pub(crate) unsafe fn cow_overlay(
     host_addr: *mut u8,
     len: usize,
     shm_fd: std::os::unix::io::RawFd,
-) -> bool {
-    // SAFETY: caller guarantees host_addr points into a valid guest
-    // memory region of at least `len` bytes and shm_fd is a valid fd.
+) -> Option<CowOverlayGuard> {
+    // SAFETY: caller guarantees [host_addr, host_addr + len) is
+    // entirely within a single valid guest memory region and shm_fd
+    // is a valid fd holding LOCK_SH. See function-level docs.
     let ptr = unsafe {
         libc::mmap(
             host_addr as *mut libc::c_void,
             len,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_POPULATE,
             shm_fd,
             0,
         )
     };
-    ptr != libc::MAP_FAILED
+    if ptr == libc::MAP_FAILED {
+        // Close and unlock fd ourselves — caller expects no cleanup
+        // responsibility on the None path.
+        unsafe {
+            libc::flock(shm_fd, libc::LOCK_UN);
+            libc::close(shm_fd);
+        }
+        return None;
+    }
+    Some(CowOverlayGuard::new(shm_fd))
 }
 
 /// Close a SHM fd and release its shared flock.
@@ -1490,6 +1611,100 @@ mod tests {
     }
 
     #[test]
+    fn try_cow_overlay_rejects_cross_region_span() {
+        // The bounds check in try_cow_overlay relies on
+        // GuestMemoryMmap::get_slice failing when a range would cross
+        // a region boundary. This test locks that semantic in: two
+        // non-contiguous regions; a range that starts in region A but
+        // extends past its end must be rejected. If this ever passes
+        // (e.g. vm-memory swaps in multi-region get_slices semantics
+        // here), try_cow_overlay's MAP_FIXED would silently clobber
+        // whatever host mapping sits between the regions.
+        use vm_memory::{GuestAddress, GuestMemory};
+        let region_a_size: usize = 64 * 1024;
+        let region_b_size: usize = 64 * 1024;
+        let region_a_start: u64 = 0;
+        let region_b_start: u64 = 1 << 20; // 1 MiB gap
+        let mem = vm_memory::GuestMemoryMmap::<()>::from_ranges(&[
+            (GuestAddress(region_a_start), region_a_size),
+            (GuestAddress(region_b_start), region_b_size),
+        ])
+        .unwrap();
+
+        // Range fully inside region A: must succeed.
+        assert!(
+            mem.get_slice(GuestAddress(region_a_start), region_a_size)
+                .is_ok(),
+            "full-region slice must succeed"
+        );
+
+        // Range starting mid-region-A and extending past region A's
+        // end: must fail. This is the exact shape of the hazardous
+        // cow_overlay case.
+        let overrun_start = region_a_start + (region_a_size as u64 / 2);
+        let overrun_len = region_a_size; // well past the region's end
+        assert!(
+            mem.get_slice(GuestAddress(overrun_start), overrun_len)
+                .is_err(),
+            "cross-boundary slice must fail"
+        );
+
+        // Range starting at a GPA inside the gap between regions:
+        // also fails (no region covers the start address).
+        let gap_addr = (region_a_start + region_a_size as u64) + 0x1000;
+        assert!(
+            mem.get_slice(GuestAddress(gap_addr), 4).is_err(),
+            "gap-start slice must fail"
+        );
+    }
+
+    #[test]
+    fn try_cow_overlay_preserves_adjacent_region_bytes() {
+        // Proves the invariant at the application layer: with the
+        // bounds check in place, we never invoke mmap(MAP_FIXED),
+        // which means bytes outside the validated range stay
+        // untouched. We simulate "before" bytes in region B, run the
+        // same bounds check try_cow_overlay uses, observe that it
+        // rejects the request, and verify region B's bytes survive.
+        use vm_memory::{Bytes, GuestAddress, GuestMemory};
+        let region_a_size: usize = 64 * 1024;
+        let region_b_size: usize = 64 * 1024;
+        let region_a_start: u64 = 0;
+        let region_b_start: u64 = 1 << 20;
+        let mem = vm_memory::GuestMemoryMmap::<()>::from_ranges(&[
+            (GuestAddress(region_a_start), region_a_size),
+            (GuestAddress(region_b_start), region_b_size),
+        ])
+        .unwrap();
+
+        // Seed region B with a detectable marker.
+        let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
+        mem.write_slice(&marker, GuestAddress(region_b_start))
+            .unwrap();
+
+        // Compute an oversized COW request: starts in region A, len
+        // spans the whole guest range up to the end of region B.
+        let overrun_load_addr = region_a_start;
+        let overrun_len = (region_b_start + region_b_size as u64) as usize;
+
+        // This is the same check try_cow_overlay uses; on failure it
+        // returns early and never invokes cow_overlay. We assert the
+        // rejection and the preservation of region B's contents.
+        assert!(
+            mem.get_slice(GuestAddress(overrun_load_addr), overrun_len)
+                .is_err(),
+            "oversized overlay must be rejected before MAP_FIXED"
+        );
+        let mut readback = vec![0u8; region_b_size];
+        mem.read_slice(&mut readback, GuestAddress(region_b_start))
+            .unwrap();
+        assert_eq!(
+            readback, marker,
+            "region B must be untouched when bounds check rejects cow_overlay"
+        );
+    }
+
+    #[test]
     fn load_initramfs_parts_sequential() {
         let part1 = vec![0xAAu8; 4096];
         let part2 = vec![0xBBu8; 512];
@@ -1639,7 +1854,13 @@ mod tests {
     }
 
     #[test]
-    fn shm_store_overwrite_idempotent() {
+    fn shm_store_last_writer_wins_even_with_size_change() {
+        // Documents actual semantics: shm_store reuses the segment name,
+        // so a second write with different size overwrites the first.
+        // Idempotent writes (same content_hash → same contents) rely on
+        // callers to derive the hash from the actual content — this test
+        // deliberately uses differently-sized payloads to prove the
+        // writer does NOT assume the old name's size is still valid.
         let hash = 0x1234_5678_9ABC_DEF0u64;
         let d1 = vec![0x11u8; 64];
         let d2 = vec![0x22u8; 128];
@@ -1670,6 +1891,60 @@ mod tests {
     fn mapped_shm_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MappedShm>();
+    }
+
+    #[test]
+    fn shm_load_base_holds_lock_until_drop() {
+        // Invariant: as long as a MappedShm is live, the SHM
+        // segment's flock is held in LOCK_SH. A concurrent writer
+        // calling LOCK_EX | LOCK_NB must fail with EWOULDBLOCK. Once
+        // the MappedShm is dropped, the lock releases and a subsequent
+        // LOCK_EX | LOCK_NB must succeed.
+        //
+        // This is the core invariant of the #2 fix — if it regresses,
+        // shm_store's ftruncate can race with a live reader and cause
+        // SIGBUS on the mapped pages.
+        let hash = 0xD0D0_BEEF_F00D_BA5Eu64;
+        shm_unlink_base(hash); // clean any stale segment
+        shm_store_base(hash, &vec![0x55u8; 256]).unwrap();
+        let loaded = shm_load_base(hash).expect("load must succeed");
+
+        // Open a second fd and attempt LOCK_EX|LOCK_NB. Should fail
+        // with EWOULDBLOCK because the MappedShm holds LOCK_SH.
+        let name = std::ffi::CString::new(shm_segment_name(hash)).unwrap();
+        unsafe {
+            let fd2 = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
+            assert!(fd2 >= 0, "second shm_open must succeed");
+            let rc = libc::flock(fd2, libc::LOCK_EX | libc::LOCK_NB);
+            let errno = *libc::__errno_location();
+            assert_eq!(
+                rc, -1,
+                "LOCK_EX|LOCK_NB must be blocked by the live reader's LOCK_SH"
+            );
+            assert_eq!(
+                errno,
+                libc::EWOULDBLOCK,
+                "lock contention must surface as EWOULDBLOCK"
+            );
+            libc::close(fd2);
+        }
+
+        // Drop the mapping; lock releases.
+        drop(loaded);
+
+        // Now LOCK_EX|LOCK_NB must succeed on a fresh fd.
+        unsafe {
+            let fd3 = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
+            assert!(fd3 >= 0, "third shm_open must succeed");
+            let rc = libc::flock(fd3, libc::LOCK_EX | libc::LOCK_NB);
+            assert_eq!(
+                rc, 0,
+                "LOCK_EX|LOCK_NB must succeed after the MappedShm is dropped"
+            );
+            libc::flock(fd3, libc::LOCK_UN);
+            libc::close(fd3);
+        }
+        shm_unlink_base(hash);
     }
 
     #[test]

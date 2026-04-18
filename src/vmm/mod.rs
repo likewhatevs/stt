@@ -1670,10 +1670,22 @@ impl KtstrVm {
     /// Compress base+suffix as separate LZ4 legacy streams, load into
     /// guest memory via COW overlay (falling back to write_slice), and
     /// verify the write. Returns `total_compressed_size`.
+    ///
+    /// On a successful COW overlay, the returned `CowOverlayGuard` is
+    /// pushed onto `vm.cow_overlay_guards` IMMEDIATELY — before any
+    /// subsequent fallible operation (suffix write, read-back verify)
+    /// runs. This is deliberate: if a later `?` unwinds this function
+    /// after the MAP_FIXED overlay is in place, a locally-held guard
+    /// would drop first, releasing `LOCK_SH` while the COW VMAs are
+    /// still live. A concurrent writer could then take `LOCK_EX` and
+    /// truncate the segment → SIGBUS on the mapped pages. Pushing the
+    /// guard onto `vm` transfers ownership to the VM, where Drop
+    /// order is structurally enforced (guard drops AFTER
+    /// `_reservation` munmaps the COW VMAs).
     #[cfg(target_arch = "x86_64")]
     fn compress_and_load_initrd(
         &self,
-        guest_mem: &GuestMemoryMmap,
+        vm: &mut kvm::KtstrKvm,
         base_bytes: &[u8],
         suffix: &[u8],
         key: &BaseKey,
@@ -1718,9 +1730,22 @@ impl KtstrVm {
         // Try COW overlay: mmap compressed base from SHM fd directly
         // into guest memory, sharing physical pages across VMs.
         let t0 = Instant::now();
-        let cow_ok = self.try_cow_overlay(guest_mem, key, lz4_base.len(), load_addr);
-        if cow_ok {
-            guest_mem
+        let cow_guard = self.try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr);
+        // IMPORTANT: stash the guard on the VM IMMEDIATELY — before
+        // any fallible operation below. If a `?` unwinds this function
+        // with a locally-held guard still on the stack, the guard
+        // drops first, releasing LOCK_SH while the COW VMAs are still
+        // live. Owned by `vm`, the guard drops with the VM's
+        // declared-order Drop, which is strictly after
+        // `_reservation` (and thus the COW VMAs). See
+        // `try_cow_overlay_rejects_cross_region_span` and the C4
+        // comment on `cow_overlay_guards` in kvm.rs.
+        let cow_active = cow_guard.is_some();
+        if let Some(guard) = cow_guard {
+            vm.cow_overlay_guards.push(guard);
+        }
+        if cow_active {
+            vm.guest_mem
                 .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
                 .context("write lz4 suffix after COW base")?;
             tracing::debug!(
@@ -1729,7 +1754,7 @@ impl KtstrVm {
                 "initrd_write"
             );
         } else {
-            initramfs::load_initramfs_parts(guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
+            initramfs::load_initramfs_parts(&vm.guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
                 cow = false,
@@ -1739,7 +1764,7 @@ impl KtstrVm {
 
         // Read back first 8 bytes from guest memory to verify write.
         let mut verify_buf = [0u8; 8];
-        guest_mem
+        vm.guest_mem
             .read_slice(&mut verify_buf, GuestAddress(load_addr))
             .context("read-back initrd verify")?;
         tracing::debug!(
@@ -1767,7 +1792,7 @@ impl KtstrVm {
     #[cfg(target_arch = "x86_64")]
     fn join_and_load_initramfs(
         &self,
-        vm: &kvm::KtstrKvm,
+        vm: &mut kvm::KtstrKvm,
         handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
         load_addr: u64,
     ) -> Result<(Option<u64>, Option<u32>)> {
@@ -1828,8 +1853,7 @@ impl KtstrVm {
             );
         }
 
-        let size =
-            self.compress_and_load_initrd(&vm.guest_mem, base_bytes, &suffix, &key, load_addr)?;
+        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
 
@@ -1910,8 +1934,7 @@ impl KtstrVm {
         // Load pre-compressed data into guest memory. The base is already
         // in the LZ4 SHM cache from get_or_compress_base above, so
         // compress_and_load_initrd will hit the cache.
-        let size =
-            self.compress_and_load_initrd(&vm.guest_mem, base_bytes, &suffix, &key, load_addr)?;
+        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size), memory_mb))
     }
 
@@ -1974,8 +1997,11 @@ impl KtstrVm {
     }
 
     /// Try to COW-overlay the compressed base from LZ4 SHM into guest
-    /// memory. Returns true on success. Validates the segment starts
-    /// with LZ4 legacy magic to reject stale data from a previous
+    /// memory. Returns `Some(CowOverlayGuard)` on success — the guard
+    /// owns the SHM fd and holds `LOCK_SH` for the mapping's lifetime,
+    /// and MUST be kept alive as long as the COW overlay is in use
+    /// (typically the VM lifetime). Validates the segment starts with
+    /// LZ4 legacy magic to reject stale data from a previous
     /// compression format.
     #[cfg(target_arch = "x86_64")]
     fn try_cow_overlay(
@@ -1984,13 +2010,11 @@ impl KtstrVm {
         key: &BaseKey,
         expected_len: usize,
         load_addr: u64,
-    ) -> bool {
-        let Some((fd, len)) = initramfs::shm_open_lz4(key.0) else {
-            return false;
-        };
+    ) -> Option<initramfs::CowOverlayGuard> {
+        let (fd, len) = initramfs::shm_open_lz4(key.0)?;
         if len != expected_len {
             initramfs::shm_close_fd(fd);
-            return false;
+            return None;
         }
         // Validate LZ4 legacy magic before COW-mapping.
         let mut magic = [0u8; 4];
@@ -2005,7 +2029,7 @@ impl KtstrVm {
             );
             if ptr == libc::MAP_FAILED {
                 initramfs::shm_close_fd(fd);
-                return false;
+                return None;
             }
             std::ptr::copy_nonoverlapping(ptr as *const u8, magic.as_mut_ptr(), 4);
             libc::munmap(ptr, len);
@@ -2019,15 +2043,47 @@ impl KtstrVm {
                 "stale compressed shm segment in COW path, skipping"
             );
             initramfs::shm_close_fd(fd);
-            return false;
+            return None;
+        }
+        // Refuse zero-length: mmap(len=0) is EINVAL and serves no
+        // purpose; the suffix-write fallback handles empty bases
+        // trivially. Also refuse load_addr + len overflow before
+        // bounds-checking, since GuestAddress arithmetic wraps
+        // silently on u64 overflow.
+        if len == 0 || load_addr.checked_add(len as u64).is_none() {
+            tracing::debug!(
+                load_addr = format!("{:#x}", load_addr),
+                len,
+                "cow_overlay: invalid range (zero-length or overflow), falling back"
+            );
+            initramfs::shm_close_fd(fd);
+            return None;
+        }
+        // Bounds-check [load_addr, load_addr + len) against guest
+        // memory BEFORE the MAP_FIXED mmap. `get_host_address` only
+        // validates the start address — without a length check,
+        // MAP_FIXED would silently overwrite whatever host VA happens
+        // to follow the region (other guest regions, reserved VA, or
+        // unrelated mappings). `get_slice` fails if the range extends
+        // past the region's end or spans a region boundary, which is
+        // exactly the guarantee MAP_FIXED needs.
+        if guest_mem.get_slice(GuestAddress(load_addr), len).is_err() {
+            tracing::debug!(
+                load_addr = format!("{:#x}", load_addr),
+                len,
+                "cow_overlay: range exceeds guest memory region, falling back"
+            );
+            initramfs::shm_close_fd(fd);
+            return None;
         }
         let Ok(host_addr) = guest_mem.get_host_address(GuestAddress(load_addr)) else {
             initramfs::shm_close_fd(fd);
-            return false;
+            return None;
         };
-        let ok = unsafe { initramfs::cow_overlay(host_addr, len, fd) };
-        initramfs::shm_close_fd(fd);
-        ok
+        // cow_overlay takes ownership of `fd` on both Some and None
+        // paths: on success the guard carries it; on failure
+        // cow_overlay itself closes it. Do NOT call shm_close_fd here.
+        unsafe { initramfs::cow_overlay(host_addr, len, fd) }
     }
 
     /// Initialize the SHM ring buffer header at `shm_base` in guest memory.
@@ -2068,6 +2124,10 @@ impl KtstrVm {
         // one shot with no estimation.
         let (kernel_result, initrd_addr, initrd_size) = if let Some(kr) = kernel_result {
             // Non-deferred: memory already allocated, kernel already loaded.
+            // compress_and_load_initrd transfers the CowOverlayGuard
+            // directly onto vm.cow_overlay_guards before any fallible
+            // operation, so a mid-function `?` cannot drop the guard
+            // before the COW VMAs are torn down.
             let (initrd_addr, initrd_size) = match initramfs_handle {
                 Some(handle) => self.join_and_load_initramfs(vm, handle, INITRD_ADDR)?,
                 None => (None, None),
