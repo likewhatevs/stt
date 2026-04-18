@@ -69,7 +69,7 @@ enum Command {
         /// Valid: CpuSpin, YieldHeavy, Mixed, IoSync, Bursty, PipeIo,
         /// FutexPingPong, CachePressure, CacheYield, CachePipe,
         /// FutexFanOut, ForkExit, NiceSweep, AffinityChurn, PolicyChurn,
-        /// SchBench.
+        /// SchBench, PageFaultChurn, MutexContention.
         #[arg(long)]
         work_type: Option<String>,
 

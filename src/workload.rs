@@ -182,6 +182,26 @@ pub enum WorkType {
         operations: usize,
         sleep_usec: u64,
     },
+    /// Rapid page fault cycling. Workers mmap a `region_kb` KB region with
+    /// `MADV_NOHUGEPAGE` (forcing 4 KB pages), touch `touches_per_cycle`
+    /// random pages via write faults, then `MADV_DONTNEED` to zap PTEs and
+    /// repeat. Exercises `do_anonymous_page`, page allocator contention,
+    /// and TLB pressure on migration.
+    PageFaultChurn {
+        region_kb: usize,
+        touches_per_cycle: usize,
+        spin_iters: u64,
+    },
+    /// N-way futex mutex contention. `contenders` workers per group contend
+    /// on a shared `AtomicU32` via CAS acquire / `FUTEX_WAIT` on failure.
+    /// Loop: `spin_burst(work_iters)` → CAS acquire → `spin_burst(hold_iters)`
+    /// → store 0 + `FUTEX_WAKE(1)`. Exercises convoy effect, lock-holder
+    /// preemption cascading stalls, and futex wait/wake contention paths.
+    MutexContention {
+        contenders: usize,
+        hold_iters: u64,
+        work_iters: u64,
+    },
     /// User-supplied work function. The function receives a reference to
     /// the stop flag and returns a [`WorkerReport`] when signaled.
     /// Function pointers are fork-safe (`Copy`), so `Custom` works with
@@ -219,6 +239,8 @@ impl WorkType {
         "AffinityChurn",
         "PolicyChurn",
         "SchBench",
+        "PageFaultChurn",
+        "MutexContention",
         "Custom",
     ];
 
@@ -244,6 +266,8 @@ impl WorkType {
             WorkType::AffinityChurn { .. } => "AffinityChurn",
             WorkType::PolicyChurn { .. } => "PolicyChurn",
             WorkType::SchBench { .. } => "SchBench",
+            WorkType::PageFaultChurn { .. } => "PageFaultChurn",
+            WorkType::MutexContention { .. } => "MutexContention",
             WorkType::Custom { name, .. } => name,
         }
     }
@@ -290,6 +314,16 @@ impl WorkType {
                 operations: 5,
                 sleep_usec: 100,
             }),
+            "PageFaultChurn" => Some(WorkType::PageFaultChurn {
+                region_kb: 4096,
+                touches_per_cycle: 256,
+                spin_iters: 64,
+            }),
+            "MutexContention" => Some(WorkType::MutexContention {
+                contenders: 4,
+                hold_iters: 256,
+                work_iters: 1024,
+            }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
         }
@@ -306,6 +340,7 @@ impl WorkType {
             | WorkType::CachePipe { .. } => Some(2),
             WorkType::FutexFanOut { fan_out, .. } => Some(fan_out + 1),
             WorkType::SchBench { fan_out, .. } => Some(fan_out + 1),
+            WorkType::MutexContention { contenders, .. } => Some(*contenders),
             _ => None,
         }
     }
@@ -317,6 +352,7 @@ impl WorkType {
             WorkType::FutexPingPong { .. }
                 | WorkType::FutexFanOut { .. }
                 | WorkType::SchBench { .. }
+                | WorkType::MutexContention { .. }
         )
     }
 
@@ -394,6 +430,24 @@ impl WorkType {
             cache_footprint_kb,
             operations,
             sleep_usec,
+        }
+    }
+
+    /// Rapid page fault cycling with `spin_iters` CPU work between cycles.
+    pub fn page_fault_churn(region_kb: usize, touches_per_cycle: usize, spin_iters: u64) -> Self {
+        WorkType::PageFaultChurn {
+            region_kb,
+            touches_per_cycle,
+            spin_iters,
+        }
+    }
+
+    /// N-way futex mutex contention with `contenders` workers per group.
+    pub fn mutex_contention(contenders: usize, hold_iters: u64, work_iters: u64) -> Self {
+        WorkType::MutexContention {
+            contenders,
+            hold_iters,
+            work_iters,
         }
     }
 
@@ -845,8 +899,8 @@ pub struct WorkerReport {
     pub max_gap_at_ms: u64,
     /// Per-wakeup latency samples (ns). Populated for blocking work types
     /// (Bursty, PipeIo, FutexPingPong, FutexFanOut, SchBench, CacheYield,
-    /// CachePipe, IoSync, NiceSweep, AffinityChurn, Sequence with
-    /// Sleep/Yield/Io phases).
+    /// CachePipe, IoSync, NiceSweep, AffinityChurn, MutexContention,
+    /// Sequence with Sleep/Yield/Io phases).
     #[serde(default)]
     pub wake_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
@@ -2014,6 +2068,120 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::PageFaultChurn {
+                region_kb,
+                touches_per_cycle,
+                spin_iters,
+            } => {
+                let region_size = region_kb * 1024;
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        region_size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    break;
+                }
+                unsafe {
+                    libc::madvise(ptr, region_size, libc::MADV_NOHUGEPAGE);
+                }
+                let page_count = region_size / 4096;
+                // xorshift64 PRNG seeded from process ID.
+                let mut rng_state = (tid as u64) | 1;
+                let xorshift64 = |state: &mut u64| -> u64 {
+                    let mut x = *state;
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *state = x;
+                    x
+                };
+                while !STOP.load(Ordering::Relaxed) {
+                    for _ in 0..touches_per_cycle {
+                        let page_idx = (xorshift64(&mut rng_state) as usize) % page_count;
+                        let page_ptr = unsafe { (ptr as *mut u8).add(page_idx * 4096) };
+                        unsafe { std::ptr::write_volatile(page_ptr, 1u8) };
+                        work_units = work_units.wrapping_add(1);
+                    }
+                    unsafe {
+                        libc::madvise(ptr, region_size, libc::MADV_DONTNEED);
+                    }
+                    spin_burst(&mut work_units, spin_iters);
+                    iterations += 1;
+                }
+                unsafe {
+                    libc::munmap(ptr, region_size);
+                }
+            }
+            WorkType::MutexContention {
+                hold_iters,
+                work_iters,
+                ..
+            } => {
+                let (futex_ptr, _) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                spin_burst(&mut work_units, work_iters);
+                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                // CAS acquire: try to set 0 -> 1. On failure, FUTEX_WAIT.
+                loop {
+                    if STOP.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if atom
+                        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    let before_block = Instant::now();
+                    let ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 100_000_000, // 100ms
+                    };
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_futex,
+                            futex_ptr,
+                            libc::FUTEX_WAIT,
+                            1u32, // expected value (locked)
+                            &ts as *const libc::timespec,
+                            std::ptr::null::<u32>(),
+                            0u32,
+                        );
+                    }
+                    reservoir_push(
+                        &mut wake_latencies_ns,
+                        &mut wake_sample_count,
+                        before_block.elapsed().as_nanos() as u64,
+                        MAX_WAKE_SAMPLES,
+                    );
+                }
+                // Critical section: hold the lock.
+                spin_burst(&mut work_units, hold_iters);
+                // Release: atomic store with Release ordering ensures
+                // critical section work is visible before the unlock.
+                atom.store(0, Ordering::Release);
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        futex_ptr,
+                        libc::FUTEX_WAKE,
+                        1,
+                        std::ptr::null::<libc::timespec>(),
+                        std::ptr::null::<u32>(),
+                        0u32,
+                    );
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
             WorkType::Custom { .. } => unreachable!("handled by early return"),
         }
 
@@ -2356,7 +2524,7 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        assert_eq!(WorkType::ALL_NAMES.len(), 18);
+        assert_eq!(WorkType::ALL_NAMES.len(), 20);
     }
 
     #[test]
@@ -4408,5 +4576,186 @@ mod tests {
     fn workload_config_default_mempolicy() {
         let wl = WorkloadConfig::default();
         assert!(matches!(wl.mem_policy, MemPolicy::Default));
+    }
+
+    // -- PageFaultChurn tests --
+
+    #[test]
+    fn page_fault_churn_name_roundtrip() {
+        let wt = WorkType::from_name("PageFaultChurn").unwrap();
+        assert_eq!(wt.name(), "PageFaultChurn");
+    }
+
+    #[test]
+    fn page_fault_churn_from_name_defaults() {
+        let wt = WorkType::from_name("PageFaultChurn").unwrap();
+        match wt {
+            WorkType::PageFaultChurn {
+                region_kb,
+                touches_per_cycle,
+                spin_iters,
+            } => {
+                assert_eq!(region_kb, 4096);
+                assert_eq!(touches_per_cycle, 256);
+                assert_eq!(spin_iters, 64);
+            }
+            _ => panic!("expected PageFaultChurn"),
+        }
+    }
+
+    #[test]
+    fn page_fault_churn_group_size_none() {
+        let wt = WorkType::page_fault_churn(4096, 256, 64);
+        assert_eq!(wt.worker_group_size(), None);
+    }
+
+    #[test]
+    fn page_fault_churn_no_shared_mem() {
+        assert!(!WorkType::page_fault_churn(4096, 256, 64).needs_shared_mem());
+    }
+
+    #[test]
+    fn page_fault_churn_no_cache_buf() {
+        assert!(!WorkType::page_fault_churn(4096, 256, 64).needs_cache_buf());
+    }
+
+    #[test]
+    fn spawn_page_fault_churn_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            affinity: AffinityMode::None,
+            work_type: WorkType::PageFaultChurn {
+                region_kb: 64,
+                touches_per_cycle: 16,
+                spin_iters: 32,
+            },
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(
+                r.work_units > 0,
+                "PageFaultChurn worker {} did no work",
+                r.tid
+            );
+        }
+    }
+
+    // -- MutexContention tests --
+
+    #[test]
+    fn mutex_contention_name_roundtrip() {
+        let wt = WorkType::from_name("MutexContention").unwrap();
+        assert_eq!(wt.name(), "MutexContention");
+    }
+
+    #[test]
+    fn mutex_contention_from_name_defaults() {
+        let wt = WorkType::from_name("MutexContention").unwrap();
+        match wt {
+            WorkType::MutexContention {
+                contenders,
+                hold_iters,
+                work_iters,
+            } => {
+                assert_eq!(contenders, 4);
+                assert_eq!(hold_iters, 256);
+                assert_eq!(work_iters, 1024);
+            }
+            _ => panic!("expected MutexContention"),
+        }
+    }
+
+    #[test]
+    fn mutex_contention_group_size() {
+        let wt = WorkType::mutex_contention(4, 256, 1024);
+        assert_eq!(wt.worker_group_size(), Some(4));
+        let wt2 = WorkType::mutex_contention(8, 256, 1024);
+        assert_eq!(wt2.worker_group_size(), Some(8));
+    }
+
+    #[test]
+    fn mutex_contention_needs_shared_mem() {
+        assert!(WorkType::mutex_contention(4, 256, 1024).needs_shared_mem());
+    }
+
+    #[test]
+    fn mutex_contention_no_cache_buf() {
+        assert!(!WorkType::mutex_contention(4, 256, 1024).needs_cache_buf());
+    }
+
+    #[test]
+    fn spawn_mutex_contention_produces_work() {
+        let config = WorkloadConfig {
+            num_workers: 4,
+            affinity: AffinityMode::None,
+            work_type: WorkType::MutexContention {
+                contenders: 4,
+                hold_iters: 64,
+                work_iters: 256,
+            },
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 4);
+        for r in &reports {
+            assert!(
+                r.work_units > 0,
+                "MutexContention worker {} did no work",
+                r.tid
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_mutex_contention_bad_worker_count_fails() {
+        let config = WorkloadConfig {
+            num_workers: 3,
+            affinity: AffinityMode::None,
+            work_type: WorkType::MutexContention {
+                contenders: 4,
+                hold_iters: 256,
+                work_iters: 1024,
+            },
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let result = WorkloadHandle::spawn(&config);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("divisible by 4"),
+            "expected divisibility error: {msg}"
+        );
+    }
+
+    #[test]
+    fn mutex_contention_records_wake_latency() {
+        let config = WorkloadConfig {
+            num_workers: 4,
+            affinity: AffinityMode::None,
+            work_type: WorkType::MutexContention {
+                contenders: 4,
+                hold_iters: 64,
+                work_iters: 256,
+            },
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let reports = h.stop_and_collect();
+        let has_latencies = reports.iter().any(|r| !r.wake_latencies_ns.is_empty());
+        assert!(has_latencies, "contenders should record wake latencies");
     }
 }

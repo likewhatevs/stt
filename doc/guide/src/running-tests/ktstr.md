@@ -59,10 +59,11 @@ running ktstr.
 **Work types (for `--work-type`):** `CpuSpin`, `YieldHeavy`, `Mixed`,
 `IoSync`, `Bursty`, `PipeIo`, `FutexPingPong`, `CachePressure`,
 `CacheYield`, `CachePipe`, `FutexFanOut`, `ForkExit`, `NiceSweep`,
-`AffinityChurn`, `PolicyChurn`, `SchBench`. Names are matched
-case-sensitively. `Sequence` and `Custom` exist in the library but
-are not constructible from `--work-type` (`Sequence` requires explicit
-phases; `Custom` requires a function pointer).
+`AffinityChurn`, `PolicyChurn`, `SchBench`, `PageFaultChurn`,
+`MutexContention`. Names are matched case-sensitively. `Sequence` and
+`Custom` exist in the library but are not constructible from
+`--work-type` (`Sequence` requires explicit phases; `Custom` requires
+a function pointer).
 
 ### list
 

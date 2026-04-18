@@ -934,5 +934,43 @@ pub fn all_scenarios() -> Vec<Scenario> {
             CpusetMode::None,
             w(WorkType::policy_churn(1024), SchedPolicy::Normal)
         ),
+        // Stress: rapid page fault cycling
+        s!(
+            "page_fault_churn",
+            "stress",
+            "Workers cycling mmap/fault/MADV_DONTNEED, TLB pressure",
+            2,
+            CpusetMode::None,
+            w(
+                WorkType::page_fault_churn(4096, 256, 64),
+                SchedPolicy::Normal
+            )
+        ),
+        // Stress: light mutex contention
+        s!(
+            "mutex_contention_light",
+            "stress",
+            "4-way mutex contention, short hold",
+            2,
+            CpusetMode::None,
+            vec![Work {
+                num_workers: Some(4),
+                work_type: WorkType::mutex_contention(4, 64, 1024),
+                ..Default::default()
+            }]
+        ),
+        // Stress: heavy mutex contention
+        s!(
+            "mutex_contention_heavy",
+            "stress",
+            "8-way mutex contention, long hold",
+            2,
+            CpusetMode::None,
+            vec![Work {
+                num_workers: Some(8),
+                work_type: WorkType::mutex_contention(8, 1024, 256),
+                ..Default::default()
+            }]
+        ),
     ]
 }

@@ -169,7 +169,7 @@ readiness gates between host and guest.
 </details>
 
 <details>
-<summary><b>18 work types</b> — configurable workload profiles for different scheduling pressures</summary>
+<summary><b>20 work types</b> — configurable workload profiles for different scheduling pressures</summary>
 
 Workers are `fork()`ed processes placed in cgroups:
 
@@ -190,6 +190,8 @@ Workers are `fork()`ed processes placed in cgroups:
 - `AffinityChurn` — rapid self-directed sched_setaffinity
 - `PolicyChurn` — cycle through scheduling policies
 - `SchBench` — schbench-style messenger/worker with matrix multiply
+- `PageFaultChurn` — rapid mmap/fault/MADV_DONTNEED cycling
+- `MutexContention` — N-way futex mutex contention
 - `Custom` — user-supplied work function
 
 See [Work Types](concepts/work-types.md).

@@ -21,6 +21,8 @@ pub enum WorkType {
     NiceSweep,
     AffinityChurn { spin_iters: u64 },
     PolicyChurn { spin_iters: u64 },
+    PageFaultChurn { region_kb: usize, touches_per_cycle: usize, spin_iters: u64 },
+    MutexContention { contenders: usize, hold_iters: u64, work_iters: u64 },
     Custom { name: &'static str, run: fn(&AtomicBool) -> WorkerReport },
 }
 ```
@@ -32,6 +34,8 @@ Parameterized variants have convenience constructors:
 `WorkType::futex_fan_out(4, 1024)`,
 `WorkType::schbench(4, 256, 5, 100)`,
 `WorkType::affinity_churn(1024)`, `WorkType::policy_churn(1024)`,
+`WorkType::page_fault_churn(4096, 256, 64)`,
+`WorkType::mutex_contention(4, 256, 1024)`,
 `WorkType::custom("my_work", my_fn)`.
 
 ## Choosing a work type
@@ -50,6 +54,8 @@ Parameterized variants have convenience constructors:
 | Priority reweighting / nice dynamics | `NiceSweep` |
 | Rapid CPU migration / affinity churn | `AffinityChurn` |
 | Scheduling class transitions | `PolicyChurn` |
+| Page fault / TLB pressure | `PageFaultChurn` |
+| Lock contention / convoy effect | `MutexContention` |
 | Arbitrary user-defined workload | `Custom` |
 
 ## Variants
@@ -157,6 +163,23 @@ with priority 1 when `CAP_SYS_NICE` is available). Exercises
 `__sched_setscheduler` and scheduling class transitions. Resets to
 `SCHED_OTHER` before exit. Records per-yield wake latency.
 
+**`PageFaultChurn`** -- rapid page fault cycling. Workers mmap a
+`region_kb` KB region with `MADV_NOHUGEPAGE` (forcing 4 KB pages),
+touch `touches_per_cycle` random pages via write faults through
+`do_anonymous_page`, then `MADV_DONTNEED` to zap PTEs and repeat.
+`spin_iters` iterations of CPU work separate cycles. Exercises
+the page allocator, TLB pressure on migration, and rapid user/kernel
+transitions. Uses xorshift64 PRNG for random page selection (seeded
+from the process ID).
+
+**`MutexContention`** -- N-way futex mutex contention. `contenders`
+workers per group contend on a shared `AtomicU32` via CAS acquire
+(`FUTEX_WAIT` on failure). Loop: `spin_burst(work_iters)` then CAS
+acquire, `spin_burst(hold_iters)` in the critical section, then
+store 0 + `FUTEX_WAKE(1)` to release. Exercises convoy effect,
+lock-holder preemption cascading stalls, and futex wait/wake
+contention paths. Requires `num_workers` divisible by `contenders`.
+
 **`Custom`** -- user-supplied work function. The `run` function pointer
 receives a reference to the stop flag (`&AtomicBool`, set by SIGUSR1)
 and returns a `WorkerReport` when the flag becomes `true`. The
@@ -215,10 +238,11 @@ let wt = WorkType::custom("my_workload", my_workload);
 `PipeIo`, `FutexPingPong`, and `CachePipe` require `num_workers`
 divisible by 2 (paired). `FutexFanOut` and `SchBench` require
 `num_workers` divisible by `fan_out + 1` (1 messenger + N receivers per
-group). `WorkType::worker_group_size()` returns the group size for these
-variants, or `None` for ungrouped types. `PipeIo` and `CachePipe` use
-pipes; `FutexPingPong`, `FutexFanOut`, and `SchBench` use shared mmap
-pages with futex wait/wake.
+group). `MutexContention` requires `num_workers` divisible by
+`contenders`. `WorkType::worker_group_size()` returns the group size
+for these variants, or `None` for ungrouped types. `PipeIo` and
+`CachePipe` use pipes; `FutexPingPong`, `FutexFanOut`, `SchBench`,
+and `MutexContention` use shared mmap pages with futex wait/wake.
 
 ## Default values
 
@@ -233,6 +257,8 @@ pages with futex wait/wake.
 - `SchBench`: `fan_out=4`, `cache_footprint_kb=256`, `operations=5`, `sleep_usec=100`
 - `AffinityChurn`: `spin_iters=1024`
 - `PolicyChurn`: `spin_iters=1024`
+- `PageFaultChurn`: `region_kb=4096`, `touches_per_cycle=256`, `spin_iters=64`
+- `MutexContention`: `contenders=4`, `hold_iters=256`, `work_iters=1024`
 
 ## String lookup
 
@@ -290,8 +316,8 @@ for all scenarios that use it. Scenarios with non-`CpuSpin` work types
 are not overridden.
 
 Overrides to grouped work types (`PipeIo`, `FutexPingPong`,
-`CachePipe`, `FutexFanOut`, `SchBench`) are skipped when `num_workers`
-is not divisible by the work type's group size.
+`CachePipe`, `FutexFanOut`, `SchBench`, `MutexContention`) are skipped
+when `num_workers` is not divisible by the work type's group size.
 
 Ops-based scenarios have a separate override mechanism via
 `CgroupDef.swappable`. See [Ops and Steps](ops.md#work-type-overrides-and-swappable).
