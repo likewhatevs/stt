@@ -4985,13 +4985,16 @@ mod tests {
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
 
         // Version-dependent skips, in order of check cost. scx_root
-        // is a 6.16+ symbol; 6.14 kernels have sched_ext but use the
-        // older scx_ops API, so its absence means "pre-6.16 SCX API,"
-        // not "no sched_ext." watchdog_offsets depends on BTF field
-        // layout that only exists on kernels exposing scx_sched.
+        // is a 6.16+ symbol; its absence means either the kernel
+        // predates the 6.16 scx_sched refactor (sched_ext still
+        // present via the older scx_ops API, e.g. 6.14) or sched_ext
+        // was not compiled in. Either way this test has nothing to
+        // verify — skip. watchdog_offsets depends on BTF field layout
+        // that only exists on 7.1+ kernels where
+        // `scx_sched.watchdog_timeout` is a struct field.
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
-            skip!("scx_root not present (pre-6.16 kernel, uses older SCX API)");
+            skip!("scx_root not present (pre-6.16 kernel, uses older SCX API); needs Linux 6.16+");
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.watchdog_offsets.is_none() {
@@ -5180,7 +5183,7 @@ mod tests {
 
         let syms = crate::test_support::require_kernel_symbols(&vmlinux);
         if syms.scx_root.is_none() {
-            skip!("scx_root not present (pre-6.16 kernel, uses older SCX API)");
+            skip!("scx_root not present (pre-6.16 kernel, uses older SCX API); needs Linux 6.16+");
         }
         let offsets = crate::test_support::require_kernel_offsets(&vmlinux);
         if offsets.event_offsets.is_none() {
