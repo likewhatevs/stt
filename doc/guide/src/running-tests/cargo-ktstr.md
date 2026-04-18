@@ -287,20 +287,6 @@ cargo ktstr stats                    # reads them
 
 Set `KTSTR_SIDECAR_DIR` to override the default sidecar directory.
 
-## Deprecated: build-kernel
-
-**DEPRECATED** -- `cargo ktstr build-kernel` is hidden from `--help`
-and retained only for backward compatibility. Use
-`cargo ktstr kernel build --source` instead:
-
-```sh
-# Old (deprecated):
-cargo ktstr build-kernel --kernel ../linux
-
-# New:
-cargo ktstr kernel build --source ../linux
-```
-
 ## Install
 
 ```sh

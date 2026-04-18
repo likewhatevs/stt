@@ -29,16 +29,6 @@ struct Ktstr {
 
 #[derive(Subcommand)]
 enum KtstrCommand {
-    /// Deprecated: use `cargo ktstr kernel build` instead.
-    #[command(hide = true)]
-    BuildKernel {
-        /// Path to the kernel source directory.
-        #[arg(long)]
-        kernel: PathBuf,
-        /// Run `make mrproper` first for a full reconfigure + rebuild.
-        #[arg(long)]
-        clean: bool,
-    },
     /// Build the kernel (if needed) and run tests via cargo nextest.
     Test {
         #[arg(long, help = KERNEL_HELP_NO_RAW)]
@@ -805,13 +795,6 @@ fn main() {
     } = Cargo::parse();
 
     let result = match ktstr.command {
-        KtstrCommand::BuildKernel { kernel, clean } => {
-            eprintln!(
-                "cargo ktstr: warning: build-kernel is deprecated, use `cargo ktstr kernel build --source {}` instead",
-                kernel.display()
-            );
-            build_kernel(&kernel, clean)
-        }
         KtstrCommand::Completions { shell, binary } => {
             run_completions(shell, &binary);
             Ok(())
