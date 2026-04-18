@@ -1667,8 +1667,8 @@ mod tests {
     // -- strip_vmlinux_debug --
 
     /// Check whether `elf` has a defined symbol with the given name.
-    /// Mirrors the production `KernelSymbols::sym_addr` filter by
-    /// requiring `st_value != 0` to reject undefined/absent symbols.
+    /// Mirrors the `sym_addr` closure inside `KernelSymbols::from_vmlinux`
+    /// by requiring `st_value != 0` to reject undefined/absent symbols.
     fn has_symbol(elf: &goblin::elf::Elf, name: &str) -> bool {
         elf.syms
             .iter()
@@ -1973,7 +1973,7 @@ mod tests {
         assert_eq!(
             source_syms.init_top_pgt.is_some(),
             syms.init_top_pgt.is_some(),
-            "strip changed init_top_pgt presence"
+            "strip changed KernelSymbols init_top_pgt presence"
         );
         assert_eq!(
             source_syms.page_offset_base_kva.is_some(),
@@ -2012,12 +2012,12 @@ mod tests {
         assert_eq!(
             has_symbol(&source_elf, "init_top_pgt"),
             has_symbol(&stripped_elf, "init_top_pgt"),
-            "strip changed init_top_pgt presence"
+            "strip changed raw-symtab init_top_pgt presence"
         );
         assert_eq!(
             has_symbol(&source_elf, "swapper_pg_dir"),
             has_symbol(&stripped_elf, "swapper_pg_dir"),
-            "strip changed swapper_pg_dir presence"
+            "strip changed raw-symtab swapper_pg_dir presence"
         );
 
         // Guards against a regression where strip_vmlinux_debug returns
