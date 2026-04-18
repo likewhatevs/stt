@@ -52,7 +52,14 @@ use crate::topology::TestTopology;
 use crate::workload::*;
 
 /// Check if a process is alive via kill(pid, 0).
+///
+/// Returns `false` for pid 0: `kill(0, ...)` targets the caller's
+/// process group rather than a single process, so the syscall would
+/// always report success and falsely mark "no process" as alive.
 fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
@@ -1330,6 +1337,14 @@ mod tests {
     fn process_alive_current_pid() {
         let pid = std::process::id();
         assert!(process_alive(pid));
+    }
+
+    #[test]
+    fn process_alive_pid_zero_is_not_alive() {
+        // kill(0, sig) targets the caller's process group, so without
+        // an explicit guard kill(0, 0) succeeds and would falsely
+        // report "process 0" as alive.
+        assert!(!process_alive(0));
     }
 
     #[test]
