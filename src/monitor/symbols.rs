@@ -29,6 +29,31 @@ pub(crate) const DEFAULT_PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const DEFAULT_PAGE_OFFSET: u64 = 0xffff_0000_0000_0000;
 
+/// ELF sections [`KernelSymbols::from_vmlinux`] reads directly.
+///
+/// The cached-vmlinux strip pipeline
+/// ([`crate::cache::strip_vmlinux_debug`]) preserves these bytes
+/// verbatim via its keep-list predicate. Removing an entry here
+/// without also removing the reader will quietly break symbol
+/// resolution on cache-booted runs.
+pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
+    b".symtab", // symbol table — source of every kernel address this module resolves
+    b".strtab", // names for .symtab entries
+    b".bss",    // already SHT_NOBITS; holds scx_root (uninitialized global)
+];
+
+/// ELF data sections whose addresses (`st_value` via `.symtab`) are
+/// read by this module, but whose backing bytes are not — guest
+/// memory is the source of truth at runtime.
+///
+/// The strip pipeline preserves the section headers as
+/// `SHT_NOBITS` with zero-length data so symbol-table entries with
+/// `st_shndx` pointing here survive `Builder::delete_orphans`.
+pub(crate) const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
+    b".data",         // init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
+    b".data..percpu", // runqueues (per-CPU runqueue template)
+];
+
 /// Kernel symbol addresses extracted from vmlinux ELF.
 #[derive(Debug, Clone)]
 pub(crate) struct KernelSymbols {

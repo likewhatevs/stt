@@ -1,5 +1,16 @@
 use super::stack::StackFunction;
 
+/// ELF sections the probe BTF loader reads from a vmlinux ELF
+/// (`parse_btf_known_kernel_func`, `resolve_field_specs`, and
+/// related entry points).
+///
+/// The cached-vmlinux strip pipeline
+/// ([`crate::cache::strip_vmlinux_debug`]) preserves these bytes
+/// verbatim via its keep-list predicate.
+pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
+    b".BTF", // BPF Type Format — probe field resolution
+];
+
 /// Display hint derived from BTF type information.
 ///
 /// Controls how auto-discovered field values are formatted in probe

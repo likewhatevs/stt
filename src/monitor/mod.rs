@@ -80,6 +80,15 @@ use crate::vmm::find_vmlinux;
 /// IKCONFIG marker: gzip data starts immediately after this 8-byte sequence.
 const IKCONFIG_MAGIC: &[u8] = b"IKCFG_ST";
 
+/// ELF sections [`read_hz_from_ikconfig`] reads.
+///
+/// The cached-vmlinux strip pipeline
+/// ([`crate::cache::strip_vmlinux_debug`]) preserves these bytes
+/// verbatim via its keep-list predicate.
+pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
+    b".rodata", // IKCONFIG gzip blob, bracketed by IKCFG_ST / IKCFG_ED markers
+];
+
 /// Extract CONFIG_HZ from the embedded IKCONFIG blob in a vmlinux ELF.
 ///
 /// The kernel (when built with CONFIG_IKCONFIG) embeds a gzip-compressed

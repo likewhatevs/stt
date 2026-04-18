@@ -672,41 +672,58 @@ pub fn prefer_source_tree_for_dwarf(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Sections whose source bytes are preserved verbatim in the cached
-/// vmlinux. Entries that start as `SHT_NOBITS` (`.bss`) have no
-/// bytes to preserve but the section header is kept so symbols
-/// pointing at them survive. Everything not in this list or
-/// [`VMLINUX_ZERO_DATA_SECTIONS`] is deleted (non-code) or has its
-/// bytes dropped via SHT_NOBITS (code). Keep-list is safer than a
-/// remove-list: new debug or data sections added by future
-/// compiler/kernel versions are stripped automatically without
-/// updating this list.
-const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
-    b"",          // null section (index 0)
-    b".BTF",      // BPF Type Format — probe field resolution
-    b".symtab",   // symbol table — monitor address resolution
-    b".strtab",   // symbol string table
-    b".shstrtab", // section header string table (structural)
-    b".rodata",   // IKCONFIG gzip blob read by read_hz_from_ikconfig
-    b".bss",      // already SHT_NOBITS — holds scx_root (uninitialized globals)
+/// Structural ELF sections that must survive any cache-time strip
+/// so that downstream readers can parse the result. Not tied to any
+/// specific consumer — independent of monitor or probe code.
+const STRUCTURAL_KEEP_SECTIONS: &[&[u8]] = &[
+    b"",          // null section (index 0) — required by ELF spec
+    b".shstrtab", // section header string table
 ];
 
-/// Data sections whose bytes are dropped (converted to SHT_NOBITS +
-/// zero-length data) while their headers and addresses are preserved.
-/// Monitor code reads only symbol addresses (`st_value`) from these,
-/// never the backing bytes — guest memory is the source of truth.
-/// Keeping the header lets symbols with `st_shndx` pointing at them
-/// survive `Builder::delete_orphans`.
+/// Data sections retained as SHT_NOBITS headers with no current
+/// consumer. Kept defensively so that symbols future kernels might
+/// place here survive `Builder::delete_orphans`; remove an entry
+/// only if no in-tree or upstream kernel version places monitored
+/// symbols in it.
+const SPECULATIVE_ZERO_DATA_SECTIONS: &[&[u8]] = &[b".init.data"];
+
+/// Union of consumer-declared keep-lists plus structural sections.
 ///
-/// Contrast with [`VMLINUX_KEEP_SECTIONS`]: that list preserves
-/// source bytes; this one discards them.
-const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
-    b".data",         // holds init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
-    b".data..percpu", // holds runqueues (per-CPU runqueue template)
-    b".init.data",    // no current consumer; header kept for symbol
-                      // survival if future kernels place monitored
-                      // symbols here
-];
+/// Each consumer module owns the list of ELF sections it reads —
+/// see [`crate::monitor::symbols::VMLINUX_KEEP_SECTIONS`],
+/// [`crate::monitor::VMLINUX_KEEP_SECTIONS`], and
+/// [`crate::probe::btf::VMLINUX_KEEP_SECTIONS`]. `is_keep_section`
+/// unions them with [`STRUCTURAL_KEEP_SECTIONS`] at strip time.
+///
+/// Keep-list (vs remove-list) is safer: new debug or data sections
+/// added by future compiler / kernel versions are stripped
+/// automatically. Sections not matched by `is_keep_section` or
+/// `is_zero_data_section` are deleted outright (non-code) or have
+/// their bytes dropped via SHT_NOBITS (code — see [`strip_keep_list`]).
+fn is_keep_section(name: &[u8]) -> bool {
+    STRUCTURAL_KEEP_SECTIONS.contains(&name)
+        || crate::monitor::symbols::VMLINUX_KEEP_SECTIONS.contains(&name)
+        || crate::monitor::VMLINUX_KEEP_SECTIONS.contains(&name)
+        || crate::probe::btf::VMLINUX_KEEP_SECTIONS.contains(&name)
+}
+
+/// Union of consumer-declared zero-data lists plus the speculative
+/// retention set.
+///
+/// Data sections whose bytes are dropped (converted to SHT_NOBITS +
+/// zero-length data) while their headers and addresses are
+/// preserved. Monitor code reads only symbol addresses (`st_value`)
+/// from these, never the backing bytes. Keeping the header lets
+/// symbols with `st_shndx` pointing at them survive
+/// `Builder::delete_orphans`.
+///
+/// See [`crate::monitor::symbols::VMLINUX_ZERO_DATA_SECTIONS`] for
+/// the current consumer list and [`SPECULATIVE_ZERO_DATA_SECTIONS`]
+/// for retained-without-consumer entries.
+fn is_zero_data_section(name: &[u8]) -> bool {
+    SPECULATIVE_ZERO_DATA_SECTIONS.contains(&name)
+        || crate::monitor::symbols::VMLINUX_ZERO_DATA_SECTIONS.contains(&name)
+}
 
 /// Stripped vmlinux written to a temporary file.
 ///
@@ -729,12 +746,13 @@ impl StrippedVmlinux {
 }
 
 /// Strip vmlinux for caching. Sections fall into three groups:
-/// bytes preserved ([`VMLINUX_KEEP_SECTIONS`] — symbol tables, BTF,
-/// `.rodata` for IKCONFIG, `.bss`, `.shstrtab`), header-only via
-/// SHT_NOBITS ([`VMLINUX_ZERO_DATA_SECTIONS`] plus all code sections,
-/// so symbols with `st_shndx` pointing at them survive), and deleted
-/// (everything else — DWARF `.debug_*`, relocations, etc.). See
-/// [`strip_keep_list`] for the dispatch detail.
+/// bytes preserved (matched by [`is_keep_section`] — symbol tables,
+/// BTF, `.rodata` for IKCONFIG, `.bss`, `.shstrtab`), header-only
+/// via SHT_NOBITS (matched by [`is_zero_data_section`] plus all
+/// code sections, so symbols with `st_shndx` pointing at them
+/// survive), and deleted (everything else — DWARF `.debug_*`,
+/// relocations, etc.). See [`strip_keep_list`] for the dispatch
+/// detail.
 ///
 /// The cached vmlinux is consumed by monitor and probe code for
 /// symbol addresses (`.symtab`) and BTF type info (`.BTF`). DWARF
@@ -852,11 +870,11 @@ fn neutralize_alloc_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 /// Keep-list strip: three-way partition of ELF sections.
 ///
-/// Sections in [`VMLINUX_KEEP_SECTIONS`] keep their bytes (symbol
+/// Sections matched by [`is_keep_section`] keep their bytes (symbol
 /// tables, BTF, `.shstrtab`, `.rodata` for IKCONFIG, `.bss` already
 /// SHT_NOBITS).
 ///
-/// Sections in [`VMLINUX_ZERO_DATA_SECTIONS`] have their headers
+/// Sections matched by [`is_zero_data_section`] have their headers
 /// preserved but bytes dropped via `SHT_NOBITS` + zero-length data.
 /// Monitor code reads symbol addresses (`st_value`) from these, never
 /// the backing bytes.
@@ -881,10 +899,10 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
     for section in builder.sections.iter_mut() {
         let name = section.name.as_slice();
-        if VMLINUX_KEEP_SECTIONS.contains(&name) {
+        if is_keep_section(name) {
             continue;
         }
-        if VMLINUX_ZERO_DATA_SECTIONS.contains(&name) {
+        if is_zero_data_section(name) {
             section.sh_type = object::elf::SHT_NOBITS;
             section.data = object::build::elf::SectionData::UninitializedData(0);
             continue;
@@ -2133,10 +2151,10 @@ mod tests {
     /// Build a minimal ELF covering every strip dispatch branch:
     /// `.text` (code, bytes dropped via SHT_NOBITS), `.BTF` (kept
     /// whole), `.BTF.ext` + `.debug_*` (deleted), and the three
-    /// VMLINUX_ZERO_DATA_SECTIONS entries (`.data`, `.data..percpu`,
-    /// `.init.data`, bytes dropped via SHT_NOBITS). Each bytes-dropped
-    /// section has a symbol pointing at an in-bounds offset so tests
-    /// can assert the symbols survive `Builder::delete_orphans`.
+    /// zero-data sections (`.data`, `.data..percpu`, `.init.data`,
+    /// bytes dropped via SHT_NOBITS). Each bytes-dropped section
+    /// has a symbol pointing at an in-bounds offset so tests can
+    /// assert the symbols survive `Builder::delete_orphans`.
     fn create_strip_test_fixture(dir: &Path) -> PathBuf {
         use object::write;
         let mut obj = write::Object::new(
@@ -2323,7 +2341,7 @@ mod tests {
         );
     }
 
-    /// Data sections in [`VMLINUX_ZERO_DATA_SECTIONS`] and code
+    /// Data sections matched by [`is_zero_data_section`] and code
     /// sections must come out as SHT_NOBITS with sh_size == 0, and
     /// symbols pointing at them must survive. Runs on the synthetic
     /// fixture so it exercises the keep-list path in CI environments
@@ -2358,9 +2376,13 @@ mod tests {
             );
         };
 
-        // Iterate the constant so the test stays in sync automatically
-        // when VMLINUX_ZERO_DATA_SECTIONS changes.
-        for name_bytes in VMLINUX_ZERO_DATA_SECTIONS {
+        // Iterate both the consumer-declared zero-data sections and
+        // the speculative retention set so the test stays in sync
+        // automatically when either source changes.
+        for name_bytes in crate::monitor::symbols::VMLINUX_ZERO_DATA_SECTIONS
+            .iter()
+            .chain(SPECULATIVE_ZERO_DATA_SECTIONS.iter())
+        {
             let name = std::str::from_utf8(name_bytes).unwrap();
             assert_nobits_empty(name);
         }
