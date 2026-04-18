@@ -2464,7 +2464,7 @@ mod tests {
         // regression (higher_is_worse).
         // total_iterations 1000 -> 500: abs delta 500 >= 100, rel 0.5
         // >= 0.10, higher_is_worse=false so decrease is a regression.
-        // Net: 2 regressions, 0 improvements; one MetricDelta per
+        // Net: 2 regressions, 0 improvements; one Finding per
         // significant metric.
         let rows_a = vec![cmp_row("test1", "tiny-1llc", true, 10.0, 1000)];
         let rows_b = vec![cmp_row("test1", "tiny-1llc", true, 30.0, 500)];
