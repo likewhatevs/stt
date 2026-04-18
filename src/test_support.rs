@@ -5993,8 +5993,8 @@ mod tests {
             "EEVDF with no COM2 output should say 'test function produced no output', got: {msg}",
         );
         assert!(
-            !msg.contains("scheduler crashed"),
-            "EEVDF error should not say 'scheduler crashed', got: {msg}",
+            !msg.contains("no test result received from guest"),
+            "EEVDF error should not use the scheduler-path wording, got: {msg}",
         );
         assert!(
             msg.contains("exit_code=1"),
@@ -6015,8 +6015,8 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("scheduler crashed"),
-            "scheduler present with no output should say 'scheduler crashed', got: {msg}",
+            msg.contains("no test result received from guest"),
+            "scheduler present with no output should take the scheduler-path fallback, got: {msg}",
         );
         assert!(
             !msg.contains("test function produced no output"),
@@ -6038,8 +6038,8 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("scheduler crashed"),
-            "should say scheduler crashed, got: {msg}",
+            msg.contains("no test result received from guest"),
+            "should take the scheduler-path fallback, got: {msg}",
         );
         assert!(
             msg.contains("--- scheduler log ---"),
@@ -6164,8 +6164,8 @@ mod tests {
             "non-parseable COM2 with EEVDF should say 'test function produced no output', got: {msg}",
         );
         assert!(
-            !msg.contains("scheduler crashed"),
-            "EEVDF should not say scheduler crashed, got: {msg}",
+            !msg.contains("no test result received from guest"),
+            "EEVDF should not use the scheduler-path wording, got: {msg}",
         );
     }
 
