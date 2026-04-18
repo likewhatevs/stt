@@ -244,6 +244,15 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
 fn run_test(kernel: Option<String>, no_perf_mode: bool, args: Vec<String>) -> Result<(), String> {
     use ktstr::kernel_path::KernelId;
 
+    eprintln!("cargo ktstr: building workspace");
+    let status = Command::new("cargo")
+        .args(["build", "--workspace"])
+        .status()
+        .map_err(|e| format!("cargo build --workspace: {e}"))?;
+    if !status.success() {
+        return Err("cargo build --workspace failed".into());
+    }
+
     let mut cmd = Command::new("cargo");
     cmd.args(["nextest", "run"]).args(&args);
 
@@ -266,9 +275,6 @@ fn run_test(kernel: Option<String>, no_perf_mode: bool, args: Vec<String>) -> Re
             }
         }
     }
-    // When kernel is None, the test framework discovers a kernel from
-    // KTSTR_TEST_KERNEL, then KTSTR_KERNEL, then falls back to cache
-    // and filesystem lookup.
 
     eprintln!("cargo ktstr: running tests");
     let err = cmd.exec();
@@ -281,6 +287,15 @@ fn run_coverage(
     args: Vec<String>,
 ) -> Result<(), String> {
     use ktstr::kernel_path::KernelId;
+
+    eprintln!("cargo ktstr: building workspace");
+    let status = Command::new("cargo")
+        .args(["build", "--workspace"])
+        .status()
+        .map_err(|e| format!("cargo build --workspace: {e}"))?;
+    if !status.success() {
+        return Err("cargo build --workspace failed".into());
+    }
 
     let mut cmd = Command::new("cargo");
     cmd.args(["llvm-cov", "nextest"]).args(&args);

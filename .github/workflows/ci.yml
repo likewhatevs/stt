@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel-version: ['6.12', '7.1']
+        kernel-version: ['6.14', '7.0']
     env:
       KTSTR_GHA_CACHE: "1"
     steps:
@@ -44,6 +44,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - name: Install ktstr
+        run: cargo install --path .
       - name: Cache kernel images
         uses: actions/cache@v5
         with:
@@ -51,15 +53,11 @@ jobs:
           key: ktstr-kernels-x64-${{ matrix.kernel-version }}-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-x64-${{ matrix.kernel-version }}-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr -- ktstr kernel build ${{ matrix.kernel-version }}
-      - name: Build scx-ktstr binary
-        run: cargo build -p scx-ktstr
-      - run: cargo nextest run --workspace --profile ci --features integration
-        env:
-          KTSTR_KERNEL: ${{ matrix.kernel-version }}
+        run: cargo ktstr kernel build ${{ matrix.kernel-version }}
+      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
-        run: cargo run --bin cargo-ktstr -- ktstr test-stats
+        run: cargo ktstr test-stats
         env:
           KTSTR_KERNEL: ${{ matrix.kernel-version }}
       - name: Upload test results to Codecov
@@ -75,7 +73,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel-version: ['6.12', '7.1']
+        kernel-version: ['6.14', '7.0']
     env:
       RUSTC_WRAPPER: ""
       KTSTR_GHA_CACHE: "1"
@@ -87,6 +85,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - name: Install ktstr
+        run: cargo install --path .
       - name: Cache kernel images
         uses: actions/cache@v5
         with:
@@ -94,15 +94,11 @@ jobs:
           key: ktstr-kernels-arm64-${{ matrix.kernel-version }}-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-arm64-${{ matrix.kernel-version }}-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr -- ktstr kernel build ${{ matrix.kernel-version }}
-      - name: Build scx-ktstr binary
-        run: cargo build -p scx-ktstr
-      - run: cargo nextest run --workspace --profile ci --features integration
-        env:
-          KTSTR_KERNEL: ${{ matrix.kernel-version }}
+        run: cargo ktstr kernel build ${{ matrix.kernel-version }}
+      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
       - name: Test statistics
         if: ${{ !cancelled() }}
-        run: cargo run --bin cargo-ktstr -- ktstr test-stats
+        run: cargo ktstr test-stats
         env:
           KTSTR_KERNEL: ${{ matrix.kernel-version }}
       - name: Upload test results to Codecov
@@ -126,6 +122,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
+      - name: Install ktstr
+        run: cargo install --path .
       - name: Cache kernel images
         uses: actions/cache@v5
         with:
@@ -133,8 +131,8 @@ jobs:
           key: ktstr-kernels-x64-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-x64-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr -- ktstr kernel build
-      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
+        run: cargo ktstr kernel build
+      - run: cargo ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:
@@ -155,6 +153,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
+      - name: Install ktstr
+        run: cargo install --path .
       - name: Cache kernel images
         uses: actions/cache@v5
         with:
@@ -162,8 +162,8 @@ jobs:
           key: ktstr-kernels-arm64-${{ hashFiles('ktstr.kconfig') }}
           restore-keys: ktstr-kernels-arm64-
       - name: Build test kernel
-        run: cargo run --bin cargo-ktstr -- ktstr kernel build
-      - run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
+        run: cargo ktstr kernel build
+      - run: cargo ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:
