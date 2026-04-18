@@ -1666,6 +1666,16 @@ mod tests {
 
     // -- strip_vmlinux_debug --
 
+    /// Check whether `elf` has a symbol with the given name. When
+    /// `require_value` is true, additionally requires `st_value != 0`
+    /// — mirrors the production [`KernelSymbols::sym_addr`]
+    /// (symbols.rs:87) filter that rejects undefined/absent symbols.
+    fn has_symbol(elf: &goblin::elf::Elf, name: &str, require_value: bool) -> bool {
+        elf.syms.iter().any(|s| {
+            (!require_value || s.st_value != 0) && elf.strtab.get_at(s.st_name) == Some(name)
+        })
+    }
+
     /// Build a minimal ELF covering every strip dispatch branch:
     /// `.text` (code, bytes dropped via SHT_NOBITS), `.BTF` (kept
     /// whole), `.BTF.ext` + `.debug_*` (deleted), and the three
@@ -1833,17 +1843,17 @@ mod tests {
         // symbol table whose strtab still contains our test symbol
         // name. End-to-end symbol preservation on real vmlinuxes is
         // covered by the *_preserves_monitor_symbols tests below.
-        let found = elf
-            .syms
-            .iter()
-            .any(|s| elf.strtab.get_at(s.st_name) == Some("test_symbol"));
-        assert!(found, "stripped ELF should contain test_symbol in symtab");
+        assert!(
+            has_symbol(&elf, "test_symbol", true),
+            "stripped ELF should contain test_symbol in symtab"
+        );
     }
 
-    /// Data sections in [`VMLINUX_ZERO_DATA_SECTIONS`] must come out
-    /// as SHT_NOBITS with sh_size == 0, and symbols pointing at them
-    /// must survive. Runs on the synthetic fixture so it exercises
-    /// the keep-list path in CI environments without a real vmlinux.
+    /// Data sections in [`VMLINUX_ZERO_DATA_SECTIONS`] and code
+    /// sections must come out as SHT_NOBITS with sh_size == 0, and
+    /// symbols pointing at them must survive. Runs on the synthetic
+    /// fixture so it exercises the keep-list path in CI environments
+    /// without a real vmlinux.
     #[test]
     fn strip_vmlinux_debug_zeros_data_sections() {
         let src = TempDir::new().unwrap();
@@ -1859,7 +1869,7 @@ mod tests {
                 .find(|s| elf.shdr_strtab.get_at(s.sh_name) == Some(name))
                 .unwrap_or_else(|| panic!("section {name} missing from stripped ELF"))
         };
-        for name in [".data", ".data..percpu", ".init.data"] {
+        let assert_nobits_empty = |name: &str| {
             let sh = find_section(name);
             assert_eq!(
                 sh.sh_type, SHT_NOBITS,
@@ -1871,25 +1881,33 @@ mod tests {
                 "section {name} should have sh_size == 0 after strip, got {}",
                 sh.sh_size
             );
+        };
+
+        // Iterate the constant so the test stays in sync automatically
+        // when VMLINUX_ZERO_DATA_SECTIONS changes.
+        for name_bytes in VMLINUX_ZERO_DATA_SECTIONS {
+            let name = std::str::from_utf8(name_bytes).unwrap();
+            assert_nobits_empty(name);
         }
 
-        // Symbols pointing at the zeroed sections must survive
-        // Builder::delete_orphans.
-        let has_sym = |name: &str| {
-            elf.syms
-                .iter()
-                .any(|s| elf.strtab.get_at(s.st_name) == Some(name))
-        };
+        // Code sections (`.text` in the fixture) receive the same
+        // SHT_NOBITS treatment so function symbols survive
+        // `Builder::delete_orphans`.
+        assert_nobits_empty(".text");
+
+        // Symbols pointing at the zeroed data sections must survive.
+        // Fixture symbol values are 0x2000/0x3000/0x4000 (nonzero),
+        // so the production-matching require_value filter applies.
         assert!(
-            has_sym("test_data_symbol"),
+            has_symbol(&elf, "test_data_symbol", true),
             "test_data_symbol dropped by strip"
         );
         assert!(
-            has_sym("test_percpu_symbol"),
+            has_symbol(&elf, "test_percpu_symbol", true),
             "test_percpu_symbol dropped by strip"
         );
         assert!(
-            has_sym("test_initdata_symbol"),
+            has_symbol(&elf, "test_initdata_symbol", true),
             "test_initdata_symbol dropped by strip"
         );
     }
@@ -1973,32 +1991,35 @@ mod tests {
         let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
         let stripped_data = fs::read(&stripped_path).unwrap();
         let stripped_elf = goblin::elf::Elf::parse(&stripped_data).unwrap();
-        let has_sym = |elf: &goblin::elf::Elf, name: &str| {
-            elf.syms
-                .iter()
-                .any(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
-        };
         assert_eq!(
-            has_sym(&source_elf, "init_top_pgt"),
-            has_sym(&stripped_elf, "init_top_pgt"),
+            has_symbol(&source_elf, "init_top_pgt", true),
+            has_symbol(&stripped_elf, "init_top_pgt", true),
             "strip changed init_top_pgt presence"
         );
         assert_eq!(
-            has_sym(&source_elf, "swapper_pg_dir"),
-            has_sym(&stripped_elf, "swapper_pg_dir"),
+            has_symbol(&source_elf, "swapper_pg_dir", true),
+            has_symbol(&stripped_elf, "swapper_pg_dir", true),
             "strip changed swapper_pg_dir presence"
         );
 
-        // The strip should shrink the file. Guards against a
-        // regression that silently falls through to a path that
-        // caches the unstripped vmlinux.
-        let source_size = fs::metadata(&path).unwrap().len();
-        let stripped_size = fs::metadata(&stripped_path).unwrap().len();
-        assert!(
-            stripped_size < source_size,
-            "stripped vmlinux ({stripped_size} bytes) should be smaller than \
-             source ({source_size} bytes)"
-        );
+        // Guards against a regression where strip_vmlinux_debug returns
+        // Ok but produces output close to the source size. Skip when
+        // source lacks .debug_info — without DWARF to drop, strip's
+        // savings may not exceed the header overhead and the inequality
+        // no longer meaningfully checks the strip path.
+        let source_has_debug = source_elf
+            .section_headers
+            .iter()
+            .any(|sh| source_elf.shdr_strtab.get_at(sh.sh_name) == Some(".debug_info"));
+        if source_has_debug {
+            let source_size = fs::metadata(&path).unwrap().len();
+            let stripped_size = fs::metadata(&stripped_path).unwrap().len();
+            assert!(
+                stripped_size < source_size,
+                "stripped vmlinux ({stripped_size} bytes) should be smaller than \
+                 source ({source_size} bytes)"
+            );
+        }
     }
 
     #[test]
@@ -2013,17 +2034,12 @@ mod tests {
         let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
         let data = fs::read(&stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
-        let has = |name: &str| {
-            elf.syms
-                .iter()
-                .any(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
-        };
         assert!(
-            has("map_idr"),
+            has_symbol(&elf, "map_idr", true),
             "map_idr symbol missing from stripped vmlinux"
         );
         assert!(
-            has("prog_idr"),
+            has_symbol(&elf, "prog_idr", true),
             "prog_idr symbol missing from stripped vmlinux"
         );
     }
