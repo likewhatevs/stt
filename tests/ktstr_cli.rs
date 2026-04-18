@@ -291,6 +291,46 @@ fn completions_invalid_shell() {
     ktstr().args(["completions", "noshell"]).assert().failure();
 }
 
+// -- run --flags / --work-type drift detection --
+
+/// `ktstr run --help` hardcodes the valid `--flags` list. This test
+/// fails the build when that list drifts from `scenario::flags::ALL`,
+/// catching new flag additions or renames before they ship.
+#[test]
+fn run_help_flags_lists_match_flags_all() {
+    use ktstr::scenario::flags;
+    let assert = ktstr().args(["run", "--help"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for &name in flags::ALL {
+        assert!(
+            stdout.contains(name),
+            "ktstr run --help missing flag '{name}' that is in scenario::flags::ALL; \
+             update the --flags doc-comment in src/bin/ktstr.rs to include it",
+        );
+    }
+}
+
+/// `ktstr run --help` hardcodes the valid `--work-type` list. This
+/// test fails the build when that list drifts from
+/// `WorkType::ALL_NAMES` (excluding the two non-CLI-constructible
+/// variants `Sequence` and `Custom`).
+#[test]
+fn run_help_work_type_lists_match_all_names() {
+    use ktstr::workload::WorkType;
+    let assert = ktstr().args(["run", "--help"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for &name in WorkType::ALL_NAMES {
+        if name == "Sequence" || name == "Custom" {
+            continue;
+        }
+        assert!(
+            stdout.contains(name),
+            "ktstr run --help missing work_type '{name}' that is in WorkType::ALL_NAMES; \
+             update the --work-type doc-comment in src/bin/ktstr.rs to include it",
+        );
+    }
+}
+
 // -- kernel list --
 
 #[test]

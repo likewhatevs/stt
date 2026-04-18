@@ -14,9 +14,18 @@ use crate::runner::RunConfig;
 use crate::scenario::{Scenario, flags};
 use crate::workload::WorkType;
 
-/// Help text for `--kernel` in contexts that reject raw image files
-/// (test, coverage, `ktstr shell`). Matches `KernelResolvePolicy {
-/// accept_raw_image: false, .. }`.
+/// Help text for `--kernel` in contexts that reject raw image files:
+/// `cargo ktstr test`, `cargo ktstr coverage`, and `ktstr shell`.
+/// Matches `KernelResolvePolicy { accept_raw_image: false, .. }`.
+///
+/// Raw images are rejected here because these commands depend on a
+/// matching `vmlinux` and the cached kconfig fragment alongside the
+/// image (test/coverage need BTF, `ktstr shell` reuses the cache
+/// entry for kconfig discovery). A bare `bzImage`/`Image` passed
+/// directly carries neither, so silently accepting it would produce
+/// hard-to-diagnose mid-run failures. The verifier and
+/// `cargo ktstr shell` accept raw images because their flows do not
+/// need that companion metadata; see [`KERNEL_HELP_RAW_OK`].
 pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      path (e.g. `../linux`), a version (`6.14.2`, or major.minor prefix \
      `6.14` for latest patch), or a cache key (see `kernel list`). Raw \
@@ -24,9 +33,11 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      on a fresh tree); versions auto-download from kernel.org on cache \
      miss.";
 
-/// Help text for `--kernel` in contexts that accept raw image files
-/// (verifier, `cargo ktstr shell`). Matches `KernelResolvePolicy {
-/// accept_raw_image: true, .. }`.
+/// Help text for `--kernel` in contexts that accept raw image files:
+/// `cargo ktstr verifier` and `cargo ktstr shell`. Matches
+/// `KernelResolvePolicy { accept_raw_image: true, .. }`. See
+/// [`KERNEL_HELP_NO_RAW`] for the converse and the rationale for
+/// the asymmetry.
 pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      path (e.g. `../linux`), a raw image file (`bzImage` / `Image`), a \
      version (`6.14.2`, or major.minor prefix `6.14` for latest patch), \

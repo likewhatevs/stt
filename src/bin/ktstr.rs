@@ -24,6 +24,24 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run test scenarios on the host under whatever scheduler is already active.
+    ///
+    /// Requires cgroup v2 mounted at `/sys/fs/cgroup` and write
+    /// permission on it (typically root, or a delegated subtree).
+    /// Each invocation creates `/sys/fs/cgroup/ktstr-<pid>/` and
+    /// removes it on exit; `ktstr cleanup` reaps directories left
+    /// behind by crashed runs.
+    ///
+    /// Probe modes interact as follows:
+    /// - `--repro` alone: no-op (probe attachment requires a stack).
+    /// - `--repro` + `--probe-stack`: attach BPF kprobes on the
+    ///   listed functions for the duration of the scenario; emit a
+    ///   probe-event report at exit and force the scenario to fail
+    ///   so the report is preserved in CI output.
+    /// - `--auto-repro`: applies only to VM-based runs (the
+    ///   `#[ktstr_test]` harness invoked via `cargo nextest run` /
+    ///   `cargo ktstr test`). Has no effect here -- this command runs
+    ///   on the host without spawning a VM, so there is no second
+    ///   boot to perform.
     Run {
         /// Scenario duration in seconds.
         #[arg(long, default_value = "20")]
@@ -33,6 +51,10 @@ enum Command {
         #[arg(long, default_value = "4")]
         workers: usize,
 
+        // Hardcoded list of valid flags below MUST mirror
+        // `scenario::flags::ALL`. The drift test
+        // `run_help_flags_lists_match_flags_all` (in tests/ktstr_cli.rs)
+        // fails the build if the two diverge.
         /// Active flags (comma-separated). Omit for all profiles.
         /// Valid: llc, borrow, steal, rebal, reject-pin, no-ctrl.
         #[arg(long, value_delimiter = ',')]
@@ -46,7 +68,9 @@ enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Enable repro mode (attach BPF probes).
+        /// Attach BPF probes during the scenario. Has no effect
+        /// without `--probe-stack`; see the command help above for
+        /// the full probe-mode interaction.
         #[arg(long)]
         repro: bool,
 
@@ -54,10 +78,12 @@ enum Command {
         #[arg(long)]
         probe_stack: Option<String>,
 
-        /// On scheduler crash, rerun the scenario in a second VM with
-        /// BPF probes attached on the crash call chain. Requires a
-        /// kernel with the `sched_ext_exit` tracepoint; falls back to
-        /// dynamic stack discovery when no --probe-stack is supplied.
+        /// VM-based test re-run on scheduler crash. Applies only when
+        /// the scenario is invoked through the `#[ktstr_test]`
+        /// harness (`cargo ktstr test` / `cargo nextest run`); has no
+        /// effect on this `ktstr run` command, which executes on the
+        /// host. Documented here for parity with the test harness's
+        /// flag set.
         #[arg(long)]
         auto_repro: bool,
 
@@ -65,6 +91,11 @@ enum Command {
         #[arg(long)]
         kernel_dir: Option<String>,
 
+        // Hardcoded list of valid work types below MUST mirror
+        // `WorkType::ALL_NAMES` minus `Sequence` (requires explicit
+        // phases) and `Custom` (requires a function pointer). The
+        // drift test `run_help_work_type_lists_match_all_names` (in
+        // tests/ktstr_cli.rs) fails the build if they diverge.
         /// Override work type for all cgroups. Case-sensitive.
         /// Valid: CpuSpin, YieldHeavy, Mixed, IoSync, Bursty, PipeIo,
         /// FutexPingPong, CachePressure, CacheYield, CachePipe,
@@ -94,17 +125,17 @@ enum Command {
     Topo,
     /// Clean up leftover cgroups.
     ///
-    /// Without `--parent-cgroup`, removes all cgroups matching
-    /// `/sys/fs/cgroup/ktstr` and `/sys/fs/cgroup/ktstr-<pid>`
-    /// (the paths `ktstr run` and the in-process test harness create).
-    /// The directories themselves are removed too. `ktstr-<pid>`
-    /// directories whose pid is still a running ktstr or cargo-ktstr
-    /// process are skipped, so a concurrent cleanup run doesn't
-    /// yank an active run's cgroup.
+    /// Without `--parent-cgroup`, scans `/sys/fs/cgroup` for the
+    /// default ktstr parents (`ktstr` and `ktstr-<pid>`, the paths
+    /// `ktstr run` and the in-process test harness create) and
+    /// rmdirs each. `ktstr-<pid>` directories whose pid is still a
+    /// running ktstr or cargo-ktstr process are skipped, so a
+    /// concurrent cleanup run doesn't yank an active run's cgroup.
     Cleanup {
         /// Parent cgroup path. When set, cleans only this path and
-        /// leaves the parent directory in place; when omitted, globs
-        /// the default ktstr parents and rmdirs each.
+        /// leaves the parent directory in place; when omitted, scans
+        /// `/sys/fs/cgroup` for the default ktstr parents
+        /// (`ktstr/` and `ktstr-<pid>/`) and rmdirs each.
         #[arg(long)]
         parent_cgroup: Option<String>,
     },
@@ -146,6 +177,11 @@ enum Command {
     Completions {
         /// Shell to generate completions for.
         shell: clap_complete::Shell,
+        /// Binary name to register the completion under. Override
+        /// when invoking ktstr through a symlink with a different
+        /// name (the shell looks up completions by argv[0]).
+        #[arg(long, default_value = "ktstr")]
+        binary: String,
     },
 }
 
@@ -153,9 +189,13 @@ enum Command {
 enum KernelCommand {
     /// List cached kernel images.
     List {
-        /// Output in JSON format for CI scripting. Each entry includes
-        /// a computed `eol` boolean derived by fetching kernel.org's
-        /// `releases.json`; this requires network access on the host.
+        /// Output in JSON format for CI scripting. Each entry's
+        /// `eol` boolean is derived by fetching kernel.org's
+        /// `releases.json` to learn the active series prefixes; on
+        /// fetch failure (offline, kernel.org unreachable, response
+        /// malformed) the active list is empty and no entry is
+        /// flagged EOL. The cache listing itself is local and
+        /// always succeeds; only the EOL annotation degrades.
         #[arg(long)]
         json: bool,
     },
@@ -180,18 +220,24 @@ enum KernelCommand {
         /// Rebuild even if a cached image exists.
         #[arg(long)]
         force: bool,
-        /// Run make mrproper before configuring (local source only).
+        /// Run `make mrproper` before configuring. Only meaningful
+        /// with `--source`: downloaded tarball and freshly cloned
+        /// git sources start clean, so this flag prints a notice
+        /// and is ignored in those modes.
         #[arg(long)]
         clean: bool,
     },
     /// Remove cached kernel images.
     Clean {
         /// Keep the N most recent cached kernels. When absent, removes
-        /// all cached entries (subject to the confirmation prompt
-        /// unless --force is also set).
+        /// every cached entry.
         #[arg(long)]
         keep: Option<usize>,
-        /// Skip confirmation prompt. Required in non-interactive contexts.
+        /// Skip the y/N confirmation prompt before deleting. Always
+        /// required in non-interactive contexts: without `--force`
+        /// the command bails on a non-tty stdin rather than hang
+        /// waiting for input. In an interactive shell, omit
+        /// `--force` to be prompted.
         #[arg(long)]
         force: bool,
     },
@@ -333,9 +379,9 @@ fn kernel_build(
     Ok(())
 }
 
-fn run_completions(shell: clap_complete::Shell) {
+fn run_completions(shell: clap_complete::Shell, binary: &str) {
     let mut cmd = Cli::command();
-    clap_complete::generate(shell, &mut cmd, "ktstr", &mut std::io::stdout());
+    clap_complete::generate(shell, &mut cmd, binary, &mut std::io::stdout());
 }
 
 fn main() -> Result<()> {
@@ -566,8 +612,8 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Command::Completions { shell } => {
-            run_completions(shell);
+        Command::Completions { shell, binary } => {
+            run_completions(shell, &binary);
         }
     }
 

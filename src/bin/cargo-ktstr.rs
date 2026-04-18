@@ -169,9 +169,13 @@ enum StatsCommand {
 enum KernelCommand {
     /// List cached kernel images.
     List {
-        /// Output in JSON format for CI scripting. Each entry includes
-        /// a computed `eol` boolean derived by fetching kernel.org's
-        /// `releases.json`; this requires network access on the host.
+        /// Output in JSON format for CI scripting. Each entry's
+        /// `eol` boolean is derived by fetching kernel.org's
+        /// `releases.json` to learn the active series prefixes; on
+        /// fetch failure (offline, kernel.org unreachable, response
+        /// malformed) the active list is empty and no entry is
+        /// flagged EOL. The cache listing itself is local and
+        /// always succeeds; only the EOL annotation degrades.
         #[arg(long)]
         json: bool,
     },
@@ -196,18 +200,24 @@ enum KernelCommand {
         /// Rebuild even if a cached image exists.
         #[arg(long)]
         force: bool,
-        /// Run make mrproper before configuring (local source only).
+        /// Run `make mrproper` before configuring. Only meaningful
+        /// with `--source`: downloaded tarball and freshly cloned
+        /// git sources start clean, so this flag prints a notice
+        /// and is ignored in those modes.
         #[arg(long)]
         clean: bool,
     },
     /// Remove cached kernel images.
     Clean {
         /// Keep the N most recent cached kernels. When absent, removes
-        /// all cached entries (subject to the confirmation prompt
-        /// unless --force is also set).
+        /// every cached entry.
         #[arg(long)]
         keep: Option<usize>,
-        /// Skip confirmation prompt. Required in non-interactive contexts.
+        /// Skip the y/N confirmation prompt before deleting. Always
+        /// required in non-interactive contexts: without `--force`
+        /// the command bails on a non-tty stdin rather than hang
+        /// waiting for input. In an interactive shell, omit
+        /// `--force` to be prompted.
         #[arg(long)]
         force: bool,
     },
