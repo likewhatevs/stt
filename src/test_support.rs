@@ -2462,23 +2462,12 @@ fn attempt_auto_repro(
     }
 
     // Extract probe JSON from the repro VM and format on the host with
-    // kernel_dir so blazesym can resolve source locations via vmlinux DWARF.
-    // Canonicalize the kernel path first so relative paths resolve correctly.
-    let canon_kernel = std::fs::canonicalize(kernel).ok();
-    let kernel_dir = canon_kernel
-        .as_ref()
-        .and_then(|p| p.to_str())
-        .and_then(|p| {
-            #[cfg(target_arch = "x86_64")]
-            {
-                p.strip_suffix("/arch/x86/boot/bzImage")
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                p.strip_suffix("/arch/arm64/boot/Image")
-            }
-        })
-        .map(|s| s.to_string());
+    // kernel_dir so blazesym can resolve source locations via vmlinux
+    // DWARF. derive_kernel_dir handles both build-tree and cache-entry
+    // layouts; cached kernels with DWARF stripped still won't recover
+    // file:line (tracked in #25).
+    let kernel_dir =
+        crate::kernel_path::derive_kernel_dir(kernel).and_then(|p| p.to_str().map(String::from));
     let kernel_dir_str = kernel_dir.as_deref();
     let probe_section = extract_probe_output(&repro_result.output, kernel_dir_str);
 

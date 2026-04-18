@@ -123,6 +123,46 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Derive the kernel directory (holding `vmlinux` and related build
+/// artifacts) from a kernel image path.
+///
+/// Recognizes two layouts:
+///
+/// - **Build tree**: `<root>/arch/x86/boot/bzImage` (or
+///   `arch/arm64/boot/Image`) → `<root>`. Suffix match on the
+///   canonical path.
+/// - **Cache entry**: `<cache_dir>/bzImage` (or `Image`) with a
+///   sibling `vmlinux` → `<cache_dir>`. Lets probe source-location
+///   resolution walk a cached kernel's stripped ELF.
+///
+/// Returns `None` when neither layout matches or the input path
+/// doesn't canonicalize. The cached vmlinux for tarball/git source
+/// types has DWARF stripped, so even a Some result only recovers
+/// file:line for local-build cache entries whose source tree is
+/// still on disk (tracked separately in #25).
+#[allow(dead_code)]
+pub fn derive_kernel_dir(image: &std::path::Path) -> Option<std::path::PathBuf> {
+    let canon = std::fs::canonicalize(image).ok()?;
+
+    #[cfg(target_arch = "x86_64")]
+    let build_suffix = "/arch/x86/boot/bzImage";
+    #[cfg(target_arch = "aarch64")]
+    let build_suffix = "/arch/arm64/boot/Image";
+
+    if let Some(canon_str) = canon.to_str()
+        && let Some(root) = canon_str.strip_suffix(build_suffix)
+    {
+        return Some(std::path::PathBuf::from(root));
+    }
+
+    let parent = canon.parent()?;
+    if parent.join("vmlinux").exists() {
+        return Some(parent.to_path_buf());
+    }
+
+    None
+}
+
 /// Find a bootable kernel image within a directory.
 ///
 /// Checks the arch-specific build tree path first (`arch/x86/boot/bzImage`
@@ -393,6 +433,89 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("bzImage"), b"fake").unwrap();
         assert!(_has_kernel_artifacts(tmp.path()));
+    }
+
+    // -- derive_kernel_dir --
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn derive_kernel_dir_build_tree_x86() {
+        let tmp = TempDir::new().unwrap();
+        let boot = tmp.path().join("arch/x86/boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        let image = boot.join("bzImage");
+        std::fs::write(&image, b"fake").unwrap();
+
+        let canon_root = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(derive_kernel_dir(&image), Some(canon_root));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn derive_kernel_dir_build_tree_aarch64() {
+        let tmp = TempDir::new().unwrap();
+        let boot = tmp.path().join("arch/arm64/boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        let image = boot.join("Image");
+        std::fs::write(&image, b"fake").unwrap();
+
+        let canon_root = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(derive_kernel_dir(&image), Some(canon_root));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn derive_kernel_dir_cache_entry_x86_with_vmlinux() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("bzImage");
+        std::fs::write(&image, b"fake").unwrap();
+        std::fs::write(tmp.path().join("vmlinux"), b"fake-elf").unwrap();
+
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(derive_kernel_dir(&image), Some(canon));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn derive_kernel_dir_cache_entry_aarch64_with_vmlinux() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("Image");
+        std::fs::write(&image, b"fake").unwrap();
+        std::fs::write(tmp.path().join("vmlinux"), b"fake-elf").unwrap();
+
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(derive_kernel_dir(&image), Some(canon));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn derive_kernel_dir_cache_entry_without_vmlinux() {
+        // bzImage at root with no vmlinux sibling — neither layout
+        // applies, return None.
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("bzImage");
+        std::fs::write(&image, b"fake").unwrap();
+        assert_eq!(derive_kernel_dir(&image), None);
+    }
+
+    #[test]
+    fn derive_kernel_dir_nonexistent_path() {
+        // canonicalize fails on a nonexistent path.
+        let p = std::path::Path::new("/nonexistent/kernel/bzImage");
+        assert_eq!(derive_kernel_dir(p), None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn derive_kernel_dir_arbitrary_image_no_vmlinux_sibling() {
+        // A file named bzImage but in a dir without a vmlinux sibling
+        // and not under arch/x86/boot — no match.
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("somewhere/else");
+        std::fs::create_dir_all(&sub).unwrap();
+        let image = sub.join("bzImage");
+        std::fs::write(&image, b"fake").unwrap();
+        assert_eq!(derive_kernel_dir(&image), None);
     }
 
     // -- resolve_btf --
