@@ -508,7 +508,6 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
 const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
     b"",           // null section (index 0)
     b".BTF",       // BPF Type Format — probe field resolution
-    b".BTF.ext",   // BTF extension data
     b".symtab",    // symbol table — monitor address resolution
     b".strtab",    // symbol string table
     b".shstrtab",  // section header string table (structural)
