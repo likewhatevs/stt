@@ -3889,7 +3889,7 @@ impl KtstrVmBuilder {
 
     /// Override the guest scx watchdog timeout. Applied via
     /// `scx_sched.watchdog_timeout` (7.1+) or the static
-    /// `scx_watchdog_timeout` symbol (6.16-7.0); silently no-ops on
+    /// `scx_watchdog_timeout` symbol (pre-7.1); silently no-ops on
     /// kernels where neither path is available.
     #[allow(dead_code)]
     pub fn watchdog_timeout(mut self, timeout: Duration) -> Self {
