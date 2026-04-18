@@ -2065,11 +2065,7 @@ mod tests {
         // entry was rebuilt.
         let source_data = fs::read(&path).unwrap();
         let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();
-        let source_has_schedule = source_elf
-            .syms
-            .iter()
-            .any(|s| s.st_value != 0 && source_elf.strtab.get_at(s.st_name) == Some("schedule"));
-        if !source_has_schedule {
+        if !has_symbol(&source_elf, "schedule", true) {
             skip!(
                 "source vmlinux has no `schedule` symbol \
                  (already stripped by older ktstr) -- rebuild the kernel \
@@ -2080,13 +2076,8 @@ mod tests {
         let (_dir, stripped_path) = strip_vmlinux_debug(&path).unwrap();
         let data = fs::read(&stripped_path).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
-        let has_func = |name: &str| {
-            elf.syms
-                .iter()
-                .any(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
-        };
         assert!(
-            has_func("schedule"),
+            has_symbol(&elf, "schedule", true),
             "schedule function symbol dropped by strip"
         );
     }
