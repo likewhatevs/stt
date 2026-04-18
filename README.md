@@ -266,7 +266,7 @@ cargo ktstr kernel build --git URL --ref v6.14             # shallow-clone a git
 cargo ktstr kernel list                                    # list cached kernels (shows (EOL) tags)
 cargo ktstr kernel clean --keep 3                          # keep 3 most recent
 cargo ktstr verifier --scheduler scx_my_sched              # BPF verifier stats
-cargo ktstr test-stats                                     # aggregate gauntlet sidecars
+cargo ktstr stats                                          # aggregate gauntlet sidecars
 cargo ktstr shell --kernel 6.14.2                          # interactive VM shell
 cargo ktstr completions bash                               # shell completions
 ```

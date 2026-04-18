@@ -163,6 +163,11 @@ enum StatsCommand {
         /// test_name, topology, scheduler, work_type.
         #[arg(short = 'E', long)]
         filter: Option<String>,
+        /// Relative significance threshold (percentage). Deltas below
+        /// this percentage are treated as unchanged regardless of
+        /// direction. Overrides the per-metric default_rel.
+        #[arg(long, default_value = "10.0")]
+        threshold: f64,
     },
 }
 
@@ -339,9 +344,14 @@ fn run_stats(command: &Option<StatsCommand>, dir: &Option<PathBuf>) -> Result<()
             Ok(())
         }
         Some(StatsCommand::List) => cli::baseline_list().map_err(|e| format!("{e:#}")),
-        Some(StatsCommand::Compare { a, b, filter }) => {
-            let exit =
-                cli::baseline_compare(a, b, filter.as_deref()).map_err(|e| format!("{e:#}"))?;
+        Some(StatsCommand::Compare {
+            a,
+            b,
+            filter,
+            threshold,
+        }) => {
+            let exit = cli::baseline_compare(a, b, filter.as_deref(), *threshold)
+                .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {
                 std::process::exit(exit);
             }
@@ -1037,12 +1047,49 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::Stats {
-                command: Some(StatsCommand::Compare { a, b, filter, .. }),
+                command:
+                    Some(StatsCommand::Compare {
+                        a,
+                        b,
+                        filter,
+                        threshold,
+                    }),
                 ..
             } => {
                 assert_eq!(a, "a");
                 assert_eq!(b, "b");
                 assert_eq!(filter.as_deref(), Some("cgroup_steady"));
+                assert!((threshold - 10.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    #[test]
+    fn parse_stats_compare_with_threshold() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "a",
+            "b",
+            "--threshold",
+            "5.0",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        threshold, filter, ..
+                    }),
+                ..
+            } => {
+                assert!((threshold - 5.0).abs() < f64::EPSILON);
+                assert!(filter.is_none());
             }
             _ => panic!("expected Stats Compare"),
         }

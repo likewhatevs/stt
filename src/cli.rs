@@ -754,8 +754,8 @@ pub fn baseline_list() -> Result<()> {
 }
 
 /// Compare two baselines and report regressions.
-pub fn baseline_compare(a: &str, b: &str, filter: Option<&str>) -> Result<i32> {
-    crate::stats::baseline_compare(a, b, filter)
+pub fn baseline_compare(a: &str, b: &str, filter: Option<&str>, threshold: f64) -> Result<i32> {
+    crate::stats::baseline_compare(a, b, filter, threshold)
 }
 
 /// Pre-flight check for /dev/kvm availability and permissions.

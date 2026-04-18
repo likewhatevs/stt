@@ -1347,8 +1347,17 @@ pub fn baseline_list() -> anyhow::Result<()> {
 
 /// Compare two baselines and report regressions.
 ///
+/// `threshold` is a relative percentage (e.g. 10.0 for 10%). Deltas
+/// whose relative magnitude is below `threshold / 100.0` are treated
+/// as unchanged, overriding the per-metric `default_rel`.
+///
 /// Returns 0 on no regressions, 1 if regressions detected.
-pub fn baseline_compare(a: &str, b: &str, filter: Option<&str>) -> anyhow::Result<i32> {
+pub fn baseline_compare(
+    a: &str,
+    b: &str,
+    filter: Option<&str>,
+    threshold: f64,
+) -> anyhow::Result<i32> {
     let root = baselines_root()?;
     let dir_a = root.join(a);
     let dir_b = root.join(b);
@@ -1408,9 +1417,10 @@ pub fn baseline_compare(a: &str, b: &str, filter: Option<&str>) -> anyhow::Resul
             }
 
             let def = metric_def(metric_name);
-            let (abs_thresh, rel_thresh, higher_is_worse) = match def {
-                Some(d) => (d.default_abs, d.default_rel, d.higher_is_worse),
-                None => (1.0, 0.10, true),
+            let rel_thresh = threshold / 100.0;
+            let (abs_thresh, higher_is_worse) = match def {
+                Some(d) => (d.default_abs, d.higher_is_worse),
+                None => (1.0, true),
             };
 
             let delta = val_b - val_a;

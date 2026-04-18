@@ -177,7 +177,9 @@ Collect test statistics after the test run:
 `stats` reads sidecar JSON files from `target/ktstr/{branch}-{hash}/`
 and prints gauntlet analysis, BPF verifier stats, callback profiles,
 and KVM stats. The `if: !cancelled()` condition ensures stats are
-collected even on test failure.
+collected even on test failure. See
+[cargo-ktstr stats](running-tests/cargo-ktstr.md#stats) for
+subcommands and options.
 
 ## aarch64
 
