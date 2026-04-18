@@ -2109,7 +2109,10 @@ fn evaluate_vm_result(
     } else if let Some(crash_msg) = extract_panic_message(output) {
         format!("guest crashed: {crash_msg}")
     } else if entry.scheduler.binary.has_active_scheduling() {
-        "scheduler crashed before the test could produce results".to_string()
+        "no test result received from guest \
+         (scheduler may have crashed, or guest output was lost \
+         before reaching the host)"
+            .to_string()
     } else {
         "test function produced no output (no test result found)".to_string()
     };
