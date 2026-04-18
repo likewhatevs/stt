@@ -5022,10 +5022,11 @@ mod tests {
             Err(e) => panic!("{e:#}"),
         };
         let result = vm.run().unwrap();
-        let Some(ref report) = result.monitor else {
-            eprintln!("ktstr: SKIP: monitor not initialized (kernel/BTF incompatible)");
-            return;
-        };
+        let report = result.monitor.as_ref().expect(
+            "ktstr: monitor report missing — require_kernel_offsets, scx_root, and \
+             watchdog_offsets all resolved at setup, so monitor initialization must \
+             have succeeded. A None report here is a bug in monitor startup",
+        );
         let Some(obs) = &report.watchdog_observation else {
             // Scheduler never attached (scx_root stayed null for the
             // whole run). Not a watchdog regression — skip.
@@ -5118,7 +5119,13 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn monitor_reads_runqueue_data_with_scheduler() {
         let kernel = crate::test_support::require_kernel();
-        let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+        let vmlinux = crate::test_support::require_vmlinux(&kernel);
+
+        // Monitor-reads-runqueue asserts on cpu.rq_clock and cpu.schedstat,
+        // which resolve through the non-optional rq offsets inside
+        // KernelOffsets. Gating these at setup turns a silently-skipped
+        // test (on BTF parse failure) into a loud infrastructure error.
+        let _offsets = crate::test_support::require_kernel_offsets(&vmlinux);
 
         let sched_bin = crate::test_support::require_binary("scx-ktstr");
 
@@ -5141,10 +5148,11 @@ mod tests {
             Err(e) => panic!("{e:#}"),
         };
         let result = vm.run().unwrap();
-        let Some(ref report) = result.monitor else {
-            eprintln!("ktstr: SKIP: monitor not initialized");
-            return;
-        };
+        let report = result.monitor.as_ref().expect(
+            "ktstr: monitor report missing — require_kernel_offsets resolved at \
+             setup, so monitor initialization must have succeeded. A None report \
+             here is a bug in monitor startup",
+        );
 
         assert!(
             report.summary.total_samples >= 2,
@@ -5228,10 +5236,11 @@ mod tests {
             Err(e) => panic!("{e:#}"),
         };
         let result = vm.run().unwrap();
-        let Some(ref report) = result.monitor else {
-            eprintln!("ktstr: SKIP: monitor not initialized");
-            return;
-        };
+        let report = result.monitor.as_ref().expect(
+            "ktstr: monitor report missing — require_kernel_offsets, scx_root, and \
+             event_offsets all resolved at setup, so monitor initialization must \
+             have succeeded. A None report here is a bug in monitor startup",
+        );
 
         assert!(
             report.summary.total_samples > 0,
@@ -5331,10 +5340,11 @@ mod tests {
             Err(e) => panic!("{e:#}"),
         };
         let result = vm.run().unwrap();
-        let Some(ref report) = result.monitor else {
-            eprintln!("ktstr: SKIP: monitor not initialized");
-            return;
-        };
+        let report = result.monitor.as_ref().expect(
+            "ktstr: monitor report missing — require_kernel_offsets and \
+             sched_domain_offsets resolved at setup, so monitor initialization \
+             must have succeeded. A None report here is a bug in monitor startup",
+        );
 
         assert!(
             report.summary.total_samples > 0,
