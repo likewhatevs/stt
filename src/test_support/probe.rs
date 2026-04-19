@@ -1,0 +1,1222 @@
+//! Auto-repro and BPF probe pipeline for `#[ktstr_test]`.
+//!
+//! When a scheduler crash is observed in a ktstr_test VM, the framework
+//! boots a second "repro" VM with BPF kprobes/fentries attached to the
+//! functions that appeared in the crash stack. Probe output is
+//! serialized on the guest (COM2) and deserialized + formatted on the
+//! host where DWARF is available.
+//!
+//! Probe attachment runs in two phases:
+//! - **Phase A** ([`start_probe_phase_a`]) attaches kprobes, fexits,
+//!   and the tracepoint trigger to kernel functions before the scheduler
+//!   starts. Needed because kprobes must be in place before the
+//!   first call to each traced function.
+//! - **Phase B** ([`maybe_dispatch_vm_test_with_phase_a`]) discovers
+//!   BPF symbols from the running scheduler and attaches fentries to
+//!   BPF callbacks. Runs after the scheduler has loaded.
+//!
+//! The single-phase path ([`maybe_dispatch_vm_test_with_args`]) is used
+//! when the kernel doesn't support Phase A; all probes attach after the
+//! scheduler is up.
+
+use std::path::Path;
+use std::time::Duration;
+
+use crate::assert::AssertResult;
+use crate::vmm;
+
+use super::args::{
+    extract_probe_stack_arg, extract_test_fn_arg, extract_work_type_arg, resolve_cgroup_root,
+};
+use super::entry::find_test;
+use super::eval::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
+use super::output::{extract_sched_ext_dump, parse_sched_output, print_assert_result};
+use super::profraw::try_flush_profraw;
+use super::{KtstrTestEntry, TopoOverride};
+
+/// Sentinel value for `--ktstr-probe-stack` when no crash stack functions
+/// were extracted. Triggers the guest-side probe path so
+/// `discover_bpf_symbols()` can dynamically find the scheduler's BPF
+/// programs. `filter_traceable` drops it (not in kallsyms).
+const DISCOVER_SENTINEL: &str = "__discover__";
+
+/// Delimiters for probe output in guest COM2 (written by emit_probe_payload).
+pub(crate) const PROBE_OUTPUT_START: &str = "===PROBE_OUTPUT_START===";
+pub(crate) const PROBE_OUTPUT_END: &str = "===PROBE_OUTPUT_END===";
+
+/// Format the last `n` lines of `text` under a `--- header ---` delimiter.
+/// Returns `None` if `text` is empty.
+fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let start = lines.len().saturating_sub(n);
+    Some(format!("--- {header} ---\n{}", lines[start..].join("\n")))
+}
+
+/// Attempt auto-repro: extract stack functions from COM2 scheduler output
+/// or COM1 kernel console (fallback), boot a second VM with BPF probes
+/// attached, and return formatted probe data. When no stack functions are
+/// available (e.g. BPF text error without backtrace), falls back to
+/// dynamic BPF program discovery in the repro VM.
+/// `console_output` is COM1 kernel console text, used when COM2 has no
+/// extractable functions (e.g. scheduler died before writing output).
+/// Returns `None` if repro cannot be attempted or yields no data.
+pub(crate) fn attempt_auto_repro(
+    entry: &KtstrTestEntry,
+    kernel: &Path,
+    scheduler: Option<&Path>,
+    ktstr_bin: &Path,
+    first_vm_output: &str,
+    console_output: &str,
+    topo: Option<&TopoOverride>,
+) -> Option<String> {
+    use crate::probe::stack::extract_stack_functions_all;
+
+    // Extract scheduler log from COM2 output.
+    eprintln!(
+        "ktstr_test: auto-repro: COM2 length={} has_sched_start={} has_sched_end={}",
+        first_vm_output.len(),
+        first_vm_output.contains("===SCHED_OUTPUT_START==="),
+        first_vm_output.contains("===SCHED_OUTPUT_END==="),
+    );
+    let sched_output = parse_sched_output(first_vm_output);
+
+    // Extract function names from COM2 scheduler log first, then
+    // fall back to COM1 kernel console (which has kernel backtraces
+    // including sched_ext_dump output).
+    let stack_funcs = if let Some(sched) = sched_output {
+        let funcs = extract_stack_functions_all(sched);
+        if funcs.is_empty() {
+            eprintln!("ktstr_test: auto-repro: no functions from COM2, trying COM1");
+            extract_stack_functions_all(console_output)
+        } else {
+            funcs
+        }
+    } else {
+        eprintln!("ktstr_test: auto-repro: no scheduler output on COM2, trying COM1");
+        extract_stack_functions_all(console_output)
+    };
+    let func_names: Vec<String> = stack_funcs.iter().map(|f| f.raw_name.clone()).collect();
+
+    // When no stack functions were extracted (e.g. BPF text error with no
+    // backtrace), still boot the repro VM. The guest-side discover_bpf_symbols()
+    // dynamically finds the scheduler's BPF programs. Pass a sentinel value
+    // so extract_probe_stack_arg returns Some and the guest probe path activates.
+    let probe_arg = if func_names.is_empty() {
+        eprintln!("ktstr_test: auto-repro: no stack functions, using BPF discovery in repro VM");
+        format!("--ktstr-probe-stack={DISCOVER_SENTINEL}")
+    } else {
+        eprintln!(
+            "ktstr_test: auto-repro: probing {} functions in second VM",
+            func_names.len()
+        );
+        format!("--ktstr-probe-stack={}", func_names.join(","))
+    };
+
+    // Build guest args for the repro VM.
+    let guest_args = vec![
+        "run".to_string(),
+        "--ktstr-test-fn".to_string(),
+        entry.name.to_string(),
+        probe_arg,
+    ];
+
+    let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
+    for s in entry.scheduler.sysctls {
+        cmdline_parts.push(format!("sysctl.{}={}", s.key, s.value));
+    }
+    for &karg in entry.scheduler.kargs {
+        cmdline_parts.push(karg.to_string());
+    }
+    if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
+        cmdline_parts.push(format!("RUST_BACKTRACE={bt}"));
+    }
+    if let Ok(log) = std::env::var("RUST_LOG") {
+        cmdline_parts.push(format!("RUST_LOG={log}"));
+    }
+    let cmdline_extra = cmdline_parts.join(" ");
+
+    let (vm_topology, memory_mb) = match topo {
+        Some(t) => (
+            vmm::Topology::new(t.numa_nodes, t.llcs, t.cores, t.threads),
+            t.memory_mb,
+        ),
+        None => {
+            let cpus = entry.topology.total_cpus();
+            let mem = (cpus * 64).max(256).max(entry.memory_mb);
+            (entry.topology, mem)
+        }
+    };
+
+    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
+    let mut builder = vmm::KtstrVm::builder()
+        .kernel(kernel)
+        .init_binary(ktstr_bin)
+        .with_topology(vm_topology)
+        .memory_deferred_min(memory_mb)
+        .cmdline(&cmdline_extra)
+        .shm_size(KTSTR_TEST_SHM_SIZE)
+        .run_args(&guest_args)
+        .timeout(Duration::from_secs(60))
+        .no_perf_mode(no_perf_mode);
+
+    if let Some(sched_path) = scheduler {
+        builder = builder.scheduler_binary(sched_path);
+    }
+
+    {
+        let mut args: Vec<String> = Vec::new();
+        if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
+            builder = builder.include_files(vec![(archive_path, host_path)]);
+            args.push("--config".to_string());
+            args.push(guest_path);
+        }
+        if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
+            args.push("--cell-parent-cgroup".to_string());
+            args.push(cgroup_path.to_string());
+        }
+        args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
+        args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
+        if !args.is_empty() {
+            builder = builder.sched_args(&args);
+        }
+    }
+
+    // Forward bpf_map_write and watchdog_timeout so the repro VM
+    // reproduces the same exit as the first VM with probes attached.
+    if let Some(bpf_write) = entry.bpf_map_write {
+        builder =
+            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
+    }
+    builder = builder.watchdog_timeout(entry.watchdog_timeout);
+
+    let vm = match builder.build() {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("ktstr_test: auto-repro: failed to build VM: {e:#}");
+            return None;
+        }
+    };
+
+    let repro_result = match vm.run() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("ktstr_test: auto-repro: VM run failed: {e:#}");
+            return None;
+        }
+    };
+
+    // Forward guest stderr (COM1) and COM2 probe lines when verbose.
+    if verbose() {
+        eprintln!(
+            "ktstr_test: auto-repro: COM1 stderr length={} COM2 stdout length={}",
+            repro_result.stderr.len(),
+            repro_result.output.len(),
+        );
+        for line in repro_result.stderr.lines() {
+            eprintln!("  repro-vm-com1: {line}");
+        }
+        let mut in_probe = false;
+        for line in repro_result.output.lines() {
+            if line.contains("ktstr_test: probe:") {
+                in_probe = true;
+            }
+            if in_probe {
+                eprintln!("  repro-vm-com2: {line}");
+            }
+        }
+    }
+
+    // Extract probe JSON from the repro VM and format on the host with
+    // kernel_dir so blazesym can resolve source locations via vmlinux
+    // DWARF. derive_kernel_dir handles both build-tree and cache-entry
+    // layouts; for Local cache entries whose source tree is still on
+    // disk, prefer_source_tree_for_dwarf re-routes blazesym to the
+    // unstripped vmlinux in the source tree. Tarball/git cache entries
+    // still can't recover file:line — stripped cache vmlinux is all
+    // we have.
+    let kernel_dir = crate::kernel_path::derive_kernel_dir(kernel)
+        .map(|dir| crate::cache::prefer_source_tree_for_dwarf(&dir).unwrap_or(dir))
+        .and_then(|p| p.to_str().map(String::from));
+    let kernel_dir_str = kernel_dir.as_deref();
+    let probe_section = extract_probe_output(&repro_result.output, kernel_dir_str);
+
+    // Build diagnostic tails from the repro VM's output.
+    const REPRO_TAIL_LINES: usize = 40;
+
+    let sched_log_tail = parse_sched_output(&repro_result.output).and_then(|log| {
+        let collapsed = crate::verifier::collapse_cycles(log);
+        format_tail(&collapsed, REPRO_TAIL_LINES, "repro VM scheduler log")
+    });
+
+    let dump_tail = extract_sched_ext_dump(&repro_result.stderr)
+        .and_then(|dump| format_tail(&dump, REPRO_TAIL_LINES, "repro VM sched_ext dump"));
+
+    // Filter sched_ext_dump lines from dmesg tail to avoid duplicating
+    // the dump section. Only non-dump kernel console lines are shown.
+    let dmesg_filtered: String = repro_result
+        .stderr
+        .lines()
+        .filter(|l| !l.contains("sched_ext_dump"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dmesg_tail = format_tail(&dmesg_filtered, REPRO_TAIL_LINES, "repro VM dmesg");
+
+    let tails: Vec<String> = [sched_log_tail, dump_tail, dmesg_tail]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if probe_section.is_none() && tails.is_empty() {
+        return None;
+    }
+
+    let has_probe = probe_section.is_some();
+    let mut out = probe_section.unwrap_or_default();
+
+    // Crash reproduction status when probe data is absent.
+    if !has_probe {
+        let status = if repro_result.timed_out {
+            "repro VM: timed out".to_string()
+        } else if repro_result.crash_message.is_some()
+            || repro_result.output.contains("SCHEDULER_DIED")
+        {
+            format!(
+                "repro VM: scheduler crashed (exit code {})",
+                repro_result.exit_code,
+            )
+        } else if repro_result.exit_code != 0 {
+            format!(
+                "repro VM: exited abnormally (exit code {})",
+                repro_result.exit_code,
+            )
+        } else {
+            "repro VM: scheduler ran normally (crash did not reproduce)".to_string()
+        };
+        out.push_str(&status);
+    }
+
+    // Duration line before tails.
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "repro VM duration: {:.1}s",
+        repro_result.duration.as_secs_f64(),
+    ));
+
+    for tail in &tails {
+        out.push_str("\n\n");
+        out.push_str(tail);
+    }
+    Some(out)
+}
+
+/// Extract probe JSON from guest COM2, deserialize, and format on the
+/// host where vmlinux (DWARF) is available for source locations.
+pub(crate) fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Option<String> {
+    let json = crate::probe::output::extract_section(output, PROBE_OUTPUT_START, PROBE_OUTPUT_END);
+    if json.is_empty() {
+        return None;
+    }
+    let payload: ProbePayload = match serde_json::from_str(&json) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ktstr_test: probe payload deserialize failed: {e}");
+            return None;
+        }
+    };
+    let mut out = String::new();
+
+    // Append pipeline diagnostics if present.
+    if let Some(ref diag) = payload.diagnostics {
+        out.push_str(&format_probe_diagnostics(&diag.pipeline, &diag.skeleton));
+    }
+
+    if payload.events.is_empty() {
+        if out.is_empty() {
+            return None;
+        }
+        return Some(out);
+    }
+    out.push_str(&crate::probe::output::format_probe_events_with_bpf_locs(
+        &payload.events,
+        &payload.func_names,
+        kernel_dir,
+        &payload.bpf_source_locs,
+        payload.nr_cpus,
+        &payload.param_names,
+        &payload.render_hints,
+    ));
+    Some(out)
+}
+
+/// Format probe pipeline diagnostics into a human-readable summary.
+pub(crate) fn format_probe_diagnostics(
+    pipeline: &PipelineDiagnostics,
+    skeleton: &crate::probe::process::ProbeDiagnostics,
+) -> String {
+    let mut out = String::new();
+    out.push_str("--- probe pipeline ---\n");
+
+    // Stage 1: extraction
+    out.push_str(&format!(
+        "  extracted:   {} functions from crash backtrace\n",
+        pipeline.stack_extracted,
+    ));
+
+    // Stage 2: filter
+    let passed = pipeline.stack_extracted as usize - pipeline.filter_dropped.len();
+    if pipeline.filter_dropped.is_empty() {
+        out.push_str(&format!("  traceable:   {passed} passed filter\n"));
+    } else {
+        out.push_str(&format!(
+            "  traceable:   {passed} passed, {} dropped: {}\n",
+            pipeline.filter_dropped.len(),
+            pipeline.filter_dropped.join(", "),
+        ));
+    }
+
+    // Stage 3: BPF discovery
+    out.push_str(&format!(
+        "  bpf_discover: {} programs found\n",
+        pipeline.bpf_discovered,
+    ));
+
+    // Stage 4: expansion
+    out.push_str(&format!(
+        "  after_expand: {} total probe targets\n",
+        pipeline.total_after_expand,
+    ));
+
+    // Stage 5: kprobe attach
+    if skeleton.kprobe_attach_failed.is_empty() {
+        out.push_str(&format!(
+            "  kprobes:     {} attached\n",
+            skeleton.kprobe_attached,
+        ));
+    } else {
+        out.push_str(&format!(
+            "  kprobes:     {} attached, {} failed: {}\n",
+            skeleton.kprobe_attached,
+            skeleton.kprobe_attach_failed.len(),
+            skeleton
+                .kprobe_attach_failed
+                .iter()
+                .map(|(n, e)| format!("{n} ({e})"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if !skeleton.kprobe_resolve_failed.is_empty() {
+        out.push_str(&format!(
+            "  kprobe_miss: {} unresolved: {}\n",
+            skeleton.kprobe_resolve_failed.len(),
+            skeleton.kprobe_resolve_failed.join(", "),
+        ));
+    }
+
+    // Stage 6: fentry attach
+    if skeleton.fentry_candidates > 0 {
+        if skeleton.fentry_attach_failed.is_empty() {
+            out.push_str(&format!(
+                "  fentry:      {} attached\n",
+                skeleton.fentry_attached,
+            ));
+        } else {
+            out.push_str(&format!(
+                "  fentry:      {} attached, {} failed: {}\n",
+                skeleton.fentry_attached,
+                skeleton.fentry_attach_failed.len(),
+                skeleton
+                    .fentry_attach_failed
+                    .iter()
+                    .map(|(n, e)| format!("{n} ({e})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
+
+    // Stage 7: trigger
+    let trigger_type = if skeleton.trigger_type.is_empty() {
+        "unknown"
+    } else {
+        &skeleton.trigger_type
+    };
+    if let Some(ref err) = skeleton.trigger_attach_error {
+        out.push_str(&format!("  trigger:     attach failed ({err})\n"));
+    } else {
+        out.push_str(&format!(
+            "  trigger:     {} ({})\n",
+            if skeleton.trigger_fired {
+                "fired"
+            } else {
+                "not fired"
+            },
+            trigger_type,
+        ));
+    }
+
+    // Stage 8: capture
+    out.push_str(&format!(
+        "  probe_data:  {} keys, {} unmatched IPs\n",
+        skeleton.probe_data_keys, skeleton.probe_data_unmatched_ips,
+    ));
+
+    // Stage 9: events + stitching
+    out.push_str(&format!(
+        "  events:      {} captured, {} after stitch\n",
+        skeleton.events_before_stitch, skeleton.events_after_stitch,
+    ));
+
+    // Stage 10: BPF-side counters
+    if skeleton.bpf_kprobe_fires > 0
+        || skeleton.bpf_trigger_fires > 0
+        || skeleton.bpf_meta_misses > 0
+    {
+        out.push_str(&format!(
+            "  bpf_counts:  {} kprobe fires, {} trigger fires, {} meta misses\n",
+            skeleton.bpf_kprobe_fires, skeleton.bpf_trigger_fires, skeleton.bpf_meta_misses,
+        ));
+        if !skeleton.bpf_miss_ips.is_empty() {
+            let ips: Vec<String> = skeleton
+                .bpf_miss_ips
+                .iter()
+                .map(|ip| format!("0x{ip:x}"))
+                .collect();
+            out.push_str(&format!("  miss_ips:    {}\n", ips.join(", ")));
+        }
+    }
+
+    out
+}
+
+/// Guest-side dispatch: check for `--ktstr-test-fn=NAME` in args, run the
+/// registered function, write the result to SHM and stdout (COM2),
+/// and exit. Profraw data is flushed via `try_flush_profraw()`
+/// inline on both the success and failure paths before
+/// `std::process::exit()` is invoked.
+///
+/// Called from `ktstr_test_early_dispatch()` (ctor) before `main()`, or
+/// from `ktstr_guest_init()` when running as PID 1.
+///
+/// When called from PID 1 context, args must be pre-loaded into the
+/// process args (the caller reads `/args` from the initramfs).
+/// Returns `Some(exit_code)` if dispatched, `None` if not an
+/// ktstr_test invocation.
+pub fn maybe_dispatch_vm_test() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    maybe_dispatch_vm_test_with_args(&args)
+}
+
+/// Like `maybe_dispatch_vm_test` but with explicit args. Used by
+/// `ktstr_guest_init()` which reads args from `/args` in the initramfs.
+pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
+    let name = extract_test_fn_arg(args)?;
+
+    // Propagate RUST_BACKTRACE and RUST_LOG from kernel cmdline to env.
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        let parts: Vec<&str> = cmdline.split_whitespace().collect();
+        if let Some(val) = parts
+            .iter()
+            .find(|s| s.starts_with("RUST_BACKTRACE="))
+            .and_then(|s| s.strip_prefix("RUST_BACKTRACE="))
+        {
+            // SAFETY: guest-side dispatch runs single-threaded before
+            // any test threads are spawned.
+            unsafe { std::env::set_var("RUST_BACKTRACE", val) };
+        }
+        if let Some(val) = parts
+            .iter()
+            .find(|s| s.starts_with("RUST_LOG="))
+            .and_then(|s| s.strip_prefix("RUST_LOG="))
+        {
+            unsafe { std::env::set_var("RUST_LOG", val) };
+        }
+    }
+
+    let entry = match find_test(name) {
+        Some(e) => e,
+        None => {
+            eprintln!("ktstr_test: unknown test function '{name}'");
+            return Some(1);
+        }
+    };
+
+    // Parse --ktstr-probe-stack=func1,func2,... for auto-repro mode.
+    let probe_stack = extract_probe_stack_arg(args);
+
+    // Parse --ktstr-work-type=NAME for work type override.
+    let work_type_override = extract_work_type_arg(args).and_then(|s| {
+        crate::workload::WorkType::from_name(&s).or_else(|| {
+            eprintln!("ktstr_test: unknown work type '{s}'");
+            None
+        })
+    });
+
+    // Set up BPF probes if --ktstr-probe-stack was provided.
+    let probe_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_handle: Option<ProbeHandle> = probe_stack.as_ref().and_then(|stack_input| {
+        use crate::probe::stack::load_probe_stack;
+
+        eprintln!("ktstr_test: probe: loading probe stack from --ktstr-probe-stack");
+        let mut pipe_diag = PipelineDiagnostics::default();
+        let raw_functions = load_probe_stack(stack_input);
+        pipe_diag.stack_extracted = raw_functions.len() as u32;
+        let pre_filter: Vec<String> = raw_functions.iter().map(|f| f.raw_name.clone()).collect();
+        let mut functions = crate::probe::stack::filter_traceable(raw_functions);
+        // Record which functions were dropped by filter_traceable.
+        for name in &pre_filter {
+            if !functions.iter().any(|f| f.raw_name == *name) {
+                pipe_diag.filter_dropped.push(name.clone());
+            }
+        }
+        // Discover BPF scheduler functions from the running scheduler.
+        // Stack-extracted BPF names have stale prog IDs from the first VM;
+        // discover_bpf_symbols finds the current scheduler's programs.
+        let stack_display_names: Vec<&str> = functions
+            .iter()
+            .filter(|f| f.is_bpf)
+            .map(|f| f.display_name.as_str())
+            .collect();
+        let bpf_syms = crate::probe::btf::discover_bpf_symbols(&stack_display_names);
+        pipe_diag.bpf_discovered = bpf_syms.len() as u32;
+        if !bpf_syms.is_empty() {
+            eprintln!(
+                "ktstr_test: probe: {} BPF symbols discovered",
+                bpf_syms.len()
+            );
+            functions.extend(bpf_syms);
+        }
+        // Expand BPF functions to kernel-side callers for bridge kprobes,
+        // keeping BPF functions for fentry attachment.
+        let functions = crate::probe::stack::expand_bpf_to_kernel_callers(functions);
+        pipe_diag.total_after_expand = functions.len() as u32;
+        if functions.is_empty() {
+            eprintln!("ktstr_test: no traceable functions from --ktstr-probe-stack");
+            return None;
+        }
+
+        eprintln!(
+            "ktstr_test: probe: {} functions loaded, spawning probe thread",
+            functions.len()
+        );
+
+        // Resolve BTF signatures for kernel functions so probe output
+        // gets decoded field names instead of raw register values.
+        let kernel_names: Vec<&str> = functions
+            .iter()
+            .filter(|f| !f.is_bpf)
+            .map(|f| f.raw_name.as_str())
+            .collect();
+        let mut btf_funcs = crate::probe::btf::parse_btf_functions(&kernel_names, None);
+        // Parse BPF function signatures from BPF program BTF.
+        let bpf_btf_args: Vec<(&str, u32)> = functions
+            .iter()
+            .filter(|f| f.is_bpf)
+            .filter_map(|f| Some((f.display_name.as_str(), f.bpf_prog_id?)))
+            .collect();
+        if !bpf_btf_args.is_empty() {
+            btf_funcs.extend(crate::probe::btf::parse_bpf_btf_functions(&bpf_btf_args));
+        }
+
+        // Build func_names from the filtered list so indices match
+        // the func_idx values assigned by run_probe_skeleton.
+        let func_names: Vec<(u32, String)> = functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i as u32, f.display_name.clone()))
+            .collect();
+
+        // Pre-open BPF program FDs while the scheduler is alive.
+        // Holding these FDs keeps programs alive via kernel refcounting
+        // even after the scheduler crashes.
+        let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
+        let pnames = crate::probe::output::build_param_names(&btf_funcs);
+        let rhints = crate::probe::output::build_render_hints(&btf_funcs);
+        let pnames_thread = pnames.clone();
+        let rhints_thread = rhints.clone();
+        let stop = probe_stop.clone();
+        let funcs = functions.clone();
+        let fn_names = func_names.clone();
+        let pd = pipe_diag.clone();
+        let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output_done_thread = output_done.clone();
+        let probes_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probes_ready_thread = probes_ready.clone();
+        let handle = std::thread::spawn(move || {
+            use crate::probe::process::run_probe_skeleton;
+            let (events, diag, accumulated_fn_names) = run_probe_skeleton(
+                &funcs,
+                &btf_funcs,
+                &stop,
+                &bpf_fds,
+                &probes_ready_thread,
+                None,
+            );
+            let emit_fn_names = if accumulated_fn_names.is_empty() {
+                &fn_names
+            } else {
+                &accumulated_fn_names
+            };
+            // Serialize probe output after the trigger fires or stop
+            // is signaled. Runs before the thread returns so output
+            // reaches COM2 even if the main thread is blocked.
+            emit_probe_payload(
+                events.as_deref().unwrap_or(&[]),
+                emit_fn_names,
+                &pd,
+                &diag,
+                &pnames_thread,
+                &rhints_thread,
+            );
+            output_done_thread.store(true, std::sync::atomic::Ordering::Release);
+            (events, diag, accumulated_fn_names)
+        });
+
+        // Wait for probes to attach before starting the test function.
+        // Without this, the test may crash the scheduler before probes
+        // are active, resulting in 0 captured events.
+        while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        Some((handle, func_names, pipe_diag, output_done, pnames, rhints))
+    });
+
+    // Sysfs is ground truth: CPUID, ACPI MADT, and MPTABLE all express
+    // the VM's actual topology. Only fall back to from_spec on error.
+    let topo = match crate::topology::TestTopology::from_system() {
+        Ok(sys) => sys,
+        Err(e) => {
+            eprintln!("ktstr_test: topology from sysfs failed ({e}), using VM spec fallback");
+            crate::topology::TestTopology::from_vm_topology(&entry.topology)
+        }
+    };
+    let cgroup_root = resolve_cgroup_root(args);
+    let cgroups = crate::cgroup::CgroupManager::new(&cgroup_root);
+    if let Err(e) = cgroups.setup(false) {
+        eprintln!("ktstr_test: cgroup setup failed: {e}");
+    }
+    let sched_pid = std::env::var("SCHED_PID")
+        .ok()
+        .and_then(|s| s.parse::<libc::pid_t>().ok())
+        .unwrap_or(0);
+    let workers_per_cgroup = entry.workers_per_cgroup as usize;
+    // Three-layer merge: default_checks -> scheduler.assert -> entry.assert.
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(&entry.scheduler.assert)
+        .merge(&entry.assert);
+    let ctx = crate::scenario::Ctx {
+        cgroups: &cgroups,
+        topo: &topo,
+        duration: entry.duration,
+        workers_per_cgroup,
+        sched_pid,
+        settle: Duration::from_millis(500),
+        work_type_override,
+        assert: merged_assert,
+        wait_for_map_write: entry.bpf_map_write.is_some(),
+    };
+
+    let result = match (entry.func)(&ctx) {
+        Ok(r) => r,
+        Err(e) => {
+            let r = AssertResult {
+                passed: false,
+                skipped: false,
+                details: vec![format!("{e:#}").into()],
+                stats: Default::default(),
+            };
+            try_flush_profraw();
+            print_assert_result(&r);
+            collect_and_print_probe_data(probe_stop, probe_handle);
+            return Some(1);
+        }
+    };
+
+    let exit_code = if result.passed { 0 } else { 1 };
+    try_flush_profraw();
+    print_assert_result(&result);
+    collect_and_print_probe_data(probe_stop, probe_handle);
+    Some(exit_code)
+}
+
+/// Result returned by the probe thread: collected events, skeleton
+/// diagnostics, and accumulated function names from both phases.
+type ProbeThreadResult = (
+    Option<Vec<crate::probe::process::ProbeEvent>>,
+    crate::probe::process::ProbeDiagnostics,
+    Vec<(u32, String)>,
+);
+
+type ProbeHandle = (
+    std::thread::JoinHandle<ProbeThreadResult>,
+    Vec<(u32, String)>,
+    PipelineDiagnostics,
+    std::sync::Arc<std::sync::atomic::AtomicBool>, // output_done
+    std::collections::HashMap<String, Vec<(String, String)>>, // param_names
+    std::collections::HashMap<String, crate::probe::btf::RenderHint>, // render_hints
+);
+
+/// Pre-skeleton pipeline diagnostics captured during guest probe setup.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PipelineDiagnostics {
+    /// Functions from --ktstr-probe-stack before filter.
+    pub stack_extracted: u32,
+    /// Functions dropped by filter_traceable.
+    pub filter_dropped: Vec<String>,
+    /// BPF symbols discovered from running scheduler.
+    pub bpf_discovered: u32,
+    /// Functions after expand_bpf_to_kernel_callers.
+    pub total_after_expand: u32,
+}
+
+/// State from Phase A probe attachment (before scheduler starts).
+///
+/// Returned by `start_probe_phase_a`. Contains the probe thread handle,
+/// the channel to send Phase B input (BPF fentry targets), and metadata
+/// needed by the readout phase.
+pub(crate) struct ProbePhaseAState {
+    pub handle: std::thread::JoinHandle<ProbeThreadResult>,
+    pub phase_b_tx: std::sync::mpsc::Sender<crate::probe::process::PhaseBInput>,
+    pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub kernel_func_names: Vec<(u32, String)>,
+    /// Number of functions in Phase A. Phase B uses this as func_idx_offset
+    /// to avoid index collisions in the shared BPF maps.
+    pub kernel_func_count: u32,
+    pub pipe_diag: PipelineDiagnostics,
+    pub output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub param_names: std::collections::HashMap<String, Vec<(String, String)>>,
+    pub render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
+}
+
+/// Start Phase A of the probe pipeline (before scheduler starts).
+///
+/// Parses `--ktstr-probe-stack` from args, loads kernel functions,
+/// attaches kprobes + trigger + kernel fexit, and spawns the probe
+/// thread with a Phase B channel. Returns `None` if no probe stack
+/// arg is present or no traceable functions remain.
+pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
+    use crate::probe::stack::{filter_traceable, load_probe_stack};
+
+    let stack_input = extract_probe_stack_arg(args)?;
+
+    eprintln!("ktstr_test: probe phase_a: loading kernel functions");
+    let mut pipe_diag = PipelineDiagnostics::default();
+    let raw_functions = load_probe_stack(&stack_input);
+    pipe_diag.stack_extracted = raw_functions.len() as u32;
+    let pre_filter: Vec<String> = raw_functions.iter().map(|f| f.raw_name.clone()).collect();
+    let functions = filter_traceable(raw_functions);
+    for name in &pre_filter {
+        if !functions.iter().any(|f| f.raw_name == *name) {
+            pipe_diag.filter_dropped.push(name.clone());
+        }
+    }
+
+    // Phase A only processes kernel functions (non-BPF). BPF functions
+    // are handled in Phase B after the scheduler starts.
+    let kernel_functions: Vec<crate::probe::stack::StackFunction> =
+        functions.into_iter().filter(|f| !f.is_bpf).collect();
+
+    // Resolve BTF for kernel functions.
+    let kernel_names: Vec<&str> = kernel_functions
+        .iter()
+        .map(|f| f.raw_name.as_str())
+        .collect();
+    let btf_funcs = crate::probe::btf::parse_btf_functions(&kernel_names, None);
+
+    let func_names: Vec<(u32, String)> = kernel_functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (i as u32, f.display_name.clone()))
+        .collect();
+
+    pipe_diag.total_after_expand = kernel_functions.len() as u32;
+
+    let bpf_fds = std::collections::HashMap::new(); // No BPF FDs in Phase A
+    let param_names = crate::probe::output::build_param_names(&btf_funcs);
+    let render_hints = crate::probe::output::build_render_hints(&btf_funcs);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probes_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let (phase_b_tx, phase_b_rx) = std::sync::mpsc::channel();
+
+    let stop_clone = stop.clone();
+    let output_done_clone = output_done.clone();
+    let probes_ready_clone = probes_ready.clone();
+    let funcs = kernel_functions.clone();
+    let btf = btf_funcs.clone();
+    let fn_names = func_names.clone();
+    let pd = pipe_diag.clone();
+    let pnames = param_names.clone();
+    let rhints = render_hints.clone();
+
+    let handle = std::thread::spawn(move || {
+        let (events, diag, accumulated_fn_names) = crate::probe::process::run_probe_skeleton(
+            &funcs,
+            &btf,
+            &stop_clone,
+            &bpf_fds,
+            &probes_ready_clone,
+            Some(phase_b_rx),
+        );
+        let emit_fn_names = if accumulated_fn_names.is_empty() {
+            &fn_names
+        } else {
+            &accumulated_fn_names
+        };
+        emit_probe_payload(
+            events.as_deref().unwrap_or(&[]),
+            emit_fn_names,
+            &pd,
+            &diag,
+            &pnames,
+            &rhints,
+        );
+        output_done_clone.store(true, std::sync::atomic::Ordering::Release);
+        (events, diag, accumulated_fn_names)
+    });
+
+    // Wait for Phase A probes (kprobes + trigger + kernel fexit) to attach.
+    while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    eprintln!(
+        "ktstr_test: probe phase_a: {} kernel functions attached, waiting for Phase B",
+        kernel_functions.len(),
+    );
+
+    let kernel_func_count = kernel_functions.len() as u32;
+
+    Some(ProbePhaseAState {
+        handle,
+        phase_b_tx,
+        stop,
+        kernel_func_names: func_names,
+        kernel_func_count,
+        pipe_diag,
+        output_done,
+        param_names,
+        render_hints,
+    })
+}
+
+/// Complete the probe pipeline with Phase B (after scheduler starts).
+///
+/// Discovers BPF symbols from the running scheduler, opens BPF prog
+/// FDs, sends Phase B input to the probe thread, waits for Phase B
+/// attachment, then runs the test function and collects probe output.
+///
+/// Returns `Some(exit_code)` if dispatched, `None` if not.
+pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
+    args: &[String],
+    pa: ProbePhaseAState,
+) -> Option<i32> {
+    use crate::probe::btf::discover_bpf_symbols;
+    use crate::probe::stack::expand_bpf_to_kernel_callers;
+
+    let name = extract_test_fn_arg(args)?;
+
+    // Propagate RUST_BACKTRACE and RUST_LOG from kernel cmdline to env.
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        let parts: Vec<&str> = cmdline.split_whitespace().collect();
+        if let Some(val) = parts
+            .iter()
+            .find(|s| s.starts_with("RUST_BACKTRACE="))
+            .and_then(|s| s.strip_prefix("RUST_BACKTRACE="))
+        {
+            unsafe { std::env::set_var("RUST_BACKTRACE", val) };
+        }
+        if let Some(val) = parts
+            .iter()
+            .find(|s| s.starts_with("RUST_LOG="))
+            .and_then(|s| s.strip_prefix("RUST_LOG="))
+        {
+            unsafe { std::env::set_var("RUST_LOG", val) };
+        }
+    }
+
+    let entry = match find_test(name) {
+        Some(e) => e,
+        None => {
+            eprintln!("ktstr_test: unknown test function '{name}'");
+            return Some(1);
+        }
+    };
+
+    let work_type_override = extract_work_type_arg(args).and_then(|s| {
+        crate::workload::WorkType::from_name(&s).or_else(|| {
+            eprintln!("ktstr_test: unknown work type '{s}'");
+            None
+        })
+    });
+
+    // Phase B: discover BPF symbols from the running scheduler.
+    eprintln!("ktstr_test: probe phase_b: discovering BPF symbols");
+    let stack_display_names: Vec<&str> = Vec::new(); // Discovery uses empty hint list
+    let bpf_syms = discover_bpf_symbols(&stack_display_names);
+    eprintln!(
+        "ktstr_test: probe phase_b: {} BPF symbols discovered",
+        bpf_syms.len()
+    );
+
+    if !bpf_syms.is_empty() {
+        // Expand BPF to kernel callers. Both BPF callbacks (for fentry)
+        // and kernel callers (for additional kprobes) are included in
+        // Phase B input.
+        let phase_b_functions = expand_bpf_to_kernel_callers(bpf_syms);
+
+        // Open BPF program FDs while the scheduler is alive.
+        let bpf_fds = crate::probe::process::open_bpf_prog_fds(&phase_b_functions);
+
+        // Parse BPF function signatures from BPF program BTF.
+        let bpf_btf_args: Vec<(&str, u32)> = phase_b_functions
+            .iter()
+            .filter(|f| f.is_bpf)
+            .filter_map(|f| Some((f.display_name.as_str(), f.bpf_prog_id?)))
+            .collect();
+        let mut phase_b_btf = if !bpf_btf_args.is_empty() {
+            crate::probe::btf::parse_bpf_btf_functions(&bpf_btf_args)
+        } else {
+            Vec::new()
+        };
+        // Parse BTF for kernel callers added by expand_bpf_to_kernel_callers.
+        let kernel_caller_names: Vec<&str> = phase_b_functions
+            .iter()
+            .filter(|f| !f.is_bpf)
+            .map(|f| f.raw_name.as_str())
+            .collect();
+        if !kernel_caller_names.is_empty() {
+            phase_b_btf.extend(crate::probe::btf::parse_btf_functions(
+                &kernel_caller_names,
+                None,
+            ));
+        }
+
+        let phase_b_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let phase_b_done_clone = phase_b_done.clone();
+
+        let phase_b_input = crate::probe::process::PhaseBInput {
+            functions: phase_b_functions,
+            bpf_prog_fds: bpf_fds,
+            btf_funcs: phase_b_btf,
+            done: phase_b_done_clone,
+            func_idx_offset: pa.kernel_func_count,
+        };
+
+        if let Err(e) = pa.phase_b_tx.send(phase_b_input) {
+            eprintln!("ktstr_test: probe phase_b: failed to send: {e}");
+        } else {
+            // Wait for Phase B attachment to complete.
+            while !phase_b_done.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            eprintln!("ktstr_test: probe phase_b: BPF fentry attached");
+        }
+    } else {
+        eprintln!("ktstr_test: probe phase_b: no BPF symbols, skipping fentry");
+        // Drop the sender so the probe thread's try_recv sees Disconnected.
+        drop(pa.phase_b_tx);
+    }
+
+    // Run the test function (same as maybe_dispatch_vm_test_with_args).
+    let topo = match crate::topology::TestTopology::from_system() {
+        Ok(sys) => sys,
+        Err(e) => {
+            eprintln!("ktstr_test: topology from sysfs failed ({e}), using VM spec fallback");
+            crate::topology::TestTopology::from_vm_topology(&entry.topology)
+        }
+    };
+    let cgroup_root = resolve_cgroup_root(args);
+    let cgroups = crate::cgroup::CgroupManager::new(&cgroup_root);
+    if let Err(e) = cgroups.setup(false) {
+        eprintln!("ktstr_test: cgroup setup failed: {e}");
+    }
+    let sched_pid = std::env::var("SCHED_PID")
+        .ok()
+        .and_then(|s| s.parse::<libc::pid_t>().ok())
+        .unwrap_or(0);
+    let workers_per_cgroup = entry.workers_per_cgroup as usize;
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(&entry.scheduler.assert)
+        .merge(&entry.assert);
+    let ctx = crate::scenario::Ctx {
+        cgroups: &cgroups,
+        topo: &topo,
+        duration: entry.duration,
+        workers_per_cgroup,
+        sched_pid,
+        settle: std::time::Duration::from_millis(500),
+        work_type_override,
+        assert: merged_assert,
+        wait_for_map_write: entry.bpf_map_write.is_some(),
+    };
+
+    let result = match (entry.func)(&ctx) {
+        Ok(r) => r,
+        Err(e) => {
+            let r = AssertResult {
+                passed: false,
+                skipped: false,
+                details: vec![format!("{e:#}").into()],
+                stats: Default::default(),
+            };
+            try_flush_profraw();
+            print_assert_result(&r);
+            let probe_handle = Some((
+                pa.handle,
+                pa.kernel_func_names,
+                pa.pipe_diag,
+                pa.output_done,
+                pa.param_names,
+                pa.render_hints,
+            ));
+            collect_and_print_probe_data(pa.stop, probe_handle);
+            return Some(1);
+        }
+    };
+
+    let exit_code = if result.passed { 0 } else { 1 };
+    try_flush_profraw();
+    print_assert_result(&result);
+    let probe_handle = Some((
+        pa.handle,
+        pa.kernel_func_names,
+        pa.pipe_diag,
+        pa.output_done,
+        pa.param_names,
+        pa.render_hints,
+    ));
+    collect_and_print_probe_data(pa.stop, probe_handle);
+    Some(exit_code)
+}
+
+/// Serialized probe data sent from guest to host via COM2.
+/// The host deserializes and formats with kernel_dir for source locations.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProbePayload {
+    pub events: Vec<crate::probe::process::ProbeEvent>,
+    pub func_names: Vec<(u32, String)>,
+    #[serde(default)]
+    pub bpf_source_locs: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub diagnostics: Option<ProbePayloadDiagnostics>,
+    /// Guest VM CPU count for cpumask masking. Populated by
+    /// `emit_probe_payload` which runs inside the guest where
+    /// sysfs reports the correct value.
+    #[serde(default)]
+    pub nr_cpus: Option<u32>,
+    /// BTF-resolved parameter labels per function: func_name ->
+    /// vec of (param_name, type_label). Used by the formatter to
+    /// print named args instead of arg0/arg1.
+    #[serde(default)]
+    pub param_names: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// BTF-derived render hints for auto-discovered fields.
+    /// Maps field key (e.g. `"ctx:task_ctx.data__sz"`) to display format.
+    #[serde(default)]
+    pub render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
+}
+
+/// Combined diagnostics for the probe payload.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProbePayloadDiagnostics {
+    #[serde(default)]
+    pub pipeline: PipelineDiagnostics,
+    #[serde(default)]
+    pub skeleton: crate::probe::process::ProbeDiagnostics,
+}
+
+/// Serialize probe payload to stdout (COM2) between delimiters.
+/// Resolves BPF source locations from loaded programs before serializing.
+fn emit_probe_payload(
+    events: &[crate::probe::process::ProbeEvent],
+    func_names: &[(u32, String)],
+    pipeline_diag: &PipelineDiagnostics,
+    skeleton_diag: &crate::probe::process::ProbeDiagnostics,
+    param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
+    render_hints: &std::collections::HashMap<String, crate::probe::btf::RenderHint>,
+) {
+    let source_loc_names: Vec<&str> = func_names.iter().map(|(_, name)| name.as_str()).collect();
+    let bpf_syms = crate::probe::btf::discover_bpf_symbols(&source_loc_names);
+    let bpf_prog_ids: Vec<u32> = func_names
+        .iter()
+        .filter_map(|(_, name)| {
+            bpf_syms
+                .iter()
+                .find(|s| s.display_name == *name)
+                .and_then(|s| s.bpf_prog_id)
+        })
+        .collect();
+    let bpf_source_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
+
+    let payload = ProbePayload {
+        events: events.to_vec(),
+        func_names: func_names.to_vec(),
+        bpf_source_locs,
+        diagnostics: Some(ProbePayloadDiagnostics {
+            pipeline: pipeline_diag.clone(),
+            skeleton: skeleton_diag.clone(),
+        }),
+        nr_cpus: crate::probe::output::get_nr_cpus(),
+        param_names: param_names.clone(),
+        render_hints: render_hints.clone(),
+    };
+    println!("{PROBE_OUTPUT_START}");
+    if let Ok(json) = serde_json::to_string(&payload) {
+        println!("{json}");
+    }
+    println!("{PROBE_OUTPUT_END}");
+}
+
+/// Stop probes, join the probe thread. The probe thread emits output
+/// directly when the trigger fires; this function only needs to set
+/// `stop` and join. If the probe thread already emitted output, this
+/// is a no-op.
+fn collect_and_print_probe_data(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<ProbeHandle>,
+) {
+    let Some((handle, func_names, pipeline_diag, output_done, param_names, render_hints)) = handle
+    else {
+        return;
+    };
+
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (events, skeleton_diag, accumulated_fn_names) = match handle.join() {
+        Ok((Some(events), diag, fnames)) => (events, diag, fnames),
+        Ok((None, diag, fnames)) => (Vec::new(), diag, fnames),
+        Err(_) => (
+            Vec::new(),
+            crate::probe::process::ProbeDiagnostics::default(),
+            Vec::new(),
+        ),
+    };
+
+    // Prefer accumulated func_names (includes both Phase A and Phase B).
+    let effective_fn_names = if accumulated_fn_names.is_empty() {
+        &func_names
+    } else {
+        &accumulated_fn_names
+    };
+
+    // The probe thread already emitted output on trigger/stop.
+    // Only emit here if it somehow didn't (e.g. thread panicked
+    // before reaching emit_probe_payload).
+    if !output_done.load(std::sync::atomic::Ordering::Acquire) {
+        emit_probe_payload(
+            &events,
+            effective_fn_names,
+            &pipeline_diag,
+            &skeleton_diag,
+            &param_names,
+            &render_hints,
+        );
+    }
+}

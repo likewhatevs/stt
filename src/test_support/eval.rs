@@ -1,0 +1,867 @@
+//! Host-side VM result evaluation for `#[ktstr_test]` runs.
+//!
+//! The core [`run_ktstr_test_inner`] orchestrates a single test run:
+//! boot the guest VM with the scheduler and workload, collect profraw
+//! + stimulus events from SHM, then hand off to [`evaluate_vm_result`]
+//!   for pass/fail judgment and error-message construction.
+//!
+//! [`evaluate_vm_result`] is factored out of the VM-boot path so error
+//! formatting can be unit-tested with synthetic `VmResult` values.
+//!
+//! Supporting items:
+//! - [`resolve_scheduler`] / [`resolve_test_kernel`] locate the
+//!   scheduler binary and kernel image from env + cache + filesystem.
+//! - [`nextest_setup`] is the `setup-script` entry point that warms the
+//!   SHM initramfs cache before nextest starts running tests.
+//! - [`scheduler_label`] formats the `[sched=...]` bracket in error
+//!   headers.
+//! - [`format_monitor_section`] and [`trim_settle_samples`] handle the
+//!   `--- monitor ---` block in failed-test output.
+
+use anyhow::{Context, Result};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::assert::AssertResult;
+use crate::timeline::StimulusEvent;
+use crate::vmm;
+
+use super::output::{
+    classify_init_stage, ensure_kvm, extract_kernel_version, extract_panic_message,
+    extract_sched_ext_dump, format_console_diagnostics, parse_assert_result,
+    parse_assert_result_shm, parse_sched_output, sched_log_fingerprint,
+};
+use super::probe::attempt_auto_repro;
+use super::profraw::{MSG_TYPE_PROFRAW, write_profraw};
+use super::sidecar::{write_sidecar, write_skip_sidecar};
+use super::topo::TopoOverride;
+use super::{KtstrTestEntry, SchedulerSpec, Topology};
+
+/// True when RUST_BACKTRACE is set to "1" or "full".
+///
+/// Controls whether the full guest kernel console is appended to the
+/// `--- diagnostics ---` section of a failed test, and whether
+/// auto-repro forwards the repro VM's COM1/COM2 output to the host
+/// terminal in real time. The scheduler-log and sched_ext-dump
+/// sections of a failure are always emitted regardless of this flag.
+pub(crate) fn verbose() -> bool {
+    std::env::var("RUST_BACKTRACE")
+        .map(|v| v == "1" || v == "full")
+        .unwrap_or(false)
+}
+
+/// SHM size for ktstr_test VMs: 16 MB.
+/// Sized for profraw (1-2 MB), stimulus events, exit code, and test
+/// results with mid-flight drain headroom.
+pub(crate) const KTSTR_TEST_SHM_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Derive initramfs archive path, host path, and guest path from a
+/// scheduler's `config_file`. Returns `None` when no config file is set.
+pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
+    let config_path = entry.scheduler.config_file?;
+    let file_name = Path::new(config_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("config_file must have a valid filename");
+    let archive_path = format!("include-files/{file_name}");
+    let guest_path = format!("/include-files/{file_name}");
+    Some((archive_path, PathBuf::from(config_path), guest_path))
+}
+
+/// Run a single ktstr_test and return the VM's AssertResult.
+pub(crate) fn run_ktstr_test_inner(
+    entry: &KtstrTestEntry,
+    topo: Option<&TopoOverride>,
+    active_flags: &[String],
+) -> Result<AssertResult> {
+    entry.validate().context("KtstrTestEntry validation")?;
+    if let Some(t) = topo {
+        t.validate().context("TopoOverride validation")?;
+    }
+    if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
+        eprintln!(
+            "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+            entry.name,
+        );
+        // Record the skip so stats tooling sees every skipped run,
+        // not just the ones that made it to the VM-run site.
+        write_skip_sidecar(entry, active_flags);
+        return Ok(AssertResult::skip(
+            "test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+        ));
+    }
+    ensure_kvm()?;
+    let kernel = resolve_test_kernel()?;
+    let scheduler = resolve_scheduler(&entry.scheduler.binary)?;
+    let ktstr_bin = crate::resolve_current_exe()?;
+
+    let guest_args = vec![
+        "run".to_string(),
+        "--ktstr-test-fn".to_string(),
+        entry.name.to_string(),
+    ];
+
+    let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
+    for s in entry.scheduler.sysctls {
+        cmdline_parts.push(format!("sysctl.{}={}", s.key, s.value));
+    }
+    for &karg in entry.scheduler.kargs {
+        cmdline_parts.push(karg.to_string());
+    }
+    // Propagate RUST_BACKTRACE and RUST_LOG to the guest so
+    // guest-side code can gate verbose output and tracing.
+    if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
+        cmdline_parts.push(format!("RUST_BACKTRACE={bt}"));
+    }
+    if let Ok(log) = std::env::var("RUST_LOG") {
+        cmdline_parts.push(format!("RUST_LOG={log}"));
+    }
+    let cmdline_extra = cmdline_parts.join(" ");
+
+    let (vm_topology, memory_mb) = match topo {
+        Some(t) => (
+            vmm::Topology::new(t.numa_nodes, t.llcs, t.cores, t.threads),
+            t.memory_mb,
+        ),
+        None => {
+            let cpus = entry.topology.total_cpus();
+            let mem = (cpus * 64).max(256).max(entry.memory_mb);
+            (entry.topology, mem)
+        }
+    };
+
+    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
+    let mut builder = vmm::KtstrVm::builder()
+        .kernel(&kernel)
+        .init_binary(&ktstr_bin)
+        .with_topology(vm_topology)
+        .memory_deferred_min(memory_mb)
+        .cmdline(&cmdline_extra)
+        .shm_size(KTSTR_TEST_SHM_SIZE)
+        .run_args(&guest_args)
+        .timeout(Duration::from_secs(60))
+        .performance_mode(entry.performance_mode)
+        .no_perf_mode(no_perf_mode);
+
+    // Merge order: default_checks -> scheduler.assert -> per-test assert.
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(&entry.scheduler.assert)
+        .merge(&entry.assert);
+
+    if let Some(ref sched_path) = scheduler {
+        builder = builder.scheduler_binary(sched_path);
+    }
+    if let SchedulerSpec::KernelBuiltin { enable, disable } = &entry.scheduler.binary {
+        builder = builder.sched_enable_cmds(enable);
+        builder = builder.sched_disable_cmds(disable);
+    }
+    if entry.scheduler.binary.has_active_scheduling() {
+        builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
+    }
+
+    let mut sched_args: Vec<String> = Vec::new();
+    if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
+        builder = builder.include_files(vec![(archive_path, host_path)]);
+        sched_args.push("--config".to_string());
+        sched_args.push(guest_path);
+    }
+    if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
+        sched_args.push("--cell-parent-cgroup".to_string());
+        sched_args.push(cgroup_path.to_string());
+    }
+    sched_args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
+    sched_args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
+    for flag_name in active_flags {
+        if let Some(args) = entry.scheduler.flag_args(flag_name) {
+            sched_args.extend(args.iter().map(|s| s.to_string()));
+        }
+    }
+    if !sched_args.is_empty() {
+        builder = builder.sched_args(&sched_args);
+    }
+
+    builder = builder.watchdog_timeout(entry.watchdog_timeout);
+
+    if let Some(bpf_write) = entry.bpf_map_write {
+        builder =
+            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
+    }
+
+    // Catch ResourceContention before .context() wraps it —
+    // downcast_ref only checks the outermost error type, so
+    // .context() would hide ResourceContention from the skip
+    // logic in result_to_exit_code.
+    let vm = match builder.build() {
+        Ok(vm) => vm,
+        Err(e)
+            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+                .is_some() =>
+        {
+            return Err(e);
+        }
+        Err(e) => return Err(e.context("build ktstr_test VM")),
+    };
+
+    let result = match vm.run() {
+        Ok(r) => r,
+        Err(e)
+            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+                .is_some() =>
+        {
+            return Err(e);
+        }
+        Err(e) => return Err(e.context("run ktstr_test VM")),
+    };
+
+    // Drop the VM to release CPU/LLC flock fds before auto-repro.
+    drop(vm);
+
+    // Log verifier stats count for visibility.
+    if !result.verifier_stats.is_empty() {
+        eprintln!(
+            "ktstr_test: verifier_stats: {} struct_ops programs",
+            result.verifier_stats.len(),
+        );
+    }
+
+    // When running with a struct_ops scheduler, verify that host-side
+    // BPF program enumeration found programs with non-zero verified_insns.
+    if entry.scheduler.binary.has_active_scheduling()
+        && result.success
+        && result.verifier_stats.is_empty()
+    {
+        eprintln!("ktstr_test: WARNING: scheduler loaded but verifier_stats is empty");
+    }
+
+    // Extract profraw from SHM ring buffer and collect stimulus events.
+    let mut stimulus_events = Vec::new();
+    if let Some(ref shm) = result.shm_data {
+        for entry in &shm.entries {
+            if entry.msg_type == MSG_TYPE_PROFRAW
+                && entry.crc_ok
+                && !entry.payload.is_empty()
+                && let Err(e) = write_profraw(&entry.payload)
+            {
+                eprintln!("ktstr_test: write guest profraw: {e}");
+            }
+            if entry.msg_type == crate::vmm::shm_ring::MSG_TYPE_STIMULUS
+                && entry.crc_ok
+                && let Some(ev) = crate::vmm::shm_ring::StimulusEvent::from_payload(&entry.payload)
+            {
+                stimulus_events.push(crate::timeline::StimulusEvent {
+                    elapsed_ms: ev.elapsed_ms as u64,
+                    label: format!("StepStart[{}]", ev.step_index),
+                    op_kind: Some(format!("ops={}", ev.op_count)),
+                    detail: Some(format!(
+                        "{} cgroups, {} workers",
+                        ev.cgroup_count, ev.worker_count,
+                    )),
+                    total_iterations: if ev.total_iterations > 0 {
+                        Some(ev.total_iterations)
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+    }
+
+    // auto_repro is enabled when:
+    // - entry.auto_repro is true (default)
+    // - a scheduler is running (not EEVDF)
+    // - the test does not expect failure (expect_err = false)
+    let effective_auto_repro = entry.auto_repro && scheduler.is_some() && !entry.expect_err;
+    let repro_fn = |output: &str| -> Option<String> {
+        if !effective_auto_repro {
+            return None;
+        }
+        let repro = attempt_auto_repro(
+            entry,
+            &kernel,
+            scheduler.as_deref(),
+            &ktstr_bin,
+            output,
+            &result.stderr,
+            topo,
+        );
+        // When auto-repro was attempted but produced no data, return a
+        // diagnostic so the user knows it was tried.
+        Some(repro.unwrap_or_else(|| {
+            "auto-repro: no probe data — the scheduler may have \
+             exited before probes could capture events, or the \
+             crash did not reproduce in the repro VM. Re-run with \
+             RUST_LOG=debug for probe pipeline diagnostics. Check \
+             the sched_ext dump and scheduler log sections above \
+             for crash details."
+                .to_string()
+        }))
+    };
+
+    evaluate_vm_result(
+        entry,
+        &result,
+        &merged_assert,
+        &stimulus_events,
+        &vm_topology,
+        active_flags,
+        &repro_fn,
+    )
+}
+
+/// Evaluate a VM result and produce the appropriate error or Ok.
+///
+/// This is the core result-evaluation logic, extracted from
+/// `run_ktstr_test_inner` so that error message formatting can be tested
+/// without booting a VM. The `repro_fn` callback handles auto-repro
+/// (which requires a second VM boot) when provided.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_vm_result(
+    entry: &KtstrTestEntry,
+    result: &vmm::VmResult,
+    merged_assert: &crate::assert::Assert,
+    stimulus_events: &[StimulusEvent],
+    topo: &Topology,
+    active_flags: &[String],
+    repro_fn: &dyn Fn(&str) -> Option<String>,
+) -> Result<AssertResult> {
+    // Build timeline from stimulus events + monitor samples.
+    let timeline = result
+        .monitor
+        .as_ref()
+        .map(|m| crate::timeline::Timeline::build(stimulus_events, &m.samples));
+
+    let sched_label = scheduler_label(&entry.scheduler.binary);
+    let output = &result.output;
+    let dump_section = extract_sched_ext_dump(&result.stderr)
+        .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
+        .unwrap_or_default();
+    let sched_log_section = parse_sched_output(output)
+        .map(|s| {
+            let collapsed = crate::verifier::collapse_cycles(s);
+            format!("\n\n--- scheduler log ---\n{collapsed}")
+        })
+        .unwrap_or_default();
+    let fingerprint_line = sched_log_fingerprint(output)
+        .map(|fp| {
+            if crate::cli::stderr_color() {
+                format!("\x1b[1;31m{fp}\x1b[0m\n")
+            } else {
+                format!("{fp}\n")
+            }
+        })
+        .unwrap_or_default();
+
+    let tl_ctx = crate::timeline::TimelineContext {
+        kernel: extract_kernel_version(&result.stderr),
+        topology: Some(format!("{topo} ({} cpus)", topo.total_cpus())),
+        scheduler: Some(entry.scheduler.name.to_string()),
+        scenario: Some(entry.name.to_string()),
+        duration_s: Some(result.duration.as_secs_f64()),
+    };
+
+    if let Ok(verify_result) =
+        parse_assert_result_shm(result.shm_data.as_ref()).or_else(|_| parse_assert_result(output))
+    {
+        // Write sidecar before checking pass/fail so both outcomes are captured.
+        let args: Vec<String> = std::env::args().collect();
+        let work_type =
+            super::args::extract_work_type_arg(&args).unwrap_or_else(|| "CpuSpin".to_string());
+        write_sidecar(
+            entry,
+            result,
+            stimulus_events,
+            &verify_result,
+            &work_type,
+            active_flags,
+        );
+
+        if !verify_result.passed {
+            let details = verify_result
+                .details
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            let repro = if entry.scheduler.binary.has_active_scheduling() {
+                repro_fn(output)
+            } else {
+                None
+            };
+            let repro_section = repro
+                .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
+                .unwrap_or_default();
+            let timeline_section = timeline
+                .as_ref()
+                .filter(|t| !t.phases.is_empty())
+                .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
+                .unwrap_or_default();
+            let stats_section = if !verify_result.stats.cgroups.is_empty() {
+                let s = &verify_result.stats;
+                let mut lines = vec![format!(
+                    "\n\n--- stats ---\n{} workers, {} cpus, {} migrations, worst_spread={:.1}%, worst_gap={}ms",
+                    s.total_workers,
+                    s.total_cpus,
+                    s.total_migrations,
+                    s.worst_spread,
+                    s.worst_gap_ms,
+                )];
+                for (i, cg) in s.cgroups.iter().enumerate() {
+                    lines.push(format!(
+                        "  cg{}: workers={} cpus={} spread={:.1}% gap={}ms migrations={} iter={}",
+                        i,
+                        cg.num_workers,
+                        cg.num_cpus,
+                        cg.spread,
+                        cg.max_gap_ms,
+                        cg.total_migrations,
+                        cg.total_iterations,
+                    ));
+                }
+                lines.join("\n")
+            } else {
+                String::new()
+            };
+            let console_section = if verify_result
+                .details
+                .iter()
+                .any(|d| d.contains("scheduler died") || d.contains("scheduler crashed"))
+                || verbose()
+            {
+                let init_stage = classify_init_stage(output);
+                format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
+            } else {
+                String::new()
+            };
+            let monitor_section = if entry.scheduler.binary.has_active_scheduling()
+                && let Some(ref monitor) = result.monitor
+            {
+                format_monitor_section(monitor, merged_assert)
+            } else {
+                String::new()
+            };
+            let msg = format!(
+                "{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}",
+                fingerprint_line,
+                entry.name,
+                sched_label,
+                topo,
+                details,
+                stats_section,
+                console_section,
+                timeline_section,
+                sched_log_section,
+                monitor_section,
+                dump_section,
+                repro_section,
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Evaluate monitor data against thresholds when a scheduler is running.
+        // Without a scheduler (EEVDF), monitor reads rq data that may be
+        // uninitialized or irrelevant — skip evaluation in that case.
+        //
+        // Skip early monitor warmup samples: during boot, BPF verification,
+        // and initramfs unpacking the scheduler tick may not fire for hundreds
+        // of milliseconds. These transient stalls are real but not indicative
+        // of scheduler bugs.
+        if entry.scheduler.binary.has_active_scheduling()
+            && let Some(ref monitor) = result.monitor
+        {
+            let eval_report = trim_settle_samples(monitor);
+            let thresholds = merged_assert.monitor_thresholds();
+            let verdict = thresholds.evaluate(&eval_report);
+            if !verdict.passed {
+                let details = verdict.details.join("\n  ");
+                let timeline_section = timeline
+                    .as_ref()
+                    .filter(|t| !t.phases.is_empty())
+                    .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
+                    .unwrap_or_default();
+                let monitor_section = format_monitor_section(monitor, merged_assert);
+                let msg = format!(
+                    "{}ktstr_test '{}'{} [topo={}] passed scenario but monitor failed:\n  {}{}{}{}{}",
+                    fingerprint_line,
+                    entry.name,
+                    sched_label,
+                    topo,
+                    details,
+                    timeline_section,
+                    monitor_section,
+                    sched_log_section,
+                    dump_section,
+                );
+                anyhow::bail!("{msg}");
+            }
+        }
+
+        return Ok(verify_result);
+    }
+
+    // No parseable result — no AssertResult found in SHM or COM2.
+    // When a scheduler is running this typically means the scheduler died;
+    // without a scheduler (EEVDF) it means the payload itself failed.
+    // Attempt auto-repro if enabled and a scheduler was running.
+    // Any scheduler failure that prevents producing a test result warrants
+    // repro — BPF verifier failures, scx_bpf_error() exits, crashes, and
+    // stalls all land here. Previous code required specific string patterns
+    // ("SCHEDULER_DIED", "sched_ext:" + "disabled") which missed mid-test
+    // deaths where the sched_exit_monitor writes to SHM but not COM2.
+    let repro_section = if entry.scheduler.binary.has_active_scheduling() {
+        repro_fn(output)
+            .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Build a diagnostic section from COM1 kernel console output and exit code.
+    // When COM2 has scheduler output markers, sched_log_section and dump_section
+    // carry the diagnostics and the kernel console is noise (BIOS, ACPI boot).
+    // When COM2 has NO scheduler output (crash before writing), the kernel console
+    // is the ONLY source of crash info — include it unconditionally as a fallback.
+    let has_sched_output = output.contains("===SCHED_OUTPUT_START===");
+    let console_section = if !has_sched_output || verbose() {
+        let init_stage = classify_init_stage(output);
+        format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
+    } else {
+        String::new()
+    };
+
+    let timeline_section = timeline
+        .as_ref()
+        .filter(|t| !t.phases.is_empty())
+        .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
+        .unwrap_or_default();
+
+    // Build monitor section for error paths where neither SHM nor COM2 had a parseable result.
+    let monitor_section = if entry.scheduler.binary.has_active_scheduling()
+        && let Some(ref monitor) = result.monitor
+    {
+        format_monitor_section(monitor, merged_assert)
+    } else {
+        String::new()
+    };
+
+    if result.timed_out {
+        let msg = format!(
+            "{}ktstr_test '{}'{} [topo={}] timed out (no result in SHM or COM2){}{}{}{}{}{}",
+            fingerprint_line,
+            entry.name,
+            sched_label,
+            topo,
+            console_section,
+            timeline_section,
+            sched_log_section,
+            dump_section,
+            monitor_section,
+            repro_section,
+        );
+        anyhow::bail!("{msg}");
+    }
+
+    let reason = if let Some(ref shm_crash) = result.crash_message {
+        format!("guest crashed:\n{shm_crash}")
+    } else if let Some(crash_msg) = extract_panic_message(output) {
+        format!("guest crashed: {crash_msg}")
+    } else if entry.scheduler.binary.has_active_scheduling() {
+        "no test result received from guest \
+         (scheduler may have crashed, or guest output was lost \
+         before reaching the host)"
+            .to_string()
+    } else {
+        "test function produced no output (no test result found)".to_string()
+    };
+    let msg = format!(
+        "{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}",
+        fingerprint_line,
+        entry.name,
+        sched_label,
+        topo,
+        reason,
+        console_section,
+        timeline_section,
+        sched_log_section,
+        dump_section,
+        monitor_section,
+        repro_section,
+    );
+    anyhow::bail!("{msg}")
+}
+
+/// Format the `--- monitor ---` section for failure output.
+///
+/// Shows peak values, averaged metrics, event counter rates, schedstat
+/// rates, and the monitor verdict. All values are from the post-warmup
+/// evaluation window (boot-settle samples trimmed).
+pub(crate) fn format_monitor_section(
+    monitor: &crate::monitor::MonitorReport,
+    merged_assert: &crate::assert::Assert,
+) -> String {
+    let eval_report = trim_settle_samples(monitor);
+    let s = &eval_report.summary;
+    let thresholds = merged_assert.monitor_thresholds();
+    let verdict = thresholds.evaluate(&eval_report);
+    let verdict_line = if verdict.passed {
+        verdict.summary.clone()
+    } else {
+        format!("{}: {}", verdict.summary, verdict.details.join("; "))
+    };
+
+    let mut lines = vec![
+        format!(
+            "samples={} max_imbalance={:.2} max_dsq_depth={} stall={}",
+            s.total_samples, s.max_imbalance_ratio, s.max_local_dsq_depth, s.stall_detected,
+        ),
+        format!(
+            "avg: imbalance={:.2} nr_running/cpu={:.1} dsq/cpu={:.1}",
+            s.avg_imbalance_ratio, s.avg_nr_running, s.avg_local_dsq_depth,
+        ),
+    ];
+
+    if let Some(ref ev) = s.event_deltas {
+        lines.push(format!(
+            "events: fallback={} ({:.1}/s) keep_last={} ({:.1}/s) offline={}",
+            ev.total_fallback,
+            ev.fallback_rate,
+            ev.total_dispatch_keep_last,
+            ev.keep_last_rate,
+            ev.total_dispatch_offline,
+        ));
+        let mut extra = Vec::new();
+        if ev.total_reenq_immed != 0 {
+            extra.push(format!("reenq_immed={}", ev.total_reenq_immed));
+        }
+        if ev.total_reenq_local_repeat != 0 {
+            extra.push(format!(
+                "reenq_local_repeat={}",
+                ev.total_reenq_local_repeat
+            ));
+        }
+        if ev.total_refill_slice_dfl != 0 {
+            extra.push(format!("refill_slice_dfl={}", ev.total_refill_slice_dfl));
+        }
+        if ev.total_bypass_activate != 0 {
+            extra.push(format!("bypass_activate={}", ev.total_bypass_activate));
+        }
+        if ev.total_bypass_dispatch != 0 {
+            extra.push(format!("bypass_dispatch={}", ev.total_bypass_dispatch));
+        }
+        if ev.total_bypass_duration != 0 {
+            extra.push(format!("bypass_duration={}ns", ev.total_bypass_duration));
+        }
+        if ev.total_insert_not_owned != 0 {
+            extra.push(format!("insert_not_owned={}", ev.total_insert_not_owned));
+        }
+        if ev.total_sub_bypass_dispatch != 0 {
+            extra.push(format!(
+                "sub_bypass_dispatch={}",
+                ev.total_sub_bypass_dispatch
+            ));
+        }
+        if !extra.is_empty() {
+            lines.push(format!("events+: {}", extra.join(" ")));
+        }
+    }
+
+    if let Some(ref ss) = s.schedstat_deltas {
+        lines.push(format!(
+            "schedstat: csw={} ({:.0}/s) run_delay={:.0}ns/s ttwu={} goidle={}",
+            ss.total_sched_count,
+            ss.sched_count_rate,
+            ss.run_delay_rate,
+            ss.total_ttwu_count,
+            ss.total_sched_goidle,
+        ));
+    }
+
+    if let Some(ref progs) = s.prog_stats_deltas {
+        for p in progs {
+            if p.cnt > 0 {
+                lines.push(format!(
+                    "bpf: {} cnt={} {:.0}ns/call",
+                    p.name, p.cnt, p.nsecs_per_call,
+                ));
+            }
+        }
+    }
+
+    lines.push(format!("verdict: {verdict_line}"));
+
+    format!("\n\n--- monitor ---\n{}", lines.join("\n"))
+}
+
+/// Number of monitor samples to skip at the start of evaluation.
+///
+/// During VM boot the kernel performs BPF verification, initramfs
+/// unpacking, and scheduler loading. These memory-intensive operations
+/// cause the scheduler tick to stall for hundreds of milliseconds.
+/// The stalls are real but transient — evaluating them produces false
+/// positives, especially in low-memory VMs.
+///
+/// 20 samples at ~100ms interval = ~2 seconds of warmup. This covers
+/// the boot settling period after the scheduler attaches.
+const MONITOR_WARMUP_SAMPLES: usize = 20;
+
+/// Skip boot-settle samples from a MonitorReport for threshold evaluation.
+///
+/// Returns a report with the first `MONITOR_WARMUP_SAMPLES` removed so
+/// that transient boot-time stalls don't trigger sustained-window
+/// violations.
+pub(crate) fn trim_settle_samples(
+    report: &crate::monitor::MonitorReport,
+) -> crate::monitor::MonitorReport {
+    if report.samples.len() <= MONITOR_WARMUP_SAMPLES {
+        return report.clone();
+    }
+
+    let trimmed = report.samples[MONITOR_WARMUP_SAMPLES..].to_vec();
+    let summary = crate::monitor::MonitorSummary::from_samples_with_threshold(
+        &trimmed,
+        report.preemption_threshold_ns,
+    );
+    crate::monitor::MonitorReport {
+        samples: trimmed,
+        summary,
+        preemption_threshold_ns: report.preemption_threshold_ns,
+        watchdog_observation: report.watchdog_observation,
+    }
+}
+
+/// Setup function for nextest `setup-script` integration.
+///
+/// Validates KVM access, discovers a kernel, writes `KTSTR_TEST_KERNEL`
+/// to `env_writer`, and warms the SHM initramfs cache for each binary.
+pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<()> {
+    ensure_kvm()?;
+    let kernel = resolve_test_kernel()?;
+    writeln!(env_writer, "KTSTR_TEST_KERNEL={}", kernel.display())
+        .context("write KTSTR_TEST_KERNEL to env")?;
+
+    for bin in binaries {
+        let key = vmm::BaseKey::new(bin, None)?;
+        let _ = vmm::get_or_build_base(bin, &[], &[], false, &key)?;
+    }
+
+    Ok(())
+}
+
+/// Format a label for the scheduler spec, for use in test output.
+pub(crate) fn scheduler_label(spec: &SchedulerSpec) -> String {
+    match spec {
+        SchedulerSpec::None => String::new(),
+        SchedulerSpec::Name(n) => format!(" [sched={n}]"),
+        SchedulerSpec::Path(p) => format!(" [sched={p}]"),
+        SchedulerSpec::KernelBuiltin { .. } => " [sched=kernel]".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a scheduler binary from a `SchedulerSpec`.
+///
+/// Returns `Ok(None)` for `SchedulerSpec::None` (EEVDF).
+/// For `Name`, searches: `KTSTR_SCHEDULER` env, sibling of current_exe,
+/// `target/debug/`, `target/release/`.
+/// For `Path`, validates the file exists.
+pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
+    match spec {
+        SchedulerSpec::None | SchedulerSpec::KernelBuiltin { .. } => Ok(None),
+        SchedulerSpec::Path(p) => {
+            let path = PathBuf::from(p);
+            anyhow::ensure!(path.exists(), "scheduler not found: {p}");
+            Ok(Some(path))
+        }
+        SchedulerSpec::Name(name) => {
+            // 1. KTSTR_SCHEDULER env var
+            if let Ok(p) = std::env::var("KTSTR_SCHEDULER") {
+                let path = PathBuf::from(&p);
+                if path.exists() {
+                    return Ok(Some(path));
+                }
+            }
+
+            // 2. Sibling of current executable (or parent of deps/)
+            if let Ok(exe) = crate::resolve_current_exe()
+                && let Some(dir) = exe.parent()
+            {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Ok(Some(candidate));
+                }
+                // Integration tests and nextest place test binaries in
+                // target/{debug,release}/deps/. The scheduler binary is
+                // one level up in target/{debug,release}/.
+                if dir.file_name().is_some_and(|d| d == "deps")
+                    && let Some(parent) = dir.parent()
+                {
+                    let candidate = parent.join(name);
+                    if candidate.exists() {
+                        return Ok(Some(candidate));
+                    }
+                }
+            }
+
+            // 3. target/debug/
+            let candidate = PathBuf::from("target/debug").join(name);
+            if candidate.exists() {
+                return Ok(Some(candidate));
+            }
+
+            // 4. target/release/
+            let candidate = PathBuf::from("target/release").join(name);
+            if candidate.exists() {
+                return Ok(Some(candidate));
+            }
+
+            // 5. Build the scheduler package on demand.
+            match crate::build_and_find_binary(name) {
+                Ok(path) => return Ok(Some(path)),
+                Err(e) => eprintln!("ktstr: auto-build scheduler '{name}' failed: {e:#}"),
+            }
+
+            anyhow::bail!(
+                "scheduler '{name}' not found. Set KTSTR_SCHEDULER or \
+                 place it next to the test binary or in target/{{debug,release}}/"
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel resolution
+// ---------------------------------------------------------------------------
+
+/// Find a kernel image for running tests.
+///
+/// Checks `KTSTR_TEST_KERNEL` env var first (direct image path),
+/// then delegates to [`crate::find_kernel()`] for cache and
+/// filesystem discovery. Bails with actionable hints on failure.
+pub fn resolve_test_kernel() -> Result<PathBuf> {
+    // Check environment variable first.
+    if let Ok(path) = std::env::var("KTSTR_TEST_KERNEL") {
+        let p = PathBuf::from(&path);
+        anyhow::ensure!(p.exists(), "KTSTR_TEST_KERNEL not found: {path}");
+        return Ok(p);
+    }
+
+    // Standard locations.
+    if let Some(p) = crate::find_kernel()? {
+        return Ok(p);
+    }
+
+    anyhow::bail!(
+        "no kernel found\n  \
+         hint: run `cargo ktstr kernel build` to download and build the latest stable kernel\n  \
+         hint: or set KTSTR_KERNEL=/path/to/linux\n  \
+         hint: or set KTSTR_TEST_KERNEL=/path/to/{image_name}",
+        image_name = if cfg!(target_arch = "aarch64") {
+            "Image"
+        } else {
+            "bzImage"
+        }
+    )
+}
