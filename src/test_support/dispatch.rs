@@ -182,7 +182,11 @@ pub(crate) fn run_ktstr_test_with_topo_and_flags(
 /// Run a test result through expect_err logic and return an exit code.
 ///
 /// Returns 0 on pass, 1 on failure. `ResourceContention` returns
-/// 0 — the test never ran, not a real failure.
+/// 0 — the test never ran, not a real failure. The skip sidecar for
+/// this case is written upstream in `run_ktstr_test_inner` at the
+/// ResourceContention propagation site so every caller (including
+/// the library entry point `run_ktstr_test`) records it, not just
+/// the nextest dispatch path.
 fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
     match result {
         Ok(_) if expect_err => {
@@ -435,13 +439,24 @@ fn run_named_test(test_name: &str) -> i32 {
         return run_host_only_test(entry);
     }
 
+    // Base tests don't carry a gauntlet profile, but the entry's
+    // `required_flags` must still be activated for tests whose
+    // scheduler-arg contract requires them (per the invariant
+    // enforced by validate_entry_flags: every gauntlet profile
+    // contains required_flags). Using an empty flags list would run
+    // the scheduler without its required CLI args and produce
+    // incorrect sidecar metadata.
+    let active_flags: Vec<String> = entry.required_flags.iter().map(|s| s.to_string()).collect();
+
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
         eprintln!(
             "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             bare_name,
         );
         // See run_ktstr_test_inner for the sidecar-emission rationale.
-        write_skip_sidecar(entry, &[]);
+        if let Err(e) = write_skip_sidecar(entry, &active_flags) {
+            eprintln!("ktstr_test: {e:#}");
+        }
         return 0;
     }
 
@@ -453,7 +468,7 @@ fn run_named_test(test_name: &str) -> i32 {
         return 1;
     }
 
-    let result = run_ktstr_test_inner(entry, None, &[]);
+    let result = run_ktstr_test_inner(entry, None, &active_flags);
     result_to_exit_code(result, entry.expect_err)
 }
 
@@ -544,7 +559,9 @@ fn run_gauntlet_test(rest: &str) -> i32 {
             "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
         );
-        write_skip_sidecar(entry, &flags);
+        if let Err(e) = write_skip_sidecar(entry, &flags) {
+            eprintln!("ktstr_test: {e:#}");
+        }
         return 0;
     }
 

@@ -1582,7 +1582,7 @@ mod tests {
             crash_message: None,
         };
         let verify_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]);
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]).unwrap();
 
         // Clean up written file.
         let path = dir.join("__sidecar_default_dir__.ktstr.json");
@@ -1638,7 +1638,7 @@ mod tests {
             crash_message: None,
         };
         let verify_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]);
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]).unwrap();
 
         // Sidecar filename now includes a variant hash suffix so
         // gauntlet variants don't clobber each other. Find the file
@@ -1705,8 +1705,8 @@ mod tests {
         let ok = AssertResult::pass();
         let flags_a = vec!["llc".to_string()];
         let flags_b = vec!["llc".to_string(), "steal".to_string()];
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a);
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b);
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b).unwrap();
 
         let names: Vec<String> = std::fs::read_dir(&tmp)
             .unwrap()
@@ -1763,8 +1763,8 @@ mod tests {
             crash_message: None,
         };
         let ok = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[]);
-        write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[]);
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[]).unwrap();
 
         let names: Vec<String> = std::fs::read_dir(&tmp)
             .unwrap()

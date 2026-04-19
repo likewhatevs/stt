@@ -2702,9 +2702,7 @@ impl KtstrVm {
 
                 // __per_cpu_offset is a kernel data symbol: use text mapping.
                 let pco_pa = monitor::symbols::text_kva_to_pa(symbols.per_cpu_offset);
-                let offsets_arr = unsafe {
-                    monitor::symbols::read_per_cpu_offsets(mem.base_ptr(), pco_pa, num_cpus)
-                };
+                let offsets_arr = monitor::symbols::read_per_cpu_offsets(&mem, pco_pa, num_cpus);
                 // Per-CPU addresses (runqueues + offset) are in the
                 // direct mapping: use PAGE_OFFSET.
                 let rq_pas =

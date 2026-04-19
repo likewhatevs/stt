@@ -918,24 +918,46 @@ enum StartupStatus {
     WaitError(std::io::Error),
 }
 
-/// Poll `/sys/kernel/sched_ext/root/ops` at `interval` cadence for
-/// up to `timeout`, returning `true` as soon as the file is
-/// non-empty (a scheduler has attached). Returns `false` if the
-/// window closes without observing an attachment — the scheduler
-/// process is alive but never finished binding to sched_ext, which
-/// indicates an init-time failure in the BPF program (verifier
-/// error, ops struct mismatch, etc.) that left the child spinning
-/// or stuck in a setup phase.
+/// Poll `/sys/kernel/sched_ext/root/ops` at `interval` cadence for up
+/// to `timeout`, returning `true` as soon as the file is non-empty
+/// (a scheduler is registered and its ops struct has a populated
+/// name). Returns `false` if the window closes without observing
+/// a registration.
+///
+/// The sysfs path is built in two steps by the kernel:
+/// - `kernel/sched/ext.c` creates the `sched_ext` kset under
+///   `kernel_kobj` via `kset_create_and_add("sched_ext", ...)` in
+///   the scx init path, giving `/sys/kernel/sched_ext/`.
+/// - Each `struct scx_sched` allocation assigns `sch->kobj.kset =
+///   scx_kset` then calls `kobject_init_and_add(..., NULL, "root")`
+///   (or `"sub-%llu"` when `CONFIG_EXT_SUB_SCHED` and a parent is
+///   present), yielding `/sys/kernel/sched_ext/root/`. The `ops`
+///   attribute is registered on `scx_ktype` via `scx_sched_groups`;
+///   `scx_attr_ops_show` emits `sch->ops.name` through `sysfs_emit`.
+///
+/// Semantics we can claim based on the kernel flow above: a non-empty
+/// `root/ops` proves the scheduler completed `scx_alloc_and_add_sched`
+/// — the scx_sched struct is allocated, `sch->ops = *ops` has copied
+/// the userspace-provided ops (including `name`), and the kobject is
+/// registered with the kset. The kobject add happens BEFORE any BPF
+/// callback (`ops.init`, `ops.enable`, `ops.runnable`, etc.) runs, so
+/// a non-empty read does NOT prove those callbacks validated. Use
+/// this poll only to confirm "scheduler registered and name
+/// populated"; verify BPF callback success via monitor telemetry or
+/// the scheduler's own exit kind.
 ///
 /// Separate from [`poll_startup`] (which watches the child process
 /// state): a scheduler can be `Alive` from the process-waitpid
-/// perspective and still have zero progress on scx attachment.
+/// perspective and still have zero progress on scx registration.
 fn poll_scx_attached(interval: std::time::Duration, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
-        // The kernel writes the attached scheduler's name into
-        // `root/ops` once `sched_ext_ops.init` succeeds. Absent /
-        // empty => no attachment yet.
+        // The kernel populates `sch->ops.name` before the kobject is
+        // added, so the file becomes readable and non-empty the
+        // moment registration succeeds. Absent / empty => no
+        // registration yet (either no scheduler has reached
+        // scx_alloc_and_add_sched or the sysfs tree is still being
+        // torn down by a previous scheduler's exit).
         if let Ok(contents) = fs::read_to_string("/sys/kernel/sched_ext/root/ops")
             && !contents.trim().is_empty()
         {

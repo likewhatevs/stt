@@ -269,12 +269,20 @@ fn read_node_meminfo(node: usize) -> Option<NodeMemInfo> {
 
 /// Read NUMA distance row from `/sys/devices/system/node/nodeN/distance`.
 ///
-/// Returns the space-separated distance values as a `Vec<u8>`.
+/// Returns the space-separated distance values as a `Vec<u8>`. Returns
+/// `None` when the file is missing, any token fails to parse, or the
+/// file is whitespace-only — `split_whitespace` on an empty/whitespace
+/// file yields zero tokens so `collect` succeeds with an empty vec,
+/// which the caller would otherwise accept as a valid distance row
+/// for a zero-node topology.
 fn read_node_distances(node: usize) -> Option<Vec<u8>> {
     let path = format!("/sys/devices/system/node/node{node}/distance");
     let content = fs::read_to_string(path).ok()?;
     let values: Option<Vec<u8>> = content.split_whitespace().map(|s| s.parse().ok()).collect();
-    values
+    match values {
+        Some(v) if v.is_empty() => None,
+        other => other,
+    }
 }
 
 /// Read the cpulist for a NUMA node. Returns `true` if the node has
@@ -328,13 +336,57 @@ impl TestTopology {
         let mut llc_cache_sizes: BTreeMap<usize, Option<u64>> = BTreeMap::new();
 
         for &cpu_id in &online_cpus {
-            if !Path::new(&format!("/sys/devices/system/cpu/cpu{cpu_id}")).exists() {
+            let cpu_path = format!("/sys/devices/system/cpu/cpu{cpu_id}");
+            if !Path::new(&cpu_path).exists() {
+                tracing::warn!(
+                    cpu = cpu_id,
+                    path = %cpu_path,
+                    "/sys/devices/system/cpu/online listed this CPU but \
+                     /sys/devices/system/cpu/cpuN/ is absent; skipping — \
+                     the CPU will not appear in TestTopology.all_cpus()"
+                );
                 continue;
             }
             cpus.insert(cpu_id);
-            let llc_id = read_llc_id(cpu_id).unwrap_or(0);
-            let node_id = read_numa_node(cpu_id).unwrap_or(0);
-            let core_id = read_core_id(cpu_id);
+            let llc_id = match read_llc_id(cpu_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        cpu = cpu_id,
+                        error = %e,
+                        "LLC id unreadable from sysfs; bucketing CPU into fallback LLC 0 — \
+                         LlcAligned affinity will merge this CPU with any other unreadable CPUs"
+                    );
+                    0
+                }
+            };
+            let node_id = match read_numa_node(cpu_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        cpu = cpu_id,
+                        error = %e,
+                        "NUMA node unreadable from sysfs; bucketing CPU into fallback node 0 — \
+                         NUMA-aware placement may be incorrect for this CPU"
+                    );
+                    0
+                }
+            };
+            // core_id unreadable = synthesize a singleton core using the
+            // CPU id. Without this, CPUs with missing core_id are added
+            // to `info.cpus` but excluded from `info.cores`, so per-core
+            // iterators silently drop them. Using cpu_id as the core id
+            // guarantees uniqueness; a degenerate topology (no SMT
+            // sibling info) is better than a CPU invisible to core-aware
+            // consumers.
+            let core_id = read_core_id(cpu_id).unwrap_or_else(|| {
+                tracing::warn!(
+                    cpu = cpu_id,
+                    "core_id unreadable from sysfs; synthesizing singleton core entry \
+                     using cpu_id as the core id — SMT sibling grouping unavailable for this CPU"
+                );
+                cpu_id
+            });
             numa_nodes.insert(node_id);
             llc_cache_sizes
                 .entry(llc_id)
@@ -343,15 +395,11 @@ impl TestTopology {
                 .entry(llc_id)
                 .and_modify(|info| {
                     info.cpus.push(cpu_id);
-                    if let Some(cid) = core_id {
-                        info.cores.entry(cid).or_default().push(cpu_id);
-                    }
+                    info.cores.entry(core_id).or_default().push(cpu_id);
                 })
                 .or_insert_with(|| {
                     let mut cores = BTreeMap::new();
-                    if let Some(cid) = core_id {
-                        cores.insert(cid, vec![cpu_id]);
-                    }
+                    cores.insert(core_id, vec![cpu_id]);
                     LlcInfo {
                         cpus: vec![cpu_id],
                         numa_node: node_id,
@@ -403,21 +451,35 @@ impl TestTopology {
         // Build distance matrix. Try sysfs first, fall back to 10/20.
         let numa_distances = {
             let mut matrix = Vec::with_capacity(n * n);
-            let mut from_sysfs = true;
+            let mut fallback_reason: Option<String> = None;
             for &nid in &node_ids {
-                if let Some(row) = read_node_distances(nid) {
-                    if row.len() == n {
-                        matrix.extend_from_slice(&row);
-                    } else {
-                        from_sysfs = false;
+                match read_node_distances(nid) {
+                    Some(row) if row.len() == n => matrix.extend_from_slice(&row),
+                    Some(row) => {
+                        fallback_reason = Some(format!(
+                            "node{nid}/distance has {} entries, expected {n}",
+                            row.len()
+                        ));
                         break;
                     }
-                } else {
-                    from_sysfs = false;
-                    break;
+                    None => {
+                        fallback_reason =
+                            Some(format!("node{nid}/distance missing or unparseable"));
+                        break;
+                    }
                 }
             }
-            if !from_sysfs || matrix.len() != n * n {
+            if fallback_reason.is_some() || matrix.len() != n * n {
+                let reason = fallback_reason.unwrap_or_else(|| {
+                    format!("distance matrix length {} != {}", matrix.len(), n * n)
+                });
+                tracing::warn!(
+                    reason = %reason,
+                    numa_nodes = n,
+                    "NUMA distance matrix unavailable from /sys/devices/system/node/*/distance; \
+                     falling back to 10 (intra-node) / 20 (inter-node) — \
+                     NUMA-aware placement decisions will use uniform distances"
+                );
                 matrix.clear();
                 matrix.resize(n * n, 0);
                 for i in 0..n {
@@ -456,6 +518,11 @@ impl TestTopology {
         // NUMA node set must be non-empty too (every online CPU has
         // a NUMA node, so this is a belt-and-suspenders guard).
         let numa_nodes = if numa_nodes.is_empty() {
+            tracing::warn!(
+                "NUMA node set empty after sysfs discovery (no nodeN entries and \
+                 no per-CPU node ids); synthesizing a fallback {{0}} — \
+                 NUMA-aware placement will treat the machine as single-node"
+            );
             let mut s = BTreeSet::new();
             s.insert(0);
             s

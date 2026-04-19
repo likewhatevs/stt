@@ -217,24 +217,22 @@ pub(crate) fn text_kva_to_pa(kva: u64) -> u64 {
 /// Read the `__per_cpu_offset` array from guest memory.
 /// Returns per-CPU offsets for each CPU (index = CPU number).
 ///
-/// # Safety
-///
-/// `host_base` must point to the start of a guest memory region at least
-/// `per_cpu_offset_pa + num_cpus * 8` bytes long. The memory at each
-/// offset must contain a valid `u64` written by the guest kernel.
-pub(crate) unsafe fn read_per_cpu_offsets(
-    host_base: *const u8,
+/// Each u64 element is read via [`GuestMem::read_u64`], which uses
+/// per-byte `read_volatile` internally and is alignment-safe even
+/// when `per_cpu_offset_pa` is not 8-aligned. The previous raw
+/// `std::ptr::read_volatile(*const u64)` implementation was UB on
+/// misaligned addresses (same alignment gap that reader.rs closed
+/// in WO-3g). GuestMem also bounds-checks each read against its
+/// mapped size, so reads past the end of guest memory return 0
+/// instead of faulting.
+pub(crate) fn read_per_cpu_offsets(
+    mem: &super::reader::GuestMem,
     per_cpu_offset_pa: u64,
     num_cpus: u32,
 ) -> Vec<u64> {
-    let mut offsets = Vec::with_capacity(num_cpus as usize);
-    for cpu in 0..num_cpus {
-        let addr = per_cpu_offset_pa + (cpu as u64) * 8;
-        let ptr = unsafe { host_base.add(addr as usize) as *const u64 };
-        let val = unsafe { std::ptr::read_volatile(ptr) };
-        offsets.push(val);
-    }
-    offsets
+    (0..num_cpus)
+        .map(|cpu| mem.read_u64(per_cpu_offset_pa + (cpu as u64) * 8, 0))
+        .collect()
 }
 
 /// Compute the physical address of each CPU's `struct rq`.
@@ -306,18 +304,24 @@ mod tests {
 
     #[test]
     fn read_per_cpu_offsets_zero_cpus() {
+        use crate::monitor::reader::GuestMem;
         // With num_cpus=0, should return an empty vec without any reads.
-        let buf = [0u8; 64];
-        let result = unsafe { read_per_cpu_offsets(buf.as_ptr(), 0, 0) };
+        let mut buf = [0u8; 64];
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let result = read_per_cpu_offsets(&mem, 0, 0);
         assert!(result.is_empty());
     }
 
     #[test]
     fn read_per_cpu_offsets_known_buffer() {
+        use crate::monitor::reader::GuestMem;
         // Buffer with 3 known u64 offsets at PA 0.
-        let offsets: [u64; 3] = [0x1000, 0x2000, 0x3000];
-        let buf: &[u8] = unsafe { std::slice::from_raw_parts(offsets.as_ptr() as *const u8, 24) };
-        let result = unsafe { read_per_cpu_offsets(buf.as_ptr(), 0, 3) };
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&0x1000u64.to_ne_bytes());
+        buf[8..16].copy_from_slice(&0x2000u64.to_ne_bytes());
+        buf[16..24].copy_from_slice(&0x3000u64.to_ne_bytes());
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let result = read_per_cpu_offsets(&mem, 0, 3);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], 0x1000);
         assert_eq!(result[1], 0x2000);
@@ -326,13 +330,45 @@ mod tests {
 
     #[test]
     fn read_per_cpu_offsets_nonzero_pa() {
+        use crate::monitor::reader::GuestMem;
         // Place offsets at PA=16 (skip 16 bytes of padding).
         let mut buf = [0u8; 40]; // 16 padding + 3*8 offsets
-        let vals: [u64; 3] = [0xAA, 0xBB, 0xCC];
-        buf[16..40]
-            .copy_from_slice(unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, 24) });
-        let result = unsafe { read_per_cpu_offsets(buf.as_ptr(), 16, 3) };
+        buf[16..24].copy_from_slice(&0xAAu64.to_ne_bytes());
+        buf[24..32].copy_from_slice(&0xBBu64.to_ne_bytes());
+        buf[32..40].copy_from_slice(&0xCCu64.to_ne_bytes());
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let result = read_per_cpu_offsets(&mem, 16, 3);
         assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn read_per_cpu_offsets_misaligned_pa() {
+        use crate::monitor::reader::GuestMem;
+        // Regression for the alignment UB fix: a non-8-aligned PA
+        // (PA=1 here) must not cause misaligned-u64 UB. Byte-wise
+        // volatile reads through GuestMem make this safe.
+        let mut buf = [0u8; 32];
+        buf[1..9].copy_from_slice(&0x1122_3344_5566_7788u64.to_ne_bytes());
+        buf[9..17].copy_from_slice(&0x99AA_BBCC_DDEE_FF00u64.to_ne_bytes());
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let result = read_per_cpu_offsets(&mem, 1, 2);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], 0x1122_3344_5566_7788);
+        assert_eq!(result[1], 0x99AA_BBCC_DDEE_FF00);
+    }
+
+    #[test]
+    fn read_per_cpu_offsets_out_of_bounds_returns_zero() {
+        use crate::monitor::reader::GuestMem;
+        // Asking for more CPUs than the buffer can hold: GuestMem's
+        // bounds check yields 0 for each out-of-range read rather
+        // than faulting or reading garbage past the mapped region.
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&0x1111u64.to_ne_bytes());
+        buf[8..16].copy_from_slice(&0x2222u64.to_ne_bytes());
+        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        let result = read_per_cpu_offsets(&mem, 0, 4);
+        assert_eq!(result, vec![0x1111, 0x2222, 0, 0]);
     }
 
     #[test]

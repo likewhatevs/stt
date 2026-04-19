@@ -27,6 +27,8 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
+
 use crate::assert::{AssertResult, ScenarioStats};
 use crate::monitor::MonitorSummary;
 use crate::timeline::StimulusEvent;
@@ -445,7 +447,15 @@ fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
 /// with empty VM telemetry (no monitor, no stimulus events, no
 /// verifier stats, no kvm stats). Stats tooling that subtracts
 /// skipped runs from the pass count treats the entry correctly.
-pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String]) {
+///
+/// Returns `Err` when the sidecar directory cannot be created, the
+/// JSON cannot be serialized, or the file write fails. Callers that
+/// ignore the Result accept the risk of stats-tooling blind spots on
+/// this run.
+pub(crate) fn write_skip_sidecar(
+    entry: &KtstrTestEntry,
+    active_flags: &[String],
+) -> anyhow::Result<()> {
     let dir = sidecar_dir();
     let topo = entry.topology.to_string();
     let sched_name = match &entry.scheduler.binary {
@@ -490,12 +500,13 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String]
     };
     let variant_hash = sidecar_variant_hash(&sidecar);
     let path = dir.join(format!("{}-{:016x}.ktstr.json", entry.name, variant_hash));
-    if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
-        let _ = std::fs::create_dir_all(&dir);
-        if let Err(e) = std::fs::write(&path, json) {
-            eprintln!("ktstr_test: write skip sidecar {}: {e}", path.display());
-        }
-    }
+    let json = serde_json::to_string_pretty(&sidecar)
+        .with_context(|| format!("serialize skip sidecar for '{}'", entry.name))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create sidecar dir {}", dir.display()))?;
+    std::fs::write(&path, json)
+        .with_context(|| format!("write skip sidecar {}", path.display()))?;
+    Ok(())
 }
 
 /// Write a sidecar JSON file for post-run analysis.
@@ -503,6 +514,11 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String]
 /// Output goes to the current run's sidecar directory
 /// (`KTSTR_SIDECAR_DIR` override, or
 /// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`).
+///
+/// Returns `Err` when the sidecar directory cannot be created, the
+/// JSON cannot be serialized, or the file write fails. Callers that
+/// ignore the Result accept the risk of stats-tooling blind spots on
+/// this run.
 pub(crate) fn write_sidecar(
     entry: &KtstrTestEntry,
     vm_result: &vmm::VmResult,
@@ -510,7 +526,7 @@ pub(crate) fn write_sidecar(
     verify_result: &AssertResult,
     work_type: &str,
     active_flags: &[String],
-) {
+) -> anyhow::Result<()> {
     let dir = sidecar_dir();
     let topo = entry.topology.to_string();
     let sched_name = match &entry.scheduler.binary {
@@ -558,10 +574,10 @@ pub(crate) fn write_sidecar(
     // each variant gets its own sidecar file.
     let variant_hash = sidecar_variant_hash(&sidecar);
     let path = dir.join(format!("{}-{:016x}.ktstr.json", entry.name, variant_hash));
-    if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
-        let _ = std::fs::create_dir_all(&dir);
-        if let Err(e) = std::fs::write(&path, json) {
-            eprintln!("ktstr_test: write sidecar {}: {e}", path.display());
-        }
-    }
+    let json = serde_json::to_string_pretty(&sidecar)
+        .with_context(|| format!("serialize sidecar for '{}'", entry.name))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create sidecar dir {}", dir.display()))?;
+    std::fs::write(&path, json).with_context(|| format!("write sidecar {}", path.display()))?;
+    Ok(())
 }

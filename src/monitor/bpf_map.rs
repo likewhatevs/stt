@@ -829,14 +829,11 @@ impl<'a> BpfMapAccessor<'a> {
             return Vec::new();
         };
         let pco_pa = super::symbols::text_kva_to_pa(pco_kva);
-        let end = pco_pa + num_cpus as u64 * 8;
-        if end > self.kernel.mem().size() {
-            return Vec::new();
-        }
-        // SAFETY: bounds checked above; GuestMem outlives this call.
-        let per_cpu_offsets = unsafe {
-            super::symbols::read_per_cpu_offsets(self.kernel.mem().base_ptr(), pco_pa, num_cpus)
-        };
+        // read_per_cpu_offsets routes through GuestMem::read_u64 which
+        // bounds-checks each element against the mapped size; out-of-
+        // range PAs yield 0 rather than faulting. No pre-check needed.
+        let per_cpu_offsets =
+            super::symbols::read_per_cpu_offsets(self.kernel.mem(), pco_pa, num_cpus);
 
         read_percpu_array_value(
             self.kernel.mem(),

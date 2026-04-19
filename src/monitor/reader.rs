@@ -2915,11 +2915,22 @@ mod tests {
         // Per-struct size covers make_sd_buffer's layout
         // (sd_ttwu_move_balance=232 + 4 bytes for that u32 + 8 bytes
         // guard = 244) rounded up to the next multiple of 8. The
-        // readers use `ptr::read_volatile(*const u64)`, which is UB
-        // on misaligned pointers (triggers ABRT under the std's
-        // debug alignment check on some archs). With first_pa=1024
-        // (already 8-aligned) and a 248-byte stride, every per-domain
-        // PA is 8-aligned, so u64 reads land on aligned addresses.
+        // readers go through `GuestMem::read_u32` / `read_u64`, which
+        // call `read_volatile_bytes<N>` — per-byte volatile reads that
+        // are always 1-aligned and recompose the integer via
+        // `from_ne_bytes`, so misaligned PAs are safe. The 8-alignment
+        // baked into this stride is therefore no longer load-bearing
+        // for correctness; it remains because every real kernel
+        // sched_domain is `__randomize_layout`-aligned past u64 and
+        // matching that stride keeps the fixture realistic.
+        //
+        // Byte-wise volatile has no atomicity guarantee: a concurrent
+        // guest-side write mid-read can produce a torn integer. The
+        // monitor treats its samples as best-effort, so tearing is
+        // acceptable here. `from_ne_bytes` uses host endianness;
+        // x86_64/aarch64 guests and hosts share little-endian, so
+        // the recomposed value matches the guest's stored value.
+        //
         // Each sched_domain lives at a distinct PA and points at the
         // next via sd->parent, forming an acyclic chain longer than
         // MAX_DEPTH so the depth bound — not the visited set — is

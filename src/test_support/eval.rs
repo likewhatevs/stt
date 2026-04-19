@@ -85,8 +85,12 @@ pub(crate) fn run_ktstr_test_inner(
             entry.name,
         );
         // Record the skip so stats tooling sees every skipped run,
-        // not just the ones that made it to the VM-run site.
-        write_skip_sidecar(entry, active_flags);
+        // not just the ones that made it to the VM-run site. A sidecar
+        // write failure is logged but not propagated: the skip itself
+        // is still valid — only post-run stats tooling loses visibility.
+        if let Err(e) = write_skip_sidecar(entry, active_flags) {
+            eprintln!("ktstr_test: {e:#}");
+        }
         return Ok(AssertResult::skip(
             "test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
         ));
@@ -191,13 +195,19 @@ pub(crate) fn run_ktstr_test_inner(
     // Catch ResourceContention before .context() wraps it —
     // downcast_ref only checks the outermost error type, so
     // .context() would hide ResourceContention from the skip
-    // logic in result_to_exit_code.
+    // logic in result_to_exit_code. Also record a skip sidecar at
+    // the propagation point: a ResourceContention-skipped run is
+    // otherwise invisible to stats tooling that enumerates
+    // sidecars.
     let vm = match builder.build() {
         Ok(vm) => vm,
         Err(e)
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some() =>
         {
+            if let Err(se) = write_skip_sidecar(entry, active_flags) {
+                eprintln!("ktstr_test: {se:#}");
+            }
             return Err(e);
         }
         Err(e) => return Err(e.context("build ktstr_test VM")),
@@ -209,6 +219,9 @@ pub(crate) fn run_ktstr_test_inner(
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some() =>
         {
+            if let Err(se) = write_skip_sidecar(entry, active_flags) {
+                eprintln!("ktstr_test: {se:#}");
+            }
             return Err(e);
         }
         Err(e) => return Err(e.context("run ktstr_test VM")),
@@ -364,17 +377,22 @@ pub(crate) fn evaluate_vm_result(
         parse_assert_result_shm(result.shm_data.as_ref()).or_else(|_| parse_assert_result(output))
     {
         // Write sidecar before checking pass/fail so both outcomes are captured.
+        // A sidecar write failure is logged but not propagated: the test
+        // verdict itself is still valid — only post-run stats tooling
+        // loses visibility.
         let args: Vec<String> = std::env::args().collect();
         let work_type =
             super::args::extract_work_type_arg(&args).unwrap_or_else(|| "CpuSpin".to_string());
-        write_sidecar(
+        if let Err(e) = write_sidecar(
             entry,
             result,
             stimulus_events,
             &verify_result,
             &work_type,
             active_flags,
-        );
+        ) {
+            eprintln!("ktstr_test: {e:#}");
+        }
 
         if !verify_result.passed {
             let details = verify_result
