@@ -2820,7 +2820,6 @@ dependencies = [
  "nix 0.31.2",
  "object 0.36.7",
  "opendal",
- "parking_lot",
  "polars",
  "predicates",
  "proptest",

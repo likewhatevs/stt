@@ -3779,70 +3779,53 @@ fn dispatch_io_in(
 
 /// Find the vmlinux ELF next to a kernel image path.
 ///
-/// On x86_64, checks the bzImage's parent directory and, if the path
-/// looks like `<root>/arch/x86/boot/bzImage`, checks `<root>/vmlinux`.
-#[cfg(target_arch = "x86_64")]
+/// Shared across x86_64 and aarch64. Both architectures follow the
+/// kernel build's `<root>/arch/<arch>/boot/<image>` layout, so
+/// stepping 3 directories up from `kernel_path` lands on `<root>`
+/// where `vmlinux` sits. Distro paths diverge: x86_64 ships debug
+/// vmlinux at `/usr/lib/debug/boot/vmlinux-<version>`, aarch64 splits
+/// between `/boot/vmlinux-<version>` and
+/// `/lib/modules/<version>/build/vmlinux`. Both distro layouts are
+/// probed regardless of arch — the arch-specific filename prefix
+/// (`bzImage` vs `Image`) only tells us where to look, not which
+/// layout owns the match.
 pub(crate) fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
     let dir = kernel_path.parent()?;
     let candidate = dir.join("vmlinux");
     if candidate.exists() {
         return Some(candidate);
     }
-    // kernel_path is typically <root>/arch/x86/boot/bzImage
+    // Kernel build tree: <root>/arch/<arch>/boot/<image> -> <root>/vmlinux.
     if let Ok(root) = dir.join("../../..").canonicalize() {
         let candidate = root.join("vmlinux");
         if candidate.exists() {
             return Some(candidate);
         }
     }
-    // CI/distro kernel: try /usr/lib/debug/boot/vmlinux-<version>
+    // Distro layouts keyed by the image's version suffix
+    // (`vmlinuz-<version>`).
     if let Some(name) = kernel_path.file_name().and_then(|n| n.to_str()) {
         let version = name.strip_prefix("vmlinuz-").unwrap_or(name);
-        let debug = PathBuf::from(format!("/usr/lib/debug/boot/vmlinux-{version}"));
-        if debug.exists() {
-            return Some(debug);
+        for candidate in [
+            PathBuf::from(format!("/usr/lib/debug/boot/vmlinux-{version}")),
+            PathBuf::from(format!("/boot/vmlinux-{version}")),
+            PathBuf::from(format!("/lib/modules/{version}/build/vmlinux")),
+        ] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
         }
     }
-    None
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
-    let dir = kernel_path.parent()?;
-    let candidate = dir.join("vmlinux");
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    // kernel_path is typically <root>/arch/arm64/boot/Image
-    if let Ok(root) = dir.join("../../..").canonicalize() {
-        let candidate = root.join("vmlinux");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    // Distro kernel: extract version from vmlinuz-<version> and check
-    // /boot/vmlinux-<version> or /lib/modules/<version>/build/vmlinux.
-    if let Some(name) = kernel_path.file_name().and_then(|n| n.to_str()) {
-        let version = name.strip_prefix("vmlinuz-").unwrap_or(name);
-        let boot = PathBuf::from(format!("/boot/vmlinux-{version}"));
-        if boot.exists() {
-            return Some(boot);
-        }
-        let modules = PathBuf::from(format!("/lib/modules/{version}/build/vmlinux"));
-        if modules.exists() {
-            return Some(modules);
-        }
-    }
-    // kernel_path may be /lib/modules/<version>/vmlinuz — extract version
-    // from the parent directory name.
+    // `/lib/modules/<version>/vmlinuz` layout: version is the parent
+    // directory name, and the sibling `build/vmlinux` is the target.
     if let Some(parent_name) = dir.file_name().and_then(|n| n.to_str()) {
-        let build = dir.join("build/vmlinux");
-        if build.exists() {
-            return Some(build);
-        }
-        let boot = PathBuf::from(format!("/boot/vmlinux-{parent_name}"));
-        if boot.exists() {
-            return Some(boot);
+        for candidate in [
+            dir.join("build/vmlinux"),
+            PathBuf::from(format!("/boot/vmlinux-{parent_name}")),
+        ] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
         }
     }
     None

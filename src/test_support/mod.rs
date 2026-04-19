@@ -50,7 +50,7 @@ mod profraw;
 mod runtime;
 mod sidecar;
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 mod timefmt;
 mod topo;
 

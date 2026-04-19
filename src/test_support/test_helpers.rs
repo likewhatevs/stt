@@ -43,6 +43,58 @@ pub(crate) fn dummy_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+/// RAII guard that mutates an environment variable and restores the
+/// original value on drop. Not thread-safe: hold [`ENV_LOCK`] for the
+/// guard's full lifetime when another test in the same binary might
+/// mutate the same key.
+///
+/// nextest runs each test in its own process, so simple single-variable
+/// tests don't need the lock — the lock is only needed when multiple
+/// tests in a single process mutate overlapping keys.
+///
+/// Shared across cache / remote_cache / anywhere else that needs to
+/// rewrite HOME / XDG_CACHE_HOME / KTSTR_CACHE_DIR / ACTIONS_CACHE_URL
+/// and friends during a test run. Previously duplicated in
+/// `cache::tests` and `remote_cache::tests`.
+pub(crate) struct EnvVarGuard {
+    key: String,
+    original: Option<String>,
+}
+
+impl EnvVarGuard {
+    pub(crate) fn set(key: &str, value: &str) -> Self {
+        let original = std::env::var(key).ok();
+        // SAFETY: nextest runs each test in its own process; callers
+        // that share a key across concurrent tests in the same process
+        // must take `ENV_LOCK` before constructing the guard.
+        unsafe { std::env::set_var(key, value) };
+        EnvVarGuard {
+            key: key.to_string(),
+            original,
+        }
+    }
+
+    pub(crate) fn remove(key: &str) -> Self {
+        let original = std::env::var(key).ok();
+        // SAFETY: same rationale as `set`.
+        unsafe { std::env::remove_var(key) };
+        EnvVarGuard {
+            key: key.to_string(),
+            original,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            // SAFETY: nextest runs each test in its own process.
+            Some(val) => unsafe { std::env::set_var(&self.key, val) },
+            None => unsafe { std::env::remove_var(&self.key) },
+        }
+    }
+}
+
 /// Build a minimal `KtstrTestEntry` bound to the EEVDF scheduler.
 /// Intended for `evaluate_vm_result` tests that exercise the no-scx
 /// code path — see the `sched_entry` sibling for the scx variant.

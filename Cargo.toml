@@ -60,7 +60,6 @@ cpio = "0.4.1"
 virtio-bindings = "0.2.7"
 virtio-queue = "0.17"
 vm-superio = "0.8.1"
-parking_lot = "0.12"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 linkme = "0.3"

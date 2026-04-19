@@ -715,19 +715,11 @@ fn strip_debug(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("read binary: {}", path.display()))
 }
 
-/// Remove debug sections from ELF data using the object crate's
-/// build module. Parses the ELF, marks debug sections for deletion,
-/// and writes back a new ELF without them.
+/// Remove debug sections from ELF data using the shared
+/// [`crate::elf_strip::rewrite`] primitive. Thin filter — delete
+/// sections whose name is in the explicit [`DEBUG_SECTIONS`] list.
 fn strip_debug_sections(data: &[u8]) -> std::result::Result<Vec<u8>, object::build::Error> {
-    let mut builder = object::build::elf::Builder::read(data)?;
-    for section in builder.sections.iter_mut() {
-        if DEBUG_SECTIONS.contains(&section.name.as_slice()) {
-            section.delete = true;
-        }
-    }
-    let mut out = Vec::new();
-    builder.write(&mut out)?;
-    Ok(out)
+    crate::elf_strip::rewrite(data, |name| DEBUG_SECTIONS.contains(&name))
 }
 
 /// Check if `path` is the current executable and has been deleted.
@@ -1027,20 +1019,11 @@ pub fn create_initramfs_base(
     Ok(archive)
 }
 
-/// Build the suffix that completes a base archive: /args and /sched_args
-/// entries, trailer, and 512-byte padding. `base_len` is needed to compute
-/// the padding. The returned Vec is typically ~200 bytes.
-#[cfg(test)]
-pub(crate) fn build_suffix(
-    base_len: usize,
-    args: &[String],
-    sched_args: &[String],
-) -> Result<Vec<u8>> {
-    build_suffix_full(base_len, args, sched_args, &[], &[], None)
-}
-
-/// Extended suffix builder that also writes /sched_enable and /sched_disable
-/// shell scripts for kernel-built schedulers.
+/// Build the suffix that completes a base archive: /args and
+/// /sched_args entries, optional /sched_enable and /sched_disable
+/// shell scripts for kernel-built schedulers, optional /exec_cmd,
+/// trailer, and 512-byte padding. `base_len` is needed to compute the
+/// padding. The returned Vec is typically ~200 bytes.
 pub fn build_suffix_full(
     base_len: usize,
     args: &[String],
@@ -1089,22 +1072,6 @@ pub fn build_suffix_full(
     suffix.extend(std::iter::repeat_n(0u8, pad));
 
     Ok(suffix)
-}
-
-/// Create a complete cpio newc archive in one call.
-/// Convenience wrapper over `create_initramfs_base` + `build_suffix`.
-#[cfg(test)]
-pub fn create_initramfs(
-    payload: &Path,
-    extra_binaries: &[(&str, &Path)],
-    args: &[String],
-) -> Result<Vec<u8>> {
-    let base = create_initramfs_base(payload, extra_binaries, &[], false)?;
-    let suffix = build_suffix(base.len(), args, &[])?;
-    let mut archive = Vec::with_capacity(base.len() + suffix.len());
-    archive.extend_from_slice(&base);
-    archive.extend_from_slice(&suffix);
-    Ok(archive)
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,24 +1469,12 @@ pub(crate) fn shm_close_fd(fd: std::os::unix::io::RawFd) {
     }
 }
 
-/// Load an initramfs into guest memory at the given address.
-/// Returns (address, size) for boot_params.
-#[cfg(test)]
-pub fn load_initramfs(
-    guest_mem: &vm_memory::GuestMemoryMmap,
-    initrd_data: &[u8],
-    load_addr: u64,
-) -> Result<(u64, u32)> {
-    use vm_memory::{Bytes, GuestAddress};
-    guest_mem
-        .write_slice(initrd_data, GuestAddress(load_addr))
-        .context("write initramfs to guest memory")?;
-    Ok((load_addr, initrd_data.len() as u32))
-}
-
-/// Write multiple byte slices sequentially into guest memory as a single
-/// contiguous initramfs. Avoids copying parts into a single Vec first.
-/// Returns (address, total_size) for boot_params.
+/// Write one or more byte slices sequentially into guest memory as a
+/// single contiguous initramfs. Passing a one-element `parts` slice
+/// matches the "single blob" caller; multi-element slices avoid the
+/// copy into a monolithic `Vec` that the split base/suffix production
+/// path would otherwise need. Returns (address, total_size) for
+/// boot_params.
 pub fn load_initramfs_parts(
     guest_mem: &vm_memory::GuestMemoryMmap,
     parts: &[&[u8]],
@@ -1575,6 +1530,33 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Thin test wrapper over [`build_suffix_full`] that skips the
+    /// kernel-builtin scheduler and exec-cmd knobs — the tests in this
+    /// module only exercise `args` and `sched_args`, so stripping the
+    /// unused parameters keeps assertions focused.
+    fn build_suffix(base_len: usize, args: &[String], sched_args: &[String]) -> Result<Vec<u8>> {
+        build_suffix_full(base_len, args, sched_args, &[], &[], None)
+    }
+
+    /// Thin test wrapper that produces a complete cpio newc archive by
+    /// concatenating [`create_initramfs_base`] and [`build_suffix`]
+    /// output. Production callers build base and suffix separately so
+    /// they can stream the parts into guest memory without an
+    /// intermediate `Vec`; the monolithic form is only needed for
+    /// round-trip archive-shape assertions in tests.
+    fn create_initramfs(
+        payload: &Path,
+        extra_binaries: &[(&str, &Path)],
+        args: &[String],
+    ) -> Result<Vec<u8>> {
+        let base = create_initramfs_base(payload, extra_binaries, &[], false)?;
+        let suffix = build_suffix(base.len(), args, &[])?;
+        let mut archive = Vec::with_capacity(base.len() + suffix.len());
+        archive.extend_from_slice(&base);
+        archive.extend_from_slice(&suffix);
+        Ok(archive)
+    }
 
     /// Extract cpio entry names from a newc archive for test assertions.
     fn cpio_entry_names(archive: &[u8]) -> Vec<String> {
@@ -2206,7 +2188,7 @@ mod tests {
             16 << 20,
         )])
         .unwrap();
-        let (addr, size) = load_initramfs(&mem, &data, 0x200000).unwrap();
+        let (addr, size) = load_initramfs_parts(&mem, &[&data], 0x200000).unwrap();
         assert_eq!(addr, 0x200000);
         assert_eq!(size, 4096);
         let mut buf = vec![0u8; 4096];

@@ -230,6 +230,7 @@ pub(crate) fn read_kmsg() -> String {
 pub mod assert;
 pub(crate) mod budget;
 pub mod cli;
+pub(crate) mod elf_strip;
 pub mod fetch;
 pub mod kernel_path;
 pub(crate) mod monitor;

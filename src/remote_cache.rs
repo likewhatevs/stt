@@ -681,42 +681,5 @@ mod tests {
         ));
     }
 
-    // -- EnvVarGuard (same pattern as cache.rs tests) --
-
-    struct EnvVarGuard {
-        key: String,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: nextest runs each test in its own process.
-            unsafe { std::env::set_var(key, value) };
-            EnvVarGuard {
-                key: key.to_string(),
-                original,
-            }
-        }
-
-        fn remove(key: &str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: nextest runs each test in its own process.
-            unsafe { std::env::remove_var(key) };
-            EnvVarGuard {
-                key: key.to_string(),
-                original,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                // SAFETY: nextest runs each test in its own process.
-                Some(val) => unsafe { std::env::set_var(&self.key, val) },
-                None => unsafe { std::env::remove_var(&self.key) },
-            }
-        }
-    }
+    use crate::test_support::test_helpers::EnvVarGuard;
 }

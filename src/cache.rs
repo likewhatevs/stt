@@ -999,21 +999,13 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Fallback strip: remove only .debug_* and .comment sections.
+/// Fallback strip: remove only .debug_* and .comment sections. Uses
+/// the shared [`crate::elf_strip::rewrite`] primitive.
 fn strip_debug_prefix(data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut builder = object::build::elf::Builder::read(data)
-        .map_err(|e| anyhow::anyhow!("parse vmlinux ELF (fallback): {e}"))?;
-    for section in builder.sections.iter_mut() {
-        let name = section.name.as_slice();
-        if name.starts_with(b".debug_") || name == b".comment" {
-            section.delete = true;
-        }
-    }
-    let mut out = Vec::new();
-    builder
-        .write(&mut out)
-        .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux (fallback): {e}"))?;
-    Ok(out)
+    crate::elf_strip::rewrite(data, |name| {
+        name.starts_with(b".debug_") || name == b".comment"
+    })
+    .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux (fallback): {e}"))
 }
 
 /// Resolve the cache root directory path.
@@ -2993,46 +2985,5 @@ mod tests {
         );
     }
 
-    // -- EnvVarGuard for test isolation --
-
-    /// RAII guard that sets/unsets an environment variable and restores
-    /// the original value on drop. Not thread-safe -- tests using this
-    /// must run serially (nextest runs each test in its own process).
-    struct EnvVarGuard {
-        key: String,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: nextest runs each test in its own process, so
-            // concurrent env var mutation cannot occur.
-            unsafe { std::env::set_var(key, value) };
-            EnvVarGuard {
-                key: key.to_string(),
-                original,
-            }
-        }
-
-        fn remove(key: &str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: nextest runs each test in its own process.
-            unsafe { std::env::remove_var(key) };
-            EnvVarGuard {
-                key: key.to_string(),
-                original,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                // SAFETY: nextest runs each test in its own process.
-                Some(val) => unsafe { std::env::set_var(&self.key, val) },
-                None => unsafe { std::env::remove_var(&self.key) },
-            }
-        }
-    }
+    use crate::test_support::test_helpers::EnvVarGuard;
 }

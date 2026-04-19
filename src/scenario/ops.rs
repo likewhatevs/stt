@@ -604,7 +604,12 @@ impl ShmWriter {
     /// Acquires `SHM_WRITE_LOCK` to serialize against concurrent writers
     /// (sched-exit-mon thread via `write_msg`).
     fn write(&self, msg_type: u32, payload: &[u8]) {
-        let _guard = shm_ring::SHM_WRITE_LOCK.lock();
+        // Recover from poisoning: the ring is fully overwritten on
+        // each write, so a panicking writer does not leave shared
+        // invariants in a bad state.
+        let _guard = shm_ring::SHM_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match self {
             ShmWriter::Mapped { ptr, shm_size, .. } => {
                 let buf = unsafe { std::slice::from_raw_parts_mut(*ptr, *shm_size) };

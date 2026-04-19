@@ -216,7 +216,12 @@ pub fn init_shm_ptr(base: *mut u8, size: usize) {
 /// (sched-exit-mon thread and step executor).
 pub fn write_msg(msg_type: u32, payload: &[u8]) {
     let Ok((ptr, size)) = shm_ptr() else { return };
-    let _guard = SHM_WRITE_LOCK.lock();
+    // Recover from poisoning: a panicking writer may have left the
+    // ring in an inconsistent state, but the post-panic thread is
+    // still safe to re-enter — the only shared mutable state the lock
+    // guards (the SHM region bytes) is fully overwritten on each
+    // `shm_write` call.
+    let _guard = SHM_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
     shm_write(buf, 0, msg_type, payload);
 }
@@ -231,7 +236,11 @@ pub fn write_msg_nonblocking(msg_type: u32, payload: &[u8]) -> bool {
     let Ok((ptr, size)) = shm_ptr() else {
         return false;
     };
-    let Some(_guard) = SHM_WRITE_LOCK.try_lock() else {
+    // `try_lock` fails if the lock is contended OR poisoned. Both
+    // map to "don't block, just drop this message" in the
+    // non-blocking path — the caller is invariably an exit/dump
+    // hook that cannot afford to wait for the writer.
+    let Ok(_guard) = SHM_WRITE_LOCK.try_lock() else {
         return false;
     };
     let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
@@ -255,7 +264,7 @@ static SHM_PTR: std::sync::OnceLock<ShmPtr> = std::sync::OnceLock::new();
 /// Mutex serializing guest-side SHM ring writes. Prevents the sched-exit-mon
 /// thread (write_msg) and the step executor (ShmWriter::write) from
 /// concurrently modifying the ring's write_ptr.
-pub static SHM_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+pub static SHM_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Get the cached SHM mmap pointer and size, initializing from
 /// /proc/cmdline if not already set.
