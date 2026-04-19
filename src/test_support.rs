@@ -938,6 +938,10 @@ pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32, u32)> {
     if s_pos >= c_pos || c_pos >= t_pos {
         return None;
     }
+    // Reject trailing garbage after 't', same as the new-format path.
+    if s[t_pos + 1..].chars().next().is_some() {
+        return None;
+    }
     let llcs: u32 = s[..s_pos].parse().ok()?;
     let cores: u32 = s[s_pos + 1..c_pos].parse().ok()?;
     let threads: u32 = s[c_pos + 1..t_pos].parse().ok()?;
@@ -958,6 +962,12 @@ fn parse_topo_string_new(s: &str) -> Option<(u32, u32, u32, u32)> {
     let c_pos = s.find('c')?;
     let t_pos = s.find('t')?;
     if first_pos >= l_pos || l_pos >= c_pos || c_pos >= t_pos {
+        return None;
+    }
+    // Reject trailing garbage after the 't' terminator. Silently
+    // accepting e.g. "1n2l4c2tEXTRA" as (1,2,4,2) masks typos and
+    // version-skew bugs in cached nextest args / sidecar filenames.
+    if s[t_pos + 1..].chars().next().is_some() {
         return None;
     }
     let numa_nodes: u32 = s[..first_pos].parse().ok()?;
@@ -3699,8 +3709,15 @@ fn sched_log_fingerprint(output: &str) -> Option<&str> {
 fn parse_sched_output(output: &str) -> Option<&str> {
     // Cannot use extract_section here: it returns an owned String,
     // but callers need a borrowed &str tied to `output`'s lifetime.
+    //
+    // `find` on the start marker and `rfind` on the end marker: if the
+    // scheduler's own output happens to contain the end sentinel string
+    // (e.g. a stack trace that quotes the marker), `find` would
+    // truncate the section early. `rfind` anchors on the last
+    // occurrence, which is the real terminator emitted by the guest's
+    // post-scenario shutdown path.
     let start = output.find(SCHED_OUTPUT_START)?;
-    let end = output.find(SCHED_OUTPUT_END)?;
+    let end = output.rfind(SCHED_OUTPUT_END)?;
     let after_marker = start + SCHED_OUTPUT_START.len();
     if after_marker >= end {
         return None;
@@ -4894,6 +4911,27 @@ mod tests {
         assert!(parsed.contains("balance_one"));
     }
 
+    #[test]
+    fn parse_sched_output_rfind_survives_end_marker_in_content() {
+        // Regression for #25: if the scheduler log echoes the END
+        // marker inside its own content (e.g. a shell heredoc, a
+        // diagnostic that quotes the sentinel), `find` truncated the
+        // section at the first occurrence — which was inside the
+        // content, not at the terminator. `rfind` anchors on the last
+        // occurrence, which is the real terminator.
+        let content = format!("line1\nfake {SCHED_OUTPUT_END} inside\nline3");
+        let output = format!("{SCHED_OUTPUT_START}\n{content}\n{SCHED_OUTPUT_END}\n");
+        let parsed = parse_sched_output(&output).unwrap();
+        assert!(
+            parsed.contains("line3"),
+            "rfind must keep content after an embedded END marker: {parsed:?}"
+        );
+        assert!(
+            parsed.contains("fake"),
+            "content before the embedded marker must also survive: {parsed:?}"
+        );
+    }
+
     // -- sched_log_fingerprint tests --
 
     #[test]
@@ -5482,6 +5520,49 @@ mod tests {
     #[test]
     fn parse_topo_new_format_wrong_order() {
         assert!(parse_topo_string("2l1n4c2t").is_none());
+    }
+
+    #[test]
+    fn parse_topo_rejects_trailing_garbage() {
+        // Regression for #27: trailing characters after the 't'
+        // terminator were silently dropped. Old behavior accepted
+        // "1n2l4c2tEXTRA" as (1, 2, 4, 2) — a typo or cached
+        // version-skew string would round-trip as a valid topology.
+        assert!(
+            parse_topo_string("1n2l4c2tEXTRA").is_none(),
+            "trailing garbage after 't' must cause None"
+        );
+        assert!(
+            parse_topo_string("1n2l4c2tb").is_none(),
+            "single trailing character must cause None"
+        );
+        assert!(
+            parse_topo_string("1s2l4c2t_debug").is_none(),
+            "trailing garbage after old-format 't' must cause None"
+        );
+    }
+
+    #[test]
+    fn parse_topo_legacy_rejects_trailing_garbage() {
+        // Regression for #27 on the legacy NsNcNt path: trailing
+        // characters were silently dropped. "2s4c2tEXTRA" used to
+        // return Some((1, 2, 4, 2)); must now return None so cached
+        // nextest args with drift surface as parse errors.
+        assert!(
+            parse_topo_string("2s4c2tEXTRA").is_none(),
+            "legacy-format trailing garbage after 't' must cause None"
+        );
+        assert!(
+            parse_topo_string("2s4c2tx").is_none(),
+            "legacy-format single trailing character must cause None"
+        );
+    }
+
+    #[test]
+    fn parse_topo_accepts_clean_terminator() {
+        // Sanity: after #27, the clean form still parses.
+        assert_eq!(parse_topo_string("1n2l4c2t"), Some((1, 2, 4, 2)));
+        assert_eq!(parse_topo_string("1s2l4c2t"), Some((1, 2, 4, 2)));
     }
 
     // -- NsNlNcNt backward compat (old format still parses) --

@@ -312,8 +312,32 @@ pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
 /// Ensure the kconfig fragment is applied to the kernel's .config.
 ///
 /// Creates a default .config via `make defconfig` if none exists.
-/// Checks each non-comment CONFIG line from the fragment against
-/// the current .config. If all are present, .config is not touched
+/// Pure check used by [`configure_kernel`]: every non-empty line of
+/// `fragment` (including disable directives like
+/// `# CONFIG_X is not set`) must appear as an exact line of `config`.
+///
+/// Exact-line matching avoids the prefix-aliasing hazard of the prior
+/// `config.contains(fragment_line)` formulation, where a fragment line
+/// false-matches when it appears as a substring of an unrelated
+/// `.config` line — e.g. fragment `CONFIG_NR_CPUS=1` appearing inside
+/// `CONFIG_NR_CPUS=128`, or any numeric-tail option where the
+/// requested value is a prefix of the existing value.
+///
+/// `# CONFIG_X is not set` comments ARE kconfig semantics (the
+/// canonical way to disable an option), so they participate in the
+/// check; the only lines skipped are genuinely empty ones.
+fn all_fragment_lines_present(fragment: &str, config: &str) -> bool {
+    let existing: std::collections::HashSet<&str> = config.lines().map(str::trim).collect();
+    fragment
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .all(|t| existing.contains(t))
+}
+
+/// Checks each non-empty line of the fragment against the current
+/// `.config` via [`all_fragment_lines_present`]. If every fragment
+/// line already appears in `.config`, the file is not touched
 /// (preserving mtime for make's dependency tracking). If any are
 /// missing, appends the full fragment and runs `make olddefconfig`
 /// to resolve new options with defaults — without this, the
@@ -326,15 +350,7 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
     }
 
     let config_content = std::fs::read_to_string(&config_path)?;
-    let all_present = fragment
-        .lines()
-        .filter(|l| {
-            let trimmed = l.trim();
-            !trimmed.is_empty() && !trimmed.starts_with('#')
-        })
-        .all(|l| config_content.contains(l.trim()));
-
-    if all_present {
+    if all_fragment_lines_present(fragment, &config_content) {
         return Ok(());
     }
 
@@ -1832,6 +1848,75 @@ mod tests {
         let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
         // Should not have appended (mtime preserved behavior).
         assert_eq!(config, initial);
+    }
+
+    #[test]
+    fn configure_kernel_rejects_numeric_prefix_false_match() {
+        // Regression for #24: fragment asks `CONFIG_NR_CPUS=1`, .config
+        // has `CONFIG_NR_CPUS=128`. Under the old
+        // `config_content.contains(fragment_line)`, the substring
+        // "CONFIG_NR_CPUS=1" IS present inside "CONFIG_NR_CPUS=128"
+        // (numeric prefix), so the fragment line was reported as
+        // already-configured and the append was skipped — wrong.
+        // Exact-line matching via the HashSet helper correctly
+        // distinguishes the two and appends.
+        let dir = tempfile::TempDir::new().unwrap();
+        let initial = "CONFIG_NR_CPUS=128\n";
+        std::fs::write(dir.path().join(".config"), initial).unwrap();
+        std::fs::write(dir.path().join("Makefile"), "olddefconfig:\n\t@true\n").unwrap();
+        let fragment = "CONFIG_NR_CPUS=1\n";
+        configure_kernel(dir.path(), fragment).unwrap();
+        let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
+        assert!(
+            config.lines().any(|l| l.trim() == "CONFIG_NR_CPUS=1"),
+            "CONFIG_NR_CPUS=1 must be appended as its own line: {config:?}"
+        );
+        assert!(
+            config.lines().any(|l| l.trim() == "CONFIG_NR_CPUS=128"),
+            "original CONFIG_NR_CPUS=128 must be preserved: {config:?}"
+        );
+    }
+
+    // -- all_fragment_lines_present pure helper --
+
+    #[test]
+    fn all_fragment_lines_present_exact_match() {
+        let config = "CONFIG_FOO=y\nCONFIG_BAR=m\n";
+        assert!(all_fragment_lines_present("CONFIG_FOO=y\n", config));
+        assert!(all_fragment_lines_present("CONFIG_BAR=m\n", config));
+        assert!(all_fragment_lines_present(
+            "CONFIG_FOO=y\nCONFIG_BAR=m\n",
+            config
+        ));
+    }
+
+    #[test]
+    fn all_fragment_lines_present_numeric_prefix_not_present() {
+        // The bug case. Substring match would incorrectly report present.
+        let config = "CONFIG_NR_CPUS=128\n";
+        assert!(!all_fragment_lines_present("CONFIG_NR_CPUS=1\n", config));
+        assert!(!all_fragment_lines_present("CONFIG_NR_CPUS=12\n", config));
+    }
+
+    #[test]
+    fn all_fragment_lines_present_disable_directive_participates() {
+        // `# CONFIG_X is not set` is a real kconfig semantic (disable),
+        // not a comment to be skipped. It must participate in the check.
+        let config = "CONFIG_BPF=y\n";
+        // Fragment disables CONFIG_BPF via the standard kconfig comment
+        // syntax. Since .config has it enabled, the disable line is
+        // NOT present and the helper must return false.
+        assert!(!all_fragment_lines_present(
+            "# CONFIG_BPF is not set\n",
+            config
+        ));
+    }
+
+    #[test]
+    fn all_fragment_lines_present_empty_lines_skipped() {
+        // Truly empty lines in the fragment carry no kconfig state.
+        let config = "CONFIG_FOO=y\n";
+        assert!(all_fragment_lines_present("\n\nCONFIG_FOO=y\n\n", config));
     }
 
     // -- resolve_in_path --
