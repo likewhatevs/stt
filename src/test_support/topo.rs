@@ -7,12 +7,29 @@
 //! wire-format parser used by both paths.
 
 /// Optional topology override for `run_ktstr_test`.
+///
+/// Field names intentionally drop the `_per_llc` / `_per_core` suffix
+/// that `vmm::topology::Topology` uses. A `TopoOverride` is the wire
+/// form carried in gauntlet preset tables and on the `--ktstr-topo`
+/// CLI (e.g. `1n2l4c2t`), where the short axis names are readable and
+/// the per-unit meaning is unambiguous. Convert to
+/// [`crate::vmm::topology::Topology`] via the `From` impl below.
 pub(crate) struct TopoOverride {
     pub numa_nodes: u32,
     pub llcs: u32,
     pub cores: u32,
     pub threads: u32,
     pub memory_mb: u32,
+}
+
+impl From<&TopoOverride> for crate::vmm::topology::Topology {
+    /// Construct a VM-builder [`Topology`](crate::vmm::topology::Topology)
+    /// from an override's four topology axes. `memory_mb` is discarded —
+    /// VM memory lives on [`vmm::KtstrVm::builder().memory_deferred_min()`]
+    /// which the dispatcher sets separately from the topology.
+    fn from(t: &TopoOverride) -> Self {
+        crate::vmm::topology::Topology::new(t.numa_nodes, t.llcs, t.cores, t.threads)
+    }
 }
 
 impl TopoOverride {

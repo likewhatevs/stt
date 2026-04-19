@@ -521,9 +521,6 @@ pub struct KtstrTestEntry {
     /// When true, a crash triggers an auto-repro run with BPF probes
     /// attached to the crash call chain.
     pub auto_repro: bool,
-    /// Number of times the scenario is replicated within a single
-    /// test invocation.
-    pub replicas: u32,
     /// Per-entry assertion overrides merged on top of
     /// `Assert::default_checks()` and the scheduler's `assert`.
     pub assert: crate::assert::Assert,
@@ -589,7 +586,16 @@ impl KtstrTestEntry {
     /// `true` boots a second VM with BPF probes attached on failure,
     /// which roughly doubles a failing test's wall-clock time.
     ///
-    /// ```ignore
+    /// ```
+    /// use ktstr::prelude::*;
+    /// use ktstr::test_support::{KtstrTestEntry, KTSTR_TESTS};
+    /// use linkme::distributed_slice;
+    ///
+    /// fn my_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
+    ///     Ok(AssertResult::pass())
+    /// }
+    ///
+    /// #[distributed_slice(KTSTR_TESTS)]
     /// static ENTRY: KtstrTestEntry = KtstrTestEntry {
     ///     name: "my_test",
     ///     func: my_test_fn,
@@ -612,7 +618,6 @@ impl KtstrTestEntry {
         memory_mb: 2048,
         scheduler: &Scheduler::EEVDF,
         auto_repro: true,
-        replicas: 1,
         assert: crate::assert::Assert::NONE,
         extra_sched_args: &[],
         watchdog_timeout: Duration::from_secs(4),
@@ -637,8 +642,6 @@ impl KtstrTestEntry {
     /// - `name` must be non-empty (empty names collapse into each
     ///   other in nextest output and in sidecar lookups).
     /// - `memory_mb` must be `> 0` (a VM with zero memory cannot boot).
-    /// - `replicas` must be `> 0` (zero replicas runs zero scenarios —
-    ///   assertion count is zero, so every assertion passes vacuously).
     /// - `duration` must be `> 0` (a zero-duration run never exercises
     ///   the scheduler and produces no telemetry).
     /// - `workers_per_cgroup` must be `> 0` (zero workers emit no
@@ -654,14 +657,6 @@ impl KtstrTestEntry {
             anyhow::bail!(
                 "KtstrTestEntry '{}'.memory_mb must be > 0 (a VM with \
                  zero memory cannot boot)",
-                self.name,
-            );
-        }
-        if self.replicas == 0 {
-            anyhow::bail!(
-                "KtstrTestEntry '{}'.replicas must be > 0 (a zero-replica \
-                 entry runs no scenarios and passes every assertion \
-                 vacuously)",
                 self.name,
             );
         }
@@ -780,7 +775,6 @@ mod tests {
         assert_eq!(d.scheduler.name, "eevdf");
         assert!(!d.scheduler.binary.has_active_scheduling());
         assert!(d.auto_repro);
-        assert_eq!(d.replicas, 1);
         assert!(d.extra_sched_args.is_empty());
         assert_eq!(d.watchdog_timeout, Duration::from_secs(4));
         assert!(d.bpf_map_write.is_none());

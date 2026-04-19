@@ -75,7 +75,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut max_local_dsq_depth: Option<u32> = None;
     let mut fail_on_stall: Option<bool> = None;
     let mut sustained_samples: Option<usize> = None;
-    let mut replicas: u32 = 1;
     let mut max_throughput_cv: Option<f64> = None;
     let mut min_work_rate: Option<f64> = None;
     let mut max_fallback_rate: Option<f64> = None;
@@ -195,7 +194,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "threads"
                     | "numa_nodes"
                     | "memory_mb"
-                    | "replicas"
                     | "sustained_samples"
                     | "max_gap_ms"
                     | "watchdog_timeout_s"
@@ -248,11 +246,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                             "memory_mb" => {
                                 memory_mb = lit_int
-                                    .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
-                            }
-                            "replicas" => {
-                                replicas = lit_int
                                     .base10_parse::<u32>()
                                     .unwrap_or_else(|e| panic!("{e}"))
                             }
@@ -465,7 +458,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, replicas, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only"),
+                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only"),
                         )
                         .to_compile_error()
                         .into();
@@ -551,15 +544,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             proc_macro2::Span::call_site(),
             "workers_per_cgroup must be > 0 (a zero-worker cgroup emits no \
              WorkerReports and assertions vacuously pass)",
-        )
-        .to_compile_error()
-        .into();
-    }
-    if replicas == 0 {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "replicas must be > 0 (a zero-replica entry runs no scenarios \
-             and passes every assertion vacuously)",
         )
         .to_compile_error()
         .into();
@@ -828,7 +812,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             memory_mb: #memory_mb,
             scheduler: #scheduler_tokens,
             auto_repro: #auto_repro,
-            replicas: #replicas,
             assert: ::ktstr::assert::Assert {
                 not_starved: #not_starved_tokens,
                 isolation: #isolation_tokens,

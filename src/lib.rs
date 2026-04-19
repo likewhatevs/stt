@@ -313,8 +313,21 @@ pub mod prelude {
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::test_support::{
         BpfMapWrite, CgroupPath, MemSideCache, NumaDistance, NumaNode, Scheduler, SchedulerSpec,
-        Sysctl, Topology,
+        SidecarResult, Sysctl, Topology,
     };
+    // `FlagDecl` is already re-exported via `crate::scenario::flags::FlagDecl`
+    // above; omitted here because `test_support::FlagDecl` is the same item
+    // (`pub use crate::scenario::flags::FlagDecl;` in test_support/mod.rs),
+    // and a second prelude line would shadow harmlessly but add noise.
+    //
+    // `test_support::{newest_run_dir, runs_root, analyze_sidecars, ktstr_main,
+    // ktstr_test_early_dispatch, run_ktstr_test, nextest_setup, resolve_scheduler,
+    // resolve_test_kernel, propagate_rust_env_from_cmdline, maybe_dispatch_vm_test}`
+    // are intentionally NOT in the prelude. They are either binary-entry
+    // helpers (the `ktstr` / `cargo-ktstr` bins), macro-generated glue the
+    // `#[ktstr_test]` expansion consumes, or nextest-setup-script entry
+    // points — audiences distinct from the test-author surface this
+    // module provides.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
         AffinityKind, AffinityMode, MemPolicy, MpolFlags, Phase, SchedPolicy, Work, WorkType,

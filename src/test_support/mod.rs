@@ -371,11 +371,25 @@ mod tests {
 
     #[test]
     fn parse_shm_params_absent() {
-        // Host /proc/cmdline does not contain KTSTR_SHM_BASE/KTSTR_SHM_SIZE.
+        // Precondition: the host's /proc/cmdline does not contain
+        // KTSTR_SHM_BASE. True for any developer machine or CI runner;
+        // could flake on a ktstr-booted guest that then runs
+        // `cargo nextest` against this crate (a self-hosting scenario).
+        // Read the file directly and skip this specific assertion when
+        // the precondition doesn't hold; the pure-string behavior is
+        // already pinned by the `parse_shm_params_from_str_*` tests.
+        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        if cmdline.contains("KTSTR_SHM_BASE") {
+            skip!(
+                "host /proc/cmdline has KTSTR_SHM_BASE (self-hosted guest?); \
+                 the pure-string branch of parse_shm_params is covered by \
+                 parse_shm_params_from_str_*"
+            );
+        }
         let result = parse_shm_params();
         assert!(
             result.is_none(),
-            "host should not have KTSTR_SHM_BASE in /proc/cmdline"
+            "host without KTSTR_SHM_BASE in /proc/cmdline must yield None"
         );
     }
 
@@ -1806,14 +1820,12 @@ mod tests {
     fn validate_entry(
         name: &'static str,
         memory_mb: u32,
-        replicas: u32,
         duration: Duration,
         workers_per_cgroup: u32,
     ) -> KtstrTestEntry {
         KtstrTestEntry {
             name,
             memory_mb,
-            replicas,
             duration,
             workers_per_cgroup,
             ..KtstrTestEntry::DEFAULT
@@ -1822,13 +1834,13 @@ mod tests {
 
     #[test]
     fn ktstr_test_entry_validate_accepts_defaults() {
-        let e = validate_entry("ok", 512, 1, Duration::from_secs(2), 2);
+        let e = validate_entry("ok", 512, Duration::from_secs(2), 2);
         e.validate().unwrap();
     }
 
     #[test]
     fn ktstr_test_entry_validate_rejects_empty_name() {
-        let e = validate_entry("", 512, 1, Duration::from_secs(2), 2);
+        let e = validate_entry("", 512, Duration::from_secs(2), 2);
         let err = e.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -1839,7 +1851,7 @@ mod tests {
 
     #[test]
     fn ktstr_test_entry_validate_rejects_zero_memory() {
-        let e = validate_entry("t", 0, 1, Duration::from_secs(2), 2);
+        let e = validate_entry("t", 0, Duration::from_secs(2), 2);
         let err = e.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -1849,19 +1861,8 @@ mod tests {
     }
 
     #[test]
-    fn ktstr_test_entry_validate_rejects_zero_replicas() {
-        let e = validate_entry("t", 512, 0, Duration::from_secs(2), 2);
-        let err = e.validate().unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("replicas") && msg.contains("> 0"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
     fn ktstr_test_entry_validate_rejects_zero_duration() {
-        let e = validate_entry("t", 512, 1, Duration::ZERO, 2);
+        let e = validate_entry("t", 512, Duration::ZERO, 2);
         let err = e.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -1872,7 +1873,7 @@ mod tests {
 
     #[test]
     fn ktstr_test_entry_validate_rejects_zero_workers() {
-        let e = validate_entry("t", 512, 1, Duration::from_secs(2), 0);
+        let e = validate_entry("t", 512, Duration::from_secs(2), 0);
         let err = e.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(

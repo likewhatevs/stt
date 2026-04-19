@@ -178,10 +178,7 @@ pub(crate) fn attempt_auto_repro(
     let cmdline_extra = cmdline_parts.join(" ");
 
     let (vm_topology, memory_mb) = match topo {
-        Some(t) => (
-            vmm::Topology::new(t.numa_nodes, t.llcs, t.cores, t.threads),
-            t.memory_mb,
-        ),
+        Some(t) => (vmm::Topology::from(t), t.memory_mb),
         None => {
             let cpus = entry.topology.total_cpus();
             let mem = (cpus * 64).max(256).max(entry.memory_mb);
