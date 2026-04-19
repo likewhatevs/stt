@@ -42,3 +42,46 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
     let guest_path = format!("/include-files/{file_name}");
     Some((archive_path, PathBuf::from(config_path), guest_path))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::entry::Scheduler;
+    use super::*;
+
+    #[test]
+    fn config_file_parts_nested_path() {
+        static SCHED: Scheduler = Scheduler::new("cfg").config_file("configs/my_sched.toml");
+        let entry = KtstrTestEntry {
+            name: "cfg_test",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (archive, host, guest) = config_file_parts(&entry).unwrap();
+        assert_eq!(archive, "include-files/my_sched.toml");
+        assert_eq!(host, PathBuf::from("configs/my_sched.toml"));
+        assert_eq!(guest, "/include-files/my_sched.toml");
+    }
+
+    #[test]
+    fn config_file_parts_bare_filename() {
+        static SCHED: Scheduler = Scheduler::new("cfg").config_file("config.toml");
+        let entry = KtstrTestEntry {
+            name: "cfg_bare",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (archive, host, guest) = config_file_parts(&entry).unwrap();
+        assert_eq!(archive, "include-files/config.toml");
+        assert_eq!(host, PathBuf::from("config.toml"));
+        assert_eq!(guest, "/include-files/config.toml");
+    }
+
+    #[test]
+    fn config_file_parts_none_when_unset() {
+        let entry = KtstrTestEntry {
+            name: "no_cfg",
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(config_file_parts(&entry).is_none());
+    }
+}

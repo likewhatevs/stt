@@ -1236,3 +1236,138 @@ fn collect_and_print_probe_data(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_probe_output_valid_json() {
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbePayload {
+            events: vec![ProbeEvent {
+                func_idx: 0,
+                task_ptr: 1,
+                ts: 100,
+                args: [0; 6],
+                fields: vec![("p:task_struct.pid".to_string(), 42)],
+                kstack: vec![],
+                str_val: None,
+                ..Default::default()
+            }],
+            func_names: vec![(0, "schedule".to_string())],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let output = format!("noise\n{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}\nmore");
+        let parsed = extract_probe_output(&output, None);
+        assert!(parsed.is_some());
+        let formatted = parsed.unwrap();
+        assert!(
+            formatted.contains("schedule"),
+            "should contain func name: {formatted}"
+        );
+        assert!(
+            formatted.contains("pid"),
+            "should contain field name: {formatted}"
+        );
+    }
+
+    #[test]
+    fn extract_probe_output_missing() {
+        assert!(extract_probe_output("no markers", None).is_none());
+    }
+
+    #[test]
+    fn extract_probe_output_empty() {
+        let output = format!("{PROBE_OUTPUT_START}\n\n{PROBE_OUTPUT_END}");
+        assert!(extract_probe_output(&output, None).is_none());
+    }
+
+    #[test]
+    fn extract_probe_output_invalid_json() {
+        let output = format!("{PROBE_OUTPUT_START}\nnot valid json\n{PROBE_OUTPUT_END}");
+        assert!(extract_probe_output(&output, None).is_none());
+    }
+
+    #[test]
+    fn extract_probe_output_enriched_fields() {
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbePayload {
+            events: vec![
+                ProbeEvent {
+                    func_idx: 0,
+                    task_ptr: 1,
+                    ts: 100,
+                    args: [0xDEAD, 0, 0, 0, 0, 0],
+                    fields: vec![
+                        ("prev:task_struct.pid".to_string(), 42),
+                        ("prev:task_struct.scx_flags".to_string(), 0x1c),
+                    ],
+                    kstack: vec![],
+                    str_val: None,
+                    ..Default::default()
+                },
+                ProbeEvent {
+                    func_idx: 1,
+                    task_ptr: 1,
+                    ts: 200,
+                    args: [0; 6],
+                    fields: vec![("rq:rq.cpu".to_string(), 3)],
+                    kstack: vec![],
+                    str_val: None,
+                    ..Default::default()
+                },
+            ],
+            func_names: vec![
+                (0, "schedule".to_string()),
+                (1, "pick_task_scx".to_string()),
+            ],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");
+        let formatted = extract_probe_output(&output, None).unwrap();
+
+        // Decoded fields present (not raw args).
+        assert!(formatted.contains("pid"), "pid field: {formatted}");
+        assert!(formatted.contains("42"), "pid value: {formatted}");
+        assert!(
+            formatted.contains("scx_flags"),
+            "scx_flags field: {formatted}"
+        );
+        assert!(formatted.contains("cpu"), "cpu field: {formatted}");
+        assert!(formatted.contains("3"), "cpu value: {formatted}");
+
+        // Type header grouping for struct params.
+        assert!(
+            formatted.contains("task_struct *prev"),
+            "type header for task_struct: {formatted}"
+        );
+        assert!(
+            formatted.contains("rq *rq"),
+            "type header for rq: {formatted}"
+        );
+
+        // Raw args suppressed when fields present.
+        assert!(
+            !formatted.contains("arg0"),
+            "raw args should not appear when fields exist: {formatted}"
+        );
+
+        // Function names present.
+        assert!(formatted.contains("schedule"), "func schedule: {formatted}");
+        assert!(
+            formatted.contains("pick_task_scx"),
+            "func pick_task_scx: {formatted}"
+        );
+    }
+}

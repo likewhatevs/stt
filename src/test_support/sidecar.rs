@@ -575,3 +575,754 @@ pub(crate) fn write_sidecar(
     };
     serialize_and_write_sidecar(&sidecar, "sidecar")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_helpers::ENV_LOCK;
+    use super::*;
+    use crate::assert::{AssertResult, CgroupStats};
+    use crate::scenario::Ctx;
+    use anyhow::Result;
+
+    #[test]
+    fn sidecar_result_roundtrip() {
+        let sc = SidecarResult {
+            test_name: "my_test".to_string(),
+            topology: "2s4c2t".to_string(),
+            scheduler: "scx_mitosis".to_string(),
+            passed: true,
+            skipped: false,
+            stats: crate::assert::ScenarioStats {
+                cgroups: vec![CgroupStats {
+                    num_workers: 4,
+                    num_cpus: 2,
+                    avg_off_cpu_pct: 50.0,
+                    min_off_cpu_pct: 40.0,
+                    max_off_cpu_pct: 60.0,
+                    spread: 20.0,
+                    max_gap_ms: 100,
+                    max_gap_cpu: 1,
+                    total_migrations: 5,
+                    ..Default::default()
+                }],
+                total_workers: 4,
+                total_cpus: 2,
+                total_migrations: 5,
+                worst_spread: 20.0,
+                worst_gap_ms: 100,
+                worst_gap_cpu: 1,
+                ..Default::default()
+            },
+            monitor: Some(MonitorSummary {
+                prog_stats_deltas: None,
+                total_samples: 10,
+                max_imbalance_ratio: 1.5,
+                max_local_dsq_depth: 3,
+                stall_detected: false,
+                event_deltas: Some(crate::monitor::ScxEventDeltas {
+                    total_fallback: 7,
+                    fallback_rate: 0.5,
+                    max_fallback_burst: 2,
+                    total_dispatch_offline: 0,
+                    total_dispatch_keep_last: 3,
+                    keep_last_rate: 0.2,
+                    total_enq_skip_exiting: 0,
+                    total_enq_skip_migration_disabled: 0,
+                    ..Default::default()
+                }),
+                schedstat_deltas: None,
+                ..Default::default()
+            }),
+            stimulus_events: vec![crate::timeline::StimulusEvent {
+                elapsed_ms: 500,
+                label: "StepStart[0]".to_string(),
+                op_kind: Some("SetCpuset".to_string()),
+                detail: Some("4 cpus".to_string()),
+                total_iterations: None,
+            }],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let json = serde_json::to_string_pretty(&sc).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.test_name, "my_test");
+        assert_eq!(loaded.topology, "2s4c2t");
+        assert_eq!(loaded.scheduler, "scx_mitosis");
+        assert!(loaded.passed);
+        assert_eq!(loaded.stats.total_workers, 4);
+        assert_eq!(loaded.stats.cgroups.len(), 1);
+        assert_eq!(loaded.stats.cgroups[0].num_workers, 4);
+        assert_eq!(loaded.stats.worst_spread, 20.0);
+        let mon = loaded.monitor.unwrap();
+        assert_eq!(mon.total_samples, 10);
+        assert_eq!(mon.max_imbalance_ratio, 1.5);
+        assert_eq!(mon.max_local_dsq_depth, 3);
+        assert!(!mon.stall_detected);
+        let deltas = mon.event_deltas.unwrap();
+        assert_eq!(deltas.total_fallback, 7);
+        assert_eq!(deltas.total_dispatch_keep_last, 3);
+        assert_eq!(loaded.stimulus_events.len(), 1);
+        assert_eq!(loaded.stimulus_events[0].label, "StepStart[0]");
+    }
+
+    #[test]
+    fn sidecar_result_roundtrip_no_monitor() {
+        let sc = SidecarResult {
+            test_name: "eevdf_test".to_string(),
+            topology: "1s2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: false,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.test_name, "eevdf_test");
+        assert!(!loaded.passed);
+        assert!(loaded.monitor.is_none());
+        assert!(loaded.stimulus_events.is_empty());
+        // monitor field should be absent from JSON when None
+        assert!(!json.contains("\"monitor\""));
+    }
+
+    // -- collect_sidecars tests --
+
+    #[test]
+    fn collect_sidecars_empty_dir() {
+        let tmp = std::env::temp_dir().join("ktstr-sidecars-empty-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let results = collect_sidecars(&tmp);
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn collect_sidecars_nonexistent_dir() {
+        let results = collect_sidecars(std::path::Path::new("/nonexistent/path"));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn collect_sidecars_reads_json() {
+        let tmp = std::env::temp_dir().join("ktstr-sidecars-json-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sc = SidecarResult {
+            test_name: "test_x".to_string(),
+            topology: "1s2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: true,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        std::fs::write(tmp.join("test_x.ktstr.json"), &json).unwrap();
+        // Non-ktstr JSON should be ignored.
+        std::fs::write(tmp.join("other.json"), r#"{"key":"val"}"#).unwrap();
+        let results = collect_sidecars(&tmp);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].test_name, "test_x");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn collect_sidecars_recurses_one_level() {
+        let tmp = std::env::temp_dir().join("ktstr-sidecars-recurse-test");
+        let sub = tmp.join("job-0");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sc = SidecarResult {
+            test_name: "nested_test".to_string(),
+            topology: "2s4c2t".to_string(),
+            scheduler: "scx_mitosis".to_string(),
+            passed: false,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        std::fs::write(sub.join("nested_test.ktstr.json"), &json).unwrap();
+        let results = collect_sidecars(&tmp);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].test_name, "nested_test");
+        assert!(!results[0].passed);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn collect_sidecars_does_not_recurse_past_one_level() {
+        // Companion to `collect_sidecars_recurses_one_level`: pin the
+        // "exactly one level, no deeper" contract. A sidecar two
+        // directories deep must be ignored. If a future change
+        // switches collect_sidecars to a depth-unbounded walk, this
+        // test catches the schema-scope regression before stats
+        // tooling starts double-counting results from unrelated
+        // sub-runs under the same `runs_root`.
+        let tmp = std::env::temp_dir().join("ktstr-sidecars-depth-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let top_sub = tmp.join("job-0");
+        let deep_sub = top_sub.join("replay-0");
+        std::fs::create_dir_all(&deep_sub).unwrap();
+
+        let sc = |name: &str| SidecarResult {
+            test_name: name.to_string(),
+            topology: "1s1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: true,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        // One level: should be collected.
+        std::fs::write(
+            top_sub.join("top_level.ktstr.json"),
+            serde_json::to_string(&sc("top_level")).unwrap(),
+        )
+        .unwrap();
+        // Two levels: must NOT be collected.
+        std::fs::write(
+            deep_sub.join("deep_level.ktstr.json"),
+            serde_json::to_string(&sc("deep_level")).unwrap(),
+        )
+        .unwrap();
+
+        let results = collect_sidecars(&tmp);
+        let names: Vec<&str> = results.iter().map(|r| r.test_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["top_level"],
+            "collect_sidecars must see only the one-level-deep sidecar, not the two-level one"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_sidecars_skips_invalid_json() {
+        let tmp = std::env::temp_dir().join("ktstr-sidecars-invalid-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("bad.ktstr.json"), "not json").unwrap();
+        let results = collect_sidecars(&tmp);
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn collect_sidecars_skips_non_ktstr_json() {
+        let tmp = std::env::temp_dir().join("ktstr-sidecars-notktstr-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // File ends in .json but does NOT contain ".ktstr." in the name
+        std::fs::write(tmp.join("other.json"), r#"{"test":"val"}"#).unwrap();
+        let results = collect_sidecars(&tmp);
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn sidecar_result_work_type_field() {
+        let sc = SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1s1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: true,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "Bursty".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.work_type, "Bursty");
+    }
+
+    #[test]
+    fn write_sidecar_defaults_to_target_dir_without_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let kernel_key = "KTSTR_KERNEL";
+        let target_key = "CARGO_TARGET_DIR";
+        let prev = std::env::var(key).ok();
+        let prev_kernel = std::env::var(kernel_key).ok();
+        let prev_target = std::env::var(target_key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(kernel_key);
+            std::env::remove_var(target_key);
+        };
+
+        let dir = sidecar_dir();
+        let expected = format!("target/ktstr/unknown-{}", crate::GIT_HASH);
+        assert_eq!(dir, PathBuf::from(&expected));
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__sidecar_default_dir__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let verify_result = AssertResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]).unwrap();
+
+        // Clean up written file.
+        let path = dir.join("__sidecar_default_dir__.ktstr.json");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            match prev_kernel {
+                Some(v) => std::env::set_var(kernel_key, v),
+                None => std::env::remove_var(kernel_key),
+            }
+            match prev_target {
+                Some(v) => std::env::set_var(target_key, v),
+                None => std::env::remove_var(target_key),
+            }
+        }
+    }
+
+    #[test]
+    fn write_sidecar_writes_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-write-test");
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__sidecar_write_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let verify_result = AssertResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]).unwrap();
+
+        // Sidecar filename now includes a variant hash suffix so
+        // gauntlet variants don't clobber each other. Find the file
+        // by prefix match rather than exact path.
+        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
+            .expect("sidecar dir was created")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("__sidecar_write_test__-") && n.ends_with(".ktstr.json"))
+                    .unwrap_or(false)
+            })
+            .expect("sidecar file with variant suffix should be written");
+        let data = std::fs::read_to_string(&path).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
+        assert_eq!(loaded.test_name, "__sidecar_write_test__");
+        assert!(loaded.passed);
+        assert!(!loaded.skipped, "pass result is not a skip");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn write_sidecar_variant_hash_distinguishes_active_flags() {
+        // Regression for #34: two gauntlet variants differing ONLY in
+        // active_flags must produce distinct sidecar filenames so
+        // neither clobbers the other. This is the scenario the prior
+        // fix (based on work_type/sysctls/kargs alone) missed.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-flagvariant-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__flagvariant_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let ok = AssertResult::pass();
+        let flags_a = vec!["llc".to_string()];
+        let flags_b = vec!["llc".to_string(), "steal".to_string()];
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b).unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("__flagvariant_test__-"))
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "two active_flags variants must produce two distinct files, got {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn write_sidecar_variant_hash_distinguishes_work_types() {
+        // Regression for #34: two gauntlet variants differing only in
+        // work_type must produce distinct sidecar filenames so neither
+        // clobbers the other.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-variant-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__variant_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let ok = AssertResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[]).unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("__variant_test__-"))
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "two work_type variants must produce two distinct files, got {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// Freeze the `sidecar_variant_hash` wire format to the exact 64-bit
+    /// value produced for a representative populated SidecarResult.
+    ///
+    /// Sidecar filenames embed this hash as a hex suffix; gauntlet
+    /// tooling groups variants by it. A silent change — e.g. bumping
+    /// `siphasher`, switching keys, or reordering fields fed into the
+    /// hasher — would let old-version tooling mis-group new-version
+    /// sidecars and vice versa. Pinning the output against a
+    /// pre-computed constant catches that drift before it ships.
+    ///
+    /// Only fields that feed the hash (topology, scheduler, work_type,
+    /// active_flags, sysctls, kargs) are set to significant values;
+    /// irrelevant fields are zero-ish defaults so this test stays
+    /// robust against unrelated `SidecarResult` schema growth.
+    #[test]
+    fn sidecar_variant_hash_stability_populated() {
+        use crate::assert::ScenarioStats;
+        let sc = SidecarResult {
+            test_name: String::new(),
+            topology: "1n2l4c1t".to_string(),
+            scheduler: "scx-ktstr".to_string(),
+            passed: false,
+            skipped: false,
+            stats: ScenarioStats::default(),
+            monitor: None,
+            stimulus_events: Vec::new(),
+            work_type: "CpuSpin".to_string(),
+            active_flags: vec!["llc".to_string(), "steal".to_string()],
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            sysctls: vec!["sysctl.kernel.sched_cfs_bandwidth_slice_us=1000".to_string()],
+            kargs: vec!["nosmt".to_string()],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        // If this assertion trips, the wire format changed. Bumping
+        // the expected value is the wrong fix unless you also plan
+        // for old sidecars to be regenerated — see the contract on
+        // `sidecar_variant_hash`.
+        assert_eq!(
+            sidecar_variant_hash(&sc),
+            0xcd4044360a818e72,
+            "sidecar_variant_hash output drifted — regenerate expected only if \
+             the wire format change is intentional and old sidecars are \
+             disposable (which they are per ktstr's pre-1.0 stance)",
+        );
+    }
+
+    /// Pair to [`sidecar_variant_hash_stability_populated`] covering
+    /// the empty-collections path. If the inter-collection separator
+    /// bytes (0xfe / 0xfd / 0xff) disappear or change, an empty-
+    /// flags variant could collide with an empty-sysctls variant
+    /// whose kargs start with bytes that happen to match the dropped
+    /// separator. Pinning the empty-inputs hash catches separator
+    /// regressions.
+    #[test]
+    fn sidecar_variant_hash_stability_empty_collections() {
+        use crate::assert::ScenarioStats;
+        let sc = SidecarResult {
+            test_name: String::new(),
+            topology: "1n1l1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: false,
+            skipped: false,
+            stats: ScenarioStats::default(),
+            monitor: None,
+            stimulus_events: Vec::new(),
+            work_type: String::new(),
+            active_flags: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            sysctls: Vec::new(),
+            kargs: Vec::new(),
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        assert_eq!(sidecar_variant_hash(&sc), 0xe6b48e8fa3394bd8);
+    }
+
+    // -- format_verifier_stats tests --
+
+    fn make_sidecar_with_vstats(
+        vstats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
+    ) -> SidecarResult {
+        SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1s1c1t".to_string(),
+            scheduler: "test".to_string(),
+            passed: true,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vstats,
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn format_verifier_stats_empty() {
+        assert!(format_verifier_stats(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_verifier_stats_no_data() {
+        let sc = make_sidecar_with_vstats(vec![]);
+        assert!(format_verifier_stats(&[sc]).is_empty());
+    }
+
+    #[test]
+    fn format_verifier_stats_table() {
+        let sc = make_sidecar_with_vstats(vec![
+            crate::monitor::bpf_prog::ProgVerifierStats {
+                name: "dispatch".to_string(),
+                verified_insns: 50000,
+            },
+            crate::monitor::bpf_prog::ProgVerifierStats {
+                name: "enqueue".to_string(),
+                verified_insns: 30000,
+            },
+        ]);
+        let result = format_verifier_stats(&[sc]);
+        assert!(result.contains("BPF VERIFIER STATS"));
+        assert!(result.contains("dispatch"));
+        assert!(result.contains("enqueue"));
+        assert!(result.contains("50000"));
+        assert!(result.contains("30000"));
+        assert!(result.contains("total verified insns: 80000"));
+        assert!(!result.contains("WARNING"));
+    }
+
+    #[test]
+    fn format_verifier_stats_warning() {
+        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
+            name: "heavy".to_string(),
+            verified_insns: 800000,
+        }]);
+        let result = format_verifier_stats(&[sc]);
+        assert!(result.contains("WARNING"));
+        assert!(result.contains("heavy"));
+        assert!(result.contains("80.0%"));
+    }
+
+    #[test]
+    fn sidecar_verifier_stats_serde_roundtrip() {
+        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
+            name: "init".to_string(),
+            verified_insns: 5000,
+        }]);
+        let json = serde_json::to_string(&sc).unwrap();
+        assert!(json.contains("verifier_stats"));
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.verifier_stats.len(), 1);
+        assert_eq!(loaded.verifier_stats[0].name, "init");
+        assert_eq!(loaded.verifier_stats[0].verified_insns, 5000);
+    }
+
+    #[test]
+    fn sidecar_verifier_stats_empty_omitted() {
+        let sc = make_sidecar_with_vstats(vec![]);
+        let json = serde_json::to_string(&sc).unwrap();
+        assert!(!json.contains("verifier_stats"));
+    }
+
+    #[test]
+    fn format_verifier_stats_deduplicates() {
+        let sc1 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
+            name: "dispatch".to_string(),
+            verified_insns: 50000,
+        }]);
+        let sc2 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
+            name: "dispatch".to_string(),
+            verified_insns: 50000,
+        }]);
+        let result = format_verifier_stats(&[sc1, sc2]);
+        // Deduplicated: total should be 50000, not 100000.
+        assert!(result.contains("total verified insns: 50000"));
+    }
+}

@@ -297,7 +297,7 @@ pub(crate) fn run_ktstr_test_inner(
 /// without booting a VM. The `repro_fn` callback handles auto-repro
 /// (which requires a second VM boot) when provided.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn evaluate_vm_result(
+fn evaluate_vm_result(
     entry: &KtstrTestEntry,
     result: &vmm::VmResult,
     merged_assert: &crate::assert::Assert,
@@ -721,7 +721,7 @@ pub(crate) fn trim_settle_samples(
 /// a KVM fd, and failing fast here yields an actionable error
 /// ("add your user to the kvm group") before the VM builder starts
 /// allocating memory / fetching kernels.
-pub(crate) fn ensure_kvm() -> Result<()> {
+fn ensure_kvm() -> Result<()> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -757,7 +757,7 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
 /// header reads `ktstr_test 'name' [topo=...]` with no sched
 /// bracket — every other variant renders `" [sched=X]"` where `X`
 /// comes from [`SchedulerSpec::display_name`].
-pub(crate) fn scheduler_label(spec: &SchedulerSpec) -> String {
+fn scheduler_label(spec: &SchedulerSpec) -> String {
     if matches!(spec, SchedulerSpec::Eevdf) {
         String::new()
     } else {
@@ -872,4 +872,1060 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
             "bzImage"
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::output::{RESULT_END, RESULT_START, SCHED_OUTPUT_END};
+    use super::super::test_helpers::{
+        ENV_LOCK, EVAL_TOPO, eevdf_entry, make_vm_result, no_repro, sched_entry,
+    };
+    use super::*;
+
+    // -- resolve_test_kernel tests --
+
+    #[test]
+    fn resolve_test_kernel_with_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_TEST_KERNEL";
+        let prev = std::env::var(key).ok();
+        let exe = crate::resolve_current_exe().unwrap();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+        let result = resolve_test_kernel();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), exe);
+    }
+
+    #[test]
+    fn resolve_test_kernel_with_nonexistent_env_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_TEST_KERNEL";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, "/nonexistent/kernel/path") };
+        let result = resolve_test_kernel();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(result.is_err());
+    }
+
+    // -- KVM check --
+
+    #[test]
+    fn kvm_accessible_on_test_host() {
+        // Verifies /dev/kvm is accessible with read+write permissions.
+        ensure_kvm().expect("/dev/kvm not accessible");
+    }
+
+    // -- resolve_scheduler tests --
+
+    #[test]
+    fn resolve_scheduler_none() {
+        let result = resolve_scheduler(&SchedulerSpec::Eevdf).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_scheduler_path_exists() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let result = resolve_scheduler(&SchedulerSpec::Path(Box::leak(
+            exe.to_str().unwrap().to_string().into_boxed_str(),
+        )))
+        .unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn resolve_scheduler_path_missing() {
+        let result = resolve_scheduler(&SchedulerSpec::Path("/nonexistent/scheduler"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_scheduler_name_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SCHEDULER";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::remove_var(key) };
+        let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_xyz__"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_scheduler_name_via_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SCHEDULER";
+        let prev = std::env::var(key).ok();
+        let exe = crate::resolve_current_exe().unwrap();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+        let result = resolve_scheduler(&SchedulerSpec::Discover("anything"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap(), exe);
+    }
+
+    // -- scheduler_label tests --
+
+    #[test]
+    fn scheduler_label_none_empty() {
+        assert_eq!(scheduler_label(&SchedulerSpec::Eevdf), "");
+    }
+
+    #[test]
+    fn scheduler_label_name() {
+        assert_eq!(
+            scheduler_label(&SchedulerSpec::Discover("scx_mitosis")),
+            " [sched=scx_mitosis]"
+        );
+    }
+
+    #[test]
+    fn scheduler_label_path() {
+        assert_eq!(
+            scheduler_label(&SchedulerSpec::Path("/usr/bin/sched")),
+            " [sched=/usr/bin/sched]"
+        );
+    }
+
+    // -- nextest_setup --
+
+    #[test]
+    fn nextest_setup_writes_kernel_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_TEST_KERNEL";
+        let prev = std::env::var(key).ok();
+        let exe = crate::resolve_current_exe().unwrap();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+
+        let mut buf = Vec::new();
+        let result = nextest_setup(&[exe.as_path()], &mut buf);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+
+        assert!(result.is_ok(), "nextest_setup failed: {result:?}");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.starts_with("KTSTR_TEST_KERNEL="),
+            "expected KTSTR_TEST_KERNEL=..., got: {output}"
+        );
+    }
+
+    // -- evaluate_vm_result error path tests --
+
+    #[test]
+    fn eval_eevdf_no_com2_output() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let entry = eevdf_entry("__eval_eevdf_no_out__");
+        let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("test function produced no output"),
+            "EEVDF with no COM2 output should say 'test function produced no output', got: {msg}",
+        );
+        assert!(
+            !msg.contains("no test result received from guest"),
+            "EEVDF error should not use the scheduler-path wording, got: {msg}",
+        );
+        assert!(
+            msg.contains("exit_code=1"),
+            "should include exit code, got: {msg}"
+        );
+        assert!(
+            msg.contains("Kernel panic"),
+            "should include console output, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn eval_sched_dies_no_com2_output() {
+        let entry = sched_entry("__eval_sched_dies__");
+        let result = make_vm_result("", "boot ok", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no test result received from guest"),
+            "scheduler present with no output should take the scheduler-path fallback, got: {msg}",
+        );
+        assert!(
+            !msg.contains("test function produced no output"),
+            "should not say 'test function produced no output' when scheduler is set, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_dies_with_sched_log() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let sched_log = format!(
+            "noise\n{SCHED_OUTPUT_START}\ndo_enqueue_task+0x1a0\nbalance_one+0x50\n{SCHED_OUTPUT_END}\nmore",
+        );
+        let entry = sched_entry("__eval_sched_log__");
+        let result = make_vm_result(&sched_log, "", -1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no test result received from guest"),
+            "should take the scheduler-path fallback, got: {msg}",
+        );
+        assert!(
+            msg.contains("--- scheduler log ---"),
+            "should include scheduler log section, got: {msg}",
+        );
+        assert!(
+            msg.contains("do_enqueue_task"),
+            "should include scheduler log content, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_mid_test_death_triggers_repro() {
+        // Scheduler dies mid-test: sched_exit_monitor dumps log to COM2
+        // but does NOT write "SCHEDULER_DIED". Auto-repro should still
+        // trigger because has_active_scheduling() is true and no
+        // AssertResult was produced.
+        let sched_log =
+            format!("{SCHED_OUTPUT_START}\nError: BPF program error\n{SCHED_OUTPUT_END}",);
+        let entry = sched_entry("__eval_mid_death_repro__");
+        let result = make_vm_result(&sched_log, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let repro_called = std::sync::atomic::AtomicBool::new(false);
+        let repro_fn = |_output: &str| -> Option<String> {
+            repro_called.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some("repro data".to_string())
+        };
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &repro_fn,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            repro_called.load(std::sync::atomic::Ordering::Relaxed),
+            "repro_fn should be called for mid-test scheduler death without SCHEDULER_DIED marker",
+        );
+        assert!(
+            msg.contains("--- auto-repro ---"),
+            "error should include auto-repro section, got: {msg}",
+        );
+        assert!(
+            msg.contains("repro data"),
+            "error should include repro output, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_repro_no_data_shows_diagnostic() {
+        // When repro_fn returns the fallback diagnostic, the error
+        // output should include it so the user knows auto-repro was
+        // tried and why it produced nothing.
+        let entry = sched_entry("__eval_repro_no_data__");
+        let result = make_vm_result("", "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let repro_fn = |_output: &str| -> Option<String> {
+            Some(
+                "auto-repro: no probe data — scheduler may have exited before \
+                 probes could attach. Check the sched_ext dump and scheduler \
+                 log sections above for crash details."
+                    .to_string(),
+            )
+        };
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &repro_fn,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--- auto-repro ---"),
+            "should include auto-repro section, got: {msg}",
+        );
+        assert!(
+            msg.contains("no probe data"),
+            "should include diagnostic message, got: {msg}",
+        );
+        assert!(
+            msg.contains("sched_ext dump"),
+            "should direct user to dump section, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_timeout_no_result() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let entry = eevdf_entry("__eval_timeout__");
+        let result = make_vm_result("", "booting...\nstill booting...", 0, true);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("timed out"),
+            "should say timed out, got: {msg}",
+        );
+        assert!(
+            msg.contains("no result in SHM or COM2"),
+            "should mention SHM or COM2, got: {msg}",
+        );
+        assert!(
+            msg.contains("booting"),
+            "should include console output, got: {msg}",
+        );
+        assert!(
+            msg.contains("[topo="),
+            "error should include topology, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_payload_exits_no_verify_result() {
+        // Payload wrote something to COM2 but not a valid AssertResult.
+        let entry = eevdf_entry("__eval_no_verify__");
+        let result = make_vm_result(
+            "some output but no delimiters",
+            "Linux version 6.14.0\nboot complete",
+            0,
+            false,
+        );
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("test function produced no output"),
+            "non-parseable COM2 with EEVDF should say 'test function produced no output', got: {msg}",
+        );
+        assert!(
+            !msg.contains("no test result received from guest"),
+            "EEVDF should not use the scheduler-path wording, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_sched_ext_dump_included() {
+        let dump_line = "ktstr-0 [001] 0.5: sched_ext_dump: Debug dump line";
+        let entry = sched_entry("__eval_dump__");
+        let result = make_vm_result("", dump_line, -1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--- sched_ext dump ---"),
+            "should include dump section, got: {msg}",
+        );
+        assert!(
+            msg.contains("sched_ext_dump: Debug dump"),
+            "should include dump content, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_verify_result_passed_returns_ok() {
+        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = eevdf_entry("__eval_pass__");
+        let result = make_vm_result(&output, "", 0, false);
+        let assertions = crate::assert::Assert::NONE;
+        assert!(
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro,
+            )
+            .is_ok(),
+            "passing AssertResult should return Ok",
+        );
+    }
+
+    #[test]
+    fn eval_verify_result_failed_includes_details() {
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"},{"kind":"Unfair","message":"spread 45%"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = eevdf_entry("__eval_fail_details__");
+        let result = make_vm_result(&output, "", 0, false);
+        let assertions = crate::assert::Assert::NONE;
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("failed:"), "got: {msg}");
+        assert!(msg.contains("stuck 3000ms"), "got: {msg}");
+        assert!(msg.contains("spread 45%"), "got: {msg}");
+    }
+
+    #[test]
+    fn eval_assert_failure_includes_sched_log() {
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"worker 0 stuck 5000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!(
+            "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
+        );
+        let entry = sched_entry("__eval_fail_sched_log__");
+        let result = make_vm_result(&output, "", 0, false);
+        let assertions = crate::assert::Assert::NONE;
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("worker 0 stuck 5000ms"), "got: {msg}");
+        assert!(msg.contains("scheduler noise"), "got: {msg}");
+        assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
+    }
+
+    #[test]
+    fn eval_assert_failure_has_fingerprint() {
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let error_line = "Error: apply_cell_config BPF program returned error -2";
+        let output = format!(
+            "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
+        );
+        let entry = sched_entry("__eval_fingerprint__");
+        let result = make_vm_result(&output, "", 0, false);
+        let assertions = crate::assert::Assert::NONE;
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains(error_line), "got: {msg}");
+        let fp_pos = msg.find(error_line).unwrap();
+        let name_pos = msg.find("ktstr_test").unwrap();
+        assert!(fp_pos < name_pos, "got: {msg}");
+    }
+
+    #[test]
+    fn eval_timeout_has_fingerprint() {
+        let error_line = "Error: scheduler panicked";
+        let output = format!("{SCHED_OUTPUT_START}\n{error_line}\n{SCHED_OUTPUT_END}",);
+        let entry = sched_entry("__eval_timeout_fp__");
+        let result = make_vm_result(&output, "", 0, true);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(error_line),
+            "timeout should contain fingerprint, got: {msg}",
+        );
+        let fp_pos = msg.find(error_line).unwrap();
+        let name_pos = msg.find("ktstr_test").unwrap();
+        assert!(
+            fp_pos < name_pos,
+            "fingerprint should appear before ktstr_test line, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_no_result_has_fingerprint() {
+        let error_line = "Error: fatal scheduler crash";
+        let output =
+            format!("{SCHED_OUTPUT_START}\nstartup log\n{error_line}\n{SCHED_OUTPUT_END}",);
+        let entry = sched_entry("__eval_no_result_fp__");
+        let result = make_vm_result(&output, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(error_line),
+            "no-result failure should contain fingerprint, got: {msg}",
+        );
+        let fp_pos = msg.find(error_line).unwrap();
+        let name_pos = msg.find("ktstr_test").unwrap();
+        assert!(
+            fp_pos < name_pos,
+            "fingerprint should appear before ktstr_test line, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_no_sched_output_no_fingerprint() {
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = eevdf_entry("__eval_no_fp__");
+        let result = make_vm_result(&output, "", 0, false);
+        let assertions = crate::assert::Assert::NONE;
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
+        );
+        assert!(msg.starts_with("ktstr_test"), "got: {msg}");
+    }
+
+    #[test]
+    fn eval_monitor_fail_has_fingerprint() {
+        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let error_line = "Error: imbalance detected internally";
+        let sched_log =
+            format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
+        let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");
+        let entry = sched_entry("__eval_monitor_fp__");
+        let imbalance_samples: Vec<crate::monitor::MonitorSample> = (0..30)
+            .map(|i| {
+                crate::monitor::MonitorSample::new(
+                    (i * 100) as u64,
+                    vec![
+                        crate::monitor::CpuSnapshot {
+                            nr_running: 10,
+                            scx_nr_running: 10,
+                            local_dsq_depth: 0,
+                            rq_clock: 1000 + (i as u64 * 100),
+                            scx_flags: 0,
+                            event_counters: None,
+                            schedstat: None,
+                            vcpu_cpu_time_ns: None,
+                            sched_domains: None,
+                        },
+                        crate::monitor::CpuSnapshot {
+                            nr_running: 1,
+                            scx_nr_running: 1,
+                            local_dsq_depth: 0,
+                            rq_clock: 2000 + (i as u64 * 100),
+                            scx_flags: 0,
+                            event_counters: None,
+                            schedstat: None,
+                            vcpu_cpu_time_ns: None,
+                            sched_domains: None,
+                        },
+                    ],
+                )
+            })
+            .collect();
+        let summary =
+            crate::monitor::MonitorSummary::from_samples_with_threshold(&imbalance_samples, 0);
+        let result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output,
+            stderr: String::new(),
+            monitor: Some(crate::monitor::MonitorReport {
+                samples: imbalance_samples,
+                summary,
+                preemption_threshold_ns: 0,
+                watchdog_observation: None,
+            }),
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let assertions = crate::assert::Assert::default_checks();
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
+        );
+        assert!(
+            msg.contains("passed scenario but monitor failed"),
+            "got: {msg}"
+        );
+        assert!(msg.contains(error_line), "got: {msg}");
+        let fp_pos = msg.find(error_line).unwrap();
+        let name_pos = msg.find("ktstr_test").unwrap();
+        assert!(fp_pos < name_pos, "got: {msg}");
+    }
+
+    #[test]
+    fn eval_timeout_with_sched_includes_diagnostics() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let entry = sched_entry("__eval_timeout_sched__");
+        let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("timed out"),
+            "should say timed out, got: {msg}"
+        );
+        assert!(
+            msg.contains("[sched=test_sched_bin]"),
+            "should include scheduler label, got: {msg}"
+        );
+        assert!(
+            msg.contains("--- diagnostics ---"),
+            "should include diagnostics, got: {msg}"
+        );
+        assert!(
+            msg.contains("kernel panic here"),
+            "should include console tail, got: {msg}"
+        );
+    }
+
+    // -- sentinel integration in evaluate_vm_result --
+
+    #[test]
+    fn eval_no_sentinels_shows_initramfs_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let entry = eevdf_entry("__eval_no_sentinel__");
+        let result = make_vm_result("", "Kernel panic", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("init script never started"),
+            "no sentinels should indicate kernel/mount failure, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_init_started_but_no_payload() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let entry = eevdf_entry("__eval_init_only__");
+        let result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("init started but payload never ran"),
+            "init sentinel only should indicate cgroup/scheduler setup failure, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn eval_payload_started_no_result() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let entry = eevdf_entry("__eval_payload_start__");
+        let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\ngarbage";
+        let result = make_vm_result(output, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("payload started but produced no test result"),
+            "both sentinels should indicate payload ran but failed, got: {msg}",
+        );
+    }
+
+    // -- guest panic detection tests --
+
+    #[test]
+    fn eval_crash_in_output_says_guest_crashed() {
+        let entry = sched_entry("__eval_crash_detect__");
+        let output = "KTSTR_INIT_STARTED\nPANIC: panicked at src/foo.rs:42: assertion failed";
+        let result = make_vm_result(output, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("guest crashed:"), "got: {msg}");
+        assert!(msg.contains("assertion failed"), "got: {msg}");
+    }
+
+    #[test]
+    fn eval_crash_eevdf_says_guest_crashed() {
+        let entry = eevdf_entry("__eval_crash_eevdf__");
+        let output = "PANIC: panicked at src/bar.rs:10: index out of bounds";
+        let result = make_vm_result(output, "", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("guest crashed:"), "got: {msg}");
+        assert!(msg.contains("index out of bounds"), "got: {msg}");
+    }
+
+    #[test]
+    fn eval_crash_message_from_shm() {
+        let entry = sched_entry("__eval_crash_shm__");
+        let shm_crash = "PANIC: panicked at src/test.rs:42: assertion failed\n   \
+                          0: ktstr::vmm::rust_init::ktstr_guest_init\n";
+        // COM2 also has a PANIC: line (serial fallback). SHM must take priority.
+        let output = "PANIC: panicked at src/test.rs:42: assertion failed";
+        let mut result = make_vm_result(output, "", 1, false);
+        result.crash_message = Some(shm_crash.to_string());
+        let assertions = crate::assert::Assert::NONE;
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("guest crashed:"),
+            "should say 'guest crashed:', got: {msg}",
+        );
+        assert!(
+            msg.contains("ktstr_guest_init"),
+            "SHM backtrace content should be present, got: {msg}",
+        );
+        // SHM path uses "guest crashed:\n{shm_crash}" (multiline),
+        // COM2 path uses "guest crashed: {msg}" (single line).
+        // The backtrace frame proves SHM was used, not COM2.
+        assert!(
+            msg.contains("0: ktstr::vmm::rust_init::ktstr_guest_init"),
+            "full backtrace from SHM should appear, got: {msg}",
+        );
+    }
+
+    // -- diagnostic section tests --
+
+    #[test]
+    fn eval_sched_died_includes_console() {
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = sched_entry("__eval_sched_died_console__");
+        let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
+        let assertions = crate::assert::Assert::NONE;
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("--- diagnostics ---"), "got: {msg}");
+        assert!(msg.contains("kernel panic"), "got: {msg}");
+    }
+
+    #[test]
+    fn eval_sched_died_includes_monitor() {
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let entry = sched_entry("__eval_sched_died_monitor__");
+        let result = crate::vmm::VmResult {
+            success: false,
+            exit_code: 1,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: output.to_string(),
+            stderr: String::new(),
+            monitor: Some(crate::monitor::MonitorReport {
+                samples: vec![],
+                summary: crate::monitor::MonitorSummary {
+                    total_samples: 5,
+                    max_imbalance_ratio: 3.0,
+                    max_local_dsq_depth: 2,
+                    stall_detected: false,
+                    event_deltas: None,
+                    schedstat_deltas: None,
+                    prog_stats_deltas: None,
+                    ..Default::default()
+                },
+                preemption_threshold_ns: 0,
+                watchdog_observation: None,
+            }),
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let assertions = crate::assert::Assert::NONE;
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("--- monitor ---"), "got: {msg}");
+        assert!(msg.contains("max_imbalance"), "got: {msg}");
+    }
+
+    #[test]
+    fn eval_monitor_fail_includes_sched_log() {
+        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let sched_log =
+            format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
+        let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");
+        let entry = sched_entry("__eval_monitor_fail_sched__");
+        // Imbalance ratio 10.0 exceeds default threshold of 4.0,
+        // sustained for 5+ samples past the 20-sample warmup window.
+        let imbalance_samples: Vec<crate::monitor::MonitorSample> = (0..30)
+            .map(|i| {
+                crate::monitor::MonitorSample::new(
+                    (i * 100) as u64,
+                    vec![
+                        crate::monitor::CpuSnapshot {
+                            nr_running: 10,
+                            scx_nr_running: 10,
+                            local_dsq_depth: 0,
+                            rq_clock: 1000 + (i as u64 * 100),
+                            scx_flags: 0,
+                            event_counters: None,
+                            schedstat: None,
+                            vcpu_cpu_time_ns: None,
+                            sched_domains: None,
+                        },
+                        crate::monitor::CpuSnapshot {
+                            nr_running: 1,
+                            scx_nr_running: 1,
+                            local_dsq_depth: 0,
+                            rq_clock: 2000 + (i as u64 * 100),
+                            scx_flags: 0,
+                            event_counters: None,
+                            schedstat: None,
+                            vcpu_cpu_time_ns: None,
+                            sched_domains: None,
+                        },
+                    ],
+                )
+            })
+            .collect();
+        let summary =
+            crate::monitor::MonitorSummary::from_samples_with_threshold(&imbalance_samples, 0);
+        let result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output,
+            stderr: String::new(),
+            monitor: Some(crate::monitor::MonitorReport {
+                samples: imbalance_samples,
+                summary,
+                preemption_threshold_ns: 0,
+                watchdog_observation: None,
+            }),
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let assertions = crate::assert::Assert::default_checks();
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
+        );
+        assert!(
+            msg.contains("passed scenario but monitor failed"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
+    }
 }

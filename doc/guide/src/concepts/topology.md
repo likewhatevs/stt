@@ -48,15 +48,16 @@ IDs, NUMA node IDs, core IDs, and cache sizes for each online CPU.
 Also scans `/sys/devices/system/node/` to discover memory-only nodes
 (CXL), reads per-node meminfo and inter-node distances.
 
-**`from_spec(numa_nodes, llcs, cores, threads) -> Self`** -- builds a
-topology from a VM spec. Parameters are big-to-little: NUMA nodes,
+**`from_vm_topology(topo: &Topology) -> Self`** -- builds a topology
+from a VM spec. `Topology` fields are big-to-little: NUMA nodes,
 last-level caches, cores per LLC, threads per core. Multiple LLCs
 can share a NUMA node when `numa_nodes < llcs`; `llcs` must be an
 exact multiple of `numa_nodes` so LLCs partition evenly across nodes
 (the `#[derive(Scheduler)]` macro rejects violations at compile time
-and runtime `from_spec` callers inside ktstr hold the same invariant).
-CPUs numbered sequentially. Used as a fallback when sysfs is
-incomplete inside a guest VM.
+and runtime callers inside ktstr hold the same invariant). CPUs
+numbered sequentially. Used as a fallback when sysfs is incomplete
+inside a guest VM. For the memory-aware variant, see
+`from_vm_topology_with_memory`.
 
 **`synthetic(num_cpus, num_llcs) -> Self`** (test-only) -- creates a
 topology with evenly distributed CPUs across LLCs. Used in unit tests.
@@ -107,8 +108,8 @@ is not present or meminfo is unavailable. `NodeMemInfo` has
 
 **`numa_distance(from, to) -> u8`** -- inter-node NUMA distance.
 Returns 255 when either node ID is not present (matches the kernel's
-unreachable distance). For `from_spec()` topologies without explicit
-distances, returns 10 for local and 20 for remote.
+unreachable distance). For `from_vm_topology()` topologies without
+explicit distances, returns 10 for local and 20 for remote.
 
 **`is_memory_only(node_id) -> bool`** -- whether the node is
 memory-only (has RAM but no CPUs). Typical for CXL-attached memory

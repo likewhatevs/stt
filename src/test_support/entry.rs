@@ -869,4 +869,429 @@ mod tests {
             "expected actionable hint, got: {msg}"
         );
     }
+
+    // -- Scheduler method tests --
+
+    use super::super::test_helpers::{
+        FLAGS_A, FLAGS_AB, FLAGS_BORROW_LONG, FLAGS_BORROW_REBAL, FLAGS_LLC_STEAL, FLAGS_STEAL_LLC,
+        validate_entry,
+    };
+
+    #[test]
+    fn scheduler_eevdf_defaults() {
+        let s = &Scheduler::EEVDF;
+        assert_eq!(s.name, "eevdf");
+        assert!(s.flags.is_empty());
+        assert!(s.sysctls.is_empty());
+        assert!(s.kargs.is_empty());
+        assert!(s.assert.not_starved.is_none());
+        assert!(s.assert.max_imbalance_ratio.is_none());
+    }
+
+    #[test]
+    fn scheduler_new_builder() {
+        static TEST_SYSCTLS: &[Sysctl] =
+            &[Sysctl::new("kernel.sched_cfs_bandwidth_slice_us", "1000")];
+        let s = Scheduler::new("test_sched")
+            .binary(SchedulerSpec::Discover("test_bin"))
+            .flags(FLAGS_A)
+            .sysctls(TEST_SYSCTLS)
+            .kargs(&["nosmt"]);
+        assert_eq!(s.name, "test_sched");
+        assert_eq!(s.flags.len(), 1);
+        assert_eq!(s.sysctls.len(), 1);
+        assert_eq!(s.kargs.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_supported_flag_names() {
+        let s = Scheduler::new("sched").flags(FLAGS_BORROW_REBAL);
+        let names = s.supported_flag_names();
+        assert_eq!(names, vec!["borrow", "rebal"]);
+    }
+
+    #[test]
+    fn scheduler_flag_requires_found() {
+        let s = Scheduler::new("sched").flags(FLAGS_STEAL_LLC);
+        assert_eq!(s.flag_requires("steal"), vec!["llc"]);
+        assert!(s.flag_requires("llc").is_empty());
+    }
+
+    #[test]
+    fn scheduler_flag_requires_not_found() {
+        let s = Scheduler::new("sched").flags(&[]);
+        assert!(s.flag_requires("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn scheduler_flag_args_found() {
+        let s = Scheduler::new("sched").flags(FLAGS_BORROW_LONG);
+        assert_eq!(s.flag_args("borrow"), Some(["--enable-borrow"].as_slice()));
+    }
+
+    #[test]
+    fn scheduler_flag_args_not_found() {
+        let s = Scheduler::new("sched").flags(&[]);
+        assert!(s.flag_args("nonexistent").is_none());
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_no_flags() {
+        let s = Scheduler::new("sched");
+        let profiles = s.generate_profiles(&[], &[]);
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].flags.is_empty());
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_all_optional() {
+        let s = Scheduler::new("sched").flags(FLAGS_AB);
+        let profiles = s.generate_profiles(&[], &[]);
+        assert_eq!(profiles.len(), 4);
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_with_required() {
+        let s = Scheduler::new("sched").flags(FLAGS_AB);
+        let profiles = s.generate_profiles(&["a"], &[]);
+        assert_eq!(profiles.len(), 2);
+        for p in &profiles {
+            assert!(p.flags.contains(&"a"));
+        }
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_with_excluded() {
+        let s = Scheduler::new("sched").flags(FLAGS_AB);
+        let profiles = s.generate_profiles(&[], &["a"]);
+        assert_eq!(profiles.len(), 2);
+        for p in &profiles {
+            assert!(!p.flags.contains(&"a"));
+        }
+    }
+
+    #[test]
+    fn scheduler_generate_profiles_dependency_filter() {
+        let s = Scheduler::new("sched").flags(FLAGS_LLC_STEAL);
+        let profiles = s.generate_profiles(&[], &[]);
+        assert_eq!(profiles.len(), 3);
+        let steal_alone = profiles
+            .iter()
+            .any(|p| p.flags.contains(&"steal") && !p.flags.contains(&"llc"));
+        assert!(!steal_alone);
+    }
+
+    #[test]
+    fn scheduler_with_verify() {
+        let v = crate::assert::Assert::NONE
+            .check_not_starved()
+            .max_imbalance_ratio(3.0);
+        let s = Scheduler::new("sched").assert(v);
+        assert_eq!(s.assert.not_starved, Some(true));
+        assert_eq!(s.assert.max_imbalance_ratio, Some(3.0));
+    }
+
+    // -- KtstrTestEntry::validate coverage --
+
+    #[test]
+    fn ktstr_test_entry_validate_accepts_defaults() {
+        let e = validate_entry("ok", 512, Duration::from_secs(2), 2);
+        e.validate().unwrap();
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_empty_name() {
+        let e = validate_entry("", 512, Duration::from_secs(2), 2);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("name") && msg.contains("non-empty"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_zero_memory() {
+        let e = validate_entry("t", 0, Duration::from_secs(2), 2);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("memory_mb") && msg.contains("> 0") && msg.contains("'t'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_zero_duration() {
+        let e = validate_entry("t", 512, Duration::ZERO, 2);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duration") && msg.contains("> 0"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_zero_workers() {
+        let e = validate_entry("t", 512, Duration::from_secs(2), 0);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workers_per_cgroup") && msg.contains("> 0"),
+            "got: {msg}"
+        );
+    }
+
+    // -- TopologyConstraints tests --
+
+    #[test]
+    fn topology_constraints_default_has_max_values() {
+        let c = TopologyConstraints::DEFAULT;
+        assert_eq!(c.max_llcs, Some(12));
+        assert_eq!(c.max_numa_nodes, Some(1));
+        assert_eq!(c.max_cpus, Some(192));
+    }
+
+    #[test]
+    fn topology_constraints_max_fields_set() {
+        let c = TopologyConstraints {
+            max_llcs: Some(16),
+            max_numa_nodes: Some(4),
+            max_cpus: Some(128),
+            ..TopologyConstraints::DEFAULT
+        };
+        assert_eq!(c.max_llcs, Some(16));
+        assert_eq!(c.max_numa_nodes, Some(4));
+        assert_eq!(c.max_cpus, Some(128));
+        assert_eq!(c.min_numa_nodes, 1);
+        assert_eq!(c.min_llcs, 1);
+        assert_eq!(c.min_cpus, 1);
+    }
+
+    #[test]
+    fn topology_constraints_equality() {
+        let a = TopologyConstraints::DEFAULT;
+        let b = TopologyConstraints::DEFAULT;
+        assert_eq!(a, b);
+
+        let c = TopologyConstraints {
+            max_llcs: Some(8),
+            ..TopologyConstraints::DEFAULT
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn accepts_default_allows_within_limits() {
+        let c = TopologyConstraints::DEFAULT;
+        // 1 NUMA, 8 LLCs, 4 cores, 2 threads = 64 CPUs
+        let t = Topology::new(1, 8, 4, 2);
+        assert!(c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_default_rejects_multi_numa() {
+        let c = TopologyConstraints::DEFAULT;
+        // 2 NUMA, 8 LLCs, 4 cores, 2 threads = 64 CPUs
+        let t = Topology::new(2, 8, 4, 2);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_default_rejects_too_many_llcs() {
+        let c = TopologyConstraints::DEFAULT;
+        // 16 LLCs exceeds max_llcs=12
+        let t = Topology::new(1, 16, 2, 1);
+        assert!(!c.accepts(&t, 128, 32, 32));
+    }
+
+    #[test]
+    fn accepts_none_means_no_limit() {
+        let c = TopologyConstraints {
+            max_llcs: None,
+            max_numa_nodes: None,
+            max_cpus: None,
+            ..TopologyConstraints::DEFAULT
+        };
+        // 4 NUMA, 16 LLCs, 8 cores, 2 threads = 256 CPUs
+        let t = Topology::new(4, 16, 8, 2);
+        assert!(c.accepts(&t, 512, 32, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_many_llcs() {
+        let c = TopologyConstraints {
+            max_llcs: Some(4),
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(1, 8, 2, 1);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_allows_llcs_at_max() {
+        let c = TopologyConstraints {
+            max_llcs: Some(4),
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(1, 4, 2, 1);
+        assert!(c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_many_numa_nodes() {
+        let c = TopologyConstraints {
+            max_numa_nodes: Some(2),
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(4, 4, 2, 1);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_allows_numa_at_max() {
+        let c = TopologyConstraints {
+            max_numa_nodes: Some(2),
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(2, 4, 2, 1);
+        assert!(c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_many_cpus() {
+        let c = TopologyConstraints {
+            max_cpus: Some(16),
+            ..TopologyConstraints::DEFAULT
+        };
+        // 4 LLCs * 4 cores * 2 threads = 32 CPUs
+        let t = Topology::new(1, 4, 4, 2);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_allows_cpus_at_max() {
+        let c = TopologyConstraints {
+            max_cpus: Some(16),
+            ..TopologyConstraints::DEFAULT
+        };
+        // 2 LLCs * 4 cores * 2 threads = 16 CPUs
+        let t = Topology::new(1, 2, 4, 2);
+        assert!(c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_few_llcs() {
+        let c = TopologyConstraints {
+            min_llcs: 4,
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(1, 2, 4, 1);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_exceeding_host_cpus() {
+        let c = TopologyConstraints::DEFAULT;
+        let t = Topology::new(1, 4, 4, 2); // 32 CPUs
+        assert!(!c.accepts(&t, 16, 16, 32)); // host has only 16
+    }
+
+    #[test]
+    fn accepts_rejects_exceeding_host_llcs() {
+        let c = TopologyConstraints::DEFAULT;
+        let t = Topology::new(1, 8, 2, 1);
+        assert!(!c.accepts(&t, 128, 4, 32)); // host has only 4 LLCs
+    }
+
+    #[test]
+    fn accepts_combined_min_and_max() {
+        let c = TopologyConstraints {
+            min_llcs: 2,
+            max_llcs: Some(8),
+            min_cpus: 4,
+            max_cpus: Some(32),
+            ..TopologyConstraints::DEFAULT
+        };
+        // 1 LLC, 4 CPUs -- rejected (min_llcs=2)
+        assert!(!c.accepts(&Topology::new(1, 1, 4, 1), 128, 16, 32));
+        // 2 LLCs, 4 CPUs -- accepted
+        assert!(c.accepts(&Topology::new(1, 2, 2, 1), 128, 16, 32));
+        // 16 LLCs, 32 CPUs -- rejected (max_llcs=8)
+        assert!(!c.accepts(&Topology::new(1, 16, 2, 1), 128, 16, 32));
+        // 8 LLCs, 16 CPUs -- accepted
+        assert!(c.accepts(&Topology::new(1, 8, 2, 1), 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_requires_smt() {
+        let c = TopologyConstraints {
+            requires_smt: true,
+            ..TopologyConstraints::DEFAULT
+        };
+        let no_smt = Topology::new(1, 2, 4, 1);
+        let with_smt = Topology::new(1, 2, 4, 2);
+        assert!(!c.accepts(&no_smt, 128, 16, 32));
+        assert!(c.accepts(&with_smt, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_few_numa_nodes() {
+        let c = TopologyConstraints {
+            min_numa_nodes: 2,
+            max_numa_nodes: None,
+            ..TopologyConstraints::DEFAULT
+        };
+        let t = Topology::new(1, 4, 4, 1);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_too_few_cpus() {
+        let c = TopologyConstraints {
+            min_cpus: 32,
+            ..TopologyConstraints::DEFAULT
+        };
+        // 2 LLCs * 4 cores * 2 threads = 16 CPUs
+        let t = Topology::new(1, 2, 4, 2);
+        assert!(!c.accepts(&t, 128, 16, 32));
+    }
+
+    #[test]
+    fn accepts_rejects_exceeding_host_cpus_per_llc() {
+        let c = TopologyConstraints::DEFAULT;
+        // cores_per_llc=8, threads_per_core=2 → 16 CPUs/LLC
+        let t = Topology::new(1, 2, 8, 2);
+        assert!(!c.accepts(&t, 128, 16, 8));
+    }
+
+    // -- validate_entry_flags panic paths --
+
+    #[test]
+    #[should_panic(expected = "unknown required_flag")]
+    fn validate_entry_flags_unknown_required() {
+        static SCHED: Scheduler = Scheduler::new("sched").flags(FLAGS_AB);
+        let entry = KtstrTestEntry {
+            name: "bad_required",
+            scheduler: &SCHED,
+            required_flags: &["nonexistent"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        validate_entry_flags(&entry);
+    }
+
+    #[test]
+    #[should_panic(expected = "in both required_flags and excluded_flags")]
+    fn validate_entry_flags_both_required_and_excluded() {
+        static SCHED: Scheduler = Scheduler::new("sched").flags(FLAGS_AB);
+        let entry = KtstrTestEntry {
+            name: "bad_both",
+            scheduler: &SCHED,
+            required_flags: &["a"],
+            excluded_flags: &["a"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        validate_entry_flags(&entry);
+    }
 }

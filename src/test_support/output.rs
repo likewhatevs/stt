@@ -215,3 +215,323 @@ pub(crate) fn format_console_diagnostics(
     }
     format!("\n\n--- diagnostics ---\n{}", parts.join("\n"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- parse_assert_result --
+
+    #[test]
+    fn parse_assert_result_valid() {
+        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("noise\n{RESULT_START}\n{json}\n{RESULT_END}\nmore");
+        let r = parse_assert_result(&output).unwrap();
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn parse_assert_result_missing_start() {
+        let output = format!("no start\n{RESULT_END}\n");
+        assert!(parse_assert_result(&output).is_err());
+    }
+
+    #[test]
+    fn parse_assert_result_missing_end() {
+        let output = format!("{RESULT_START}\n{{}}");
+        assert!(parse_assert_result(&output).is_err());
+    }
+
+    #[test]
+    fn parse_assert_result_failed() {
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let r = parse_assert_result(&output).unwrap();
+        assert!(!r.passed);
+        assert_eq!(r.details, vec!["stuck 3000ms"]);
+    }
+
+    #[test]
+    fn parse_assert_result_malformed_json() {
+        let output = format!("{RESULT_START}\nnot valid json\n{RESULT_END}");
+        assert!(parse_assert_result(&output).is_err());
+    }
+
+    #[test]
+    fn parse_assert_result_empty_json_between_delimiters() {
+        let output = format!("{RESULT_START}\n\n{RESULT_END}");
+        assert!(parse_assert_result(&output).is_err());
+    }
+
+    #[test]
+    fn parse_assert_result_with_details() {
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Other","message":"err1"},{"kind":"Other","message":"err2"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let r = parse_assert_result(&output).unwrap();
+        assert!(!r.passed);
+        assert_eq!(r.details.len(), 2);
+        assert_eq!(r.details[0], "err1");
+        assert_eq!(r.details[1], "err2");
+    }
+
+    // -- parse_sched_output --
+
+    #[test]
+    fn parse_sched_output_valid() {
+        let output = format!(
+            "noise\n{SCHED_OUTPUT_START}\nscheduler log line 1\nline 2\n{SCHED_OUTPUT_END}\nmore"
+        );
+        let parsed = parse_sched_output(&output);
+        assert!(parsed.is_some());
+        let content = parsed.unwrap();
+        assert!(content.contains("scheduler log line 1"));
+        assert!(content.contains("line 2"));
+    }
+
+    #[test]
+    fn parse_sched_output_missing_start() {
+        let output = format!("no start\n{SCHED_OUTPUT_END}\n");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_missing_end() {
+        let output = format!("{SCHED_OUTPUT_START}\nsome content");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_empty_content() {
+        let output = format!("{SCHED_OUTPUT_START}\n\n{SCHED_OUTPUT_END}");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_with_stack_traces() {
+        let stack = "do_enqueue_task+0x1a0/0x380\nbalance_one+0x50/0x100\n";
+        let output = format!("{SCHED_OUTPUT_START}\n{stack}\n{SCHED_OUTPUT_END}");
+        let parsed = parse_sched_output(&output).unwrap();
+        assert!(parsed.contains("do_enqueue_task"));
+        assert!(parsed.contains("balance_one"));
+    }
+
+    #[test]
+    fn parse_sched_output_rfind_survives_end_marker_in_content() {
+        // Regression: if the scheduler log echoes the END marker
+        // inside its own content (e.g. a shell heredoc, a diagnostic
+        // that quotes the sentinel), `find` truncated the section at
+        // the first occurrence — which was inside the content, not
+        // at the terminator. `rfind` anchors on the last occurrence,
+        // which is the real terminator.
+        let content = format!("line1\nfake {SCHED_OUTPUT_END} inside\nline3");
+        let output = format!("{SCHED_OUTPUT_START}\n{content}\n{SCHED_OUTPUT_END}\n");
+        let parsed = parse_sched_output(&output).unwrap();
+        assert!(
+            parsed.contains("line3"),
+            "rfind must keep content after an embedded END marker: {parsed:?}"
+        );
+        assert!(
+            parsed.contains("fake"),
+            "content before the embedded marker must also survive: {parsed:?}"
+        );
+    }
+
+    // -- sched_log_fingerprint --
+
+    #[test]
+    fn sched_log_fingerprint_last_line() {
+        let output = format!(
+            "{SCHED_OUTPUT_START}\nstarting scheduler\nError: apply_cell_config BPF program returned error -2\n{SCHED_OUTPUT_END}",
+        );
+        assert_eq!(
+            sched_log_fingerprint(&output),
+            Some("Error: apply_cell_config BPF program returned error -2"),
+        );
+    }
+
+    #[test]
+    fn sched_log_fingerprint_skips_trailing_blanks() {
+        let output = format!("{SCHED_OUTPUT_START}\nfatal error here\n\n\n{SCHED_OUTPUT_END}",);
+        assert_eq!(sched_log_fingerprint(&output), Some("fatal error here"));
+    }
+
+    #[test]
+    fn sched_log_fingerprint_none_without_markers() {
+        assert!(sched_log_fingerprint("no markers").is_none());
+    }
+
+    #[test]
+    fn sched_log_fingerprint_none_empty_content() {
+        let output = format!("{SCHED_OUTPUT_START}\n\n{SCHED_OUTPUT_END}");
+        assert!(sched_log_fingerprint(&output).is_none());
+    }
+
+    // -- extract_sched_ext_dump --
+
+    #[test]
+    fn extract_sched_ext_dump_present() {
+        let output = "noise\n  ktstr-0  [001]  0.500: sched_ext_dump: Debug dump\n  ktstr-0  [001]  0.501: sched_ext_dump: scheduler state\nmore";
+        let parsed = extract_sched_ext_dump(output);
+        assert!(parsed.is_some());
+        let dump = parsed.unwrap();
+        assert!(dump.contains("sched_ext_dump: Debug dump"));
+        assert!(dump.contains("sched_ext_dump: scheduler state"));
+    }
+
+    #[test]
+    fn extract_sched_ext_dump_absent() {
+        assert!(extract_sched_ext_dump("no dump lines here").is_none());
+    }
+
+    #[test]
+    fn extract_sched_ext_dump_empty_output() {
+        assert!(extract_sched_ext_dump("").is_none());
+    }
+
+    // -- extract_kernel_version --
+
+    #[test]
+    fn extract_kernel_version_from_boot() {
+        let console = "[    0.000000] Linux version 6.14.0-rc3+ (user@host) (gcc) #1 SMP\n\
+                        [    0.001000] Command line: console=ttyS0";
+        assert_eq!(
+            extract_kernel_version(console),
+            Some("6.14.0-rc3+".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_kernel_version_none() {
+        assert_eq!(extract_kernel_version("no kernel here"), None);
+    }
+
+    #[test]
+    fn extract_kernel_version_bare() {
+        let console = "Linux version 6.12.0";
+        assert_eq!(extract_kernel_version(console), Some("6.12.0".to_string()),);
+    }
+
+    // -- format_console_diagnostics --
+
+    #[test]
+    fn format_console_diagnostics_empty_ok() {
+        assert_eq!(format_console_diagnostics("", 0, "test stage"), "");
+    }
+
+    #[test]
+    fn format_console_diagnostics_empty_nonzero_exit() {
+        let s = format_console_diagnostics("", 1, "test stage");
+        assert!(s.contains("exit_code=1"));
+        assert!(s.contains("--- diagnostics ---"));
+        assert!(s.contains("stage: test stage"));
+        assert!(!s.contains("console ("));
+    }
+
+    #[test]
+    fn format_console_diagnostics_with_console() {
+        let console = "line1\nline2\nKernel panic - not syncing\n";
+        let s = format_console_diagnostics(console, -1, "payload started");
+        assert!(s.contains("exit_code=-1"));
+        assert!(s.contains("console (3 lines)"));
+        assert!(s.contains("Kernel panic"));
+        assert!(s.contains("stage: payload started"));
+        assert!(!s.contains("truncated"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_truncates_long() {
+        let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
+        let console = format!("{}\n", lines.join("\n"));
+        let s = format_console_diagnostics(&console, 0, "test");
+        assert!(s.contains("console (20 lines)"));
+        assert!(s.contains("boot line 49"));
+        assert!(!s.contains("boot line 29"));
+        assert!(!s.contains("truncated"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_short_console() {
+        let console = "Linux version 6.14.0\nbooted ok\n";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains("console (2 lines)"));
+        assert!(s.contains("Linux version 6.14.0"));
+        assert!(s.contains("booted ok"));
+        assert!(!s.contains("truncated"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_no_truncation_with_trailing_newline() {
+        let console = "line1\nline2\nline3\n";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains("console (3 lines)"));
+        assert!(!s.contains("truncated"));
+        assert!(!s.contains("[truncated]"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_truncation_without_trailing_newline() {
+        let console = "line1\nline2\npartial li";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains(", truncated)"));
+        assert!(s.contains("partial li [truncated]"));
+    }
+
+    // -- classify_init_stage --
+
+    #[test]
+    fn classify_no_sentinels() {
+        assert_eq!(
+            classify_init_stage(""),
+            "init script never started (kernel or mount failure)",
+        );
+    }
+
+    #[test]
+    fn classify_init_started_only() {
+        assert_eq!(
+            classify_init_stage("KTSTR_INIT_STARTED\nsome noise"),
+            "init started but payload never ran (cgroup/scheduler setup failed)",
+        );
+    }
+
+    #[test]
+    fn classify_payload_starting() {
+        let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\nsome output";
+        assert_eq!(
+            classify_init_stage(output),
+            "payload started but produced no test result",
+        );
+    }
+
+    #[test]
+    fn classify_payload_starting_without_init() {
+        // Edge case: payload sentinel present but init sentinel
+        // missing. payload_starting implies init ran, so classify as
+        // payload started.
+        assert_eq!(
+            classify_init_stage("KTSTR_PAYLOAD_STARTING"),
+            "payload started but produced no test result",
+        );
+    }
+
+    // -- extract_panic_message --
+
+    #[test]
+    fn extract_panic_message_found() {
+        let output = "noise\nPANIC: panicked at src/main.rs:5: oh no\nmore";
+        assert_eq!(
+            extract_panic_message(output),
+            Some("panicked at src/main.rs:5: oh no"),
+        );
+    }
+
+    #[test]
+    fn extract_panic_message_absent() {
+        assert!(extract_panic_message("no panic here").is_none());
+    }
+
+    #[test]
+    fn extract_panic_message_empty() {
+        assert!(extract_panic_message("").is_none());
+    }
+}

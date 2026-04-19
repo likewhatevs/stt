@@ -679,3 +679,90 @@ pub fn ktstr_main() -> ! {
     eprintln!("       <binary> --exact <test_name> --nocapture");
     std::process::exit(1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // run_named_test / run_gauntlet_test — nextest dispatch routing
+    // ---------------------------------------------------------------
+    //
+    // These tests cover the `test_name → function` routing without
+    // booting a VM. The happy paths require KVM and a kernel image,
+    // so the assertions here target the failure branches that return
+    // exit code 1 before any VM spawn:
+    //   - `ktstr/` prefix with unknown bare name
+    //   - `gauntlet/` prefix with malformed parts / unknown preset /
+    //     unknown profile
+    //   - bare names fall through to `ktstr/` lookup
+    //
+    // The routing invariant: `gauntlet/` always delegates to
+    // `run_gauntlet_test`, every other prefix (including none)
+    // delegates to the base-test path inside `run_named_test`.
+
+    #[test]
+    fn run_named_test_gauntlet_prefix_routes_to_run_gauntlet_test() {
+        // Gauntlet names require three slash-separated parts after
+        // the prefix; a name missing them is rejected by
+        // `run_gauntlet_test`, proving the prefix routed there and
+        // not into the base-test path (which would print
+        // `unknown test: gauntlet/...` instead of the gauntlet-
+        // specific error and still return 1 but via a different
+        // branch).
+        let exit = run_named_test("gauntlet/__unit_test_dummy__");
+        assert_eq!(exit, 1, "malformed gauntlet names must exit 1");
+    }
+
+    #[test]
+    fn run_named_test_bare_unknown_exits_nonzero() {
+        // `run_named_test` strips `ktstr/` when present; a bare
+        // unknown name falls through to `find_test` which returns
+        // None, producing exit code 1.
+        let exit = run_named_test("__definitely_not_a_real_test__");
+        assert_eq!(exit, 1);
+    }
+
+    #[test]
+    fn run_named_test_ktstr_prefix_unknown_exits_nonzero() {
+        // `ktstr/` prefix is stripped; the bare name (also unknown)
+        // returns 1 via the find_test None path.
+        let exit = run_named_test("ktstr/__definitely_not_a_real_test__");
+        assert_eq!(exit, 1);
+    }
+
+    #[test]
+    fn run_gauntlet_test_rejects_name_with_fewer_than_three_parts() {
+        // `rest` must split into exactly 3 parts
+        // (`{name}/{preset}/{profile}`). Two parts is a format error.
+        let exit = run_gauntlet_test("some_test/some_preset");
+        assert_eq!(exit, 1);
+    }
+
+    #[test]
+    fn run_gauntlet_test_rejects_empty_rest() {
+        // Empty rest splits into one empty string — also a format
+        // error.
+        let exit = run_gauntlet_test("");
+        assert_eq!(exit, 1);
+    }
+
+    #[test]
+    fn run_gauntlet_test_rejects_unknown_test_name() {
+        // Well-formed three-part name whose test is not registered
+        // in KTSTR_TESTS. Returns 1 via the find_test None branch,
+        // never reaching preset lookup or VM spawn.
+        let exit = run_gauntlet_test("__not_a_test__/tiny-1llc/default");
+        assert_eq!(exit, 1);
+    }
+
+    #[test]
+    fn run_gauntlet_test_rejects_unknown_preset() {
+        // `__unit_test_dummy__` is registered in test_support::tests;
+        // combined with a preset name that is not in
+        // `gauntlet_presets`, the function returns 1 at the preset-
+        // lookup branch.
+        let exit = run_gauntlet_test("__unit_test_dummy__/__no_such_preset__/__default__");
+        assert_eq!(exit, 1);
+    }
+}
