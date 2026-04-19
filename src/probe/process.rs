@@ -277,6 +277,46 @@ pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashM
     fds
 }
 
+/// Attach the fentry program in slot 0..=3 on the fentry skeleton.
+///
+/// The fentry skeleton exposes four indexed programs
+/// (`ktstr_fentry_0`..`ktstr_fentry_3`) matching the 4-slot batch
+/// model in `bpf/ktstr.bpf.c`. Six call sites across this file
+/// previously spelled the full 4-arm `match slot { ... }` inline;
+/// routing through this helper keeps the dispatch in one place so a
+/// future slot addition is a one-line change instead of six.
+///
+/// Returns `None` for slot indices outside 0..=3, matching the
+/// existing `continue;` behaviour at call sites.
+fn attach_fentry_by_slot(
+    skel: &crate::bpf_skel::fentry::FentryProbeSkel<'_>,
+    slot: usize,
+) -> Option<libbpf_rs::Result<libbpf_rs::Link>> {
+    Some(match slot {
+        0 => skel.progs.ktstr_fentry_0.attach_trace(),
+        1 => skel.progs.ktstr_fentry_1.attach_trace(),
+        2 => skel.progs.ktstr_fentry_2.attach_trace(),
+        3 => skel.progs.ktstr_fentry_3.attach_trace(),
+        _ => return None,
+    })
+}
+
+/// Attach the fexit program in slot 0..=3 on the fentry skeleton.
+/// Sibling of [`attach_fentry_by_slot`]; see its doc for the routing
+/// rationale.
+fn attach_fexit_by_slot(
+    skel: &crate::bpf_skel::fentry::FentryProbeSkel<'_>,
+    slot: usize,
+) -> Option<libbpf_rs::Result<libbpf_rs::Link>> {
+    Some(match slot {
+        0 => skel.progs.ktstr_fexit_0.attach_trace(),
+        1 => skel.progs.ktstr_fexit_1.attach_trace(),
+        2 => skel.progs.ktstr_fexit_2.attach_trace(),
+        3 => skel.progs.ktstr_fexit_3.attach_trace(),
+        _ => return None,
+    })
+}
+
 /// Run the BPF probe skeleton for auto-repro.
 ///
 /// Operates in two modes depending on `phase_b_rx`:
@@ -726,12 +766,8 @@ pub fn run_probe_skeleton(
                 }
                 func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
 
-                let result = match t.slot {
-                    0 => fentry_skel.progs.ktstr_fentry_0.attach_trace(),
-                    1 => fentry_skel.progs.ktstr_fentry_1.attach_trace(),
-                    2 => fentry_skel.progs.ktstr_fentry_2.attach_trace(),
-                    3 => fentry_skel.progs.ktstr_fentry_3.attach_trace(),
-                    _ => continue,
+                let Some(result) = attach_fentry_by_slot(&fentry_skel, t.slot) else {
+                    continue;
                 };
                 match result {
                     Ok(link) => {
@@ -745,12 +781,8 @@ pub fn run_probe_skeleton(
                     }
                 }
                 // Attach fexit for exit-side capture.
-                let fexit_result = match t.slot {
-                    0 => fentry_skel.progs.ktstr_fexit_0.attach_trace(),
-                    1 => fentry_skel.progs.ktstr_fexit_1.attach_trace(),
-                    2 => fentry_skel.progs.ktstr_fexit_2.attach_trace(),
-                    3 => fentry_skel.progs.ktstr_fexit_3.attach_trace(),
-                    _ => continue,
+                let Some(fexit_result) = attach_fexit_by_slot(&fentry_skel, t.slot) else {
+                    continue;
                 };
                 match fexit_result {
                     Ok(link) => {
@@ -912,12 +944,8 @@ pub fn run_probe_skeleton(
             if !t.ok {
                 continue;
             }
-            let result = match t.slot {
-                0 => fentry_skel.progs.ktstr_fexit_0.attach_trace(),
-                1 => fentry_skel.progs.ktstr_fexit_1.attach_trace(),
-                2 => fentry_skel.progs.ktstr_fexit_2.attach_trace(),
-                3 => fentry_skel.progs.ktstr_fexit_3.attach_trace(),
-                _ => continue,
+            let Some(result) = attach_fexit_by_slot(&fentry_skel, t.slot) else {
+                continue;
             };
             match result {
                 Ok(link) => {
@@ -1530,12 +1558,8 @@ fn attach_phase_b_fentry(
             if !t.ok {
                 continue;
             }
-            let result = match t.slot {
-                0 => fentry_skel.progs.ktstr_fexit_0.attach_trace(),
-                1 => fentry_skel.progs.ktstr_fexit_1.attach_trace(),
-                2 => fentry_skel.progs.ktstr_fexit_2.attach_trace(),
-                3 => fentry_skel.progs.ktstr_fexit_3.attach_trace(),
-                _ => continue,
+            let Some(result) = attach_fexit_by_slot(&fentry_skel, t.slot) else {
+                continue;
             };
             match result {
                 Ok(link) => {
@@ -1785,12 +1809,8 @@ fn attach_phase_b_fentry(
             }
             func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
 
-            let result = match t.slot {
-                0 => fentry_skel.progs.ktstr_fentry_0.attach_trace(),
-                1 => fentry_skel.progs.ktstr_fentry_1.attach_trace(),
-                2 => fentry_skel.progs.ktstr_fentry_2.attach_trace(),
-                3 => fentry_skel.progs.ktstr_fentry_3.attach_trace(),
-                _ => continue,
+            let Some(result) = attach_fentry_by_slot(&fentry_skel, t.slot) else {
+                continue;
             };
             match result {
                 Ok(link) => {
@@ -1803,12 +1823,8 @@ fn attach_phase_b_fentry(
                         .push((t.name.to_string(), e.to_string()));
                 }
             }
-            let fexit_result = match t.slot {
-                0 => fentry_skel.progs.ktstr_fexit_0.attach_trace(),
-                1 => fentry_skel.progs.ktstr_fexit_1.attach_trace(),
-                2 => fentry_skel.progs.ktstr_fexit_2.attach_trace(),
-                3 => fentry_skel.progs.ktstr_fexit_3.attach_trace(),
-                _ => continue,
+            let Some(fexit_result) = attach_fexit_by_slot(&fentry_skel, t.slot) else {
+                continue;
             };
             match fexit_result {
                 Ok(link) => {

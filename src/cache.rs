@@ -1062,6 +1062,72 @@ mod tests {
         image
     }
 
+    // -- keep-list source disjointness --
+
+    /// Every entry in `is_keep_section` comes from one of four source
+    /// lists owned by independent modules. Overlap is harmless at
+    /// strip time but masks drift: if two modules add `.foo` and one
+    /// later removes it, the strip still preserves `.foo` via the
+    /// other module — the "dead" reference outlives its reader.
+    ///
+    /// This test locks the four lists as disjoint sets so a removal
+    /// in one module immediately drops `.foo` from
+    /// `is_keep_section`, and the downstream consumer's loss of its
+    /// declared section becomes a visible test break rather than a
+    /// silent ALL-tests-pass-but-data-is-missing runtime surprise.
+    #[test]
+    fn keep_section_sources_are_disjoint() {
+        use std::collections::HashMap;
+        let mut origins: HashMap<&[u8], Vec<&str>> = HashMap::new();
+        let sources: &[(&str, &[&[u8]])] = &[
+            ("cache::STRUCTURAL_KEEP_SECTIONS", STRUCTURAL_KEEP_SECTIONS),
+            (
+                "monitor::symbols::VMLINUX_KEEP_SECTIONS",
+                crate::monitor::symbols::VMLINUX_KEEP_SECTIONS,
+            ),
+            (
+                "monitor::VMLINUX_KEEP_SECTIONS",
+                crate::monitor::VMLINUX_KEEP_SECTIONS,
+            ),
+            (
+                "probe::btf::VMLINUX_KEEP_SECTIONS",
+                crate::probe::btf::VMLINUX_KEEP_SECTIONS,
+            ),
+        ];
+        for (label, list) in sources {
+            for name in *list {
+                origins.entry(*name).or_default().push(label);
+            }
+        }
+        let dupes: Vec<_> = origins
+            .iter()
+            .filter(|(_, lists)| lists.len() > 1)
+            .collect();
+        assert!(
+            dupes.is_empty(),
+            "keep-list entries declared by multiple source modules (drift hazard): {dupes:?}",
+        );
+    }
+
+    /// Same disjointness contract for the two zero-data lists.
+    /// Retained sections here keep symbols but drop bytes — duplicate
+    /// declarations would mask the same drift the keep-list test
+    /// guards against.
+    #[test]
+    fn zero_data_section_sources_are_disjoint() {
+        use std::collections::HashSet;
+        let speculative: HashSet<&[u8]> = SPECULATIVE_ZERO_DATA_SECTIONS.iter().copied().collect();
+        let declared: HashSet<&[u8]> = crate::monitor::symbols::VMLINUX_ZERO_DATA_SECTIONS
+            .iter()
+            .copied()
+            .collect();
+        let overlap: Vec<_> = speculative.intersection(&declared).collect();
+        assert!(
+            overlap.is_empty(),
+            "zero-data section declared by both SPECULATIVE and a consumer (drift hazard): {overlap:?}",
+        );
+    }
+
     // -- KernelMetadata serde --
 
     #[test]

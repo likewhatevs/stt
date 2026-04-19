@@ -726,10 +726,21 @@ mod tests {
 
     // -- proptest --
 
+    use proptest::prop_assert;
+
     proptest::proptest! {
+        /// Any arbitrary input must not panic AND, on success, return
+        /// only values the input string can justify. Broadened from
+        /// 0..20 to 0..100 characters to exercise long/multi-dot
+        /// pathological inputs the 20-char range missed.
         #[test]
-        fn prop_major_version_never_panics(s in "\\PC{0,20}") {
-            let _ = major_version(&s);
+        fn prop_major_version_never_panics(s in "\\PC{0,100}") {
+            if let Ok(major) = major_version(&s) {
+                // Ok(major) is only valid when the first dot-segment
+                // parses as the returned integer.
+                let first = s.split('.').next().unwrap_or("");
+                prop_assert!(first.parse::<u32>().ok() == Some(major));
+            }
         }
 
         #[test]

@@ -1848,11 +1848,50 @@ mod tests {
 
     #[test]
     fn thresholds_default_values() {
+        // Regression guard for `MonitorThresholds::DEFAULT`. Every
+        // field is asserted: changing a default silently shifts what
+        // "passes by default" across every test that inherits
+        // defaults via `Assert::default_checks()` + per-scheduler
+        // merge. If a default moves, the rationale belongs in the
+        // doc comment on `DEFAULT` first; the test failure then
+        // prompts the rationale update.
         let t = MonitorThresholds::default();
-        assert!((t.max_imbalance_ratio - 4.0).abs() < f64::EPSILON);
-        assert_eq!(t.max_local_dsq_depth, 50);
-        assert!(t.fail_on_stall);
-        assert_eq!(t.sustained_samples, 5);
+        assert!(
+            (t.max_imbalance_ratio - 4.0).abs() < f64::EPSILON,
+            "default max_imbalance_ratio drifted: {}",
+            t.max_imbalance_ratio,
+        );
+        assert_eq!(
+            t.max_local_dsq_depth, 50,
+            "default max_local_dsq_depth drifted",
+        );
+        assert!(t.fail_on_stall, "default fail_on_stall drifted");
+        assert_eq!(t.sustained_samples, 5, "default sustained_samples drifted");
+        assert!(
+            (t.max_fallback_rate - 200.0).abs() < f64::EPSILON,
+            "default max_fallback_rate drifted: {}",
+            t.max_fallback_rate,
+        );
+        assert!(
+            (t.max_keep_last_rate - 100.0).abs() < f64::EPSILON,
+            "default max_keep_last_rate drifted: {}",
+            t.max_keep_last_rate,
+        );
+    }
+
+    #[test]
+    fn thresholds_default_matches_const() {
+        // `Default::default()` and `DEFAULT` must agree — the impl
+        // forwards, but the forward is a single expression that a
+        // drive-by refactor could break.
+        let a = MonitorThresholds::default();
+        let b = MonitorThresholds::DEFAULT;
+        assert!((a.max_imbalance_ratio - b.max_imbalance_ratio).abs() < f64::EPSILON);
+        assert_eq!(a.max_local_dsq_depth, b.max_local_dsq_depth);
+        assert_eq!(a.fail_on_stall, b.fail_on_stall);
+        assert_eq!(a.sustained_samples, b.sustained_samples);
+        assert!((a.max_fallback_rate - b.max_fallback_rate).abs() < f64::EPSILON);
+        assert!((a.max_keep_last_rate - b.max_keep_last_rate).abs() < f64::EPSILON);
     }
 
     #[test]

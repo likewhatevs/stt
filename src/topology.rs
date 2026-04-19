@@ -1347,10 +1347,21 @@ mod tests {
 
     // -- proptest --
 
+    use proptest::prop_assert;
+
     proptest::proptest! {
+        /// Any arbitrary input must either succeed and return a
+        /// sorted Vec whose elements all came from the input, or
+        /// fail without panicking. Broadened from 30 to 120
+        /// characters to exercise long lists and pathological
+        /// range/comma mixes.
         #[test]
-        fn prop_parse_cpu_list_never_panics(s in "\\PC{0,30}") {
-            let _ = parse_cpu_list(&s);
+        fn prop_parse_cpu_list_never_panics(s in "\\PC{0,120}") {
+            if let Ok(cpus) = parse_cpu_list(&s) {
+                for w in cpus.windows(2) {
+                    prop_assert!(w[0] <= w[1], "parse_cpu_list not sorted: {cpus:?}");
+                }
+            }
         }
 
         #[test]
@@ -1372,9 +1383,15 @@ mod tests {
             }
         }
 
+        /// Lenient parser must never panic AND its output must stay
+        /// sorted — the strict parser's contract carries over.
+        /// Broadened range from 30 to 120 characters.
         #[test]
-        fn prop_parse_cpu_list_lenient_never_panics(s in "\\PC{0,30}") {
-            let _ = parse_cpu_list_lenient(&s);
+        fn prop_parse_cpu_list_lenient_never_panics(s in "\\PC{0,120}") {
+            let cpus = parse_cpu_list_lenient(&s);
+            for w in cpus.windows(2) {
+                prop_assert!(w[0] <= w[1], "parse_cpu_list_lenient not sorted: {cpus:?}");
+            }
         }
 
         #[test]

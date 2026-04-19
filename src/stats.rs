@@ -3009,10 +3009,18 @@ mod tests {
 
     // -- parse_label proptests --
 
+    use proptest::prop_assert;
+
     proptest::proptest! {
+        /// Arbitrary input must produce a well-formed tuple: replica
+        /// is always >= 1 (1 is the default when no `#N` suffix is
+        /// present; 0 would mean "no replicas" which is nonsensical).
+        /// Broadened the input range from 50 to 200 characters to
+        /// exercise long labels and pathological `/`/`#` mixes.
         #[test]
-        fn prop_parse_label_never_panics(s in "\\PC{0,50}") {
-            let _ = parse_label(&s);
+        fn prop_parse_label_never_panics(s in "\\PC{0,200}") {
+            let (_topo, _scenario, _flags, _work_type, replica) = parse_label(&s);
+            prop_assert!(replica >= 1, "replica < 1 from {s:?}: {replica}");
         }
 
         #[test]

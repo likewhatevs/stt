@@ -722,10 +722,21 @@ mod tests {
 
     // -- proptest --
 
+    use proptest::prop_assert;
+
     proptest::proptest! {
+        /// Arbitrary input must parse into a `KernelId` variant whose
+        /// payload round-trips to the original string where a
+        /// round-trip is defined (Path / Version / CacheKey). Bumped
+        /// the input range from 30 to 120 characters to exercise long
+        /// paths and pathological multi-dot strings.
         #[test]
-        fn prop_kernel_id_parse_never_panics(s in "\\PC{0,30}") {
-            let _ = KernelId::parse(&s);
+        fn prop_kernel_id_parse_never_panics(s in "\\PC{0,120}") {
+            match KernelId::parse(&s) {
+                KernelId::Path(p) => prop_assert!(p == s, "Path payload drift for {s:?}"),
+                KernelId::Version(v) => prop_assert!(v == s, "Version payload drift for {s:?}"),
+                KernelId::CacheKey(k) => prop_assert!(k == s, "CacheKey payload drift for {s:?}"),
+            }
         }
 
         #[test]
