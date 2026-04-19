@@ -918,6 +918,36 @@ enum StartupStatus {
     WaitError(std::io::Error),
 }
 
+/// Poll `/sys/kernel/sched_ext/root/ops` at `interval` cadence for
+/// up to `timeout`, returning `true` as soon as the file is
+/// non-empty (a scheduler has attached). Returns `false` if the
+/// window closes without observing an attachment — the scheduler
+/// process is alive but never finished binding to sched_ext, which
+/// indicates an init-time failure in the BPF program (verifier
+/// error, ops struct mismatch, etc.) that left the child spinning
+/// or stuck in a setup phase.
+///
+/// Separate from [`poll_startup`] (which watches the child process
+/// state): a scheduler can be `Alive` from the process-waitpid
+/// perspective and still have zero progress on scx attachment.
+fn poll_scx_attached(interval: std::time::Duration, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        // The kernel writes the attached scheduler's name into
+        // `root/ops` once `sched_ext_ops.init` succeeds. Absent /
+        // empty => no attachment yet.
+        if let Ok(contents) = fs::read_to_string("/sys/kernel/sched_ext/root/ops")
+            && !contents.trim().is_empty()
+        {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
 /// Poll a freshly-spawned child at `interval` cadence for up to
 /// `timeout`. Returns as soon as the child exits (detecting early
 /// failure faster than a single `sleep(timeout)`) or when the window
@@ -1016,7 +1046,24 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                     force_reboot();
                 }
                 StartupStatus::Alive => {
-                    // Still running after timeout.
+                    // Still running after the liveness window. Now
+                    // verify the scheduler actually BOUND to sched_ext
+                    // — a scheduler process can be alive but stuck in
+                    // its BPF init (verifier reject, ops mismatch),
+                    // which would leave the test running against the
+                    // default kernel scheduler without the host ever
+                    // noticing. `root/ops` is the post-attach marker.
+                    if !poll_scx_attached(
+                        std::time::Duration::from_millis(50),
+                        std::time::Duration::from_secs(3),
+                    ) {
+                        write_com2("===SCHED_OUTPUT_START===");
+                        dump_file_to_com2(log_path);
+                        write_com2("===SCHED_OUTPUT_END===");
+                        write_com2("SCHEDULER_NOT_ATTACHED");
+                        write_com2("KTSTR_EXIT=1");
+                        force_reboot();
+                    }
                     (Some(child), Some(log_path.to_string()))
                 }
                 StartupStatus::WaitError(e) => {

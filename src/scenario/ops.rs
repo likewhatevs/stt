@@ -2471,7 +2471,8 @@ mod tests {
 
     /// #37 — the SetAffinity dispatcher's `AffinityMode::Random`
     /// arm is guarded by `!from.is_empty() && *count > 0` (see the
-    /// match arm at L1223). This test mirrors that classification to
+    /// `AffinityMode::Random` arm with that same guard in
+    /// `apply_ops`). This test mirrors that classification to
     /// lock the contract in place: future refactors that drop either
     /// side of the AND must update this test alongside the dispatch.
     /// The live dispatcher path requires a mounted cgroup tree and

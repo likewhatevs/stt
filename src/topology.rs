@@ -287,6 +287,29 @@ fn is_node_memory_only(node: usize) -> bool {
     }
 }
 
+/// Build a synthetic single-LLC [`LlcInfo`] covering every online
+/// CPU. Used by [`TestTopology::from_system`] when sysfs reports
+/// online CPUs but no cache topology — the fallback path keeps
+/// downstream LLC-aware accessors non-empty.
+///
+/// Each CPU becomes its own core (no SMT sibling data available),
+/// so `num_cores()` equals the CPU count and the per-core sibling
+/// map is non-empty.
+fn synthesize_fallback_llc(cpus: &[usize], numa_node: usize) -> LlcInfo {
+    // Core map: with sysfs unavailable we can't reconstruct SMT
+    // sibling groupings, so assume no SMT — treat each CPU as its
+    // own core. Keeps `num_cores()` equal to the physical CPU count
+    // and `cores()` non-empty so consumers iterating sibling groups
+    // always see at least one entry per CPU.
+    let cores: BTreeMap<usize, Vec<usize>> = cpus.iter().map(|&c| (c, vec![c])).collect();
+    LlcInfo {
+        cpus: cpus.to_vec(),
+        numa_node,
+        cache_size_kb: None,
+        cores,
+    }
+}
+
 impl TestTopology {
     /// Discover topology from sysfs (reads `/sys/devices/system/cpu/`).
     pub fn from_system() -> Result<Self> {
@@ -426,22 +449,7 @@ impl TestTopology {
                  synthesizing a single fallback LLC covering all online CPUs — \
                  LlcAligned affinity will pin to the entire machine"
             );
-            // Core map: with sysfs unavailable we can't reconstruct
-            // SMT sibling groupings, so assume no SMT — treat each
-            // CPU as its own core. This keeps `num_cores()` equal to
-            // the physical CPU count and `cores()` non-empty so
-            // consumers that iterate sibling groups always see at
-            // least one entry per CPU. The alternative (empty
-            // BTreeMap) forces `num_cores()` into the degenerate
-            // `cpus.len()` fallback branch at L49.
-            let cores: BTreeMap<usize, Vec<usize>> =
-                fallback_cpus.iter().map(|&c| (c, vec![c])).collect();
-            vec![LlcInfo {
-                cpus: fallback_cpus,
-                numa_node: fallback_node,
-                cache_size_kb: None,
-                cores,
-            }]
+            vec![synthesize_fallback_llc(&fallback_cpus, fallback_node)]
         } else {
             llcs
         };
@@ -1471,5 +1479,51 @@ mod tests {
                 "from_system must always yield at least one LLC",
             );
         }
+    }
+
+    /// Direct test of the fallback-LLC synthesis path. The only way
+    /// `from_system` itself can reach the fallback is a pathological
+    /// sysfs (online CPUs present, cache topology empty), which is
+    /// impossible to inject reliably from a unit test. Extracting
+    /// `synthesize_fallback_llc` to an independent helper lets us
+    /// exercise the shape contract the fallback must satisfy
+    /// downstream.
+    #[test]
+    fn synthesize_fallback_llc_populates_cpus_node_and_cores() {
+        let cpus = [0, 1, 3, 7];
+        let llc = synthesize_fallback_llc(&cpus, 2);
+
+        // Covers every input CPU.
+        assert_eq!(llc.cpus(), &cpus);
+
+        // NUMA node faithfully carried through.
+        assert_eq!(llc.numa_node(), 2);
+
+        // Cache size unknown (we had no sysfs entries to read).
+        assert!(llc.cache_size_kb().is_none());
+
+        // One core per CPU (no SMT sibling reconstruction possible).
+        assert_eq!(llc.cores().len(), cpus.len());
+        for &c in &cpus {
+            assert_eq!(
+                llc.cores().get(&c).map(|v| v.as_slice()),
+                Some(&[c][..]),
+                "each CPU must appear as its own single-sibling core",
+            );
+        }
+        assert_eq!(llc.num_cores(), cpus.len());
+    }
+
+    /// Zero CPUs is legal input (`from_system` would bail earlier
+    /// with "no online CPUs found", but the helper itself must not
+    /// panic): an empty LlcInfo with empty cores map.
+    #[test]
+    fn synthesize_fallback_llc_empty_cpus_returns_empty_llc() {
+        let llc = synthesize_fallback_llc(&[], 0);
+        assert!(llc.cpus().is_empty());
+        assert_eq!(llc.numa_node(), 0);
+        assert!(llc.cores().is_empty());
+        // With empty cores map, num_cores falls back to cpus.len() == 0.
+        assert_eq!(llc.num_cores(), 0);
     }
 }

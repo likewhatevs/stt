@@ -147,6 +147,45 @@ impl GuestMem {
         }
     }
 
+    /// Read `N` volatile bytes from `ptr`. Each byte is read via
+    /// `read_volatile` so the compiler cannot cache or elide across
+    /// the loop (the guest writes to this memory concurrently and
+    /// those writes are invisible to Rust's model). Returning a
+    /// `[u8; N]` lets callers recompose the fundamental integer via
+    /// `from_ne_bytes` without needing pointer alignment to match.
+    ///
+    /// Handles the alignment case: even if `ptr` is not aligned for
+    /// `T`, per-byte `read_volatile` has 1-byte alignment and is
+    /// always safe.
+    ///
+    /// # Safety
+    /// `ptr..ptr+N` must be a valid, readable range in the mapped
+    /// guest region. The caller (`read_u32`/`read_u64`/etc.) bounds
+    /// checks before resolving the pointer.
+    #[inline]
+    unsafe fn read_volatile_bytes<const N: usize>(ptr: *const u8) -> [u8; N] {
+        let mut bytes = [0u8; N];
+        for (i, slot) in bytes.iter_mut().enumerate() {
+            // SAFETY: ptr..ptr+N is in-bounds per caller's check.
+            *slot = unsafe { std::ptr::read_volatile(ptr.add(i)) };
+        }
+        bytes
+    }
+
+    /// Write `N` volatile bytes to `ptr`. Mirror of
+    /// [`read_volatile_bytes`] for the store path.
+    ///
+    /// # Safety
+    /// `ptr..ptr+N` must be a valid, writable range in the mapped
+    /// guest region.
+    #[inline]
+    unsafe fn write_volatile_bytes<const N: usize>(ptr: *mut u8, bytes: [u8; N]) {
+        for (i, &byte) in bytes.iter().enumerate() {
+            // SAFETY: ptr..ptr+N is in-bounds per caller's check.
+            unsafe { std::ptr::write_volatile(ptr.add(i), byte) };
+        }
+    }
+
     /// Read a u32 at DRAM offset `pa + offset`.
     pub fn read_u32(&self, pa: u64, offset: usize) -> u32 {
         let addr = pa + offset as u64;
@@ -154,7 +193,11 @@ impl GuestMem {
             return 0;
         }
         match self.resolve_ptr(addr) {
-            Some(ptr) => unsafe { std::ptr::read_volatile(ptr as *const u32) },
+            // SAFETY: bounds checked above; resolve_ptr returned a
+            // valid pointer into the mapped region.
+            Some(ptr) => {
+                u32::from_ne_bytes(unsafe { Self::read_volatile_bytes::<4>(ptr as *const u8) })
+            }
             None => 0,
         }
     }
@@ -166,7 +209,11 @@ impl GuestMem {
             return 0;
         }
         match self.resolve_ptr(addr) {
-            Some(ptr) => unsafe { std::ptr::read_volatile(ptr as *const u64) },
+            // SAFETY: bounds checked above; resolve_ptr returned a
+            // valid pointer into the mapped region.
+            Some(ptr) => {
+                u64::from_ne_bytes(unsafe { Self::read_volatile_bytes::<8>(ptr as *const u8) })
+            }
             None => 0,
         }
     }
@@ -183,6 +230,8 @@ impl GuestMem {
             return;
         }
         if let Some(ptr) = self.resolve_ptr(addr) {
+            // SAFETY: bounds checked above. u8 is always 1-aligned,
+            // so this is a single volatile store.
             unsafe { std::ptr::write_volatile(ptr, val) }
         }
     }
@@ -194,7 +243,8 @@ impl GuestMem {
             return;
         }
         if let Some(ptr) = self.resolve_ptr(addr) {
-            unsafe { std::ptr::write_volatile(ptr as *mut u64, val) }
+            // SAFETY: bounds checked above.
+            unsafe { Self::write_volatile_bytes::<8>(ptr, val.to_ne_bytes()) };
         }
     }
 
@@ -205,6 +255,7 @@ impl GuestMem {
             return 0;
         }
         match self.resolve_ptr(addr) {
+            // SAFETY: bounds checked above. u8 is always 1-aligned.
             Some(ptr) => unsafe { std::ptr::read_volatile(ptr) },
             None => 0,
         }
@@ -237,7 +288,8 @@ impl GuestMem {
             return;
         }
         if let Some(ptr) = self.resolve_ptr(addr) {
-            unsafe { std::ptr::write_volatile(ptr as *mut u32, val) }
+            // SAFETY: bounds checked above.
+            unsafe { Self::write_volatile_bytes::<4>(ptr, val.to_ne_bytes()) };
         }
     }
 

@@ -1395,6 +1395,8 @@ fn run_named_test(test_name: &str) -> i32 {
             "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             bare_name,
         );
+        // See run_ktstr_test_inner for the sidecar-emission rationale.
+        write_skip_sidecar(entry, &[]);
         return 0;
     }
 
@@ -1497,6 +1499,7 @@ fn run_gauntlet_test(rest: &str) -> i32 {
             "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
         );
+        write_skip_sidecar(entry, &flags);
         return 0;
     }
 
@@ -1786,7 +1789,12 @@ fn run_ktstr_test_inner(
             "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             entry.name,
         );
-        return Ok(AssertResult::pass());
+        // Record the skip so stats tooling sees every skipped run,
+        // not just the ones that made it to the VM-run site.
+        write_skip_sidecar(entry, active_flags);
+        return Ok(AssertResult::skip(
+            "test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+        ));
     }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
@@ -4528,6 +4536,71 @@ fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
         h.write(&[0]);
     }
     h.finish()
+}
+
+/// Emit a minimal sidecar for an early-skip path.
+///
+/// Stats tooling enumerates sidecars to compute pass/skip/fail
+/// rates; when a test bails before `run_ktstr_test_inner` reaches
+/// the VM-run site that calls [`write_sidecar`], the skip is
+/// invisible to post-run analysis — it shows up as a missing
+/// result rather than a recorded skip.
+///
+/// This helper writes a sidecar flagged `skipped: true, passed: true`
+/// with empty VM telemetry (no monitor, no stimulus events, no
+/// verifier stats, no kvm stats). Stats tooling that subtracts
+/// skipped runs from the pass count treats the entry correctly.
+fn write_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String]) {
+    let dir = sidecar_dir();
+    let topo = entry.topology.to_string();
+    let sched_name = match &entry.scheduler.binary {
+        SchedulerSpec::None => "eevdf",
+        SchedulerSpec::Name(n) => n,
+        SchedulerSpec::Path(p) => p,
+        SchedulerSpec::KernelBuiltin { .. } => "kernel",
+    };
+    let sysctls: Vec<String> = entry
+        .scheduler
+        .sysctls
+        .iter()
+        .map(|s| format!("sysctl.{}={}", s.key, s.value))
+        .collect();
+    let kargs: Vec<String> = entry
+        .scheduler
+        .kargs
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let sidecar = SidecarResult {
+        test_name: entry.name.to_string(),
+        topology: topo,
+        scheduler: sched_name.to_string(),
+        passed: true,
+        skipped: true,
+        stats: Default::default(),
+        monitor: None,
+        stimulus_events: Vec::new(),
+        // Skip paths never ran a workload; work_type is "skipped"
+        // so stats tooling that groups by work_type puts these in a
+        // distinguishable bucket.
+        work_type: "skipped".to_string(),
+        active_flags: active_flags.to_vec(),
+        verifier_stats: Vec::new(),
+        kvm_stats: None,
+        sysctls,
+        kargs,
+        kernel_version: detect_kernel_version(),
+        timestamp: now_iso8601(),
+        run_id: generate_run_id(),
+    };
+    let variant_hash = sidecar_variant_hash(&sidecar);
+    let path = dir.join(format!("{}-{:016x}.ktstr.json", entry.name, variant_hash));
+    if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::write(&path, json) {
+            eprintln!("ktstr_test: write skip sidecar {}: {e}", path.display());
+        }
+    }
 }
 
 /// Write a sidecar JSON file for post-run analysis.
