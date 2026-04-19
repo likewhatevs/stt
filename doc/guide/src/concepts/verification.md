@@ -196,7 +196,10 @@ Use `Assert` for both the merge chain (`#[ktstr_test]` attributes,
 
 ## Constants
 
-- `Assert::NONE` -- all checks disabled, all overrides `None`.
+- `Assert::NO_OVERRIDES` -- identity for `merge`; every field is `None`,
+  so it overrides nothing. This is not "no checks" -- when used as a
+  per-test or per-scheduler `assert`, the runtime chain still applies
+  defaults because it merges `default_checks() -> scheduler -> test`.
 - `Assert::default_checks()` -- `not_starved` enabled, monitor
   thresholds populated from `MonitorThresholds::DEFAULT`.
 

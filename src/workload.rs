@@ -878,7 +878,12 @@ pub struct Migration {
 ///
 /// Each field is populated by the worker itself (inside the VM) and
 /// serialized via a pipe to the parent process.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// [`Default`] produces a zero/empty report. Callers building a sentinel
+/// report should spread `..WorkerReport::default()` rather than listing
+/// every field by hand -- the sentinel drifts silently when a field
+/// is added.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkerReport {
     /// Worker process ID (from `getpid()` in the forked child).
     /// Stored as `pid_t` (i32) to match the kernel's native type and

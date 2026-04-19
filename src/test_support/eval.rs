@@ -1038,7 +1038,7 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1072,7 +1072,7 @@ mod tests {
     fn eval_sched_dies_no_com2_output() {
         let entry = sched_entry("__eval_sched_dies__");
         let result = make_vm_result("", "boot ok", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1103,7 +1103,7 @@ mod tests {
         );
         let entry = sched_entry("__eval_sched_log__");
         let result = make_vm_result(&sched_log, "", -1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1139,7 +1139,7 @@ mod tests {
             format!("{SCHED_OUTPUT_START}\nError: BPF program error\n{SCHED_OUTPUT_END}",);
         let entry = sched_entry("__eval_mid_death_repro__");
         let result = make_vm_result(&sched_log, "", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let repro_called = std::sync::atomic::AtomicBool::new(false);
         let repro_fn = |_output: &str| -> Option<String> {
             repro_called.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1177,7 +1177,7 @@ mod tests {
         // tried and why it produced nothing.
         let entry = sched_entry("__eval_repro_no_data__");
         let result = make_vm_result("", "", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let repro_fn = |_output: &str| -> Option<String> {
             Some(
                 "auto-repro: no probe data — scheduler may have exited before \
@@ -1217,7 +1217,7 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1257,7 +1257,7 @@ mod tests {
             0,
             false,
         );
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1284,7 +1284,7 @@ mod tests {
         let dump_line = "ktstr-0 [001] 0.5: sched_ext_dump: Debug dump line";
         let entry = sched_entry("__eval_dump__");
         let result = make_vm_result("", dump_line, -1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1312,7 +1312,7 @@ mod tests {
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_pass__");
         let result = make_vm_result(&output, "", 0, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         assert!(
             evaluate_vm_result(
                 &entry,
@@ -1334,7 +1334,7 @@ mod tests {
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_fail_details__");
         let result = make_vm_result(&output, "", 0, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
             evaluate_vm_result(
@@ -1361,7 +1361,7 @@ mod tests {
         );
         let entry = sched_entry("__eval_fail_sched_log__");
         let result = make_vm_result(&output, "", 0, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
             evaluate_vm_result(
@@ -1389,7 +1389,7 @@ mod tests {
         );
         let entry = sched_entry("__eval_fingerprint__");
         let result = make_vm_result(&output, "", 0, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
             evaluate_vm_result(
@@ -1415,7 +1415,7 @@ mod tests {
         let output = format!("{SCHED_OUTPUT_START}\n{error_line}\n{SCHED_OUTPUT_END}",);
         let entry = sched_entry("__eval_timeout_fp__");
         let result = make_vm_result(&output, "", 0, true);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1446,7 +1446,7 @@ mod tests {
             format!("{SCHED_OUTPUT_START}\nstartup log\n{error_line}\n{SCHED_OUTPUT_END}",);
         let entry = sched_entry("__eval_no_result_fp__");
         let result = make_vm_result(&output, "", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1476,7 +1476,7 @@ mod tests {
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_no_fp__");
         let result = make_vm_result(&output, "", 0, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
             evaluate_vm_result(
@@ -1583,7 +1583,7 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1621,7 +1621,7 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1645,7 +1645,7 @@ mod tests {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1670,7 +1670,7 @@ mod tests {
         let entry = eevdf_entry("__eval_payload_start__");
         let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\ngarbage";
         let result = make_vm_result(output, "", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1695,7 +1695,7 @@ mod tests {
         let entry = sched_entry("__eval_crash_detect__");
         let output = "KTSTR_INIT_STARTED\nPANIC: panicked at src/foo.rs:42: assertion failed";
         let result = make_vm_result(output, "", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1716,7 +1716,7 @@ mod tests {
         let entry = eevdf_entry("__eval_crash_eevdf__");
         let output = "PANIC: panicked at src/bar.rs:10: index out of bounds";
         let result = make_vm_result(output, "", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1741,7 +1741,7 @@ mod tests {
         let output = "PANIC: panicked at src/test.rs:42: assertion failed";
         let mut result = make_vm_result(output, "", 1, false);
         result.crash_message = Some(shm_crash.to_string());
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
             &result,
@@ -1778,7 +1778,7 @@ mod tests {
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
             evaluate_vm_result(
@@ -1829,7 +1829,7 @@ mod tests {
             kvm_stats: None,
             crash_message: None,
         };
-        let assertions = crate::assert::Assert::NONE;
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
             evaluate_vm_result(

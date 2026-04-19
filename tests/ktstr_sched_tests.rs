@@ -79,7 +79,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
         func: scenario_bpf_api,
         scheduler: &KTSTR_SCHED,
         auto_repro: false,
-        assert: ktstr::assert::Assert::NONE.fail_on_stall(false),
+        assert: ktstr::assert::Assert::NO_OVERRIDES.fail_on_stall(false),
         bpf_map_write: &[&BPF_NOOP],
         duration: std::time::Duration::from_secs(10),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT

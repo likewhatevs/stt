@@ -27,7 +27,7 @@ const RELAXED: Scheduler = Scheduler::new("relaxed")
     .binary(SchedulerSpec::Discover("scx_relaxed"))
     .flags(&[&MY_LLC, &MY_BORROW])
     .assert(
-        Assert::NONE
+        Assert::NO_OVERRIDES
             .max_imbalance_ratio(5.0)    // tolerate 5:1 imbalance
             .max_fallback_rate(500.0)     // higher fallback rate ok
             .fail_on_stall(false)         // don't fail on stall
@@ -69,7 +69,7 @@ Three-layer merge with last-`Some`-wins semantics. See
 
 ```rust,ignore
 fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
-    let assertions = Assert::NONE
+    let assertions = Assert::NO_OVERRIDES
         .check_not_starved()
         .max_gap_ms(3000);
 

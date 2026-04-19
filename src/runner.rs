@@ -74,7 +74,7 @@ impl Default for RunConfig {
             settle: Duration::from_millis(500),
             cleanup: Duration::from_millis(200),
             work_type_override: None,
-            assert: crate::assert::Assert::NONE,
+            assert: crate::assert::Assert::NO_OVERRIDES,
         }
     }
 }
@@ -225,17 +225,18 @@ impl Runner {
 
             // Start BPF skeleton probes for auto-probe.
             let probe_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            type SkeletonHandle = (
-                std::thread::JoinHandle<(
-                    Option<Vec<crate::probe::process::ProbeEvent>>,
-                    crate::probe::process::ProbeDiagnostics,
-                    Vec<(u32, String)>,
-                )>,
+            type SkeletonThreadResult = (
+                Option<Vec<crate::probe::process::ProbeEvent>>,
+                crate::probe::process::ProbeDiagnostics,
                 Vec<(u32, String)>,
-                std::collections::HashMap<String, String>,
-                std::collections::HashMap<String, Vec<(String, String)>>,
-                std::collections::HashMap<String, crate::probe::btf::RenderHint>,
             );
+            struct SkeletonHandle {
+                thread: std::thread::JoinHandle<SkeletonThreadResult>,
+                func_names: Vec<(u32, String)>,
+                bpf_locs: std::collections::HashMap<String, String>,
+                param_names: std::collections::HashMap<String, Vec<(String, String)>>,
+                render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
+            }
             let mut skeleton_handle: Option<SkeletonHandle> = if self.config.repro
                 && let Some(ref stack_input) = self.config.probe_stack
             {
@@ -307,7 +308,13 @@ impl Runner {
                     while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Some((handle, func_names, bpf_locs, param_names, render_hints))
+                    Some(SkeletonHandle {
+                        thread: handle,
+                        func_names,
+                        bpf_locs,
+                        param_names,
+                        render_hints,
+                    })
                 }
             } else {
                 None
@@ -318,39 +325,34 @@ impl Runner {
             tracing::info!(qname, elapsed = ?start.elapsed(), "scenario complete");
 
             // Stop probes and collect results.
-            let probe_output =
-                if let Some((handle, func_names, bpf_locs, param_names, render_hints)) =
-                    skeleton_handle.take()
-                {
-                    probe_stop.store(true, std::sync::atomic::Ordering::Release);
-                    handle
-                        .join()
-                        .ok()
-                        .and_then(|(events, diag, _accumulated_fn)| {
-                            let mut out = String::new();
-                            // Format diagnostics summary.
-                            let pipeline = crate::test_support::PipelineDiagnostics::default();
-                            out.push_str(&crate::test_support::format_probe_diagnostics(
-                                &pipeline, &diag,
+            let probe_output = if let Some(sh) = skeleton_handle.take() {
+                probe_stop.store(true, std::sync::atomic::Ordering::Release);
+                sh.thread
+                    .join()
+                    .ok()
+                    .and_then(|(events, diag, _accumulated_fn)| {
+                        let mut out = String::new();
+                        // Format diagnostics summary.
+                        let pipeline = crate::test_support::PipelineDiagnostics::default();
+                        out.push_str(&crate::test_support::format_probe_diagnostics(
+                            &pipeline, &diag,
+                        ));
+                        if let Some(events) = events {
+                            out.push_str(&crate::probe::output::format_probe_events_with_bpf_locs(
+                                &events,
+                                &sh.func_names,
+                                self.config.kernel_dir.as_deref(),
+                                &sh.bpf_locs,
+                                Some(self.topo.total_cpus() as u32),
+                                &sh.param_names,
+                                &sh.render_hints,
                             ));
-                            if let Some(events) = events {
-                                out.push_str(
-                                    &crate::probe::output::format_probe_events_with_bpf_locs(
-                                        &events,
-                                        &func_names,
-                                        self.config.kernel_dir.as_deref(),
-                                        &bpf_locs,
-                                        Some(self.topo.total_cpus() as u32),
-                                        &param_names,
-                                        &render_hints,
-                                    ),
-                                );
-                            }
-                            if out.is_empty() { None } else { Some(out) }
-                        })
-                } else {
-                    None
-                };
+                        }
+                        if out.is_empty() { None } else { Some(out) }
+                    })
+            } else {
+                None
+            };
 
             let _ = cgroups.cleanup_all();
             std::thread::sleep(self.config.cleanup);
@@ -767,7 +769,7 @@ mod tests {
             settle: Duration::from_millis(500),
             cleanup: Duration::from_millis(100),
             work_type_override: Some(crate::workload::WorkType::CpuSpin),
-            assert: crate::assert::Assert::NONE.max_gap_ms(5000),
+            assert: crate::assert::Assert::NO_OVERRIDES.max_gap_ms(5000),
         };
         let c2 = config.clone();
         assert_eq!(c2.duration, config.duration);

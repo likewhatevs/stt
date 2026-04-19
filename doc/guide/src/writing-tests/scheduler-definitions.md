@@ -139,7 +139,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Discover("scx_my_sched"))
     .flags(&[&MY_LLC, &MY_STEAL])
     .topology(1, 2, 4, 1)
-    .assert(Assert::NONE.max_imbalance_ratio(2.0));
+    .assert(Assert::NO_OVERRIDES.max_imbalance_ratio(2.0));
 ```
 
 ## Cgroup parent
@@ -285,7 +285,7 @@ A scheduler that tolerates higher imbalance:
 ```rust,ignore
 const RELAXED: Scheduler = Scheduler::new("relaxed")
     .binary(SchedulerSpec::Discover("scx_relaxed"))
-    .assert(Assert::NONE.max_imbalance_ratio(5.0));
+    .assert(Assert::NO_OVERRIDES.max_imbalance_ratio(5.0));
 ```
 
 ## Kernel-built scheduler example

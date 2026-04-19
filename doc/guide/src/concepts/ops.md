@@ -197,7 +197,7 @@ Equivalent to `execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])`.
 use ktstr::prelude::*;
 
 fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
-    let assertions = Assert::NONE
+    let assertions = Assert::NO_OVERRIDES
         .check_not_starved()
         .max_gap_ms(3000);
 

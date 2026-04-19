@@ -300,7 +300,7 @@ impl Scheduler {
         flags: &[],
         sysctls: &[],
         kargs: &[],
-        assert: crate::assert::Assert::NONE,
+        assert: crate::assert::Assert::NO_OVERRIDES,
         cgroup_parent: None,
         sched_args: &[],
         topology: Topology {
@@ -323,7 +323,7 @@ impl Scheduler {
             flags: &[],
             sysctls: &[],
             kargs: &[],
-            assert: crate::assert::Assert::NONE,
+            assert: crate::assert::Assert::NO_OVERRIDES,
             cgroup_parent: None,
             sched_args: &[],
             topology: Topology {
@@ -641,7 +641,7 @@ impl KtstrTestEntry {
         memory_mb: 2048,
         scheduler: &Scheduler::EEVDF,
         auto_repro: true,
-        assert: crate::assert::Assert::NONE,
+        assert: crate::assert::Assert::NO_OVERRIDES,
         extra_sched_args: &[],
         watchdog_timeout: Duration::from_secs(4),
         bpf_map_write: &[],
@@ -854,7 +854,7 @@ mod tests {
             sched_pid: 0,
             settle: Duration::from_millis(0),
             work_type_override: None,
-            assert: crate::assert::Assert::NONE,
+            assert: crate::assert::Assert::NO_OVERRIDES,
             wait_for_map_write: false,
         };
         let result = default_test_func(&ctx);
@@ -983,7 +983,7 @@ mod tests {
 
     #[test]
     fn scheduler_with_verify() {
-        let v = crate::assert::Assert::NONE
+        let v = crate::assert::Assert::NO_OVERRIDES
             .check_not_starved()
             .max_imbalance_ratio(3.0);
         let s = Scheduler::new("sched").assert(v);

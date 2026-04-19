@@ -64,7 +64,7 @@ pub(crate) static SCHED_TEST: Scheduler = Scheduler {
     flags: &[],
     sysctls: &[],
     kargs: &[],
-    assert: crate::assert::Assert::NONE,
+    assert: crate::assert::Assert::NO_OVERRIDES,
     cgroup_parent: None,
     sched_args: &[],
     topology: Topology {

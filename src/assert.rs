@@ -842,12 +842,12 @@ impl AssertPlan {
 /// ```
 /// # use ktstr::assert::Assert;
 /// // Start from defaults, override imbalance threshold.
-/// let sched_assert = Assert::NONE.max_imbalance_ratio(5.0);
+/// let sched_assert = Assert::NO_OVERRIDES.max_imbalance_ratio(5.0);
 ///
 /// // Merge: defaults <- scheduler <- test.
 /// let merged = Assert::default_checks()
 ///     .merge(&sched_assert)
-///     .merge(&Assert::NONE.max_gap_ms(5000));
+///     .merge(&Assert::NO_OVERRIDES.max_gap_ms(5000));
 ///
 /// assert_eq!(merged.not_starved, Some(true));   // from default_checks
 /// assert_eq!(merged.max_imbalance_ratio, Some(5.0)); // from sched
@@ -933,18 +933,19 @@ pub struct Assert {
 
 impl Assert {
     /// Identity element for [`Assert::merge`]: every field is `None`,
-    /// so neither side of a merge with `NONE` is altered.
+    /// so neither side of a merge with `NO_OVERRIDES` is altered.
     ///
-    /// `NONE` is "no overrides," not "no checks." When used as a
-    /// per-test or per-scheduler value (`entry.assert`,
-    /// `scheduler.assert`), the runtime merge chain
+    /// The constant is named `NO_OVERRIDES` rather than `NONE` because
+    /// "none" invites the misreading "no checks"; this value adds no
+    /// overrides but, when used as a per-test or per-scheduler value
+    /// (`entry.assert`, `scheduler.assert`), the runtime merge chain
     /// `default_checks().merge(&scheduler.assert).merge(&entry.assert)`
     /// still leaves [`default_checks`](Self::default_checks) intact,
     /// so `not_starved` and the monitor thresholds keep firing. To
     /// turn a default check off, override it explicitly with the
     /// builder method (e.g. `not_starved = Some(false)` via
-    /// struct-update syntax) rather than reaching for `NONE`.
-    pub const NONE: Assert = Assert {
+    /// struct-update syntax) rather than reaching for `NO_OVERRIDES`.
+    pub const NO_OVERRIDES: Assert = Assert {
         not_starved: None,
         isolation: None,
         max_gap_ms: None,
@@ -972,10 +973,11 @@ impl Assert {
     /// [`MonitorThresholds::DEFAULT`] (imbalance 4.0, dsq_depth 50,
     /// stall on, sustained 5, fallback 200.0/s, keep_last 100.0/s).
     ///
-    /// Because [`Assert::NONE`] is the merge identity, scheduler- or
-    /// per-test asserts that leave a default field as `None` inherit
+    /// Because [`Assert::NO_OVERRIDES`] is the merge identity, scheduler-
+    /// or per-test asserts that leave a default field as `None` inherit
     /// it. To suppress a default check, override the field explicitly
-    /// (e.g. `not_starved: Some(false)`), not by switching to `NONE`.
+    /// (e.g. `not_starved: Some(false)`), not by switching to
+    /// `NO_OVERRIDES`.
     pub const fn default_checks() -> Assert {
         use crate::monitor::MonitorThresholds;
         Assert {
@@ -1120,11 +1122,11 @@ impl Assert {
     /// overrides the corresponding field in `self`; `None` fields
     /// inherit from `self`.
     ///
-    /// [`Assert::NONE`] is the two-sided identity: `x.merge(&NONE)`
-    /// and `NONE.merge(&x)` both yield `x`. The runtime composes
-    /// scheduler- and test-level overrides as
+    /// [`Assert::NO_OVERRIDES`] is the two-sided identity:
+    /// `x.merge(&NO_OVERRIDES)` and `NO_OVERRIDES.merge(&x)` both yield
+    /// `x`. The runtime composes scheduler- and test-level overrides as
     /// `Assert::default_checks().merge(&scheduler.assert).merge(&test.assert)`,
-    /// so a `NONE` at either override layer leaves the defaults
+    /// so a `NO_OVERRIDES` at either override layer leaves the defaults
     /// untouched -- which means "no override," not "no checks."
     pub const fn merge(&self, other: &Assert) -> Assert {
         // `Option::or` is not yet const-stable (tracking issue
@@ -2460,8 +2462,8 @@ mod tests {
     // -- Assert merge tests --
 
     #[test]
-    fn assert_none_has_no_checks() {
-        let v = Assert::NONE;
+    fn assert_no_overrides_has_no_checks() {
+        let v = Assert::NO_OVERRIDES;
         assert!(v.not_starved.is_none());
         assert!(v.isolation.is_none());
         assert!(v.max_gap_ms.is_none());
@@ -2484,8 +2486,8 @@ mod tests {
 
     #[test]
     fn assert_merge_other_overrides_self() {
-        let base = Assert::NONE;
-        let other = Assert::NONE
+        let base = Assert::NO_OVERRIDES;
+        let other = Assert::NO_OVERRIDES
             .check_not_starved()
             .max_gap_ms(5000)
             .max_imbalance_ratio(2.0);
@@ -2498,7 +2500,7 @@ mod tests {
     #[test]
     fn assert_merge_preserves_self_when_other_is_none() {
         let base = Assert::default_checks();
-        let merged = base.merge(&Assert::NONE);
+        let merged = base.merge(&Assert::NO_OVERRIDES);
         assert_eq!(merged.not_starved, Some(true));
         assert!(merged.max_imbalance_ratio.is_some());
         assert!(merged.max_local_dsq_depth.is_some());
@@ -2506,16 +2508,16 @@ mod tests {
 
     #[test]
     fn assert_merge_other_takes_precedence() {
-        let base = Assert::NONE.max_imbalance_ratio(4.0);
-        let other = Assert::NONE.max_imbalance_ratio(2.0);
+        let base = Assert::NO_OVERRIDES.max_imbalance_ratio(4.0);
+        let other = Assert::NO_OVERRIDES.max_imbalance_ratio(2.0);
         let merged = base.merge(&other);
         assert_eq!(merged.max_imbalance_ratio, Some(2.0));
     }
 
     #[test]
     fn assert_merge_last_some_wins() {
-        let base = Assert::NONE.check_not_starved();
-        let other = Assert::NONE.check_isolation();
+        let base = Assert::NO_OVERRIDES.check_not_starved();
+        let other = Assert::NO_OVERRIDES.check_isolation();
         let merged = base.merge(&other);
         assert_eq!(merged.not_starved, Some(true));
         assert_eq!(merged.isolation, Some(true));
@@ -2526,7 +2528,7 @@ mod tests {
         let base = Assert::default_checks(); // not_starved = Some(true)
         let other = Assert {
             not_starved: Some(false),
-            ..Assert::NONE
+            ..Assert::NO_OVERRIDES
         };
         let merged = base.merge(&other);
         assert_eq!(merged.not_starved, Some(false));
@@ -2535,10 +2537,10 @@ mod tests {
 
     #[test]
     fn assert_merge_child_disables_isolation() {
-        let base = Assert::NONE.check_isolation(); // isolation = Some(true)
+        let base = Assert::NO_OVERRIDES.check_isolation(); // isolation = Some(true)
         let other = Assert {
             isolation: Some(false),
-            ..Assert::NONE
+            ..Assert::NO_OVERRIDES
         };
         let merged = base.merge(&other);
         assert_eq!(merged.isolation, Some(false));
@@ -2547,7 +2549,7 @@ mod tests {
 
     #[test]
     fn assert_worker_plan_extraction() {
-        let v = Assert::NONE
+        let v = Assert::NO_OVERRIDES
             .check_not_starved()
             .check_isolation()
             .max_gap_ms(3000)
@@ -2563,7 +2565,7 @@ mod tests {
 
     #[test]
     fn assert_cgroup_delegates_to_plan() {
-        let v = Assert::NONE.check_not_starved();
+        let v = Assert::NO_OVERRIDES.check_not_starved();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
         let r = v.assert_cgroup(&reports, None);
         assert!(r.passed);
@@ -2572,7 +2574,7 @@ mod tests {
 
     #[test]
     fn assert_monitor_thresholds_extraction() {
-        let v = Assert::NONE
+        let v = Assert::NO_OVERRIDES
             .max_imbalance_ratio(2.5)
             .max_local_dsq_depth(100)
             .fail_on_stall(false)
@@ -2590,7 +2592,7 @@ mod tests {
 
     #[test]
     fn assert_monitor_thresholds_defaults_when_none() {
-        let v = Assert::NONE;
+        let v = Assert::NO_OVERRIDES;
         let t = v.monitor_thresholds();
         let d = crate::monitor::MonitorThresholds::DEFAULT;
         assert!((t.max_imbalance_ratio - d.max_imbalance_ratio).abs() < f64::EPSILON);
@@ -2599,7 +2601,7 @@ mod tests {
 
     #[test]
     fn assert_chain_all_setters() {
-        let v = Assert::NONE
+        let v = Assert::NO_OVERRIDES
             .check_not_starved()
             .check_isolation()
             .max_gap_ms(1000)
@@ -2646,67 +2648,76 @@ mod tests {
 
     #[test]
     fn assert_merge_max_spread_pct() {
-        let base = Assert::NONE.max_spread_pct(10.0);
-        let other = Assert::NONE.max_spread_pct(5.0);
+        let base = Assert::NO_OVERRIDES.max_spread_pct(10.0);
+        let other = Assert::NO_OVERRIDES.max_spread_pct(5.0);
         assert_eq!(base.merge(&other).max_spread_pct, Some(5.0));
-        assert_eq!(base.merge(&Assert::NONE).max_spread_pct, Some(10.0));
+        assert_eq!(base.merge(&Assert::NO_OVERRIDES).max_spread_pct, Some(10.0));
     }
 
     #[test]
     fn assert_merge_fail_on_stall() {
-        let base = Assert::NONE.fail_on_stall(true);
-        let other = Assert::NONE.fail_on_stall(false);
+        let base = Assert::NO_OVERRIDES.fail_on_stall(true);
+        let other = Assert::NO_OVERRIDES.fail_on_stall(false);
         assert_eq!(base.merge(&other).fail_on_stall, Some(false));
-        assert_eq!(base.merge(&Assert::NONE).fail_on_stall, Some(true));
+        assert_eq!(base.merge(&Assert::NO_OVERRIDES).fail_on_stall, Some(true));
     }
 
     #[test]
     fn assert_merge_sustained_samples() {
-        let base = Assert::NONE.sustained_samples(5);
-        let other = Assert::NONE.sustained_samples(10);
+        let base = Assert::NO_OVERRIDES.sustained_samples(5);
+        let other = Assert::NO_OVERRIDES.sustained_samples(10);
         assert_eq!(base.merge(&other).sustained_samples, Some(10));
-        assert_eq!(base.merge(&Assert::NONE).sustained_samples, Some(5));
+        assert_eq!(base.merge(&Assert::NO_OVERRIDES).sustained_samples, Some(5));
     }
 
     #[test]
     fn assert_merge_max_fallback_rate() {
-        let base = Assert::NONE.max_fallback_rate(200.0);
-        let other = Assert::NONE.max_fallback_rate(50.0);
+        let base = Assert::NO_OVERRIDES.max_fallback_rate(200.0);
+        let other = Assert::NO_OVERRIDES.max_fallback_rate(50.0);
         assert_eq!(base.merge(&other).max_fallback_rate, Some(50.0));
-        assert_eq!(base.merge(&Assert::NONE).max_fallback_rate, Some(200.0));
+        assert_eq!(
+            base.merge(&Assert::NO_OVERRIDES).max_fallback_rate,
+            Some(200.0)
+        );
     }
 
     #[test]
     fn assert_merge_max_keep_last_rate() {
-        let base = Assert::NONE.max_keep_last_rate(100.0);
-        let other = Assert::NONE.max_keep_last_rate(25.0);
+        let base = Assert::NO_OVERRIDES.max_keep_last_rate(100.0);
+        let other = Assert::NO_OVERRIDES.max_keep_last_rate(25.0);
         assert_eq!(base.merge(&other).max_keep_last_rate, Some(25.0));
-        assert_eq!(base.merge(&Assert::NONE).max_keep_last_rate, Some(100.0));
+        assert_eq!(
+            base.merge(&Assert::NO_OVERRIDES).max_keep_last_rate,
+            Some(100.0)
+        );
     }
 
     #[test]
     fn assert_merge_max_local_dsq_depth() {
-        let base = Assert::NONE.max_local_dsq_depth(50);
-        let other = Assert::NONE.max_local_dsq_depth(100);
+        let base = Assert::NO_OVERRIDES.max_local_dsq_depth(50);
+        let other = Assert::NO_OVERRIDES.max_local_dsq_depth(100);
         assert_eq!(base.merge(&other).max_local_dsq_depth, Some(100));
-        assert_eq!(base.merge(&Assert::NONE).max_local_dsq_depth, Some(50));
+        assert_eq!(
+            base.merge(&Assert::NO_OVERRIDES).max_local_dsq_depth,
+            Some(50)
+        );
     }
 
     #[test]
     fn assert_merge_max_gap_ms() {
-        let base = Assert::NONE.max_gap_ms(2000);
-        let other = Assert::NONE.max_gap_ms(5000);
+        let base = Assert::NO_OVERRIDES.max_gap_ms(2000);
+        let other = Assert::NO_OVERRIDES.max_gap_ms(5000);
         assert_eq!(base.merge(&other).max_gap_ms, Some(5000));
-        assert_eq!(base.merge(&Assert::NONE).max_gap_ms, Some(2000));
+        assert_eq!(base.merge(&Assert::NO_OVERRIDES).max_gap_ms, Some(2000));
     }
 
     #[test]
     fn assert_merge_three_layers() {
         let defaults = Assert::default_checks();
-        let sched = Assert::NONE
+        let sched = Assert::NO_OVERRIDES
             .max_imbalance_ratio(2.0)
             .max_fallback_rate(50.0);
-        let test = Assert::NONE.max_gap_ms(5000);
+        let test = Assert::NO_OVERRIDES.max_gap_ms(5000);
         let merged = defaults.merge(&sched).merge(&test);
         assert_eq!(merged.not_starved, Some(true));
         assert_eq!(merged.max_imbalance_ratio, Some(2.0));
@@ -2884,7 +2895,7 @@ mod tests {
 
     #[test]
     fn neg_assert_cgroup_via_assert_struct() {
-        let v = Assert::NONE.check_not_starved().check_isolation();
+        let v = Assert::NO_OVERRIDES.check_not_starved().check_isolation();
         let expected: BTreeSet<usize> = [0].into_iter().collect();
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2], 50)];
         let r = v.assert_cgroup(&reports, Some(&expected));
@@ -2899,21 +2910,21 @@ mod tests {
     }
 
     #[test]
-    fn assert_merge_none_preserves_base() {
+    fn assert_merge_no_overrides_preserves_base() {
         let base = Assert::default_checks();
-        let merged = base.merge(&Assert::NONE);
+        let merged = base.merge(&Assert::NO_OVERRIDES);
         assert_eq!(merged.not_starved, Some(true));
         assert!(merged.max_imbalance_ratio.is_some());
         assert!(merged.fail_on_stall.is_some());
     }
 
-    /// `Assert::NONE` is the two-sided identity for `merge`. The
+    /// `Assert::NO_OVERRIDES` is the two-sided identity for `merge`. The
     /// right-identity case is covered above; this locks the
-    /// left-identity case so a `NONE.merge(&default_checks())` at
-    /// either order in the runtime chain produces the same defaults.
+    /// left-identity case so a `NO_OVERRIDES.merge(&default_checks())`
+    /// at either order in the runtime chain produces the same defaults.
     #[test]
-    fn assert_merge_none_is_left_identity() {
-        let merged = Assert::NONE.merge(&Assert::default_checks());
+    fn assert_merge_no_overrides_is_left_identity() {
+        let merged = Assert::NO_OVERRIDES.merge(&Assert::default_checks());
         let baseline = Assert::default_checks();
         assert_eq!(merged.not_starved, baseline.not_starved);
         assert_eq!(merged.max_imbalance_ratio, baseline.max_imbalance_ratio);
@@ -2929,13 +2940,13 @@ mod tests {
 
     /// The runtime three-layer chain
     /// `default_checks -> scheduler -> test` collapses to
-    /// `default_checks` when both override layers are `NONE`. This
-    /// proves the documented "NONE means no override, not no checks"
+    /// `default_checks` when both override layers are `NO_OVERRIDES`.
+    /// This proves the documented "no override, not no checks"
     /// invariant end-to-end.
     #[test]
-    fn assert_merge_runtime_chain_with_none_overrides_yields_defaults() {
-        let scheduler_assert = Assert::NONE;
-        let test_assert = Assert::NONE;
+    fn assert_merge_runtime_chain_with_no_overrides_yields_defaults() {
+        let scheduler_assert = Assert::NO_OVERRIDES;
+        let test_assert = Assert::NO_OVERRIDES;
         let merged = Assert::default_checks()
             .merge(&scheduler_assert)
             .merge(&test_assert);
@@ -2951,8 +2962,8 @@ mod tests {
 
     #[test]
     fn assert_merge_overrides_fields() {
-        let base = Assert::NONE;
-        let overrides = Assert::NONE
+        let base = Assert::NO_OVERRIDES;
+        let overrides = Assert::NO_OVERRIDES
             .max_imbalance_ratio(5.0)
             .max_gap_ms(1000)
             .check_not_starved();
@@ -2964,15 +2975,15 @@ mod tests {
 
     #[test]
     fn assert_merge_later_overrides_earlier() {
-        let a = Assert::NONE.max_imbalance_ratio(2.0);
-        let b = Assert::NONE.max_imbalance_ratio(10.0);
+        let a = Assert::NO_OVERRIDES.max_imbalance_ratio(2.0);
+        let b = Assert::NO_OVERRIDES.max_imbalance_ratio(10.0);
         let merged = a.merge(&b);
         assert_eq!(merged.max_imbalance_ratio, Some(10.0));
     }
 
     #[test]
     fn assert_worker_plan_extracts_fields() {
-        let v = Assert::NONE
+        let v = Assert::NO_OVERRIDES
             .check_not_starved()
             .check_isolation()
             .max_gap_ms(500)
@@ -2988,7 +2999,7 @@ mod tests {
 
     #[test]
     fn assert_monitor_thresholds_defaults() {
-        let v = Assert::NONE;
+        let v = Assert::NO_OVERRIDES;
         let t = v.monitor_thresholds();
         // Should use MonitorThresholds::DEFAULT values.
         let d = crate::monitor::MonitorThresholds::DEFAULT;
@@ -2998,7 +3009,7 @@ mod tests {
 
     #[test]
     fn assert_monitor_thresholds_overridden() {
-        let v = Assert::NONE
+        let v = Assert::NO_OVERRIDES
             .max_imbalance_ratio(99.0)
             .max_local_dsq_depth(42)
             .fail_on_stall(false)
@@ -3016,7 +3027,7 @@ mod tests {
 
     #[test]
     fn assert_max_spread_pct() {
-        let v = Assert::NONE.max_spread_pct(25.0);
+        let v = Assert::NO_OVERRIDES.max_spread_pct(25.0);
         assert_eq!(v.max_spread_pct, Some(25.0));
     }
 
@@ -3460,8 +3471,8 @@ mod tests {
     // -- Assert::has_worker_checks --
 
     #[test]
-    fn assert_none_has_no_worker_checks() {
-        assert!(!Assert::NONE.has_worker_checks());
+    fn assert_no_overrides_has_no_worker_checks() {
+        assert!(!Assert::NO_OVERRIDES.has_worker_checks());
     }
 
     #[test]
@@ -3471,24 +3482,50 @@ mod tests {
 
     #[test]
     fn assert_single_field_has_worker_checks() {
-        assert!(Assert::NONE.max_gap_ms(5000).has_worker_checks());
-        assert!(Assert::NONE.check_isolation().has_worker_checks());
-        assert!(Assert::NONE.max_spread_pct(10.0).has_worker_checks());
-        assert!(Assert::NONE.max_throughput_cv(0.5).has_worker_checks());
-        assert!(Assert::NONE.min_work_rate(100.0).has_worker_checks());
+        assert!(Assert::NO_OVERRIDES.max_gap_ms(5000).has_worker_checks());
+        assert!(Assert::NO_OVERRIDES.check_isolation().has_worker_checks());
         assert!(
-            Assert::NONE
+            Assert::NO_OVERRIDES
+                .max_spread_pct(10.0)
+                .has_worker_checks()
+        );
+        assert!(
+            Assert::NO_OVERRIDES
+                .max_throughput_cv(0.5)
+                .has_worker_checks()
+        );
+        assert!(
+            Assert::NO_OVERRIDES
+                .min_work_rate(100.0)
+                .has_worker_checks()
+        );
+        assert!(
+            Assert::NO_OVERRIDES
                 .max_p99_wake_latency_ns(1000)
                 .has_worker_checks()
         );
-        assert!(Assert::NONE.max_wake_latency_cv(0.5).has_worker_checks());
-        assert!(Assert::NONE.min_iteration_rate(10.0).has_worker_checks());
-        assert!(Assert::NONE.max_migration_ratio(0.5).has_worker_checks());
+        assert!(
+            Assert::NO_OVERRIDES
+                .max_wake_latency_cv(0.5)
+                .has_worker_checks()
+        );
+        assert!(
+            Assert::NO_OVERRIDES
+                .min_iteration_rate(10.0)
+                .has_worker_checks()
+        );
+        assert!(
+            Assert::NO_OVERRIDES
+                .max_migration_ratio(0.5)
+                .has_worker_checks()
+        );
     }
 
     #[test]
     fn assert_monitor_only_no_worker_checks() {
-        let a = Assert::NONE.max_imbalance_ratio(5.0).fail_on_stall(true);
+        let a = Assert::NO_OVERRIDES
+            .max_imbalance_ratio(5.0)
+            .fail_on_stall(true);
         assert!(!a.has_worker_checks());
     }
 
@@ -3530,13 +3567,13 @@ mod tests {
         let defaults = Assert::default_checks();
 
         // Layer 2: scheduler sets worker and benchmark fields.
-        let sched = Assert::NONE
+        let sched = Assert::NO_OVERRIDES
             .max_spread_pct(50.0)
             .max_p99_wake_latency_ns(100_000)
             .max_migration_ratio(0.5);
 
         // Layer 3: test overrides a worker field and sets isolation.
-        let test = Assert::NONE.check_isolation().max_spread_pct(80.0);
+        let test = Assert::NO_OVERRIDES.check_isolation().max_spread_pct(80.0);
 
         let merged = defaults.merge(&sched).merge(&test);
 
@@ -3752,39 +3789,43 @@ not_hex default N0=10
 
     #[test]
     fn assert_min_page_locality_setter() {
-        let v = Assert::NONE.min_page_locality(0.9);
+        let v = Assert::NO_OVERRIDES.min_page_locality(0.9);
         assert_eq!(v.min_page_locality, Some(0.9));
     }
 
     #[test]
     fn assert_merge_numa_fields() {
-        let base = Assert::NONE.min_page_locality(0.9);
-        let merged = base.merge(&Assert::NONE);
+        let base = Assert::NO_OVERRIDES.min_page_locality(0.9);
+        let merged = base.merge(&Assert::NO_OVERRIDES);
         assert_eq!(merged.min_page_locality, Some(0.9));
     }
 
     #[test]
     fn assert_merge_numa_override() {
-        let base = Assert::NONE.min_page_locality(0.9);
-        let other = Assert::NONE.min_page_locality(0.5);
+        let base = Assert::NO_OVERRIDES.min_page_locality(0.9);
+        let other = Assert::NO_OVERRIDES.min_page_locality(0.5);
         assert_eq!(base.merge(&other).min_page_locality, Some(0.5));
     }
 
     #[test]
     fn assert_numa_has_worker_checks() {
-        assert!(Assert::NONE.min_page_locality(0.8).has_worker_checks());
+        assert!(
+            Assert::NO_OVERRIDES
+                .min_page_locality(0.8)
+                .has_worker_checks()
+        );
     }
 
     #[test]
     fn assert_page_locality_method_pass() {
-        let a = Assert::NONE.min_page_locality(0.8);
+        let a = Assert::NO_OVERRIDES.min_page_locality(0.8);
         let r = a.assert_page_locality(0.9, 100, 90);
         assert!(r.passed, "{:?}", r.details);
     }
 
     #[test]
     fn assert_page_locality_method_fail() {
-        let a = Assert::NONE.min_page_locality(0.95);
+        let a = Assert::NO_OVERRIDES.min_page_locality(0.95);
         let r = a.assert_page_locality(0.8, 100, 80);
         assert!(!r.passed);
     }
@@ -3902,14 +3943,14 @@ numa_miss 5";
 
     #[test]
     fn assert_max_cross_node_migration_ratio_setter() {
-        let v = Assert::NONE.max_cross_node_migration_ratio(0.05);
+        let v = Assert::NO_OVERRIDES.max_cross_node_migration_ratio(0.05);
         assert_eq!(v.max_cross_node_migration_ratio, Some(0.05));
     }
 
     #[test]
     fn assert_merge_cross_node_migration() {
-        let base = Assert::NONE.max_cross_node_migration_ratio(0.1);
-        let other = Assert::NONE.max_cross_node_migration_ratio(0.05);
+        let base = Assert::NO_OVERRIDES.max_cross_node_migration_ratio(0.1);
+        let other = Assert::NO_OVERRIDES.max_cross_node_migration_ratio(0.05);
         assert_eq!(
             base.merge(&other).max_cross_node_migration_ratio,
             Some(0.05)
@@ -3918,9 +3959,10 @@ numa_miss 5";
 
     #[test]
     fn assert_merge_cross_node_migration_preserves() {
-        let base = Assert::NONE.max_cross_node_migration_ratio(0.1);
+        let base = Assert::NO_OVERRIDES.max_cross_node_migration_ratio(0.1);
         assert_eq!(
-            base.merge(&Assert::NONE).max_cross_node_migration_ratio,
+            base.merge(&Assert::NO_OVERRIDES)
+                .max_cross_node_migration_ratio,
             Some(0.1)
         );
     }
@@ -3928,7 +3970,7 @@ numa_miss 5";
     #[test]
     fn assert_cross_node_migration_has_worker_checks() {
         assert!(
-            Assert::NONE
+            Assert::NO_OVERRIDES
                 .max_cross_node_migration_ratio(0.1)
                 .has_worker_checks()
         );
@@ -3936,14 +3978,14 @@ numa_miss 5";
 
     #[test]
     fn assert_cross_node_migration_method_pass() {
-        let a = Assert::NONE.max_cross_node_migration_ratio(0.1);
+        let a = Assert::NO_OVERRIDES.max_cross_node_migration_ratio(0.1);
         let r = a.assert_cross_node_migration(5, 100);
         assert!(r.passed, "{:?}", r.details);
     }
 
     #[test]
     fn assert_cross_node_migration_method_fail() {
-        let a = Assert::NONE.max_cross_node_migration_ratio(0.05);
+        let a = Assert::NO_OVERRIDES.max_cross_node_migration_ratio(0.05);
         let r = a.assert_cross_node_migration(20, 100);
         assert!(!r.passed);
     }

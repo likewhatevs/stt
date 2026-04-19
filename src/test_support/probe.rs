@@ -756,7 +756,14 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        Some((handle, func_names, pipe_diag, output_done, pnames, rhints))
+        Some(ProbeHandle {
+            thread: handle,
+            func_names,
+            pipeline_diag: pipe_diag,
+            output_done,
+            param_names: pnames,
+            render_hints: rhints,
+        })
     });
 
     let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
@@ -803,14 +810,22 @@ type ProbeThreadResult = (
     Vec<(u32, String)>,
 );
 
-type ProbeHandle = (
-    std::thread::JoinHandle<ProbeThreadResult>,
-    Vec<(u32, String)>,
-    PipelineDiagnostics,
-    std::sync::Arc<std::sync::atomic::AtomicBool>, // output_done
-    std::collections::HashMap<String, Vec<(String, String)>>, // param_names
-    std::collections::HashMap<String, crate::probe::btf::RenderHint>, // render_hints
-);
+/// Probe-thread handle and associated state returned by the setup path.
+///
+/// Owns the join handle plus everything `collect_and_print_probe_data`
+/// needs on the stop side: function-name registry for event rendering,
+/// pipeline diagnostics captured before skeleton spawn, the
+/// `output_done` flag the thread flips when it has already written
+/// `PROBE_PAYLOAD_*` to COM2, and the param-name / render-hint maps
+/// used to pretty-print parameters.
+struct ProbeHandle {
+    thread: std::thread::JoinHandle<ProbeThreadResult>,
+    func_names: Vec<(u32, String)>,
+    pipeline_diag: PipelineDiagnostics,
+    output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    param_names: std::collections::HashMap<String, Vec<(String, String)>>,
+    render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
+}
 
 /// Pre-skeleton pipeline diagnostics captured during guest probe setup.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1086,14 +1101,14 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             };
             try_flush_profraw();
             print_assert_result(&r);
-            let probe_handle = Some((
-                pa.handle,
-                pa.kernel_func_names,
-                pa.pipe_diag,
-                pa.output_done,
-                pa.param_names,
-                pa.render_hints,
-            ));
+            let probe_handle = Some(ProbeHandle {
+                thread: pa.handle,
+                func_names: pa.kernel_func_names,
+                pipeline_diag: pa.pipe_diag,
+                output_done: pa.output_done,
+                param_names: pa.param_names,
+                render_hints: pa.render_hints,
+            });
             collect_and_print_probe_data(pa.stop, probe_handle);
             return Some(1);
         }
@@ -1102,14 +1117,14 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     let exit_code = if result.passed { 0 } else { 1 };
     try_flush_profraw();
     print_assert_result(&result);
-    let probe_handle = Some((
-        pa.handle,
-        pa.kernel_func_names,
-        pa.pipe_diag,
-        pa.output_done,
-        pa.param_names,
-        pa.render_hints,
-    ));
+    let probe_handle = Some(ProbeHandle {
+        thread: pa.handle,
+        func_names: pa.kernel_func_names,
+        pipeline_diag: pa.pipe_diag,
+        output_done: pa.output_done,
+        param_names: pa.param_names,
+        render_hints: pa.render_hints,
+    });
     collect_and_print_probe_data(pa.stop, probe_handle);
     Some(exit_code)
 }
@@ -1192,13 +1207,12 @@ fn collect_and_print_probe_data(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<ProbeHandle>,
 ) {
-    let Some((handle, func_names, pipeline_diag, output_done, param_names, render_hints)) = handle
-    else {
+    let Some(ph) = handle else {
         return;
     };
 
     stop.store(true, std::sync::atomic::Ordering::Release);
-    let (events, skeleton_diag, accumulated_fn_names) = match handle.join() {
+    let (events, skeleton_diag, accumulated_fn_names) = match ph.thread.join() {
         Ok((Some(events), diag, fnames)) => (events, diag, fnames),
         Ok((None, diag, fnames)) => (Vec::new(), diag, fnames),
         Err(_) => (
@@ -1210,7 +1224,7 @@ fn collect_and_print_probe_data(
 
     // Prefer accumulated func_names (includes both Phase A and Phase B).
     let effective_fn_names = if accumulated_fn_names.is_empty() {
-        &func_names
+        &ph.func_names
     } else {
         &accumulated_fn_names
     };
@@ -1218,14 +1232,14 @@ fn collect_and_print_probe_data(
     // The probe thread already emitted output on trigger/stop.
     // Only emit here if it somehow didn't (e.g. thread panicked
     // before reaching emit_probe_payload).
-    if !output_done.load(std::sync::atomic::Ordering::Acquire) {
+    if !ph.output_done.load(std::sync::atomic::Ordering::Acquire) {
         emit_probe_payload(
             &events,
             effective_fn_names,
-            &pipeline_diag,
+            &ph.pipeline_diag,
             &skeleton_diag,
-            &param_names,
-            &render_hints,
+            &ph.param_names,
+            &ph.render_hints,
         );
     }
 }
