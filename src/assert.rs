@@ -1129,11 +1129,10 @@ impl Assert {
     /// so a `NO_OVERRIDES` at either override layer leaves the defaults
     /// untouched -- which means "no override," not "no checks."
     pub const fn merge(&self, other: &Assert) -> Assert {
-        // `Option::or` is not yet const-stable (tracking issue
-        // rust-lang/rust#143874), so each field expands a match
-        // rather than calling `other.x.or(self.x)`. Keep it this way
-        // until `const fn` can call `Option::or`; at that point the
-        // 19 match blocks collapse to 19 `.or()` calls.
+        // `Option::or` is not yet const-stable, so each field expands
+        // a match rather than calling `other.x.or(self.x)`. Keep it
+        // this way until `const fn` can call `Option::or`; at that
+        // point the 19 match blocks collapse to 19 `.or()` calls.
         Assert {
             not_starved: match other.not_starved {
                 Some(v) => Some(v),

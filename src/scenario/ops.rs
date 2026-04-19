@@ -2761,7 +2761,6 @@ mod tests {
         /// Return an error from the Nth call (0-indexed from now) with
         /// the given message. Used by tests that verify error
         /// propagation through apply_setup.
-        #[allow(dead_code)]
         fn fail_call_at(&self, index: usize, message: &str) {
             *self.fail_at.lock().unwrap() = Some((index, message.to_string()));
         }

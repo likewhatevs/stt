@@ -19,9 +19,9 @@
 //    resolves at crate-root visibility there. Use `pub` for items
 //    build.rs needs, `fn` (private) for items lib.rs alone uses.
 // 3. **No `#[cfg(test)]` items referencing non-std test helpers.**
-//    build.rs still compiles them. Keep test helpers `use`-less or
-//    gate them behind `#[cfg(all(test, not(build)))]` if they need
-//    crates unavailable to build.rs.
+//    build.rs still compiles them. Keep `#[cfg(test)]` blocks inside
+//    this file restricted to std-only APIs so build.rs can still
+//    compile the fragment.
 // 4. **All functions are pure.** Callers supply inputs and handle
 //    caching — no global state, no `std::env::set_var`, no FS
 //    writes outside the caller-provided paths. Pure is what makes

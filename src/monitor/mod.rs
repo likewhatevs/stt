@@ -45,13 +45,6 @@ pub(crate) struct Cr3Pa(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PageOffset(pub u64);
 
-/// A kernel virtual address. Translated to a physical address via the
-/// text mapping (symbol addresses), the direct mapping (SLAB / kmalloc),
-/// or a full page-table walk (vmalloc / .bss). Newtype around `u64`;
-/// see [`Cr3Pa`] for the rationale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct Kva(pub u64);
-
 /// DSQ depth above this value indicates uninitialized guest memory.
 /// Real kernels never queue this many tasks on a single CPU's local DSQ.
 pub const DSQ_PLAUSIBILITY_CEILING: u32 = 10_000;

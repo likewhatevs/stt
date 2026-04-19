@@ -885,6 +885,12 @@ fn mount_filesystems() {
 /// match the previous behavior — the early guest init best-effort
 /// creates each mount point and continues regardless, since any
 /// real failure surfaces downstream when `mount()` itself fails.
+///
+/// Directory mode: std's `create_dir_all` creates directories with
+/// mode 0o777 masked by the process umask (default 0o022 yields
+/// 0o755). The guest init process inherits umask 0o022, so the
+/// resulting permissions match the `mkdir -p` default of 0o755 that
+/// this function replaced.
 fn mkdir_p(path: &str) {
     let _ = std::fs::create_dir_all(path);
 }

@@ -310,6 +310,11 @@ where
         .filter(|f| !required.contains(f) && !excluded.contains(f))
         .cloned()
         .collect();
+    debug_assert!(
+        optional.len() < 32,
+        "compute_flag_profiles: {} optional flags would overflow u32 power-set mask",
+        optional.len(),
+    );
     let mut out = Vec::new();
     for mask in 0..(1u32 << optional.len()) {
         let mut fl: Vec<T> = required.to_vec();
@@ -415,7 +420,7 @@ impl std::fmt::Debug for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Action::Steady => write!(f, "Steady"),
-            Action::Custom(_) => write!(f, "Custom(fn)"),
+            Action::Custom(_) => write!(f, "Custom(<closure>)"),
         }
     }
 }
@@ -814,6 +819,13 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         if let Some(cs) = cpusets.as_deref()
             && i >= cs.len()
         {
+            // Panic in debug builds to surface caller bugs early;
+            // release builds fall through to the warn + fallback below.
+            debug_assert!(
+                i < cs.len(),
+                "cgroup_idx {i} out of range for cpusets of len {}",
+                cs.len(),
+            );
             tracing::warn!(
                 cgroup_idx = i,
                 cpusets_len = cs.len(),

@@ -394,6 +394,9 @@ impl GuestMem {
         use crate::vmm::kvm::DRAM_START;
 
         const VALID: u64 = 1;
+        // 0b11 means "table descriptor" at PGD/PMD levels and "page
+        // descriptor" at the PTE level. Same encoding, role-dependent
+        // interpretation per ARMv8-A.
         const TABLE: u64 = 0b11;
         const BLOCK: u64 = 0b01;
         const DESC_MASK: u64 = 0b11;

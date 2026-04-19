@@ -667,7 +667,16 @@ fn read_ring_volatile(
 pub fn shm_write(buf: &mut [u8], shm_offset: usize, msg_type: u32, payload: &[u8]) -> usize {
     let header = read_header(buf, shm_offset);
     let capacity = header.capacity as usize;
-    let total = MSG_HEADER_SIZE + payload.len();
+    let Some(total) = MSG_HEADER_SIZE.checked_add(payload.len()) else {
+        // Pathological payload whose size overflows with the header
+        // prefix: treat as ring-full so the drops counter reflects the
+        // lost message, matching the capacity-overflow path below.
+        let drops_offset = shm_offset + 32;
+        let current = u64::from_ne_bytes(buf[drops_offset..drops_offset + 8].try_into().unwrap());
+        buf[drops_offset..drops_offset + 8]
+            .copy_from_slice(&current.saturating_add(1).to_ne_bytes());
+        return 0;
+    };
 
     // Available space: capacity - (write_ptr - read_ptr). Both ptrs
     // are monotonic u64 counters; `wrapping_sub` is the semantically
@@ -688,7 +697,10 @@ pub fn shm_write(buf: &mut [u8], shm_offset: usize, msg_type: u32, payload: &[u8
         );
         return 0;
     }
-    if used + total > capacity {
+    // `checked_add` guards against overflow on a pathological payload
+    // (MSG_HEADER_SIZE + usize::MAX). Treat overflow as ring-full.
+    let needed = used.checked_add(total);
+    if needed.is_none_or(|n| n > capacity) {
         // Ring full — increment drops counter. `saturating_add` because
         // a pinned-at-u64::MAX counter is the right observable state
         // when drops overflow; a wraparound to 0 would masquerade as
