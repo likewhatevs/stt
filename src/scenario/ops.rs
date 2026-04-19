@@ -852,11 +852,14 @@ pub fn execute_steps_with(
         if step_idx > 0 && !process_alive(ctx.sched_pid) {
             let mut r = collect_result(&mut state, effective_checks, ctx.topo);
             r.passed = false;
-            r.details.push(format!(
-                "scheduler crashed after completing step {} of {} ({:.1}s into test)",
-                step_idx,
-                steps.len(),
-                scenario_start.elapsed().as_secs_f64(),
+            r.details.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Monitor,
+                format!(
+                    "scheduler crashed after completing step {} of {} ({:.1}s into test)",
+                    step_idx,
+                    steps.len(),
+                    scenario_start.elapsed().as_secs_f64(),
+                ),
             ));
             return Ok(r);
         }
@@ -918,10 +921,13 @@ pub fn execute_steps_with(
 
     if sched_dead {
         result.passed = false;
-        result.details.push(format!(
-            "scheduler crashed during test (detected after all {} steps completed, {:.1}s elapsed)",
-            steps.len(),
-            scenario_start.elapsed().as_secs_f64(),
+        result.details.push(crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::Monitor,
+            format!(
+                "scheduler crashed during test (detected after all {} steps completed, {:.1}s elapsed)",
+                steps.len(),
+                scenario_start.elapsed().as_secs_f64(),
+            ),
         ));
     }
 

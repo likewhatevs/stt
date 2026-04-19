@@ -636,15 +636,18 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     // Capture kernel log on failure
     if !result.passed {
         for line in read_kmsg().lines() {
-            result.details.push(line.to_string());
+            result.details.push(line.to_string().into());
         }
     }
 
     if sched_dead {
         result.passed = false;
-        result.details.push(format!(
-            "scheduler crashed during workload ({:.1}s into test)",
-            scenario_start.elapsed().as_secs_f64(),
+        result.details.push(crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::Monitor,
+            format!(
+                "scheduler crashed during workload ({:.1}s into test)",
+                scenario_start.elapsed().as_secs_f64(),
+            ),
         ));
     }
 

@@ -51,7 +51,7 @@ fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<AssertResult> {
     }
     Ok(AssertResult {
         passed: false,
-        details: vec![format!("schedule address: {ip:?}")],
+        details: vec![format!("schedule address: {ip:?}").into()],
         stats: Default::default(),
     })
 }
@@ -683,16 +683,22 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
     // The VM must have more than the 2-CPU / 1-LLC default. Any
     // regression that replaces sysfs with the entry default will fail.
     if total < 4 {
-        details.push(format!("expected >= 4 CPUs, got {total}"));
+        details.push(ktstr::assert::AssertDetail::from(format!(
+            "expected >= 4 CPUs, got {total}"
+        )));
         passed = false;
     }
     if llcs < 2 {
-        details.push(format!("expected >= 2 LLCs, got {llcs}"));
+        details.push(ktstr::assert::AssertDetail::from(format!(
+            "expected >= 2 LLCs, got {llcs}"
+        )));
         passed = false;
     }
     // LLCs cannot exceed CPU count.
     if llcs > total {
-        details.push(format!("LLCs ({llcs}) > CPUs ({total})"));
+        details.push(ktstr::assert::AssertDetail::from(format!(
+            "LLCs ({llcs}) > CPUs ({total})"
+        )));
         passed = false;
     }
     if passed {

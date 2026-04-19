@@ -125,6 +125,119 @@ fn spread_threshold_pct() -> f64 {
     if cfg!(debug_assertions) { 35.0 } else { 15.0 }
 }
 
+/// Category tag for an [`AssertDetail`]. Enables structural filtering
+/// (e.g. by [`AssertPlan`]) without matching on substrings of
+/// human-readable messages, which is fragile if wording changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum DetailKind {
+    /// A worker made zero progress.
+    Starved,
+    /// A worker was stuck off-CPU longer than the gap threshold.
+    Stuck,
+    /// Spread between best and worst worker exceeded the fairness threshold.
+    Unfair,
+    /// A worker ran on a CPU outside its expected cpuset.
+    Isolation,
+    /// Throughput / benchmarking threshold failure (p99, CV, rate).
+    Benchmark,
+    /// Migration-ratio threshold failure (migrations per iteration).
+    Migration,
+    /// NUMA page locality threshold failure.
+    PageLocality,
+    /// Cross-node migration threshold failure.
+    CrossNodeMigration,
+    /// Slow-tier (memory tier) threshold failure.
+    SlowTier,
+    /// Scheduler-health diagnostic — includes monitor-subsystem anomalies
+    /// (imbalance, DSQ depth, rq_clock stall) and scheduler-liveness
+    /// detection (process crashes).
+    Monitor,
+    /// Skip notification (scenario could not run under this topology/flags).
+    Skip,
+    /// Uncategorized — falls through when a detail has no specific kind.
+    Other,
+}
+
+/// A single diagnostic message from an assertion, paired with a
+/// structural [`DetailKind`] so filtering is robust to wording changes.
+///
+/// `Deref<Target = str>` and `Display` forward to `message` so existing
+/// string-based probes (`d.contains("...")`, `format!("{d}")`) keep
+/// working; new code that needs to filter by category should match on
+/// `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssertDetail {
+    pub kind: DetailKind,
+    pub message: String,
+}
+
+impl PartialEq<&str> for AssertDetail {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
+impl PartialEq<str> for AssertDetail {
+    fn eq(&self, other: &str) -> bool {
+        self.message == *other
+    }
+}
+
+impl PartialEq<String> for AssertDetail {
+    fn eq(&self, other: &String) -> bool {
+        self.message == *other
+    }
+}
+
+impl AsRef<str> for AssertDetail {
+    fn as_ref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl AssertDetail {
+    pub fn new(kind: DetailKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for AssertDetail {
+    /// Conversion for uncategorized messages; defaults `kind` to
+    /// [`DetailKind::Other`]. Prefer [`AssertDetail::new`] when the
+    /// detail has a meaningful category.
+    fn from(message: String) -> Self {
+        Self {
+            kind: DetailKind::Other,
+            message,
+        }
+    }
+}
+
+impl From<&str> for AssertDetail {
+    fn from(s: &str) -> Self {
+        Self {
+            kind: DetailKind::Other,
+            message: s.to_string(),
+        }
+    }
+}
+
+impl std::ops::Deref for AssertDetail {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for AssertDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Result of checking a scenario run.
 ///
 /// Contains pass/fail status, human-readable detail messages, and
@@ -132,25 +245,26 @@ fn spread_threshold_pct() -> f64 {
 /// [`merge()`](AssertResult::merge).
 ///
 /// ```
-/// # use ktstr::assert::AssertResult;
+/// # use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 /// let mut a = AssertResult::pass();
 /// assert!(a.passed);
 ///
 /// let mut b = AssertResult::pass();
 /// b.passed = false;
-/// b.details.push("worker starved".into());
+/// b.details.push(AssertDetail::new(DetailKind::Starved, "worker starved"));
 ///
 /// a.merge(b);
 /// assert!(!a.passed);
-/// assert!(a.details.iter().any(|d| d.contains("starved")));
+/// assert!(a.details.iter().any(|d| d.kind == DetailKind::Starved));
 /// ```
 #[must_use = "test verdict is lost if not checked"]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssertResult {
     /// Whether all checks passed.
     pub passed: bool,
-    /// Human-readable diagnostic messages (failures, warnings).
-    pub details: Vec<String>,
+    /// Human-readable diagnostic messages (failures, warnings), each
+    /// tagged with a [`DetailKind`] for structural filtering.
+    pub details: Vec<AssertDetail>,
     /// Aggregated stats from all workers in this scenario.
     #[serde(default)]
     pub stats: ScenarioStats,
@@ -278,7 +392,7 @@ impl AssertResult {
     pub fn skip(reason: impl Into<String>) -> Self {
         Self {
             passed: true,
-            details: vec![reason.into()],
+            details: vec![AssertDetail::new(DetailKind::Skip, reason)],
             stats: Default::default(),
         }
     }
@@ -335,12 +449,26 @@ impl AssertResult {
             self.stats.worst_cross_node_migration_ratio =
                 other.stats.worst_cross_node_migration_ratio;
         }
-        // Merge extensible metrics: take worst (max) value per key.
+        // Merge extensible metrics: take worst per key according to
+        // each metric's polarity in the MetricDef registry. For
+        // `higher_is_worse: true` the worst is max; for
+        // `higher_is_worse: false` the worst is min. Unknown metrics
+        // default to max (treat them as higher-is-worse until the
+        // caller registers a MetricDef — conservative for regressions).
+        //
+        // `or_insert(*v)` rather than `or_insert(0.0)`: the old sentinel
+        // clobbered real-but-small values for min-polarity metrics on
+        // first merge, making the subsequent min comparison meaningless.
         for (k, v) in &other.stats.ext_metrics {
-            let entry = self.stats.ext_metrics.entry(k.clone()).or_insert(0.0);
-            if *v > *entry {
-                *entry = *v;
-            }
+            let higher_is_worse = crate::stats::metric_def(k)
+                .map(|m| m.higher_is_worse)
+                .unwrap_or(true);
+            let entry = self.stats.ext_metrics.entry(k.clone()).or_insert(*v);
+            *entry = if higher_is_worse {
+                entry.max(*v)
+            } else {
+                entry.min(*v)
+            };
         }
     }
 }
@@ -409,21 +537,26 @@ impl AssertPlan {
                 // Re-check spread against custom threshold. The default
                 // assert_not_starved uses spread_threshold_pct(); clear
                 // those failures and re-evaluate.
-                cgroup_result.details.retain(|d| !d.contains("unfair"));
+                cgroup_result
+                    .details
+                    .retain(|d| d.kind != DetailKind::Unfair);
                 if let Some(cg) = cgroup_result.stats.cgroups.first() {
                     if cg.spread > spread_limit && cg.num_workers >= 2 {
                         cgroup_result.passed = false;
-                        cgroup_result.details.push(format!(
-                            "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
-                            cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
-                            cg.num_workers, cg.num_cpus, spread_limit
+                        cgroup_result.details.push(AssertDetail::new(
+                            DetailKind::Unfair,
+                            format!(
+                                "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
+                                cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
+                                cg.num_workers, cg.num_cpus, spread_limit
+                            ),
                         ));
                     } else {
                         // Re-derive passed: only non-spread failures matter.
                         cgroup_result.passed = !cgroup_result
                             .details
                             .iter()
-                            .any(|d| d.contains("starved") || d.contains("stuck"));
+                            .any(|d| matches!(d.kind, DetailKind::Starved | DetailKind::Stuck));
                     }
                 }
             }
@@ -433,15 +566,20 @@ impl AssertPlan {
                 // assert_not_starved uses gap_threshold_ms() (2000ms
                 // release, 3000ms debug); clear those failures and
                 // re-evaluate.
-                cgroup_result.details.retain(|d| !d.contains("stuck"));
+                cgroup_result
+                    .details
+                    .retain(|d| d.kind != DetailKind::Stuck);
                 let had_gap_failure = reports.iter().any(|w| w.max_gap_ms > threshold);
                 if had_gap_failure {
                     cgroup_result.passed = false;
                     for w in reports {
                         if w.max_gap_ms > threshold {
-                            cgroup_result.details.push(format!(
-                                "stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
-                                w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold
+                            cgroup_result.details.push(AssertDetail::new(
+                                DetailKind::Stuck,
+                                format!(
+                                    "stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
+                                    w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold
+                                ),
                             ));
                         }
                     }
@@ -450,7 +588,7 @@ impl AssertPlan {
                     cgroup_result.passed = !cgroup_result
                         .details
                         .iter()
-                        .any(|d| d.contains("starved") || d.contains("unfair"));
+                        .any(|d| matches!(d.kind, DetailKind::Starved | DetailKind::Unfair));
                 }
             }
             r.merge(cgroup_result);
@@ -488,9 +626,12 @@ impl AssertPlan {
             };
             if ratio > max_ratio {
                 r.passed = false;
-                r.details.push(format!(
-                    "migration ratio {:.4} exceeds threshold {:.4} ({} migrations / {} iterations)",
-                    ratio, max_ratio, total_mig, total_iters,
+                r.details.push(AssertDetail::new(
+                    DetailKind::Migration,
+                    format!(
+                        "migration ratio {:.4} exceeds threshold {:.4} ({} migrations / {} iterations)",
+                        ratio, max_ratio, total_mig, total_iters,
+                    ),
                 ));
             }
         }
@@ -575,9 +716,12 @@ fn assert_slow_tier_ratio(
     let ratio = slow_pages as f64 / total_pages as f64;
     if ratio > max_ratio {
         r.passed = false;
-        r.details.push(format!(
-            "slow-tier page ratio {ratio:.4} exceeds threshold {max_ratio:.4} \
-             ({slow_pages}/{total_pages} pages on non-CPU nodes)",
+        r.details.push(AssertDetail::new(
+            DetailKind::SlowTier,
+            format!(
+                "slow-tier page ratio {ratio:.4} exceeds threshold {max_ratio:.4} \
+                 ({slow_pages}/{total_pages} pages on non-CPU nodes)",
+            ),
         ));
     }
     r
@@ -598,8 +742,11 @@ pub fn assert_page_locality(
         && observed < threshold
     {
         r.passed = false;
-        r.details.push(format!(
-            "page locality {observed:.4} below threshold {threshold:.4} ({local_pages}/{total_pages} pages local)",
+        r.details.push(AssertDetail::new(
+            DetailKind::PageLocality,
+            format!(
+                "page locality {observed:.4} below threshold {threshold:.4} ({local_pages}/{total_pages} pages local)",
+            ),
         ));
     }
     r
@@ -624,8 +771,11 @@ pub fn assert_cross_node_migration(
         };
         if ratio > threshold {
             r.passed = false;
-            r.details.push(format!(
-                "cross-node migration ratio {ratio:.4} exceeds threshold {threshold:.4} ({migrated_pages}/{total_pages} pages migrated)",
+            r.details.push(AssertDetail::new(
+                DetailKind::CrossNodeMigration,
+                format!(
+                    "cross-node migration ratio {ratio:.4} exceeds threshold {threshold:.4} ({migrated_pages}/{total_pages} pages migrated)",
+                ),
             ));
         }
     }
@@ -1145,8 +1295,10 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
         let bad: BTreeSet<usize> = w.cpus_used.difference(expected).copied().collect();
         if !bad.is_empty() {
             r.passed = false;
-            r.details
-                .push(format!("tid {} ran on unexpected CPUs {:?}", w.tid, bad));
+            r.details.push(AssertDetail::new(
+                DetailKind::Isolation,
+                format!("tid {} ran on unexpected CPUs {:?}", w.tid, bad),
+            ));
         }
     }
     r
@@ -1170,6 +1322,27 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// assert!(r.passed);
 /// assert_eq!(r.stats.total_workers, 1);
 /// ```
+/// Nearest-rank percentile of a sorted slice (`p` in `[0.0, 1.0]`).
+///
+/// Returns the value at index `ceil(n * p) - 1`, clamped into
+/// `[0, n-1]`. For `n = 100` and `p = 0.99` this is `sorted[98]` (the
+/// 99th element in 1-indexed order), not `sorted[99]` (the max). The
+/// previous formulation, `ceil(n * 0.99)` without the `-1`, was
+/// off-by-one and returned the max for `n = 100`.
+///
+/// Callers must pass a sorted non-empty slice; an empty slice yields
+/// `0` (the caller should short-circuit before invoking).
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let n = sorted.len();
+    let idx = ((n as f64 * p).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    sorted[idx]
+}
+
 pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     let mut r = AssertResult::pass();
     if reports.is_empty() {
@@ -1185,8 +1358,10 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     for w in reports {
         if w.work_units == 0 {
             r.passed = false;
-            r.details
-                .push(format!("tid {} starved (0 work units)", w.tid));
+            r.details.push(AssertDetail::new(
+                DetailKind::Starved,
+                format!("tid {} starved (0 work units)", w.tid),
+            ));
         }
         if w.wall_time_ns > 0 {
             pcts.push(w.off_cpu_ns as f64 / w.wall_time_ns as f64 * 100.0);
@@ -1217,8 +1392,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     } else {
         let mut sorted = all_latencies.clone();
         sorted.sort_unstable();
-        let p99_idx = (sorted.len() as f64 * 0.99).ceil() as usize;
-        let p99 = sorted[p99_idx.min(sorted.len() - 1)] as f64 / 1000.0;
+        let p99 = percentile(&sorted, 0.99) as f64 / 1000.0;
         let median = sorted[sorted.len() / 2] as f64 / 1000.0;
         let n = all_latencies.len() as f64;
         let mean_ns = all_latencies.iter().sum::<u64>() as f64 / n;
@@ -1280,13 +1454,16 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     let spread_limit = spread_threshold_pct();
     if spread > spread_limit && pcts.len() >= 2 {
         r.passed = false;
-        r.details.push(format!(
-            "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus",
-            spread,
-            min,
-            max,
-            reports.len(),
-            cpus.len(),
+        r.details.push(AssertDetail::new(
+            DetailKind::Unfair,
+            format!(
+                "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus",
+                spread,
+                min,
+                max,
+                reports.len(),
+                cpus.len(),
+            ),
         ));
     }
 
@@ -1295,9 +1472,12 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     for w in reports {
         if w.max_gap_ms > gap_limit {
             r.passed = false;
-            r.details.push(format!(
-                "stuck {}ms on cpu{} at +{}ms",
-                w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms
+            r.details.push(AssertDetail::new(
+                DetailKind::Stuck,
+                format!(
+                    "stuck {}ms on cpu{} at +{}ms",
+                    w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms
+                ),
             ));
         }
     }
@@ -1384,8 +1564,11 @@ pub fn assert_throughput_parity(
         let cv = stddev / mean;
         if cv > cv_limit {
             r.passed = false;
-            r.details.push(format!(
-                "throughput CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0} work/cpu_s)"
+            r.details.push(AssertDetail::new(
+                DetailKind::Benchmark,
+                format!(
+                    "throughput CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0} work/cpu_s)"
+                ),
             ));
         }
     }
@@ -1394,9 +1577,12 @@ pub fn assert_throughput_parity(
         for (i, &rate) in rates.iter().enumerate() {
             if rate < floor {
                 r.passed = false;
-                r.details.push(format!(
-                    "worker {} throughput {rate:.0} work/cpu_s below floor {floor:.0}",
-                    reports[i].tid
+                r.details.push(AssertDetail::new(
+                    DetailKind::Benchmark,
+                    format!(
+                        "worker {} throughput {rate:.0} work/cpu_s below floor {floor:.0}",
+                        reports[i].tid
+                    ),
                 ));
             }
         }
@@ -1447,13 +1633,15 @@ pub fn assert_benchmarks(
     {
         let mut sorted = all_latencies.clone();
         sorted.sort_unstable();
-        let p99_idx = (sorted.len() as f64 * 0.99).ceil() as usize;
-        let p99 = sorted[p99_idx.min(sorted.len() - 1)];
+        let p99 = percentile(&sorted, 0.99);
         if p99 > p99_limit {
             r.passed = false;
-            r.details.push(format!(
-                "p99 wake latency {p99}ns exceeds limit {p99_limit}ns ({} samples)",
-                sorted.len()
+            r.details.push(AssertDetail::new(
+                DetailKind::Benchmark,
+                format!(
+                    "p99 wake latency {p99}ns exceeds limit {p99_limit}ns ({} samples)",
+                    sorted.len()
+                ),
             ));
         }
     }
@@ -1472,8 +1660,11 @@ pub fn assert_benchmarks(
             let cv = variance.sqrt() / mean;
             if cv > cv_limit {
                 r.passed = false;
-                r.details.push(format!(
-                    "wake latency CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0}ns)"
+                r.details.push(AssertDetail::new(
+                    DetailKind::Benchmark,
+                    format!(
+                        "wake latency CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0}ns)"
+                    ),
                 ));
             }
         }
@@ -1487,9 +1678,12 @@ pub fn assert_benchmarks(
             let rate = w.iterations as f64 / (w.wall_time_ns as f64 / 1e9);
             if rate < rate_floor {
                 r.passed = false;
-                r.details.push(format!(
-                    "worker {} iteration rate {rate:.1}/s below floor {rate_floor:.1}/s",
-                    w.tid
+                r.details.push(AssertDetail::new(
+                    DetailKind::Benchmark,
+                    format!(
+                        "worker {} iteration rate {rate:.1}/s below floor {rate_floor:.1}/s",
+                        w.tid
+                    ),
                 ));
             }
         }
@@ -1726,6 +1920,101 @@ mod tests {
     }
 
     #[test]
+    fn merge_ext_metrics_higher_is_worse_takes_max() {
+        // "worst_spread" is registered with higher_is_worse=true → merge max.
+        let mut a = AssertResult::pass();
+        a.stats.ext_metrics.insert("worst_spread".into(), 10.0);
+        let mut b = AssertResult::pass();
+        b.stats.ext_metrics.insert("worst_spread".into(), 42.0);
+        a.merge(b);
+        assert_eq!(a.stats.ext_metrics["worst_spread"], 42.0);
+    }
+
+    #[test]
+    fn merge_ext_metrics_higher_is_better_takes_min() {
+        // Regression: "total_iterations" is registered with
+        // higher_is_worse=false. Merge must take min (worst case)
+        // rather than max (best case). Previously returned 42.0.
+        let mut a = AssertResult::pass();
+        a.stats.ext_metrics.insert("total_iterations".into(), 10.0);
+        let mut b = AssertResult::pass();
+        b.stats.ext_metrics.insert("total_iterations".into(), 42.0);
+        a.merge(b);
+        assert_eq!(
+            a.stats.ext_metrics["total_iterations"], 10.0,
+            "higher_is_worse=false must take min on merge"
+        );
+    }
+
+    #[test]
+    fn merge_ext_metrics_unknown_metric_defaults_to_max() {
+        // Unregistered metric names fall back to max (conservative —
+        // treat as higher-is-worse until a MetricDef is registered).
+        let mut a = AssertResult::pass();
+        a.stats.ext_metrics.insert("unknown_metric".into(), 10.0);
+        let mut b = AssertResult::pass();
+        b.stats.ext_metrics.insert("unknown_metric".into(), 42.0);
+        a.merge(b);
+        assert_eq!(a.stats.ext_metrics["unknown_metric"], 42.0);
+    }
+
+    #[test]
+    fn merge_ext_metrics_first_insert_uses_other_value() {
+        // When the key is absent on self, insert other's value verbatim
+        // regardless of polarity (no prior value to compare against).
+        let mut a = AssertResult::pass();
+        let mut b = AssertResult::pass();
+        b.stats.ext_metrics.insert("total_iterations".into(), 77.0);
+        a.merge(b);
+        assert_eq!(a.stats.ext_metrics["total_iterations"], 77.0);
+    }
+
+    // -- percentile: nearest-rank without off-by-one --
+
+    #[test]
+    fn percentile_empty_slice_is_zero() {
+        assert_eq!(percentile(&[], 0.99), 0);
+    }
+
+    #[test]
+    fn percentile_single_element() {
+        assert_eq!(percentile(&[42], 0.99), 42);
+    }
+
+    #[test]
+    fn percentile_p99_of_100_samples_is_element_98() {
+        // Regression: previous formulation `ceil(n * 0.99)` returned
+        // index 99 (the max) for n=100. The correct nearest-rank p99
+        // of [0, 1, 2, ..., 99] is 98 — the 99th element 1-indexed.
+        let sorted: Vec<u64> = (0..100).collect();
+        assert_eq!(percentile(&sorted, 0.99), 98);
+    }
+
+    #[test]
+    fn percentile_p99_of_1000_samples_is_element_989() {
+        let sorted: Vec<u64> = (0..1000).collect();
+        assert_eq!(percentile(&sorted, 0.99), 989);
+    }
+
+    #[test]
+    fn percentile_saturates_into_bounds_for_small_n() {
+        // For very small n, ceil(n * 0.99) may equal n, so the helper
+        // must saturating_sub(1) and clamp to n-1 to stay in bounds.
+        for n in 1u64..=10 {
+            let sorted: Vec<u64> = (0..n).collect();
+            let v = percentile(&sorted, 0.99);
+            assert!(v < n, "percentile({sorted:?}, 0.99)={v} must be < n ({n})");
+        }
+    }
+
+    #[test]
+    fn percentile_p50_on_odd_count_is_middle() {
+        // p50 of [0..9] at nearest-rank: ceil(9 * 0.5) - 1 = 4.
+        let sorted: Vec<u64> = (0..9).collect();
+        assert_eq!(percentile(&sorted, 0.50), 4);
+    }
+
+    #[test]
     fn isolation_empty_reports() {
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
         assert!(assert_isolation(&[], &expected).passed);
@@ -1867,6 +2156,66 @@ mod tests {
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("stuck")));
         assert!(r.details.iter().any(|d| d.contains("threshold 1500ms")));
+    }
+
+    #[test]
+    fn plan_custom_gap_threshold_produces_stuck_kind() {
+        // Regression for #22: AssertPlan's custom-threshold stuck
+        // re-emission must tag DetailKind::Stuck so downstream kind
+        // filters (and any test expecting structural categorization)
+        // see it.
+        let plan = AssertPlan::new().check_not_starved().max_gap_ms(1500);
+        let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
+        let r = plan.assert_cgroup(&reports, None, None);
+        assert!(!r.passed);
+        assert!(
+            r.details.iter().any(|d| d.kind == DetailKind::Stuck),
+            "custom gap override must produce a Stuck-kind detail: {:?}",
+            r.details
+        );
+    }
+
+    #[test]
+    fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_starved() {
+        // Regression for #22: when custom spread + gap thresholds are
+        // permissive enough to absorb the default-threshold failures,
+        // AssertPlan must strip the Unfair/Stuck details it generated
+        // but keep the Starved detail (kind-based filtering, not
+        // substring match).
+        //
+        // Worker 1: 10% off-CPU, 500ms gap — fair, not stuck.
+        // Worker 2: work=0 — starved (kind=Starved).
+        // Worker 3: 80% off-CPU — would trigger default Unfair; absorbed
+        //                         by permissive max_spread_pct.
+        // Worker 4: 4000ms gap — would trigger default Stuck; absorbed
+        //                        by permissive max_gap_ms.
+        let reports = [
+            rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 500),
+            rpt(2, 0, 5e9 as u64, 0, &[0], 500),
+            rpt(3, 500, 5e9 as u64, 4e9 as u64, &[0], 500),
+            rpt(4, 1000, 5e9 as u64, 5e8 as u64, &[0], 4000),
+        ];
+        let mut plan = AssertPlan::new();
+        plan.not_starved = true;
+        plan.max_spread_pct = Some(100.0);
+        plan.max_gap_ms = Some(5000);
+        let r = plan.assert_cgroup(&reports, None, None);
+        assert!(
+            r.details.iter().any(|d| d.kind == DetailKind::Starved),
+            "starved detail must survive permissive overrides: {:?}",
+            r.details
+        );
+        assert!(
+            !r.details.iter().any(|d| d.kind == DetailKind::Unfair),
+            "unfair detail must be cleared by permissive spread: {:?}",
+            r.details
+        );
+        assert!(
+            !r.details.iter().any(|d| d.kind == DetailKind::Stuck),
+            "stuck detail must be cleared by permissive gap: {:?}",
+            r.details
+        );
+        assert!(!r.passed, "starved alone is still a failure");
     }
 
     #[test]
@@ -2704,6 +3053,60 @@ mod tests {
     }
 
     #[test]
+    fn assert_benchmarks_p99_n100_at_limit_passes() {
+        // Regression for #23: with samples [0..100], the corrected p99
+        // is 98 (nearest-rank: sorted[ceil(100*0.99) - 1] = sorted[98]).
+        // Setting the limit to 99 must pass (98 <= 99). Under the old
+        // off-by-one formulation, the returned p99 was 99 (the max),
+        // which would have been exactly at the limit (99 <= 99) — the
+        // same pass, but for the wrong reason. Pairing this with the
+        // _fail test below pins down the correct index.
+        let latencies: Vec<u64> = (0..100).collect();
+        let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
+        let r = assert_benchmarks(&reports, Some(99), None, None);
+        assert!(
+            r.passed,
+            "p99 should be 98, under limit 99: {:?}",
+            r.details
+        );
+    }
+
+    #[test]
+    fn assert_benchmarks_p99_n100_below_old_p100_passes() {
+        // Tighter regression: with samples [0..100], set the limit to
+        // 98. Correct p99 (98) equals the limit and passes (strict
+        // `p99 > p99_limit` comparison). The old off-by-one returned
+        // 99, which would have FAILED (99 > 98). This test therefore
+        // only passes with the corrected index.
+        let latencies: Vec<u64> = (0..100).collect();
+        let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
+        let r = assert_benchmarks(&reports, Some(98), None, None);
+        assert!(
+            r.passed,
+            "corrected p99 (98) must equal limit 98 and pass: {:?}",
+            r.details
+        );
+    }
+
+    #[test]
+    fn assert_not_starved_p99_n100_is_99_microseconds() {
+        // Regression for #23: assert_not_starved exposes p99 as
+        // microseconds via ScenarioStats. Samples = [1000, 2000, ...,
+        // 100_000] ns (100 values at kilo-ns spacing) so the reported
+        // p99 is exactly 99.0us with the corrected index
+        // (sorted[ceil(100*0.99) - 1] = sorted[98] = 99_000ns = 99us).
+        // The old off-by-one returned sorted[99] = 100_000ns = 100us.
+        let latencies: Vec<u64> = (1..=100).map(|v: u64| v * 1000).collect();
+        let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
+        let r = assert_not_starved(&reports);
+        assert_eq!(
+            r.stats.p99_wake_latency_us, 99.0,
+            "p99 must equal 99.0us (sorted[98] = 99_000ns), got {}us",
+            r.stats.p99_wake_latency_us
+        );
+    }
+
+    #[test]
     fn assert_benchmarks_p99_fail() {
         let reports = [rpt_with_latencies(
             1,
@@ -2794,7 +3197,7 @@ mod tests {
         assert!(r.passed, "{:?}", r.details);
         let s = &r.stats;
         // p99 of [1000,2000,3000,4000,5000,6000,7000,8000,9000,10000] in us:
-        // sorted, p99_idx = ceil(10*0.99) = 10, clamped to 9 -> 10000ns = 10.0us
+        // sorted, percentile index = ceil(10*0.99) - 1 = 9 -> sorted[9] = 10000ns = 10.0us
         assert!(
             s.p99_wake_latency_us > 9.0,
             "p99: {}",

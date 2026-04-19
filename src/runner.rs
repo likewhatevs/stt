@@ -311,7 +311,7 @@ impl Runner {
                         v.passed = false;
                         for line in output.lines() {
                             if !line.trim().is_empty() {
-                                v.details.push(line.to_string());
+                                v.details.push(line.to_string().into());
                             }
                         }
                     }
@@ -319,7 +319,7 @@ impl Runner {
                         scenario_name: qname,
                         passed: v.passed,
                         duration_s: start.elapsed().as_secs_f64(),
-                        details: v.details,
+                        details: v.details.into_iter().map(|d| d.message).collect(),
                         stats: v.stats,
                     }
                 }

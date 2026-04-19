@@ -142,11 +142,14 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
         for w in &reports {
             if w.max_gap_ms > 1500 {
                 r.passed = false;
-                r.details.push(format!(
-                    "pinned worker {} on CPU {} had {}ms gap (dispatch contention stall)",
-                    w.tid,
-                    w.cpus_used.iter().next().unwrap_or(&0),
-                    w.max_gap_ms
+                r.details.push(crate::assert::AssertDetail::new(
+                    crate::assert::DetailKind::Stuck,
+                    format!(
+                        "pinned worker {} on CPU {} had {}ms gap (dispatch contention stall)",
+                        w.tid,
+                        w.cpus_used.iter().next().unwrap_or(&0),
+                        w.max_gap_ms
+                    ),
                 ));
             }
         }

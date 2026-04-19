@@ -1925,7 +1925,12 @@ fn evaluate_vm_result(
         write_sidecar(entry, result, stimulus_events, &verify_result, &work_type);
 
         if !verify_result.passed {
-            let details = verify_result.details.join("\n  ");
+            let details = verify_result
+                .details
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ");
             let repro = if entry.scheduler.binary.has_active_scheduling() {
                 repro_fn(output)
             } else {
@@ -2981,7 +2986,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         Err(e) => {
             let r = AssertResult {
                 passed: false,
-                details: vec![format!("{e:#}")],
+                details: vec![format!("{e:#}").into()],
                 stats: Default::default(),
             };
             try_flush_profraw();
@@ -3317,7 +3322,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         Err(e) => {
             let r = crate::assert::AssertResult {
                 passed: false,
-                details: vec![format!("{e:#}")],
+                details: vec![format!("{e:#}").into()],
                 stats: Default::default(),
             };
             try_flush_profraw();

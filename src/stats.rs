@@ -73,11 +73,12 @@ impl MetricDef {
 /// assertion overrides can still use their own thresholds; this registry
 /// is the source of truth for polarity and display.
 ///
-/// Note: `AssertResult::merge` always takes the max value per metric
-/// (ext_metrics). For `higher_is_worse: false` metrics (total_iterations,
-/// page_locality), merge produces the best case, not the worst. The
-/// comparison system ([`compare_runs`]) uses `higher_is_worse`
-/// correctly for delta direction regardless of merge behavior.
+/// `AssertResult::merge` consults `higher_is_worse` via [`metric_def`]
+/// when folding per-cgroup `ext_metrics` into the scenario-level worst
+/// case: `true` takes max, `false` takes min. Unknown names (not in
+/// this registry) default to max; register a `MetricDef` here before
+/// relying on min-polarity merge. The comparison system
+/// ([`compare_runs`]) uses `higher_is_worse` for delta direction.
 pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_spread",
