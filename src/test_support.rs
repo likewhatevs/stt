@@ -933,6 +933,39 @@ pub(crate) struct TopoOverride {
     pub memory_mb: u32,
 }
 
+impl TopoOverride {
+    /// Reject zero-valued fields. The proc macro validates the same
+    /// constraints at compile time for attribute-built entries; this
+    /// covers runtime-constructed overrides (topology gauntlet
+    /// presets, CLI flags that bypass the macro).
+    ///
+    /// Unlike the auto-derived `entry.memory_mb` path, which floors
+    /// to `max(256, cpus*64)`, an explicit override is used verbatim
+    /// — so `memory_mb == 0` would instruct the VM builder to boot
+    /// with zero memory, which is a silent configuration error.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.numa_nodes == 0 {
+            anyhow::bail!("TopoOverride.numa_nodes must be > 0");
+        }
+        if self.llcs == 0 {
+            anyhow::bail!("TopoOverride.llcs must be > 0");
+        }
+        if self.cores == 0 {
+            anyhow::bail!("TopoOverride.cores must be > 0");
+        }
+        if self.threads == 0 {
+            anyhow::bail!("TopoOverride.threads must be > 0");
+        }
+        if self.memory_mb == 0 {
+            anyhow::bail!(
+                "TopoOverride.memory_mb must be > 0 (a VM with zero memory \
+                 cannot boot); no implicit floor is applied to override path"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Parse a topology string in "NnNlNcNt" or legacy "NsNcNt" format.
 /// `n` = NUMA nodes, `l` = LLCs, `c` = cores/LLC, `t` = threads/core.
 /// Returns `(numa_nodes, llcs, cores, threads)` or None on parse failure.
@@ -1662,6 +1695,9 @@ fn run_ktstr_test_inner(
     topo: Option<&TopoOverride>,
     active_flags: &[String],
 ) -> Result<AssertResult> {
+    if let Some(t) = topo {
+        t.validate().context("TopoOverride validation")?;
+    }
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
         eprintln!(
             "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
@@ -4555,7 +4591,7 @@ mod tests {
 
     #[test]
     fn parse_assert_result_valid() {
-        let json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("noise\n{RESULT_START}\n{json}\n{RESULT_END}\nmore");
         let r = parse_assert_result(&output).unwrap();
         assert!(r.passed);
@@ -4575,7 +4611,7 @@ mod tests {
 
     #[test]
     fn parse_assert_result_failed() {
-        let json = r#"{"passed":false,"details":["stuck 3000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let r = parse_assert_result(&output).unwrap();
         assert!(!r.passed);
@@ -4677,7 +4713,7 @@ mod tests {
 
     #[test]
     fn parse_assert_result_with_details() {
-        let json = r#"{"passed":false,"details":["err1","err2"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Other","message":"err1"},{"kind":"Other","message":"err2"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let r = parse_assert_result(&output).unwrap();
         assert!(!r.passed);
@@ -6194,6 +6230,83 @@ mod tests {
         assert_eq!(t.memory_mb, 8192);
     }
 
+    #[test]
+    fn topo_override_validate_accepts_nonzero() {
+        let t = TopoOverride {
+            numa_nodes: 1,
+            llcs: 2,
+            cores: 4,
+            threads: 2,
+            memory_mb: 8192,
+        };
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn topo_override_validate_rejects_zero_memory() {
+        let t = TopoOverride {
+            numa_nodes: 1,
+            llcs: 2,
+            cores: 4,
+            threads: 2,
+            memory_mb: 0,
+        };
+        let err = t.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("memory_mb") && msg.contains("> 0"),
+            "error must name memory_mb: {msg}"
+        );
+    }
+
+    #[test]
+    fn topo_override_validate_rejects_zero_numa_nodes() {
+        let t = TopoOverride {
+            numa_nodes: 0,
+            llcs: 2,
+            cores: 4,
+            threads: 2,
+            memory_mb: 8192,
+        };
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn topo_override_validate_rejects_zero_llcs() {
+        let t = TopoOverride {
+            numa_nodes: 1,
+            llcs: 0,
+            cores: 4,
+            threads: 2,
+            memory_mb: 8192,
+        };
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn topo_override_validate_rejects_zero_cores() {
+        let t = TopoOverride {
+            numa_nodes: 1,
+            llcs: 2,
+            cores: 0,
+            threads: 2,
+            memory_mb: 8192,
+        };
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn topo_override_validate_rejects_zero_threads() {
+        let t = TopoOverride {
+            numa_nodes: 1,
+            llcs: 2,
+            cores: 4,
+            threads: 0,
+            memory_mb: 8192,
+        };
+        assert!(t.validate().is_err());
+    }
+
     // -- evaluate_vm_result error path tests --
 
     fn dummy_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
@@ -6542,7 +6655,7 @@ mod tests {
 
     #[test]
     fn eval_verify_result_passed_returns_ok() {
-        let json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_pass__");
         let result = make_vm_result(&output, "", 0, false);
@@ -6564,7 +6677,7 @@ mod tests {
 
     #[test]
     fn eval_verify_result_failed_includes_details() {
-        let json = r#"{"passed":false,"details":["stuck 3000ms","spread 45%"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"},{"kind":"Unfair","message":"spread 45%"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_fail_details__");
         let result = make_vm_result(&output, "", 0, false);
@@ -6589,7 +6702,7 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_includes_sched_log() {
-        let json = r#"{"passed":false,"details":["worker 0 stuck 5000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"worker 0 stuck 5000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
         );
@@ -6616,7 +6729,7 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_has_fingerprint() {
-        let json = r#"{"passed":false,"details":["stuck 3000ms"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let error_line = "Error: apply_cell_config BPF program returned error -2";
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
@@ -6706,7 +6819,7 @@ mod tests {
 
     #[test]
     fn eval_no_sched_output_no_fingerprint() {
-        let json = r#"{"passed":false,"details":["stuck"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_no_fp__");
         let result = make_vm_result(&output, "", 0, false);
@@ -6729,7 +6842,7 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_has_fingerprint() {
-        let pass_json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let error_line = "Error: imbalance detected internally";
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
@@ -7171,7 +7284,7 @@ mod tests {
 
     #[test]
     fn eval_sched_died_includes_console() {
-        let json = r#"{"passed":false,"details":["scheduler crashed after completing step 1 of 2 (0.5s into test)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
@@ -7195,7 +7308,7 @@ mod tests {
 
     #[test]
     fn eval_sched_died_includes_monitor() {
-        let json = r#"{"passed":false,"details":["scheduler crashed during workload (2.0s into test)"],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_monitor__");
         let result = crate::vmm::VmResult {
@@ -7246,7 +7359,7 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_includes_sched_log() {
-        let pass_json = r#"{"passed":true,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
         let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");

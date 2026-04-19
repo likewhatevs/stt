@@ -2860,13 +2860,19 @@ mod tests {
     #[test]
     fn read_sched_domain_tree_max_depth_bound_on_long_chain() {
         let sd_off = test_sched_domain_offsets();
-        // Per-struct size matches make_sd_buffer's internal layout
+        // Per-struct size covers make_sd_buffer's layout
         // (sd_ttwu_move_balance=232 + 4 bytes for that u32 + 8 bytes
-        // guard = 244). Each sched_domain lives at a distinct PA and
-        // points at the next via sd->parent, forming an acyclic chain
-        // longer than MAX_DEPTH so the depth bound — not the visited
-        // set — is what stops the walk.
-        const SD_SIZE: u64 = 244;
+        // guard = 244) rounded up to the next multiple of 8. The
+        // readers use `ptr::read_volatile(*const u64)`, which is UB
+        // on misaligned pointers (triggers ABRT under the std's
+        // debug alignment check on some archs). With first_pa=1024
+        // (already 8-aligned) and a 248-byte stride, every per-domain
+        // PA is 8-aligned, so u64 reads land on aligned addresses.
+        // Each sched_domain lives at a distinct PA and points at the
+        // next via sd->parent, forming an acyclic chain longer than
+        // MAX_DEPTH so the depth bound — not the visited set — is
+        // what stops the walk.
+        const SD_SIZE: u64 = 248;
         const CHAIN_LEN: usize = 10;
         let first_pa: u64 = 1024;
 

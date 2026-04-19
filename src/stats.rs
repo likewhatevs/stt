@@ -1750,7 +1750,7 @@ mod tests {
         let rows = extract_rows(&results);
         let df = build_dataframe(&rows).unwrap();
         assert_eq!(df.height(), 2);
-        assert_eq!(df.width(), 29);
+        assert_eq!(df.width(), 30);
     }
 
     #[test]

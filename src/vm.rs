@@ -49,6 +49,9 @@ impl Default for VmConfig {
 /// optional scheduler), and boots the VM. Returns the VM's exit
 /// result including serial output.
 pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
+    if cfg.memory_mb == 0 {
+        anyhow::bail!("VmConfig.memory_mb must be > 0 (a VM with zero memory cannot boot)");
+    }
     // Resolve kernel
     let kernel = if let Some(ref kd) = cfg.kernel_dir {
         #[cfg(target_arch = "x86_64")]
@@ -534,6 +537,20 @@ mod tests {
                 cpus
             );
         }
+    }
+
+    #[test]
+    fn run_in_vm_rejects_zero_memory() {
+        let cfg = VmConfig {
+            memory_mb: 0,
+            ..VmConfig::default()
+        };
+        let err = run_in_vm(&cfg, &[]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("memory_mb") && msg.contains("> 0"),
+            "error must name the field: {msg}"
+        );
     }
 
     #[test]

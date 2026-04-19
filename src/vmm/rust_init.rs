@@ -906,6 +906,47 @@ fn create_cgroup_parent_from_sched_args() {
     }
 }
 
+/// Outcome of [`poll_startup`].
+#[derive(Debug)]
+enum StartupStatus {
+    /// Child exited before the poll window closed.
+    Died,
+    /// Child was still running when the poll window closed.
+    Alive,
+    /// `try_wait` returned an error (treated as alive by the caller
+    /// so the test can still proceed).
+    WaitError(std::io::Error),
+}
+
+/// Poll a freshly-spawned child at `interval` cadence for up to
+/// `timeout`. Returns as soon as the child exits (detecting early
+/// failure faster than a single `sleep(timeout)`) or when the window
+/// closes with the child still running.
+///
+/// Replaces an unconditional `sleep(1s)` — most healthy schedulers
+/// stay up indefinitely, so the poll never shortens the happy path,
+/// but an instant-death case now surfaces within one interval
+/// instead of a full second.
+fn poll_startup(
+    child: &mut Child,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> StartupStatus {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return StartupStatus::Died,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    return StartupStatus::Alive;
+                }
+                std::thread::sleep(interval);
+            }
+            Err(e) => return StartupStatus::WaitError(e),
+        }
+    }
+}
+
 /// Start the scheduler binary if it exists. Returns the child process
 /// and the path to its log file.
 #[tracing::instrument]
@@ -960,10 +1001,12 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                 std::env::set_var("SCHED_PID", child.id().to_string());
             }
 
-            // Wait 1 second and check if scheduler is alive.
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            match child.try_wait() {
-                Ok(Some(_status)) => {
+            match poll_startup(
+                &mut child,
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(1),
+            ) {
+                StartupStatus::Died => {
                     // Scheduler died during startup.
                     write_com2("===SCHED_OUTPUT_START===");
                     dump_file_to_com2(log_path);
@@ -972,11 +1015,11 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                     write_com2("KTSTR_EXIT=1");
                     force_reboot();
                 }
-                Ok(None) => {
-                    // Still running.
+                StartupStatus::Alive => {
+                    // Still running after timeout.
                     (Some(child), Some(log_path.to_string()))
                 }
-                Err(e) => {
+                StartupStatus::WaitError(e) => {
                     eprintln!("ktstr-init: check scheduler status: {e}");
                     (Some(child), Some(log_path.to_string()))
                 }
@@ -1325,5 +1368,64 @@ mod tests {
     fn parse_topo_from_cmdline_not_present_on_host() {
         // Host /proc/cmdline won't contain KTSTR_TOPO.
         assert!(parse_topo_from_cmdline().is_none());
+    }
+
+    /// A child that exits immediately must be observed as `Died`
+    /// well before the poll timeout. This is the regression gate
+    /// for the old unconditional `sleep(1s)` — we don't want to
+    /// wait a full second to notice an instant crash.
+    #[test]
+    fn poll_startup_detects_early_death_quickly() {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let start = std::time::Instant::now();
+        let status = poll_startup(
+            &mut child,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(1),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(status, StartupStatus::Died),
+            "expected Died, got {status:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "early death must be detected fast, took {elapsed:?}"
+        );
+    }
+
+    /// A child that stays alive past the poll window must be
+    /// observed as `Alive` within ~timeout — the caller accepts
+    /// this as "scheduler ready" without any longer wait.
+    #[test]
+    fn poll_startup_reports_alive_after_timeout() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let start = std::time::Instant::now();
+        let status = poll_startup(
+            &mut child,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(100),
+        );
+        let elapsed = start.elapsed();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            matches!(status, StartupStatus::Alive),
+            "expected Alive, got {status:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "Alive must wait the full timeout, took only {elapsed:?}"
+        );
+        // Poll is allowed one extra interval of slack.
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "Alive should not overshoot timeout significantly, took {elapsed:?}"
+        );
     }
 }

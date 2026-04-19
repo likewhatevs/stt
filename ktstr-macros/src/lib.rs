@@ -514,6 +514,24 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
     }
+    if duration_s == 0 {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "duration_s must be > 0 (a zero-duration run never exercises the \
+             scheduler and produces no data for assertions)",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if workers_per_cgroup == 0 {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "workers_per_cgroup must be > 0 (a zero-worker cgroup emits no \
+             WorkerReports and assertions vacuously pass)",
+        )
+        .to_compile_error()
+        .into();
+    }
     if replicas == 0 {
         return syn::Error::new(proc_macro2::Span::call_site(), "replicas must be > 0")
             .to_compile_error()

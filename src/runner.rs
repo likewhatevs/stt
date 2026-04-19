@@ -71,6 +71,36 @@ impl Default for RunConfig {
     }
 }
 
+impl RunConfig {
+    /// Reject values that produce silent failures downstream. The
+    /// `ktstr_test` proc macro enforces the same constraints at compile
+    /// time for attribute-built configs; this method covers library
+    /// users who build [`RunConfig`] directly (Gauntlet, custom
+    /// runners, tests).
+    ///
+    /// Rules:
+    /// - `duration == Duration::ZERO` — scenario body never runs, no
+    ///   data collected, assertions vacuously pass.
+    /// - `workers_per_cgroup == 0` — every cgroup without an explicit
+    ///   `num_workers` ends up with zero workers, emitting no
+    ///   `WorkerReport`s so assertions again vacuously pass.
+    pub fn validate(&self) -> Result<()> {
+        if self.duration.is_zero() {
+            anyhow::bail!(
+                "RunConfig.duration must be > 0 (a zero-duration run never \
+                 exercises the scheduler and produces no data for assertions)"
+            );
+        }
+        if self.workers_per_cgroup == 0 {
+            anyhow::bail!(
+                "RunConfig.workers_per_cgroup must be > 0 (a zero-worker \
+                 cgroup emits no WorkerReports and assertions vacuously pass)"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Result of running a single scenario with a specific flag profile.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScenarioResult {
@@ -144,6 +174,7 @@ impl Runner {
     /// reset on drop; once repro mode is on it stays on for the life
     /// of the process.
     pub fn new(config: RunConfig, topo: TestTopology) -> Result<Self> {
+        config.validate().context("RunConfig validation")?;
         if config.repro {
             crate::workload::set_repro_mode(true);
         }
@@ -378,7 +409,8 @@ mod tests {
 
     #[test]
     fn scenario_result_default_stats() {
-        let json = r#"{"scenario_name":"t","passed":true,"duration_s":1.0,"details":[]}"#;
+        let json =
+            r#"{"scenario_name":"t","passed":true,"skipped":false,"duration_s":1.0,"details":[]}"#;
         let r: ScenarioResult = serde_json::from_str(json).unwrap();
         assert!(r.passed);
         assert_eq!(r.stats.total_workers, 0);
@@ -554,8 +586,7 @@ mod tests {
     #[test]
     fn scenario_result_serde_missing_stats_uses_default_values() {
         // JSON without "stats" field — serde #[serde(default)] should fill defaults.
-        let json =
-            r#"{"scenario_name":"missing_stats","passed":true,"duration_s":1.0,"details":["ok"]}"#;
+        let json = r#"{"scenario_name":"missing_stats","passed":true,"skipped":false,"duration_s":1.0,"details":["ok"]}"#;
         let r: ScenarioResult = serde_json::from_str(json).unwrap();
         assert_eq!(r.scenario_name, "missing_stats");
         assert!(r.passed);
@@ -578,6 +609,59 @@ mod tests {
         // Verify it also doesn't contain any other flag.
         assert!(profile.flags.is_empty());
         assert_eq!(profile.name(), "default");
+    }
+
+    #[test]
+    fn run_config_validate_rejects_zero_duration() {
+        let cfg = RunConfig {
+            duration: Duration::ZERO,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duration") && msg.contains("> 0"),
+            "error must name the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_config_validate_rejects_zero_workers() {
+        let cfg = RunConfig {
+            workers_per_cgroup: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workers_per_cgroup") && msg.contains("> 0"),
+            "error must name the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_config_validate_accepts_defaults() {
+        RunConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn runner_new_rejects_zero_duration() {
+        let topo = TestTopology::from_spec(1, 2, 4, 2);
+        let cfg = RunConfig {
+            duration: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(Runner::new(cfg, topo).is_err());
+    }
+
+    #[test]
+    fn runner_new_rejects_zero_workers() {
+        let topo = TestTopology::from_spec(1, 2, 4, 2);
+        let cfg = RunConfig {
+            workers_per_cgroup: 0,
+            ..Default::default()
+        };
+        assert!(Runner::new(cfg, topo).is_err());
     }
 
     #[test]

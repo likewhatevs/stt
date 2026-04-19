@@ -509,18 +509,61 @@ impl CacheDir {
         fs::write(tmp_dir.join("metadata.json"), meta_json)
             .map_err(|e| anyhow::anyhow!("write cache metadata: {e}"))?;
 
-        // Atomic rename. Try rename first; if the target exists
-        // (ENOTEMPTY / EEXIST), remove it and retry once. This avoids
-        // the TOCTOU race of check-then-remove-then-rename.
+        // Rename-to-staging swap. A naive "remove_dir_all(final_dir)
+        // then rename(tmp_dir, final_dir)" has a TOCTOU window: a
+        // concurrent store of the same key could re-create final_dir
+        // between the remove and the rename, and the second rename
+        // would fail with ENOTEMPTY, leaving our fresh content
+        // orphaned in tmp_dir.
+        //
+        // Instead, when final_dir already exists, atomically move the
+        // old content sideways into a thread-unique staging dir and
+        // then rename our fresh tmp_dir into place. Best-effort clean
+        // the staging dir afterwards via RAII.
         match fs::rename(&tmp_dir, &final_dir) {
             Ok(()) => {}
             Err(e)
                 if e.raw_os_error() == Some(libc::ENOTEMPTY)
                     || e.raw_os_error() == Some(libc::EEXIST) =>
             {
-                fs::remove_dir_all(&final_dir)?;
-                fs::rename(&tmp_dir, &final_dir)
-                    .map_err(|e2| anyhow::anyhow!("atomic rename cache entry (retry): {e2}"))?;
+                // Thread id disambiguates same-process concurrent
+                // stores of the same key; without it, two threads
+                // would collide on the staging path.
+                let staging_dir = self.root.join(format!(
+                    ".evict-{}-{}-{:?}",
+                    cache_key,
+                    std::process::id(),
+                    std::thread::current().id(),
+                ));
+                // A stale staging dir from a crashed prior store must
+                // go before we try to rename into the slot.
+                if staging_dir.exists() {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                }
+                fs::rename(&final_dir, &staging_dir)
+                    .map_err(|e2| anyhow::anyhow!("atomic rename final_dir to staging: {e2}"))?;
+                // Guard cleans up staging_dir on every exit from this
+                // block. On successful rollback below, staging_dir no
+                // longer exists and the guard's remove_dir_all is a
+                // harmless no-op. On rollback failure we disarm so the
+                // old content persists in staging rather than being
+                // deleted.
+                let stage_guard = TmpDirGuard(&staging_dir);
+                if let Err(e2) = fs::rename(&tmp_dir, &final_dir) {
+                    // Install failed. Try to restore the previous
+                    // cache content so readers don't see a missing
+                    // entry. If rollback also fails, preserve the
+                    // staging dir so the old content isn't lost.
+                    if let Err(rollback_err) = fs::rename(&staging_dir, &final_dir) {
+                        tracing::warn!(
+                            "cache rollback failed, preserving staging dir: {rollback_err}"
+                        );
+                        stage_guard.disarm();
+                    }
+                    return Err(anyhow::anyhow!(
+                        "atomic rename tmp_dir to final_dir (retry): {e2}"
+                    ));
+                }
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("atomic rename cache entry: {e}"));
@@ -1803,6 +1846,110 @@ mod tests {
     }
 
     // -- atomic write safety --
+
+    /// Regression for the rename-TOCTOU fix: a second `store` with
+    /// the same key must atomically replace the previous entry's
+    /// content without leaving half-installed state — even though
+    /// the underlying code path exercises the
+    /// `final_dir-exists → swap` branch rather than the plain
+    /// rename. The new content wins, the old content is gone, and
+    /// no `.evict-*` staging dir lingers under cache_root.
+    #[test]
+    fn cache_dir_store_overwrites_existing_key_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+
+        // First install.
+        let src_a = TempDir::new().unwrap();
+        let image_a = create_fake_image(src_a.path());
+        fs::write(&image_a, b"version-a").unwrap();
+        let mut meta_a = test_metadata("6.14.2");
+        meta_a.built_at = "2026-04-10T00:00:00Z".to_string();
+        let entry_a = cache
+            .store("collide", &CacheArtifacts::new(&image_a), &meta_a)
+            .unwrap();
+        assert_eq!(
+            fs::read(entry_a.path.join("bzImage")).unwrap(),
+            b"version-a"
+        );
+
+        // Second install with the same key — exercises the rename-
+        // to-staging branch. Different built_at so we can tell
+        // which metadata won.
+        let src_b = TempDir::new().unwrap();
+        let image_b = create_fake_image(src_b.path());
+        fs::write(&image_b, b"version-b").unwrap();
+        let mut meta_b = test_metadata("6.14.2");
+        meta_b.built_at = "2026-04-18T00:00:00Z".to_string();
+        let entry_b = cache
+            .store("collide", &CacheArtifacts::new(&image_b), &meta_b)
+            .unwrap();
+
+        // New content wins.
+        assert_eq!(
+            fs::read(entry_b.path.join("bzImage")).unwrap(),
+            b"version-b",
+            "new content must replace old content atomically"
+        );
+        let installed_meta = read_metadata(&entry_b.path).expect("metadata.json");
+        assert_eq!(installed_meta.built_at, "2026-04-18T00:00:00Z");
+
+        // No staging or tmp residue.
+        for dirent in fs::read_dir(&cache_root).unwrap() {
+            let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".evict-") && !name.starts_with(".tmp-"),
+                "unexpected leftover directory under cache_root: {name}"
+            );
+        }
+    }
+
+    /// If a stale `.evict-*` dir from a crashed prior store survived
+    /// on disk, the next store of the same key must still succeed
+    /// (the fresh rename reuses the staging name).
+    #[test]
+    fn cache_dir_store_cleans_stale_evict_dir() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+
+        // Prime the cache so final_dir exists.
+        let src_a = TempDir::new().unwrap();
+        let image_a = create_fake_image(src_a.path());
+        cache
+            .store(
+                "repeat",
+                &CacheArtifacts::new(&image_a),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+
+        // Plant a stale staging dir from a simulated prior crash.
+        // Match the exact staging path the current thread would
+        // compute, since staging names are now pid+thread-scoped.
+        let stale_evict = cache_root.join(format!(
+            ".evict-repeat-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        fs::create_dir_all(&stale_evict).unwrap();
+        fs::write(stale_evict.join("leftover"), b"x").unwrap();
+
+        // Second store must handle the stale evict dir and succeed.
+        let src_b = TempDir::new().unwrap();
+        let image_b = create_fake_image(src_b.path());
+        fs::write(&image_b, b"fresh").unwrap();
+        let entry = cache
+            .store(
+                "repeat",
+                &CacheArtifacts::new(&image_b),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        assert_eq!(fs::read(entry.path.join("bzImage")).unwrap(), b"fresh");
+        assert!(!stale_evict.exists(), "stale evict dir must be cleaned");
+    }
 
     #[test]
     fn cache_dir_store_cleans_stale_tmp() {
