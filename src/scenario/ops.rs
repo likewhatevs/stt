@@ -2483,9 +2483,11 @@ mod tests {
     /// `apply_ops`). This test mirrors that classification to
     /// lock the contract in place: future refactors that drop either
     /// side of the AND must update this test alongside the dispatch.
-    /// The live dispatcher path requires a mounted cgroup tree and
-    /// a workload handle — covered by #17 (CgroupManager test trait)
-    /// when it lands.
+    /// The live dispatcher path is partially covered by the
+    /// `apply_setup_*` tests via `MockCgroupOps`, but the SetAffinity
+    /// arm specifically still requires a running workload handle to
+    /// exercise end-to-end and is therefore only covered by its
+    /// classification guard here.
     #[test]
     fn set_affinity_random_no_op_conditions() {
         fn should_apply(from: &BTreeSet<usize>, count: usize) -> bool {
