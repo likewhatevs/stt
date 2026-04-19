@@ -407,7 +407,7 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// stability reason as the initramfs cache keys — the discriminator
 /// must be the same across Rust toolchain versions or downstream
 /// tooling that groups variants by filename breaks.
-fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
+pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
     let mut h = SipHasher13::new_with_keys(0, 0);

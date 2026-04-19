@@ -794,8 +794,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis #inner_sig #block
 
-        #[::ktstr::__linkme::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]
-        #[linkme(crate = ::ktstr::__linkme)]
+        #[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]
+        #[linkme(crate = ::ktstr::__private::linkme)]
         static #entry_name: ::ktstr::test_support::KtstrTestEntry = ::ktstr::test_support::KtstrTestEntry {
             name: #name_str,
             func: #inner_name,
@@ -1446,7 +1446,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
         /// Intercept `--ktstr-list-flags` before `main()` runs.
         /// Serializes this scheduler's flag declarations as JSON to
         /// stdout and exits, avoiding BPF program loading.
-        #[::ktstr::__ctor::ctor(crate_path = ::ktstr::__ctor)]
+        #[::ktstr::__private::ctor::ctor(crate_path = ::ktstr::__private::ctor)]
         fn #list_flags_ctor() {
             if !::std::env::args().any(|a| a == "--ktstr-list-flags") {
                 return;
@@ -1456,7 +1456,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
                     .iter()
                     .map(|d| ::ktstr::scenario::flags::FlagDeclJson::from_decl(d))
                     .collect();
-            let json = ::ktstr::__serde_json::to_string(&decls).expect("serialize flags");
+            let json = ::ktstr::__private::serde_json::to_string(&decls).expect("serialize flags");
             println!("{json}");
             ::std::process::exit(0);
         }

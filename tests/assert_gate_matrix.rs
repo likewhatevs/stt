@@ -34,8 +34,8 @@ macro_rules! gate_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-        #[linkme(crate = ktstr::__linkme)]
+        #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+        #[linkme(crate = ktstr::__private::linkme)]
         static $name: KtstrTestEntry = KtstrTestEntry {
             name: stringify!($name),
             func: $name::scenario,

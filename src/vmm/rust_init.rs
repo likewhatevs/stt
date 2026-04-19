@@ -43,6 +43,14 @@ const TRACE_TRACING_ON: &str = "/sys/kernel/tracing/tracing_on";
 /// reader opens this once per boot and forwards every line to COM1.
 const TRACE_PIPE: &str = "/sys/kernel/tracing/trace_pipe";
 
+/// sysfs attribute exposing the active sched_ext root scheduler's
+/// name. Empty / absent when no scheduler is registered; populated
+/// (with a trailing newline) when registration has completed.
+/// Kernel-side owner: `kernel/sched/ext.c` creates this via
+/// `kobject_init_and_add` under the `sched_ext` kset after
+/// `sch->ops.name` is set.
+const SYSFS_SCHED_EXT_ROOT_OPS: &str = "/sys/kernel/sched_ext/root/ops";
+
 /// Returns true when this process is PID 1 (running as /init in a VM).
 pub fn is_pid1() -> bool {
     unsafe { libc::getpid() == 1 }
@@ -933,11 +941,46 @@ enum StartupStatus {
     WaitError(std::io::Error),
 }
 
+/// Outcome of [`poll_scx_attached`].
+#[derive(Debug, PartialEq, Eq)]
+enum ScxAttachStatus {
+    /// sched_ext root kobject exposes a non-empty `ops` attribute —
+    /// scheduler registered and its ops name is populated.
+    Attached,
+    /// Poll window closed. At least one read of `root/ops` succeeded
+    /// (the kernel supports sched_ext and the kset exists), but the
+    /// file never became non-empty before the timeout. Typically
+    /// means the scheduler process is alive but has not finished
+    /// `scx_alloc_and_add_sched` — often a BPF verifier reject, an
+    /// ops-mismatch, or a slow userspace init path.
+    Timeout,
+    /// Every read of `root/ops` returned `Err`. Either the kernel
+    /// lacks sched_ext support entirely or the sysfs tree has not
+    /// been created for the current kernel — distinct from
+    /// [`Timeout`](Self::Timeout), where reads succeed but the file
+    /// is empty.
+    SysfsAbsent,
+}
+
+impl ScxAttachStatus {
+    /// True when the scheduler registered successfully. Equivalent to
+    /// the pre-enum `bool` return value.
+    fn is_attached(&self) -> bool {
+        matches!(self, ScxAttachStatus::Attached)
+    }
+}
+
 /// Poll `/sys/kernel/sched_ext/root/ops` at `interval` cadence for up
-/// to `timeout`, returning `true` as soon as the file is non-empty
-/// (a scheduler is registered and its ops struct has a populated
-/// name). Returns `false` if the window closes without observing
-/// a registration.
+/// to `timeout`.
+///
+/// Returns [`ScxAttachStatus::Attached`] as soon as the file is
+/// non-empty (a scheduler is registered and its ops struct has a
+/// populated name). When the window closes without a successful
+/// attachment, distinguishes [`Timeout`](ScxAttachStatus::Timeout)
+/// (reads succeeded but the file never became non-empty — the
+/// scheduler did not finish registering) from
+/// [`SysfsAbsent`](ScxAttachStatus::SysfsAbsent) (every read
+/// errored — the kernel lacks sched_ext sysfs entirely).
 ///
 /// The sysfs path is built in two steps by the kernel:
 /// - `kernel/sched/ext.c` creates the `sched_ext` kset under
@@ -964,8 +1007,12 @@ enum StartupStatus {
 /// Separate from [`poll_startup`] (which watches the child process
 /// state): a scheduler can be `Alive` from the process-waitpid
 /// perspective and still have zero progress on scx registration.
-fn poll_scx_attached(interval: std::time::Duration, timeout: std::time::Duration) -> bool {
+fn poll_scx_attached(
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> ScxAttachStatus {
     let start = std::time::Instant::now();
+    let mut ever_read_ok = false;
     loop {
         // The kernel populates `sch->ops.name` before the kobject is
         // added, so the file becomes readable and non-empty the
@@ -973,13 +1020,25 @@ fn poll_scx_attached(interval: std::time::Duration, timeout: std::time::Duration
         // registration yet (either no scheduler has reached
         // scx_alloc_and_add_sched or the sysfs tree is still being
         // torn down by a previous scheduler's exit).
-        if let Ok(contents) = fs::read_to_string("/sys/kernel/sched_ext/root/ops")
-            && !contents.trim().is_empty()
-        {
-            return true;
+        match fs::read_to_string(SYSFS_SCHED_EXT_ROOT_OPS) {
+            Ok(contents) => {
+                ever_read_ok = true;
+                if !contents.trim().is_empty() {
+                    return ScxAttachStatus::Attached;
+                }
+            }
+            Err(_) => {
+                // Leave `ever_read_ok` unchanged — every transient or
+                // permanent failure counts toward SysfsAbsent unless
+                // at least one success flipped the flag.
+            }
         }
         if start.elapsed() >= timeout {
-            return false;
+            return if ever_read_ok {
+                ScxAttachStatus::Timeout
+            } else {
+                ScxAttachStatus::SysfsAbsent
+            };
         }
         std::thread::sleep(interval);
     }
@@ -1090,14 +1149,23 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                     // which would leave the test running against the
                     // default kernel scheduler without the host ever
                     // noticing. `root/ops` is the post-attach marker.
-                    if !poll_scx_attached(
+                    let status = poll_scx_attached(
                         std::time::Duration::from_millis(50),
                         std::time::Duration::from_secs(3),
-                    ) {
+                    );
+                    if !status.is_attached() {
                         write_com2(crate::test_support::SCHED_OUTPUT_START);
                         dump_file_to_com2(log_path);
                         write_com2(crate::test_support::SCHED_OUTPUT_END);
-                        write_com2("SCHEDULER_NOT_ATTACHED");
+                        match status {
+                            ScxAttachStatus::Timeout => {
+                                write_com2("SCHEDULER_NOT_ATTACHED: timeout")
+                            }
+                            ScxAttachStatus::SysfsAbsent => {
+                                write_com2("SCHEDULER_NOT_ATTACHED: sched_ext sysfs absent")
+                            }
+                            ScxAttachStatus::Attached => unreachable!(),
+                        }
                         write_com2("KTSTR_EXIT=1");
                         force_reboot();
                     }

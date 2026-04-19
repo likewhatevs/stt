@@ -71,8 +71,8 @@ static BPF_NOOP: BpfMapWrite = BpfMapWrite {
     value: 0,
 };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "sched_bpf_map_api_integration",
@@ -121,8 +121,8 @@ fn scenario_perf_negative(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::A
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_PERF_NEG: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "sched_perf_negative",
@@ -153,8 +153,8 @@ fn scenario_scattershot(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Ass
 const SCATTER_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_SCATTER: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_scattershot_migration",
@@ -193,8 +193,8 @@ fn scenario_throughput_regression(
 const SLOW_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_SLOW: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_throughput_regression",
@@ -220,8 +220,8 @@ fn scenario_auto_repro(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Asse
 const STALL_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_AUTO_REPRO: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_auto_repro",
@@ -244,8 +244,8 @@ fn scenario_baseline(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Assert
     execute_steps(ctx, steps)
 }
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_EEVDF: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_baseline_eevdf",
@@ -257,8 +257,8 @@ static __KTSTR_ENTRY_EEVDF: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_baseline_scx",
@@ -304,8 +304,8 @@ fn scenario_mid_degrade(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Ass
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_MID_DEGRADE: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_mid_run_degrade",

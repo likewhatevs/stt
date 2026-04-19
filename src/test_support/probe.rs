@@ -29,12 +29,12 @@ use super::args::{
     extract_probe_stack_arg, extract_test_fn_arg, extract_work_type_arg, resolve_cgroup_root,
 };
 use super::entry::find_test;
-use super::eval::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
 use super::output::{
     SCHED_OUTPUT_END, SCHED_OUTPUT_START, extract_sched_ext_dump, parse_sched_output,
     print_assert_result,
 };
 use super::profraw::try_flush_profraw;
+use super::runtime::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
 use super::{KtstrTestEntry, TopoOverride};
 
 /// Sentinel value for `--ktstr-probe-stack` when no crash stack functions

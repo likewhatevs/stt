@@ -41,8 +41,8 @@ fn scenario_multi_numa_boot(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_MULTI_NUMA_BOOT: KtstrTestEntry = KtstrTestEntry {
     name: "numa_multi_node_boot",
     func: scenario_multi_numa_boot,
@@ -92,8 +92,8 @@ fn scenario_cxl_memory_only(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_CXL_MEM_ONLY: KtstrTestEntry = KtstrTestEntry {
     name: "numa_cxl_memory_only_node",
     func: scenario_cxl_memory_only,
@@ -129,8 +129,8 @@ fn scenario_mempolicy_bind_locality(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_MEMPOLICY_BIND: KtstrTestEntry = KtstrTestEntry {
     name: "numa_mempolicy_bind_locality",
     func: scenario_mempolicy_bind_locality,
@@ -165,8 +165,8 @@ fn scenario_vmstat_migration(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_VMSTAT_MIGRATION: KtstrTestEntry = KtstrTestEntry {
     name: "numa_vmstat_migration_tracking",
     func: scenario_vmstat_migration,

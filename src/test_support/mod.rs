@@ -20,14 +20,16 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 10 private submodules re-exported
+//! Implementation is split across 11 private submodules re-exported
 //! at `test_support::*` for a flat public API: `entry` (scheduler +
 //! test-entry types), `eval` (host-side VM result evaluation), `probe`
 //! (auto-repro and BPF probe pipeline), `dispatch` (ktstr / cargo-ktstr
 //! CLI entry points), `sidecar` (per-run JSON records), `output`
 //! (guest-output and console parsing), `args` (CLI argument extraction),
-//! `profraw` (coverage flush), `topo` (topology override parsing), and
-//! `timefmt` (ISO-8601 + run-id helpers).
+//! `profraw` (coverage flush), `topo` (topology override parsing),
+//! `timefmt` (ISO-8601 + run-id helpers), and `runtime` (neutral
+//! home for verbose/shm-size/config-file-parts shared by eval and
+//! probe so they don't circularly depend on each other).
 
 #[cfg(test)]
 use crate::monitor::MonitorSummary;
@@ -52,6 +54,7 @@ mod eval;
 mod output;
 mod probe;
 mod profraw;
+mod runtime;
 mod sidecar;
 mod timefmt;
 mod topo;
@@ -65,13 +68,13 @@ pub(crate) use args::{
     extract_flags_arg, extract_probe_stack_arg, extract_test_fn_arg, extract_topo_arg,
     extract_work_type_arg,
 };
-#[cfg(test)]
-pub(crate) use sidecar::write_sidecar;
 pub use sidecar::{SidecarResult, newest_run_dir, runs_root};
 pub(crate) use sidecar::{
     collect_sidecars, format_callback_profile, format_kvm_stats, format_verifier_stats,
     sidecar_dir, write_skip_sidecar,
 };
+#[cfg(test)]
+pub(crate) use sidecar::{sidecar_variant_hash, write_sidecar};
 
 pub use dispatch::{analyze_sidecars, ktstr_main, ktstr_test_early_dispatch, run_ktstr_test};
 pub(crate) use entry::validate_entry_flags;
@@ -81,8 +84,10 @@ pub use entry::{
 };
 pub(crate) use eval::run_ktstr_test_inner;
 #[cfg(test)]
-pub(crate) use eval::{config_file_parts, evaluate_vm_result, scheduler_label};
+pub(crate) use eval::{evaluate_vm_result, scheduler_label};
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
+#[cfg(test)]
+pub(crate) use runtime::config_file_parts;
 // Marker constants are consumed outside the #[cfg(test)] block by the
 // guest-side init (rust_init.rs) which writes them to COM2, and by the
 // host-side reader (eval.rs / probe.rs) which parses them back. Single
@@ -1865,6 +1870,87 @@ mod tests {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },
         }
+    }
+
+    /// Freeze the `sidecar_variant_hash` wire format to the exact 64-bit
+    /// value produced for a representative populated SidecarResult.
+    ///
+    /// Sidecar filenames embed this hash as a hex suffix; gauntlet
+    /// tooling groups variants by it. A silent change — e.g. bumping
+    /// `siphasher`, switching keys, or reordering fields fed into the
+    /// hasher — would let old-version tooling mis-group new-version
+    /// sidecars and vice versa. Pinning the output against a
+    /// pre-computed constant catches that drift before it ships.
+    ///
+    /// Only fields that feed the hash (topology, scheduler, work_type,
+    /// active_flags, sysctls, kargs) are set to significant values;
+    /// irrelevant fields are zero-ish defaults so this test stays
+    /// robust against unrelated `SidecarResult` schema growth.
+    #[test]
+    fn sidecar_variant_hash_stability_populated() {
+        use crate::assert::ScenarioStats;
+        let sc = SidecarResult {
+            test_name: String::new(),
+            topology: "1n2l4c1t".to_string(),
+            scheduler: "scx-ktstr".to_string(),
+            passed: false,
+            skipped: false,
+            stats: ScenarioStats::default(),
+            monitor: None,
+            stimulus_events: Vec::new(),
+            work_type: "CpuSpin".to_string(),
+            active_flags: vec!["llc".to_string(), "steal".to_string()],
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            sysctls: vec!["sysctl.kernel.sched_cfs_bandwidth_slice_us=1000".to_string()],
+            kargs: vec!["nosmt".to_string()],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        // If this assertion trips, the wire format changed. Bumping
+        // the expected value is the wrong fix unless you also plan
+        // for old sidecars to be regenerated — see the contract on
+        // `sidecar_variant_hash`.
+        assert_eq!(
+            sidecar_variant_hash(&sc),
+            0xcd4044360a818e72,
+            "sidecar_variant_hash output drifted — regenerate expected only if \
+             the wire format change is intentional and old sidecars are \
+             disposable (which they are per ktstr's pre-1.0 stance)",
+        );
+    }
+
+    /// Pair to [`sidecar_variant_hash_stability_populated`] covering
+    /// the empty-collections path. If the inter-collection separator
+    /// bytes (0xfe / 0xfd / 0xff) disappear or change, an empty-
+    /// flags variant could collide with an empty-sysctls variant
+    /// whose kargs start with bytes that happen to match the dropped
+    /// separator. Pinning the empty-inputs hash catches separator
+    /// regressions.
+    #[test]
+    fn sidecar_variant_hash_stability_empty_collections() {
+        use crate::assert::ScenarioStats;
+        let sc = SidecarResult {
+            test_name: String::new(),
+            topology: "1n1l1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: false,
+            skipped: false,
+            stats: ScenarioStats::default(),
+            monitor: None,
+            stimulus_events: Vec::new(),
+            work_type: String::new(),
+            active_flags: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            sysctls: Vec::new(),
+            kargs: Vec::new(),
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        assert_eq!(sidecar_variant_hash(&sc), 0xe6b48e8fa3394bd8);
     }
 
     #[test]

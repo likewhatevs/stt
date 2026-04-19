@@ -316,8 +316,8 @@ static BPF_CRASH: BpfMapWrite = BpfMapWrite {
 
 use ktstr::test_support::{KtstrTestEntry, Topology};
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
     name: "cover_watchdog_forced_stall",
     func: scenario_sched_mixed,
@@ -337,8 +337,8 @@ static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
     name: "neg_stall_detection_scx_exit",
     func: scenario_sched_mixed,
@@ -358,8 +358,8 @@ static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
     name: "neg_sched_death_no_verify_result",
     func: scenario_sched_mixed,
@@ -379,8 +379,8 @@ static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_AUTO_REPRO_VERIFY: KtstrTestEntry = KtstrTestEntry {
     name: "neg_auto_repro_on_verify_failure",
     func: scenario_forced_failure,
@@ -397,8 +397,8 @@ static __KTSTR_ENTRY_AUTO_REPRO_VERIFY: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     name: "neg_crash_after_auto_repro",
     func: scenario_sched_mixed,
@@ -416,8 +416,8 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
     name: "demo_bpf_crash_auto_repro",
     func: scenario_sched_mixed,
@@ -434,8 +434,8 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     name: "neg_host_crash_auto_repro",
     func: scenario_yield_heavy,
@@ -453,8 +453,8 @@ static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__linkme)]
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     name: "demo_host_crash_auto_repro",
     func: scenario_yield_heavy,

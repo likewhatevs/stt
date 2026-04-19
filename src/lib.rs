@@ -274,13 +274,20 @@ pub fn cache_key_suffix() -> String {
 pub use ktstr_macros::Scheduler;
 pub use ktstr_macros::ktstr_test;
 
-// Internal re-exports for proc macro generated code. Not public API.
+/// Internal re-exports for proc-macro-generated code. Not public API.
+///
+/// Grouped into a single hidden module so that `use ktstr::*;` pulls
+/// in one module name instead of three leading-underscore items.
+/// Consumers of `#[ktstr_test]` should not reference anything under
+/// this path — the macro expansion names these crates via
+/// `::ktstr::__private::ctor` / `linkme` / `serde_json` and the set
+/// may change without notice.
 #[doc(hidden)]
-pub use ctor as __ctor;
-#[doc(hidden)]
-pub use linkme as __linkme;
-#[doc(hidden)]
-pub use serde_json as __serde_json;
+pub mod __private {
+    pub use ctor;
+    pub use linkme;
+    pub use serde_json;
+}
 
 #[cfg(feature = "integration")]
 pub use crate::probe::process::resolve_func_ip;
