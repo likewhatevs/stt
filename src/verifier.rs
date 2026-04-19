@@ -461,9 +461,9 @@ pub struct VerifierVmResult {
 /// Boot a VM and collect verifier statistics via host-side memory
 /// introspection. Per-program `verified_insns` comes from
 /// `bpf_prog_aux->verified_insns` read through the guest's physical
-/// memory. On load failure, libbpf prints the verifier log to stderr
-/// which the VM captures between `===SCHED_OUTPUT_START===` /
-/// `===SCHED_OUTPUT_END===` markers.
+/// memory. On load failure, libbpf prints the verifier log to stderr;
+/// the returned `scheduler_log` field contains the scheduler's captured
+/// output from the VM.
 pub fn collect_verifier_output(
     sched_bin: &std::path::Path,
     ktstr_bin: &std::path::Path,
@@ -489,11 +489,7 @@ pub fn collect_verifier_output(
 
     let result = vm.run().context("run verifier VM")?;
 
-    let scheduler_log = result
-        .output
-        .split("===SCHED_OUTPUT_START===")
-        .nth(1)
-        .and_then(|s| s.split("===SCHED_OUTPUT_END===").next())
+    let scheduler_log = crate::test_support::parse_sched_output(&result.output)
         .unwrap_or("")
         .to_string();
 

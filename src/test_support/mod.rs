@@ -79,7 +79,7 @@ pub(crate) use eval::run_ktstr_test_inner;
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
 pub(crate) use output::{
     SCHED_OUTPUT_END, SCHED_OUTPUT_START, SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX,
-    SENTINEL_INIT_STARTED, SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED,
+    SENTINEL_INIT_STARTED, SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED, parse_sched_output,
 };
 pub(crate) use probe::maybe_dispatch_vm_test;
 pub use probe::propagate_rust_env_from_cmdline;

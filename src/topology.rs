@@ -996,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_single_llc() {
+    fn from_vm_topology_single_llc() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 2));
         assert_eq!(t.total_cpus(), 8);
         assert_eq!(t.num_llcs(), 1);
@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_multi_llc() {
+    fn from_vm_topology_multi_llc() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 2));
         assert_eq!(t.total_cpus(), 16);
         assert_eq!(t.num_llcs(), 2);
@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_no_smt() {
+    fn from_vm_topology_no_smt() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 2, 1));
         assert_eq!(t.total_cpus(), 4);
         assert_eq!(t.num_llcs(), 2);
@@ -1025,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_minimal() {
+    fn from_vm_topology_minimal() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 1, 1));
         assert_eq!(t.total_cpus(), 1);
         assert_eq!(t.num_llcs(), 1);
@@ -1033,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_multi_numa() {
+    fn from_vm_topology_multi_numa() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 2));
         assert_eq!(t.total_cpus(), 32);
         assert_eq!(t.num_llcs(), 4);
@@ -1189,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_large() {
+    fn from_vm_topology_large() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 4, 8, 2));
         assert_eq!(t.total_cpus(), 64);
         assert_eq!(t.num_llcs(), 4);
@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_cores_populated() {
+    fn from_vm_topology_cores_populated() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 2));
         let llc0 = &t.llcs()[0];
         assert_eq!(llc0.num_cores(), 4);
@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_no_smt_cores() {
+    fn from_vm_topology_no_smt_cores() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
         let llc = &t.llcs()[0];
         assert_eq!(llc.num_cores(), 4);
@@ -1327,7 +1327,7 @@ mod tests {
         // NUMA 0: LLCs 0,1 → CPUs 0-3, 4-7 = 0-7
         // NUMA 1: LLCs 2,3 → CPUs 8-11, 12-15 = 8-15 (but only 16 CPUs)
         //
-        // from_spec(2, 4, 4, 1) → 4 LLCs × 4 cores × 1 thread = 16 CPUs
+        // Topology::new(2, 4, 4, 1) → 4 LLCs × 4 cores × 1 thread = 16 CPUs
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert_eq!(t.total_cpus(), 16);
         assert_eq!(t.num_numa_nodes(), 2);
@@ -1449,21 +1449,21 @@ mod tests {
     // -- NUMA distance tests --
 
     #[test]
-    fn from_spec_numa_distance_local() {
+    fn from_vm_topology_numa_distance_local() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert_eq!(t.numa_distance(0, 0), 10);
         assert_eq!(t.numa_distance(1, 1), 10);
     }
 
     #[test]
-    fn from_spec_numa_distance_remote() {
+    fn from_vm_topology_numa_distance_remote() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert_eq!(t.numa_distance(0, 1), 20);
         assert_eq!(t.numa_distance(1, 0), 20);
     }
 
     #[test]
-    fn from_spec_numa_distance_single_node() {
+    fn from_vm_topology_numa_distance_single_node() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 1));
         assert_eq!(t.numa_distance(0, 0), 10);
     }
@@ -1504,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn from_spec_no_meminfo() {
+    fn from_vm_topology_no_meminfo() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert!(t.node_meminfo(0).is_none());
         assert!(t.node_meminfo(1).is_none());
@@ -1519,7 +1519,7 @@ mod tests {
     // -- is_memory_only tests --
 
     #[test]
-    fn from_spec_not_memory_only() {
+    fn from_vm_topology_not_memory_only() {
         let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert!(!t.is_memory_only(0));
         assert!(!t.is_memory_only(1));

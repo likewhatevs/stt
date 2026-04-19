@@ -900,7 +900,7 @@ mod tests {
     // -- resolve_scheduler tests --
 
     #[test]
-    fn resolve_scheduler_none() {
+    fn resolve_scheduler_eevdf() {
         let result = resolve_scheduler(&SchedulerSpec::Eevdf).unwrap();
         assert!(result.is_none());
     }
@@ -922,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scheduler_name_missing() {
+    fn resolve_scheduler_discover_missing() {
         let _guard = ENV_LOCK.lock().unwrap();
         let key = "KTSTR_SCHEDULER";
         let prev = std::env::var(key).ok();
@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scheduler_name_via_env() {
+    fn resolve_scheduler_discover_via_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         let key = "KTSTR_SCHEDULER";
         let prev = std::env::var(key).ok();
@@ -956,12 +956,12 @@ mod tests {
     // -- scheduler_label tests --
 
     #[test]
-    fn scheduler_label_none_empty() {
+    fn scheduler_label_eevdf_empty() {
         assert_eq!(scheduler_label(&SchedulerSpec::Eevdf), "");
     }
 
     #[test]
-    fn scheduler_label_name() {
+    fn scheduler_label_discover() {
         assert_eq!(
             scheduler_label(&SchedulerSpec::Discover("scx_mitosis")),
             " [sched=scx_mitosis]"
