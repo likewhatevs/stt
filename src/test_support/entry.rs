@@ -815,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn ktstr_test_entry_default_passes_own_validation() {
+    fn ktstr_test_entry_default_rejected_by_empty_name() {
         // DEFAULT has name = "" which validate() rejects — so the
         // stub entry cannot accidentally dispatch. This pins that
         // invariant.
