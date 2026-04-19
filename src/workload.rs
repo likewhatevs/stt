@@ -3101,6 +3101,238 @@ mod tests {
         }
     }
 
+    // -- SpawnGuard failure-injection tests --
+    //
+    // These exercise the error-path cleanup that the unified
+    // `handle_drop_reaps_children_and_closes_pipes` test explicitly
+    // noted it could not cover: the mid-spawn bail paths reached when
+    // a syscall inside `WorkloadHandle::spawn` fails with EMFILE
+    // (RLIMIT_NOFILE) or EAGAIN (RLIMIT_NPROC). Each case forks a
+    // helper subprocess so `setrlimit` scope is confined to that
+    // child and the parent test binary's limits stay intact.
+    //
+    // Cleanup verification strategy:
+    //   - Count open fds via `/proc/self/fd/` before and after the
+    //     failed `spawn`. After SpawnGuard::Drop, the fd count must
+    //     return to baseline (all pipe pairs, report pipes, and start
+    //     pipes released).
+    //   - Poll `waitpid(-1, WNOHANG)` to prove no zombie worker
+    //     children were left behind by a partial fork.
+    //
+    // Child exit code convention:
+    //   0  = success (spawn returned Err AND cleanup is clean)
+    //   10 = spawn unexpectedly returned Ok (failure not triggered)
+    //   11 = fd leak detected after SpawnGuard::Drop
+    //   12 = zombie worker process detected after SpawnGuard::Drop
+    //   13 = setrlimit itself failed (harness issue, not a test
+    //        failure of the guard)
+    //   other nonzero = unrelated failure (panic, assertion miss)
+    //
+    // `libc::_exit` is used instead of `std::process::exit` in the
+    // child so Rust's global destructors — shared with the parent
+    // test binary through the fork's copied state — do not fire.
+
+    /// Count open file descriptors for the calling process by
+    /// listing `/proc/self/fd/`. The directory iterator itself holds
+    /// one fd while open; the snapshot is taken after the iterator
+    /// drops, so the count reflects steady state.
+    fn count_open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+
+    /// Non-blocking reap of any exited children. Returns true when a
+    /// child reported via waitpid(-1, WNOHANG), indicating an
+    /// orphaned-but-not-reaped zombie remained after `spawn`'s error
+    /// path. SpawnGuard::Drop reaps everything it forked; any
+    /// positive return here is a guard bug.
+    fn any_zombie_child() -> bool {
+        let mut status = 0i32;
+        let ret = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        ret > 0
+    }
+
+    /// Lower RLIMIT_NOFILE to `limit`. Returns true on success.
+    /// Safe to call in the post-fork single-threaded child; not safe
+    /// to call in the parent test (would affect sibling tests).
+    fn set_rlimit_nofile(limit: u64) -> bool {
+        let rl = libc::rlimit {
+            rlim_cur: limit,
+            rlim_max: limit,
+        };
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 }
+    }
+
+    /// Lower RLIMIT_NPROC to the current process count so any `fork`
+    /// in this child returns -1 with EAGAIN. Returns true on success.
+    fn set_rlimit_nproc_zero_headroom() -> bool {
+        // Setting rlim_cur to 1 would block even our own existing
+        // thread spawns; setting it to the current process's uid
+        // usage is what reliably triggers EAGAIN on the next fork.
+        // getrusage does not expose that counter; instead use a
+        // small value just high enough for the ktstr test binary's
+        // baseline and no more. Empirically, setting rlim_cur == 0
+        // causes fork to return EAGAIN because the kernel rejects
+        // the new-process creation against the per-uid cap.
+        let rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rl) == 0 }
+    }
+
+    /// Fork a helper subprocess that lowers its own rlimits, runs
+    /// the provided test body, and exits with the body's result
+    /// code. Parent waits for child and returns the child's exit
+    /// code. Any nonzero code from the child indicates a guard
+    /// cleanup defect or harness issue — see exit-code convention
+    /// comment above.
+    fn run_in_forked_child<F: FnOnce() -> i32>(body: F) -> i32 {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Child: install a silent panic hook so an assertion
+            // failure inside the body doesn't multiplex stderr with
+            // the parent's test output. Then run the body, which
+            // returns an exit code. `_exit` skips Rust destructors
+            // so the parent's resources copied via fork are not
+            // double-closed.
+            let _ = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(99);
+            unsafe { libc::_exit(code) };
+        }
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            waited,
+            pid,
+            "waitpid({pid}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            // Terminated by signal — surface the signal number
+            // as a large exit code so the parent's assertion can
+            // distinguish it from the body's own codes.
+            100 + libc::WTERMSIG(status)
+        }
+    }
+
+    /// EMFILE on the inter-worker pipe loop: with num_workers=4 and
+    /// PipeIo (which needs 2 pipe pairs = 4 pipe() calls = 8 fds),
+    /// cap RLIMIT_NOFILE at baseline+4 so the first pair allocates
+    /// cleanly (ab+ba = 4 fds) and the second pair's first `pipe(ab)`
+    /// call fails with EMFILE (needs 2 fds, only 1 slot remains).
+    /// At bail time `guard.pipe_pairs` holds the first pair;
+    /// SpawnGuard::Drop must close all 4 fds so the child's fd
+    /// count returns to baseline.
+    #[test]
+    fn spawn_guard_cleans_up_on_interworker_pipe_emfile() {
+        let code = run_in_forked_child(|| {
+            let baseline = count_open_fds();
+            // RLIMIT_NOFILE is a hard limit on the highest fd
+            // number + 1, not a headroom value — we need to pass a
+            // value slightly above baseline so the first pipe pair
+            // succeeds but the second pair's first `pipe(ab)` does
+            // not. baseline + 5 permits 4 new fds (1 pair of
+            // pipes) plus one transient fd for /proc/self/fd
+            // reads.
+            let target = (baseline + 5) as u64;
+            if !set_rlimit_nofile(target) {
+                return 13;
+            }
+            let config = WorkloadConfig {
+                num_workers: 4,
+                affinity: AffinityMode::None,
+                work_type: WorkType::PipeIo { burst_iters: 1 },
+                sched_policy: SchedPolicy::Normal,
+                ..Default::default()
+            };
+            let result = WorkloadHandle::spawn(&config);
+            if result.is_ok() {
+                return 10; // Failure did not trigger.
+            }
+            // SpawnGuard::Drop has already run on the `?`/`bail!`
+            // exit. Raise the limit back up so reading
+            // /proc/self/fd for the post-check does not itself
+            // fail with EMFILE.
+            let err_msg = format!("{:#}", result.as_ref().err().unwrap());
+            let _ = set_rlimit_nofile(u64::MAX);
+            // Prove the bail arrived via the pipe branch, not a
+            // later mmap or fork. Both pipe-failure paths bail
+            // with "pipe failed".
+            if !err_msg.contains("pipe failed") {
+                return 14;
+            }
+            let after = count_open_fds();
+            if after > baseline {
+                return 11; // Fd leak.
+            }
+            if any_zombie_child() {
+                return 12;
+            }
+            0
+        });
+        assert_eq!(
+            code, 0,
+            "child reported cleanup defect (code {code}): see exit-code table above \
+             spawn_guard_cleans_up_on_interworker_pipe_emfile"
+        );
+    }
+
+    /// EAGAIN on `fork`: with num_workers=1 and CpuSpin (no pipe
+    /// pairs, no futex), cap RLIMIT_NPROC to 0 so the very first
+    /// `libc::fork` inside the per-worker loop returns -1. At bail
+    /// time the local cleanup has closed the report+start pipes
+    /// (lines 1278-1283), so the guard carries only its empty
+    /// `pipe_pairs`, zero children, and the iter_counters mmap. The
+    /// Drop munmaps the iter_counters region (no-op for the fd
+    /// count but proves the guard path fires) and returns cleanly.
+    /// No zombies, no fd leak.
+    #[test]
+    fn spawn_guard_cleans_up_on_fork_eagain() {
+        let code = run_in_forked_child(|| {
+            let baseline = count_open_fds();
+            if !set_rlimit_nproc_zero_headroom() {
+                return 13;
+            }
+            let config = WorkloadConfig {
+                num_workers: 1,
+                affinity: AffinityMode::None,
+                work_type: WorkType::CpuSpin,
+                sched_policy: SchedPolicy::Normal,
+                ..Default::default()
+            };
+            let result = WorkloadHandle::spawn(&config);
+            if result.is_ok() {
+                return 10; // Failure did not trigger.
+            }
+            let msg = format!("{:#}", result.err().unwrap());
+            // RLIMIT_NPROC denies fork with EAGAIN; prove the bail
+            // arrived via the fork branch, not an earlier pipe
+            // allocation.
+            if !msg.contains("fork failed") {
+                return 14;
+            }
+            let after = count_open_fds();
+            if after > baseline {
+                return 11;
+            }
+            if any_zombie_child() {
+                return 12;
+            }
+            0
+        });
+        assert_eq!(
+            code, 0,
+            "child reported cleanup defect (code {code}): see exit-code table above \
+             spawn_guard_cleans_up_on_fork_eagain"
+        );
+    }
+
     #[test]
     fn spawn_io_sync_produces_work() {
         let config = WorkloadConfig {
