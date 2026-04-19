@@ -50,9 +50,18 @@ pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
 ///
 /// Concretely, the strip pipeline rewrites these sections as
 /// `SHT_NOBITS` with zero-length data so symbol-table entries whose
-/// `st_shndx` points here survive `Builder::delete_orphans`. An address
-/// resolved from `.data` / `.data..percpu` is then translated via
-/// `text_kva_to_pa` / `kva_to_pa` and read out of `GuestMem`.
+/// `st_shndx` points here survive `Builder::delete_orphans`. How the
+/// stored `st_value` becomes a guest PA differs by section:
+///
+/// - `.data`: `st_value` is a kernel VA. `kva_to_pa` (direct mapping)
+///   or `text_kva_to_pa` (text mapping) translates it to a PA that
+///   [`super::reader::GuestMem`] reads directly.
+/// - `.data..percpu`: `sh_addr = 0` on this section, so `st_value` is
+///   a section-relative offset, NOT a KVA. The per-CPU KVA for CPU
+///   `n` is `st_value + __per_cpu_offset[n]`; [`compute_rq_pas`]
+///   performs that add and then calls `kva_to_pa` for each CPU.
+///   Calling `kva_to_pa` on the raw `st_value` would translate the
+///   wrong address.
 pub(crate) const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
     b".data",         // init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
     b".data..percpu", // runqueues (per-CPU runqueue template)
