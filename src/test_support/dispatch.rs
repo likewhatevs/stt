@@ -165,7 +165,13 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     {
         anyhow::bail!("vmlinux not found, bpf_map_write requires vmlinux");
     }
-    run_ktstr_test_inner(entry, None, &[])
+    // Matches run_named_test: tests declaring `required_flags` must
+    // keep them active even on the zero-override library entry point,
+    // otherwise scheduler-feature-gated scenarios silently run with
+    // the wrong flag profile. Passing &[] here is the bug this
+    // replaces.
+    let active_flags: Vec<String> = entry.required_flags.iter().map(|s| s.to_string()).collect();
+    run_ktstr_test_inner(entry, None, &active_flags)
 }
 
 /// Like `run_ktstr_test` but with an explicit topology override and

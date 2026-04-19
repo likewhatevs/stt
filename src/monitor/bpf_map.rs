@@ -850,6 +850,17 @@ impl<'a> BpfMapAccessor<'a> {
     ///
     /// Returns an empty vec if the map is not `BPF_MAP_TYPE_PERCPU_ARRAY`,
     /// `key >= max_entries`, or the `__per_cpu_offset` symbol is missing.
+    ///
+    /// When the `__per_cpu_offset` array straddles the end of guest
+    /// memory, the former pre-check returned an empty vec; the current
+    /// path delegates bounds-checking to [`super::symbols::read_per_cpu_offsets`]
+    /// (which reads one u64 at a time via [`super::reader::GuestMem::read_u64`]
+    /// and yields `0` for any out-of-range slot). Out-of-range CPUs
+    /// therefore pick up a zero offset, which aliases CPU 0's per-CPU
+    /// base and yields `Some(bytes)` copies of CPU 0's value rather
+    /// than `None`. Callers that need strict "unreadable=None"
+    /// semantics must compare `__per_cpu_offset[cpu]` against the
+    /// DRAM bound themselves.
     pub fn read_percpu_array(
         &self,
         map: &BpfMapInfo,
