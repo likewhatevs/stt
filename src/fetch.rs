@@ -378,38 +378,95 @@ pub fn fetch_version_for_prefix(prefix: &str, cli_label: &str) -> Result<String,
     probe_latest_patch(prefix, cli_label)
 }
 
+/// Upper bound for the search range in [`probe_latest_patch`].
+/// No kernel minor has ever produced this many patch releases; the bound
+/// exists only to terminate the exponential-expansion phase when a CDN
+/// misbehaves and returns success for every probe.
+const PROBE_PATCH_MAX: u32 = 500;
+
+/// HEAD one cdn.kernel.org tarball URL for `{prefix}.{patch}`.
+///
+/// Returns `Ok(true)` iff the server returned a 2xx status AND the
+/// response body is not HTML (some CDN error pages return 200 with
+/// text/html). Network / transport failures propagate as `Err`.
+fn probe_patch_exists(
+    client: &reqwest::blocking::Client,
+    major: u32,
+    prefix: &str,
+    patch: u32,
+) -> Result<bool, String> {
+    let url =
+        format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{prefix}.{patch}.tar.xz");
+    let response = client
+        .head(&url)
+        .send()
+        .map_err(|e| format!("HEAD {url}: {e}"))?;
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    if let Some(ct) = response.headers().get(reqwest::header::CONTENT_TYPE)
+        && let Ok(ct_str) = ct.to_str()
+        && ct_str.contains("text/html")
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Probe cdn.kernel.org to find the highest patch version for an EOL series.
 ///
-/// Sends HEAD requests for {prefix}.1, {prefix}.2, ... until a non-success
-/// response or the safety cap (500). Returns the last version that returned
-/// 200 with a non-HTML content type.
+/// Probes patches in parallel batches that double in size each round
+/// (16, 32, 64, ...). Each batch HEADs its entire window concurrently
+/// via rayon; scanning the ordered results short-circuits at the first
+/// non-existent patch. This replaces the former "serial HEAD 1..=500"
+/// scan, which issued up to 500 sequential HTTP requests — each ~1 RTT
+/// — even for minors with only a handful of published patches, and
+/// stalled interactive runs by ~500x the single-request RTT on the
+/// slowest path.
+///
+/// Complexity: the largest patch N is pinpointed in `O(log N)` batches
+/// rather than `O(N)` serial requests, and every batch completes in
+/// roughly one RTT.
 fn probe_latest_patch(prefix: &str, cli_label: &str) -> Result<String, String> {
+    use rayon::prelude::*;
+
     let major = major_version(prefix)?;
     let client = reqwest::blocking::Client::new();
 
-    let mut last_good: Option<String> = None;
-    for patch in 1u32..=500 {
-        let version = format!("{prefix}.{patch}");
-        let url =
-            format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz");
-        let response = client
-            .head(&url)
-            .send()
-            .map_err(|e| format!("HEAD {url}: {e}"))?;
-        if !response.status().is_success() {
+    /// Initial batch size. Each subsequent round doubles the window so
+    /// minors with many patches still finish in log-time rounds.
+    const PROBE_PATCH_INITIAL_BATCH: u32 = 16;
+
+    let mut last_good: u32 = 0;
+    let mut lo: u32 = 1;
+    let mut window: u32 = PROBE_PATCH_INITIAL_BATCH;
+    'expand: loop {
+        let hi = (lo + window - 1).min(PROBE_PATCH_MAX);
+        // HEAD the entire window concurrently. Any transport error
+        // short-circuits via `collect::<Result<_, _>>()`.
+        let results: Vec<(u32, bool)> = (lo..=hi)
+            .into_par_iter()
+            .map(|patch| probe_patch_exists(&client, major, prefix, patch).map(|ok| (patch, ok)))
+            .collect::<Result<Vec<_>, _>>()?;
+        // rayon preserves input order, so iterating advances `last_good`
+        // monotonically and stops at the first 404 in this batch.
+        for (patch, ok) in results {
+            if !ok {
+                break 'expand;
+            }
+            last_good = patch;
+        }
+        if hi >= PROBE_PATCH_MAX {
             break;
         }
-        if let Some(ct) = response.headers().get(reqwest::header::CONTENT_TYPE)
-            && let Ok(ct_str) = ct.to_str()
-            && ct_str.contains("text/html")
-        {
-            break;
-        }
-        last_good = Some(version);
+        lo = hi + 1;
+        window = window.saturating_mul(2);
     }
 
-    let version =
-        last_good.ok_or_else(|| format!("no tarball found for {prefix}.x on cdn.kernel.org"))?;
+    if last_good == 0 {
+        return Err(format!("no tarball found for {prefix}.x on cdn.kernel.org"));
+    }
+    let version = format!("{prefix}.{last_good}");
     eprintln!("{cli_label}: latest {prefix}.x kernel (from cdn probe): {version}");
     Ok(version)
 }

@@ -251,37 +251,21 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     }
 
     if !cli::has_sched_ext(kernel_dir) {
-        let sp = cli::Spinner::start("Configuring kernel...");
-        let result =
-            cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"));
-        if result.is_err() {
-            drop(sp);
-        } else {
-            sp.finish("Kernel configured");
-        }
-        result?;
+        cli::Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {
+            cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"))
+        })?;
     }
 
-    let sp = cli::Spinner::start("Building kernel...");
-    let result = cli::make_kernel_with_output(kernel_dir, Some(&sp)).map_err(|e| format!("{e:#}"));
-    if result.is_err() {
-        drop(sp);
-    } else {
-        sp.finish("Kernel built");
-    }
-    result?;
+    cli::Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
+        cli::make_kernel_with_output(kernel_dir, Some(sp)).map_err(|e| format!("{e:#}"))
+    })?;
 
     cli::validate_kernel_config(kernel_dir).map_err(|e| format!("{e:#}"))?;
 
-    let sp = cli::Spinner::start("Generating compile_commands.json...");
-    let result = cli::run_make_with_output(kernel_dir, &["compile_commands.json"], Some(&sp))
-        .map_err(|e| format!("{e:#}"));
-    if result.is_err() {
-        drop(sp);
-    } else {
-        sp.finish("Done");
-    }
-    result?;
+    cli::Spinner::with_progress("Generating compile_commands.json...", "Done", |sp| {
+        cli::run_make_with_output(kernel_dir, &["compile_commands.json"], Some(sp))
+            .map_err(|e| format!("{e:#}"))
+    })?;
     Ok(())
 }
 

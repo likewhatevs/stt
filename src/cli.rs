@@ -589,38 +589,25 @@ pub fn kernel_build_pipeline(
     }
 
     if !has_sched_ext(source_dir) {
-        let sp = Spinner::start("Configuring kernel...");
-        let result = configure_kernel(source_dir, EMBEDDED_KCONFIG);
-        if result.is_err() {
-            drop(sp);
-        } else {
-            sp.finish("Kernel configured");
-        }
-        result?;
+        Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {
+            configure_kernel(source_dir, EMBEDDED_KCONFIG)
+        })?;
     }
 
-    let sp = Spinner::start("Building kernel...");
-    let result = make_kernel_with_output(source_dir, Some(&sp));
-    if result.is_err() {
-        drop(sp);
-    } else {
-        sp.finish("Kernel built");
-    }
-    result?;
+    Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
+        make_kernel_with_output(source_dir, Some(sp))
+    })?;
 
     // Validate critical config options were not silently disabled.
     validate_kernel_config(source_dir)?;
 
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
-        let sp = Spinner::start("Generating compile_commands.json...");
-        let result = run_make_with_output(source_dir, &["compile_commands.json"], Some(&sp));
-        if result.is_err() {
-            drop(sp);
-        } else {
-            sp.finish("compile_commands.json generated");
-        }
-        result?;
+        Spinner::with_progress(
+            "Generating compile_commands.json...",
+            "compile_commands.json generated",
+            |sp| run_make_with_output(source_dir, &["compile_commands.json"], Some(sp)),
+        )?;
     }
 
     // Find the built kernel image and vmlinux.
@@ -1380,6 +1367,34 @@ impl Spinner {
         match self.pb {
             Some(ref pb) => pb.suspend(f),
             None => f(),
+        }
+    }
+
+    /// Run `f` under a spinner that starts with `start_msg`, replaces
+    /// itself with `success_msg` on `Ok`, and drops silently on `Err`
+    /// so the error propagates without a stale progress bar obscuring
+    /// the caller's diagnostics. The closure receives the live
+    /// `&Spinner` so it can call [`Self::println`] / [`Self::suspend`]
+    /// / [`Self::set_message`] during the operation.
+    pub fn with_progress<T, E, F>(
+        start_msg: impl Into<std::borrow::Cow<'static, str>>,
+        success_msg: impl Into<std::borrow::Cow<'static, str>>,
+        f: F,
+    ) -> Result<T, E>
+    where
+        F: FnOnce(&Spinner) -> Result<T, E>,
+    {
+        let sp = Spinner::start(start_msg);
+        let result = f(&sp);
+        match result {
+            Ok(v) => {
+                sp.finish(success_msg);
+                Ok(v)
+            }
+            Err(e) => {
+                drop(sp);
+                Err(e)
+            }
         }
     }
 }
