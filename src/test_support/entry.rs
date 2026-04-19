@@ -534,12 +534,13 @@ pub struct KtstrTestEntry {
     pub watchdog_timeout: Duration,
     /// Host-side BPF map writes to perform during VM execution.
     ///
-    /// Empty slice (the default) means "no writes." Every entry in the
-    /// slice is applied in order during the VM's startup sequence; the
-    /// multi-write plumbing runs each entry through the same
-    /// Phase-1-fail-fast / Phase-2-abort contract the single-write
-    /// path used, so a failure mid-way aborts the remaining writes
-    /// rather than silently proceeding with partial state.
+    /// Empty slice (the default) means "no writes." Setup failures
+    /// (accessor init, map resolution, probes-ready wait) abort before
+    /// any writes are attempted. Within the write phase itself, every
+    /// entry is attempted; individual write failures are logged but do
+    /// not abort remaining writes — partial success suppresses the
+    /// final signal to the guest so it times out rather than observing
+    /// half-applied state.
     pub bpf_map_write: &'static [&'static BpfMapWrite],
     /// Flags that must be present in every flag profile for this test.
     pub required_flags: &'static [&'static str],
