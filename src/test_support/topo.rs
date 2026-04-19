@@ -62,6 +62,28 @@ impl TopoOverride {
                  cannot boot); no implicit floor is applied to override path"
             );
         }
+        // Reject topologies whose total CPU count overflows u32.
+        // Downstream `Topology::new(numa_nodes, llcs, cores, threads)`
+        // and cpuset math multiply these three u32 dimensions
+        // together; silent wrap produces a nonsense total_cpus that
+        // would mis-size vCPU allocations and cgroup cpusets.
+        let cpus_per_llc = self.cores.checked_mul(self.threads).ok_or_else(|| {
+            anyhow::anyhow!(
+                "TopoOverride: cores ({}) * threads ({}) overflows u32 — \
+                 cpus_per_llc cannot be represented",
+                self.cores,
+                self.threads,
+            )
+        })?;
+        self.llcs.checked_mul(cpus_per_llc).ok_or_else(|| {
+            anyhow::anyhow!(
+                "TopoOverride: llcs ({}) * cores ({}) * threads ({}) \
+                 overflows u32 — total_cpus cannot be represented",
+                self.llcs,
+                self.cores,
+                self.threads,
+            )
+        })?;
         Ok(())
     }
 }
@@ -385,5 +407,59 @@ mod tests {
             memory_mb: 8192,
         };
         assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn topo_override_validate_rejects_cpus_per_llc_overflow() {
+        // cores * threads > u32::MAX must fail fast with an overflow
+        // message, not silently wrap.
+        let t = TopoOverride {
+            numa_nodes: 1,
+            llcs: 1,
+            cores: 0x1_0001,
+            threads: 0x1_0000,
+            memory_mb: 8192,
+        };
+        let err = t.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cpus_per_llc") && msg.contains("overflows u32"),
+            "expected overflow error for cores*threads, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn topo_override_validate_rejects_total_cpus_overflow() {
+        // cores * threads fits in u32 (2 * 2 = 4), but
+        // llcs * cpus_per_llc overflows (u32::MAX * 4).
+        let t = TopoOverride {
+            numa_nodes: 1,
+            llcs: u32::MAX,
+            cores: 2,
+            threads: 2,
+            memory_mb: 8192,
+        };
+        let err = t.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("total_cpus") && msg.contains("overflows u32"),
+            "expected overflow error for total_cpus, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn topo_override_validate_accepts_max_non_overflowing() {
+        // Boundary case: exactly u32::MAX total CPUs — no overflow,
+        // but also no realistic hardware. Validator only gates on
+        // "can u32 hold this?"; physical host constraints are
+        // checked elsewhere (TopologyConstraints::accepts).
+        let t = TopoOverride {
+            numa_nodes: 1,
+            llcs: u32::MAX,
+            cores: 1,
+            threads: 1,
+            memory_mb: 8192,
+        };
+        t.validate().unwrap();
     }
 }

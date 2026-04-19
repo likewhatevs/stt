@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
-use crate::assert::ScenarioStats;
+use crate::assert::{AssertDetail, ScenarioStats};
 use crate::cgroup::CgroupManager;
 use crate::probe::btf::discover_bpf_symbols;
 use crate::probe::stack::{expand_bpf_to_kernel_callers, filter_traceable, load_probe_stack};
@@ -124,9 +124,16 @@ pub struct ScenarioResult {
     pub skipped: bool,
     /// Wall-clock seconds the scenario body ran for.
     pub duration_s: f64,
-    /// Human-readable per-check messages surfaced on failure; empty
-    /// on clean passes.
-    pub details: Vec<String>,
+    /// Per-check details surfaced on failure; empty on clean passes.
+    ///
+    /// Each entry carries both a categorized [`AssertDetail::kind`]
+    /// (serialized into sidecar JSON and consumed by stats tooling
+    /// to bucket failures) and a human-readable message. An earlier
+    /// version stored `Vec<String>` here and lost the kind on the
+    /// boundary between `AssertResult` and `ScenarioResult`, so
+    /// post-run categorization had to regex against free-text
+    /// messages.
+    pub details: Vec<AssertDetail>,
     /// Aggregate statistics merged across all cgroups and workers for
     /// this scenario.
     #[serde(default)]
@@ -363,7 +370,7 @@ impl Runner {
                         passed: v.passed,
                         skipped: v.is_skipped(),
                         duration_s: start.elapsed().as_secs_f64(),
-                        details: v.details.into_iter().map(|d| d.message).collect(),
+                        details: v.details,
                         stats: v.stats,
                     }
                 }
@@ -372,7 +379,7 @@ impl Runner {
                     passed: false,
                     skipped: false,
                     duration_s: start.elapsed().as_secs_f64(),
-                    details: vec![format!("{e:#}")],
+                    details: vec![AssertDetail::from(format!("{e:#}"))],
                     stats: Default::default(),
                 },
             };
@@ -594,11 +601,13 @@ mod tests {
     #[test]
     fn scenario_result_serde_missing_stats_uses_default_values() {
         // JSON without "stats" field — serde #[serde(default)] should fill defaults.
-        let json = r#"{"scenario_name":"missing_stats","passed":true,"skipped":false,"duration_s":1.0,"details":["ok"]}"#;
+        let json = r#"{"scenario_name":"missing_stats","passed":true,"skipped":false,"duration_s":1.0,"details":[{"kind":"Other","message":"ok"}]}"#;
         let r: ScenarioResult = serde_json::from_str(json).unwrap();
         assert_eq!(r.scenario_name, "missing_stats");
         assert!(r.passed);
-        assert_eq!(r.details, vec!["ok"]);
+        assert_eq!(r.details.len(), 1);
+        assert_eq!(r.details[0].message, "ok");
+        assert_eq!(r.details[0].kind, crate::assert::DetailKind::Other);
         // Verify every stats field gets its Default value, not just total_workers.
         assert_eq!(r.stats.total_workers, 0);
         assert_eq!(r.stats.total_cpus, 0);

@@ -258,6 +258,61 @@ fn list_tests(ignored_only: bool) {
     }
 }
 
+/// Host capacity inputs for `TopologyConstraints::accepts`.
+///
+/// `list_tests_all` and `list_tests_budget` both need the same
+/// `(cpus, llcs, max_cpus_per_llc)` triple to filter gauntlet presets
+/// against what the host can actually schedule. Reading sysfs here
+/// once per listing (instead of per-entry) keeps the signal-to-noise
+/// of each lister high and makes the host-query decision explicit.
+fn host_capacity() -> (u32, u32, u32) {
+    let host_cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+    let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
+    let host_llcs = host_topo
+        .as_ref()
+        .map(|t| t.llc_groups.len() as u32)
+        .unwrap_or(1);
+    let host_max_cpus_per_llc = host_topo
+        .as_ref()
+        .map(|t| t.max_cores_per_llc() as u32)
+        .unwrap_or(host_cpus);
+    (host_cpus, host_llcs, host_max_cpus_per_llc)
+}
+
+/// Iterate (preset, profile) pairs that both fit the host capacity
+/// and match the entry's `TopologyConstraints`. Shared between the
+/// eager ("print every name") and budgeted ("push a candidate")
+/// listers in `list_tests_*`.
+fn for_each_gauntlet_variant<F>(
+    entry: &KtstrTestEntry,
+    presets: &[crate::vm::TopoPreset],
+    host_cpus: u32,
+    host_llcs: u32,
+    host_max_cpus_per_llc: u32,
+    mut visit: F,
+) where
+    F: FnMut(&crate::vm::TopoPreset, &crate::scenario::FlagProfile),
+{
+    let profiles = entry
+        .scheduler
+        .generate_profiles(entry.required_flags, entry.excluded_flags);
+    for preset in presets {
+        if !entry.constraints.accepts(
+            &preset.topology,
+            host_cpus,
+            host_llcs,
+            host_max_cpus_per_llc,
+        ) {
+            continue;
+        }
+        for profile in &profiles {
+            visit(preset, profile);
+        }
+    }
+}
+
 /// List all tests without budget filtering.
 fn list_tests_all(ignored_only: bool) {
     let presets = crate::vm::gauntlet_presets();
@@ -265,6 +320,7 @@ fn list_tests_all(ignored_only: bool) {
         .ok()
         .and_then(|k| crate::vmm::find_vmlinux(&k))
         .is_some();
+    let (host_cpus, host_llcs, host_max_cpus_per_llc) = host_capacity();
 
     for entry in KTSTR_TESTS.iter() {
         validate_entry_flags(entry);
@@ -286,39 +342,24 @@ fn list_tests_all(ignored_only: bool) {
             continue;
         }
 
-        let profiles = entry
-            .scheduler
-            .generate_profiles(entry.required_flags, entry.excluded_flags);
-
         // Gauntlet variants are always ignored — users opt in with
         // --run-ignored. Presets that exceed the host's CPU count or
         // LLC count are filtered from the listing entirely.
-        let host_cpus = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(1);
-        let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
-        let host_llcs = host_topo
-            .as_ref()
-            .map(|t| t.llc_groups.len() as u32)
-            .unwrap_or(1);
-        let host_max_cpus_per_llc = host_topo
-            .as_ref()
-            .map(|t| t.max_cores_per_llc() as u32)
-            .unwrap_or(host_cpus);
-        for preset in &presets {
-            if !entry.constraints.accepts(
-                &preset.topology,
-                host_cpus,
-                host_llcs,
-                host_max_cpus_per_llc,
-            ) {
-                continue;
-            }
-            for profile in &profiles {
-                let pname = profile.name();
-                println!("gauntlet/{}/{}/{}: test", entry.name, preset.name, pname);
-            }
-        }
+        for_each_gauntlet_variant(
+            entry,
+            &presets,
+            host_cpus,
+            host_llcs,
+            host_max_cpus_per_llc,
+            |preset, profile| {
+                println!(
+                    "gauntlet/{}/{}/{}: test",
+                    entry.name,
+                    preset.name,
+                    profile.name()
+                );
+            },
+        );
     }
 }
 
@@ -334,6 +375,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
         .ok()
         .and_then(|k| crate::vmm::find_vmlinux(&k))
         .is_some();
+    let (host_cpus, host_llcs, host_max_cpus_per_llc) = host_capacity();
     let mut candidates: Vec<TestCandidate> = Vec::new();
 
     for entry in KTSTR_TESTS.iter() {
@@ -359,36 +401,17 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             continue;
         }
 
-        let profiles = entry
-            .scheduler
-            .generate_profiles(entry.required_flags, entry.excluded_flags);
-
-        let host_cpus = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(1);
-        let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
-        let host_llcs = host_topo
-            .as_ref()
-            .map(|t| t.llc_groups.len() as u32)
-            .unwrap_or(1);
-        let host_max_cpus_per_llc = host_topo
-            .as_ref()
-            .map(|t| t.max_cores_per_llc() as u32)
-            .unwrap_or(host_cpus);
-        for preset in &presets {
-            if !entry.constraints.accepts(
-                &preset.topology,
-                host_cpus,
-                host_llcs,
-                host_max_cpus_per_llc,
-            ) {
-                continue;
-            }
-            for profile in &profiles {
-                let pname = profile.name();
-                let test_name = format!("gauntlet/{}/{}/{}", entry.name, preset.name, pname);
+        for_each_gauntlet_variant(
+            entry,
+            &presets,
+            host_cpus,
+            host_llcs,
+            host_max_cpus_per_llc,
+            |preset, profile| {
+                let test_name =
+                    format!("gauntlet/{}/{}/{}", entry.name, preset.name, profile.name());
                 candidates.push(TestCandidate {
-                    name: format!("{}: test", test_name),
+                    name: format!("{test_name}: test"),
                     features: extract_features(
                         entry,
                         &preset.topology,
@@ -398,8 +421,8 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
                     ),
                     estimated_secs: estimate_duration(entry, &preset.topology),
                 });
-            }
-        }
+            },
+        );
     }
 
     let selected = select(&candidates, budget_secs);

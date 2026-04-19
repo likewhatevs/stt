@@ -118,7 +118,10 @@ pub fn parse_cpu_list(s: &str) -> Result<Vec<usize>> {
 /// Parse a CPU list string, silently skipping invalid entries.
 ///
 /// Unlike [`parse_cpu_list`], this never fails — non-numeric elements
-/// and reversed ranges are ignored.
+/// and reversed ranges are ignored. Returns a sorted ascending
+/// `Vec<usize>`, matching `parse_cpu_list`'s contract so callers that
+/// do `iter().min()` / binary search / fold-into-BTreeSet see
+/// identical ordering whichever parser they used.
 pub fn parse_cpu_list_lenient(s: &str) -> Vec<usize> {
     let mut cpus = Vec::new();
     for part in s.trim().split(',') {
@@ -134,6 +137,7 @@ pub fn parse_cpu_list_lenient(s: &str) -> Vec<usize> {
             cpus.push(cpu);
         }
     }
+    cpus.sort();
     cpus
 }
 
@@ -567,6 +571,18 @@ impl TestTopology {
         &self.numa_nodes
     }
     /// All LLC domains.
+    ///
+    /// # Ordering
+    ///
+    /// Returned slice is ordered by **LLC id** (ascending), not by
+    /// first-CPU. Both [`from_system`](Self::from_system) and
+    /// [`from_vm_topology`](Self::from_vm_topology) build the LLC
+    /// list by iterating a `BTreeMap<llc_id, LlcInfo>::into_values()`,
+    /// so the result is deterministic and stable across runs. When
+    /// sysfs assigns non-contiguous LLC ids (cache `id` file, or
+    /// `shared_cpu_list.min()` fallback), the slice order can differ
+    /// from CPU order — callers that need CPU-sorted LLCs must
+    /// sort by `llc.cpus()[0]` themselves.
     pub fn llcs(&self) -> &[LlcInfo] {
         &self.llcs
     }
@@ -722,6 +738,20 @@ impl TestTopology {
     /// uniform and explicit-node topologies. For uniform topologies,
     /// pass `total_memory_mb` to populate per-node memory info; when
     /// `None`, memory info is omitted.
+    ///
+    /// # Signature asymmetry with [`from_system`](Self::from_system)
+    ///
+    /// `from_system` returns `Result` because sysfs I/O is a
+    /// runtime-failable operation (unreadable files, cgroup-restricted
+    /// views, non-Linux hosts). `from_vm_topology` infallibly returns
+    /// `Self` because its input is already validated: every
+    /// [`Topology`](crate::vmm::topology::Topology) reaches this
+    /// function via `Topology::new`, which asserts `llcs > 0`,
+    /// `cores_per_llc > 0`, `threads_per_core > 0`, and
+    /// `numa_nodes > 0` at construction time. The remaining asserts
+    /// inside this function guard against hand-constructed `Topology`
+    /// struct literals that bypass `Topology::new`; they never fire
+    /// for any `Topology` obtained through the normal constructor.
     pub fn from_vm_topology(topo: &crate::vmm::topology::Topology) -> Self {
         Self::from_vm_topology_with_memory(topo, None)
     }
