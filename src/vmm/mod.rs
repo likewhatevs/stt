@@ -2903,10 +2903,14 @@ impl KtstrVm {
                 let accessor = owned.as_accessor();
 
                 // Phase 2: resolve every queued map before signaling the
-                // guest. Running writes serially against partially-
-                // resolved maps would let a late-discovery failure
-                // leave the guest blocked waiting for slot 0 with no
-                // way to recover.
+                // guest. All-or-nothing: if any map fails to resolve
+                // within the deadline, the thread aborts without
+                // signaling slot 0. The guest then proceeds under its
+                // own timeout rather than observing a partial setup.
+                // Running writes serially against partially-resolved
+                // maps would let a late-discovery failure leave the
+                // guest blocked waiting for slot 0 with no way to
+                // recover.
                 let retry_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(30);
                 let mut resolved: Vec<(BpfMapWriteParams, monitor::bpf_map::BpfMapInfo)> =
@@ -5417,9 +5421,9 @@ mod tests {
         );
         // SCHEDULER_DIED / SCHEDULER_NOT_ATTACHED are written by
         // rust_init when the scx scheduler exits (rust_init.rs:1140,
-        // 1162, 1185). "sched_ext: disabled" is the kernel's own
-        // disable message when scx tears down a scheduler (e.g. on
-        // watchdog stall). Any of these appearing proves the
+        // 1165, 1168, 1188). "sched_ext: disabled" is the kernel's
+        // own disable message when scx tears down a scheduler (e.g.
+        // on watchdog stall). Any of these appearing proves the
         // watchdog either fired or the scheduler failed for another
         // reason — either way the test's "no stall exit" invariant
         // is broken.

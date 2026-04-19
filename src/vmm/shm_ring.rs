@@ -216,11 +216,8 @@ pub fn init_shm_ptr(base: *mut u8, size: usize) {
 /// (sched-exit-mon thread and step executor).
 pub fn write_msg(msg_type: u32, payload: &[u8]) {
     let Ok((ptr, size)) = shm_ptr() else { return };
-    // Recover from poisoning: a panicking writer may have left the
-    // ring in an inconsistent state, but the post-panic thread is
-    // still safe to re-enter — the only shared mutable state the lock
-    // guards (the SHM region bytes) is fully overwritten on each
-    // `shm_write` call.
+    // Safe to re-enter: write_ptr advances only after header + payload
+    // land, so a mid-write panic cannot corrupt committed messages.
     let _guard = SHM_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
     shm_write(buf, 0, msg_type, payload);

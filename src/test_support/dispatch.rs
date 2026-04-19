@@ -14,12 +14,10 @@
 //!   and renders the full gauntlet analysis (rows + verifier + callback
 //!   profile + KVM stats) into a string.
 //!
-//! The heavy lifting lives in sibling submodules:
-//! [`super::eval::run_ktstr_test_inner`] /
-//! [`super::eval::evaluate_vm_result`] (host-side result judgment),
-//! [`super::sidecar`] (per-run JSON), [`super::probe`] (auto-repro +
-//! BPF probe pipeline), [`super::args`] (CLI extraction), and the
-//! [`crate::vmm`] VM launcher.
+//! The heavy lifting lives in sibling submodules: `eval` (host-side
+//! result judgment — `run_ktstr_test_inner` and `evaluate_vm_result`),
+//! `sidecar` (per-run JSON), `probe` (auto-repro + BPF probe pipeline),
+//! `args` (CLI extraction), and the [`crate::vmm`] VM launcher.
 
 use anyhow::Result;
 

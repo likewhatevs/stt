@@ -759,7 +759,7 @@ impl CpusetSpec {
 
     /// Resolve to a concrete CPU set given the topology.
     ///
-    /// **Callers MUST run [`validate`] first and propagate its error.**
+    /// **Callers MUST run [`Self::validate`] first and propagate its error.**
     /// `apply_setup` and `apply_ops::SetCpuset` do so via `anyhow::bail!`.
     ///
     /// Defense-in-depth: every malformed input that `validate`
@@ -2725,9 +2725,8 @@ mod tests {
 
     /// A call captured by MockCgroupOps during apply_setup execution.
     /// Equality-comparable so tests can assert on the exact sequence.
-    /// `tids` in `MoveTasks` is stored but not compared strictly — the
-    /// `fuzzy_move_tasks` helper in individual tests matches on cgroup
-    /// name + tid count since PIDs are unpredictable between runs.
+    /// `MoveTasks` stores the tid count rather than the full `tids` Vec
+    /// because PIDs are unpredictable between runs.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum CgroupCall {
         Setup(bool),
@@ -3019,7 +3018,8 @@ mod tests {
             cpusets: std::collections::HashMap::new(),
         };
         // Llc(99) on a 1-LLC topology is out of range; CpusetSpec::validate
-        // bails before any mock call.
+        // bails after create_cgroup runs but before set_cpuset / move_tasks
+        // fire.
         let defs = vec![CgroupDef::named("cg_bad").with_cpuset(CpusetSpec::Llc(99))];
         let err = apply_setup(&ctx, &mut state, &defs).unwrap_err();
         let msg = format!("{err:#}");
@@ -3027,9 +3027,8 @@ mod tests {
             msg.contains("CpusetSpec validation failed"),
             "expected validation error, got: {msg}"
         );
-        // create_cgroup already ran before the cpuset validation,
-        // which is the documented order — record that so future
-        // refactors notice if the order flips.
+        // create_cgroup runs before cpuset validation — record that
+        // here so future refactors notice if the order flips.
         let calls = mock.calls();
         assert_eq!(
             calls,

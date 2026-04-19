@@ -449,7 +449,7 @@ fn probe_latest_patch(prefix: &str, cli_label: &str) -> Result<String, String> {
             .map(|patch| probe_patch_exists(&client, major, prefix, patch).map(|ok| (patch, ok)))
             .collect::<Result<Vec<_>, _>>()?;
         // rayon preserves input order, so iterating advances `last_good`
-        // monotonically and stops at the first 404 in this batch.
+        // through increasing patch numbers and stops at the first 404.
         for (patch, ok) in results {
             if !ok {
                 break 'expand;

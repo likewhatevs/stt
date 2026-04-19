@@ -117,7 +117,7 @@
 //! ```
 //!
 //! The only feature flag is `integration`, which gates
-//! [`resolve_func_ip`] visibility for integration tests.
+//! `resolve_func_ip` visibility for integration tests.
 //!
 //! # Crate organization
 //!
@@ -154,15 +154,15 @@ pub mod cgroup;
 
 /// Map a raw errno value to its C constant name.
 ///
-/// Returns `None` for unrecognized values. The match arms below carry
-/// the `&'static str` names by hand; [`nix::errno::Errno`] only
-/// validates that `errno` is a known variant (via
-/// `matches!(e, UnknownErrno)`), since `Errno` has no `#[derive(Debug)]`
-/// that yields `&'static str` cheaply at runtime — `format!("{:?}", e)`
-/// allocates a fresh `String` on every call. Adding a new errno means
-/// extending both nix's port-constants table (for the UnknownErrno
-/// gate) and this match; the test suite pins a representative subset
-/// so a stale arm surfaces at build time.
+/// Returns `None` for unrecognized values. [`nix::errno::Errno`] has
+/// `#[derive(Debug)]`, but `format!("{:?}", e)` allocates a fresh
+/// `String` on every call; the hand-rolled match below returns a
+/// `&'static str` pointing at a literal instead. [`nix::errno::Errno`]
+/// is used here to gate unknown errnos via
+/// `matches!(e, UnknownErrno)`. Adding a new errno means extending
+/// both nix's port-constants table (for the UnknownErrno gate) and
+/// this match; the test suite pins a representative subset so a
+/// stale arm surfaces at build time.
 pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
     let e = nix::errno::Errno::from_raw(errno);
     if matches!(e, nix::errno::Errno::UnknownErrno) {
@@ -348,14 +348,16 @@ pub mod prelude {
     // (`pub use crate::scenario::flags::FlagDecl;` in test_support/mod.rs),
     // and a second prelude line would shadow harmlessly but add noise.
     //
-    // `test_support::{newest_run_dir, runs_root, analyze_sidecars, ktstr_main,
-    // ktstr_test_early_dispatch, run_ktstr_test, nextest_setup, resolve_scheduler,
-    // resolve_test_kernel, propagate_rust_env_from_cmdline, maybe_dispatch_vm_test}`
-    // are intentionally NOT in the prelude. They are either binary-entry
-    // helpers (the `ktstr` / `cargo-ktstr` bins), macro-generated glue the
-    // `#[ktstr_test]` expansion consumes, or nextest-setup-script entry
-    // points — audiences distinct from the test-author surface this
-    // module provides.
+    // The following items are intentionally NOT in the prelude. They
+    // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins),
+    // macro-generated glue the `#[ktstr_test]` expansion consumes, or
+    // nextest-setup-script entry points — audiences distinct from the
+    // test-author surface this module provides. Import directly from
+    // `ktstr::test_support::<item>` when needed:
+    // `newest_run_dir`, `runs_root`, `analyze_sidecars`, `ktstr_main`,
+    // `ktstr_test_early_dispatch`, `run_ktstr_test`, `nextest_setup`,
+    // `resolve_scheduler`, `resolve_test_kernel`,
+    // `propagate_rust_env_from_cmdline`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
         AffinityKind, AffinityMode, MemPolicy, MpolFlags, Phase, SchedPolicy, Work, WorkType,

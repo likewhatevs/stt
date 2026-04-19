@@ -1,12 +1,9 @@
 //! Runtime configuration primitives shared by `eval` and `probe`.
 //!
-//! These items live here instead of either `eval` or `probe` so the
-//! two siblings do not form a circular import chain. `eval` calls
-//! `probe::attempt_auto_repro` from its failure path; `probe`
-//! previously borrowed `verbose`, `KTSTR_TEST_SHM_SIZE`, and
-//! `config_file_parts` back from `eval`. Hoisting those three into a
-//! neutral module breaks the cycle without introducing any new
-//! concept — the items remain internal to `test_support`.
+//! `eval` calls `probe::attempt_auto_repro` from its failure path,
+//! so items shared between the two siblings live here to avoid a
+//! circular import chain. All items are `pub(crate)` and remain
+//! internal to `test_support`.
 
 use std::path::{Path, PathBuf};
 
@@ -65,11 +62,16 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     parts.join(" ")
 }
 
-/// Resolve `(vm_topology, memory_mb)` from an optional TopoOverride.
-/// When absent, derives memory from the entry's declared topology
-/// using the 64 MB-per-CPU floor (clamped to at least 256 and at
-/// least `entry.memory_mb`). Shared with `attempt_auto_repro` so the
-/// repro VM always sizes memory the same way as the first VM.
+/// Resolve the VM topology and memory size from an optional
+/// TopoOverride.
+///
+/// Returns `(topology, memory_mb)` where `topology` is the
+/// `vmm::topology::Topology` passed to the VM builder and `memory_mb`
+/// is the memory allocation in megabytes. When `topo` is `Some`, both
+/// come from the override. When `topo` is `None`, the topology comes
+/// from `entry.topology` and memory is `max(total_cpus * 64, 256,
+/// entry.memory_mb)`. Shared with `attempt_auto_repro` so the repro
+/// VM always sizes memory the same way as the first VM.
 pub(crate) fn resolve_vm_topology(
     entry: &KtstrTestEntry,
     topo: Option<&super::topo::TopoOverride>,
