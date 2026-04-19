@@ -93,7 +93,7 @@ pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
 pub const SHM_RING_VERSION: u32 = 1;
 
 /// Byte offset within the SHM region for the host-to-guest dump request flag.
-/// Occupies the first byte of the `_pad` field in ShmRingHeader (offset 12).
+/// Occupies the first byte of the `control_bytes` field in ShmRingHeader (offset 12).
 /// Host writes `DUMP_REQ_SYSRQ_D` to request a SysRq-D dump; guest polls
 /// this byte, triggers the dump, and clears it back to 0.
 pub const DUMP_REQ_OFFSET: usize = 12;
@@ -102,7 +102,7 @@ pub const DUMP_REQ_OFFSET: usize = 12;
 pub const DUMP_REQ_SYSRQ_D: u8 = b'D';
 
 /// Byte offset within the SHM region for the host-to-guest stall request flag.
-/// Occupies the second byte of the `_pad` field in ShmRingHeader (offset 13).
+/// Occupies the second byte of the `control_bytes` field in ShmRingHeader (offset 13).
 /// Host writes `STALL_REQ_ACTIVATE` to request a scheduler stall; guest polls
 /// this byte, creates /tmp/ktstr_stall, and clears it back to 0.
 pub const STALL_REQ_OFFSET: usize = 13;
@@ -111,8 +111,8 @@ pub const STALL_REQ_OFFSET: usize = 13;
 pub const STALL_REQ_ACTIVATE: u8 = b'S';
 
 /// Base offset within the SHM region for numbered signal slots.
-/// Slots occupy bytes starting at offset 14 (third byte of `_pad`)
-/// and extending into byte 15 (fourth byte of `_pad`), providing
+/// Slots occupy bytes starting at offset 14 (third byte of `control_bytes`)
+/// and extending into byte 15 (fourth byte of `control_bytes`), providing
 /// 2 slots (0..1). AtomicU8 with Acquire/Release ordering.
 pub const SIGNAL_SLOT_BASE: usize = 14;
 
@@ -315,7 +315,15 @@ pub struct ShmRingHeader {
     pub version: u32,
     /// Data area size in bytes (region_size - sizeof(ShmRingHeader)).
     pub capacity: u32,
-    pub _pad: u32,
+    /// Packed host→guest control bytes — NOT padding despite being
+    /// declared as `u32` for alignment. Byte 0 = `DUMP_REQ_OFFSET`
+    /// (SysRq-D dump trigger), byte 1 = `STALL_REQ_OFFSET` (scheduler
+    /// stall trigger), bytes 2-3 = `SIGNAL_SLOT_BASE + {0, 1}` (2
+    /// indexed `AtomicU8` signal slots). Read/written byte-wise with
+    /// `Acquire`/`Release` ordering via the `*_OFFSET` / `*_BASE`
+    /// constants above; the `u32` spelling exists only so the header
+    /// remains a plain POD for zerocopy derive.
+    pub control_bytes: u32,
     /// Total bytes written by the guest (monotonic).
     pub write_ptr: u64,
     /// Total bytes read by the host (monotonic).
@@ -427,12 +435,16 @@ impl StimulusEvent {
 /// where the SHM region starts. `shm_size` is the total region size.
 #[allow(dead_code)]
 pub fn shm_init(buf: &mut [u8], shm_offset: usize, shm_size: usize) {
-    let capacity = shm_size - HEADER_SIZE;
+    // Clamp to 0 when the caller mis-sized the region: a 0-capacity ring
+    // is internally consistent (every `shm_write` hits the ring-full
+    // branch and drops), whereas an arithmetic underflow would panic the
+    // VMM before the shm layout error could surface to the operator.
+    let capacity = shm_size.saturating_sub(HEADER_SIZE);
     let header = ShmRingHeader {
         magic: SHM_RING_MAGIC,
         version: SHM_RING_VERSION,
         capacity: capacity as u32,
-        _pad: 0,
+        control_bytes: 0,
         write_ptr: 0,
         read_ptr: 0,
         drops: 0,
@@ -452,7 +464,7 @@ fn read_header(buf: &[u8], shm_offset: usize) -> ShmRingHeader {
         magic: u32::from_ne_bytes(s[0..4].try_into().unwrap()),
         version: u32::from_ne_bytes(s[4..8].try_into().unwrap()),
         capacity: u32::from_ne_bytes(s[8..12].try_into().unwrap()),
-        _pad: u32::from_ne_bytes(s[12..16].try_into().unwrap()),
+        control_bytes: u32::from_ne_bytes(s[12..16].try_into().unwrap()),
         write_ptr: u64::from_ne_bytes(s[16..24].try_into().unwrap()),
         read_ptr: u64::from_ne_bytes(s[24..32].try_into().unwrap()),
         drops: u64::from_ne_bytes(s[32..40].try_into().unwrap()),
@@ -678,10 +690,14 @@ pub fn shm_write(buf: &mut [u8], shm_offset: usize, msg_type: u32, payload: &[u8
         return 0;
     }
     if used + total > capacity {
-        // Ring full — increment drops counter.
+        // Ring full — increment drops counter. `saturating_add` because
+        // a pinned-at-u64::MAX counter is the right observable state
+        // when drops overflow; a wraparound to 0 would masquerade as
+        // "no drops" to the host telemetry reader.
         let drops_offset = shm_offset + 32; // offset of `drops` field
         let current = u64::from_ne_bytes(buf[drops_offset..drops_offset + 8].try_into().unwrap());
-        buf[drops_offset..drops_offset + 8].copy_from_slice(&(current + 1).to_ne_bytes());
+        buf[drops_offset..drops_offset + 8]
+            .copy_from_slice(&current.saturating_add(1).to_ne_bytes());
         return 0;
     }
 
@@ -1172,7 +1188,7 @@ mod tests {
             magic: SHM_RING_MAGIC,
             version: SHM_RING_VERSION,
             capacity: 216,
-            _pad: 0,
+            control_bytes: 0,
             write_ptr: 0x1122_3344_5566_7788,
             read_ptr: 0xAABB_CCDD_EEFF_0011,
             drops: 42,
@@ -1200,13 +1216,13 @@ mod tests {
     }
 
     #[test]
-    fn dump_req_offset_in_pad() {
+    fn dump_req_offset_in_control_bytes() {
         assert_eq!(DUMP_REQ_OFFSET, 12);
         assert_eq!(DUMP_REQ_SYSRQ_D, b'D');
     }
 
     #[test]
-    fn stall_req_offset_in_pad() {
+    fn stall_req_offset_in_control_bytes() {
         assert_eq!(STALL_REQ_OFFSET, 13);
         assert_eq!(STALL_REQ_ACTIVATE, b'S');
     }

@@ -917,7 +917,7 @@ pub struct WorkerReport {
     /// (Bursty, PipeIo, FutexPingPong, FutexFanOut, SchBench, CacheYield,
     /// CachePipe, IoSync, NiceSweep, AffinityChurn, MutexContention,
     /// Sequence with Sleep/Yield/Io phases).
-    pub wake_latencies_ns: Vec<u64>,
+    pub resume_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
     pub iterations: u64,
     /// Delta of /proc/self/schedstat field 2 (run_delay) over the work loop.
@@ -1599,7 +1599,7 @@ impl WorkloadHandle {
                     max_gap_ms: 0,
                     max_gap_cpu: 0,
                     max_gap_at_ms: 0,
-                    wake_latencies_ns: Vec::new(),
+                    resume_latencies_ns: Vec::new(),
                     iterations: 0,
                     schedstat_run_delay_ns: 0,
                     schedstat_ctx_switches: 0,
@@ -1706,7 +1706,7 @@ fn worker_main(
     let mut io_seq_file: Option<(std::fs::File, String)> = None;
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
     const MAX_WAKE_SAMPLES: usize = 100_000;
-    let mut wake_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
+    let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut wake_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
     // AffinityChurn: read effective cpuset once at start via sched_getaffinity.
@@ -1822,7 +1822,7 @@ fn worker_main(
                 let before_sleep = Instant::now();
                 std::thread::sleep(Duration::from_micros(100));
                 reservoir_push(
-                    &mut wake_latencies_ns,
+                    &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     before_sleep.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -1839,7 +1839,7 @@ fn worker_main(
                     let before_sleep = Instant::now();
                     std::thread::sleep(Duration::from_millis(sleep_ms));
                     reservoir_push(
-                        &mut wake_latencies_ns,
+                        &mut resume_latencies_ns,
                         &mut wake_sample_count,
                         before_sleep.elapsed().as_nanos() as u64,
                         MAX_WAKE_SAMPLES,
@@ -1856,7 +1856,7 @@ fn worker_main(
                 pipe_exchange(
                     read_fd,
                     write_fd,
-                    &mut wake_latencies_ns,
+                    &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     MAX_WAKE_SAMPLES,
                 );
@@ -1900,7 +1900,7 @@ fn worker_main(
                     let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
                     if cur == my_val {
                         reservoir_push(
-                            &mut wake_latencies_ns,
+                            &mut resume_latencies_ns,
                             &mut wake_sample_count,
                             before_block.elapsed().as_nanos() as u64,
                             MAX_WAKE_SAMPLES,
@@ -1940,7 +1940,7 @@ fn worker_main(
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
-                    &mut wake_latencies_ns,
+                    &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     before_yield.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -1962,7 +1962,7 @@ fn worker_main(
                 pipe_exchange(
                     read_fd,
                     write_fd,
-                    &mut wake_latencies_ns,
+                    &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     MAX_WAKE_SAMPLES,
                 );
@@ -2013,7 +2013,7 @@ fn worker_main(
                         let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
                         if cur != expected {
                             reservoir_push(
-                                &mut wake_latencies_ns,
+                                &mut resume_latencies_ns,
                                 &mut wake_sample_count,
                                 before_block.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -2055,7 +2055,7 @@ fn worker_main(
                             let before_sleep = Instant::now();
                             std::thread::sleep(*dur);
                             reservoir_push(
-                                &mut wake_latencies_ns,
+                                &mut resume_latencies_ns,
                                 &mut wake_sample_count,
                                 before_sleep.elapsed().as_nanos() as u64,
                                 MAX_WAKE_SAMPLES,
@@ -2069,7 +2069,7 @@ fn worker_main(
                                 let before_yield = Instant::now();
                                 std::thread::yield_now();
                                 reservoir_push(
-                                    &mut wake_latencies_ns,
+                                    &mut resume_latencies_ns,
                                     &mut wake_sample_count,
                                     before_yield.elapsed().as_nanos() as u64,
                                     MAX_WAKE_SAMPLES,
@@ -2103,7 +2103,7 @@ fn worker_main(
                                 let before_sleep = Instant::now();
                                 std::thread::sleep(Duration::from_micros(100));
                                 reservoir_push(
-                                    &mut wake_latencies_ns,
+                                    &mut resume_latencies_ns,
                                     &mut wake_sample_count,
                                     before_sleep.elapsed().as_nanos() as u64,
                                     MAX_WAKE_SAMPLES,
@@ -2165,7 +2165,7 @@ fn worker_main(
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
-                    &mut wake_latencies_ns,
+                    &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     before_yield.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -2192,7 +2192,7 @@ fn worker_main(
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
-                    &mut wake_latencies_ns,
+                    &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     before_yield.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -2212,7 +2212,7 @@ fn worker_main(
                 let before_yield = Instant::now();
                 std::thread::yield_now();
                 reservoir_push(
-                    &mut wake_latencies_ns,
+                    &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     before_yield.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
@@ -2277,7 +2277,7 @@ fn worker_main(
                             let wake_ns = unsafe { std::ptr::read_volatile(wake_ts_ptr) };
                             let latency = now_ns.saturating_sub(wake_ns);
                             reservoir_push(
-                                &mut wake_latencies_ns,
+                                &mut resume_latencies_ns,
                                 &mut wake_sample_count,
                                 latency,
                                 MAX_WAKE_SAMPLES,
@@ -2401,7 +2401,7 @@ fn worker_main(
                         );
                     }
                     reservoir_push(
-                        &mut wake_latencies_ns,
+                        &mut resume_latencies_ns,
                         &mut wake_sample_count,
                         before_block.elapsed().as_nanos() as u64,
                         MAX_WAKE_SAMPLES,
@@ -2524,7 +2524,7 @@ fn worker_main(
         max_gap_ms: max_gap_ns / 1_000_000,
         max_gap_cpu,
         max_gap_at_ms: max_gap_at_ns / 1_000_000,
-        wake_latencies_ns,
+        resume_latencies_ns,
         iterations,
         schedstat_run_delay_ns: ss_delay_end.saturating_sub(ss_delay_start),
         schedstat_ctx_switches: ss_ts_end.saturating_sub(ss_ts_start),
@@ -2581,7 +2581,7 @@ fn schbench_matrix_multiply(data: &mut [u64], size: usize) {
 fn pipe_exchange(
     read_fd: i32,
     write_fd: i32,
-    wake_latencies_ns: &mut Vec<u64>,
+    resume_latencies_ns: &mut Vec<u64>,
     wake_sample_count: &mut u64,
     max_wake_samples: usize,
 ) {
@@ -2601,7 +2601,7 @@ fn pipe_exchange(
             let mut byte = [0u8; 1];
             unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut _, 1) };
             reservoir_push(
-                wake_latencies_ns,
+                resume_latencies_ns,
                 wake_sample_count,
                 before_block.elapsed().as_nanos() as u64,
                 max_wake_samples,
@@ -2867,7 +2867,7 @@ mod tests {
             max_gap_ms: 50,
             max_gap_cpu: 1,
             max_gap_at_ms: 500,
-            wake_latencies_ns: vec![1000, 2000],
+            resume_latencies_ns: vec![1000, 2000],
             iterations: 10,
             schedstat_run_delay_ns: 500_000,
             schedstat_ctx_switches: 20,
@@ -3479,7 +3479,7 @@ mod tests {
             max_gap_ms: 0,
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
-            wake_latencies_ns: vec![],
+            resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
@@ -3506,7 +3506,7 @@ mod tests {
             max_gap_ms: u64::MAX,
             max_gap_cpu: usize::MAX,
             max_gap_at_ms: u64::MAX,
-            wake_latencies_ns: vec![],
+            resume_latencies_ns: vec![],
             iterations: u64::MAX,
             schedstat_run_delay_ns: u64::MAX,
             schedstat_ctx_switches: u64::MAX,
@@ -3897,7 +3897,7 @@ mod tests {
             max_gap_ms: 77,
             max_gap_cpu: 5,
             max_gap_at_ms: 500,
-            wake_latencies_ns: vec![],
+            resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
@@ -3949,7 +3949,7 @@ mod tests {
             max_gap_ms: 0,
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
-            wake_latencies_ns: vec![],
+            resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
@@ -4201,7 +4201,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let reports = h.stop_and_collect();
         // At least one receiver should have wake latency samples.
-        let has_latencies = reports.iter().any(|r| !r.wake_latencies_ns.is_empty());
+        let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
         assert!(has_latencies, "receivers should record wake latencies");
     }
 
@@ -4633,7 +4633,7 @@ mod tests {
             max_gap_ms: 0,
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
-            wake_latencies_ns: vec![],
+            resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
@@ -4676,7 +4676,7 @@ mod tests {
             max_gap_ms: 0,
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
-            wake_latencies_ns: vec![],
+            resume_latencies_ns: vec![],
             iterations: work_units,
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
@@ -4780,7 +4780,7 @@ mod tests {
         for r in &reports {
             assert!(r.work_units > 0, "SchBench worker {} did no work", r.tid);
         }
-        let has_latencies = reports.iter().any(|r| !r.wake_latencies_ns.is_empty());
+        let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
         assert!(has_latencies, "workers should record wake latencies");
     }
 
@@ -5165,7 +5165,7 @@ mod tests {
         h.start();
         std::thread::sleep(std::time::Duration::from_millis(500));
         let reports = h.stop_and_collect();
-        let has_latencies = reports.iter().any(|r| !r.wake_latencies_ns.is_empty());
+        let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
         assert!(has_latencies, "contenders should record wake latencies");
     }
 }

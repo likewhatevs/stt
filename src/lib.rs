@@ -232,29 +232,22 @@ pub(crate) mod budget;
 pub mod cli;
 pub mod fetch;
 pub mod kernel_path;
-#[allow(dead_code)]
 pub(crate) mod monitor;
-#[allow(dead_code)]
 pub(crate) mod probe;
 pub mod runner;
 pub mod scenario;
-#[allow(dead_code)]
 pub(crate) mod stats;
 pub mod test_support;
-#[allow(dead_code)]
 pub(crate) mod timeline;
 pub mod topology;
 
 pub mod remote_cache;
 pub mod verifier;
-#[allow(dead_code)]
 pub(crate) mod vm;
-#[allow(dead_code)]
 pub(crate) mod vmm;
 pub mod workload;
 
 /// Static busybox binary compiled in build.rs for guest shell mode.
-#[allow(dead_code)]
 pub(crate) const BUSYBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
 
 /// Short git commit hash at ktstr build time, or "unknown" when

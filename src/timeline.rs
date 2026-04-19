@@ -1,3 +1,9 @@
+// Timeline is `pub(crate)` but its phase builders are called from
+// `cargo ktstr stats` and the VM dispatch path that renders
+// stimulus-aligned phase reports. Narrowing the allow here replaces
+// the blanket in lib.rs.
+#![allow(dead_code)]
+
 //! Stimulus/phase correlation for scenario execution.
 //!
 //! Correlates [`StimulusEvent`]s (cgroup operations, cpuset changes)
@@ -252,7 +258,12 @@ impl Timeline {
                 let duration_s =
                     phases[i].end_ms.saturating_sub(phases[i].start_ms) as f64 / 1000.0;
                 if duration_s > 0.0 && e > s {
-                    phases[i].metrics.iteration_rate = Some((e - s) as f64 / duration_s);
+                    // `e > s` above, but `saturating_sub` is
+                    // defense-in-depth — if a future change reorders
+                    // the guard, the rate stays at 0 rather than
+                    // panicking on underflow.
+                    phases[i].metrics.iteration_rate =
+                        Some(e.saturating_sub(s) as f64 / duration_s);
                 }
             }
         }
@@ -547,7 +558,12 @@ fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
 
     let (fallback_rate, keep_last_rate) = match (first_ev, last_ev) {
         (Some(first), Some(last)) if first.elapsed_ms < last.elapsed_ms => {
-            let duration_s = (last.elapsed_ms - first.elapsed_ms) as f64 / 1000.0;
+            // `<` guard above is expected to rule out underflow, but
+            // `saturating_sub` is defense-in-depth: if a future change
+            // loosens the guard, the worst outcome becomes
+            // `duration_s == 0.0` (which disables the rate below) rather
+            // than a panic.
+            let duration_s = last.elapsed_ms.saturating_sub(first.elapsed_ms) as f64 / 1000.0;
             // Event counters can reset mid-run (scheduler restart) and
             // produce a negative raw delta. Shared helper clamps to
             // >= 0 so the computed rate never goes negative; same

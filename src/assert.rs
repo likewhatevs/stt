@@ -1316,7 +1316,7 @@ impl Assert {
 /// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 2_000_000,
 /// #     off_cpu_ns: 1_000_000, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 0, max_gap_cpu: 0, max_gap_at_ms: 0,
-/// #     wake_latencies_ns: vec![], iterations: 0,
+/// #     resume_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
 /// #     schedstat_cpu_time_ns: 0,
 /// #     numa_pages: std::collections::BTreeMap::new(),
@@ -1350,7 +1350,7 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 5_000_000_000,
 /// #     off_cpu_ns: 500_000_000, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
-/// #     wake_latencies_ns: vec![], iterations: 0,
+/// #     resume_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
 /// #     schedstat_cpu_time_ns: 0,
 /// #     numa_pages: std::collections::BTreeMap::new(),
@@ -1423,7 +1423,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
     // Compute benchmarking stats from worker reports.
     let all_latencies: Vec<u64> = reports
         .iter()
-        .flat_map(|w| w.wake_latencies_ns.iter().copied())
+        .flat_map(|w| w.resume_latencies_ns.iter().copied())
         .collect();
     let (p99_us, median_us, lat_cv) = if all_latencies.is_empty() {
         (0.0, 0.0, 0.0)
@@ -1560,7 +1560,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 /// #     work_units: units, cpu_time_ns: cpu_ns, wall_time_ns: cpu_ns,
 /// #     off_cpu_ns: cpu_ns, migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 0, max_gap_cpu: 0, max_gap_at_ms: 0,
-/// #     wake_latencies_ns: vec![], iterations: 0,
+/// #     resume_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
 /// #     schedstat_cpu_time_ns: 0,
 /// #     numa_pages: std::collections::BTreeMap::new(),
@@ -1643,7 +1643,7 @@ pub fn assert_throughput_parity(
 /// #     wall_time_ns: 5_000_000_000, off_cpu_ns: 2_500_000_000,
 /// #     migration_count: 0, migrations: vec![],
 /// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
-/// #     wake_latencies_ns: vec![100, 200, 300, 400, 500],
+/// #     resume_latencies_ns: vec![100, 200, 300, 400, 500],
 /// #     iterations: 1000,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
 /// #     schedstat_cpu_time_ns: 0,
@@ -1667,7 +1667,7 @@ pub fn assert_benchmarks(
     // Collect all wake latencies across workers.
     let all_latencies: Vec<u64> = reports
         .iter()
-        .flat_map(|w| w.wake_latencies_ns.iter().copied())
+        .flat_map(|w| w.resume_latencies_ns.iter().copied())
         .collect();
 
     if let Some(p99_limit) = max_p99_ns
@@ -1759,7 +1759,7 @@ mod tests {
             max_gap_ms: gap_ms,
             max_gap_cpu: cpus.first().copied().unwrap_or(0),
             max_gap_at_ms: 1000,
-            wake_latencies_ns: vec![],
+            resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,
@@ -3114,7 +3114,7 @@ mod tests {
             max_gap_ms: 50,
             max_gap_cpu: 0,
             max_gap_at_ms: 1000,
-            wake_latencies_ns: latencies,
+            resume_latencies_ns: latencies,
             iterations,
             schedstat_run_delay_ns: 0,
             schedstat_ctx_switches: 0,

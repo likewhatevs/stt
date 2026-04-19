@@ -1,3 +1,11 @@
+// VMM contains the KVM boot path, console/SHM ring helpers, and
+// gauntlet entry points used by `ktstr run`, `cargo ktstr verifier`,
+// `cargo ktstr shell`, and the `#[ktstr_test]` dispatch harness. It
+// stays `pub(crate)` to avoid freezing the public surface while the
+// auto-repro and monitor pipelines continue to evolve; the allow is
+// narrowed here to replace the blanket in lib.rs.
+#![allow(dead_code)]
+
 //! Virtual machine monitor for booting Linux kernels in KVM to host
 //! scheduler test scenarios.
 //!
@@ -2158,7 +2166,7 @@ impl KtstrVm {
             magic: shm_ring::SHM_RING_MAGIC,
             version: shm_ring::SHM_RING_VERSION,
             capacity: (shm_size - shm_ring::HEADER_SIZE) as u32,
-            _pad: 0,
+            control_bytes: 0,
             write_ptr: 0,
             read_ptr: 0,
             drops: 0,
@@ -2882,7 +2890,7 @@ impl KtstrVm {
                 // Phase 1: wait for BPF map accessor (kernel booted, page tables up).
                 let phase1_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(30);
-                let accessor = loop {
+                let owned = loop {
                     match monitor::bpf_map::BpfMapAccessorOwned::new(&mem, &vmlinux) {
                         Ok(a) => break a,
                         Err(e) => {
@@ -2897,6 +2905,7 @@ impl KtstrVm {
                         }
                     }
                 };
+                let accessor = owned.as_accessor();
 
                 // Phase 2: resolve every queued map before signaling the
                 // guest. Running writes serially against partially-

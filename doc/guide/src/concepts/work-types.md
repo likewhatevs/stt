@@ -220,7 +220,7 @@ fn my_workload(stop: &AtomicBool) -> WorkerReport {
         max_gap_ms: 0,
         max_gap_cpu: 0,
         max_gap_at_ms: 0,
-        wake_latencies_ns: vec![],
+        resume_latencies_ns: vec![],
         iterations: work_units,
         schedstat_run_delay_ns: 0,
         schedstat_ctx_switches: 0,

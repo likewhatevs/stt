@@ -927,79 +927,10 @@ impl<'a> BpfMapAccessorOwned<'a> {
         &self.kernel
     }
 
-    /// Enumerate all BPF maps in the kernel's `map_idr`.
-    pub fn maps(&self) -> Vec<BpfMapInfo> {
-        self.as_accessor().maps()
-    }
-
-    /// Find the first BPF ARRAY map whose name ends with `name_suffix`.
-    ///
-    /// Only returns `BPF_MAP_TYPE_ARRAY` maps. Use [`maps`](Self::maps)
-    /// to enumerate maps of all types.
-    pub fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
-        self.as_accessor().find_map(name_suffix)
-    }
-
-    /// Read bytes from a map's value region.
-    pub fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>> {
-        self.as_accessor().read_value(map, offset, len)
-    }
-
-    /// Write bytes to a map's value region.
-    pub fn write_value(&self, map: &BpfMapInfo, offset: usize, data: &[u8]) -> bool {
-        self.as_accessor().write_value(map, offset, data)
-    }
-
-    /// Write a u32 to a map's value region.
-    pub fn write_value_u32(&self, map: &BpfMapInfo, offset: usize, val: u32) -> bool {
-        self.as_accessor().write_value_u32(map, offset, val)
-    }
-
-    /// Read a u32 from a map's value region.
-    pub fn read_value_u32(&self, map: &BpfMapInfo, offset: usize) -> Option<u32> {
-        self.as_accessor().read_value_u32(map, offset)
-    }
-
-    /// Iterate all entries in a `BPF_MAP_TYPE_HASH` map.
-    pub fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.as_accessor().iter_hash_map(map)
-    }
-
-    /// Read per-CPU values for a key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
-    pub fn read_percpu_array(
-        &self,
-        map: &BpfMapInfo,
-        key: u32,
-        num_cpus: u32,
-    ) -> Vec<Option<Vec<u8>>> {
-        self.as_accessor().read_percpu_array(map, key, num_cpus)
-    }
-
-    /// Resolve the value layout from the map's BTF.
-    pub fn resolve_value_layout(&self, map: &BpfMapInfo) -> Option<BpfValueLayout> {
-        self.as_accessor().resolve_value_layout(map)
-    }
-
-    /// Read a typed field from a map's value region.
-    pub fn read_field(
-        &self,
-        map: &BpfMapInfo,
-        layout: &BpfValueLayout,
-        field: &str,
-    ) -> Option<BpfValue> {
-        self.as_accessor().read_field(map, layout, field)
-    }
-
-    /// Write a typed field to a map's value region.
-    pub fn write_field(
-        &self,
-        map: &BpfMapInfo,
-        layout: &BpfValueLayout,
-        field: &str,
-        val: BpfValue,
-    ) -> bool {
-        self.as_accessor().write_field(map, layout, field, val)
-    }
+    // Map operations live on [`BpfMapAccessor`]. Borrow via
+    // [`as_accessor`] to call them: `owned.as_accessor().find_map(...)`.
+    // The wrapper type exists only to own the `GuestKernel` and
+    // `BpfMapOffsets`; it does not duplicate the accessor's surface.
 }
 
 #[cfg(test)]

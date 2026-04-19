@@ -1,3 +1,9 @@
+// VM exposes gauntlet presets and launch-config helpers that the
+// `ktstr run` and `cargo ktstr test` binaries consume. The module
+// stays `pub(crate)` to avoid fixing every public doc example; the
+// allow is narrowed here to replace the blanket in lib.rs.
+#![allow(dead_code)]
+
 //! VM launch configuration and gauntlet topology presets.
 //!
 //! See the [Running Tests](https://likewhatevs.github.io/ktstr/guide/running-tests.html)

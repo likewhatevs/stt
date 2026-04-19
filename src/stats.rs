@@ -1,3 +1,9 @@
+// Stats is `pub(crate)` but its extractors and comparators are called
+// from `cargo ktstr stats` CLI handlers that build outside the lib
+// crate's own dependency graph (separate [[bin]] target). Narrowing
+// the allow to this file replaces the blanket in lib.rs.
+#![allow(dead_code)]
+
 //! Gauntlet analysis and run-to-run comparison.
 //!
 //! Collects per-scenario results into a [`polars`] DataFrame for

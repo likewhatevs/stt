@@ -56,7 +56,7 @@ pub struct WorkerReport {
     pub max_gap_ms: u64,
     pub max_gap_cpu: usize,
     pub max_gap_at_ms: u64,
-    pub wake_latencies_ns: Vec<u64>,
+    pub resume_latencies_ns: Vec<u64>,
     pub iterations: u64,
     pub schedstat_run_delay_ns: u64,
     pub schedstat_ctx_switches: u64,
@@ -80,7 +80,7 @@ pub struct WorkerReport {
 
 Workers collect two categories of timing data:
 
-**Per-wakeup latency** (`wake_latencies_ns`): timestamp-based samples
+**Per-wakeup latency** (`resume_latencies_ns`): timestamp-based samples
 recorded around blocking operations. Populated for work types with a
 blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
 (futex wait), FutexFanOut (futex wait, receivers only), SchBench
