@@ -272,6 +272,12 @@ pub(crate) fn ktstr_guest_init() -> ! {
     };
     tracing::debug!(args = ?args, "parsed /args");
 
+    // Propagate RUST_BACKTRACE and RUST_LOG from the kernel cmdline to
+    // the process environment BEFORE Phase A spawns its probe thread.
+    // `std::env::set_var` mutates glibc's `__environ` without locking;
+    // calling it while the probe thread is live is UB on Linux.
+    crate::test_support::propagate_rust_env_from_cmdline();
+
     // Phase 2b: Probe Phase A (before scheduler starts).
     // Attaches kprobes + trigger + kernel fexit so the one-shot
     // sched_ext_exit tracepoint is captured even if the scheduler

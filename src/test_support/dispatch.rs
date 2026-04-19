@@ -28,8 +28,9 @@ use crate::assert::AssertResult;
 use super::{
     KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_flags_arg,
     extract_test_fn_arg, extract_topo_arg, find_test, format_callback_profile, format_kvm_stats,
-    format_verifier_stats, maybe_dispatch_vm_test, parse_topo_string, resolve_test_kernel,
-    run_ktstr_test_inner, sidecar_dir, try_flush_profraw, validate_entry_flags, write_skip_sidecar,
+    format_verifier_stats, maybe_dispatch_vm_test, parse_topo_string,
+    propagate_rust_env_from_cmdline, resolve_test_kernel, run_ktstr_test_inner, sidecar_dir,
+    try_flush_profraw, validate_entry_flags, write_skip_sidecar,
 };
 
 /// Early dispatch for `#[ktstr_test]` test execution.
@@ -59,6 +60,12 @@ pub fn ktstr_test_early_dispatch() {
     if let Some(code) = maybe_dispatch_host_test() {
         std::process::exit(code);
     }
+    // Propagate RUST_BACKTRACE / RUST_LOG from /proc/cmdline before
+    // `maybe_dispatch_vm_test` runs: ctor context is single-threaded
+    // (`.init_array` runs before any user thread exists), so this
+    // `set_var` is sound and the later guest-side code that spawns
+    // the probe thread observes the correct env.
+    propagate_rust_env_from_cmdline();
     if let Some(code) = maybe_dispatch_vm_test() {
         // The LLVM profiling runtime registers its atexit handler via a
         // .init_array entry (C++ global initializer). Our ctor also lives

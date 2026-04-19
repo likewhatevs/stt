@@ -1695,6 +1695,13 @@ fn worker_main(
     let mut max_gap_at_ns: u64 = 0;
     // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe, SchBench).
     let mut cache_pressure_buf: Option<Vec<u8>> = None;
+    // Separate Vec<u64> for schbench_matrix_multiply: the matrix
+    // workload interprets its storage as a sequence of u64 operands,
+    // and a `Vec<u8>` has only 1-byte alignment. Reinterpreting a
+    // u8-backed buffer as `*mut u64` is UB regardless of buffer
+    // contents. Vec<u64> gives natural 8-byte alignment from the
+    // allocator.
+    let mut schbench_matrix_buf: Option<Vec<u64>> = None;
     // Persistent temp file for IoSync / Phase::Io (opened on first use, removed on exit).
     let mut io_sync_file: Option<(std::fs::File, String)> = None;
     let mut io_seq_file: Option<(std::fs::File, String)> = None;
@@ -2294,8 +2301,8 @@ fn worker_main(
                         std::thread::sleep(Duration::from_micros(sleep_usec));
                     }
                     if schbench_matrix_size > 0 && !STOP.load(Ordering::Relaxed) {
-                        let buf = cache_pressure_buf.get_or_insert_with(|| {
-                            vec![0u8; 3 * schbench_matrix_size * schbench_matrix_size * 8]
+                        let buf = schbench_matrix_buf.get_or_insert_with(|| {
+                            vec![0u64; 3 * schbench_matrix_size * schbench_matrix_size]
                         });
                         for _ in 0..operations {
                             schbench_matrix_multiply(buf, schbench_matrix_size);
@@ -2549,9 +2556,13 @@ fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_units: &mut u6
 }
 
 /// Naive matrix multiply: three square matrices of u64, O(n^3).
-fn schbench_matrix_multiply(buf: &mut [u8], size: usize) {
-    let data =
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u64, 3 * size * size) };
+///
+/// The caller owns a `Vec<u64>` of length `3 * size * size` so the
+/// storage is naturally 8-byte aligned. An earlier version took a
+/// `&mut [u8]` and cast to `*mut u64`, which was UB because a
+/// `Vec<u8>` is only 1-byte aligned.
+fn schbench_matrix_multiply(data: &mut [u64], size: usize) {
+    debug_assert_eq!(data.len(), 3 * size * size);
     let stride = size * size;
     for i in 0..size {
         for j in 0..size {

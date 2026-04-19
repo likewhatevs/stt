@@ -219,6 +219,13 @@ fn read_llc_cache_size(cpu: usize) -> Option<u64> {
 }
 
 /// Parse a cache size string like "32768K" or "32M" into KB.
+///
+/// Bare numeric input is interpreted as bytes and converted to KB via
+/// ceiling division — a non-zero byte count smaller than 1 KB still
+/// rounds up to 1 KB rather than silently becoming 0 KB (which a
+/// consumer would read as "no cache"). Integer division on
+/// `500 / 1024 = 0` is the failure mode being avoided. Zero bytes
+/// still maps to 0 KB.
 fn parse_cache_size(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(kb) = s.strip_suffix('K') {
@@ -226,8 +233,9 @@ fn parse_cache_size(s: &str) -> Option<u64> {
     } else if let Some(mb) = s.strip_suffix('M') {
         mb.parse::<u64>().ok().map(|v| v * 1024)
     } else {
-        // Bare number: assume bytes, convert to KB
-        s.parse::<u64>().ok().map(|v| v / 1024)
+        // Bare number: assume bytes, ceil-convert to KB so sub-KB
+        // values don't collapse to 0.
+        s.parse::<u64>().ok().map(|v| v.div_ceil(1024))
     }
 }
 
@@ -1204,7 +1212,18 @@ mod tests {
     fn parse_cache_size_formats() {
         assert_eq!(parse_cache_size("32768K"), Some(32768));
         assert_eq!(parse_cache_size("32M"), Some(32768));
+        // 65536 bytes = 64 KB exactly.
         assert_eq!(parse_cache_size("65536"), Some(64));
+        // Sub-KB bare-byte values round up to 1 KB instead of 0 KB.
+        // Consumers treat 0 as "no cache"; a 500-byte cache is not
+        // "no cache", it's "small cache."
+        assert_eq!(parse_cache_size("500"), Some(1));
+        assert_eq!(parse_cache_size("1"), Some(1));
+        assert_eq!(parse_cache_size("1023"), Some(1));
+        // Just over 1 KB still ceils to 2 KB.
+        assert_eq!(parse_cache_size("1025"), Some(2));
+        // Exact zero bytes maps to zero KB.
+        assert_eq!(parse_cache_size("0"), Some(0));
     }
 
     #[test]

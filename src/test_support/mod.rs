@@ -89,13 +89,13 @@ pub(crate) use output::{
     ensure_kvm, extract_kernel_version, extract_panic_message, extract_sched_ext_dump,
     format_console_diagnostics, parse_assert_result, parse_sched_output, sched_log_fingerprint,
 };
-pub use probe::maybe_dispatch_vm_test;
 #[cfg(test)]
 pub(crate) use probe::{PROBE_OUTPUT_END, PROBE_OUTPUT_START, ProbePayload, extract_probe_output};
 pub(crate) use probe::{
     PipelineDiagnostics, format_probe_diagnostics, maybe_dispatch_vm_test_with_args,
     maybe_dispatch_vm_test_with_phase_a, start_probe_phase_a,
 };
+pub use probe::{maybe_dispatch_vm_test, propagate_rust_env_from_cmdline};
 #[cfg(test)]
 pub(crate) use profraw::MSG_TYPE_PROFRAW;
 pub(crate) use profraw::try_flush_profraw;

@@ -40,6 +40,42 @@ use super::{KtstrTestEntry, TopoOverride};
 /// programs. `filter_traceable` drops it (not in kallsyms).
 const DISCOVER_SENTINEL: &str = "__discover__";
 
+/// Propagate `RUST_BACKTRACE` and `RUST_LOG` from the guest kernel
+/// cmdline into the process environment.
+///
+/// Must be called while the process is single-threaded — i.e. before
+/// any probe thread is spawned (`start_probe_phase_a`) and before any
+/// test thread runs. `std::env::set_var` is not thread-safe on Linux
+/// because glibc mutates the global `__environ` array without locks;
+/// a concurrent reader (or another `set_var`) produces UB. Callers on
+/// the VM-boot path must invoke this from `ktstr_guest_init` after
+/// `/args` is read and before `start_probe_phase_a` spawns the probe
+/// thread.
+pub fn propagate_rust_env_from_cmdline() {
+    let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
+        return;
+    };
+    let parts: Vec<&str> = cmdline.split_whitespace().collect();
+    if let Some(val) = parts
+        .iter()
+        .find(|s| s.starts_with("RUST_BACKTRACE="))
+        .and_then(|s| s.strip_prefix("RUST_BACKTRACE="))
+    {
+        // SAFETY: called from ktstr_guest_init before any probe /
+        // workload thread is spawned; single-threaded mutation of
+        // `__environ` is sound.
+        unsafe { std::env::set_var("RUST_BACKTRACE", val) };
+    }
+    if let Some(val) = parts
+        .iter()
+        .find(|s| s.starts_with("RUST_LOG="))
+        .and_then(|s| s.strip_prefix("RUST_LOG="))
+    {
+        // SAFETY: see above.
+        unsafe { std::env::set_var("RUST_LOG", val) };
+    }
+}
+
 /// Delimiters for probe output in guest COM2 (written by emit_probe_payload).
 pub(crate) const PROBE_OUTPUT_START: &str = "===PROBE_OUTPUT_START===";
 pub(crate) const PROBE_OUTPUT_END: &str = "===PROBE_OUTPUT_END===";
@@ -514,29 +550,14 @@ pub fn maybe_dispatch_vm_test() -> Option<i32> {
 
 /// Like `maybe_dispatch_vm_test` but with explicit args. Used by
 /// `ktstr_guest_init()` which reads args from `/args` in the initramfs.
+///
+/// The caller (`ktstr_guest_init`) must have invoked
+/// [`propagate_rust_env_from_cmdline`] before any probe / workload
+/// thread was spawned. Doing the env propagation here would race
+/// with the probe thread `start_probe_phase_a` spawned in the split
+/// path, so it lives in the caller instead.
 pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     let name = extract_test_fn_arg(args)?;
-
-    // Propagate RUST_BACKTRACE and RUST_LOG from kernel cmdline to env.
-    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
-        let parts: Vec<&str> = cmdline.split_whitespace().collect();
-        if let Some(val) = parts
-            .iter()
-            .find(|s| s.starts_with("RUST_BACKTRACE="))
-            .and_then(|s| s.strip_prefix("RUST_BACKTRACE="))
-        {
-            // SAFETY: guest-side dispatch runs single-threaded before
-            // any test threads are spawned.
-            unsafe { std::env::set_var("RUST_BACKTRACE", val) };
-        }
-        if let Some(val) = parts
-            .iter()
-            .find(|s| s.starts_with("RUST_LOG="))
-            .and_then(|s| s.strip_prefix("RUST_LOG="))
-        {
-            unsafe { std::env::set_var("RUST_LOG", val) };
-        }
-    }
 
     let entry = match find_test(name) {
         Some(e) => e,
@@ -922,26 +943,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     use crate::probe::btf::discover_bpf_symbols;
     use crate::probe::stack::expand_bpf_to_kernel_callers;
 
+    // Env propagation cannot happen here: `pa` holds a live probe
+    // thread spawned by `start_probe_phase_a`, so mutating
+    // `std::env::__environ` now would race with that thread. The
+    // caller (`ktstr_guest_init`) invokes `propagate_rust_env_from_cmdline`
+    // before Phase A spawns the thread.
     let name = extract_test_fn_arg(args)?;
-
-    // Propagate RUST_BACKTRACE and RUST_LOG from kernel cmdline to env.
-    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
-        let parts: Vec<&str> = cmdline.split_whitespace().collect();
-        if let Some(val) = parts
-            .iter()
-            .find(|s| s.starts_with("RUST_BACKTRACE="))
-            .and_then(|s| s.strip_prefix("RUST_BACKTRACE="))
-        {
-            unsafe { std::env::set_var("RUST_BACKTRACE", val) };
-        }
-        if let Some(val) = parts
-            .iter()
-            .find(|s| s.starts_with("RUST_LOG="))
-            .and_then(|s| s.strip_prefix("RUST_LOG="))
-        {
-            unsafe { std::env::set_var("RUST_LOG", val) };
-        }
-    }
 
     let entry = match find_test(name) {
         Some(e) => e,
