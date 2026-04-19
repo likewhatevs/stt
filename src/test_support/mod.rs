@@ -83,12 +83,17 @@ pub(crate) use eval::run_ktstr_test_inner;
 #[cfg(test)]
 pub(crate) use eval::{config_file_parts, evaluate_vm_result, scheduler_label};
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
+// Marker constants are consumed outside the #[cfg(test)] block by the
+// guest-side init (rust_init.rs) which writes them to COM2, and by the
+// host-side reader (eval.rs / probe.rs) which parses them back. Single
+// source of truth for the wire format — a rename stays in sync.
 #[cfg(test)]
 pub(crate) use output::{
-    RESULT_END, RESULT_START, SCHED_OUTPUT_END, SCHED_OUTPUT_START, classify_init_stage,
-    ensure_kvm, extract_kernel_version, extract_panic_message, extract_sched_ext_dump,
-    format_console_diagnostics, parse_assert_result, parse_sched_output, sched_log_fingerprint,
+    RESULT_END, RESULT_START, classify_init_stage, ensure_kvm, extract_kernel_version,
+    extract_panic_message, extract_sched_ext_dump, format_console_diagnostics, parse_assert_result,
+    parse_sched_output, sched_log_fingerprint,
 };
+pub(crate) use output::{SCHED_OUTPUT_END, SCHED_OUTPUT_START};
 #[cfg(test)]
 pub(crate) use probe::{PROBE_OUTPUT_END, PROBE_OUTPUT_START, ProbePayload, extract_probe_output};
 pub(crate) use probe::{

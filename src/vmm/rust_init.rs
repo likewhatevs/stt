@@ -1075,9 +1075,9 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
             ) {
                 StartupStatus::Died => {
                     // Scheduler died during startup.
-                    write_com2("===SCHED_OUTPUT_START===");
+                    write_com2(crate::test_support::SCHED_OUTPUT_START);
                     dump_file_to_com2(log_path);
-                    write_com2("===SCHED_OUTPUT_END===");
+                    write_com2(crate::test_support::SCHED_OUTPUT_END);
                     write_com2("SCHEDULER_DIED");
                     write_com2("KTSTR_EXIT=1");
                     force_reboot();
@@ -1094,9 +1094,9 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                         std::time::Duration::from_millis(50),
                         std::time::Duration::from_secs(3),
                     ) {
-                        write_com2("===SCHED_OUTPUT_START===");
+                        write_com2(crate::test_support::SCHED_OUTPUT_START);
                         dump_file_to_com2(log_path);
-                        write_com2("===SCHED_OUTPUT_END===");
+                        write_com2(crate::test_support::SCHED_OUTPUT_END);
                         write_com2("SCHEDULER_NOT_ATTACHED");
                         write_com2("KTSTR_EXIT=1");
                         force_reboot();
@@ -1111,9 +1111,9 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
         }
         Err(e) => {
             eprintln!("ktstr-init: spawn scheduler: {e}");
-            write_com2("===SCHED_OUTPUT_START===");
+            write_com2(crate::test_support::SCHED_OUTPUT_START);
             write_com2(&format!("failed to spawn: {e}"));
-            write_com2("===SCHED_OUTPUT_END===");
+            write_com2(crate::test_support::SCHED_OUTPUT_END);
             write_com2("SCHEDULER_DIED");
             write_com2("KTSTR_EXIT=1");
             force_reboot();
@@ -1123,9 +1123,9 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
 
 /// Dump scheduler output to COM2 between markers.
 fn dump_sched_output(log_path: &str) {
-    write_com2("===SCHED_OUTPUT_START===");
+    write_com2(crate::test_support::SCHED_OUTPUT_START);
     dump_file_to_com2(log_path);
-    write_com2("===SCHED_OUTPUT_END===");
+    write_com2(crate::test_support::SCHED_OUTPUT_END);
 }
 
 /// Write a file's contents to COM2.
