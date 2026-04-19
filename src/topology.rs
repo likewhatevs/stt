@@ -406,9 +406,47 @@ impl TestTopology {
             matrix
         };
 
+        let llcs: Vec<LlcInfo> = llc_map.into_values().collect();
+        // Construction-time invariant: every TestTopology has at
+        // least one LLC. If sysfs reports online CPUs but no LLC
+        // info (pathological kernel — missing
+        // `/sys/devices/system/cpu/*/cache/` entries, unreadable
+        // `shared_cpu_list`, or a cgroup-restricted view that hides
+        // the per-cpu cache topology), synthesize a single LLC
+        // covering all online CPUs so downstream accessors
+        // (`llc_aligned_cpuset`, `cpus_in_llc`, LlcAligned affinity
+        // resolution) always have something to return.
+        let llcs = if llcs.is_empty() {
+            let fallback_cpus: Vec<usize> = cpus.iter().copied().collect();
+            let fallback_node = *numa_nodes.iter().next().unwrap_or(&0);
+            tracing::warn!(
+                cpu_count = fallback_cpus.len(),
+                fallback_numa_node = fallback_node,
+                "LLC discovery empty from /sys/devices/system/cpu/*/cache/; \
+                 synthesizing a single fallback LLC covering all online CPUs — \
+                 LlcAligned affinity will pin to the entire machine"
+            );
+            vec![LlcInfo {
+                cpus: fallback_cpus,
+                numa_node: fallback_node,
+                cache_size_kb: None,
+                cores: BTreeMap::new(),
+            }]
+        } else {
+            llcs
+        };
+        // NUMA node set must be non-empty too (every online CPU has
+        // a NUMA node, so this is a belt-and-suspenders guard).
+        let numa_nodes = if numa_nodes.is_empty() {
+            let mut s = BTreeSet::new();
+            s.insert(0);
+            s
+        } else {
+            numa_nodes
+        };
         Ok(Self {
             cpus: cpus.into_iter().collect(),
-            llcs: llc_map.into_values().collect(),
+            llcs,
             numa_nodes,
             numa_distances,
             node_mem,
@@ -460,12 +498,26 @@ impl TestTopology {
         self.usable_cpus().iter().copied().collect()
     }
     /// CPUs belonging to LLC at index `idx`.
+    ///
+    /// Out-of-range indices return an empty slice rather than
+    /// panicking. Construction guarantees at least one LLC (see
+    /// [`TestTopology::from_vm_topology_with_memory`]), so the only
+    /// way to hit the out-of-range branch is passing an index larger
+    /// than [`num_llcs`](Self::num_llcs) — a caller bug that used to
+    /// crash the whole scheduler test run.
     pub fn cpus_in_llc(&self, idx: usize) -> &[usize] {
-        &self.llcs[idx].cpus
+        match self.llcs.get(idx) {
+            Some(llc) => &llc.cpus,
+            None => &[],
+        }
     }
-    /// CPUs in LLC `idx` as a `BTreeSet`.
+    /// CPUs in LLC `idx` as a `BTreeSet`. See [`cpus_in_llc`](Self::cpus_in_llc)
+    /// for the out-of-range behavior (returns an empty set).
     pub fn llc_aligned_cpuset(&self, idx: usize) -> BTreeSet<usize> {
-        self.llcs[idx].cpus.iter().copied().collect()
+        match self.llcs.get(idx) {
+            Some(llc) => llc.cpus.iter().copied().collect(),
+            None => BTreeSet::new(),
+        }
     }
     /// CPUs in all LLCs belonging to NUMA node `node` as a `BTreeSet`.
     pub fn numa_aligned_cpuset(&self, node: usize) -> BTreeSet<usize> {
@@ -594,6 +646,22 @@ impl TestTopology {
         topo: &crate::vmm::topology::Topology,
         total_memory_mb: Option<u32>,
     ) -> Self {
+        // Construction-time invariant: every TestTopology has at
+        // least one LLC, core, and thread. Downstream code
+        // (`llc_aligned_cpuset`, `resolve_affinity_for_cgroup`'s
+        // LlcAligned branch, cpuset resolution) assumes this.
+        assert!(
+            topo.llcs > 0 && topo.cores_per_llc > 0 && topo.threads_per_core > 0,
+            "TestTopology requires non-zero llcs/cores/threads; got llcs={}, cores={}, threads={}",
+            topo.llcs,
+            topo.cores_per_llc,
+            topo.threads_per_core,
+        );
+        assert!(
+            topo.numa_nodes > 0,
+            "TestTopology requires at least one NUMA node; got {}",
+            topo.numa_nodes,
+        );
         let llcs = topo.llcs;
         let cores = topo.cores_per_llc;
         let threads = topo.threads_per_core;
@@ -684,6 +752,21 @@ impl TestTopology {
 
     #[cfg(test)]
     pub fn synthetic(num_cpus: usize, num_llcs: usize) -> Self {
+        // Construction-time invariant: every TestTopology has at
+        // least one LLC and at least one CPU. `llc_aligned_cpuset`,
+        // `cpus_in_llc`, and affinity resolution all assume this.
+        assert!(
+            num_llcs > 0,
+            "TestTopology::synthetic requires num_llcs > 0; got 0"
+        );
+        assert!(
+            num_cpus > 0,
+            "TestTopology::synthetic requires num_cpus > 0; got 0"
+        );
+        assert!(
+            num_cpus >= num_llcs,
+            "TestTopology::synthetic requires num_cpus ({num_cpus}) >= num_llcs ({num_llcs})",
+        );
         let cpus: Vec<usize> = (0..num_cpus).collect();
         let per_llc = num_cpus / num_llcs;
         let llcs: Vec<LlcInfo> = (0..num_llcs)
@@ -1303,5 +1386,80 @@ mod tests {
     fn is_memory_only_nonexistent_node() {
         let t = TestTopology::from_spec(2, 4, 4, 1);
         assert!(!t.is_memory_only(99));
+    }
+
+    /// Regression for the unchecked-index panic in `llc_aligned_cpuset`:
+    /// an out-of-range index used to panic at `self.llcs[idx]`. Now
+    /// it returns an empty BTreeSet so a caller bug degrades rather
+    /// than crashing the test run.
+    #[test]
+    fn llc_aligned_cpuset_out_of_range_returns_empty() {
+        let t = TestTopology::from_spec(1, 2, 4, 1);
+        assert_eq!(t.num_llcs(), 2);
+        let empty = t.llc_aligned_cpuset(99);
+        assert!(
+            empty.is_empty(),
+            "out-of-range LLC idx must return empty, got {empty:?}"
+        );
+    }
+
+    /// Companion for `cpus_in_llc` — same out-of-range handling.
+    #[test]
+    fn cpus_in_llc_out_of_range_returns_empty_slice() {
+        let t = TestTopology::from_spec(1, 2, 4, 1);
+        assert_eq!(t.cpus_in_llc(99), &[] as &[usize]);
+    }
+
+    /// Regression for `AffinityKind::LlcAligned` panic when the
+    /// topology has zero LLCs: construction now asserts non-zero,
+    /// so the path that used to hit `self.llcs[0]` on empty is
+    /// unreachable.
+    #[test]
+    #[should_panic(expected = "non-zero llcs")]
+    fn from_vm_topology_rejects_zero_llcs() {
+        let bad = crate::vmm::topology::Topology {
+            llcs: 0,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let _ = TestTopology::from_vm_topology(&bad);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_llcs > 0")]
+    fn synthetic_rejects_zero_llcs() {
+        let _ = TestTopology::synthetic(4, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_cpus > 0")]
+    fn synthetic_rejects_zero_cpus() {
+        let _ = TestTopology::synthetic(0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = ">= num_llcs")]
+    fn synthetic_rejects_more_llcs_than_cpus() {
+        let _ = TestTopology::synthetic(2, 4);
+    }
+
+    /// Every constructor must land a topology with at least one LLC
+    /// so `llc_aligned_cpuset(0)` always returns a non-empty set.
+    #[test]
+    fn every_constructor_produces_nonzero_llcs() {
+        let a = TestTopology::synthetic(8, 2);
+        assert!(a.num_llcs() >= 1);
+        let b = TestTopology::from_spec(1, 2, 4, 1);
+        assert!(b.num_llcs() >= 1);
+        // `from_system` depends on /sys; skip when unavailable.
+        if let Ok(c) = TestTopology::from_system() {
+            assert!(
+                c.num_llcs() >= 1,
+                "from_system must always yield at least one LLC",
+            );
+        }
     }
 }

@@ -68,6 +68,14 @@ pub enum AffinityMode {
     /// Pin to a specific set of CPUs.
     Fixed(BTreeSet<usize>),
     /// Pin to `count` randomly-chosen CPUs from `from`.
+    ///
+    /// - `count` must be `> 0`; zero is rejected at resolve time
+    ///   (previously it coerced silently to 1 and masked caller bugs).
+    /// - `count > from.len()` is clamped to `from.len()` — asking for
+    ///   more CPUs than the pool contains is a topology fact, not a
+    ///   caller error.
+    /// - `from` empty with `count > 0` resolves to no affinity (no
+    ///   pool to sample from); downstream treats this as `None`.
     Random { from: BTreeSet<usize>, count: usize },
     /// Pin to a single CPU.
     SingleCpu(usize),
@@ -2562,6 +2570,12 @@ fn resolve_affinity(mode: &AffinityMode) -> Result<Option<BTreeSet<usize>>> {
         AffinityMode::SingleCpu(cpu) => Ok(Some([*cpu].into_iter().collect())),
         AffinityMode::Random { from, count } => {
             use rand::seq::IndexedRandom;
+            if *count == 0 {
+                anyhow::bail!(
+                    "AffinityMode::Random.count must be > 0; a zero count \
+                     previously silently coerced to 1, masking caller bugs"
+                );
+            }
             if from.is_empty() {
                 tracing::debug!(
                     count = count,
@@ -2570,7 +2584,10 @@ fn resolve_affinity(mode: &AffinityMode) -> Result<Option<BTreeSet<usize>>> {
                 return Ok(None);
             }
             let pool: Vec<usize> = from.iter().copied().collect();
-            let count = (*count).min(pool.len()).max(1);
+            // Clamp count down to the pool size (user asked for more
+            // CPUs than exist). Silent clamp is fine here: the pool
+            // upper bound is a topology fact, not a caller bug.
+            let count = (*count).min(pool.len());
             Ok(Some(
                 pool.sample(&mut rand::rng(), count).copied().collect(),
             ))
@@ -3685,11 +3702,16 @@ mod tests {
     // -- resolve_affinity edge cases --
 
     #[test]
-    fn resolve_affinity_random_zero_count() {
+    fn resolve_affinity_random_zero_count_rejected() {
+        // Regression: count=0 previously coerced silently to 1, masking
+        // caller bugs. Now it must return an Err.
         let from: BTreeSet<usize> = (0..4).collect();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 0 }).unwrap();
-        // count is clamped to max(1), so should get 1 CPU
-        assert_eq!(r.unwrap().len(), 1);
+        let err = resolve_affinity(&AffinityMode::Random { from, count: 0 }).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("count") && msg.contains("> 0"),
+            "error must name the field: {msg}"
+        );
     }
 
     #[test]

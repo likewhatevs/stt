@@ -399,6 +399,45 @@ pub enum HoldSpec {
 impl HoldSpec {
     /// Hold for the full scenario duration (`Frac(1.0)`).
     pub const FULL: HoldSpec = HoldSpec::Frac(1.0);
+
+    /// Reject hold values that are vacuous (no-op step) or would
+    /// panic downstream.
+    ///
+    /// Rules:
+    /// - `Fixed(Duration::ZERO)` — the step applies ops and then
+    ///   immediately advances; workers get no run time before the
+    ///   next step. Almost always a typo; reject.
+    /// - `Frac(f)` with `!f.is_finite()` (NaN/Inf) — propagates into
+    ///   `Duration::from_secs_f64(f)` which panics.
+    /// - `Frac(f)` with `f <= 0.0` — zero is vacuous, negative
+    ///   panics in `Duration::from_secs_f64`.
+    /// - `Loop { interval: Duration::ZERO }` — busy-polls the
+    ///   deadline loop without yielding; almost always a typo.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match self {
+            HoldSpec::Fixed(d) if d.is_zero() => {
+                Err("HoldSpec::Fixed(Duration::ZERO) is vacuous — workers \
+                     get no run time before the next step; use at least a \
+                     few ms or drop the step entirely"
+                    .into())
+            }
+            HoldSpec::Frac(f) if !f.is_finite() => Err(format!(
+                "HoldSpec::Frac({f}) is not finite (NaN/Inf) — would \
+                     panic in Duration::from_secs_f64"
+            )),
+            HoldSpec::Frac(f) if *f <= 0.0 => Err(format!(
+                "HoldSpec::Frac({f}) must be > 0.0; negative values \
+                     panic in Duration::from_secs_f64 and zero is vacuous"
+            )),
+            HoldSpec::Loop { interval } if interval.is_zero() => {
+                Err("HoldSpec::Loop { interval: Duration::ZERO } would \
+                     busy-spin the deadline check without yielding; use a \
+                     non-zero interval"
+                    .into())
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Op {
@@ -680,6 +719,12 @@ impl CpusetSpec {
                     of
                 ))
             }
+            CpusetSpec::Exact(cpus) if cpus.is_empty() => {
+                Err("CpusetSpec::Exact(empty) would assign no CPUs to the \
+                 cgroup; cpuset.cpus rejects an empty mask and the \
+                 cgroup would become unschedulable"
+                    .into())
+            }
             _ => Ok(()),
         }
     }
@@ -814,6 +859,14 @@ pub fn execute_steps_with(
     steps: Vec<Step>,
     checks: Option<&crate::assert::Assert>,
 ) -> Result<AssertResult> {
+    // Validate every step's hold spec up front so a typo doesn't
+    // reach `Duration::from_secs_f64(NaN)` / `thread::sleep(ZERO)` /
+    // a no-yield Loop busy-wait after ops have already been applied.
+    for (i, step) in steps.iter().enumerate() {
+        if let Err(reason) = step.hold.validate() {
+            anyhow::bail!("step {i} hold validation: {reason}");
+        }
+    }
     let effective_checks = checks.unwrap_or(&ctx.assert);
     let mut state = StepState {
         cgroups: CgroupGroup::new(ctx.cgroups),
@@ -1476,6 +1529,71 @@ mod tests {
         let mut rng2 = seeded_rng(2);
         let same = (0..10).all(|_| rng1.random::<u64>() == rng2.random::<u64>());
         assert!(!same);
+    }
+
+    // -- HoldSpec validate --
+
+    #[test]
+    fn holdspec_validate_accepts_valid() {
+        HoldSpec::Frac(0.5).validate().unwrap();
+        HoldSpec::Frac(1.0).validate().unwrap();
+        HoldSpec::Fixed(Duration::from_millis(1))
+            .validate()
+            .unwrap();
+        HoldSpec::Loop {
+            interval: Duration::from_millis(100),
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_fixed_zero() {
+        let err = HoldSpec::Fixed(Duration::ZERO).validate().unwrap_err();
+        assert!(
+            err.contains("Fixed") && err.contains("vacuous"),
+            "error must name the variant and reason: {err}"
+        );
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_frac_zero() {
+        let err = HoldSpec::Frac(0.0).validate().unwrap_err();
+        assert!(err.contains("Frac") && err.contains("> 0"), "got: {err}");
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_frac_negative() {
+        let err = HoldSpec::Frac(-0.5).validate().unwrap_err();
+        assert!(err.contains("Frac") && err.contains("> 0"), "got: {err}");
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_frac_nan() {
+        let err = HoldSpec::Frac(f64::NAN).validate().unwrap_err();
+        assert!(
+            err.contains("not finite") || err.contains("NaN"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_frac_inf() {
+        let err = HoldSpec::Frac(f64::INFINITY).validate().unwrap_err();
+        assert!(
+            err.contains("not finite") || err.contains("Inf"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_loop_zero_interval() {
+        let err = HoldSpec::Loop {
+            interval: Duration::ZERO,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("Loop") && err.contains("busy"), "got: {err}");
     }
 
     // -- HoldSpec variants --
@@ -2227,11 +2345,54 @@ mod tests {
     }
 
     #[test]
-    fn cpusetspec_validate_exact_always_ok() {
+    fn cpusetspec_validate_exact_nonempty_ok() {
         let (cg, topo) = make_ctx(1, 4, 1);
         let ctx = ctx_from(&cg, &topo);
         let spec = CpusetSpec::exact([99]);
         assert!(spec.validate(&ctx).is_ok());
+    }
+
+    #[test]
+    fn cpusetspec_validate_exact_empty_rejected() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Exact(BTreeSet::new());
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("Exact") && err.contains("empty"), "got: {err}");
+    }
+
+    /// Regression guard for the HoldSpec pre-loop validation:
+    /// execute_steps_with must bail on a vacuous hold BEFORE running
+    /// any op. Failure mode without the pre-loop check: ops mutate
+    /// cgroup state, then `Duration::from_secs_f64` / `thread::sleep`
+    /// hit the downstream panic, leaving orphan cgroups on disk.
+    #[test]
+    fn execute_steps_with_bails_on_invalid_hold_before_ops() {
+        let parent =
+            std::env::temp_dir().join(format!("ktstr-hold-validate-{}", std::process::id()));
+        // Pre-clean in case a prior failing test left a directory.
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&parent).unwrap();
+        let cgroups = crate::cgroup::CgroupManager::new(parent.to_str().unwrap());
+        let topo = crate::topology::TestTopology::from_spec(1, 1, 4, 1);
+        let ctx = ctx_from(&cgroups, &topo);
+        let cg_name = "should_never_exist";
+        let step = Step::new(
+            vec![Op::add_cgroup(cg_name)],
+            HoldSpec::Fixed(Duration::ZERO),
+        );
+        let err = execute_steps_with(&ctx, vec![step], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hold validation") && msg.contains("Fixed"),
+            "error must cite hold validation + variant: {msg}"
+        );
+        assert!(
+            !parent.join(cg_name).exists(),
+            "AddCgroup op ran before hold validation — cgroup dir '{}' exists",
+            parent.join(cg_name).display()
+        );
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]
