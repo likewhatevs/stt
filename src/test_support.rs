@@ -56,6 +56,12 @@ pub struct SidecarResult {
     pub scheduler: String,
     /// Overall pass/fail verdict for this run.
     pub passed: bool,
+    /// True when the test was skipped (e.g. topology mismatch,
+    /// missing resource). A skipped test has `passed == true`
+    /// (to keep the verdict gate simple) but downstream stats
+    /// tooling must subtract `skipped` runs from "pass count" to
+    /// avoid reporting non-executions as passes.
+    pub skipped: bool,
     /// Aggregate per-cgroup statistics merged across every worker.
     pub stats: ScenarioStats,
     /// Monitor summary. `None` means the monitor loop did not run
@@ -69,6 +75,10 @@ pub struct SidecarResult {
     /// Work type label used for post-hoc filtering and A/B comparison
     /// (distinct from the `WorkType` enum — this is the text name).
     pub work_type: String,
+    /// Scheduler flag names active for this gauntlet variant. Empty
+    /// for the default (no-flags) profile. Participates in the
+    /// sidecar variant-hash so flag-only variants don't clobber.
+    pub active_flags: Vec<String>,
     /// Per-BPF-program verifier statistics captured from the VM's
     /// scheduler (when one was loaded). Absent when no scheduler
     /// programs were inspected; empty vec distinguishes "inspected,
@@ -1872,6 +1882,7 @@ fn run_ktstr_test_inner(
         &merged_assert,
         &stimulus_events,
         &vm_topology,
+        active_flags,
         &repro_fn,
     )
 }
@@ -1889,6 +1900,7 @@ fn evaluate_vm_result(
     merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
     topo: &Topology,
+    active_flags: &[String],
     repro_fn: &dyn Fn(&str) -> Option<String>,
 ) -> Result<AssertResult> {
     // Build timeline from stimulus events + monitor samples.
@@ -1932,7 +1944,14 @@ fn evaluate_vm_result(
         // Write sidecar before checking pass/fail so both outcomes are captured.
         let args: Vec<String> = std::env::args().collect();
         let work_type = extract_work_type_arg(&args).unwrap_or_else(|| "CpuSpin".to_string());
-        write_sidecar(entry, result, stimulus_events, &verify_result, &work_type);
+        write_sidecar(
+            entry,
+            result,
+            stimulus_events,
+            &verify_result,
+            &work_type,
+            active_flags,
+        );
 
         if !verify_result.passed {
             let details = verify_result
@@ -2996,6 +3015,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         Err(e) => {
             let r = AssertResult {
                 passed: false,
+                skipped: false,
                 details: vec![format!("{e:#}").into()],
                 stats: Default::default(),
             };
@@ -3332,6 +3352,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         Err(e) => {
             let r = crate::assert::AssertResult {
                 passed: false,
+                skipped: false,
                 details: vec![format!("{e:#}").into()],
                 stats: Default::default(),
             };
@@ -4353,6 +4374,43 @@ fn generate_run_id() -> String {
     format!("{}-{n}", crate::GIT_HASH)
 }
 
+/// Compute a stable 64-bit discriminator over the fields that
+/// distinguish gauntlet variants of the same test. Used to suffix
+/// the sidecar filename so concurrent variants do not clobber each
+/// other's output.
+///
+/// Uses [`siphasher::sip::SipHasher13`] with zero keys for the same
+/// stability reason as the initramfs cache keys — the discriminator
+/// must be the same across Rust toolchain versions or downstream
+/// tooling that groups variants by filename breaks.
+fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
+    use siphasher::sip::SipHasher13;
+    use std::hash::Hasher;
+    let mut h = SipHasher13::new_with_keys(0, 0);
+    h.write(sidecar.topology.as_bytes());
+    h.write(&[0]);
+    h.write(sidecar.scheduler.as_bytes());
+    h.write(&[0]);
+    h.write(sidecar.work_type.as_bytes());
+    h.write(&[0]);
+    h.write(&[0xfe]);
+    for f in &sidecar.active_flags {
+        h.write(f.as_bytes());
+        h.write(&[0]);
+    }
+    h.write(&[0xfd]);
+    for s in &sidecar.sysctls {
+        h.write(s.as_bytes());
+        h.write(&[0]);
+    }
+    h.write(&[0xff]);
+    for k in &sidecar.kargs {
+        h.write(k.as_bytes());
+        h.write(&[0]);
+    }
+    h.finish()
+}
+
 /// Write a sidecar JSON file for post-run analysis.
 ///
 /// Output goes to the current run's sidecar directory
@@ -4364,6 +4422,7 @@ fn write_sidecar(
     stimulus_events: &[StimulusEvent],
     verify_result: &AssertResult,
     work_type: &str,
+    active_flags: &[String],
 ) {
     let dir = sidecar_dir();
     let topo = entry.topology.to_string();
@@ -4390,10 +4449,12 @@ fn write_sidecar(
         topology: topo,
         scheduler: sched_name.to_string(),
         passed: verify_result.passed,
+        skipped: verify_result.is_skipped(),
         stats: verify_result.stats.clone(),
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
+        active_flags: active_flags.to_vec(),
         verifier_stats: vm_result.verifier_stats.clone(),
         kvm_stats: vm_result.kvm_stats.clone(),
         sysctls,
@@ -4402,7 +4463,14 @@ fn write_sidecar(
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
     };
-    let path = dir.join(format!("{}.ktstr.json", entry.name));
+    // Gauntlet variants of the same test differ by work_type, flags
+    // (via scheduler args → sysctls/kargs), scheduler, and topology.
+    // A filename of just `{test_name}.ktstr.json` causes variants to
+    // overwrite each other, erasing all but the last-written result.
+    // Hash the discriminating fields into a short stable suffix so
+    // each variant gets its own sidecar file.
+    let variant_hash = sidecar_variant_hash(&sidecar);
+    let path = dir.join(format!("{}-{:016x}.ktstr.json", entry.name, variant_hash));
     if let Ok(json) = serde_json::to_string_pretty(&sidecar) {
         let _ = std::fs::create_dir_all(&dir);
         if let Err(e) = std::fs::write(&path, json) {
@@ -5315,6 +5383,7 @@ mod tests {
             topology: "2s4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             passed: true,
+            skipped: false,
             stats: crate::assert::ScenarioStats {
                 cgroups: vec![crate::assert::CgroupStats {
                     num_workers: 4,
@@ -5364,6 +5433,7 @@ mod tests {
                 total_iterations: None,
             }],
             work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
             sysctls: vec![],
@@ -5401,10 +5471,12 @@ mod tests {
             topology: "1s2c1t".to_string(),
             scheduler: "eevdf".to_string(),
             passed: false,
+            skipped: false,
             stats: Default::default(),
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
             sysctls: vec![],
@@ -5744,10 +5816,12 @@ mod tests {
             topology: "1s2c1t".to_string(),
             scheduler: "eevdf".to_string(),
             passed: true,
+            skipped: false,
             stats: Default::default(),
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
             sysctls: vec![],
@@ -5776,10 +5850,12 @@ mod tests {
             topology: "2s4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             passed: false,
+            skipped: false,
             stats: Default::default(),
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
             sysctls: vec![],
@@ -5825,10 +5901,12 @@ mod tests {
             topology: "1s1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             passed: true,
+            skipped: false,
             stats: Default::default(),
             monitor: None,
             stimulus_events: vec![],
             work_type: "Bursty".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
             sysctls: vec![],
@@ -5886,7 +5964,7 @@ mod tests {
             crash_message: None,
         };
         let verify_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]);
 
         // Clean up written file.
         let path = dir.join("__sidecar_default_dir__.ktstr.json");
@@ -5942,14 +6020,145 @@ mod tests {
             crash_message: None,
         };
         let verify_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin");
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]);
 
-        let path = tmp.join("__sidecar_write_test__.ktstr.json");
-        assert!(path.exists(), "sidecar file should be written");
+        // Sidecar filename now includes a variant hash suffix so
+        // gauntlet variants don't clobber each other. Find the file
+        // by prefix match rather than exact path.
+        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
+            .expect("sidecar dir was created")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("__sidecar_write_test__-") && n.ends_with(".ktstr.json"))
+                    .unwrap_or(false)
+            })
+            .expect("sidecar file with variant suffix should be written");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
         assert_eq!(loaded.test_name, "__sidecar_write_test__");
         assert!(loaded.passed);
+        assert!(!loaded.skipped, "pass result is not a skip");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn write_sidecar_variant_hash_distinguishes_active_flags() {
+        // Regression for #34: two gauntlet variants differing ONLY in
+        // active_flags must produce distinct sidecar filenames so
+        // neither clobbers the other. This is the scenario the prior
+        // fix (based on work_type/sysctls/kargs alone) missed.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-flagvariant-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__flagvariant_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let ok = AssertResult::pass();
+        let flags_a = vec!["llc".to_string()];
+        let flags_b = vec!["llc".to_string(), "steal".to_string()];
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a);
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b);
+
+        let names: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("__flagvariant_test__-"))
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "two active_flags variants must produce two distinct files, got {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn write_sidecar_variant_hash_distinguishes_work_types() {
+        // Regression for #34: two gauntlet variants differing only in
+        // work_type must produce distinct sidecar filenames so neither
+        // clobbers the other.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-variant-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__variant_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let ok = AssertResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[]);
+        write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[]);
+
+        let names: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("__variant_test__-"))
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "two work_type variants must produce two distinct files, got {names:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         match prev {
@@ -6064,8 +6273,16 @@ mod tests {
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("test function produced no output"),
@@ -6090,8 +6307,16 @@ mod tests {
         let entry = sched_entry("__eval_sched_dies__");
         let result = make_vm_result("", "boot ok", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("no test result received from guest"),
@@ -6113,8 +6338,16 @@ mod tests {
         let entry = sched_entry("__eval_sched_log__");
         let result = make_vm_result(&sched_log, "", -1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("no test result received from guest"),
@@ -6146,8 +6379,16 @@ mod tests {
             repro_called.store(true, std::sync::atomic::Ordering::Relaxed);
             Some("repro data".to_string())
         };
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &repro_fn)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &repro_fn,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             repro_called.load(std::sync::atomic::Ordering::Relaxed),
@@ -6179,8 +6420,16 @@ mod tests {
                     .to_string(),
             )
         };
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &repro_fn)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &repro_fn,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("--- auto-repro ---"),
@@ -6203,8 +6452,16 @@ mod tests {
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("timed out"),
@@ -6235,8 +6492,16 @@ mod tests {
             false,
         );
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("test function produced no output"),
@@ -6254,8 +6519,16 @@ mod tests {
         let entry = sched_entry("__eval_dump__");
         let result = make_vm_result("", dump_line, -1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("--- sched_ext dump ---"),
@@ -6275,7 +6548,16 @@ mod tests {
         let result = make_vm_result(&output, "", 0, false);
         let assertions = crate::assert::Assert::NONE;
         assert!(
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro,).is_ok(),
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro,
+            )
+            .is_ok(),
             "passing AssertResult should return Ok",
         );
     }
@@ -6289,8 +6571,16 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-                .unwrap_err()
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
         );
         assert!(msg.contains("failed:"), "got: {msg}");
         assert!(msg.contains("stuck 3000ms"), "got: {msg}");
@@ -6308,8 +6598,16 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-                .unwrap_err()
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
         );
         assert!(msg.contains("worker 0 stuck 5000ms"), "got: {msg}");
         assert!(msg.contains("scheduler noise"), "got: {msg}");
@@ -6328,8 +6626,16 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-                .unwrap_err()
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
         );
         assert!(msg.contains(error_line), "got: {msg}");
         let fp_pos = msg.find(error_line).unwrap();
@@ -6344,8 +6650,16 @@ mod tests {
         let entry = sched_entry("__eval_timeout_fp__");
         let result = make_vm_result(&output, "", 0, true);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains(error_line),
@@ -6367,8 +6681,16 @@ mod tests {
         let entry = sched_entry("__eval_no_result_fp__");
         let result = make_vm_result(&output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains(error_line),
@@ -6391,8 +6713,16 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-                .unwrap_err()
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
         );
         assert!(msg.starts_with("ktstr_test"), "got: {msg}");
     }
@@ -6460,8 +6790,16 @@ mod tests {
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-                .unwrap_err()
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
         );
         assert!(
             msg.contains("passed scenario but monitor failed"),
@@ -6480,8 +6818,16 @@ mod tests {
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("timed out"),
@@ -6547,8 +6893,16 @@ mod tests {
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("init script never started"),
@@ -6563,8 +6917,16 @@ mod tests {
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("init started but payload never ran"),
@@ -6580,8 +6942,16 @@ mod tests {
         let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\ngarbage";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("payload started but produced no test result"),
@@ -6597,8 +6967,16 @@ mod tests {
         let output = "KTSTR_INIT_STARTED\nPANIC: panicked at src/foo.rs:42: assertion failed";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("guest crashed:"), "got: {msg}");
         assert!(msg.contains("assertion failed"), "got: {msg}");
@@ -6610,8 +6988,16 @@ mod tests {
         let output = "PANIC: panicked at src/bar.rs:10: index out of bounds";
         let result = make_vm_result(output, "", 1, false);
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("guest crashed:"), "got: {msg}");
         assert!(msg.contains("index out of bounds"), "got: {msg}");
@@ -6627,8 +7013,16 @@ mod tests {
         let mut result = make_vm_result(output, "", 1, false);
         result.crash_message = Some(shm_crash.to_string());
         let assertions = crate::assert::Assert::NONE;
-        let err = evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-            .unwrap_err();
+        let err = evaluate_vm_result(
+            &entry,
+            &result,
+            &assertions,
+            &[],
+            &EVAL_TOPO,
+            &[],
+            &no_repro,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("guest crashed:"),
@@ -6676,10 +7070,12 @@ mod tests {
             topology: "1s1c1t".to_string(),
             scheduler: "test".to_string(),
             passed: true,
+            skipped: false,
             stats: Default::default(),
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vstats,
             kvm_stats: None,
             sysctls: vec![],
@@ -6782,8 +7178,16 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-                .unwrap_err()
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
         );
         assert!(msg.contains("--- diagnostics ---"), "got: {msg}");
         assert!(msg.contains("kernel panic"), "got: {msg}");
@@ -6825,8 +7229,16 @@ mod tests {
         let assertions = crate::assert::Assert::NONE;
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-                .unwrap_err()
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
         );
         assert!(msg.contains("--- monitor ---"), "got: {msg}");
         assert!(msg.contains("max_imbalance"), "got: {msg}");
@@ -6896,8 +7308,16 @@ mod tests {
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(
             "{}",
-            evaluate_vm_result(&entry, &result, &assertions, &[], &EVAL_TOPO, &no_repro)
-                .unwrap_err()
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro
+            )
+            .unwrap_err()
         );
         assert!(
             msg.contains("passed scenario but monitor failed"),

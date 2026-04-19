@@ -15,6 +15,7 @@ fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
     if total == 0 {
         return Ok(AssertResult {
             passed: false,
+            skipped: false,
             details: vec!["no CPUs detected".into()],
             stats: Default::default(),
         });
@@ -51,6 +52,7 @@ fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<AssertResult> {
     }
     Ok(AssertResult {
         passed: false,
+        skipped: false,
         details: vec![format!("schedule address: {ip:?}").into()],
         stats: Default::default(),
     })
@@ -706,6 +708,7 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
     } else {
         Ok(AssertResult {
             passed: false,
+            skipped: false,
             details,
             stats: Default::default(),
         })

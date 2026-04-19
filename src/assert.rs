@@ -262,6 +262,12 @@ impl std::fmt::Display for AssertDetail {
 pub struct AssertResult {
     /// Whether all checks passed.
     pub passed: bool,
+    /// True when the scenario was skipped (e.g. topology mismatch,
+    /// missing resource). `passed` stays `true` for backward compat
+    /// with callers that treat skip as "not a failure"; stats tooling
+    /// must subtract skipped runs from pass counts so they don't
+    /// count as successful executions.
+    pub skipped: bool,
     /// Human-readable diagnostic messages (failures, warnings), each
     /// tagged with a [`DetailKind`] for structural filtering.
     pub details: Vec<AssertDetail>,
@@ -383,6 +389,7 @@ impl AssertResult {
     pub fn pass() -> Self {
         Self {
             passed: true,
+            skipped: false,
             details: vec![],
             stats: Default::default(),
         }
@@ -392,9 +399,16 @@ impl AssertResult {
     pub fn skip(reason: impl Into<String>) -> Self {
         Self {
             passed: true,
+            skipped: true,
             details: vec![AssertDetail::new(DetailKind::Skip, reason)],
             stats: Default::default(),
         }
+    }
+    /// Convenience accessor returning [`Self::skipped`]. Stats tooling
+    /// uses this to subtract non-executions from pass counts so
+    /// "topology mismatch" runs don't inflate the pass rate.
+    pub fn is_skipped(&self) -> bool {
+        self.skipped
     }
     /// Fold `other` into `self`. `passed` is conjoined (any failure
     /// wins), `details` concatenate, and aggregate stats adopt the
@@ -404,6 +418,10 @@ impl AssertResult {
         if !other.passed {
             self.passed = false;
         }
+        // skip + skip = skipped (nothing executed); skip + pass/fail =
+        // NOT skipped (real work ran). Equivalent to logical AND of
+        // the two `skipped` flags.
+        self.skipped = self.skipped && other.skipped;
         self.details.extend(other.details);
         self.stats.cgroups.extend(other.stats.cgroups);
         self.stats.total_workers += other.stats.total_workers;
@@ -1910,6 +1928,54 @@ mod tests {
     }
 
     #[test]
+    fn is_skipped_true_for_skip_result() {
+        // Regression for #36: skip results must be distinguishable
+        // from pass results so stats tooling can subtract them from
+        // pass counts (a skipped test is not a successful execution).
+        let r = AssertResult::skip("no LLC available");
+        assert!(r.passed, "skip keeps passed=true for simple gate");
+        assert!(r.is_skipped(), "skip must report is_skipped");
+    }
+
+    #[test]
+    fn is_skipped_false_for_pass_result() {
+        let r = AssertResult::pass();
+        assert!(r.passed);
+        assert!(!r.is_skipped(), "pass is not a skip");
+    }
+
+    #[test]
+    fn is_skipped_false_for_fail_result() {
+        let mut r = AssertResult::pass();
+        r.passed = false;
+        r.details
+            .push(AssertDetail::new(DetailKind::Starved, "worker starved"));
+        assert!(
+            !r.is_skipped(),
+            "fail is not a skip even with non-skip details"
+        );
+    }
+
+    #[test]
+    fn merge_skip_plus_pass_demotes_skip() {
+        let mut a = AssertResult::skip("optional");
+        let b = AssertResult::pass();
+        a.merge(b);
+        assert!(!a.skipped);
+        assert!(a.passed);
+    }
+
+    #[test]
+    fn merge_skip_plus_fail_is_fail_not_skip() {
+        let mut a = AssertResult::skip("topo missing");
+        let mut b = AssertResult::pass();
+        b.passed = false;
+        a.merge(b);
+        assert!(!a.passed);
+        assert!(!a.skipped);
+    }
+
+    #[test]
     fn merge_accumulates_totals() {
         let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)]);
         let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50)]);
@@ -2070,6 +2136,7 @@ mod tests {
     fn assert_result_serde_roundtrip() {
         let r = AssertResult {
             passed: false,
+            skipped: false,
             details: vec!["test".into()],
             stats: Default::default(),
         };
@@ -2942,6 +3009,7 @@ mod tests {
     fn assert_result_merge_combines_stats() {
         let mut a = AssertResult {
             passed: true,
+            skipped: false,
             details: vec!["a".into()],
             stats: ScenarioStats {
                 cgroups: vec![],
@@ -2956,6 +3024,7 @@ mod tests {
         };
         let b = AssertResult {
             passed: false,
+            skipped: false,
             details: vec!["b".into()],
             stats: ScenarioStats {
                 cgroups: vec![],

@@ -80,6 +80,10 @@ pub struct ScenarioResult {
     /// Overall pass/fail verdict after merging every worker- and
     /// monitor-level check.
     pub passed: bool,
+    /// True when the scenario was skipped (topology mismatch, missing
+    /// resource). Stats tooling must exclude skipped runs from pass
+    /// counts — see [`crate::assert::AssertResult::skipped`].
+    pub skipped: bool,
     /// Wall-clock seconds the scenario body ran for.
     pub duration_s: f64,
     /// Human-readable per-check messages surfaced on failure; empty
@@ -318,6 +322,7 @@ impl Runner {
                     ScenarioResult {
                         scenario_name: qname,
                         passed: v.passed,
+                        skipped: v.is_skipped(),
                         duration_s: start.elapsed().as_secs_f64(),
                         details: v.details.into_iter().map(|d| d.message).collect(),
                         stats: v.stats,
@@ -326,6 +331,7 @@ impl Runner {
                 Err(e) => ScenarioResult {
                     scenario_name: qname,
                     passed: false,
+                    skipped: false,
                     duration_s: start.elapsed().as_secs_f64(),
                     details: vec![format!("{e:#}")],
                     stats: Default::default(),
@@ -347,6 +353,7 @@ mod tests {
         let r = ScenarioResult {
             scenario_name: "test/default".into(),
             passed: false,
+            skipped: false,
             duration_s: 15.5,
             details: vec!["unfair".into(), "stuck 3000ms".into()],
             stats: ScenarioStats {
@@ -383,6 +390,7 @@ mod tests {
         let r = ScenarioResult {
             scenario_name: "proportional/default".into(),
             passed: true,
+            skipped: false,
             duration_s: 20.0,
             details: vec![],
             stats: ScenarioStats {
@@ -447,6 +455,7 @@ mod tests {
         let r = ScenarioResult {
             scenario_name: "test/with\"quotes".into(),
             passed: false,
+            skipped: false,
             duration_s: 1.0,
             details: vec!["line with\nnewline".into(), "tab\there".into()],
             stats: Default::default(),
@@ -462,6 +471,7 @@ mod tests {
         let r = ScenarioResult {
             scenario_name: "long_running".into(),
             passed: true,
+            skipped: false,
             duration_s: 86400.123456,
             details: vec![],
             stats: Default::default(),
@@ -485,6 +495,7 @@ mod tests {
         let r = ScenarioResult {
             scenario_name: "test/borrow".into(),
             passed: false,
+            skipped: false,
             duration_s: 12.5,
             details: vec!["stuck 3000ms on cpu2".into(), "unfair cgroup".into()],
             stats: crate::assert::ScenarioStats {
@@ -524,6 +535,7 @@ mod tests {
         let r = ScenarioResult {
             scenario_name: "empty/default".into(),
             passed: true,
+            skipped: false,
             duration_s: 0.0,
             details: vec![],
             stats: Default::default(),
@@ -617,6 +629,7 @@ mod tests {
         let r = ScenarioResult {
             scenario_name: "proportional/borrow".into(),
             passed: false,
+            skipped: false,
             duration_s: 15.5,
             details: vec!["stuck 3000ms".into()],
             stats: Default::default(),
@@ -670,6 +683,7 @@ mod tests {
         let r = ScenarioResult {
             scenario_name: "test/borrow".into(),
             passed: false,
+            skipped: false,
             duration_s: 12.5,
             details: vec!["err1".into(), "err2".into()],
             stats: ScenarioStats {

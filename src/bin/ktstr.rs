@@ -391,15 +391,27 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
                 for r in &results {
-                    let status = if r.passed { "PASS" } else { "FAIL" };
+                    let status = if r.skipped {
+                        "SKIP"
+                    } else if r.passed {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    };
                     println!("[{status}] {} ({:.1}s)", r.scenario_name, r.duration_s);
                     for d in &r.details {
                         println!("  {d}");
                     }
                 }
-                let passed = results.iter().filter(|r| r.passed).count();
+                let passed = results.iter().filter(|r| r.passed && !r.skipped).count();
+                let skipped = results.iter().filter(|r| r.skipped).count();
                 let total = results.len();
-                println!("\n{passed}/{total} passed");
+                let failed = total - passed - skipped;
+                if skipped > 0 {
+                    println!("\n{passed}/{total} passed ({skipped} skipped, {failed} failed)");
+                } else {
+                    println!("\n{passed}/{total} passed");
+                }
             }
         }
 

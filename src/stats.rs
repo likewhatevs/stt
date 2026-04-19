@@ -275,6 +275,11 @@ pub struct GauntletRow {
     pub scheduler: String,
     pub replica: u32,
     pub passed: bool,
+    /// True when the run was skipped (topology mismatch, missing
+    /// resource). `passed` stays `true` for gate-compat; `skipped`
+    /// lets stats tooling exclude these from pass counts so skipped
+    /// runs don't inflate the apparent pass rate.
+    pub skipped: bool,
     pub spread: f64,
     pub gap_ms: u64,
     pub migrations: u64,
@@ -319,6 +324,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         scheduler: sc.scheduler.clone(),
         replica: 1,
         passed: sc.passed,
+        skipped: sc.skipped,
         spread: sc.stats.worst_spread,
         gap_ms: sc.stats.worst_gap_ms,
         migrations: sc.stats.total_migrations,
@@ -523,6 +529,10 @@ pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
             scheduler: String::new(),
             replica,
             passed: r.passed,
+            // VmRunResult path has no skip semantic; rows here are
+            // always executed runs. Sidecar-based rows propagate the
+            // real skipped value via sidecar_to_row.
+            skipped: false,
             spread: stats.map(|s| s.worst_spread).unwrap_or(0.0),
             gap_ms: stats.map(|s| s.worst_gap_ms).unwrap_or(0),
             migrations: stats.map(|s| s.total_migrations).unwrap_or(0),
@@ -572,6 +582,7 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let work_type: Vec<&str> = rows.iter().map(|r| r.work_type.as_str()).collect();
     let replica: Vec<u32> = rows.iter().map(|r| r.replica).collect();
     let passed: Vec<bool> = rows.iter().map(|r| r.passed).collect();
+    let skipped: Vec<bool> = rows.iter().map(|r| r.skipped).collect();
     let spread: Vec<f64> = rows.iter().map(|r| r.spread).collect();
     let gap_ms: Vec<f64> = rows.iter().map(|r| r.gap_ms as f64).collect();
     let migrations: Vec<f64> = rows.iter().map(|r| r.migrations as f64).collect();
@@ -606,6 +617,7 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "work_type" => &work_type,
         "replica" => &replica,
         "passed" => &passed,
+        "skipped" => &skipped,
         "spread" => &spread,
         "gap_ms" => &gap_ms,
         "migrations" => &migrations,
@@ -812,10 +824,16 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
         .lazy()
         .group_by([col(group_col)])
         .agg([
-            col("passed")
+            // pass_count excludes skipped rows — a skipped run is not
+            // a successful execution and must not inflate pass rate.
+            (col("passed").and(col("skipped").not()))
                 .cast(DataType::UInt32)
                 .sum()
                 .alias("pass_count"),
+            col("skipped")
+                .cast(DataType::UInt32)
+                .sum()
+                .alias("skip_count"),
             col("passed").count().cast(DataType::UInt32).alias("total"),
             col("spread").mean().alias("avg_spread"),
             col("gap_ms").mean().alias("avg_gap_ms"),
@@ -838,6 +856,7 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
     let mut out = String::new();
     let names = col_str(&grouped, group_col);
     let pass_counts = col_u32(&grouped, "pass_count");
+    let skip_counts = col_u32(&grouped, "skip_count");
     let totals = col_u32(&grouped, "total");
     let spreads = col_f64(&grouped, "avg_spread");
     let gaps = col_f64(&grouped, "avg_gap_ms");
@@ -856,12 +875,14 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
     for i in 0..grouped.height() {
         let name = names.get(i).unwrap_or("?");
         let pass = pass_counts.get(i).unwrap_or(0);
+        let skip = skip_counts.as_ref().and_then(|s| s.get(i)).unwrap_or(0);
         let total = totals.get(i).unwrap_or(0);
+        let fail = total.saturating_sub(pass).saturating_sub(skip);
         let spread = spreads.get(i).unwrap_or(0.0);
         let gap = gaps.get(i).unwrap_or(0.0);
         let mut line = format!(
-            "  {:<25} {}/{} passed  avg_spread={:.1}%  avg_gap={:.0}ms",
-            name, pass, total, spread, gap
+            "  {:<25} {}/{} passed ({} skipped, {} failed)  avg_spread={:.1}%  avg_gap={:.0}ms",
+            name, pass, total, skip, fail, spread, gap
         );
         if let Some(ref imb) = imbalances {
             let v = imb.get(i).unwrap_or(0.0);
@@ -1183,10 +1204,15 @@ fn format_cgroup_pass_rates(df: &DataFrame) -> String {
             col("work_type"),
         ])
         .agg([
-            col("passed")
+            // pass_count excludes skipped rows (see #36).
+            (col("passed").and(col("skipped").not()))
                 .cast(DataType::UInt32)
                 .sum()
                 .alias("pass_count"),
+            col("skipped")
+                .cast(DataType::UInt32)
+                .sum()
+                .alias("skip_count"),
             col("passed").count().cast(DataType::UInt32).alias("total"),
             col("spread").mean().alias("avg_spread"),
             col("spread").std(1).alias("std_spread"),
@@ -1212,6 +1238,7 @@ fn format_cgroup_pass_rates(df: &DataFrame) -> String {
     let flags_col = col_str(&grouped, "flags");
     let topos = col_str(&grouped, "topology");
     let pass_counts = col_u32(&grouped, "pass_count");
+    let skip_counts = col_u32(&grouped, "skip_count");
     let totals = col_u32(&grouped, "total");
     let spreads = col_f64(&grouped, "avg_spread");
     let std_spreads = col_f64(&grouped, "std_spread");
@@ -1230,15 +1257,23 @@ fn format_cgroup_pass_rates(df: &DataFrame) -> String {
 
     for i in 0..grouped.height() {
         let pass = pass_counts.get(i).unwrap_or(0);
+        let skip = skip_counts.as_ref().and_then(|s| s.get(i)).unwrap_or(0);
         let total = totals.get(i).unwrap_or(0);
-        if total == 0 || pass == total {
+        // A group is "clean" when every executed (non-skipped) row
+        // passed. Skipped rows are neither passes nor flakes.
+        if total == 0 || pass + skip == total {
             continue;
         }
         all_pass = false;
         let sc = scenarios.get(i).unwrap_or("?");
         let fl = flags_col.get(i).unwrap_or("?");
         let tp = topos.get(i).unwrap_or("?");
-        let mut line = format!("  {tp}/{sc}/{fl}  {pass}/{total}");
+        let fail = total.saturating_sub(pass).saturating_sub(skip);
+        let mut line = if skip > 0 {
+            format!("  {tp}/{sc}/{fl}  {pass}/{total} ({skip} skipped, {fail} failed)")
+        } else {
+            format!("  {tp}/{sc}/{fl}  {pass}/{total}")
+        };
         if let Some(ref sp) = spreads {
             let avg = sp.get(i).unwrap_or(0.0);
             line.push_str(&format!("  spread={:.1}", avg));
@@ -1475,7 +1510,13 @@ pub(crate) fn compare_rows(
             continue;
         };
 
-        if !row_a.passed || !row_b.passed {
+        // Drop from regression math when either side is a skip or a
+        // failure. Skips carry no executed metrics (the run didn't
+        // happen); failures carry telemetry dominated by the failure
+        // mode (short run, stalled workload), not the scheduler's
+        // behavior — comparing either against a real run produces
+        // meaningless deltas.
+        if !row_a.passed || !row_b.passed || row_a.skipped || row_b.skipped {
             report.skipped_failed += 1;
             continue;
         }
@@ -1652,6 +1693,7 @@ mod tests {
         let sr = ScenarioResult {
             scenario_name: label.to_string(),
             passed,
+            skipped: false,
             duration_s: 20.0,
             details: vec![],
             stats: ScenarioStats {
@@ -1788,6 +1830,7 @@ mod tests {
             topology: topo.into(),
             work_type: "CpuSpin".into(),
             scheduler: String::new(),
+            skipped: false,
             replica: 1,
             passed,
             spread,
@@ -2266,6 +2309,7 @@ mod tests {
             topology: "2s4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             passed: true,
+            skipped: false,
             stats: ScenarioStats {
                 cgroups: vec![],
                 total_workers: 4,
@@ -2298,6 +2342,7 @@ mod tests {
             }),
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
             sysctls: vec![],
@@ -2329,11 +2374,13 @@ mod tests {
             test_name: "eevdf_test".to_string(),
             topology: "1s2c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            skipped: false,
             passed: false,
             stats: Default::default(),
             monitor: None,
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
             sysctls: vec![],
@@ -2359,6 +2406,7 @@ mod tests {
         let sc = test_support::SidecarResult {
             test_name: "t".to_string(),
             topology: "1s1c1t".to_string(),
+            skipped: false,
             scheduler: "test".to_string(),
             passed: true,
             stats: Default::default(),
@@ -2374,6 +2422,7 @@ mod tests {
             }),
             stimulus_events: vec![],
             work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
             sysctls: vec![],
@@ -2677,6 +2726,34 @@ mod tests {
             "spread decrease is an improvement"
         );
         assert_eq!(spread_down.delta, -20.0);
+    }
+
+    #[test]
+    fn compare_rows_skipped_side_drops_pair_into_skipped_failed() {
+        // Regression for #36: a skipped row on either side of the
+        // comparison must not contribute to regressions/improvements
+        // — a skipped run carries no executed metrics. Previously,
+        // `row.passed == true` for skips let the pair through the
+        // regression math, producing meaningless deltas against the
+        // default-zero metric values.
+        let mut row_a = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        let mut row_b = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        row_a.skipped = true; // A side was skipped
+        let res = compare_rows(&[row_a.clone()], &[row_b.clone()], None, None);
+        assert_eq!(res.regressions, 0);
+        assert_eq!(res.improvements, 0);
+        assert_eq!(
+            res.skipped_failed, 1,
+            "skipped side must count as skipped_failed, not produce deltas"
+        );
+
+        // Symmetrically on the B side.
+        row_a.skipped = false;
+        row_b.skipped = true;
+        let res = compare_rows(&[row_a], &[row_b], None, None);
+        assert_eq!(res.regressions, 0);
+        assert_eq!(res.improvements, 0);
+        assert_eq!(res.skipped_failed, 1);
     }
 
     /// Rows where either side has `passed=false` are dropped from the

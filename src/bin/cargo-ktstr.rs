@@ -601,17 +601,30 @@ fn generate_flag_profiles(
 }
 
 /// Collect the extra scheduler args for a set of active flags.
+///
+/// Returns `Err` if any flag in `active_flags` is not declared in
+/// `all_flags`. Silently dropping unknown flags masked typos in
+/// CLI `--profiles` lists and version-drift in cached nextest args —
+/// the caller would see "flag applied" in the profile name but the
+/// scheduler was actually invoked without the corresponding CLI arg.
 fn profile_sched_args(
     active_flags: &[String],
     all_flags: &[ktstr::scenario::flags::FlagDeclJson],
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     for flag_name in active_flags {
-        if let Some(decl) = all_flags.iter().find(|f| f.name == *flag_name) {
-            args.extend(decl.args.iter().cloned());
+        match all_flags.iter().find(|f| f.name == *flag_name) {
+            Some(decl) => args.extend(decl.args.iter().cloned()),
+            None => {
+                let known: Vec<&str> = all_flags.iter().map(|f| f.name.as_str()).collect();
+                return Err(format!(
+                    "unknown flag {flag_name:?} (known: {})",
+                    known.join(", ")
+                ));
+            }
         }
     }
-    args
+    Ok(args)
 }
 
 fn run_verifier(
@@ -714,6 +727,24 @@ fn run_verifier_all_profiles(
     };
 
     let total = profiles.len();
+    if total == 0 {
+        // Differentiate the empty-profile cases so the user gets an
+        // actionable error rather than a generic "0 profiles" message.
+        return Err(if flags.len() > 31 {
+            format!(
+                "no profiles to verify: power-set generation is capped at \
+                 31 flags (found {}); use --profiles to select a subset",
+                flags.len(),
+            )
+        } else {
+            format!(
+                "no profiles to verify: {} flag(s) advertised but profile \
+                 generation produced 0 profiles — check `requires` \
+                 dependencies and exclusions for cycles or conflicts",
+                flags.len(),
+            )
+        });
+    }
     if total > 32 {
         eprintln!(
             "cargo ktstr: warning: {total} profiles to verify (>32). \
@@ -737,7 +768,8 @@ fn run_verifier_all_profiles(
             profile_name
         );
 
-        let extra_args = profile_sched_args(active_flags, &flags);
+        let extra_args = profile_sched_args(active_flags, &flags)
+            .map_err(|e| format!("profile {profile_name}: {e}"))?;
         let result = ktstr::verifier::collect_verifier_output(
             sched_bin,
             ktstr_bin,
@@ -1441,7 +1473,7 @@ mod tests {
             },
         ];
         let active = vec!["llc".to_string(), "steal".to_string()];
-        let args = profile_sched_args(&active, &flags);
+        let args = profile_sched_args(&active, &flags).unwrap();
         assert_eq!(args, vec!["--llc", "--steal", "--aggressive"]);
     }
 
@@ -1453,8 +1485,29 @@ mod tests {
             requires: vec![],
         }];
         let active: Vec<String> = vec![];
-        let args = profile_sched_args(&active, &flags);
+        let args = profile_sched_args(&active, &flags).unwrap();
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn profile_sched_args_unknown_flag_errors() {
+        // Regression for #35: silently dropping unknown flag names
+        // masked typos in --profiles CLI lists and version-drift in
+        // cached nextest args — the profile NAME would still say
+        // "foo+bar" while the scheduler was invoked without the
+        // corresponding CLI switches.
+        let flags = vec![ktstr::scenario::flags::FlagDeclJson {
+            name: "llc".to_string(),
+            args: vec!["--llc".to_string()],
+            requires: vec![],
+        }];
+        let active = vec!["llc".to_string(), "unknown_flag".to_string()];
+        let err = profile_sched_args(&active, &flags).unwrap_err();
+        assert!(
+            err.contains("unknown_flag"),
+            "error should cite flag: {err}"
+        );
+        assert!(err.contains("llc"), "error should list known flags: {err}");
     }
 
     // -- format_entry_row helpers --
