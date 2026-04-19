@@ -62,10 +62,23 @@ unsafe impl Sync for GuestMem {}
 impl GuestMem {
     /// Wrap the host-mapped guest DRAM region.
     ///
-    /// `base` is a pointer to the start of the KVM memory mapping;
-    /// `size` is the mapped length in bytes. Callers are responsible
-    /// for ensuring the mapping outlives the returned `GuestMem`.
-    pub fn new(base: *mut u8, size: u64) -> Self {
+    /// # Safety
+    ///
+    /// `base` must point to the start of a valid, readable memory
+    /// mapping at least `size` bytes long. The mapping MUST outlive
+    /// every `GuestMem` access (the type holds no lifetime tying
+    /// itself to the backing allocation). The caller is also
+    /// responsible for ensuring concurrent writers do not shrink
+    /// the mapping out from under the reader (e.g. via `ftruncate`
+    /// on an underlying SHM fd).
+    ///
+    /// Marked `unsafe` because the raw-pointer contract is not
+    /// expressible in the type system — `base: *mut u8` could be
+    /// dangling, null, or into unmapped memory, and every subsequent
+    /// `read_u64` / `read_slice` would miscompute or SIGSEGV. Every
+    /// internal caller (including tests) constructs `base` from a
+    /// live allocation whose lifetime is proven at the call site.
+    pub unsafe fn new(base: *mut u8, size: u64) -> Self {
         Self {
             base,
             size,
@@ -1346,7 +1359,8 @@ mod tests {
     fn read_rq_stats_known_values() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 5, 3, 7, 999_000, 0x1);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert_eq!(snap.nr_running, 5);
         assert_eq!(snap.scx_nr_running, 3);
@@ -1359,7 +1373,8 @@ mod tests {
     fn read_rq_stats_all_zeros() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 0, 0, 0, 0, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert_eq!(snap.nr_running, 0);
         assert_eq!(snap.scx_nr_running, 0);
@@ -1372,7 +1387,8 @@ mod tests {
     fn read_rq_stats_max_values() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, u32::MAX, u32::MAX, u32::MAX, u64::MAX, u32::MAX);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert_eq!(snap.nr_running, u32::MAX);
         assert_eq!(snap.scx_nr_running, u32::MAX);
@@ -1384,7 +1400,8 @@ mod tests {
     #[test]
     fn read_u32_out_of_bounds() {
         let buf = [0xFFu8; 8];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // PA 6 + 4 bytes = 10 > 8, out of bounds
         assert_eq!(mem.read_u32(6, 0), 0);
         // Exactly at boundary: PA 4, offset 0 => addr 4, 4+4=8 == size, not >
@@ -1396,7 +1413,8 @@ mod tests {
     #[test]
     fn read_u64_out_of_bounds() {
         let buf = [0xFFu8; 16];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // PA 10 + 8 = 18 > 16
         assert_eq!(mem.read_u64(10, 0), 0);
         // Exactly at boundary: PA 8, 8+8=16 == size
@@ -1409,7 +1427,8 @@ mod tests {
     fn monitor_loop_kill_immediately() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = AtomicBool::new(true);
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -1427,7 +1446,8 @@ mod tests {
     fn monitor_loop_one_iteration() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 2, 1, 3, 500, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -1468,7 +1488,8 @@ mod tests {
         let mut combined = buf0;
         combined.extend_from_slice(&buf1);
 
-        let mem = GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
 
         let snap0 = read_rq_stats(&mem, 0, &offsets);
         let snap1 = read_rq_stats(&mem, pa1, &offsets);
@@ -1492,7 +1513,8 @@ mod tests {
         let mut buf = [0u8; 32];
         // Place 0xDEADBEEF at byte 20 (PA=12, offset=8).
         buf[20..24].copy_from_slice(&0xDEADBEEFu32.to_ne_bytes());
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.read_u32(12, 8), 0xDEADBEEF);
     }
 
@@ -1501,7 +1523,8 @@ mod tests {
         let mut buf = [0u8; 32];
         // Place value at byte 16 (PA=10, offset=6).
         buf[16..24].copy_from_slice(&0x0123456789ABCDEFu64.to_ne_bytes());
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.read_u64(10, 6), 0x0123456789ABCDEF);
     }
 
@@ -1514,7 +1537,8 @@ mod tests {
         let mut combined = buf0;
         combined.extend_from_slice(&buf1);
 
-        let mem = GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -1553,7 +1577,8 @@ mod tests {
     fn monitor_loop_elapsed_ms_progresses() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -1642,7 +1667,8 @@ mod tests {
     fn read_event_stats_known_values() {
         let ev = test_event_offsets();
         let buf = make_event_stats_buffer(&ev, 42, 7, 100, 3, 5);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let stats = read_event_stats(&mem, 0, &ev);
         assert_eq!(stats.select_cpu_fallback, 42);
         assert_eq!(stats.dispatch_local_dsq_offline, 7);
@@ -1655,7 +1681,8 @@ mod tests {
     fn read_event_stats_zeros() {
         let ev = test_event_offsets();
         let buf = make_event_stats_buffer(&ev, 0, 0, 0, 0, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let stats = read_event_stats(&mem, 0, &ev);
         assert_eq!(stats.select_cpu_fallback, 0);
         assert_eq!(stats.dispatch_local_dsq_offline, 0);
@@ -1669,7 +1696,8 @@ mod tests {
         let mut buf = [0u8; 48];
         let val: i64 = 999;
         buf[40..48].copy_from_slice(&val.to_ne_bytes());
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let stats = read_event_stats(&mem, 0, &ev);
         assert_eq!(stats.bypass_activate, 999);
         // Fields without offsets remain 0.
@@ -1682,14 +1710,16 @@ mod tests {
     fn read_i64_roundtrip() {
         let val: i64 = -12345;
         let buf = val.to_ne_bytes();
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.read_i64(0, 0), -12345);
     }
 
     #[test]
     fn write_u8_and_read_u8() {
         let mut buf = [0u8; 16];
-        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         mem.write_u8(0, 5, 0xAB);
         assert_eq!(mem.read_u8(0, 5), 0xAB);
         assert_eq!(buf[5], 0xAB);
@@ -1698,7 +1728,8 @@ mod tests {
     #[test]
     fn write_u8_out_of_bounds() {
         let mut buf = [0u8; 4];
-        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         // Should not panic or write.
         mem.write_u8(4, 0, 0xFF);
         assert_eq!(buf, [0u8; 4]);
@@ -1707,7 +1738,8 @@ mod tests {
     #[test]
     fn write_u64_and_read_u64() {
         let mut buf = [0u8; 32];
-        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         mem.write_u64(0, 8, 0xDEAD_BEEF_CAFE_1234);
         assert_eq!(mem.read_u64(0, 8), 0xDEAD_BEEF_CAFE_1234);
         assert_eq!(
@@ -1719,7 +1751,8 @@ mod tests {
     #[test]
     fn write_u64_out_of_bounds() {
         let mut buf = [0u8; 8];
-        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         // addr 1 + 8 = 9 > 8, out of bounds
         mem.write_u64(1, 0, 0xFF);
         assert_eq!(buf, [0u8; 8]);
@@ -1728,7 +1761,8 @@ mod tests {
     #[test]
     fn write_u64_at_boundary() {
         let mut buf = [0u8; 16];
-        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         // PA 8 + 8 = 16 == size, should succeed
         mem.write_u64(8, 0, 0x0123_4567_89AB_CDEF);
         assert_eq!(mem.read_u64(8, 0), 0x0123_4567_89AB_CDEF);
@@ -1737,7 +1771,8 @@ mod tests {
     #[test]
     fn read_u8_out_of_bounds() {
         let buf = [0xFFu8; 4];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.read_u8(4, 0), 0);
         assert_eq!(mem.read_u8(3, 0), 0xFF);
     }
@@ -1746,7 +1781,8 @@ mod tests {
     fn read_rq_stats_has_no_event_counters() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert!(snap.event_counters.is_none());
     }
@@ -1765,7 +1801,8 @@ mod tests {
         let mut combined = rq_buf;
         combined.extend_from_slice(&ev_buf);
 
-        let mem = GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -1805,7 +1842,8 @@ mod tests {
     fn monitor_loop_no_event_counters_when_none() {
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -1836,7 +1874,8 @@ mod tests {
         let ev = test_event_offsets();
         // scx_root pointer is 0 (null) — no scheduler loaded.
         let buf = [0u8; 64];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = resolve_event_pcpu_pas(&mem, 0, &ev, &[0, 0x4000], 0);
         assert!(result.is_none());
     }
@@ -1862,7 +1901,8 @@ mod tests {
         combined.extend_from_slice(&scx_sched_kva.to_ne_bytes());
         combined.extend_from_slice(&[0u8; 64]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let wd = WatchdogOverride::ScxSched {
@@ -1921,7 +1961,8 @@ mod tests {
         // Extra space in case of accidental write via garbage deref.
         combined.extend_from_slice(&[0u8; 128]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let wd = WatchdogOverride::ScxSched {
             scx_root_pa,
@@ -1977,7 +2018,8 @@ mod tests {
         let mut combined = rq_buf;
         combined.extend_from_slice(&[0u8; 8]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let wd = WatchdogOverride::StaticGlobal {
@@ -2037,7 +2079,8 @@ mod tests {
         let shm_pa = combined.len() as u64;
         combined.extend(vec![0u8; 64]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let trigger = DumpTrigger {
@@ -2098,7 +2141,8 @@ mod tests {
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let trigger = DumpTrigger {
@@ -2161,7 +2205,8 @@ mod tests {
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let trigger = DumpTrigger {
@@ -2220,7 +2265,8 @@ mod tests {
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let sleeper_kill = std::sync::Arc::new(AtomicBool::new(false));
@@ -2298,7 +2344,8 @@ mod tests {
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let spinner_kill = std::sync::Arc::new(AtomicBool::new(false));
@@ -2384,7 +2431,8 @@ mod tests {
         let shm_pa = combined.len() as u64;
         combined.extend(vec![0u8; 64]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let thresholds = super::super::MonitorThresholds {
@@ -2466,7 +2514,8 @@ mod tests {
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
-        let mem = GuestMem::new(combined.as_mut_ptr(), combined.len() as u64);
+        // SAFETY: combined is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let thresholds = super::super::MonitorThresholds {
@@ -2588,7 +2637,8 @@ mod tests {
     fn read_rq_schedstat_known_values() {
         let ss = test_schedstat_offsets();
         let buf = make_schedstat_buffer(&ss, 50000, 10, 3, 100, 20, 80, 40);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let stats = read_rq_schedstat(&mem, 0, &ss);
         assert_eq!(stats.run_delay, 50000);
         assert_eq!(stats.pcount, 10);
@@ -2603,7 +2653,8 @@ mod tests {
     fn read_rq_schedstat_zeros() {
         let ss = test_schedstat_offsets();
         let buf = make_schedstat_buffer(&ss, 0, 0, 0, 0, 0, 0, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let stats = read_rq_schedstat(&mem, 0, &ss);
         assert_eq!(stats.run_delay, 0);
         assert_eq!(stats.pcount, 0);
@@ -2637,7 +2688,8 @@ mod tests {
             .copy_from_slice(&7u64.to_ne_bytes());
         buf[ss.rq_sched_count..ss.rq_sched_count + 4].copy_from_slice(&42u32.to_ne_bytes());
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -2672,7 +2724,8 @@ mod tests {
         assert!(offsets.schedstat_offsets.is_none());
 
         let buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
 
         let handle = {
@@ -2795,7 +2848,8 @@ mod tests {
         // rq->sd is null — should return None.
         let sd_off = test_sched_domain_offsets();
         let buf = vec![0u8; 512];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_sched_domain_tree(&mem, 0, &sd_off, 0);
         assert!(result.is_none());
     }
@@ -2826,7 +2880,8 @@ mod tests {
         // Write name string.
         buf[name_pa as usize..name_pa as usize + name_bytes.len()].copy_from_slice(name_bytes);
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
 
         assert_eq!(domains.len(), 1);
@@ -2867,7 +2922,8 @@ mod tests {
         buf[name0_pa as usize..name0_pa as usize + 4].copy_from_slice(b"SMT\0");
         buf[name1_pa as usize..name1_pa as usize + 3].copy_from_slice(b"MC\0");
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
 
         assert_eq!(domains.len(), 2);
@@ -2907,7 +2963,8 @@ mod tests {
         buf[sd_off.rq_sd..sd_off.rq_sd + 8].copy_from_slice(&sd_pa.to_ne_bytes());
         buf[sd_pa as usize..sd_pa as usize + sd_buf.len()].copy_from_slice(&sd_buf);
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
 
         assert_eq!(
@@ -2961,7 +3018,8 @@ mod tests {
             buf[start..start + sd_buf.len()].copy_from_slice(&sd_buf);
         }
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
 
         assert_eq!(
@@ -2984,7 +3042,8 @@ mod tests {
         let mut buf = vec![0u8; 512];
         buf[sd_off.rq_sd..sd_off.rq_sd + 8].copy_from_slice(&bad_kva.to_ne_bytes());
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // page_offset=0 -> PA = bad_kva which is > buf.len().
         let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0);
 
@@ -3016,7 +3075,8 @@ mod tests {
         buf[sd_pa as usize..sd_pa as usize + sd_buf.len()].copy_from_slice(&sd_buf);
         buf[name_pa as usize..name_pa as usize + name_bytes.len()].copy_from_slice(name_bytes);
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
 
         assert_eq!(domains.len(), 1);
@@ -3040,7 +3100,8 @@ mod tests {
         buf[0..4].copy_from_slice(&10u32.to_ne_bytes());
         buf[4..8].copy_from_slice(&20u32.to_ne_bytes());
         buf[8..12].copy_from_slice(&30u32.to_ne_bytes());
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let arr = read_u32_array(&mem, 0, 0);
         assert_eq!(arr, [10, 20, 30]);
     }
@@ -3082,7 +3143,8 @@ mod tests {
         let dsq_off = offsets.rq_scx + offsets.scx_rq_local_dsq + offsets.dsq_nr;
         buf[dsq_off..dsq_off + 4].copy_from_slice(&dsq_depth.to_ne_bytes());
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let snap = read_rq_stats(&mem, 0, &offsets);
         assert_eq!(snap.nr_running, nr_running);
         assert_eq!(snap.scx_nr_running, scx_nr);

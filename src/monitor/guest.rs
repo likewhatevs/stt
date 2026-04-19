@@ -253,7 +253,8 @@ mod tests {
 
         let mut buf = vec![0u8; 0x2000];
         buf[0x1000..0x1004].copy_from_slice(&42u32.to_ne_bytes());
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.read_u32(pa, 0), 42);
     }
 
@@ -271,7 +272,8 @@ mod tests {
         let mut buf = vec![0u8; 0x3000];
         buf[dram_offset as usize..dram_offset as usize + 8]
             .copy_from_slice(&0xDEAD_BEEF_1234_5678u64.to_ne_bytes());
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.read_u64(pa, 0), 0xDEAD_BEEF_1234_5678);
     }
 
@@ -279,7 +281,8 @@ mod tests {
     fn require_symbol_found() {
         // Build a GuestKernel manually (bypassing ::new) for unit testing.
         let buf = [0u8; 64];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // SAFETY: mem outlives kernel because buf is on the stack in this test.
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
@@ -305,7 +308,8 @@ mod tests {
         let mut buf = vec![0u8; 0x200];
         buf[0x100..0x104].copy_from_slice(&99u32.to_ne_bytes());
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("my_counter".to_string(), sym_kva);
@@ -326,7 +330,8 @@ mod tests {
         let mut buf = vec![0u8; 0x200];
         buf[0x100..0x108].copy_from_slice(&0x1234_5678_ABCD_EF00u64.to_ne_bytes());
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("my_u64".to_string(), sym_kva);
@@ -350,7 +355,8 @@ mod tests {
         let mut buf = vec![0u8; 0x200];
         buf[0x100..0x105].copy_from_slice(&[1, 2, 3, 4, 5]);
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("my_bytes".to_string(), sym_kva);
@@ -370,7 +376,8 @@ mod tests {
     #[test]
     fn read_symbol_missing_returns_error() {
         let buf = [0u8; 64];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let kernel = GuestKernel {
             mem: mem_ref,
@@ -390,7 +397,8 @@ mod tests {
         let sym_kva = start_kernel_map + 0x100;
         let mut buf = vec![0u8; 0x200];
 
-        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("my_var".to_string(), sym_kva);
@@ -417,7 +425,8 @@ mod tests {
         buf[dram_offset as usize + 8..dram_offset as usize + 16]
             .copy_from_slice(&0xAAAA_BBBBu64.to_ne_bytes());
 
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let kernel = GuestKernel {
             mem: mem_ref,
@@ -434,7 +443,8 @@ mod tests {
     #[test]
     fn accessors_return_resolved_state() {
         let buf = [0u8; 64];
-        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let kernel = GuestKernel {
             mem: mem_ref,
@@ -464,7 +474,8 @@ mod tests {
         // GuestKernel::new reads page_offset_base and pgtable_l5_enabled
         // from guest memory; a zeroed buffer causes safe fallbacks.
         let mut buf = vec![0u8; 64 << 20];
-        let mem = GuestMem::new(buf.as_mut_ptr(), buf.len() as u64);
+        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = match GuestKernel::new(&mem, &path) {
             Ok(k) => k,
             Err(e) => {

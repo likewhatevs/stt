@@ -2461,7 +2461,12 @@ impl KtstrVm {
                         .get_host_address(GuestAddress(DRAM_BASE))
                         .unwrap();
                     let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
-                    monitor::reader::GuestMem::new(host_base, mem_size)
+                    // SAFETY: host_base came from GuestMemoryMmap's
+                    // get_host_address, mapping is owned by vm.guest_mem
+                    // which outlives this GuestMem (both captured by
+                    // the surrounding closure and used only while the
+                    // VM runs).
+                    unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
                 }
             };
             let shm_base = mem.size() - self.shm_size;
@@ -2660,7 +2665,10 @@ impl KtstrVm {
                     .get_host_address(GuestAddress(DRAM_BASE))
                     .unwrap();
                 let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
-                monitor::reader::GuestMem::new(host_base, mem_size)
+                // SAFETY: host_base is from GuestMemoryMmap's mapping,
+                // which outlives this GuestMem (owned by `vm` until
+                // return).
+                unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
             }
         };
         let mem_size = mem.size();
@@ -2854,7 +2862,10 @@ impl KtstrVm {
                     .get_host_address(GuestAddress(DRAM_BASE))
                     .unwrap();
                 let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
-                monitor::reader::GuestMem::new(host_base, mem_size)
+                // SAFETY: host_base is from GuestMemoryMmap's mapping,
+                // which outlives this GuestMem (owned by `vm` until
+                // return).
+                unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
             }
         };
         let kill_clone = kill.clone();
@@ -3213,7 +3224,10 @@ impl KtstrVm {
                     Err(_) => return Vec::new(),
                 };
                 let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
-                monitor::reader::GuestMem::new(host_base, mem_size)
+                // SAFETY: host_base is from GuestMemoryMmap's mapping,
+                // which outlives this GuestMem (borrowed via `vm` for
+                // the body of this function).
+                unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
             }
         };
         let kernel = match monitor::guest::GuestKernel::new(&mem, &vmlinux) {
