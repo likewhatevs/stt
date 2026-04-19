@@ -460,14 +460,16 @@ impl Action {
     /// `Arc` reference counting.
     ///
     /// # Example
-    /// ```ignore
+    /// ```
+    /// use ktstr::scenario::Action;
+    /// use ktstr::assert::AssertResult;
     /// use std::sync::atomic::{AtomicU32, Ordering};
     /// use std::sync::Arc;
     ///
     /// // Capture a shared counter that the scenario increments per run.
     /// let counter = Arc::new(AtomicU32::new(0));
     /// let counter_ref = counter.clone();
-    /// let action = Action::custom(move |_ctx| {
+    /// let _action = Action::custom(move |_ctx| {
     ///     counter_ref.fetch_add(1, Ordering::Relaxed);
     ///     Ok(AssertResult::pass())
     /// });

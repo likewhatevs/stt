@@ -78,14 +78,13 @@ pub use entry::{
 pub(crate) use eval::run_ktstr_test_inner;
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
 pub(crate) use output::{
-    SCHED_OUTPUT_END, SCHED_OUTPUT_START, SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX,
-    SENTINEL_INIT_STARTED, SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED, parse_sched_output,
+    SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX, SENTINEL_INIT_STARTED,
+    SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED,
 };
 pub(crate) use probe::maybe_dispatch_vm_test;
-pub use probe::propagate_rust_env_from_cmdline;
 pub(crate) use probe::{
     PipelineDiagnostics, format_probe_diagnostics, maybe_dispatch_vm_test_with_args,
-    maybe_dispatch_vm_test_with_phase_a, start_probe_phase_a,
+    maybe_dispatch_vm_test_with_phase_a, propagate_rust_env_from_cmdline, start_probe_phase_a,
 };
 pub(crate) use profraw::try_flush_profraw;
 pub(crate) use timefmt::now_iso8601;

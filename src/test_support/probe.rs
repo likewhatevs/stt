@@ -29,13 +29,11 @@ use super::args::{
     extract_probe_stack_arg, extract_test_fn_arg, extract_work_type_arg, resolve_cgroup_root,
 };
 use super::entry::find_test;
-use super::output::{
-    SCHED_OUTPUT_END, SCHED_OUTPUT_START, extract_sched_ext_dump, parse_sched_output,
-    print_assert_result,
-};
+use super::output::{extract_sched_ext_dump, print_assert_result};
 use super::profraw::try_flush_profraw;
 use super::runtime::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
 use super::{KtstrTestEntry, TopoOverride};
+use crate::verifier::{SCHED_OUTPUT_END, SCHED_OUTPUT_START, parse_sched_output};
 
 /// Sentinel value for `--ktstr-probe-stack` when no crash stack functions
 /// were extracted. Triggers the guest-side probe path so
@@ -46,17 +44,16 @@ const DISCOVER_SENTINEL: &str = "__discover__";
 /// Propagate `RUST_BACKTRACE` and `RUST_LOG` from the guest kernel
 /// cmdline into the process environment.
 ///
-/// # Warning
+/// # Safety invariant
 ///
-/// **This function performs `std::env::set_var`, which is unsound on
-/// Linux unless the process is provably single-threaded.** glibc
-/// mutates the global `__environ` array without locks, so a
-/// concurrent reader or another `set_var` produces UB. Callers must
-/// invoke this from the VM-boot path (`ktstr_guest_init`) after
-/// `/args` is read and before any probe / workload / test thread is
-/// spawned. External consumers outside that boot path have no sound
-/// use for this entry point; the `ktstr` binary calls it internally.
-pub fn propagate_rust_env_from_cmdline() {
+/// Performs `std::env::set_var`, which is unsound on Linux unless the
+/// process is provably single-threaded. glibc mutates the global
+/// `__environ` array without locks, so a concurrent reader or another
+/// `set_var` produces UB. The two callers
+/// ([`ktstr_test_early_dispatch`](super::dispatch::ktstr_test_early_dispatch)
+/// and the `ktstr_guest_init` boot path in `vmm::rust_init`) both
+/// invoke this before any probe / workload / test thread is spawned.
+pub(crate) fn propagate_rust_env_from_cmdline() {
     let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
         return;
     };
@@ -769,17 +766,13 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
                 details: vec![format!("{e:#}").into()],
                 stats: Default::default(),
             };
-            try_flush_profraw();
-            print_assert_result(&r);
-            collect_and_print_probe_data(probe_stop, probe_handle);
+            publish_result_and_collect(&r, probe_stop, probe_handle);
             return Some(1);
         }
     };
 
     let exit_code = if result.passed { 0 } else { 1 };
-    try_flush_profraw();
-    print_assert_result(&result);
-    collect_and_print_probe_data(probe_stop, probe_handle);
+    publish_result_and_collect(&result, probe_stop, probe_handle);
     Some(exit_code)
 }
 
@@ -852,13 +845,15 @@ pub(crate) struct PipelineDiagnostics {
 pub(crate) struct ProbePhaseAState {
     pub handle: std::thread::JoinHandle<ProbeThreadResult>,
     pub phase_b_tx: std::sync::mpsc::Sender<crate::probe::process::PhaseBInput>,
-    pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared pipeline atomics (`stop`, `output_done`, `probes_ready`)
+    /// — grouped so Phase B consumers thread a single value through
+    /// the join + publish tail rather than tracking each `Arc` by hand.
+    pub pipeline: ProbePipeline,
     pub kernel_func_names: Vec<(u32, String)>,
     /// Number of functions in Phase A. Phase B uses this as func_idx_offset
     /// to avoid index collisions in the shared BPF maps.
     pub kernel_func_count: u32,
     pub pipe_diag: PipelineDiagnostics,
-    pub output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub param_names: std::collections::HashMap<String, Vec<(String, String)>>,
     pub render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
 }
@@ -968,11 +963,10 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
     Some(ProbePhaseAState {
         handle,
         phase_b_tx,
-        stop: pipeline.stop.clone(),
+        pipeline,
         kernel_func_names: func_names,
         kernel_func_count,
         pipe_diag,
-        output_done: pipeline.output_done.clone(),
         param_names,
         render_hints,
     })
@@ -1013,6 +1007,22 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             None
         })
     });
+
+    // Destructure Phase A state up front so later branches (Phase B
+    // send / drop, handle construction, stop propagation) operate on
+    // owned locals. Keeping `pa` whole across `drop(pa.phase_b_tx)`
+    // would partial-move the value and block the final `ProbeHandle`
+    // build.
+    let ProbePhaseAState {
+        handle: pa_handle,
+        phase_b_tx: pa_phase_b_tx,
+        pipeline: pa_pipeline,
+        kernel_func_names: pa_kernel_func_names,
+        kernel_func_count: pa_kernel_func_count,
+        pipe_diag: pa_pipe_diag,
+        param_names: pa_param_names,
+        render_hints: pa_render_hints,
+    } = pa;
 
     // Phase B: discover BPF symbols from the running scheduler.
     eprintln!("ktstr_test: probe phase_b: discovering BPF symbols");
@@ -1064,10 +1074,10 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             bpf_prog_fds: bpf_fds,
             btf_funcs: phase_b_btf,
             done: phase_b_done_clone,
-            func_idx_offset: pa.kernel_func_count,
+            func_idx_offset: pa_kernel_func_count,
         };
 
-        if let Err(e) = pa.phase_b_tx.send(phase_b_input) {
+        if let Err(e) = pa_phase_b_tx.send(phase_b_input) {
             eprintln!("ktstr_test: probe phase_b: failed to send: {e}");
         } else {
             // Wait for Phase B attachment to complete.
@@ -1079,7 +1089,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     } else {
         eprintln!("ktstr_test: probe phase_b: no BPF symbols, skipping fentry");
         // Drop the sender so the probe thread's try_recv sees Disconnected.
-        drop(pa.phase_b_tx);
+        drop(pa_phase_b_tx);
     }
 
     let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
@@ -1093,6 +1103,19 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
         .build();
 
+    // Build the ProbeHandle up front from the destructured Phase A
+    // locals — cheap (mostly Arc clones and already-owned Vecs) and
+    // lets both the Ok and Err tails funnel through
+    // `publish_result_and_collect` without re-assembling the handle.
+    let stop = pa_pipeline.stop.clone();
+    let handle = ProbeHandle {
+        thread: pa_handle,
+        func_names: pa_kernel_func_names,
+        pipeline_diag: pa_pipe_diag,
+        output_done: pa_pipeline.output_done,
+        param_names: pa_param_names,
+        render_hints: pa_render_hints,
+    };
     let result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {
@@ -1102,33 +1125,13 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
                 details: vec![format!("{e:#}").into()],
                 stats: Default::default(),
             };
-            try_flush_profraw();
-            print_assert_result(&r);
-            let probe_handle = Some(ProbeHandle {
-                thread: pa.handle,
-                func_names: pa.kernel_func_names,
-                pipeline_diag: pa.pipe_diag,
-                output_done: pa.output_done,
-                param_names: pa.param_names,
-                render_hints: pa.render_hints,
-            });
-            collect_and_print_probe_data(pa.stop, probe_handle);
+            publish_result_and_collect(&r, stop, Some(handle));
             return Some(1);
         }
     };
 
     let exit_code = if result.passed { 0 } else { 1 };
-    try_flush_profraw();
-    print_assert_result(&result);
-    let probe_handle = Some(ProbeHandle {
-        thread: pa.handle,
-        func_names: pa.kernel_func_names,
-        pipeline_diag: pa.pipe_diag,
-        output_done: pa.output_done,
-        param_names: pa.param_names,
-        render_hints: pa.render_hints,
-    });
-    collect_and_print_probe_data(pa.stop, probe_handle);
+    publish_result_and_collect(&result, stop, Some(handle));
     Some(exit_code)
 }
 
@@ -1200,6 +1203,21 @@ fn emit_probe_payload(
         println!("{json}");
     }
     println!("{PROBE_OUTPUT_END}");
+}
+
+/// Flush profraw, publish the assert result to guest stdout, then stop
+/// and join the probe thread. Called on both success and error paths
+/// at the tail of every dispatch entry point so the host sees the
+/// verdict even when the guest aborts early. Owns the probe-handle
+/// value so callers don't reuse it after publication.
+fn publish_result_and_collect(
+    result: &AssertResult,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<ProbeHandle>,
+) {
+    try_flush_profraw();
+    print_assert_result(result);
+    collect_and_print_probe_data(stop, handle);
 }
 
 /// Stop probes, join the probe thread. The probe thread emits output

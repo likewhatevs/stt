@@ -10,11 +10,16 @@
 //!   [`print_assert_result`] (guest emit), [`parse_assert_result`]
 //!   (host parse from COM2 string), and [`parse_assert_result_shm`]
 //!   (host parse from SHM drain).
-//! - **Scheduler log** on COM2, bracketed by [`SCHED_OUTPUT_START`] /
-//!   [`SCHED_OUTPUT_END`]. [`parse_sched_output`] extracts the block;
-//!   [`sched_log_fingerprint`] returns the last non-empty line as a
-//!   failure fingerprint so duplicate failures cluster visually in
-//!   nextest output.
+//! - **Scheduler log** on COM2, bracketed by
+//!   [`SCHED_OUTPUT_START`](crate::verifier::SCHED_OUTPUT_START) /
+//!   [`SCHED_OUTPUT_END`](crate::verifier::SCHED_OUTPUT_END) — both
+//!   live in [`crate::verifier`] since that is the primary host-side
+//!   consumer that also parses the BPF verifier log carried inside the
+//!   block.
+//!   [`parse_sched_output`](crate::verifier::parse_sched_output)
+//!   extracts the block; [`sched_log_fingerprint`] returns the last
+//!   non-empty line as a failure fingerprint so duplicate failures
+//!   cluster visually in nextest output.
 //! - **sched_ext dump** on COM1 (kernel trace_pipe). Parsed by
 //!   [`extract_sched_ext_dump`] — it filters lines containing
 //!   `sched_ext_dump` out of the raw trace stream.
@@ -33,6 +38,7 @@
 use anyhow::{Context, Result};
 
 use crate::assert::AssertResult;
+use crate::verifier::parse_sched_output;
 use crate::vmm;
 
 /// Delimiters for the AssertResult JSON in guest output.
@@ -70,10 +76,6 @@ pub(crate) fn parse_assert_result(output: &str) -> Result<AssertResult> {
     serde_json::from_str(&json).context("parse AssertResult JSON")
 }
 
-/// Delimiters for the scheduler log in guest output (written by init script).
-pub(crate) const SCHED_OUTPUT_START: &str = "===SCHED_OUTPUT_START===";
-pub(crate) const SCHED_OUTPUT_END: &str = "===SCHED_OUTPUT_END===";
-
 /// Extract the last non-empty line from the scheduler log.
 ///
 /// This serves as a failure fingerprint: when many tests fail with the
@@ -82,31 +84,6 @@ pub(crate) const SCHED_OUTPUT_END: &str = "===SCHED_OUTPUT_END===";
 pub(crate) fn sched_log_fingerprint(output: &str) -> Option<&str> {
     let log = parse_sched_output(output)?;
     log.lines().rev().find(|l| !l.trim().is_empty())
-}
-
-/// Extract the scheduler log from guest output between delimiters.
-/// Returns `None` if the delimiters are absent or the content is empty.
-pub(crate) fn parse_sched_output(output: &str) -> Option<&str> {
-    // Cannot use extract_section here: it returns an owned String,
-    // but callers need a borrowed &str tied to `output`'s lifetime.
-    //
-    // `find` on the start marker and `rfind` on the end marker: if the
-    // scheduler's own output happens to contain the end sentinel string
-    // (e.g. a stack trace that quotes the marker), `find` would
-    // truncate the section early. `rfind` anchors on the last
-    // occurrence, which is the real terminator emitted by the guest's
-    // post-scenario shutdown path.
-    let start = output.find(SCHED_OUTPUT_START)?;
-    let end = output.rfind(SCHED_OUTPUT_END)?;
-    let after_marker = start + SCHED_OUTPUT_START.len();
-    if after_marker >= end {
-        return None;
-    }
-    let content = output[after_marker..end].trim();
-    if content.is_empty() {
-        return None;
-    }
-    Some(content)
 }
 
 /// Extract sched_ext_dump lines from COM1 kernel console (trace_pipe output).
@@ -231,6 +208,7 @@ pub(crate) fn format_console_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verifier::{SCHED_OUTPUT_END, SCHED_OUTPUT_START};
 
     // -- parse_assert_result --
 
@@ -284,68 +262,6 @@ mod tests {
         assert_eq!(r.details.len(), 2);
         assert_eq!(r.details[0], "err1");
         assert_eq!(r.details[1], "err2");
-    }
-
-    // -- parse_sched_output --
-
-    #[test]
-    fn parse_sched_output_valid() {
-        let output = format!(
-            "noise\n{SCHED_OUTPUT_START}\nscheduler log line 1\nline 2\n{SCHED_OUTPUT_END}\nmore"
-        );
-        let parsed = parse_sched_output(&output);
-        assert!(parsed.is_some());
-        let content = parsed.unwrap();
-        assert!(content.contains("scheduler log line 1"));
-        assert!(content.contains("line 2"));
-    }
-
-    #[test]
-    fn parse_sched_output_missing_start() {
-        let output = format!("no start\n{SCHED_OUTPUT_END}\n");
-        assert!(parse_sched_output(&output).is_none());
-    }
-
-    #[test]
-    fn parse_sched_output_missing_end() {
-        let output = format!("{SCHED_OUTPUT_START}\nsome content");
-        assert!(parse_sched_output(&output).is_none());
-    }
-
-    #[test]
-    fn parse_sched_output_empty_content() {
-        let output = format!("{SCHED_OUTPUT_START}\n\n{SCHED_OUTPUT_END}");
-        assert!(parse_sched_output(&output).is_none());
-    }
-
-    #[test]
-    fn parse_sched_output_with_stack_traces() {
-        let stack = "do_enqueue_task+0x1a0/0x380\nbalance_one+0x50/0x100\n";
-        let output = format!("{SCHED_OUTPUT_START}\n{stack}\n{SCHED_OUTPUT_END}");
-        let parsed = parse_sched_output(&output).unwrap();
-        assert!(parsed.contains("do_enqueue_task"));
-        assert!(parsed.contains("balance_one"));
-    }
-
-    #[test]
-    fn parse_sched_output_rfind_survives_end_marker_in_content() {
-        // Regression: if the scheduler log echoes the END marker
-        // inside its own content (e.g. a shell heredoc, a diagnostic
-        // that quotes the sentinel), `find` truncated the section at
-        // the first occurrence — which was inside the content, not
-        // at the terminator. `rfind` anchors on the last occurrence,
-        // which is the real terminator.
-        let content = format!("line1\nfake {SCHED_OUTPUT_END} inside\nline3");
-        let output = format!("{SCHED_OUTPUT_START}\n{content}\n{SCHED_OUTPUT_END}\n");
-        let parsed = parse_sched_output(&output).unwrap();
-        assert!(
-            parsed.contains("line3"),
-            "rfind must keep content after an embedded END marker: {parsed:?}"
-        );
-        assert!(
-            parsed.contains("fake"),
-            "content before the embedded marker must also survive: {parsed:?}"
-        );
     }
 
     // -- sched_log_fingerprint --

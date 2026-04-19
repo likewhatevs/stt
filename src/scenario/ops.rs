@@ -2737,6 +2737,20 @@ mod tests {
     // kernel) is abstracted behind the mock. The test subject is the
     // orchestration logic — "for each def, call create_cgroup, then
     // set_cpuset if spec.is_some(), then move_tasks after spawn".
+    //
+    // Parallel-nextest behavior: verified non-flaky over repeated
+    // `cargo nextest run --lib -E 'test(apply_setup)' --test-threads 8`
+    // invocations and back-to-back full-suite runs. Each `MockCgroupOps`
+    // owns its own `Mutex<Vec<CgroupCall>>`, so cross-test recording
+    // cannot contend. `apply_setup` does call `WorkloadHandle::start`
+    // (see top of this file) — workers wake, run briefly, and are then
+    // SIGKILL'd when the owning `WorkloadHandle` drops via
+    // `cleanup_state(&mut state)` / `state.handles.clear()` at the tail
+    // of each test. No test assertion depends on worker output, only
+    // on mock-recorded cgroup calls, so worker timing is not
+    // observable. Fd footprint is 4 pipes × `workers()` per test — 8
+    // fds for the 2-worker tests, well inside any RLIMIT_NOFILE the
+    // harness sets.
 
     use crate::cgroup::CgroupOps;
     use std::path::Path;

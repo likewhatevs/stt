@@ -356,8 +356,7 @@ pub mod prelude {
     // `ktstr::test_support::<item>` when needed:
     // `newest_run_dir`, `runs_root`, `analyze_sidecars`, `ktstr_main`,
     // `ktstr_test_early_dispatch`, `run_ktstr_test`, `nextest_setup`,
-    // `resolve_scheduler`, `resolve_test_kernel`,
-    // `propagate_rust_env_from_cmdline`.
+    // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
         AffinityKind, AffinityMode, MemPolicy, MpolFlags, Phase, SchedPolicy, Work, WorkType,

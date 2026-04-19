@@ -10,8 +10,42 @@
 //! - [`detect_cycle`] / [`collapse_cycles`] — loop iteration compression
 //! - [`format_brief_line`] — single-line program summary
 //! - [`build_b_map`] / [`build_diff_rows`] — A/B comparison helpers
+//! - [`SCHED_OUTPUT_START`] / [`SCHED_OUTPUT_END`] — COM2 delimiters
+//!   written by the guest's rust_init around the scheduler log region;
+//!   [`parse_sched_output`] extracts the enclosed block
 
 use std::collections::HashMap;
+
+/// Delimiter written to COM2 by the guest's rust_init immediately
+/// before the scheduler log block. Paired with [`SCHED_OUTPUT_END`].
+pub(crate) const SCHED_OUTPUT_START: &str = "===SCHED_OUTPUT_START===";
+/// Delimiter written to COM2 by the guest's rust_init immediately
+/// after the scheduler log block. Paired with [`SCHED_OUTPUT_START`].
+pub(crate) const SCHED_OUTPUT_END: &str = "===SCHED_OUTPUT_END===";
+
+/// Extract the scheduler log from guest output between
+/// [`SCHED_OUTPUT_START`] and [`SCHED_OUTPUT_END`]. Returns `None` if
+/// the delimiters are absent or the enclosed content is empty after
+/// trimming.
+///
+/// Uses `find` on the start marker and `rfind` on the end marker: if
+/// the scheduler log itself contains the end sentinel string (e.g. a
+/// stack trace that quotes the marker), `rfind` anchors on the last
+/// occurrence, which is the real terminator emitted by the guest's
+/// post-scenario shutdown path.
+pub(crate) fn parse_sched_output(output: &str) -> Option<&str> {
+    let start = output.find(SCHED_OUTPUT_START)?;
+    let end = output.rfind(SCHED_OUTPUT_END)?;
+    let after_marker = start + SCHED_OUTPUT_START.len();
+    if after_marker >= end {
+        return None;
+    }
+    let content = output[after_marker..end].trim();
+    if content.is_empty() {
+        return None;
+    }
+    Some(content)
+}
 
 /// Parsed verifier stats from the kernel log line:
 /// `processed N insns (limit M) max_states_per_insn X total_states Y peak_states Z mark_read W`
@@ -489,9 +523,7 @@ pub fn collect_verifier_output(
 
     let result = vm.run().context("run verifier VM")?;
 
-    let scheduler_log = crate::test_support::parse_sched_output(&result.output)
-        .unwrap_or("")
-        .to_string();
+    let scheduler_log = parse_sched_output(&result.output).unwrap_or("").to_string();
 
     // Build ProgStats from host-side ProgVerifierStats. Each program
     // that loaded successfully is visible in prog_idr with its
@@ -1531,7 +1563,6 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
         // single SCHED_OUTPUT block that wraps a libbpf-marked verifier
         // log must produce the same verifier text when extracted in
         // that order.
-        use crate::test_support::{SCHED_OUTPUT_END, SCHED_OUTPUT_START, parse_sched_output};
         let sched_inner = "\
             libbpf: -- BEGIN PROG LOAD LOG --\n\
             processed 7 insns (limit 1000000) max_states_per_insn 1 total_states 1 peak_states 1 mark_read 0\n\
@@ -1544,5 +1575,65 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
         assert!(verifier_log.contains("processed 7 insns"));
         assert!(!verifier_log.contains("SCHED_OUTPUT"));
         assert!(!verifier_log.contains("BEGIN PROG LOAD LOG"));
+    }
+
+    #[test]
+    fn parse_sched_output_valid() {
+        let output = format!(
+            "noise\n{SCHED_OUTPUT_START}\nscheduler log line 1\nline 2\n{SCHED_OUTPUT_END}\nmore"
+        );
+        let parsed = parse_sched_output(&output);
+        assert!(parsed.is_some());
+        let content = parsed.unwrap();
+        assert!(content.contains("scheduler log line 1"));
+        assert!(content.contains("line 2"));
+    }
+
+    #[test]
+    fn parse_sched_output_missing_start() {
+        let output = format!("no start\n{SCHED_OUTPUT_END}\n");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_missing_end() {
+        let output = format!("{SCHED_OUTPUT_START}\nsome content");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_empty_content() {
+        let output = format!("{SCHED_OUTPUT_START}\n\n{SCHED_OUTPUT_END}");
+        assert!(parse_sched_output(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_with_stack_traces() {
+        let stack = "do_enqueue_task+0x1a0/0x380\nbalance_one+0x50/0x100\n";
+        let output = format!("{SCHED_OUTPUT_START}\n{stack}\n{SCHED_OUTPUT_END}");
+        let parsed = parse_sched_output(&output).unwrap();
+        assert!(parsed.contains("do_enqueue_task"));
+        assert!(parsed.contains("balance_one"));
+    }
+
+    #[test]
+    fn parse_sched_output_rfind_survives_end_marker_in_content() {
+        // Regression: if the scheduler log echoes the END marker
+        // inside its own content (e.g. a shell heredoc, a diagnostic
+        // that quotes the sentinel), `find` truncated the section at
+        // the first occurrence — which was inside the content, not
+        // at the terminator. `rfind` anchors on the last occurrence,
+        // which is the real terminator.
+        let content = format!("line1\nfake {SCHED_OUTPUT_END} inside\nline3");
+        let output = format!("{SCHED_OUTPUT_START}\n{content}\n{SCHED_OUTPUT_END}\n");
+        let parsed = parse_sched_output(&output).unwrap();
+        assert!(
+            parsed.contains("line3"),
+            "rfind must keep content after an embedded END marker: {parsed:?}"
+        );
+        assert!(
+            parsed.contains("fake"),
+            "content before the embedded marker must also survive: {parsed:?}"
+        );
     }
 }

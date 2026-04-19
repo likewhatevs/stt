@@ -28,15 +28,16 @@ use crate::timeline::StimulusEvent;
 use crate::vmm;
 
 use super::output::{
-    SCHED_OUTPUT_START, classify_init_stage, extract_kernel_version, extract_panic_message,
-    extract_sched_ext_dump, format_console_diagnostics, parse_assert_result,
-    parse_assert_result_shm, parse_sched_output, sched_log_fingerprint,
+    classify_init_stage, extract_kernel_version, extract_panic_message, extract_sched_ext_dump,
+    format_console_diagnostics, parse_assert_result, parse_assert_result_shm,
+    sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
 use super::profraw::{MSG_TYPE_PROFRAW, write_profraw};
 use super::sidecar::{write_sidecar, write_skip_sidecar};
 use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
+use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
 
 use super::runtime::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
 
@@ -314,6 +315,26 @@ fn evaluate_vm_result(
         duration_s: Some(result.duration.as_secs_f64()),
     };
 
+    // Section builders shared by every error branch in this function.
+    // Timeline skips phaseless runs; monitor only reports when an
+    // active scheduler exposes rq data (EEVDF reads would be junk).
+    let build_timeline_section = || -> String {
+        timeline
+            .as_ref()
+            .filter(|t| !t.phases.is_empty())
+            .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
+            .unwrap_or_default()
+    };
+    let build_monitor_section = || -> String {
+        if entry.scheduler.binary.has_active_scheduling()
+            && let Some(ref monitor) = result.monitor
+        {
+            format_monitor_section(monitor, merged_assert)
+        } else {
+            String::new()
+        }
+    };
+
     if let Ok(verify_result) =
         parse_assert_result_shm(result.shm_data.as_ref()).or_else(|_| parse_assert_result(output))
     {
@@ -350,11 +371,7 @@ fn evaluate_vm_result(
             let repro_section = repro
                 .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
                 .unwrap_or_default();
-            let timeline_section = timeline
-                .as_ref()
-                .filter(|t| !t.phases.is_empty())
-                .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
-                .unwrap_or_default();
+            let timeline_section = build_timeline_section();
             let stats_section = if !verify_result.stats.cgroups.is_empty() {
                 let s = &verify_result.stats;
                 let mut lines = vec![format!(
@@ -392,13 +409,7 @@ fn evaluate_vm_result(
             } else {
                 String::new()
             };
-            let monitor_section = if entry.scheduler.binary.has_active_scheduling()
-                && let Some(ref monitor) = result.monitor
-            {
-                format_monitor_section(monitor, merged_assert)
-            } else {
-                String::new()
-            };
+            let monitor_section = build_monitor_section();
             let msg = format!(
                 "{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}",
                 fingerprint_line,
@@ -433,11 +444,7 @@ fn evaluate_vm_result(
             let verdict = thresholds.evaluate(&eval_report);
             if !verdict.passed {
                 let details = verdict.details.join("\n  ");
-                let timeline_section = timeline
-                    .as_ref()
-                    .filter(|t| !t.phases.is_empty())
-                    .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
-                    .unwrap_or_default();
+                let timeline_section = build_timeline_section();
                 let monitor_section = format_monitor_section(monitor, merged_assert);
                 let msg = format!(
                     "{}ktstr_test '{}'{} [topo={}] passed scenario but monitor failed:\n  {}{}{}{}{}",
@@ -488,20 +495,10 @@ fn evaluate_vm_result(
         String::new()
     };
 
-    let timeline_section = timeline
-        .as_ref()
-        .filter(|t| !t.phases.is_empty())
-        .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
-        .unwrap_or_default();
+    let timeline_section = build_timeline_section();
 
     // Build monitor section for error paths where neither SHM nor COM2 had a parseable result.
-    let monitor_section = if entry.scheduler.binary.has_active_scheduling()
-        && let Some(ref monitor) = result.monitor
-    {
-        format_monitor_section(monitor, merged_assert)
-    } else {
-        String::new()
-    };
+    let monitor_section = build_monitor_section();
 
     if result.timed_out {
         let msg = format!(
@@ -849,11 +846,12 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::output::{RESULT_END, RESULT_START, SCHED_OUTPUT_END};
+    use super::super::output::{RESULT_END, RESULT_START};
     use super::super::test_helpers::{
         ENV_LOCK, EVAL_TOPO, eevdf_entry, make_vm_result, no_repro, sched_entry,
     };
     use super::*;
+    use crate::verifier::SCHED_OUTPUT_END;
 
     // -- resolve_test_kernel tests --
 

@@ -944,8 +944,8 @@ pub struct WorkerReport {
     /// wakeup that resumes execution; not a yield-specific measure.
     /// Populated for blocking work types: Bursty, PipeIo, FutexPingPong,
     /// FutexFanOut, SchBench, CacheYield, CachePipe, IoSync, NiceSweep,
-    /// AffinityChurn, MutexContention, Sequence with Sleep/Yield/Io
-    /// phases.
+    /// AffinityChurn, PolicyChurn, MutexContention, Sequence with
+    /// Sleep/Yield/Io phases.
     pub resume_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
     pub iterations: u64,
