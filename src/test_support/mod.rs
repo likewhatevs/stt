@@ -105,8 +105,9 @@ pub(crate) use profraw::try_flush_profraw;
 // import warning until tests co-locate with their production modules.
 #[cfg(test)]
 pub(crate) use profraw::{find_symbol_vaddrs, parse_shm_params, target_dir};
+pub(crate) use timefmt::now_iso8601;
 #[cfg(test)]
-pub(crate) use timefmt::{days_to_ymd, generate_run_id, is_leap, now_iso8601};
+pub(crate) use timefmt::{days_to_ymd, generate_run_id, is_leap};
 pub(crate) use topo::{TopoOverride, parse_topo_string};
 
 // ---------------------------------------------------------------------------
@@ -3346,6 +3347,24 @@ mod tests {
     fn days_to_ymd_leap_day() {
         let (y, m, d) = days_to_ymd(11016);
         assert_eq!((y, m, d), (2000, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_2024_jan_1() {
+        // 2024-01-01 = 19723 days since epoch.
+        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_2024_leap_day() {
+        // 2024-02-29 = 19723 + 31 + 28 = 19782.
+        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_2023_end_of_year() {
+        // 2023-12-31 = 19722.
+        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
     }
 
     #[test]

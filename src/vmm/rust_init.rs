@@ -31,6 +31,18 @@ const COM1: &str = "/dev/ttyS0";
 /// Virtio-console device path. Used for shell I/O when available.
 const HVC0: &str = "/dev/hvc0";
 
+/// tracefs enable gate for the `sched_ext_dump` tracepoint. Writing
+/// `"1"` activates the event, `"0"` deactivates it.
+const TRACE_SCHED_EXT_DUMP_ENABLE: &str =
+    "/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable";
+/// Global tracefs on/off switch. Writing `"0"` flushes in-flight
+/// trace data out of the kernel ring buffer so the trace_pipe reader
+/// drains cleanly before reboot.
+const TRACE_TRACING_ON: &str = "/sys/kernel/tracing/tracing_on";
+/// tracefs streaming endpoint for the active trace. The trace_pipe
+/// reader opens this once per boot and forwards every line to COM1.
+const TRACE_PIPE: &str = "/sys/kernel/tracing/trace_pipe";
+
 /// Returns true when this process is PID 1 (running as /init in a VM).
 pub fn is_pid1() -> bool {
     unsafe { libc::getpid() == 1 }
@@ -363,14 +375,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Flush COM1 trace data before reboot. tracing_on=0 wakes the
     // blocked reader via ring_buffer_wake_waiters and causes EOF after
     // all buffered events are drained.
-    let _ = fs::write(
-        "/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable",
-        "0",
-    );
+    let _ = fs::write(TRACE_SCHED_EXT_DUMP_ENABLE, "0");
     if let Some(ref stop) = trace_stop {
         stop.store(true, Ordering::Release);
     }
-    let _ = fs::write("/sys/kernel/tracing/tracing_on", "0");
+    let _ = fs::write(TRACE_TRACING_ON, "0");
     if let Some(handle) = trace_handle {
         let _ = handle.join();
     }
@@ -1131,16 +1140,15 @@ fn dump_file_to_com2(path: &str) {
 /// Enable sched_ext_dump trace event and pipe trace_pipe to COM1 in a
 /// background thread. Returns the stop flag and thread join handle.
 fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandle<()>>) {
-    let trace_enable = "/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable";
-    if Path::new(trace_enable).exists() {
-        let _ = fs::write(trace_enable, "1");
+    if Path::new(TRACE_SCHED_EXT_DUMP_ENABLE).exists() {
+        let _ = fs::write(TRACE_SCHED_EXT_DUMP_ENABLE, "1");
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let handle = std::thread::Builder::new()
             .name("trace-pipe".into())
             .spawn(move || {
-                let Ok(mut trace) = fs::File::open("/sys/kernel/tracing/trace_pipe") else {
+                let Ok(mut trace) = fs::File::open(TRACE_PIPE) else {
                     return;
                 };
                 let Ok(mut com1) = fs::OpenOptions::new().write(true).open(COM1) else {
@@ -1260,7 +1268,7 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
             if let Some(ts) = trace_stop {
                 ts.store(true, Ordering::Release);
             }
-            let _ = fs::write("/sys/kernel/tracing/tracing_on", "0");
+            let _ = fs::write(TRACE_TRACING_ON, "0");
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
             if let Ok(f) = fs::OpenOptions::new().write(true).open(COM1) {

@@ -28,8 +28,8 @@ use crate::timeline::StimulusEvent;
 use crate::vmm;
 
 use super::output::{
-    classify_init_stage, ensure_kvm, extract_kernel_version, extract_panic_message,
-    extract_sched_ext_dump, format_console_diagnostics, parse_assert_result,
+    SCHED_OUTPUT_START, classify_init_stage, ensure_kvm, extract_kernel_version,
+    extract_panic_message, extract_sched_ext_dump, format_console_diagnostics, parse_assert_result,
     parse_assert_result_shm, parse_sched_output, sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
@@ -539,7 +539,7 @@ pub(crate) fn evaluate_vm_result(
     // carry the diagnostics and the kernel console is noise (BIOS, ACPI boot).
     // When COM2 has NO scheduler output (crash before writing), the kernel console
     // is the ONLY source of crash info — include it unconditionally as a fallback.
-    let has_sched_output = output.contains("===SCHED_OUTPUT_START===");
+    let has_sched_output = output.contains(SCHED_OUTPUT_START);
     let console_section = if !has_sched_output || verbose() {
         let init_stage = classify_init_stage(output);
         format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
@@ -766,12 +766,16 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
 }
 
 /// Format a label for the scheduler spec, for use in test output.
+///
+/// Returns an empty string for `SchedulerSpec::None` so the failure
+/// header reads `ktstr_test 'name' [topo=...]` with no sched
+/// bracket — every other variant renders `" [sched=X]"` where `X`
+/// comes from [`SchedulerSpec::display_name`].
 pub(crate) fn scheduler_label(spec: &SchedulerSpec) -> String {
-    match spec {
-        SchedulerSpec::None => String::new(),
-        SchedulerSpec::Name(n) => format!(" [sched={n}]"),
-        SchedulerSpec::Path(p) => format!(" [sched={p}]"),
-        SchedulerSpec::KernelBuiltin { .. } => " [sched=kernel]".to_string(),
+    if matches!(spec, SchedulerSpec::None) {
+        String::new()
+    } else {
+        format!(" [sched={}]", spec.display_name())
     }
 }
 

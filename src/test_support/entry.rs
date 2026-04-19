@@ -53,6 +53,22 @@ impl SchedulerSpec {
     pub const fn has_active_scheduling(&self) -> bool {
         !matches!(self, SchedulerSpec::None)
     }
+
+    /// Short, human-readable name for logging and sidecar output.
+    ///
+    /// Maps `None` → `"eevdf"`, `Name(n)` → `n`, `Path(p)` → `p`,
+    /// `KernelBuiltin { .. }` → `"kernel"`. Single source of truth
+    /// for "what do we call this scheduler when telling the user" —
+    /// sidecar serialization and failure-header formatting both use
+    /// this, and any future consumer gets identical naming for free.
+    pub const fn display_name(&self) -> &'static str {
+        match self {
+            SchedulerSpec::None => "eevdf",
+            SchedulerSpec::Name(n) => n,
+            SchedulerSpec::Path(p) => p,
+            SchedulerSpec::KernelBuiltin { .. } => "kernel",
+        }
+    }
 }
 
 /// A `key=value` sysctl applied to the guest before the scheduler

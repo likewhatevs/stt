@@ -30,7 +30,10 @@ use super::args::{
 };
 use super::entry::find_test;
 use super::eval::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
-use super::output::{extract_sched_ext_dump, parse_sched_output, print_assert_result};
+use super::output::{
+    SCHED_OUTPUT_END, SCHED_OUTPUT_START, extract_sched_ext_dump, parse_sched_output,
+    print_assert_result,
+};
 use super::profraw::try_flush_profraw;
 use super::{KtstrTestEntry, TopoOverride};
 
@@ -114,8 +117,8 @@ pub(crate) fn attempt_auto_repro(
     eprintln!(
         "ktstr_test: auto-repro: COM2 length={} has_sched_start={} has_sched_end={}",
         first_vm_output.len(),
-        first_vm_output.contains("===SCHED_OUTPUT_START==="),
-        first_vm_output.contains("===SCHED_OUTPUT_END==="),
+        first_vm_output.contains(SCHED_OUTPUT_START),
+        first_vm_output.contains(SCHED_OUTPUT_END),
     );
     let sched_output = parse_sched_output(first_vm_output);
 

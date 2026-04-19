@@ -435,6 +435,59 @@ fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
     h.finish()
 }
 
+/// Materialize the entry-derived scheduler metadata that every
+/// sidecar carries regardless of pass/fail/skip: formatted sysctl
+/// lines, kargs, and the pretty scheduler name.
+///
+/// Both write paths (`write_sidecar` and `write_skip_sidecar`) need
+/// this exact triple; keeping the derivation in one place means a
+/// change to the sidecar schema (e.g. a new scheduler-level field)
+/// shows up in all writers automatically.
+fn scheduler_fingerprint(entry: &KtstrTestEntry) -> (String, Vec<String>, Vec<String>) {
+    let sched_name = entry.scheduler.binary.display_name().to_string();
+    let sysctls: Vec<String> = entry
+        .scheduler
+        .sysctls
+        .iter()
+        .map(|s| format!("sysctl.{}={}", s.key, s.value))
+        .collect();
+    let kargs: Vec<String> = entry
+        .scheduler
+        .kargs
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    (sched_name, sysctls, kargs)
+}
+
+/// Compute the per-variant sidecar path and serialize + write the
+/// result to disk.
+///
+/// Gauntlet variants of the same test differ by work_type, flags
+/// (via scheduler args → sysctls/kargs), scheduler, and topology. A
+/// filename of just `{test_name}.ktstr.json` causes variants to
+/// overwrite each other, erasing all but the last-written result.
+/// `sidecar_variant_hash` hashes the discriminating fields into a
+/// short stable suffix so each variant gets its own sidecar file.
+///
+/// `label` is a caller-supplied noun for the context message ("skip
+/// sidecar" / "sidecar") so the error chain points at the right call
+/// site.
+fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::Result<()> {
+    let dir = sidecar_dir();
+    let variant_hash = sidecar_variant_hash(sidecar);
+    let path = dir.join(format!(
+        "{}-{:016x}.ktstr.json",
+        sidecar.test_name, variant_hash
+    ));
+    let json = serde_json::to_string_pretty(sidecar)
+        .with_context(|| format!("serialize {label} for '{}'", sidecar.test_name))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create sidecar dir {}", dir.display()))?;
+    std::fs::write(&path, json).with_context(|| format!("write {label} {}", path.display()))?;
+    Ok(())
+}
+
 /// Emit a minimal sidecar for an early-skip path.
 ///
 /// Stats tooling enumerates sidecars to compute pass/skip/fail
@@ -456,30 +509,11 @@ pub(crate) fn write_skip_sidecar(
     entry: &KtstrTestEntry,
     active_flags: &[String],
 ) -> anyhow::Result<()> {
-    let dir = sidecar_dir();
-    let topo = entry.topology.to_string();
-    let sched_name = match &entry.scheduler.binary {
-        super::SchedulerSpec::None => "eevdf",
-        super::SchedulerSpec::Name(n) => n,
-        super::SchedulerSpec::Path(p) => p,
-        super::SchedulerSpec::KernelBuiltin { .. } => "kernel",
-    };
-    let sysctls: Vec<String> = entry
-        .scheduler
-        .sysctls
-        .iter()
-        .map(|s| format!("sysctl.{}={}", s.key, s.value))
-        .collect();
-    let kargs: Vec<String> = entry
-        .scheduler
-        .kargs
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let (scheduler, sysctls, kargs) = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
-        topology: topo,
-        scheduler: sched_name.to_string(),
+        topology: entry.topology.to_string(),
+        scheduler,
         passed: true,
         skipped: true,
         stats: Default::default(),
@@ -498,15 +532,7 @@ pub(crate) fn write_skip_sidecar(
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
     };
-    let variant_hash = sidecar_variant_hash(&sidecar);
-    let path = dir.join(format!("{}-{:016x}.ktstr.json", entry.name, variant_hash));
-    let json = serde_json::to_string_pretty(&sidecar)
-        .with_context(|| format!("serialize skip sidecar for '{}'", entry.name))?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create sidecar dir {}", dir.display()))?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("write skip sidecar {}", path.display()))?;
-    Ok(())
+    serialize_and_write_sidecar(&sidecar, "skip sidecar")
 }
 
 /// Write a sidecar JSON file for post-run analysis.
@@ -527,30 +553,11 @@ pub(crate) fn write_sidecar(
     work_type: &str,
     active_flags: &[String],
 ) -> anyhow::Result<()> {
-    let dir = sidecar_dir();
-    let topo = entry.topology.to_string();
-    let sched_name = match &entry.scheduler.binary {
-        super::SchedulerSpec::None => "eevdf",
-        super::SchedulerSpec::Name(n) => n,
-        super::SchedulerSpec::Path(p) => p,
-        super::SchedulerSpec::KernelBuiltin { .. } => "kernel",
-    };
-    let sysctls: Vec<String> = entry
-        .scheduler
-        .sysctls
-        .iter()
-        .map(|s| format!("sysctl.{}={}", s.key, s.value))
-        .collect();
-    let kargs: Vec<String> = entry
-        .scheduler
-        .kargs
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let (scheduler, sysctls, kargs) = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
-        topology: topo,
-        scheduler: sched_name.to_string(),
+        topology: entry.topology.to_string(),
+        scheduler,
         passed: verify_result.passed,
         skipped: verify_result.is_skipped(),
         stats: verify_result.stats.clone(),
@@ -566,18 +573,5 @@ pub(crate) fn write_sidecar(
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
     };
-    // Gauntlet variants of the same test differ by work_type, flags
-    // (via scheduler args → sysctls/kargs), scheduler, and topology.
-    // A filename of just `{test_name}.ktstr.json` causes variants to
-    // overwrite each other, erasing all but the last-written result.
-    // Hash the discriminating fields into a short stable suffix so
-    // each variant gets its own sidecar file.
-    let variant_hash = sidecar_variant_hash(&sidecar);
-    let path = dir.join(format!("{}-{:016x}.ktstr.json", entry.name, variant_hash));
-    let json = serde_json::to_string_pretty(&sidecar)
-        .with_context(|| format!("serialize sidecar for '{}'", entry.name))?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create sidecar dir {}", dir.display()))?;
-    std::fs::write(&path, json).with_context(|| format!("write sidecar {}", path.display()))?;
-    Ok(())
+    serialize_and_write_sidecar(&sidecar, "sidecar")
 }

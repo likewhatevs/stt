@@ -116,38 +116,6 @@ pub fn format_entry_row(
     )
 }
 
-/// Current time as ISO 8601 string (UTC, second precision).
-fn now_iso8601() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs();
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
-}
-
-/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
 /// List cached kernel images.
 pub fn kernel_list(json: bool) -> Result<()> {
     let cache = CacheDir::new()?;
@@ -681,7 +649,7 @@ pub fn kernel_build_pipeline(
         acquired.kernel_source.clone(),
         arch.to_string(),
         image_name.to_string(),
-        now_iso8601(),
+        crate::test_support::now_iso8601(),
     )
     .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
@@ -1735,30 +1703,9 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // -- days_to_ymd --
-
-    #[test]
-    fn days_to_ymd_epoch() {
-        assert_eq!(days_to_ymd(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn days_to_ymd_known_date() {
-        // 2024-01-01 = 19723 days since epoch
-        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
-    }
-
-    #[test]
-    fn days_to_ymd_leap_day() {
-        // 2024-02-29 = 19723 + 31 (jan) + 28 (feb 1-28) = 19782
-        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
-    }
-
-    #[test]
-    fn days_to_ymd_end_of_year() {
-        // 2023-12-31 = 19722
-        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
-    }
+    // days_to_ymd tests moved to test_support::timefmt tests
+    // (days_to_ymd_2024_jan_1, _2024_leap_day, _2023_end_of_year)
+    // since the single implementation now lives there.
 
     // -- validate_kernel_config --
 
