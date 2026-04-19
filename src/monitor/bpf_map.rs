@@ -1115,7 +1115,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_basic() {
         let (buf, cr3_pa, kva, data_pa) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(cr3_pa, kva, false);
         assert_eq!(pa, Some(data_pa));
@@ -1127,7 +1128,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_with_offset() {
         let (buf, cr3_pa, kva, data_pa) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // KVA + 0x100 should map to data_pa + 0x100
         let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
@@ -1138,7 +1140,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_unmapped() {
         let (buf, cr3_pa, _, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // A completely different address that has no PGD entry.
         let pa = mem.translate_kva(cr3_pa, 0xFFFF_FFFF_8000_0000, false);
@@ -1149,7 +1152,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_unmapped_pte() {
         let (buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // Same PGD/PUD/PMD but next PTE index — not mapped.
         let unmapped_kva = kva + 0x1000;
@@ -1197,7 +1201,8 @@ mod tests {
         buf[huge_page_pa as usize..huge_page_pa as usize + 8]
             .copy_from_slice(&0xCAFE_BABE_1234_5678u64.to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(pgd_pa, kva, false);
         assert_eq!(pa, Some(huge_page_pa));
@@ -1242,7 +1247,8 @@ mod tests {
             (huge_page_pa + PTE_BASE) | BLOCK_FLAGS,
         );
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(pgd_pa, kva, false);
         assert_eq!(pa, Some(huge_page_pa));
@@ -1268,7 +1274,8 @@ mod tests {
         let off = (pgd_pa + pgd_idx * 8) as usize;
         buf[off..off + 8].copy_from_slice(&0x2000u64.to_ne_bytes()); // no PRESENT
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.translate_kva(pgd_pa, kva, false), None);
     }
@@ -1294,7 +1301,8 @@ mod tests {
         // PUD entry without present bit.
         write_entry(&mut buf, pud_pa, pud_idx, 0x3000); // no PRESENT
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.translate_kva(pgd_pa, kva, false), None);
     }
@@ -1322,7 +1330,8 @@ mod tests {
         // PMD entry without present bit.
         write_entry(&mut buf, pmd_pa, pmd_idx, 0x4000); // no PRESENT
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.translate_kva(pgd_pa, kva, false), None);
     }
@@ -1353,7 +1362,8 @@ mod tests {
         // PTE entry without present bit.
         write_entry(&mut buf, pte_pa, pte_idx, 0x5000); // no PRESENT
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.translate_kva(pgd_pa, kva, false), None);
     }
@@ -1364,7 +1374,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_u32_roundtrip() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -1395,7 +1406,8 @@ mod tests {
     #[test]
     fn read_bytes_basic() {
         let buf = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mut out = [0u8; 4];
         let n = mem.read_bytes(2, &mut out);
@@ -1406,7 +1418,8 @@ mod tests {
     #[test]
     fn read_bytes_past_end() {
         let buf = [1u8, 2, 3, 4];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mut out = [0u8; 8];
         let n = mem.read_bytes(2, &mut out);
@@ -1417,7 +1430,8 @@ mod tests {
     #[test]
     fn read_bytes_at_boundary() {
         let buf = [0xFFu8; 8];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mut out = [0u8; 8];
         let n = mem.read_bytes(8, &mut out);
@@ -1427,7 +1441,8 @@ mod tests {
     #[test]
     fn write_u32_roundtrip() {
         let mut buf = [0u8; 16];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         mem.write_u32(4, 0, 0xDEAD_BEEF);
         assert_eq!(mem.read_u32(4, 0), 0xDEAD_BEEF);
@@ -1442,7 +1457,8 @@ mod tests {
     #[test]
     fn xa_load_zero_head() {
         let buf = [0u8; 64];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(xa_load(&mem, 0, 0, 0, 0, 0), Some(0));
         assert_eq!(xa_load(&mem, 0, 0, 5, 0, 0), Some(0));
@@ -1455,7 +1471,8 @@ mod tests {
         let xa_head: u64 = 0xFFFF_8880_0001_0000; // bit 1 clear
         assert_eq!(xa_head & 2, 0);
         let buf = [0u8; 8];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(xa_load(&mem, 0, xa_head, 0, 0, 0), Some(xa_head));
     }
@@ -1464,7 +1481,8 @@ mod tests {
     fn xa_load_single_entry_index_nonzero() {
         let xa_head: u64 = 0xFFFF_8880_0001_0000;
         let buf = [0u8; 8];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(xa_load(&mem, 0, xa_head, 1, 0, 0), Some(0));
         assert_eq!(xa_load(&mem, 0, xa_head, 63, 0, 0), Some(0));
@@ -1503,7 +1521,8 @@ mod tests {
         let slots_off = 16; // Simulated offset of slots within xa_node.
         let entry_ptr: u64 = 0xDEAD_0000; // Leaf entry (bit 1 clear).
         let (buf, xa_head, page_offset) = setup_xa_node(&[(3, entry_ptr)], slots_off);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         assert_eq!(
@@ -1516,7 +1535,8 @@ mod tests {
     fn xa_load_multi_entry_empty_slot() {
         let slots_off = 16;
         let (buf, xa_head, page_offset) = setup_xa_node(&[], slots_off);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         // All slots are zero.
@@ -1539,7 +1559,8 @@ mod tests {
             (63, 0xCCCC_0000u64),
         ];
         let (buf, xa_head, page_offset) = setup_xa_node(&entries, slots_off);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         assert_eq!(
@@ -1666,7 +1687,8 @@ mod tests {
     fn find_bpf_map_discovers_matching_map() {
         let (buf, cr3_pa, idr_kva, offsets) =
             setup_find_bpf_map("mitosis.bss", BPF_MAP_TYPE_ARRAY, 64);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
@@ -1690,7 +1712,8 @@ mod tests {
     fn find_bpf_map_no_match_wrong_suffix() {
         let (buf, cr3_pa, idr_kva, offsets) =
             setup_find_bpf_map("mitosis.bss", BPF_MAP_TYPE_ARRAY, 64);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
@@ -1706,7 +1729,8 @@ mod tests {
     fn find_bpf_map_skips_non_array_type() {
         // map_type = 1 (BPF_MAP_TYPE_HASH), not BPF_MAP_TYPE_ARRAY.
         let (buf, cr3_pa, idr_kva, offsets) = setup_find_bpf_map("test.bss", 1, 64);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
@@ -1745,7 +1769,8 @@ mod tests {
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = find_bpf_map(
             &lookup_ctx(&mem, 0x10000, 0xFFFF_8880_0000_0000, &offsets, false),
@@ -1806,7 +1831,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_basic() {
         let (buf, cr3_pa, kva, data_pa) = setup_5level_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(cr3_pa, kva, true);
         assert_eq!(pa, Some(data_pa));
@@ -1817,7 +1843,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_with_offset() {
         let (buf, cr3_pa, kva, data_pa) = setup_5level_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(cr3_pa, kva + 0x100, true);
         assert_eq!(pa, Some(data_pa + 0x100));
@@ -1827,7 +1854,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_5level_unmapped_pml5() {
         let (buf, cr3_pa, _, _) = setup_5level_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // Different PML5 index — no entry mapped.
         let unmapped_kva: u64 = 0xFF22_8880_0000_5000;
@@ -1841,7 +1869,8 @@ mod tests {
         // is our PML5). The PGD index from a 4-level perspective differs,
         // so it should fail to find a mapping.
         let (buf, cr3_pa, kva, _) = setup_5level_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // 4-level walk uses bits 47:39 for PGD, not bits 56:48 for PML5.
         // The PGD index into our PML5 table won't find the right entry.
@@ -1857,7 +1886,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_bytes_roundtrip() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -1892,7 +1922,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_fails_on_unmapped_kva() {
         let (mut buf, cr3_pa, _, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -1973,7 +2004,8 @@ mod tests {
 
         let (buf, xa_head, page_offset) =
             setup_two_level_xarray(child_slot, leaf_slot, leaf_entry, slots_off);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         assert_eq!(
@@ -1991,7 +2023,8 @@ mod tests {
 
         let (buf, xa_head, page_offset) =
             setup_two_level_xarray(child_slot, leaf_slot, leaf_entry, slots_off);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         // Index that hits root slot 2, child slot 10 -> populated.
@@ -2013,7 +2046,8 @@ mod tests {
     fn xa_load_two_level_empty_root_slot() {
         let slots_off = 16;
         let (buf, xa_head, page_offset) = setup_two_level_xarray(3, 0, 0xDEAD_0000, slots_off);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         // Index that maps to root slot 0 (empty, child is at slot 3).
@@ -2031,7 +2065,8 @@ mod tests {
         let slots_off = 16;
         // Child at root slot 63, leaf at child slot 63. Max index for 2-level = 63*64+63 = 4095.
         let (buf, xa_head, page_offset) = setup_two_level_xarray(63, 63, 0xFFFF_0000, slots_off);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let max_index = (63 << 6) | 63; // 4095
@@ -2174,7 +2209,8 @@ mod tests {
     fn find_bpf_map_skips_wrong_name_finds_second() {
         let (buf, cr3_pa, idr_kva, offsets) = setup_find_bpf_map_multi();
         let page_offset: u64 = 0xFFFF_8880_0000_0000;
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
@@ -2196,7 +2232,8 @@ mod tests {
         // Map name fills all BPF_OBJ_NAME_LEN bytes with no null.
         let full_name = "0123456789a.bss"; // 15 bytes, fits in 16 with null.
         let (buf, cr3_pa, idr_kva, offsets) = setup_find_bpf_map(full_name, BPF_MAP_TYPE_ARRAY, 64);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
@@ -2220,7 +2257,8 @@ mod tests {
         let map_pa: u64 = 0x14000;
         let name_pa = (map_pa + offsets.map_name as u64) as usize;
         buf[name_pa..name_pa + 16].copy_from_slice(max_name.as_bytes());
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         // The name doesn't end with ".bss" — the '!' is the 16th char.
@@ -2243,7 +2281,8 @@ mod tests {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
         // Record the original bytes at data_pa before writing.
         let original_first_byte = buf[data_pa as usize];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2282,7 +2321,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_empty_data() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2314,7 +2354,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_u32_5level() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_5level_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2360,7 +2401,8 @@ mod tests {
         let off = (pml5_pa + pml5_idx * 8) as usize;
         buf[off..off + 8].copy_from_slice(&((p4d_pa + PTE_BASE) | 0x63).to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(mem.translate_kva(pml5_pa, kva, true), None);
     }
@@ -2400,7 +2442,8 @@ mod tests {
             (huge_page_pa + PTE_BASE) | BLOCK_FLAGS,
         ); // PS bit
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(pml5_pa, kva, true);
         assert_eq!(pa, Some(huge_page_pa));
@@ -2441,7 +2484,8 @@ mod tests {
             (huge_page_pa + PTE_BASE) | BLOCK_FLAGS,
         ); // PS bit
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(pml5_pa, kva, true);
         assert_eq!(pa, Some(huge_page_pa));
@@ -2495,7 +2539,8 @@ mod tests {
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = find_bpf_map(
             &lookup_ctx(&mem, pgd_pa, 0xFFFF_8880_0000_0000, &offsets, false),
@@ -2584,7 +2629,8 @@ mod tests {
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = find_bpf_map(
             &lookup_ctx(&mem, pml5_pa, 0xFFFF_8880_0000_0000, &offsets, true),
@@ -2641,7 +2687,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_across_page_boundary() {
         let (mut buf, cr3_pa, kva, page1_pa, page2_pa) = setup_two_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2683,7 +2730,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_bpf_map_value_single_byte_on_second_page() {
         let (mut buf, cr3_pa, kva, _, page2_pa) = setup_two_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2819,7 +2867,8 @@ mod tests {
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = find_bpf_map(
             &lookup_ctx(&mem, pgd_pa, page_offset, &offsets, false),
@@ -2842,7 +2891,8 @@ mod tests {
         // Write a known u32 at data_pa + 4.
         buf[data_pa as usize + 4..data_pa as usize + 8]
             .copy_from_slice(&0xCAFE_BABEu32.to_ne_bytes());
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2868,7 +2918,8 @@ mod tests {
     fn read_bpf_map_value_bytes() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_page_table();
         buf[data_pa as usize..data_pa as usize + 4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2893,7 +2944,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn read_bpf_map_value_empty() {
         let (buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2918,7 +2970,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn read_bpf_map_value_unmapped_returns_none() {
         let (buf, cr3_pa, _, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -2949,7 +3002,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_then_read_bpf_map_value_roundtrip() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3002,7 +3056,8 @@ mod tests {
         buf[page2_pa as usize] = 0xCC;
         buf[page2_pa as usize + 1] = 0xDD;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3028,7 +3083,8 @@ mod tests {
     fn read_bpf_map_value_u32_5level() {
         let (mut buf, cr3_pa, kva, data_pa) = setup_5level_page_table();
         buf[data_pa as usize..data_pa as usize + 4].copy_from_slice(&0xDEAD_BEEFu32.to_ne_bytes());
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3066,7 +3122,8 @@ mod tests {
 
         let (buf, cr3_pa, idr_kva, offsets) = setup;
         let page_offset: u64 = 0xFFFF_8880_0000_0000;
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let maps = find_all_bpf_maps(
@@ -3089,7 +3146,8 @@ mod tests {
     fn find_all_bpf_maps_single_entry() {
         let (buf, cr3_pa, idr_kva, offsets) =
             setup_find_bpf_map("test.bss", BPF_MAP_TYPE_ARRAY, 64);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let maps = find_all_bpf_maps(
@@ -3123,7 +3181,8 @@ mod tests {
         let buf = vec![0u8; 0x2000];
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = 0x1000 + start_kernel_map;
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let maps = find_all_bpf_maps(
@@ -3139,7 +3198,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn read_value_returns_none_for_non_array_map() {
         let (buf, cr3_pa, _, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3164,7 +3224,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_value_returns_false_for_non_array_map() {
         let (mut buf, cr3_pa, _, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3207,7 +3268,8 @@ mod tests {
         let flags_pa = (map_pa + offsets.map_flags as u64) as usize;
         buf[flags_pa..flags_pa + 4].copy_from_slice(&0x0400u32.to_ne_bytes()); // BPF_F_MMAPABLE
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let maps = find_all_bpf_maps(
             &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
@@ -3231,7 +3293,8 @@ mod tests {
         // Write shift=6 at node_pa + 8.
         buf[node_pa as usize + shift_off] = 6;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         assert_eq!(xa_node_shift(&mem, page_offset, node_kva, shift_off), 6);
         // With offset 0 (wrong), should read 0 (the byte at node_pa + 0).
@@ -3336,7 +3399,8 @@ mod tests {
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let maps = find_all_bpf_maps(
             &lookup_ctx(&mem, pgd_pa, page_offset, &offsets, false),
@@ -3358,7 +3422,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn read_value_rejects_out_of_bounds() {
         let (buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3389,7 +3454,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_value_rejects_out_of_bounds() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3505,7 +3571,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn read_write_field_typed_roundtrip() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3543,7 +3610,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn read_write_field_all_types() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3727,7 +3795,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn write_field_type_mismatch_returns_false() {
         let (mut buf, cr3_pa, kva, _) = setup_page_table();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
         let info = BpfMapInfo {
@@ -3853,7 +3922,8 @@ mod tests {
         let btf_tid_off = (map_pa + offsets.map_btf_value_type_id as u64) as usize;
 
         // Zero out the btf fields first — default from zeroed buf.
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let maps = find_all_bpf_maps(
             &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
@@ -3868,7 +3938,8 @@ mod tests {
         buf[btf_off..btf_off + 8].copy_from_slice(&btf_kva_val.to_ne_bytes());
         buf[btf_tid_off..btf_tid_off + 4].copy_from_slice(&7u32.to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let maps = find_all_bpf_maps(
             &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
@@ -4005,7 +4076,8 @@ mod tests {
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let idr_kva = idr_pa + start_kernel_map;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let maps = find_all_bpf_maps(
             &lookup_ctx(&mem, pgd_pa, page_offset, &offsets, false),
@@ -4064,7 +4136,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_l0_index_256() {
         let (buf, cr3_pa, kva, data_pa) = setup_page_table_vmalloc();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(cr3_pa, kva, false);
         assert_eq!(
@@ -4079,7 +4152,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_l0_index_256_with_offset() {
         let (buf, cr3_pa, kva, data_pa) = setup_page_table_vmalloc();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
         assert_eq!(pa, Some(data_pa + 0x100));
@@ -4089,7 +4163,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn translate_kva_l0_index_256_unmapped_neighbor() {
         let (buf, cr3_pa, kva, _) = setup_page_table_vmalloc();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kva_257 = kva + (1u64 << 39);
         assert_eq!(mem.translate_kva(cr3_pa, kva_257, false), None);
@@ -4133,7 +4208,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn translate_kva_vmalloc_64k() {
         let (buf, cr3_pa, kva, data_pa) = setup_page_table_vmalloc_64k();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(cr3_pa, kva, false);
         assert_eq!(pa, Some(data_pa), "64KB vmalloc walk should resolve");
@@ -4144,7 +4220,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn translate_kva_vmalloc_64k_with_offset() {
         let (buf, cr3_pa, kva, data_pa) = setup_page_table_vmalloc_64k();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
         assert_eq!(pa, Some(data_pa + 0x100));
@@ -4154,7 +4231,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn translate_kva_vmalloc_64k_unmapped_neighbor() {
         let (buf, cr3_pa, kva, _) = setup_page_table_vmalloc_64k();
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let unmapped = kva + (1u64 << 42);
         assert_eq!(mem.translate_kva(cr3_pa, unmapped, false), None);
@@ -4202,7 +4280,8 @@ mod tests {
     #[test]
     fn iter_htab_entries_non_hash_map_returns_empty() {
         let buf = [0u8; 256];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let offsets = test_htab_map_offsets();
         let map = BpfMapInfo {
@@ -4225,7 +4304,8 @@ mod tests {
     #[test]
     fn iter_htab_entries_no_htab_offsets_returns_empty() {
         let buf = [0u8; 256];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let mut offsets = test_htab_map_offsets();
         offsets.htab_offsets = None;
@@ -4373,7 +4453,8 @@ mod tests {
     #[test]
     fn iter_htab_entries_empty_map() {
         let (buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[], 4);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert!(entries.is_empty());
@@ -4384,7 +4465,8 @@ mod tests {
         let key = 42u32.to_ne_bytes();
         let val = 0xDEAD_BEEF_CAFE_1234u64.to_ne_bytes();
         let (buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert_eq!(entries.len(), 1);
@@ -4402,7 +4484,8 @@ mod tests {
         let v3 = 300u64.to_ne_bytes();
         let (buf, page_offset, map, offsets) =
             setup_htab_direct(4, 8, &[(&k1, &v1), (&k2, &v2), (&k3, &v3)], 4);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert_eq!(entries.len(), 3);
@@ -4423,7 +4506,8 @@ mod tests {
         // Override n_buckets to 0.
         let htab = test_htab_offsets();
         buf[htab.htab_n_buckets..htab.htab_n_buckets + 4].copy_from_slice(&0u32.to_ne_bytes());
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert!(entries.is_empty());
@@ -4438,7 +4522,8 @@ mod tests {
             0xFF, 0x00,
         ];
         let (buf, page_offset, map, offsets) = setup_htab_direct(8, 16, &[(&key, &val)], 2);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert_eq!(entries.len(), 1);
@@ -4527,7 +4612,8 @@ mod tests {
             btf_value_type_id: 0,
         };
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert_eq!(entries.len(), 1);
@@ -4660,7 +4746,8 @@ mod tests {
                 .copy_from_slice(&((cpu as u64 + 1) * 0x1111).to_ne_bytes());
         }
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
             &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
@@ -4682,7 +4769,8 @@ mod tests {
     fn read_percpu_array_key_out_of_bounds() {
         let (buf, cr3_pa, page_offset, info, offsets, per_cpu_offsets) =
             setup_percpu_array(2, 1, 8);
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         // key=1 is out of bounds for max_entries=1.
@@ -4701,7 +4789,8 @@ mod tests {
         let (buf, cr3_pa, page_offset, mut info, offsets, per_cpu_offsets) =
             setup_percpu_array(2, 1, 8);
         info.map_type = BPF_MAP_TYPE_ARRAY;
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = read_percpu_array_value(
@@ -4723,7 +4812,8 @@ mod tests {
         let pptrs_pa = (0x14000 + offsets.array_value as u64) as usize;
         buf[pptrs_pa..pptrs_pa + 8].copy_from_slice(&0u64.to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
             &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
@@ -4755,7 +4845,8 @@ mod tests {
             }
         }
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         for key in 0..max_entries {
@@ -4783,7 +4874,8 @@ mod tests {
         let bad_offset = buf.len() as u64 + 0x10000;
         let per_cpu_offsets = vec![0u64, bad_offset];
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
             &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
@@ -4811,7 +4903,8 @@ mod tests {
             setup_percpu_array(0, 1, 8);
         assert!(per_cpu_offsets.is_empty());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
             &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
@@ -4843,7 +4936,8 @@ mod tests {
         let bad = buf.len() as u64 + 0x10000;
         let per_cpu_offsets = vec![0, bad, 2 * stride, bad + stride];
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
             &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
@@ -4870,7 +4964,8 @@ mod tests {
         // bpf_array KVA that cannot be translated (no page table,
         // not in direct mapping) — translate_any_kva returns None.
         let buf = vec![0u8; 0x20000];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let offsets = BpfMapOffsets {
             map_name: 32,

@@ -320,7 +320,8 @@ mod tests {
         use crate::monitor::reader::GuestMem;
         // With num_cpus=0, should return an empty vec without any reads.
         let mut buf = [0u8; 64];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let result = read_per_cpu_offsets(&mem, 0, 0);
         assert!(result.is_empty());
@@ -334,7 +335,8 @@ mod tests {
         buf[0..8].copy_from_slice(&0x1000u64.to_ne_bytes());
         buf[8..16].copy_from_slice(&0x2000u64.to_ne_bytes());
         buf[16..24].copy_from_slice(&0x3000u64.to_ne_bytes());
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let result = read_per_cpu_offsets(&mem, 0, 3);
         assert_eq!(result.len(), 3);
@@ -351,7 +353,8 @@ mod tests {
         buf[16..24].copy_from_slice(&0xAAu64.to_ne_bytes());
         buf[24..32].copy_from_slice(&0xBBu64.to_ne_bytes());
         buf[32..40].copy_from_slice(&0xCCu64.to_ne_bytes());
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let result = read_per_cpu_offsets(&mem, 16, 3);
         assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
@@ -366,7 +369,8 @@ mod tests {
         let mut buf = [0u8; 32];
         buf[1..9].copy_from_slice(&0x1122_3344_5566_7788u64.to_ne_bytes());
         buf[9..17].copy_from_slice(&0x99AA_BBCC_DDEE_FF00u64.to_ne_bytes());
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let result = read_per_cpu_offsets(&mem, 1, 2);
         assert_eq!(result.len(), 2);
@@ -383,7 +387,8 @@ mod tests {
         let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&0x1111u64.to_ne_bytes());
         buf[8..16].copy_from_slice(&0x2222u64.to_ne_bytes());
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let result = read_per_cpu_offsets(&mem, 0, 4);
         assert_eq!(result, vec![0x1111, 0x2222, 0, 0]);
@@ -434,7 +439,8 @@ mod tests {
         // Write the runtime value at PA 0x1000
         buf[0x1000..0x1008].copy_from_slice(&expected_page_offset.to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
             runqueues: 0,
@@ -455,7 +461,8 @@ mod tests {
         use crate::monitor::reader::GuestMem;
 
         let buf = [0u8; 64];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let symbols = KernelSymbols {
             runqueues: 0,
@@ -478,7 +485,8 @@ mod tests {
         // page_offset_base exists but the guest hasn't written a value yet (all zeros)
         let pob_kva = START_KERNEL_MAP + 0x100;
         let buf = [0u8; 0x200];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let symbols = KernelSymbols {
             runqueues: 0,
@@ -504,7 +512,8 @@ mod tests {
         let garbage: u64 = 0x1234_5678_DEAD_BEEF;
         buf[0x1000..0x1008].copy_from_slice(&garbage.to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
             runqueues: 0,
@@ -533,7 +542,8 @@ mod tests {
         let mut buf = [0u8; 0x2000];
         buf[0x1000..0x1008].copy_from_slice(&randomized_page_offset.to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
             runqueues: 0,
@@ -558,7 +568,8 @@ mod tests {
         // Write __pgtable_l5_enabled = 1 at PA 0x1000.
         buf[0x1000..0x1004].copy_from_slice(&1u32.to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
             runqueues: 0,
@@ -583,7 +594,8 @@ mod tests {
         // Write __pgtable_l5_enabled = 0 at PA 0x1000.
         buf[0x1000..0x1004].copy_from_slice(&0u32.to_ne_bytes());
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
             runqueues: 0,
@@ -604,7 +616,8 @@ mod tests {
         use crate::monitor::reader::GuestMem;
 
         let buf = [0u8; 64];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let symbols = KernelSymbols {
             runqueues: 0,

@@ -138,18 +138,27 @@ fn load_kallsyms() -> Option<std::collections::HashMap<String, u64>> {
 
 /// Resolve a kernel function name to its address via /proc/kallsyms.
 ///
-/// The parsed `name -> address` map is cached on first call so later
-/// lookups avoid re-reading and re-splitting ~200k lines. Callers that
-/// resolve many functions in a batch (auto-probe attach, probe-stack
-/// load) dropped from O(N\*M) line scans to O(N) hash lookups.
+/// The parsed `name -> address` map is cached on first successful load
+/// so later lookups avoid re-reading and re-splitting ~200k lines.
+/// Callers that resolve many functions in a batch (auto-probe attach,
+/// probe-stack load) drop from O(N\*M) line scans to O(N) hash lookups.
+///
+/// A failed load (unreadable `/proc/kallsyms` — typical for
+/// unprivileged processes where the file is either missing or
+/// returns zeroed addresses) is NOT cached: the next call retries.
+/// This matters when the process escalates privileges mid-run (e.g.
+/// a test harness that re-execs under `sudo` after the first miss),
+/// where a cached `None` from the pre-escalation attempt would
+/// otherwise permanently suppress post-escalation resolution.
 pub fn resolve_func_ip(name: &str) -> Option<u64> {
-    static CACHE: std::sync::OnceLock<Option<std::collections::HashMap<String, u64>>> =
-        std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(load_kallsyms)
-        .as_ref()?
-        .get(name)
-        .copied()
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Option<std::collections::HashMap<String, u64>>>> = OnceLock::new();
+    let slot = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = load_kallsyms();
+    }
+    guard.as_ref()?.get(name).copied()
 }
 
 /// Populate a `func_meta` with field specs from BTF-resolved offsets.

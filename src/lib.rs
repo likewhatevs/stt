@@ -154,21 +154,24 @@ pub mod cgroup;
 
 /// Map a raw errno value to its C constant name.
 ///
-/// Returns `None` for unrecognized values. Backed by
-/// [`nix::errno::Errno`]'s `Debug` impl so the name list stays in sync
-/// with nix's ported-constants table (covering the full Linux set,
-/// not just the hand-curated subset that used to live here).
+/// Returns `None` for unrecognized values. The match arms below carry
+/// the `&'static str` names by hand; [`nix::errno::Errno`] only
+/// validates that `errno` is a known variant (via
+/// `matches!(e, UnknownErrno)`), since `Errno` has no `#[derive(Debug)]`
+/// that yields `&'static str` cheaply at runtime — `format!("{:?}", e)`
+/// allocates a fresh `String` on every call. Adding a new errno means
+/// extending both nix's port-constants table (for the UnknownErrno
+/// gate) and this match; the test suite pins a representative subset
+/// so a stale arm surfaces at build time.
 pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
     let e = nix::errno::Errno::from_raw(errno);
     if matches!(e, nix::errno::Errno::UnknownErrno) {
         return None;
     }
-    // Errno's Debug emits the constant name (e.g. "EPERM"). The
-    // returned &'static str must match the previous hand-rolled
-    // match's output verbatim so callers that compare against string
-    // literals in error formatting still pass. Since every variant
-    // in nix::errno::Errno::Debug is printed as the capital-letter
-    // name, this mapping is exact.
+    // Hand-rolled match: returns a `&'static str` pointing at a
+    // literal, avoiding the allocation that `format!("{:?}", e)` would
+    // incur. Callers that compare these against string literals in
+    // error formatting paths rely on the stable symbolic names below.
     Some(match e {
         nix::errno::Errno::EPERM => "EPERM",
         nix::errno::Errno::ENOENT => "ENOENT",

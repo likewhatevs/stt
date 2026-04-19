@@ -106,7 +106,8 @@ mod tests {
         let shift_off = 2;
         buf[0x100 + shift_off] = 12;
 
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let node_kva = DEFAULT_PAGE_OFFSET + 0x100;
         assert_eq!(
@@ -118,7 +119,8 @@ mod tests {
     #[test]
     fn xa_node_shift_zero() {
         let mut buf = [0u8; 0x200];
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let node_kva = DEFAULT_PAGE_OFFSET;
         // shift_off=0, buf[0]=0 -> shift=0.
@@ -129,7 +131,8 @@ mod tests {
     fn xa_node_shift_max_u8() {
         let mut buf = [0u8; 0x100];
         buf[0x10] = 255;
-        // SAFETY: buf is a live Vec<u8> owned for the test's duration.
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let node_kva = DEFAULT_PAGE_OFFSET;
         assert_eq!(

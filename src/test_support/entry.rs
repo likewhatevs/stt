@@ -534,11 +534,12 @@ pub struct KtstrTestEntry {
     pub watchdog_timeout: Duration,
     /// Host-side BPF map writes to perform during VM execution.
     ///
-    /// Empty slice (the default) means "no writes." Current
-    /// implementation consumes the first entry only; the slice
-    /// shape is forward-compatible with multi-write plumbing
-    /// without breaking call sites when additional entries start
-    /// being consumed.
+    /// Empty slice (the default) means "no writes." Every entry in the
+    /// slice is applied in order during the VM's startup sequence; the
+    /// multi-write plumbing runs each entry through the same
+    /// Phase-1-fail-fast / Phase-2-abort contract the single-write
+    /// path used, so a failure mid-way aborts the remaining writes
+    /// rather than silently proceeding with partial state.
     pub bpf_map_write: &'static [&'static BpfMapWrite],
     /// Flags that must be present in every flag profile for this test.
     pub required_flags: &'static [&'static str],
