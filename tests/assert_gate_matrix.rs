@@ -5,7 +5,7 @@ use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
 use ktstr::test_support::{KtstrTestEntry, Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
     let steps = vec![Step {

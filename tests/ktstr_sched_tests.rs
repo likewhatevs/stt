@@ -6,7 +6,7 @@ use ktstr::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps}
 use ktstr::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 #[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15)]
 fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
@@ -80,7 +80,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
         scheduler: &KTSTR_SCHED,
         auto_repro: false,
         assert: ktstr::assert::Assert::NONE.fail_on_stall(false),
-        bpf_map_write: Some(&BPF_NOOP),
+        bpf_map_write: &[&BPF_NOOP],
         duration: std::time::Duration::from_secs(10),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -151,7 +151,7 @@ fn scenario_scattershot(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Ass
 }
 
 const SCATTER_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__linkme)]
@@ -191,7 +191,7 @@ fn scenario_throughput_regression(
 }
 
 const SLOW_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__linkme)]
@@ -218,7 +218,7 @@ fn scenario_auto_repro(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Asse
 }
 
 const STALL_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 #[ktstr::__linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__linkme)]

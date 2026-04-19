@@ -24,7 +24,7 @@ static MY_BORROW: FlagDecl = FlagDecl {
 };
 
 const RELAXED: Scheduler = Scheduler::new("relaxed")
-    .binary(SchedulerSpec::Name("scx_relaxed"))
+    .binary(SchedulerSpec::Discover("scx_relaxed"))
     .flags(&[&MY_LLC, &MY_BORROW])
     .assert(
         Assert::NONE

@@ -5,7 +5,7 @@ use ktstr::scenario::Ctx;
 use ktstr::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 // -- basic --
 
@@ -411,7 +411,7 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
         distances: None,
     },
     scheduler: &KTSTR_SCHED,
-    bpf_map_write: Some(&BPF_CRASH),
+    bpf_map_write: &[&BPF_CRASH],
     expect_err: true,
     ..KtstrTestEntry::DEFAULT
 };
@@ -430,7 +430,7 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
         distances: None,
     },
     scheduler: &KTSTR_SCHED,
-    bpf_map_write: Some(&BPF_CRASH),
+    bpf_map_write: &[&BPF_CRASH],
     ..KtstrTestEntry::DEFAULT
 };
 
@@ -448,7 +448,7 @@ static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
         distances: None,
     },
     scheduler: &KTSTR_SCHED,
-    bpf_map_write: Some(&BPF_CRASH),
+    bpf_map_write: &[&BPF_CRASH],
     expect_err: true,
     ..KtstrTestEntry::DEFAULT
 };
@@ -467,7 +467,7 @@ static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
         distances: None,
     },
     scheduler: &KTSTR_SCHED,
-    bpf_map_write: Some(&BPF_CRASH),
+    bpf_map_write: &[&BPF_CRASH],
     ..KtstrTestEntry::DEFAULT
 };
 

@@ -222,7 +222,9 @@ pub(crate) fn attempt_auto_repro(
 
     // Forward bpf_map_write and watchdog_timeout so the repro VM
     // reproduces the same exit as the first VM with probes attached.
-    if let Some(bpf_write) = entry.bpf_map_write {
+    // Current builder consumes a single write; take the first slice
+    // entry when present.
+    if let Some(&bpf_write) = entry.bpf_map_write.first() {
         builder =
             builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }
@@ -740,7 +742,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         settle: Duration::from_millis(500),
         work_type_override,
         assert: merged_assert,
-        wait_for_map_write: entry.bpf_map_write.is_some(),
+        wait_for_map_write: !entry.bpf_map_write.is_empty(),
     };
 
     let result = match (entry.func)(&ctx) {
@@ -1063,7 +1065,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         settle: std::time::Duration::from_millis(500),
         work_type_override,
         assert: merged_assert,
-        wait_for_map_write: entry.bpf_map_write.is_some(),
+        wait_for_map_write: !entry.bpf_map_write.is_empty(),
     };
 
     let result = match (entry.func)(&ctx) {

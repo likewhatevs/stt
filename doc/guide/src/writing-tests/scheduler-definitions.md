@@ -51,10 +51,10 @@ How to find the scheduler binary:
 
 ```rust,ignore
 pub enum SchedulerSpec {
-    None,                // No binary -- use EEVDF (kernel default)
-    Name(&'static str),  // Auto-discover by name
-    Path(&'static str),  // Explicit path
-    KernelBuiltin {      // Kernel-built scheduler (no binary)
+    Eevdf,                   // No sched_ext binary -- use kernel EEVDF
+    Discover(&'static str),  // Auto-discover by name
+    Path(&'static str),      // Explicit path
+    KernelBuiltin {          // Kernel-built scheduler (no binary)
         enable: &'static [&'static str],
         disable: &'static [&'static str],
     },
@@ -67,14 +67,14 @@ run in the guest to activate the scheduler; `disable` commands run
 to deactivate it. No binary is injected into the VM.
 
 `SchedulerSpec::has_active_scheduling()` returns `true` for all
-variants except `None`. When `true`, the framework runs monitor
+variants except `Eevdf`. When `true`, the framework runs monitor
 threshold evaluation after the scenario and enables auto-repro on
 crash.
 
 ## Built-in: EEVDF
 
 `Scheduler::EEVDF` runs tests without a sched_ext scheduler, using the
-kernel's default EEVDF scheduler. Its binary is `SchedulerSpec::None`.
+kernel's default EEVDF scheduler. Its binary is `SchedulerSpec::Eevdf`.
 
 ## Defining a scheduler
 
@@ -136,7 +136,7 @@ static MY_STEAL: FlagDecl = FlagDecl {
 };
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .binary(SchedulerSpec::Discover("scx_my_sched"))
     .flags(&[&MY_LLC, &MY_STEAL])
     .topology(1, 2, 4, 1)
     .assert(Assert::NONE.max_imbalance_ratio(2.0));
@@ -163,7 +163,7 @@ Or manually:
 
 ```rust,ignore
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
-    .binary(SchedulerSpec::Name("scx_mitosis"))
+    .binary(SchedulerSpec::Discover("scx_mitosis"))
     .topology(1, 2, 4, 1)
     .cgroup_parent("/ktstr");
 ```
@@ -195,7 +195,7 @@ Or manually:
 
 ```rust,ignore
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .binary(SchedulerSpec::Discover("scx_my_sched"))
     .topology(1, 2, 4, 1)
     .config_file("configs/my_sched.toml");
 ```
@@ -220,7 +220,7 @@ Or manually:
 
 ```rust,ignore
 const MITOSIS: Scheduler = Scheduler::new("scx_mitosis")
-    .binary(SchedulerSpec::Name("scx_mitosis"))
+    .binary(SchedulerSpec::Discover("scx_mitosis"))
     .topology(1, 2, 4, 1)
     .cgroup_parent("/ktstr")
     .sched_args(&["--exit-dump-len", "1048576"]);
@@ -284,7 +284,7 @@ A scheduler that tolerates higher imbalance:
 
 ```rust,ignore
 const RELAXED: Scheduler = Scheduler::new("relaxed")
-    .binary(SchedulerSpec::Name("scx_relaxed"))
+    .binary(SchedulerSpec::Discover("scx_relaxed"))
     .assert(Assert::NONE.max_imbalance_ratio(5.0));
 ```
 

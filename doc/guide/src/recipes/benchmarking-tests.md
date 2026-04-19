@@ -30,7 +30,7 @@ Verify that a scheduler passes performance gates under
 use ktstr::prelude::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .binary(SchedulerSpec::Discover("scx_my_sched"))
     .topology(1, 1, 2, 1);
 
 #[ktstr_test(
@@ -74,7 +74,7 @@ disables auto-repro automatically.
 use ktstr::prelude::*;
 
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .binary(SchedulerSpec::Discover("scx_my_sched"))
     .topology(1, 1, 2, 1);
 
 #[ktstr_test(

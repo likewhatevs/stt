@@ -55,12 +55,12 @@ When `KTSTR_BUDGET_SECS` is not set, all tests are listed as usual.
 
 ## Custom scheduler
 
-Define a `Scheduler` with `SchedulerSpec::Name` or
+Define a `Scheduler` with `SchedulerSpec::Discover` or
 `SchedulerSpec::Path` to test a pre-built scheduler binary:
 
 ```rust,ignore
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Name("scx_my_sched"));
+    .binary(SchedulerSpec::Discover("scx_my_sched"));
 ```
 
 The binary is injected into the VM's initramfs and started before

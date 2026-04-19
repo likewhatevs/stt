@@ -354,7 +354,7 @@ fn derive_scheduler_const_name() {
 fn derive_scheduler_binary() {
     assert!(matches!(
         TEST_DERIVE.binary,
-        ktstr::test_support::SchedulerSpec::Name("scx-ktstr")
+        ktstr::test_support::SchedulerSpec::Discover("scx-ktstr")
     ));
 }
 
@@ -517,7 +517,7 @@ fn derive_empty_enum_no_flags() {
 fn derive_empty_enum_binary() {
     assert!(matches!(
         EMPTY_SCHED.binary,
-        ktstr::test_support::SchedulerSpec::Name("empty-binary")
+        ktstr::test_support::SchedulerSpec::Discover("empty-binary")
     ));
 }
 
@@ -651,7 +651,7 @@ fn derive_minimal_defaults() {
     assert!(!MINIMAL.binary.has_active_scheduling());
     assert!(matches!(
         MINIMAL.binary,
-        ktstr::test_support::SchedulerSpec::None
+        ktstr::test_support::SchedulerSpec::Eevdf
     ));
     assert_eq!(MINIMAL.topology.llcs, 1);
     assert_eq!(MINIMAL.topology.cores_per_llc, 2);

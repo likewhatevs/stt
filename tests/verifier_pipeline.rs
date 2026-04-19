@@ -115,7 +115,7 @@ static __KTSTR_ENTRY_CYCLE_COLLAPSE: KtstrTestEntry = KtstrTestEntry {
 // -- demo_verifier_fail_verify: BPF load rejection via --fail-verify --
 
 const FAIL_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Name("scx-ktstr"));
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 fn scenario_fail_verify(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {

@@ -184,7 +184,9 @@ pub(crate) fn run_ktstr_test_inner(
 
     builder = builder.watchdog_timeout(entry.watchdog_timeout);
 
-    if let Some(bpf_write) = entry.bpf_map_write {
+    // Current VM builder consumes a single write; take the first
+    // entry when the slice is non-empty.
+    if let Some(&bpf_write) = entry.bpf_map_write.first() {
         builder =
             builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }
@@ -782,12 +784,12 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
 
 /// Format a label for the scheduler spec, for use in test output.
 ///
-/// Returns an empty string for `SchedulerSpec::None` so the failure
+/// Returns an empty string for `SchedulerSpec::Eevdf` so the failure
 /// header reads `ktstr_test 'name' [topo=...]` with no sched
 /// bracket — every other variant renders `" [sched=X]"` where `X`
 /// comes from [`SchedulerSpec::display_name`].
 pub(crate) fn scheduler_label(spec: &SchedulerSpec) -> String {
-    if matches!(spec, SchedulerSpec::None) {
+    if matches!(spec, SchedulerSpec::Eevdf) {
         String::new()
     } else {
         format!(" [sched={}]", spec.display_name())
@@ -800,19 +802,19 @@ pub(crate) fn scheduler_label(spec: &SchedulerSpec) -> String {
 
 /// Resolve a scheduler binary from a `SchedulerSpec`.
 ///
-/// Returns `Ok(None)` for `SchedulerSpec::None` (EEVDF).
+/// Returns `Ok(None)` for `SchedulerSpec::Eevdf` (EEVDF).
 /// For `Name`, searches: `KTSTR_SCHEDULER` env, sibling of current_exe,
 /// `target/debug/`, `target/release/`.
 /// For `Path`, validates the file exists.
 pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
     match spec {
-        SchedulerSpec::None | SchedulerSpec::KernelBuiltin { .. } => Ok(None),
+        SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => Ok(None),
         SchedulerSpec::Path(p) => {
             let path = PathBuf::from(p);
             anyhow::ensure!(path.exists(), "scheduler not found: {p}");
             Ok(Some(path))
         }
-        SchedulerSpec::Name(name) => {
+        SchedulerSpec::Discover(name) => {
             // 1. KTSTR_SCHEDULER env var
             if let Ok(p) = std::env::var("KTSTR_SCHEDULER") {
                 let path = PathBuf::from(&p);

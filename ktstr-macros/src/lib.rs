@@ -707,8 +707,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let slow_tier_tokens = option_tokens(&max_slow_tier_ratio);
 
     let bpf_map_write_tokens = match &bpf_map_write {
-        Some(p) => quote! { Some(&#p) },
-        None => quote! { None },
+        Some(p) => quote! { &[&#p] },
+        None => quote! { &[] },
     };
 
     let test_body = if expect_err {
@@ -912,7 +912,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | Attribute | Required | Description |
 /// |---|---|---|
 /// | `name = "..."` | yes | Scheduler name passed to `Scheduler::new()` |
-/// | `binary = "..."` | no | Binary name for `SchedulerSpec::Name(...)`. Omit for EEVDF. |
+/// | `binary = "..."` | no | Binary name for `SchedulerSpec::Discover(...)`. Omit for EEVDF. |
 /// | `topology(N, L, C, T)` | no | Default VM topology `(numa_nodes, llcs, cores, threads)`. Defaults to `(1, 1, 2, 1)`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path. Must begin with `/` (e.g. `"/ktstr"`). |
 /// | `sched_args = [...]` | no | Default scheduler CLI args. |
@@ -1363,7 +1363,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     if let Some(ref binary) = sched_binary {
         builder_chain = quote! {
-            #builder_chain.binary(::ktstr::test_support::SchedulerSpec::Name(#binary))
+            #builder_chain.binary(::ktstr::test_support::SchedulerSpec::Discover(#binary))
         };
     }
 

@@ -176,7 +176,7 @@ scheduler 'scx_mitosis' not found. Set KTSTR_SCHEDULER or
 place it next to the test binary or in target/{debug,release}/
 ```
 
-When using `SchedulerSpec::Name`, ktstr searches for the scheduler
+When using `SchedulerSpec::Discover`, ktstr searches for the scheduler
 binary in:
 
 1. `KTSTR_SCHEDULER` environment variable.

@@ -468,9 +468,12 @@ impl CacheDir {
         }
         fs::create_dir_all(&tmp_dir)?;
 
-        // TmpGuard ensures the temp dir is cleaned up on any error
-        // path, including serde serialization failures.
-        let guard = TmpDirGuard(&tmp_dir);
+        // TmpGuard ensures tmp_dir is cleaned up on any error path
+        // (including serde serialization failures) and on the
+        // success path — where tmp_dir either no longer exists
+        // (plain rename moved it to final_dir) or now holds the
+        // displaced old cache content (atomic swap rotated it in).
+        let _guard = TmpDirGuard(&tmp_dir);
 
         // Copy boot image.
         let image_dest = tmp_dir.join(&metadata.image_name);
@@ -509,70 +512,47 @@ impl CacheDir {
         fs::write(tmp_dir.join("metadata.json"), meta_json)
             .map_err(|e| anyhow::anyhow!("write cache metadata: {e}"))?;
 
-        // Rename-to-staging swap. A naive "remove_dir_all(final_dir)
-        // then rename(tmp_dir, final_dir)" has a TOCTOU window: a
-        // concurrent store of the same key could re-create final_dir
-        // between the remove and the rename, and the second rename
-        // would fail with ENOTEMPTY, leaving our fresh content
-        // orphaned in tmp_dir.
+        // Atomic install. Two cases:
         //
-        // Instead, when final_dir already exists, atomically move the
-        // old content sideways into a thread-unique staging dir and
-        // then rename our fresh tmp_dir into place. Best-effort clean
-        // the staging dir afterwards via RAII.
+        // 1. final_dir does not yet exist → plain rename(tmp_dir,
+        //    final_dir). The first such rename to win races gets to
+        //    install; a concurrent store that also thought final_dir
+        //    was absent retries via the swap branch when its rename
+        //    trips ENOTEMPTY/EEXIST against the just-installed dir.
+        //
+        // 2. final_dir already exists → renameat2 with
+        //    RENAME_EXCHANGE atomically swaps tmp_dir and final_dir
+        //    in a single syscall. Readers calling lookup() at any
+        //    instant see either the old entry or the new one,
+        //    never a missing final_dir. After the swap, the old
+        //    content lives in tmp_dir and is cleaned by the guard.
+        //
+        // RENAME_EXCHANGE is Linux-specific (kernel ≥ 3.15) and
+        // requires that both paths exist at swap time. POSIX
+        // rename(old, new) on a non-empty directory returns ENOTEMPTY
+        // and would otherwise force a two-syscall dance with an
+        // observable gap where final_dir does not exist — breaking
+        // reader atomicity.
         match fs::rename(&tmp_dir, &final_dir) {
             Ok(()) => {}
             Err(e)
                 if e.raw_os_error() == Some(libc::ENOTEMPTY)
                     || e.raw_os_error() == Some(libc::EEXIST) =>
             {
-                // Thread id disambiguates same-process concurrent
-                // stores of the same key; without it, two threads
-                // would collide on the staging path.
-                let staging_dir = self.root.join(format!(
-                    ".evict-{}-{}-{:?}",
-                    cache_key,
-                    std::process::id(),
-                    std::thread::current().id(),
-                ));
-                // A stale staging dir from a crashed prior store must
-                // go before we try to rename into the slot.
-                if staging_dir.exists() {
-                    let _ = fs::remove_dir_all(&staging_dir);
-                }
-                fs::rename(&final_dir, &staging_dir)
-                    .map_err(|e2| anyhow::anyhow!("atomic rename final_dir to staging: {e2}"))?;
-                // Guard cleans up staging_dir on every exit from this
-                // block. On successful rollback below, staging_dir no
-                // longer exists and the guard's remove_dir_all is a
-                // harmless no-op. On rollback failure we disarm so the
-                // old content persists in staging rather than being
-                // deleted.
-                let stage_guard = TmpDirGuard(&staging_dir);
-                if let Err(e2) = fs::rename(&tmp_dir, &final_dir) {
-                    // Install failed. Try to restore the previous
-                    // cache content so readers don't see a missing
-                    // entry. If rollback also fails, preserve the
-                    // staging dir so the old content isn't lost.
-                    if let Err(rollback_err) = fs::rename(&staging_dir, &final_dir) {
-                        tracing::warn!(
-                            "cache rollback failed, preserving staging dir: {rollback_err}"
-                        );
-                        stage_guard.disarm();
-                    }
-                    return Err(anyhow::anyhow!(
-                        "atomic rename tmp_dir to final_dir (retry): {e2}"
-                    ));
-                }
+                atomic_swap_dirs(&tmp_dir, &final_dir)?;
+                // After the swap, tmp_dir points at the old cache
+                // entry content; drop it so the guard's
+                // remove_dir_all cleans the right tree.
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("atomic rename cache entry: {e}"));
             }
         }
 
-        // Rename succeeded — disarm the cleanup guard.
-        guard.disarm();
-
+        // Guard drops at end of scope, cleaning tmp_dir in both
+        // cases: a plain rename left it nonexistent (remove_dir_all
+        // no-ops on ENOENT); an atomic swap placed the displaced
+        // old entry there for removal.
         Ok(CacheEntry {
             key: cache_key.to_string(),
             path: final_dir,
@@ -656,23 +636,60 @@ fn validate_filename(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// RAII guard that removes a temporary directory on drop.
-///
-/// Call [`disarm`](TmpDirGuard::disarm) after a successful rename to
-/// prevent cleanup of the (now-moved) directory.
+/// RAII guard that removes a temporary directory on drop. Used by
+/// [`CacheDir::store`] to clean up both serialization-failure
+/// remnants and post-swap old cache content.
 struct TmpDirGuard<'a>(&'a Path);
-
-impl TmpDirGuard<'_> {
-    /// Prevent cleanup. Call after the tmp dir has been renamed.
-    fn disarm(self) {
-        std::mem::forget(self);
-    }
-}
 
 impl Drop for TmpDirGuard<'_> {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(self.0);
     }
+}
+
+/// Atomically swap two filesystem paths.
+///
+/// Wraps Linux `renameat2(AT_FDCWD, src, AT_FDCWD, dst,
+/// RENAME_EXCHANGE)`. Both paths must already exist. On success the
+/// inodes they name are exchanged in a single syscall — observers
+/// traversing either path see the old target or the new one, never
+/// a missing or partial entry.
+///
+/// Fails if the kernel does not support `RENAME_EXCHANGE`
+/// (pre-3.15, `ENOSYS`), if either path is missing (`ENOENT`), or
+/// if the two paths live on different filesystems (`EXDEV`). The
+/// cache keeps both tmp_dir and final_dir under the same root, so
+/// `EXDEV` would only fire on exotic bind mounts.
+fn atomic_swap_dirs(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let src_c = std::ffi::CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| anyhow::anyhow!("src path contains NUL: {e}"))?;
+    let dst_c = std::ffi::CString::new(dst.as_os_str().as_bytes())
+        .map_err(|e| anyhow::anyhow!("dst path contains NUL: {e}"))?;
+    // SAFETY: both pointers come from CString::as_ptr and outlive
+    // the syscall. AT_FDCWD interprets the paths relative to the
+    // current working directory of the calling thread, matching
+    // what fs::rename does.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src_c.as_ptr(),
+            libc::AT_FDCWD,
+            dst_c.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    Err(anyhow::anyhow!(
+        "renameat2(RENAME_EXCHANGE) {} <-> {}: {}",
+        src.display(),
+        dst.display(),
+        err,
+    ))
 }
 
 /// Read and deserialize metadata.json from a cache entry directory.
@@ -1905,52 +1922,6 @@ mod tests {
         }
     }
 
-    /// If a stale `.evict-*` dir from a crashed prior store survived
-    /// on disk, the next store of the same key must still succeed
-    /// (the fresh rename reuses the staging name).
-    #[test]
-    fn cache_dir_store_cleans_stale_evict_dir() {
-        let tmp = TempDir::new().unwrap();
-        let cache_root = tmp.path().join("cache");
-        let cache = CacheDir::with_root(cache_root.clone());
-
-        // Prime the cache so final_dir exists.
-        let src_a = TempDir::new().unwrap();
-        let image_a = create_fake_image(src_a.path());
-        cache
-            .store(
-                "repeat",
-                &CacheArtifacts::new(&image_a),
-                &test_metadata("6.14.2"),
-            )
-            .unwrap();
-
-        // Plant a stale staging dir from a simulated prior crash.
-        // Match the exact staging path the current thread would
-        // compute, since staging names are now pid+thread-scoped.
-        let stale_evict = cache_root.join(format!(
-            ".evict-repeat-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
-        fs::create_dir_all(&stale_evict).unwrap();
-        fs::write(stale_evict.join("leftover"), b"x").unwrap();
-
-        // Second store must handle the stale evict dir and succeed.
-        let src_b = TempDir::new().unwrap();
-        let image_b = create_fake_image(src_b.path());
-        fs::write(&image_b, b"fresh").unwrap();
-        let entry = cache
-            .store(
-                "repeat",
-                &CacheArtifacts::new(&image_b),
-                &test_metadata("6.14.2"),
-            )
-            .unwrap();
-        assert_eq!(fs::read(entry.path.join("bzImage")).unwrap(), b"fresh");
-        assert!(!stale_evict.exists(), "stale evict dir must be cleaned");
-    }
-
     #[test]
     fn cache_dir_store_cleans_stale_tmp() {
         let tmp = TempDir::new().unwrap();
@@ -1973,6 +1944,150 @@ mod tests {
         assert!(entry.path.join("bzImage").exists());
         // Stale tmp dir should be gone.
         assert!(!stale_tmp.exists());
+    }
+
+    /// Concurrent readers calling `lookup()` while a writer is
+    /// rapidly overwriting the same cache key must never observe a
+    /// half-installed entry. The atomic rename-to-staging swap in
+    /// `store()` should make every successful lookup return an entry
+    /// whose `image_path()` exists and whose contents match one of
+    /// the writer's complete versions — never a missing file, never a
+    /// truncated image.
+    ///
+    /// Pinning this behavior catches regressions where the swap
+    /// sequence is reordered (e.g. removing `final_dir` before
+    /// renaming the tmp dir into place) or replaced with a non-atomic
+    /// copy. Such regressions would let a reader observe a cache
+    /// entry with valid metadata but a missing `bzImage`, or a
+    /// partially-written image with bytes from two generations.
+    #[test]
+    fn cache_dir_store_atomic_under_concurrent_readers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = Arc::new(CacheDir::with_root(cache_root.clone()));
+
+        // Writer sources: two distinct full versions with
+        // recognizable, long-ish content so a torn read would be
+        // detectable by byte comparison, not just length.
+        let src_a = TempDir::new().unwrap();
+        let image_a = src_a.path().join("bzImage");
+        let content_a = b"AAAAAAAA-image-version-a-AAAAAAAA".repeat(64);
+        fs::write(&image_a, &content_a).unwrap();
+
+        let src_b = TempDir::new().unwrap();
+        let image_b = src_b.path().join("bzImage");
+        let content_b = b"BBBBBBBB-image-version-b-BBBBBBBB".repeat(64);
+        fs::write(&image_b, &content_b).unwrap();
+
+        // Prime the cache so lookup() has something to find from
+        // iteration one onwards. Without priming, early readers would
+        // legitimately see None until the writer lands the first
+        // store — and we want to assert "never missing once present,"
+        // which requires an initial present state.
+        let meta_prime = test_metadata("6.14.2");
+        cache
+            .store("atomic-key", &CacheArtifacts::new(&image_a), &meta_prime)
+            .unwrap();
+
+        const WRITE_ITERATIONS: usize = 40;
+        let stop = Arc::new(AtomicBool::new(false));
+        let lookups_observed = Arc::new(AtomicUsize::new(0));
+        let atomicity_violations = Arc::new(AtomicUsize::new(0));
+
+        // Spawn reader threads. Each reader loops until `stop` is
+        // set, calling lookup() and verifying that when Some(entry)
+        // comes back, the image file exists and matches one of the
+        // two known writer contents byte-for-byte.
+        let reader_count = 4;
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            let cache = Arc::clone(&cache);
+            let stop = Arc::clone(&stop);
+            let lookups_observed = Arc::clone(&lookups_observed);
+            let violations = Arc::clone(&atomicity_violations);
+            let expected_a = content_a.clone();
+            let expected_b = content_b.clone();
+            readers.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(entry) = cache.lookup("atomic-key") else {
+                        // Once primed, lookup must always see an
+                        // entry. A None here is a real atomicity
+                        // violation: the writer briefly removed the
+                        // final_dir without immediately replacing it.
+                        violations.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    let image_path = entry.image_path();
+                    let Ok(bytes) = fs::read(&image_path) else {
+                        // Entry directory + metadata visible, but
+                        // image file missing → non-atomic install.
+                        violations.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    if bytes != expected_a && bytes != expected_b {
+                        // Torn read: bytes don't match either
+                        // complete version. Would indicate the image
+                        // was observed mid-copy.
+                        violations.fetch_add(1, Ordering::Relaxed);
+                    }
+                    lookups_observed.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // Writer: alternate between version A and version B,
+        // exercising the rename-to-staging branch on every iteration
+        // after the first (final_dir already exists from priming).
+        for i in 0..WRITE_ITERATIONS {
+            let (image, label) = if i % 2 == 0 {
+                (&image_a, "a")
+            } else {
+                (&image_b, "b")
+            };
+            let mut meta = test_metadata("6.14.2");
+            meta.built_at = format!("2026-04-18T00:00:{:02}Z", i % 60);
+            meta.config_hash = Some(format!("iter-{i}-{label}"));
+            cache
+                .store("atomic-key", &CacheArtifacts::new(image), &meta)
+                .expect("store under concurrent readers must not fail");
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().expect("reader thread panicked");
+        }
+
+        assert_eq!(
+            atomicity_violations.load(Ordering::Relaxed),
+            0,
+            "lookup observed a missing or torn cache entry during concurrent store; \
+             rename-to-staging swap is not atomic",
+        );
+        assert!(
+            lookups_observed.load(Ordering::Relaxed) > 0,
+            "readers never observed a successful lookup — test did not \
+             actually exercise the concurrency window",
+        );
+
+        // Post-condition: final state is intact and no staging or
+        // tmp residue leaked out of the write loop.
+        let final_entry = cache.lookup("atomic-key").expect("entry must exist");
+        let final_bytes = fs::read(final_entry.image_path()).unwrap();
+        assert!(
+            final_bytes == content_a || final_bytes == content_b,
+            "final image must match one of the writer's versions",
+        );
+        for dirent in fs::read_dir(&cache_root).unwrap() {
+            let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".evict-") && !name.starts_with(".tmp-"),
+                "unexpected leftover directory under cache_root: {name}",
+            );
+        }
     }
 
     #[test]

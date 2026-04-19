@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn resolve_scheduler_none() {
-        let result = resolve_scheduler(&SchedulerSpec::None).unwrap();
+        let result = resolve_scheduler(&SchedulerSpec::Eevdf).unwrap();
         assert!(result.is_none());
     }
 
@@ -664,7 +664,7 @@ mod tests {
         let prev = std::env::var(key).ok();
         // SAFETY: test-only, single-threaded env mutation with save/restore.
         unsafe { std::env::remove_var(key) };
-        let result = resolve_scheduler(&SchedulerSpec::Name("__nonexistent_scheduler_xyz__"));
+        let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_xyz__"));
         match prev {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },
@@ -680,7 +680,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         // SAFETY: test-only, single-threaded env mutation with save/restore.
         unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
-        let result = resolve_scheduler(&SchedulerSpec::Name("anything"));
+        let result = resolve_scheduler(&SchedulerSpec::Discover("anything"));
         match prev {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },
@@ -693,13 +693,13 @@ mod tests {
 
     #[test]
     fn scheduler_label_none_empty() {
-        assert_eq!(scheduler_label(&SchedulerSpec::None), "");
+        assert_eq!(scheduler_label(&SchedulerSpec::Eevdf), "");
     }
 
     #[test]
     fn scheduler_label_name() {
         assert_eq!(
-            scheduler_label(&SchedulerSpec::Name("scx_mitosis")),
+            scheduler_label(&SchedulerSpec::Discover("scx_mitosis")),
             " [sched=scx_mitosis]"
         );
     }
@@ -1079,7 +1079,7 @@ mod tests {
         static TEST_SYSCTLS: &[Sysctl] =
             &[Sysctl::new("kernel.sched_cfs_bandwidth_slice_us", "1000")];
         let s = Scheduler::new("test_sched")
-            .binary(SchedulerSpec::Name("test_bin"))
+            .binary(SchedulerSpec::Discover("test_bin"))
             .flags(FLAGS_A)
             .sysctls(TEST_SYSCTLS)
             .kargs(&["nosmt"]);
@@ -1516,6 +1516,64 @@ mod tests {
     }
 
     #[test]
+    fn collect_sidecars_does_not_recurse_past_one_level() {
+        // Companion to `collect_sidecars_recurses_one_level`: pin the
+        // "exactly one level, no deeper" contract. A sidecar two
+        // directories deep must be ignored. If a future change
+        // switches collect_sidecars to a depth-unbounded walk, this
+        // test catches the schema-scope regression before stats
+        // tooling starts double-counting results from unrelated
+        // sub-runs under the same `runs_root`.
+        let tmp = std::env::temp_dir().join("ktstr-sidecars-depth-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let top_sub = tmp.join("job-0");
+        let deep_sub = top_sub.join("replay-0");
+        std::fs::create_dir_all(&deep_sub).unwrap();
+
+        let sc = |name: &str| SidecarResult {
+            test_name: name.to_string(),
+            topology: "1s1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            passed: true,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        // One level: should be collected.
+        std::fs::write(
+            top_sub.join("top_level.ktstr.json"),
+            serde_json::to_string(&sc("top_level")).unwrap(),
+        )
+        .unwrap();
+        // Two levels: must NOT be collected.
+        std::fs::write(
+            deep_sub.join("deep_level.ktstr.json"),
+            serde_json::to_string(&sc("deep_level")).unwrap(),
+        )
+        .unwrap();
+
+        let results = collect_sidecars(&tmp);
+        let names: Vec<&str> = results.iter().map(|r| r.test_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["top_level"],
+            "collect_sidecars must see only the one-level-deep sidecar, not the two-level one"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn collect_sidecars_skips_invalid_json() {
         let tmp = std::env::temp_dir().join("ktstr-sidecars-invalid-test");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1899,7 +1957,7 @@ mod tests {
 
     static SCHED_TEST: Scheduler = Scheduler {
         name: "test_sched",
-        binary: SchedulerSpec::Name("test_sched_bin"),
+        binary: SchedulerSpec::Discover("test_sched_bin"),
         flags: &[],
         sysctls: &[],
         kargs: &[],

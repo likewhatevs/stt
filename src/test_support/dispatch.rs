@@ -159,7 +159,7 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     if entry.host_only {
         return run_host_only_test_inner(entry);
     }
-    if entry.bpf_map_write.is_some()
+    if !entry.bpf_map_write.is_empty()
         && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {
@@ -328,7 +328,7 @@ fn list_tests_all(ignored_only: bool) {
         // bpf_map_write tests require vmlinux to resolve BPF map
         // addresses. Don't list them when vmlinux is unavailable —
         // they cannot run and would produce false PASS results.
-        if entry.bpf_map_write.is_some() && !has_vmlinux {
+        if !entry.bpf_map_write.is_empty() && !has_vmlinux {
             continue;
         }
 
@@ -381,7 +381,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     for entry in KTSTR_TESTS.iter() {
         validate_entry_flags(entry);
 
-        if entry.bpf_map_write.is_some() && !has_vmlinux {
+        if !entry.bpf_map_write.is_empty() && !has_vmlinux {
             continue;
         }
 
@@ -486,7 +486,7 @@ fn run_named_test(test_name: &str) -> i32 {
         return 0;
     }
 
-    if entry.bpf_map_write.is_some()
+    if !entry.bpf_map_write.is_empty()
         && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {
@@ -591,7 +591,7 @@ fn run_gauntlet_test(rest: &str) -> i32 {
         return 0;
     }
 
-    if entry.bpf_map_write.is_some()
+    if !entry.bpf_map_write.is_empty()
         && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
     {

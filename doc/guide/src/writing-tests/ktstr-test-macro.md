@@ -20,7 +20,7 @@ can be omitted:
 
 ```rust,ignore
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Name("scx_my_sched"))
+    .binary(SchedulerSpec::Discover("scx_my_sched"))
     //            numa, llcs, cores/llc, threads/core
     .topology(1, 2, 4, 1);
 
@@ -158,12 +158,11 @@ example.
 | Attribute | Default | Description |
 |---|---|---|
 | `auto_repro` | `true` | On scheduler crash, boot a second VM with probes attached. Set to `false` for fast iteration. |
-| `replicas` | 1 | Number of times to run |
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
 | `duration_s` | 2 | Per-scenario duration in seconds |
 | `workers_per_cgroup` | 2 | Workers per cgroup |
 | `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
-| `bpf_map_write = CONST` | `None` | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads |
+| `bpf_map_write = CONST` | empty | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads. The entry field is a slice; the macro wraps the single path in a one-element slice. |
 | `host_only` | `false` | Run the test function directly on the host instead of inside a VM. Use for tests that need host tools (e.g. cargo, nested VMs) unavailable in the guest initramfs. |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
