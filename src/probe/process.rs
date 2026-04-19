@@ -151,14 +151,26 @@ fn load_kallsyms() -> Option<std::collections::HashMap<String, u64>> {
 /// where a cached `None` from the pre-escalation attempt would
 /// otherwise permanently suppress post-escalation resolution.
 pub fn resolve_func_ip(name: &str) -> Option<u64> {
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<Option<std::collections::HashMap<String, u64>>>> = OnceLock::new();
-    let slot = CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = load_kallsyms();
+    use std::sync::{OnceLock, RwLock};
+    static CACHE: OnceLock<RwLock<Option<std::collections::HashMap<String, u64>>>> =
+        OnceLock::new();
+    let slot = CACHE.get_or_init(|| RwLock::new(None));
+    // Fast path: take the read lock when the cache is populated.
+    // Post-load the lookup is read-only and batches resolving many
+    // symbols contend only on the shared read lock.
+    {
+        let read = slot.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = read.as_ref() {
+            return map.get(name).copied();
+        }
     }
-    guard.as_ref()?.get(name).copied()
+    // Slow path: escalate to write lock to populate. Re-check under
+    // the write lock in case a racing thread filled it first.
+    let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
+    if write.is_none() {
+        *write = load_kallsyms();
+    }
+    write.as_ref()?.get(name).copied()
 }
 
 /// Populate a `func_meta` with field specs from BTF-resolved offsets.

@@ -78,6 +78,19 @@ impl GuestMem {
     /// `read_u64` / `read_slice` would miscompute or SIGSEGV. Every
     /// internal caller (including tests) constructs `base` from a
     /// live allocation whose lifetime is proven at the call site.
+    ///
+    /// # Memory ordering
+    ///
+    /// Reads go through `std::ptr::read_volatile` (see
+    /// `read_volatile_bytes`), which
+    /// disables compiler reordering and caching of the load but
+    /// provides no hardware fence. Consequently, `GuestMem` offers
+    /// no happens-before relationship with guest-side writes: a
+    /// reader may observe torn writes, stale values, or partial
+    /// updates from a concurrent guest mutator. Callers that
+    /// require atomic snapshot semantics (e.g. double-check a
+    /// CRC or re-read to confirm a stable value) must layer that
+    /// logic themselves.
     pub unsafe fn new(base: *mut u8, size: u64) -> Self {
         Self {
             base,

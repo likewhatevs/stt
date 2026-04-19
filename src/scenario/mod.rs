@@ -393,9 +393,8 @@ pub type CustomFn = std::sync::Arc<dyn Fn(&Ctx) -> Result<AssertResult> + Send +
 /// What happens during a scenario's workload phase.
 ///
 /// `Steady` runs workers for the configured duration with no dynamic
-/// operations. `Custom` wraps an arbitrary [`CustomFn`] that receives
-/// the [`Ctx`] — typically built from a `fn`-pointer-shaped free
-/// function or a closure that captures setup state.
+/// operations. `Custom` wraps a caller-supplied closure (see
+/// [`Action::custom`] for an example with captured state).
 #[derive(Clone)]
 pub enum Action {
     /// Run workers for the configured duration with no dynamic operations.
@@ -408,6 +407,25 @@ impl Action {
     /// Build a [`Custom`](Self::Custom) from any closure. Wraps the
     /// body in the shared [`CustomFn`] `Arc` so callers avoid spelling
     /// out `Arc::new(...)` at every catalog entry.
+    ///
+    /// The closure may capture state. Captured values must be
+    /// `Send + Sync + 'static` so the closure can be shared across
+    /// threads. The resulting [`Action`] is cheaply [`Clone`] via
+    /// `Arc` reference counting.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::atomic::{AtomicU32, Ordering};
+    /// use std::sync::Arc;
+    ///
+    /// // Capture a shared counter that the scenario increments per run.
+    /// let counter = Arc::new(AtomicU32::new(0));
+    /// let counter_ref = counter.clone();
+    /// let action = Action::custom(move |_ctx| {
+    ///     counter_ref.fetch_add(1, Ordering::Relaxed);
+    ///     Ok(AssertResult::pass())
+    /// });
+    /// ```
     pub fn custom<F>(f: F) -> Self
     where
         F: Fn(&Ctx) -> Result<AssertResult> + Send + Sync + 'static,
@@ -633,7 +651,8 @@ impl std::fmt::Debug for Ctx<'_> {
 /// fields (borrowed `cgroups`/`topo`) in their types.
 ///
 /// Defaults:
-/// - `duration`: 1 s — matches `scenario::basic`/`stress` test helpers
+/// - `duration`: 1 s — matches the `scenario::basic` test helper
+///   (`scenario::stress` uses 2 s and sets it explicitly)
 /// - `workers_per_cgroup`: 1
 /// - `sched_pid`: 0 — matches `Ctx` consumers that treat 0 as
 ///   "no scheduler attached"; [`run_scenario`] uses this to short-circuit

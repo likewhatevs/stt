@@ -110,7 +110,17 @@ impl TopoOverride {
 /// `t` = threads per core. Returns `(numa_nodes, llcs, cores, threads)`
 /// or `None` on parse failure — nonzero fields, canonical axis order,
 /// and no trailing characters after the `t` terminator.
+///
+/// The legacy `NsNcNt` and `NsNlNcNt` forms (pre-1.0, `s` axis
+/// letter) are flagged with a [`tracing::warn!`] before returning
+/// `None`, so stale cached args surface instead of silently failing.
 pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32, u32)> {
+    if s.contains('s') && !s.contains('n') {
+        tracing::warn!(
+            topo = s,
+            "legacy NsNcNt / NsNlNcNt topology form detected; use NnNlNcNt (e.g. 1n2l4c2t)"
+        );
+    }
     let n_pos = s.find('n')?;
     let l_pos = s.find('l')?;
     let c_pos = s.find('c')?;

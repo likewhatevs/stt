@@ -46,14 +46,16 @@ const DISCOVER_SENTINEL: &str = "__discover__";
 /// Propagate `RUST_BACKTRACE` and `RUST_LOG` from the guest kernel
 /// cmdline into the process environment.
 ///
-/// Must be called while the process is single-threaded — i.e. before
-/// any probe thread is spawned (`start_probe_phase_a`) and before any
-/// test thread runs. `std::env::set_var` is not thread-safe on Linux
-/// because glibc mutates the global `__environ` array without locks;
-/// a concurrent reader (or another `set_var`) produces UB. Callers on
-/// the VM-boot path must invoke this from `ktstr_guest_init` after
-/// `/args` is read and before `start_probe_phase_a` spawns the probe
-/// thread.
+/// # Warning
+///
+/// **This function performs `std::env::set_var`, which is unsound on
+/// Linux unless the process is provably single-threaded.** glibc
+/// mutates the global `__environ` array without locks, so a
+/// concurrent reader or another `set_var` produces UB. Callers must
+/// invoke this from the VM-boot path (`ktstr_guest_init`) after
+/// `/args` is read and before any probe / workload / test thread is
+/// spawned. External consumers outside that boot path have no sound
+/// use for this entry point; the `ktstr` binary calls it internally.
 pub fn propagate_rust_env_from_cmdline() {
     let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
         return;

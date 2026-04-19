@@ -919,10 +919,14 @@ pub struct WorkerReport {
     pub max_gap_cpu: usize,
     /// When the longest gap happened (ms from start).
     pub max_gap_at_ms: u64,
-    /// Per-wakeup latency samples (ns). Populated for blocking work types
-    /// (Bursty, PipeIo, FutexPingPong, FutexFanOut, SchBench, CacheYield,
-    /// CachePipe, IoSync, NiceSweep, AffinityChurn, MutexContention,
-    /// Sequence with Sleep/Yield/Io phases).
+    /// Per-wakeup latency samples (ns). Measures the interval between
+    /// the call that blocks (any blocking primitive — pipe `read`,
+    /// futex wait, `poll`, `sched_yield`, `nanosleep`, etc.) and the
+    /// wakeup that resumes execution; not a yield-specific measure.
+    /// Populated for blocking work types: Bursty, PipeIo, FutexPingPong,
+    /// FutexFanOut, SchBench, CacheYield, CachePipe, IoSync, NiceSweep,
+    /// AffinityChurn, MutexContention, Sequence with Sleep/Yield/Io
+    /// phases.
     pub resume_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
     pub iterations: u64,
@@ -3199,12 +3203,21 @@ mod tests {
 
     /// EMFILE on the inter-worker pipe loop: with num_workers=4 and
     /// PipeIo (which needs 2 pipe pairs = 4 pipe() calls = 8 fds),
-    /// cap RLIMIT_NOFILE at baseline+4 so the first pair allocates
+    /// cap RLIMIT_NOFILE at baseline+5 so the first pair allocates
     /// cleanly (ab+ba = 4 fds) and the second pair's first `pipe(ab)`
     /// call fails with EMFILE (needs 2 fds, only 1 slot remains).
     /// At bail time `guard.pipe_pairs` holds the first pair;
     /// SpawnGuard::Drop must close all 4 fds so the child's fd
     /// count returns to baseline.
+    ///
+    /// Assumes a dense fd table (no gaps below the current baseline).
+    /// If the child inherits a sparse table (e.g. a coordinator that
+    /// closed fd 2 but left fd 3 open), RLIMIT_NOFILE gating yields
+    /// different triggering semantics and the test may report 10
+    /// (failure did not trigger) instead of 0. Also assumes
+    /// `RUST_BACKTRACE` is unset — when set, a panic inside the body
+    /// triggers backtrace capture which itself opens fds, shifting
+    /// the effective baseline mid-run.
     #[test]
     fn spawn_guard_cleans_up_on_interworker_pipe_emfile() {
         let code = run_in_forked_child(|| {
@@ -3213,9 +3226,10 @@ mod tests {
             // number + 1, not a headroom value — we need to pass a
             // value slightly above baseline so the first pipe pair
             // succeeds but the second pair's first `pipe(ab)` does
-            // not. baseline + 5 permits 4 new fds (1 pair of
-            // pipes) plus one transient fd for /proc/self/fd
-            // reads.
+            // not. baseline + 5 permits 5 new fds: 4 for the first
+            // pipe pair (ab+ba) and 1 leftover. The second pair's
+            // `pipe(ab)` needs 2 fds against that 1 slot and fails
+            // with EMFILE.
             let target = (baseline + 5) as u64;
             if !set_rlimit_nofile(target) {
                 return 13;
