@@ -74,6 +74,11 @@ indicatif = "0.18"
 # guaranteed stable across toolchain versions; siphasher::sip::SipHasher13
 # pins the algorithm so cached artifacts survive Rust updates.
 siphasher = "1"
+# SIMD-accelerated byte-pattern search for IKCONFIG extraction from
+# stripped vmlinux images (tens of MB each). `windows().position()`
+# with an 8-byte needle is O(n) in naive byte compares; memmem uses
+# a two-way algorithm with x86_64 AVX2 / aarch64 Neon when available.
+memchr = "2"
 
 [profile.release]
 lto = "thin"

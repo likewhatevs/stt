@@ -912,26 +912,20 @@ pub struct WorkerReport {
     /// (Bursty, PipeIo, FutexPingPong, FutexFanOut, SchBench, CacheYield,
     /// CachePipe, IoSync, NiceSweep, AffinityChurn, MutexContention,
     /// Sequence with Sleep/Yield/Io phases).
-    #[serde(default)]
     pub wake_latencies_ns: Vec<u64>,
     /// Outer-loop iteration count.
-    #[serde(default)]
     pub iterations: u64,
     /// Delta of /proc/self/schedstat field 2 (run_delay) over the work loop.
-    #[serde(default)]
     pub schedstat_run_delay_ns: u64,
     /// Delta of /proc/self/schedstat field 3 (timeslices/context switches).
-    #[serde(default)]
     pub schedstat_ctx_switches: u64,
     /// Delta of /proc/self/schedstat field 1 (cpu_time) over the work loop.
-    #[serde(default)]
     pub schedstat_cpu_time_ns: u64,
     /// Per-NUMA-node page counts from `/proc/self/numa_maps` after workload.
     /// Keyed by node ID. Empty when numa_maps is unavailable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub numa_pages: BTreeMap<usize, u64>,
     /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop.
-    #[serde(default)]
     pub vmstat_numa_pages_migrated: u64,
 }
 

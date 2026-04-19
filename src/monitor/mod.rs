@@ -132,9 +132,12 @@ pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
 /// the gzip data, and parses CONFIG_HZ from the result.
 fn read_hz_from_ikconfig(vmlinux_path: &std::path::Path) -> Option<u64> {
     let data = std::fs::read(vmlinux_path).ok()?;
-    let pos = data
-        .windows(IKCONFIG_MAGIC.len())
-        .position(|w| w == IKCONFIG_MAGIC)?;
+    // vmlinux images are tens of MB; the old
+    // `windows(8).position(|w| w == IKCFG_ST)` was a naive O(n)
+    // byte-wise scan. memchr's two-way matcher uses the available
+    // SIMD path (x86_64 AVX2 / aarch64 Neon) and cuts scan time by
+    // a constant factor on every host we care about.
+    let pos = memchr::memmem::find(&data, IKCONFIG_MAGIC)?;
     let gz_start = pos + IKCONFIG_MAGIC.len();
     if gz_start >= data.len() {
         return None;

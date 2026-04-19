@@ -78,6 +78,11 @@ pub struct SidecarResult {
     /// scheduler (when one was loaded). Absent when no scheduler
     /// programs were inspected; empty vec distinguishes "inspected,
     /// none matched" from absence.
+    ///
+    /// `default` pairs with `skip_serializing_if` so a sidecar that
+    /// never collected verifier stats (empty vec → omitted from
+    /// JSON) round-trips cleanly. This is NOT a backward-compat shim
+    /// for missing fields in older sidecars.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verifier_stats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
     /// Aggregate per-vCPU KVM stats read after VM exit. `None` when

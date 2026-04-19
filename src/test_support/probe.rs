@@ -1120,32 +1120,25 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
 pub(crate) struct ProbePayload {
     pub events: Vec<crate::probe::process::ProbeEvent>,
     pub func_names: Vec<(u32, String)>,
-    #[serde(default)]
     pub bpf_source_locs: std::collections::HashMap<String, String>,
-    #[serde(default)]
     pub diagnostics: Option<ProbePayloadDiagnostics>,
     /// Guest VM CPU count for cpumask masking. Populated by
     /// `emit_probe_payload` which runs inside the guest where
     /// sysfs reports the correct value.
-    #[serde(default)]
     pub nr_cpus: Option<u32>,
     /// BTF-resolved parameter labels per function: func_name ->
     /// vec of (param_name, type_label). Used by the formatter to
     /// print named args instead of arg0/arg1.
-    #[serde(default)]
     pub param_names: std::collections::HashMap<String, Vec<(String, String)>>,
     /// BTF-derived render hints for auto-discovered fields.
     /// Maps field key (e.g. `"ctx:task_ctx.data__sz"`) to display format.
-    #[serde(default)]
     pub render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
 }
 
 /// Combined diagnostics for the probe payload.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProbePayloadDiagnostics {
-    #[serde(default)]
     pub pipeline: PipelineDiagnostics,
-    #[serde(default)]
     pub skeleton: crate::probe::process::ProbeDiagnostics,
 }
 
