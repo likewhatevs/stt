@@ -110,3 +110,132 @@ pub(crate) fn resolve_cgroup_root(args: &[String]) -> String {
     }
     "/sys/fs/cgroup/ktstr".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- extract_test_fn_arg --
+
+    #[test]
+    fn extract_test_fn_arg_equals() {
+        let args = vec![
+            "ktstr".into(),
+            "run".into(),
+            "--ktstr-test-fn=my_test".into(),
+        ];
+        assert_eq!(extract_test_fn_arg(&args), Some("my_test"));
+    }
+
+    #[test]
+    fn extract_test_fn_arg_space() {
+        let args = vec![
+            "ktstr".into(),
+            "run".into(),
+            "--ktstr-test-fn".into(),
+            "my_test".into(),
+        ];
+        assert_eq!(extract_test_fn_arg(&args), Some("my_test"));
+    }
+
+    #[test]
+    fn extract_test_fn_arg_missing() {
+        let args = vec!["ktstr".into(), "run".into()];
+        assert!(extract_test_fn_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_test_fn_arg_trailing() {
+        let args = vec!["ktstr".into(), "run".into(), "--ktstr-test-fn".into()];
+        assert!(extract_test_fn_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_test_fn_arg_empty_value() {
+        let args = vec!["ktstr".into(), "run".into(), "--ktstr-test-fn=".into()];
+        assert_eq!(extract_test_fn_arg(&args), Some(""));
+    }
+
+    #[test]
+    fn extract_test_fn_arg_space_form_empty_args() {
+        let args: Vec<String> = vec![];
+        assert!(extract_test_fn_arg(&args).is_none());
+    }
+
+    // -- extract_probe_stack_arg --
+
+    #[test]
+    fn extract_probe_stack_arg_equals() {
+        let args = vec![
+            "ktstr".into(),
+            "run".into(),
+            "--ktstr-probe-stack=func_a,func_b".into(),
+        ];
+        assert_eq!(
+            extract_probe_stack_arg(&args),
+            Some("func_a,func_b".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_probe_stack_arg_missing() {
+        let args = vec!["ktstr".into(), "run".into()];
+        assert!(extract_probe_stack_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_probe_stack_arg_empty_value() {
+        let args = vec!["ktstr".into(), "--ktstr-probe-stack=".into()];
+        assert!(extract_probe_stack_arg(&args).is_none());
+    }
+
+    // -- extract_topo_arg --
+
+    #[test]
+    fn extract_topo_arg_equals() {
+        let args = vec!["bin".into(), "--ktstr-topo=2s4c2t".into()];
+        assert_eq!(extract_topo_arg(&args), Some("2s4c2t".to_string()));
+    }
+
+    #[test]
+    fn extract_topo_arg_missing() {
+        let args = vec!["bin".into(), "--ktstr-test-fn=test".into()];
+        assert!(extract_topo_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_topo_arg_empty_value() {
+        let args = vec!["bin".into(), "--ktstr-topo=".into()];
+        assert!(extract_topo_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_topo_arg_with_other_args() {
+        let args = vec![
+            "bin".into(),
+            "--ktstr-test-fn=my_test".into(),
+            "--ktstr-topo=1s2c1t".into(),
+        ];
+        assert_eq!(extract_topo_arg(&args), Some("1s2c1t".to_string()));
+    }
+
+    // -- extract_work_type_arg --
+
+    #[test]
+    fn extract_work_type_arg_equals() {
+        let args = vec!["ktstr".into(), "--ktstr-work-type=CpuSpin".into()];
+        assert_eq!(extract_work_type_arg(&args), Some("CpuSpin".to_string()));
+    }
+
+    #[test]
+    fn extract_work_type_arg_missing() {
+        let args = vec!["ktstr".into(), "run".into()];
+        assert!(extract_work_type_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_work_type_arg_empty_value() {
+        let args = vec!["ktstr".into(), "--ktstr-work-type=".into()];
+        assert!(extract_work_type_arg(&args).is_none());
+    }
+}

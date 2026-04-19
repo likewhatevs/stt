@@ -79,3 +79,79 @@ pub(crate) fn generate_run_id() -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}-{n}", crate::GIT_HASH)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- days_to_ymd / is_leap --
+
+    #[test]
+    fn days_to_ymd_epoch() {
+        let (y, m, d) = days_to_ymd(0);
+        assert_eq!((y, m, d), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_known_date() {
+        let (y, m, d) = days_to_ymd(18628);
+        assert_eq!((y, m, d), (2021, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_leap_day() {
+        let (y, m, d) = days_to_ymd(11016);
+        assert_eq!((y, m, d), (2000, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_2024_jan_1() {
+        // 2024-01-01 = 19723 days since epoch.
+        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_2024_leap_day() {
+        // 2024-02-29 = 19723 + 31 + 28 = 19782.
+        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_2023_end_of_year() {
+        // 2023-12-31 = 19722.
+        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
+    }
+
+    #[test]
+    fn is_leap_years() {
+        assert!(is_leap(2000));
+        assert!(is_leap(2024));
+        assert!(!is_leap(1900));
+        assert!(!is_leap(2023));
+    }
+
+    // -- now_iso8601 --
+
+    #[test]
+    fn now_iso8601_format() {
+        let ts = now_iso8601();
+        assert!(ts.ends_with('Z'));
+        assert!(ts.contains('T'));
+        assert_eq!(ts.len(), 20);
+    }
+
+    // -- generate_run_id --
+
+    #[test]
+    fn generate_run_id_contains_hash() {
+        let id = generate_run_id();
+        assert!(id.contains(crate::GIT_HASH));
+    }
+
+    #[test]
+    fn generate_run_id_monotonic() {
+        let id1 = generate_run_id();
+        let id2 = generate_run_id();
+        assert_ne!(id1, id2);
+    }
+}

@@ -193,3 +193,222 @@ pub(crate) fn target_dir() -> PathBuf {
     p.push("llvm-cov-target");
     p
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_helpers::ENV_LOCK;
+    use super::*;
+    use crate::vmm::shm_ring::parse_shm_params_from_str;
+
+    // -- parse_shm_params (/proc/cmdline) --
+
+    #[test]
+    fn parse_shm_params_absent() {
+        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        if cmdline.contains("KTSTR_SHM_BASE") {
+            skip!(
+                "host /proc/cmdline has KTSTR_SHM_BASE (self-hosted guest?); \
+                 the pure-string branch of parse_shm_params is covered by \
+                 parse_shm_params_from_str_*"
+            );
+        }
+        let result = parse_shm_params();
+        assert!(
+            result.is_none(),
+            "host without KTSTR_SHM_BASE in /proc/cmdline must yield None"
+        );
+    }
+
+    // -- parse_shm_params_from_str --
+
+    #[test]
+    fn parse_shm_params_from_str_lowercase_hex() {
+        let cmdline = "console=ttyS0 KTSTR_SHM_BASE=0xfc000000 KTSTR_SHM_SIZE=0x400000 quiet";
+        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
+        assert_eq!(base, 0xfc000000);
+        assert_eq!(size, 0x400000);
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_uppercase_hex() {
+        let cmdline = "KTSTR_SHM_BASE=0XFC000000 KTSTR_SHM_SIZE=0X400000";
+        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
+        assert_eq!(base, 0xFC000000);
+        assert_eq!(size, 0x400000);
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_no_prefix() {
+        let cmdline = "KTSTR_SHM_BASE=fc000000 KTSTR_SHM_SIZE=400000";
+        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
+        assert_eq!(base, 0xfc000000);
+        assert_eq!(size, 0x400000);
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_missing_base() {
+        let cmdline = "console=ttyS0 KTSTR_SHM_SIZE=0x400000";
+        assert!(parse_shm_params_from_str(cmdline).is_none());
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_missing_size() {
+        let cmdline = "KTSTR_SHM_BASE=0xfc000000 quiet";
+        assert!(parse_shm_params_from_str(cmdline).is_none());
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_missing_both() {
+        let cmdline = "console=ttyS0 quiet";
+        assert!(parse_shm_params_from_str(cmdline).is_none());
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_empty() {
+        assert!(parse_shm_params_from_str("").is_none());
+    }
+
+    #[test]
+    fn parse_shm_params_from_str_invalid_hex() {
+        let cmdline = "KTSTR_SHM_BASE=0xZZZZ KTSTR_SHM_SIZE=0x400000";
+        assert!(parse_shm_params_from_str(cmdline).is_none());
+    }
+
+    // -- target_dir --
+
+    #[test]
+    fn target_dir_with_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "LLVM_COV_TARGET_DIR";
+        let prev = std::env::var(key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, "/tmp/my-cov-dir") };
+        let dir = target_dir();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert_eq!(dir, PathBuf::from("/tmp/my-cov-dir"));
+    }
+
+    #[test]
+    fn target_dir_from_llvm_profile_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key_cov = "LLVM_COV_TARGET_DIR";
+        let key_prof = "LLVM_PROFILE_FILE";
+        let prev_cov = std::env::var(key_cov).ok();
+        let prev_prof = std::env::var(key_prof).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe {
+            std::env::remove_var(key_cov);
+            std::env::set_var(key_prof, "/tmp/cov-target/ktstr-%p-%m.profraw");
+        }
+        let dir = target_dir();
+        unsafe {
+            match prev_cov {
+                Some(v) => std::env::set_var(key_cov, v),
+                None => std::env::remove_var(key_cov),
+            }
+            match prev_prof {
+                Some(v) => std::env::set_var(key_prof, v),
+                None => std::env::remove_var(key_prof),
+            }
+        }
+        assert_eq!(dir, PathBuf::from("/tmp/cov-target"));
+    }
+
+    #[test]
+    fn target_dir_without_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key_cov = "LLVM_COV_TARGET_DIR";
+        let key_prof = "LLVM_PROFILE_FILE";
+        let prev_cov = std::env::var(key_cov).ok();
+        let prev_prof = std::env::var(key_prof).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe {
+            std::env::remove_var(key_cov);
+            std::env::remove_var(key_prof);
+        }
+        let dir = target_dir();
+        unsafe {
+            match prev_cov {
+                Some(v) => std::env::set_var(key_cov, v),
+                None => std::env::remove_var(key_cov),
+            }
+            match prev_prof {
+                Some(v) => std::env::set_var(key_prof, v),
+                None => std::env::remove_var(key_prof),
+            }
+        }
+        // Falls back to current_exe parent + "llvm-cov-target".
+        assert!(
+            dir.ends_with("llvm-cov-target"),
+            "expected path ending in llvm-cov-target, got: {}",
+            dir.display()
+        );
+    }
+
+    // -- MSG_TYPE_PROFRAW encoding --
+
+    #[test]
+    fn msg_type_profraw_ascii() {
+        let bytes = MSG_TYPE_PROFRAW.to_be_bytes();
+        assert_eq!(&bytes, b"PRAW");
+    }
+
+    // -- shm_write full-ring semantics (uses MSG_TYPE_PROFRAW) --
+
+    #[test]
+    fn shm_write_returns_zero_on_full_ring() {
+        use crate::vmm::shm_ring::{HEADER_SIZE, MSG_HEADER_SIZE, shm_init, shm_write};
+
+        // Small ring: header + 32 bytes data.
+        let shm_size = HEADER_SIZE + 32;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+
+        // Fill the ring: 16-byte header + 16-byte payload = 32 bytes.
+        let payload = vec![0xAA; 16];
+        let written = shm_write(&mut buf, 0, MSG_TYPE_PROFRAW, &payload);
+        assert_eq!(written, MSG_HEADER_SIZE + 16);
+
+        // Ring is full — next write returns 0.
+        let written = shm_write(&mut buf, 0, MSG_TYPE_PROFRAW, b"overflow");
+        assert_eq!(written, 0);
+    }
+
+    // -- find_symbol_vaddrs --
+
+    #[test]
+    fn find_symbol_vaddrs_resolves_known_symbol() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        // "main" is present in the symtab of any Rust test binary.
+        let results = find_symbol_vaddrs(&data, &["main"]);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_some(),
+            "main symbol should be resolved in test binary"
+        );
+        assert_ne!(results[0].unwrap(), 0, "main address should be nonzero");
+    }
+
+    #[test]
+    fn find_symbol_vaddrs_missing_symbol_returns_none() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let results = find_symbol_vaddrs(&data, &["__nonexistent_symbol_xyz__"]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_none());
+    }
+
+    #[test]
+    fn find_symbol_vaddrs_mixed_results() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let results = find_symbol_vaddrs(&data, &["main", "__nonexistent_symbol_xyz__"]);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_some(), "main should resolve");
+        assert!(results[1].is_none(), "nonexistent should not resolve");
+    }
+}

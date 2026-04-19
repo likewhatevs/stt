@@ -56,6 +56,8 @@ mod probe;
 mod profraw;
 mod runtime;
 mod sidecar;
+#[cfg(test)]
+mod test_helpers;
 mod timefmt;
 mod topo;
 
@@ -111,18 +113,8 @@ pub(crate) use probe::{
     PipelineDiagnostics, format_probe_diagnostics, maybe_dispatch_vm_test_with_args,
     maybe_dispatch_vm_test_with_phase_a, start_probe_phase_a,
 };
-#[cfg(test)]
-pub(crate) use profraw::MSG_TYPE_PROFRAW;
 pub(crate) use profraw::try_flush_profraw;
-
-// Re-exports used only by the #[cfg(test)] module. `use super::*` in
-// the tests brings these into scope; suppress the non-test unused-
-// import warning until tests co-locate with their production modules.
-#[cfg(test)]
-pub(crate) use profraw::{find_symbol_vaddrs, parse_shm_params, target_dir};
 pub(crate) use timefmt::now_iso8601;
-#[cfg(test)]
-pub(crate) use timefmt::{days_to_ymd, generate_run_id, is_leap};
 pub(crate) use topo::{TopoOverride, parse_topo_string};
 
 // ---------------------------------------------------------------------------
@@ -272,20 +264,11 @@ pub(crate) fn require_bpf_prog_offsets(
     })
 }
 
-/// Serializes tests that mutate env vars. Shared across every `#[cfg(test)]`
-/// module in the crate: nextest runs tests in parallel within a binary, and
-/// `std::env::set_var` is process-wide, so any test that mutates an env var
-/// must hold this mutex for its full save/mutate/restore window.
-#[cfg(test)]
-pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::{ENV_LOCK, EVAL_TOPO};
     use super::*;
-    use crate::vmm::shm_ring::parse_shm_params_from_str;
     use linkme::distributed_slice;
-
-    const EVAL_TOPO: Topology = Topology::new(1, 1, 2, 1);
 
     // Register a test entry in the distributed slice for unit testing find_test.
     fn __ktstr_inner_unit_test_dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -396,39 +379,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_test_fn_arg_equals() {
-        let args = vec![
-            "ktstr".into(),
-            "run".into(),
-            "--ktstr-test-fn=my_test".into(),
-        ];
-        assert_eq!(extract_test_fn_arg(&args), Some("my_test"));
-    }
-
-    #[test]
-    fn extract_test_fn_arg_space() {
-        let args = vec![
-            "ktstr".into(),
-            "run".into(),
-            "--ktstr-test-fn".into(),
-            "my_test".into(),
-        ];
-        assert_eq!(extract_test_fn_arg(&args), Some("my_test"));
-    }
-
-    #[test]
-    fn extract_test_fn_arg_missing() {
-        let args = vec!["ktstr".into(), "run".into()];
-        assert!(extract_test_fn_arg(&args).is_none());
-    }
-
-    #[test]
-    fn extract_test_fn_arg_trailing() {
-        let args = vec!["ktstr".into(), "run".into(), "--ktstr-test-fn".into()];
-        assert!(extract_test_fn_arg(&args).is_none());
-    }
-
-    #[test]
     fn parse_assert_result_valid() {
         let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("noise\n{RESULT_START}\n{json}\n{RESULT_END}\nmore");
@@ -457,99 +407,6 @@ mod tests {
         assert_eq!(r.details, vec!["stuck 3000ms"]);
     }
 
-    #[test]
-    fn parse_shm_params_absent() {
-        // Precondition: the host's /proc/cmdline does not contain
-        // KTSTR_SHM_BASE. True for any developer machine or CI runner;
-        // could flake on a ktstr-booted guest that then runs
-        // `cargo nextest` against this crate (a self-hosting scenario).
-        // Read the file directly and skip this specific assertion when
-        // the precondition doesn't hold; the pure-string behavior is
-        // already pinned by the `parse_shm_params_from_str_*` tests.
-        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        if cmdline.contains("KTSTR_SHM_BASE") {
-            skip!(
-                "host /proc/cmdline has KTSTR_SHM_BASE (self-hosted guest?); \
-                 the pure-string branch of parse_shm_params is covered by \
-                 parse_shm_params_from_str_*"
-            );
-        }
-        let result = parse_shm_params();
-        assert!(
-            result.is_none(),
-            "host without KTSTR_SHM_BASE in /proc/cmdline must yield None"
-        );
-    }
-
-    // -- parse_shm_params_from_str tests --
-
-    #[test]
-    fn parse_shm_params_from_str_lowercase_hex() {
-        let cmdline = "console=ttyS0 KTSTR_SHM_BASE=0xfc000000 KTSTR_SHM_SIZE=0x400000 quiet";
-        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
-        assert_eq!(base, 0xfc000000);
-        assert_eq!(size, 0x400000);
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_uppercase_hex() {
-        let cmdline = "KTSTR_SHM_BASE=0XFC000000 KTSTR_SHM_SIZE=0X400000";
-        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
-        assert_eq!(base, 0xFC000000);
-        assert_eq!(size, 0x400000);
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_no_prefix() {
-        let cmdline = "KTSTR_SHM_BASE=fc000000 KTSTR_SHM_SIZE=400000";
-        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
-        assert_eq!(base, 0xfc000000);
-        assert_eq!(size, 0x400000);
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_missing_base() {
-        let cmdline = "console=ttyS0 KTSTR_SHM_SIZE=0x400000";
-        assert!(parse_shm_params_from_str(cmdline).is_none());
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_missing_size() {
-        let cmdline = "KTSTR_SHM_BASE=0xfc000000 quiet";
-        assert!(parse_shm_params_from_str(cmdline).is_none());
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_missing_both() {
-        let cmdline = "console=ttyS0 quiet";
-        assert!(parse_shm_params_from_str(cmdline).is_none());
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_empty() {
-        assert!(parse_shm_params_from_str("").is_none());
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_invalid_hex() {
-        let cmdline = "KTSTR_SHM_BASE=0xZZZZ KTSTR_SHM_SIZE=0x400000";
-        assert!(parse_shm_params_from_str(cmdline).is_none());
-    }
-
-    // -- extract_test_fn_arg additional tests --
-
-    #[test]
-    fn extract_test_fn_arg_empty_value() {
-        let args = vec!["ktstr".into(), "run".into(), "--ktstr-test-fn=".into()];
-        assert_eq!(extract_test_fn_arg(&args), Some(""));
-    }
-
-    #[test]
-    fn extract_test_fn_arg_space_form_empty_args() {
-        let args: Vec<String> = vec![];
-        assert!(extract_test_fn_arg(&args).is_none());
-    }
-
     // -- parse_assert_result additional tests --
 
     #[test]
@@ -573,101 +430,6 @@ mod tests {
         assert_eq!(r.details.len(), 2);
         assert_eq!(r.details[0], "err1");
         assert_eq!(r.details[1], "err2");
-    }
-
-    // -- target_dir tests --
-
-    #[test]
-    fn target_dir_with_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let key = "LLVM_COV_TARGET_DIR";
-        let prev = std::env::var(key).ok();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe { std::env::set_var(key, "/tmp/my-cov-dir") };
-        let dir = target_dir();
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-        assert_eq!(dir, PathBuf::from("/tmp/my-cov-dir"));
-    }
-
-    #[test]
-    fn target_dir_from_llvm_profile_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let key_cov = "LLVM_COV_TARGET_DIR";
-        let key_prof = "LLVM_PROFILE_FILE";
-        let prev_cov = std::env::var(key_cov).ok();
-        let prev_prof = std::env::var(key_prof).ok();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe {
-            std::env::remove_var(key_cov);
-            std::env::set_var(key_prof, "/tmp/cov-target/ktstr-%p-%m.profraw");
-        }
-        let dir = target_dir();
-        unsafe {
-            match prev_cov {
-                Some(v) => std::env::set_var(key_cov, v),
-                None => std::env::remove_var(key_cov),
-            }
-            match prev_prof {
-                Some(v) => std::env::set_var(key_prof, v),
-                None => std::env::remove_var(key_prof),
-            }
-        }
-        assert_eq!(dir, PathBuf::from("/tmp/cov-target"));
-    }
-
-    #[test]
-    fn target_dir_without_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let key_cov = "LLVM_COV_TARGET_DIR";
-        let key_prof = "LLVM_PROFILE_FILE";
-        let prev_cov = std::env::var(key_cov).ok();
-        let prev_prof = std::env::var(key_prof).ok();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe {
-            std::env::remove_var(key_cov);
-            std::env::remove_var(key_prof);
-        }
-        let dir = target_dir();
-        unsafe {
-            match prev_cov {
-                Some(v) => std::env::set_var(key_cov, v),
-                None => std::env::remove_var(key_cov),
-            }
-            match prev_prof {
-                Some(v) => std::env::set_var(key_prof, v),
-                None => std::env::remove_var(key_prof),
-            }
-        }
-        // Falls back to current_exe parent + "llvm-cov-target".
-        assert!(
-            dir.ends_with("llvm-cov-target"),
-            "expected path ending in llvm-cov-target, got: {}",
-            dir.display()
-        );
-    }
-
-    // -- shm_write return value on full ring --
-
-    #[test]
-    fn shm_write_returns_zero_on_full_ring() {
-        use crate::vmm::shm_ring::{HEADER_SIZE, MSG_HEADER_SIZE, shm_init, shm_write};
-
-        // Small ring: header + 32 bytes data.
-        let shm_size = HEADER_SIZE + 32;
-        let mut buf = vec![0u8; shm_size];
-        shm_init(&mut buf, 0, shm_size);
-
-        // Fill the ring: 16-byte header + 16-byte payload = 32 bytes.
-        let payload = vec![0xAA; 16];
-        let written = shm_write(&mut buf, 0, MSG_TYPE_PROFRAW, &payload);
-        assert_eq!(written, MSG_HEADER_SIZE + 16);
-
-        // Ring is full — next write returns 0.
-        let written = shm_write(&mut buf, 0, MSG_TYPE_PROFRAW, b"overflow");
-        assert_eq!(written, 0);
     }
 
     // -- resolve_test_kernel tests --
@@ -702,15 +464,6 @@ mod tests {
             None => unsafe { std::env::remove_var(key) },
         }
         assert!(result.is_err());
-    }
-
-    // -- MSG_TYPE_PROFRAW encoding --
-
-    #[test]
-    fn msg_type_profraw_ascii() {
-        // 0x50524157 == "PRAW" in ASCII.
-        let bytes = MSG_TYPE_PROFRAW.to_be_bytes();
-        assert_eq!(&bytes, b"PRAW");
     }
 
     // -- KVM check --
@@ -919,33 +672,6 @@ mod tests {
         assert!(sched_log_fingerprint(&output).is_none());
     }
 
-    // -- extract_probe_stack_arg tests --
-
-    #[test]
-    fn extract_probe_stack_arg_equals() {
-        let args = vec![
-            "ktstr".into(),
-            "run".into(),
-            "--ktstr-probe-stack=func_a,func_b".into(),
-        ];
-        assert_eq!(
-            extract_probe_stack_arg(&args),
-            Some("func_a,func_b".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_probe_stack_arg_missing() {
-        let args = vec!["ktstr".into(), "run".into()];
-        assert!(extract_probe_stack_arg(&args).is_none());
-    }
-
-    #[test]
-    fn extract_probe_stack_arg_empty_value() {
-        let args = vec!["ktstr".into(), "--ktstr-probe-stack=".into()];
-        assert!(extract_probe_stack_arg(&args).is_none());
-    }
-
     // -- extract_probe_output tests --
 
     #[test]
@@ -1113,54 +839,9 @@ mod tests {
         assert!(s.assert.max_imbalance_ratio.is_none());
     }
 
-    static FLAG_A: FlagDecl = FlagDecl {
-        name: "flag_a",
-        args: &["--flag-a"],
-        requires: &[],
+    use super::test_helpers::{
+        FLAGS_A, FLAGS_AB, FLAGS_BORROW_LONG, FLAGS_BORROW_REBAL, FLAGS_LLC_STEAL, FLAGS_STEAL_LLC,
     };
-    static BORROW: FlagDecl = FlagDecl {
-        name: "borrow",
-        args: &["--borrow"],
-        requires: &[],
-    };
-    static REBAL: FlagDecl = FlagDecl {
-        name: "rebal",
-        args: &["--rebal"],
-        requires: &[],
-    };
-    static TEST_LLC: FlagDecl = FlagDecl {
-        name: "llc",
-        args: &["--llc"],
-        requires: &[],
-    };
-    static TEST_STEAL: FlagDecl = FlagDecl {
-        name: "steal",
-        args: &["--steal"],
-        requires: &[&TEST_LLC],
-    };
-    static BORROW_LONG: FlagDecl = FlagDecl {
-        name: "borrow",
-        args: &["--enable-borrow"],
-        requires: &[],
-    };
-    static TEST_A: FlagDecl = FlagDecl {
-        name: "a",
-        args: &["-a"],
-        requires: &[],
-    };
-    static TEST_B: FlagDecl = FlagDecl {
-        name: "b",
-        args: &["-b"],
-        requires: &[],
-    };
-
-    // Static flag slices for tests (Scheduler.flags needs &'static).
-    static FLAGS_A: &[&FlagDecl] = &[&FLAG_A];
-    static FLAGS_BORROW_REBAL: &[&FlagDecl] = &[&BORROW, &REBAL];
-    static FLAGS_STEAL_LLC: &[&FlagDecl] = &[&TEST_STEAL, &TEST_LLC];
-    static FLAGS_BORROW_LONG: &[&FlagDecl] = &[&BORROW_LONG];
-    static FLAGS_AB: &[&FlagDecl] = &[&TEST_A, &TEST_B];
-    static FLAGS_LLC_STEAL: &[&FlagDecl] = &[&TEST_LLC, &TEST_STEAL];
 
     #[test]
     fn scheduler_new_builder() {
@@ -1384,36 +1065,6 @@ mod tests {
         assert!(!json.contains("\"monitor\""));
     }
 
-    // -- extract_topo_arg tests --
-
-    #[test]
-    fn extract_topo_arg_equals() {
-        let args = vec!["bin".into(), "--ktstr-topo=2s4c2t".into()];
-        assert_eq!(extract_topo_arg(&args), Some("2s4c2t".to_string()));
-    }
-
-    #[test]
-    fn extract_topo_arg_missing() {
-        let args = vec!["bin".into(), "--ktstr-test-fn=test".into()];
-        assert!(extract_topo_arg(&args).is_none());
-    }
-
-    #[test]
-    fn extract_topo_arg_empty_value() {
-        let args = vec!["bin".into(), "--ktstr-topo=".into()];
-        assert!(extract_topo_arg(&args).is_none());
-    }
-
-    #[test]
-    fn extract_topo_arg_with_other_args() {
-        let args = vec![
-            "bin".into(),
-            "--ktstr-test-fn=my_test".into(),
-            "--ktstr-topo=1s2c1t".into(),
-        ];
-        assert_eq!(extract_topo_arg(&args), Some("1s2c1t".to_string()));
-    }
-
     #[test]
     fn extract_kernel_version_from_boot() {
         let console = "[    0.000000] Linux version 6.14.0-rc3+ (user@host) (gcc) #1 SMP\n\
@@ -1498,26 +1149,6 @@ mod tests {
         let s = format_console_diagnostics(console, 0, "test");
         assert!(s.contains(", truncated)"));
         assert!(s.contains("partial li [truncated]"));
-    }
-
-    // -- extract_work_type_arg tests --
-
-    #[test]
-    fn extract_work_type_arg_equals() {
-        let args = vec!["ktstr".into(), "--ktstr-work-type=CpuSpin".into()];
-        assert_eq!(extract_work_type_arg(&args), Some("CpuSpin".to_string()));
-    }
-
-    #[test]
-    fn extract_work_type_arg_missing() {
-        let args = vec!["ktstr".into(), "run".into()];
-        assert!(extract_work_type_arg(&args).is_none());
-    }
-
-    #[test]
-    fn extract_work_type_arg_empty_value() {
-        let args = vec!["ktstr".into(), "--ktstr-work-type=".into()];
-        assert!(extract_work_type_arg(&args).is_none());
     }
 
     // -- collect_sidecars tests --
@@ -2044,20 +1675,7 @@ mod tests {
 
     // -- KtstrTestEntry::validate coverage --
 
-    fn validate_entry(
-        name: &'static str,
-        memory_mb: u32,
-        duration: Duration,
-        workers_per_cgroup: u32,
-    ) -> KtstrTestEntry {
-        KtstrTestEntry {
-            name,
-            memory_mb,
-            duration,
-            workers_per_cgroup,
-            ..KtstrTestEntry::DEFAULT
-        }
-    }
+    use super::test_helpers::validate_entry;
 
     #[test]
     fn ktstr_test_entry_validate_accepts_defaults() {
@@ -2111,75 +1729,7 @@ mod tests {
 
     // -- evaluate_vm_result error path tests --
 
-    fn dummy_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
-        Ok(AssertResult::pass())
-    }
-
-    fn eevdf_entry(name: &'static str) -> KtstrTestEntry {
-        KtstrTestEntry {
-            name,
-            func: dummy_test_fn,
-            auto_repro: false,
-            ..KtstrTestEntry::DEFAULT
-        }
-    }
-
-    static SCHED_TEST: Scheduler = Scheduler {
-        name: "test_sched",
-        binary: SchedulerSpec::Discover("test_sched_bin"),
-        flags: &[],
-        sysctls: &[],
-        kargs: &[],
-        assert: crate::assert::Assert::NONE,
-        cgroup_parent: None,
-        sched_args: &[],
-        topology: crate::vmm::topology::Topology {
-            llcs: 1,
-            cores_per_llc: 2,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        },
-        constraints: TopologyConstraints::DEFAULT,
-        config_file: None,
-    };
-
-    fn sched_entry(name: &'static str) -> KtstrTestEntry {
-        KtstrTestEntry {
-            name,
-            func: dummy_test_fn,
-            scheduler: &SCHED_TEST,
-            auto_repro: false,
-            ..KtstrTestEntry::DEFAULT
-        }
-    }
-
-    fn no_repro(_output: &str) -> Option<String> {
-        None
-    }
-
-    fn make_vm_result(
-        output: &str,
-        stderr: &str,
-        exit_code: i32,
-        timed_out: bool,
-    ) -> crate::vmm::VmResult {
-        crate::vmm::VmResult {
-            success: !timed_out && exit_code == 0,
-            exit_code,
-            duration: std::time::Duration::from_secs(1),
-            timed_out,
-            output: output.to_string(),
-            stderr: stderr.to_string(),
-            monitor: None,
-            shm_data: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-        }
-    }
+    use super::test_helpers::{eevdf_entry, make_vm_result, no_repro, sched_entry};
 
     #[test]
     fn eval_eevdf_no_com2_output() {
@@ -3241,41 +2791,6 @@ mod tests {
         assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
     }
 
-    // -- find_symbol_vaddrs --
-
-    #[test]
-    fn find_symbol_vaddrs_resolves_known_symbol() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let data = std::fs::read(&exe).unwrap();
-        // "main" is present in the symtab of any Rust test binary.
-        let results = find_symbol_vaddrs(&data, &["main"]);
-        assert_eq!(results.len(), 1);
-        assert!(
-            results[0].is_some(),
-            "main symbol should be resolved in test binary"
-        );
-        assert_ne!(results[0].unwrap(), 0, "main address should be nonzero");
-    }
-
-    #[test]
-    fn find_symbol_vaddrs_missing_symbol_returns_none() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let data = std::fs::read(&exe).unwrap();
-        let results = find_symbol_vaddrs(&data, &["__nonexistent_symbol_xyz__"]);
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_none());
-    }
-
-    #[test]
-    fn find_symbol_vaddrs_mixed_results() {
-        let exe = crate::resolve_current_exe().unwrap();
-        let data = std::fs::read(&exe).unwrap();
-        let results = find_symbol_vaddrs(&data, &["main", "__nonexistent_symbol_xyz__"]);
-        assert_eq!(results.len(), 2);
-        assert!(results[0].is_some(), "main should resolve");
-        assert!(results[1].is_none(), "nonexistent should not resolve");
-    }
-
     // -- TopologyConstraints tests --
 
     #[test]
@@ -3563,74 +3078,5 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         assert!(config_file_parts(&entry).is_none());
-    }
-
-    // -- now_iso8601 / days_to_ymd / is_leap tests --
-
-    #[test]
-    fn days_to_ymd_epoch() {
-        let (y, m, d) = days_to_ymd(0);
-        assert_eq!((y, m, d), (1970, 1, 1));
-    }
-
-    #[test]
-    fn days_to_ymd_known_date() {
-        let (y, m, d) = days_to_ymd(18628);
-        assert_eq!((y, m, d), (2021, 1, 1));
-    }
-
-    #[test]
-    fn days_to_ymd_leap_day() {
-        let (y, m, d) = days_to_ymd(11016);
-        assert_eq!((y, m, d), (2000, 2, 29));
-    }
-
-    #[test]
-    fn days_to_ymd_2024_jan_1() {
-        // 2024-01-01 = 19723 days since epoch.
-        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
-    }
-
-    #[test]
-    fn days_to_ymd_2024_leap_day() {
-        // 2024-02-29 = 19723 + 31 + 28 = 19782.
-        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
-    }
-
-    #[test]
-    fn days_to_ymd_2023_end_of_year() {
-        // 2023-12-31 = 19722.
-        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
-    }
-
-    #[test]
-    fn is_leap_years() {
-        assert!(is_leap(2000));
-        assert!(is_leap(2024));
-        assert!(!is_leap(1900));
-        assert!(!is_leap(2023));
-    }
-
-    #[test]
-    fn now_iso8601_format() {
-        let ts = now_iso8601();
-        assert!(ts.ends_with('Z'));
-        assert!(ts.contains('T'));
-        assert_eq!(ts.len(), 20);
-    }
-
-    // -- generate_run_id tests --
-
-    #[test]
-    fn generate_run_id_contains_hash() {
-        let id = generate_run_id();
-        assert!(id.contains(crate::GIT_HASH));
-    }
-
-    #[test]
-    fn generate_run_id_monotonic() {
-        let id1 = generate_run_id();
-        let id2 = generate_run_id();
-        assert_ne!(id1, id2);
     }
 }
