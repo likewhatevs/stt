@@ -47,7 +47,6 @@ use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
 use crate::assert::{self, AssertResult};
-use crate::cgroup::CgroupManager;
 use crate::topology::TestTopology;
 use crate::workload::*;
 
@@ -423,17 +422,25 @@ impl Scenario {
 ///
 /// Prevents cgroup leaks when workload spawning or other operations fail
 /// between cgroup creation and cleanup.
-#[derive(Debug)]
 #[must_use = "dropping a CgroupGroup immediately destroys the cgroups it manages"]
 pub struct CgroupGroup<'a> {
-    cgroups: &'a CgroupManager,
+    cgroups: &'a dyn crate::cgroup::CgroupOps,
     names: Vec<String>,
+}
+
+impl std::fmt::Debug for CgroupGroup<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CgroupGroup")
+            .field("cgroups", &self.cgroups.parent_path())
+            .field("names", &self.names)
+            .finish()
+    }
 }
 
 impl<'a> CgroupGroup<'a> {
     /// Create an empty group. Cgroups added via `add_cgroup` or
     /// `add_cgroup_no_cpuset` are removed when the group is dropped.
-    pub fn new(cgroups: &'a CgroupManager) -> Self {
+    pub fn new(cgroups: &'a dyn crate::cgroup::CgroupOps) -> Self {
         Self {
             cgroups,
             names: Vec::new(),
@@ -478,10 +485,13 @@ impl Drop for CgroupGroup<'_> {
 /// Provides access to cgroup management, topology information, and
 /// test configuration. Custom scenarios (`Action::Custom`) receive
 /// this as their sole parameter.
-#[derive(Debug)]
 pub struct Ctx<'a> {
-    /// Cgroup filesystem manager for creating/removing cgroups.
-    pub cgroups: &'a CgroupManager,
+    /// Cgroup filesystem operations. `&dyn CgroupOps` (not `&CgroupManager`)
+    /// so scenario code can be driven by an in-memory test double without
+    /// touching `/sys/fs/cgroup`. Production callers pass
+    /// `&CgroupManager` and the auto-coercion is transparent at the call
+    /// site — `ctx.cgroups.set_cpuset(...)` works unchanged.
+    pub cgroups: &'a dyn crate::cgroup::CgroupOps,
     /// VM CPU topology.
     pub topo: &'a TestTopology,
     /// How long to run the workload.
@@ -507,6 +517,25 @@ pub struct Ctx<'a> {
     /// when a `KtstrTestEntry` declares `bpf_map_write`; custom
     /// scenarios typically do not flip this manually.
     pub wait_for_map_write: bool,
+}
+
+impl std::fmt::Debug for Ctx<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `&dyn CgroupOps` is not Debug (dropped the supertrait to
+        // avoid bloating the test-double surface); render the parent
+        // path instead so debug prints are still informative.
+        f.debug_struct("Ctx")
+            .field("cgroups", &self.cgroups.parent_path())
+            .field("topo", &self.topo)
+            .field("duration", &self.duration)
+            .field("workers_per_cgroup", &self.workers_per_cgroup)
+            .field("sched_pid", &self.sched_pid)
+            .field("settle", &self.settle)
+            .field("work_type_override", &self.work_type_override)
+            .field("assert", &self.assert)
+            .field("wait_for_map_write", &self.wait_for_map_write)
+            .finish()
+    }
 }
 
 /// Run a scenario and return its assertion result.

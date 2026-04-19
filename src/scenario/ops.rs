@@ -2587,4 +2587,424 @@ mod tests {
         let def = CgroupDef::named("test").mem_policy(MemPolicy::Bind([0].into_iter().collect()));
         assert!(matches!(def.works[0].mem_policy, MemPolicy::Bind(_)));
     }
+
+    // ---------------------------------------------------------------
+    // apply_setup tests via MockCgroupOps
+    // ---------------------------------------------------------------
+    //
+    // MockCgroupOps is a recording implementor of crate::cgroup::CgroupOps
+    // that stores every call it receives in an internal Vec and can be
+    // primed to return an error from the next call. This lets
+    // apply_setup tests assert on the sequence of cgroup operations
+    // without touching /sys/fs/cgroup, so they run as regular userspace
+    // unit tests.
+    //
+    // apply_setup still calls WorkloadHandle::spawn, which forks real
+    // worker processes. That's intentional: fork does not require root,
+    // and the cgroup.procs write (which would require root in the real
+    // kernel) is abstracted behind the mock. The test subject is the
+    // orchestration logic — "for each def, call create_cgroup, then
+    // set_cpuset if spec.is_some(), then move_tasks after spawn".
+
+    use crate::cgroup::CgroupOps;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// A call captured by MockCgroupOps during apply_setup execution.
+    /// Equality-comparable so tests can assert on the exact sequence.
+    /// `tids` in `MoveTasks` is stored but not compared strictly — the
+    /// `fuzzy_move_tasks` helper in individual tests matches on cgroup
+    /// name + tid count since PIDs are unpredictable between runs.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum CgroupCall {
+        Setup(bool),
+        CreateCgroup(String),
+        RemoveCgroup(String),
+        SetCpuset(String, BTreeSet<usize>),
+        ClearCpuset(String),
+        MoveTask(String, libc::pid_t),
+        MoveTasks(String, usize), // (cgroup name, number of tids)
+        ClearSubtreeControl(String),
+        DrainTasks(String),
+        CleanupAll,
+    }
+
+    struct MockCgroupOps {
+        parent: std::path::PathBuf,
+        calls: Mutex<Vec<CgroupCall>>,
+        // When Some, the Nth call (indexed from 0 at insertion time)
+        // returns an error and decrements; otherwise all calls return Ok.
+        fail_at: Mutex<Option<(usize, String)>>,
+    }
+
+    impl MockCgroupOps {
+        fn new() -> Self {
+            Self {
+                parent: std::path::PathBuf::from("/mock/cgroup"),
+                calls: Mutex::new(Vec::new()),
+                fail_at: Mutex::new(None),
+            }
+        }
+
+        /// Return an error from the Nth call (0-indexed from now) with
+        /// the given message. Used by tests that verify error
+        /// propagation through apply_setup.
+        #[allow(dead_code)]
+        fn fail_call_at(&self, index: usize, message: &str) {
+            *self.fail_at.lock().unwrap() = Some((index, message.to_string()));
+        }
+
+        fn calls(&self) -> Vec<CgroupCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Record a call and decide whether to return Ok or inject an
+        /// error. Centralizes the fail_at logic so every trait method
+        /// gets it for free.
+        fn record(&self, call: CgroupCall) -> Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            let current_index = calls.len();
+            calls.push(call);
+            drop(calls);
+            let mut fail = self.fail_at.lock().unwrap();
+            if let Some((index, ref message)) = *fail
+                && current_index == index
+            {
+                let err_msg = message.clone();
+                *fail = None;
+                return Err(anyhow::anyhow!(err_msg));
+            }
+            Ok(())
+        }
+    }
+
+    impl CgroupOps for MockCgroupOps {
+        fn parent_path(&self) -> &Path {
+            &self.parent
+        }
+        fn setup(&self, enable_cpu_controller: bool) -> Result<()> {
+            self.record(CgroupCall::Setup(enable_cpu_controller))
+        }
+        fn create_cgroup(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::CreateCgroup(name.to_string()))
+        }
+        fn remove_cgroup(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::RemoveCgroup(name.to_string()))
+        }
+        fn set_cpuset(&self, name: &str, cpus: &BTreeSet<usize>) -> Result<()> {
+            self.record(CgroupCall::SetCpuset(name.to_string(), cpus.clone()))
+        }
+        fn clear_cpuset(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::ClearCpuset(name.to_string()))
+        }
+        fn move_task(&self, name: &str, tid: libc::pid_t) -> Result<()> {
+            self.record(CgroupCall::MoveTask(name.to_string(), tid))
+        }
+        fn move_tasks(&self, name: &str, tids: &[libc::pid_t]) -> Result<()> {
+            self.record(CgroupCall::MoveTasks(name.to_string(), tids.len()))
+        }
+        fn clear_subtree_control(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::ClearSubtreeControl(name.to_string()))
+        }
+        fn drain_tasks(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::DrainTasks(name.to_string()))
+        }
+        fn cleanup_all(&self) -> Result<()> {
+            self.record(CgroupCall::CleanupAll)
+        }
+    }
+
+    /// Build a Ctx backed by MockCgroupOps so apply_setup can be driven
+    /// without cgroup filesystem access. Topology fixed at 1 NUMA /
+    /// 1 LLC / 4 cores / 1 thread = 4 CPUs — enough range to cover
+    /// per-cpu cpuset assertions without making the mock brittle.
+    fn mock_ctx<'a>(mock: &'a MockCgroupOps, topo: &'a crate::topology::TestTopology) -> Ctx<'a> {
+        Ctx {
+            cgroups: mock,
+            topo,
+            duration: Duration::from_secs(1),
+            workers_per_cgroup: 1,
+            sched_pid: 0,
+            settle: Duration::ZERO,
+            work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
+        }
+    }
+
+    fn mock_topo() -> crate::topology::TestTopology {
+        crate::topology::TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(
+            1, 1, 4, 1,
+        ))
+    }
+
+    /// Drop workload handles inside state so apply_setup tests don't
+    /// leak worker processes. `handles` holds (cgroup_name, WorkloadHandle);
+    /// handle Drop SIGKILLs its workers — calling `state.handles.clear()`
+    /// is enough.
+    fn cleanup_state(state: &mut StepState<'_>) {
+        state.handles.clear();
+    }
+
+    #[test]
+    fn apply_setup_empty_defs_is_noop() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        apply_setup(&ctx, &mut state, &[]).unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "apply_setup on zero defs must not call any cgroup op, got: {:?}",
+            mock.calls()
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_creates_cgroup_per_def() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        let defs = vec![
+            CgroupDef::named("cg_a").workers(1),
+            CgroupDef::named("cg_b").workers(1),
+        ];
+        apply_setup(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        let creates: Vec<&CgroupCall> = calls
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::CreateCgroup(_)))
+            .collect();
+        assert_eq!(
+            creates,
+            vec![
+                &CgroupCall::CreateCgroup("cg_a".to_string()),
+                &CgroupCall::CreateCgroup("cg_b".to_string()),
+            ],
+            "one create_cgroup call per def, in order"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_sets_cpuset_when_spec_present() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_0")
+                .with_cpuset(CpusetSpec::Exact(cpus.clone()))
+                .workers(1),
+        ];
+        apply_setup(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetCpuset("cg_0".to_string(), cpus.clone())),
+            "set_cpuset must be called with exactly the resolved cpu set, got: {calls:?}"
+        );
+        // state.cpusets should mirror the set so later SetAffinity /
+        // MemPolicy checks see the resolved cpuset.
+        assert_eq!(
+            state.cpusets.get("cg_0"),
+            Some(&cpus),
+            "state.cpusets must record the resolved set"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_skips_cpuset_when_none() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        // cpuset: None → inherit parent's set, apply_setup must not
+        // emit a set_cpuset call.
+        let defs = vec![CgroupDef::named("cg_inherit").workers(1)];
+        apply_setup(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        let has_set_cpuset = calls
+            .iter()
+            .any(|c| matches!(c, CgroupCall::SetCpuset(_, _)));
+        assert!(
+            !has_set_cpuset,
+            "no set_cpuset should be emitted when CgroupDef.cpuset is None, got: {calls:?}"
+        );
+        assert!(
+            state.cpusets.is_empty(),
+            "state.cpusets should stay empty when no CpusetSpec was resolved"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_moves_spawned_tasks_into_cgroup() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        // workers(2): after spawn, apply_setup must call move_tasks
+        // with 2 pids.
+        let defs = vec![CgroupDef::named("cg_move").workers(2)];
+        apply_setup(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::MoveTasks("cg_move".to_string(), 2)),
+            "move_tasks must be called with the 2 spawned worker pids, got: {calls:?}"
+        );
+        // Ordering invariant: move_tasks follows create_cgroup, and
+        // set_cpuset (when present) follows create_cgroup but precedes
+        // move_tasks. Here with no cpuset, just assert create precedes
+        // move.
+        let create_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::CreateCgroup(n) if n == "cg_move"))
+            .expect("create_cgroup for cg_move");
+        let move_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::MoveTasks(n, _) if n == "cg_move"))
+            .expect("move_tasks for cg_move");
+        assert!(
+            create_idx < move_idx,
+            "create_cgroup must precede move_tasks for the same cgroup: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_bails_on_invalid_cpuset_spec() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        // Llc(99) on a 1-LLC topology is out of range; CpusetSpec::validate
+        // bails before any mock call.
+        let defs = vec![CgroupDef::named("cg_bad").with_cpuset(CpusetSpec::Llc(99))];
+        let err = apply_setup(&ctx, &mut state, &defs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CpusetSpec validation failed"),
+            "expected validation error, got: {msg}"
+        );
+        // create_cgroup already ran before the cpuset validation,
+        // which is the documented order — record that so future
+        // refactors notice if the order flips.
+        let calls = mock.calls();
+        assert_eq!(
+            calls,
+            vec![CgroupCall::CreateCgroup("cg_bad".to_string())],
+            "current ordering: create_cgroup first, then cpuset validation"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_propagates_set_cpuset_error() {
+        let mock = MockCgroupOps::new();
+        // Inject failure at call index 1. Index 0 is the create_cgroup
+        // emitted before the cpuset write; index 1 is the set_cpuset
+        // itself.
+        mock.fail_call_at(1, "set_cpuset kernel EBUSY");
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_setfail")
+                .with_cpuset(CpusetSpec::Exact(cpus))
+                .workers(1),
+        ];
+        let err = apply_setup(&ctx, &mut state, &defs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("set_cpuset kernel EBUSY"),
+            "set_cpuset error must propagate, got: {msg}"
+        );
+        // Verify the failure halted apply_setup before reaching spawn:
+        // no MoveTasks call should have been recorded.
+        let calls = mock.calls();
+        let has_move = calls
+            .iter()
+            .any(|c| matches!(c, CgroupCall::MoveTasks(_, _)));
+        assert!(
+            !has_move,
+            "no move_tasks call should follow a failed set_cpuset, got: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_validates_mempolicy_against_cpuset() {
+        let mock = MockCgroupOps::new();
+        // 2 NUMA / 2 LLCs (1 per node) / 4 cores / 1 thread = 8 CPUs
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(2, 2, 4, 1),
+        );
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        // cpuset = NUMA node 0 only (CPUs 0-3); mem_policy binds to
+        // node 1 — must bail, no downstream spawn.
+        let cpus: BTreeSet<usize> = (0..4).collect();
+        let bind: BTreeSet<usize> = [1].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_memfail")
+                .with_cpuset(CpusetSpec::Exact(cpus))
+                .mem_policy(MemPolicy::Bind(bind))
+                .workers(1),
+        ];
+        let err = apply_setup(&ctx, &mut state, &defs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_memfail"),
+            "error must name the bad cgroup, got: {msg}"
+        );
+        // set_cpuset was called before the mempolicy check (order
+        // documented by apply_setup). Assert move_tasks did not run —
+        // that would mean the pre-validation guard failed.
+        let calls = mock.calls();
+        let has_move = calls
+            .iter()
+            .any(|c| matches!(c, CgroupCall::MoveTasks(_, _)));
+        assert!(
+            !has_move,
+            "mempolicy validation must bail before spawn, got: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
 }

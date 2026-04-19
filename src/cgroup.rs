@@ -306,6 +306,92 @@ impl CgroupManager {
     }
 }
 
+/// Abstraction over the cgroup v2 filesystem surface used by the
+/// scenario runtime. The production implementation is [`CgroupManager`],
+/// which translates each method into real writes under `/sys/fs/cgroup`.
+///
+/// Extracted so `scenario::ops::apply_setup` and related orchestration
+/// code can be unit-tested against an in-memory double: tests construct
+/// a recording or failure-injecting implementor, drive `apply_setup`
+/// against it, and assert on the recorded call sequence without
+/// touching the host cgroup hierarchy.
+///
+/// Object-safe by design — scenario code holds the trait object behind
+/// `&dyn CgroupOps` rather than being generic. Callers keep writing
+/// `ctx.cgroups.set_cpuset(...)` with no syntactic change; dynamic
+/// dispatch resolves to `CgroupManager` in production and to the
+/// test double under `#[cfg(test)]`. The per-call indirect-call cost
+/// is dominated by the filesystem I/O the trait abstracts over.
+pub trait CgroupOps {
+    /// Path to the parent cgroup directory. See
+    /// [`CgroupManager::parent_path`].
+    fn parent_path(&self) -> &Path;
+    /// Create the parent directory and enable controllers. See
+    /// [`CgroupManager::setup`].
+    fn setup(&self, enable_cpu_controller: bool) -> Result<()>;
+    /// Create a child cgroup. See [`CgroupManager::create_cgroup`].
+    fn create_cgroup(&self, name: &str) -> Result<()>;
+    /// Drain and remove a child cgroup. See
+    /// [`CgroupManager::remove_cgroup`].
+    fn remove_cgroup(&self, name: &str) -> Result<()>;
+    /// Write `cpuset.cpus`. See [`CgroupManager::set_cpuset`].
+    fn set_cpuset(&self, name: &str, cpus: &BTreeSet<usize>) -> Result<()>;
+    /// Clear `cpuset.cpus` (inherit from parent). See
+    /// [`CgroupManager::clear_cpuset`].
+    fn clear_cpuset(&self, name: &str) -> Result<()>;
+    /// Move a single task via `cgroup.procs`. See
+    /// [`CgroupManager::move_task`].
+    fn move_task(&self, name: &str, tid: libc::pid_t) -> Result<()>;
+    /// Move multiple tasks (tolerates ESRCH, retries EBUSY). See
+    /// [`CgroupManager::move_tasks`].
+    fn move_tasks(&self, name: &str, tids: &[libc::pid_t]) -> Result<()>;
+    /// Clear `cgroup.subtree_control` on a child. See
+    /// [`CgroupManager::clear_subtree_control`].
+    fn clear_subtree_control(&self, name: &str) -> Result<()>;
+    /// Drain tasks from a child to the cgroup root. See
+    /// [`CgroupManager::drain_tasks`].
+    fn drain_tasks(&self, name: &str) -> Result<()>;
+    /// Remove all child cgroups under the parent. See
+    /// [`CgroupManager::cleanup_all`].
+    fn cleanup_all(&self) -> Result<()>;
+}
+
+impl CgroupOps for CgroupManager {
+    fn parent_path(&self) -> &Path {
+        CgroupManager::parent_path(self)
+    }
+    fn setup(&self, enable_cpu_controller: bool) -> Result<()> {
+        CgroupManager::setup(self, enable_cpu_controller)
+    }
+    fn create_cgroup(&self, name: &str) -> Result<()> {
+        CgroupManager::create_cgroup(self, name)
+    }
+    fn remove_cgroup(&self, name: &str) -> Result<()> {
+        CgroupManager::remove_cgroup(self, name)
+    }
+    fn set_cpuset(&self, name: &str, cpus: &BTreeSet<usize>) -> Result<()> {
+        CgroupManager::set_cpuset(self, name, cpus)
+    }
+    fn clear_cpuset(&self, name: &str) -> Result<()> {
+        CgroupManager::clear_cpuset(self, name)
+    }
+    fn move_task(&self, name: &str, tid: libc::pid_t) -> Result<()> {
+        CgroupManager::move_task(self, name, tid)
+    }
+    fn move_tasks(&self, name: &str, tids: &[libc::pid_t]) -> Result<()> {
+        CgroupManager::move_tasks(self, name, tids)
+    }
+    fn clear_subtree_control(&self, name: &str) -> Result<()> {
+        CgroupManager::clear_subtree_control(self, name)
+    }
+    fn drain_tasks(&self, name: &str) -> Result<()> {
+        CgroupManager::drain_tasks(self, name)
+    }
+    fn cleanup_all(&self) -> Result<()> {
+        CgroupManager::cleanup_all(self)
+    }
+}
+
 /// Drain all tasks from `procs_path` to the cgroup filesystem root.
 ///
 /// The root cgroup is exempt from the no-internal-process constraint,
