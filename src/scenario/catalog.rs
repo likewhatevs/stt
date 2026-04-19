@@ -23,7 +23,7 @@ macro_rules! s {
             required_flags: &[],
             excluded_flags: &[],
             num_cgroups: $cgroups,
-            cpuset_mode: $cpuset,
+            cpuset_partition: $cpuset,
             cgroup_works: $works,
             action: Action::Steady,
         }
@@ -39,7 +39,7 @@ macro_rules! custom {
             required_flags: &[],
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom($fn),
         }
@@ -79,7 +79,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "basic",
             "2 cgroups, no cpusets, equal load",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             dfl()
         ),
         s!(
@@ -87,7 +87,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "basic",
             "2 cgroups, LLC-aligned cpusets, equal load",
             2,
-            CpusetMode::LlcAligned,
+            CpusetPartition::LlcAligned,
             dfl()
         ),
         s!(
@@ -95,7 +95,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "basic",
             "2 cgroups, cpusets spanning LLC boundary",
             2,
-            CpusetMode::SplitMisaligned,
+            CpusetPartition::SplitMisaligned,
             dfl()
         ),
         s!(
@@ -103,7 +103,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "cpuset",
             "3 cgroups, 50% overlapping cpusets",
             3,
-            CpusetMode::Overlap(0.5),
+            CpusetPartition::Overlap(0.5),
             dfl()
         ),
         s!(
@@ -111,7 +111,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "2 cgroups, 1/3 CPUs unused",
             2,
-            CpusetMode::Holdback(0.33),
+            CpusetPartition::Holdback(0.33),
             dfl()
         ),
         s!(
@@ -119,7 +119,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "2 cgroups, 75/25 CPU split",
             2,
-            CpusetMode::Uneven(0.75),
+            CpusetPartition::Uneven(0.75),
             dfl()
         ),
         s!(
@@ -127,7 +127,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "2 cgroups, 32 mixed workers >> CPUs",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             vec![Work {
                 num_workers: Some(32),
                 work_type: WorkType::Mixed,
@@ -140,7 +140,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "affinity",
             "No explicit affinity, mixed workload",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             w(WorkType::Mixed, SchedPolicy::Normal)
         ),
         s!(
@@ -148,7 +148,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "affinity",
             "Random CPU subset per worker",
             2,
-            CpusetMode::SplitHalf,
+            CpusetPartition::SplitHalf,
             aff(AffinityKind::RandomSubset)
         ),
         s!(
@@ -156,7 +156,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "affinity",
             "Affinity mask covers all CPUs",
             2,
-            CpusetMode::SplitHalf,
+            CpusetPartition::SplitHalf,
             aff(AffinityKind::CrossCgroup)
         ),
         s!(
@@ -164,7 +164,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "affinity",
             "One CPU per worker",
             2,
-            CpusetMode::SplitHalf,
+            CpusetPartition::SplitHalf,
             aff(AffinityKind::SingleCpu)
         ),
         // Sched classes
@@ -173,7 +173,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "sched_class",
             "SCHED_BATCH workers",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             w(WorkType::CpuSpin, SchedPolicy::Batch)
         ),
         s!(
@@ -181,7 +181,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "sched_class",
             "SCHED_IDLE workers",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             w(WorkType::CpuSpin, SchedPolicy::Idle)
         ),
         s!(
@@ -189,7 +189,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "sched_class",
             "RT SCHED_FIFO + normal workers",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             vec![Work {
                 num_workers: Some(1),
                 sched_policy: SchedPolicy::Fifo(1),
@@ -205,7 +205,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "sched_class",
             "RT SCHED_RR + normal workers",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             vec![Work {
                 num_workers: Some(2),
                 sched_policy: SchedPolicy::RoundRobin(1),
@@ -224,7 +224,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 2,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![
                 Work {
                     num_workers: Some(16),
@@ -249,7 +249,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 2,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![Work {
                 num_workers: Some(16),
                 ..Default::default()
@@ -264,7 +264,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_LLC_STEAL,
             excluded_flags: &[],
             num_cgroups: 1,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![Work {
                 num_workers: Some(8),
                 ..Default::default()
@@ -279,7 +279,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REBAL,
             excluded_flags: &[],
             num_cgroups: 2,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![
                 Work {
                     num_workers: Some(16),
@@ -301,7 +301,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: &[],
             excluded_flags: &[],
             num_cgroups: 1,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![Work {
                 num_workers: Some(16),
                 ..Default::default()
@@ -316,7 +316,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_LLC,
             excluded_flags: &[],
             num_cgroups: 2,
-            cpuset_mode: CpusetMode::LlcAligned,
+            cpuset_partition: CpusetPartition::LlcAligned,
             cgroup_works: aff(AffinityKind::LlcAligned),
             action: Action::Steady,
         },
@@ -327,7 +327,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: &[],
             excluded_flags: F_REJECT_PIN,
             num_cgroups: 2,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: dfl(),
             action: Action::Custom(custom_cgroup_affinity_change),
         },
@@ -416,7 +416,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: &[],
             excluded_flags: &[],
             num_cgroups: 2,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![Work {
                 num_workers: Some(16),
                 ..Default::default()
@@ -456,7 +456,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_workload_imbalance),
         },
@@ -468,7 +468,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_load_shift),
         },
@@ -480,7 +480,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_add_load_imbalance),
         },
@@ -492,7 +492,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_imbalance_mixed_workload),
         },
@@ -504,7 +504,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REJECT_PIN,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_multicpu_pin),
         },
@@ -516,7 +516,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_NO_CTRL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_noctrl_task_migration),
         },
@@ -528,7 +528,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_change_imbalance),
         },
@@ -540,7 +540,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_load_oscillation),
         },
@@ -552,7 +552,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_NO_CTRL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_nested_cgroup_noctrl),
         },
@@ -564,7 +564,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: &[],
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_swap_disjoint),
         },
@@ -576,7 +576,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_io_compute_imbalance),
         },
@@ -588,7 +588,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_4way_load_imbalance),
         },
@@ -600,7 +600,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 3,
-            cpuset_mode: CpusetMode::Overlap(0.5),
+            cpuset_partition: CpusetPartition::Overlap(0.5),
             cgroup_works: vec![
                 Work {
                     num_workers: Some(8),
@@ -630,7 +630,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REBAL,
             excluded_flags: &[],
             num_cgroups: 3,
-            cpuset_mode: CpusetMode::Overlap(0.5),
+            cpuset_partition: CpusetPartition::Overlap(0.5),
             cgroup_works: vec![
                 Work {
                     num_workers: Some(16),
@@ -656,7 +656,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 2,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![
                 Work {
                     num_workers: Some(8),
@@ -681,7 +681,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REBAL,
             excluded_flags: &[],
             num_cgroups: 2,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![
                 Work {
                     num_workers: Some(12),
@@ -706,7 +706,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_imbalance_combined),
         },
@@ -717,7 +717,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_overlap_imbalance_combined),
         },
@@ -729,7 +729,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_NO_CTRL_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_noctrl_imbalance),
         },
@@ -741,7 +741,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_NO_CTRL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_noctrl_cpuset_change),
         },
@@ -753,7 +753,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_NO_CTRL_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_noctrl_load_imbalance),
         },
@@ -765,7 +765,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_REJECT_PIN,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_multicpu_pin),
         },
@@ -777,7 +777,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: &[],
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_add_remove),
         },
@@ -789,7 +789,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_add_during_imbalance),
         },
@@ -801,7 +801,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_nested_cgroup_imbalance),
         },
@@ -839,7 +839,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_LLC_REBAL,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cgroup_cpuset_crossllc_race),
         },
@@ -851,7 +851,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cache_pressure_imbalance),
         },
@@ -863,7 +863,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_LLC,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cache_yield_wake_affine),
         },
@@ -875,7 +875,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_cache_pipe_io_compute_imbalance),
         },
@@ -887,7 +887,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_fanout_wake),
         },
@@ -899,7 +899,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             required_flags: F_BORROW,
             excluded_flags: &[],
             num_cgroups: 0,
-            cpuset_mode: CpusetMode::None,
+            cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
             action: Action::Custom(custom_schbench_style),
         },
@@ -909,7 +909,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "Rapid fork+exit cycling, task creation pressure",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             w(WorkType::ForkExit, SchedPolicy::Normal)
         ),
         // Stress: dynamic nice level changes
@@ -918,7 +918,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "Workers cycling nice levels, priority reweighting",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             w(WorkType::NiceSweep, SchedPolicy::Normal)
         ),
         // Stress: rapid affinity changes
@@ -927,7 +927,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "Workers rapidly changing own CPU affinity",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             w(WorkType::affinity_churn(1024), SchedPolicy::Normal)
         ),
         // Stress: scheduling policy cycling
@@ -936,7 +936,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "Workers cycling scheduling policies mid-run",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             w(WorkType::policy_churn(1024), SchedPolicy::Normal)
         ),
         // Stress: rapid page fault cycling
@@ -945,7 +945,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "Workers cycling mmap/fault/MADV_DONTNEED, TLB pressure",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             w(
                 WorkType::page_fault_churn(4096, 256, 64),
                 SchedPolicy::Normal
@@ -957,7 +957,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "4-way mutex contention, short hold",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             vec![Work {
                 num_workers: Some(4),
                 work_type: WorkType::mutex_contention(4, 64, 1024),
@@ -970,7 +970,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             "stress",
             "8-way mutex contention, long hold",
             2,
-            CpusetMode::None,
+            CpusetPartition::None,
             vec![Work {
                 num_workers: Some(8),
                 work_type: WorkType::mutex_contention(8, 1024, 256),

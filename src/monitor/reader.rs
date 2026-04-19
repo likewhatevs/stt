@@ -199,36 +199,51 @@ impl GuestMem {
         }
     }
 
-    /// Read a u32 at DRAM offset `pa + offset`.
-    pub fn read_u32(&self, pa: u64, offset: usize) -> u32 {
+    /// Bounds-checked volatile read of `N` little/native-endian bytes at
+    /// DRAM offset `pa + offset`. Returns `[0; N]` if the range falls
+    /// outside the mapped region.
+    ///
+    /// `N` must match the width of the scalar caller. `read_volatile_bytes`
+    /// reads byte-by-byte, so the access does not require `N`-alignment.
+    fn read_scalar<const N: usize>(&self, pa: u64, offset: usize) -> [u8; N] {
         let addr = pa + offset as u64;
-        if addr + 4 > self.size {
-            return 0;
+        if addr + N as u64 > self.size {
+            return [0; N];
         }
         match self.resolve_ptr(addr) {
             // SAFETY: bounds checked above; resolve_ptr returned a
             // valid pointer into the mapped region.
-            Some(ptr) => {
-                u32::from_ne_bytes(unsafe { Self::read_volatile_bytes::<4>(ptr as *const u8) })
-            }
-            None => 0,
+            Some(ptr) => unsafe { Self::read_volatile_bytes::<N>(ptr as *const u8) },
+            None => [0; N],
         }
+    }
+
+    /// Bounds-checked volatile write of `bytes` at DRAM offset `pa + offset`.
+    /// Silently no-ops if the range falls outside the mapped region.
+    fn write_scalar<const N: usize>(&self, pa: u64, offset: usize, bytes: [u8; N]) {
+        let addr = pa + offset as u64;
+        if addr + N as u64 > self.size {
+            return;
+        }
+        if let Some(ptr) = self.resolve_ptr(addr) {
+            // SAFETY: bounds checked above.
+            unsafe { Self::write_volatile_bytes::<N>(ptr, bytes) };
+        }
+    }
+
+    /// Read a u8 at DRAM offset `pa + offset`.
+    pub fn read_u8(&self, pa: u64, offset: usize) -> u8 {
+        u8::from_ne_bytes(self.read_scalar::<1>(pa, offset))
+    }
+
+    /// Read a u32 at DRAM offset `pa + offset`.
+    pub fn read_u32(&self, pa: u64, offset: usize) -> u32 {
+        u32::from_ne_bytes(self.read_scalar::<4>(pa, offset))
     }
 
     /// Read a u64 at DRAM offset `pa + offset`.
     pub fn read_u64(&self, pa: u64, offset: usize) -> u64 {
-        let addr = pa + offset as u64;
-        if addr + 8 > self.size {
-            return 0;
-        }
-        match self.resolve_ptr(addr) {
-            // SAFETY: bounds checked above; resolve_ptr returned a
-            // valid pointer into the mapped region.
-            Some(ptr) => {
-                u64::from_ne_bytes(unsafe { Self::read_volatile_bytes::<8>(ptr as *const u8) })
-            }
-            None => 0,
-        }
+        u64::from_ne_bytes(self.read_scalar::<8>(pa, offset))
     }
 
     /// Read an i64 at DRAM offset `pa + offset`.
@@ -238,40 +253,12 @@ impl GuestMem {
 
     /// Write a u8 at DRAM offset `pa + offset`.
     pub fn write_u8(&self, pa: u64, offset: usize, val: u8) {
-        let addr = pa + offset as u64;
-        if addr + 1 > self.size {
-            return;
-        }
-        if let Some(ptr) = self.resolve_ptr(addr) {
-            // SAFETY: bounds checked above. u8 is always 1-aligned,
-            // so this is a single volatile store.
-            unsafe { std::ptr::write_volatile(ptr, val) }
-        }
+        self.write_scalar::<1>(pa, offset, val.to_ne_bytes());
     }
 
     /// Write a u64 at DRAM offset `pa + offset`.
     pub fn write_u64(&self, pa: u64, offset: usize, val: u64) {
-        let addr = pa + offset as u64;
-        if addr + 8 > self.size {
-            return;
-        }
-        if let Some(ptr) = self.resolve_ptr(addr) {
-            // SAFETY: bounds checked above.
-            unsafe { Self::write_volatile_bytes::<8>(ptr, val.to_ne_bytes()) };
-        }
-    }
-
-    /// Read a u8 at DRAM offset `pa + offset`.
-    pub fn read_u8(&self, pa: u64, offset: usize) -> u8 {
-        let addr = pa + offset as u64;
-        if addr + 1 > self.size {
-            return 0;
-        }
-        match self.resolve_ptr(addr) {
-            // SAFETY: bounds checked above. u8 is always 1-aligned.
-            Some(ptr) => unsafe { std::ptr::read_volatile(ptr) },
-            None => 0,
-        }
+        self.write_scalar::<8>(pa, offset, val.to_ne_bytes());
     }
 
     /// Read `len` bytes from DRAM offset `pa` into `buf`.
@@ -296,14 +283,7 @@ impl GuestMem {
 
     /// Write a u32 at DRAM offset `pa + offset`.
     pub fn write_u32(&self, pa: u64, offset: usize, val: u32) {
-        let addr = pa + offset as u64;
-        if addr + 4 > self.size {
-            return;
-        }
-        if let Some(ptr) = self.resolve_ptr(addr) {
-            // SAFETY: bounds checked above.
-            unsafe { Self::write_volatile_bytes::<4>(ptr, val.to_ne_bytes()) };
-        }
+        self.write_scalar::<4>(pa, offset, val.to_ne_bytes());
     }
 
     /// Translate a kernel virtual address to guest physical address via

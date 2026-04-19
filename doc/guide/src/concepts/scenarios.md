@@ -51,7 +51,7 @@ suites do not need it.
 
 For `Steady` scenarios, `run_scenario()`:
 
-1. Resolves cpusets from `cpuset_mode` and the VM's topology.
+1. Resolves cpusets from `cpuset_partition` and the VM's topology.
 2. Creates cgroups via `CgroupManager`.
 3. Forks worker processes via `WorkloadHandle::spawn()`.
 4. Moves workers into their target cgroups.
@@ -85,13 +85,13 @@ pub struct Scenario {
     pub required_flags: &'static [&'static flags::FlagDecl],
     pub excluded_flags: &'static [&'static flags::FlagDecl],
     pub num_cgroups: usize,
-    pub cpuset_mode: CpusetMode,
+    pub cpuset_partition: CpusetPartition,
     pub cgroup_works: Vec<Work>,
     pub action: Action,
 }
 ```
 
-**`cpuset_mode`** -- how to partition CPUs across cgroups. This is an
+**`cpuset_partition`** -- how to partition CPUs across cgroups. This is an
 internal type; external tests use
 [`CpusetSpec`](ops.md#cpusetspec) instead.
 

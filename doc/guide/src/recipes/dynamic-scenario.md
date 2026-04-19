@@ -58,7 +58,7 @@ Scenario {
     required_flags: &[],
     excluded_flags: &[],
     num_cgroups: 0,
-    cpuset_mode: CpusetMode::None,
+    cpuset_partition: CpusetPartition::None,
     cgroup_works: vec![],
     action: Action::Custom(my_resize_scenario),
 }

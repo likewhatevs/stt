@@ -17,7 +17,7 @@
 //! The [`scenarios`] submodule provides curated canned scenarios.
 //!
 //! For data-driven test cases (used by the internal catalog), see
-//! [`Scenario`], [`CpusetMode`], and [`Action`].
+//! [`Scenario`], [`CpusetPartition`], and [`Action`].
 //!
 //! See the [Scenarios](https://likewhatevs.github.io/ktstr/guide/concepts/scenarios.html)
 //! and [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
@@ -168,7 +168,11 @@ pub mod flags {
         requires: &[],
     };
 
-    /// All flag declarations in canonical order.
+    /// All flag declarations in canonical order. Single source of truth
+    /// for the flag set -- adding a [`FlagDecl`] here automatically
+    /// extends every consumer (`--flags` parsing, profile generation,
+    /// drift tests, docs) because [`ALL`] and the short-name constants
+    /// project `ALL_DECLS[i].name`.
     pub static ALL_DECLS: &[&FlagDecl] = &[
         &LLC_DECL,
         &BORROW_DECL,
@@ -178,15 +182,37 @@ pub mod flags {
         &NO_CTRL_DECL,
     ];
 
-    // String name constants for FlagProfile.flags.
-    pub const LLC: &str = "llc";
-    pub const BORROW: &str = "borrow";
-    pub const STEAL: &str = "steal";
-    pub const REBAL: &str = "rebal";
-    pub const REJECT_PIN: &str = "reject-pin";
-    pub const NO_CTRL: &str = "no-ctrl";
+    /// Number of declared flags. Compile-time bound on [`ALL`].
+    pub const N_FLAGS: usize = 6;
+    const _: () = assert!(
+        ALL_DECLS.len() == N_FLAGS,
+        "N_FLAGS must equal ALL_DECLS.len(); update both together",
+    );
 
-    pub const ALL: &[&str] = &[LLC, BORROW, STEAL, REBAL, REJECT_PIN, NO_CTRL];
+    // Short-name constants projected from `ALL_DECLS`. Keeping these as
+    // named `const`s preserves ergonomic `flags::LLC` references without
+    // re-spelling the literal -- any drift vs. `ALL_DECLS` fails to compile.
+    pub const LLC: &str = ALL_DECLS[0].name;
+    pub const BORROW: &str = ALL_DECLS[1].name;
+    pub const STEAL: &str = ALL_DECLS[2].name;
+    pub const REBAL: &str = ALL_DECLS[3].name;
+    pub const REJECT_PIN: &str = ALL_DECLS[4].name;
+    pub const NO_CTRL: &str = ALL_DECLS[5].name;
+
+    const fn build_all() -> [&'static str; N_FLAGS] {
+        let mut out = [""; N_FLAGS];
+        let mut i = 0;
+        while i < N_FLAGS {
+            out[i] = ALL_DECLS[i].name;
+            i += 1;
+        }
+        out
+    }
+
+    /// Canonical flag-name list, projected from [`ALL_DECLS`] at compile
+    /// time. Consumers iterate `ALL` for name-only use; `ALL_DECLS`
+    /// for dependency-aware use.
+    pub static ALL: &[&str] = &build_all();
 
     /// Look up a canonical flag name by its short name string.
     pub fn from_short_name(s: &str) -> Option<&'static str> {
@@ -291,10 +317,10 @@ fn generate_profiles(required: &[&'static str], excluded: &[&'static str]) -> Ve
 /// based on the VM's [`TestTopology`] and the scenario's `num_cgroups`.
 ///
 /// This is distinct from [`ops::CpusetSpec`], which computes a single
-/// cpuset for one cgroup in the ops/steps system. `CpusetMode`
+/// cpuset for one cgroup in the ops/steps system. `CpusetPartition`
 /// partitions at the scenario level; `CpusetSpec` specifies per-cgroup.
 #[derive(Clone, Debug)]
-pub enum CpusetMode {
+pub enum CpusetPartition {
     /// Each cgroup sees the full usable CPU set; no partitioning.
     None,
     /// Each cgroup is pinned to the CPUs of one full LLC, assigned in
@@ -380,7 +406,7 @@ pub struct Scenario {
     /// Number of cgroups to create.
     pub num_cgroups: usize,
     /// How to partition CPUs across cgroups.
-    pub cpuset_mode: CpusetMode,
+    pub cpuset_partition: CpusetPartition,
     /// Per-cgroup workload definitions.
     pub cgroup_works: Vec<Work>,
     /// Execution mode: steady-state or custom logic.
@@ -556,7 +582,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         return f(ctx);
     }
 
-    let cpusets = resolve_cpusets(&scenario.cpuset_mode, scenario.num_cgroups, ctx.topo);
+    let cpusets = resolve_cpusets(&scenario.cpuset_partition, scenario.num_cgroups, ctx.topo);
 
     // Skip if topology doesn't support the test
     if let Some(ref cs) = cpusets
@@ -689,15 +715,15 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
 }
 
 fn resolve_cpusets(
-    mode: &CpusetMode,
+    mode: &CpusetPartition,
     n: usize,
     topo: &TestTopology,
 ) -> Option<Vec<BTreeSet<usize>>> {
     let all = topo.all_cpus();
     let usable = topo.usable_cpus();
     match mode {
-        CpusetMode::None => None,
-        CpusetMode::LlcAligned => {
+        CpusetPartition::None => None,
+        CpusetPartition::LlcAligned => {
             let llcs = topo.split_by_llc();
             if llcs.len() < 2 {
                 return Some(vec![BTreeSet::new()]);
@@ -711,14 +737,14 @@ fn resolve_cpusets(
             }
             Some(sets)
         }
-        CpusetMode::SplitHalf => {
+        CpusetPartition::SplitHalf => {
             let mid = usable.len() / 2;
             Some(vec![
                 usable[..mid].iter().copied().collect(),
                 usable[mid..].iter().copied().collect(),
             ])
         }
-        CpusetMode::SplitMisaligned => {
+        CpusetPartition::SplitMisaligned => {
             let split = if topo.num_llcs() > 1 {
                 topo.cpus_in_llc(0).len() / 2
             } else {
@@ -729,15 +755,15 @@ fn resolve_cpusets(
                 usable[split..].iter().copied().collect(),
             ])
         }
-        CpusetMode::Overlap(frac) => Some(topo.overlapping_cpusets(n, *frac)),
-        CpusetMode::Uneven(frac) => {
+        CpusetPartition::Overlap(frac) => Some(topo.overlapping_cpusets(n, *frac)),
+        CpusetPartition::Uneven(frac) => {
             let split = (usable.len() as f64 * frac) as usize;
             Some(vec![
                 usable[..split.max(1)].iter().copied().collect(),
                 usable[split.max(1)..].iter().copied().collect(),
             ])
         }
-        CpusetMode::Holdback(frac) => {
+        CpusetPartition::Holdback(frac) => {
             let keep = all.len() - (all.len() as f64 * frac) as usize;
             let mid = keep / 2;
             Some(vec![
@@ -1067,13 +1093,13 @@ mod tests {
     #[test]
     fn resolve_cpusets_none_returns_none() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        assert!(resolve_cpusets(&CpusetMode::None, 2, &t).is_none());
+        assert!(resolve_cpusets(&CpusetPartition::None, 2, &t).is_none());
     }
 
     #[test]
     fn resolve_cpusets_split_half_covers_usable() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::SplitHalf, 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::SplitHalf, 2, &t).unwrap();
         assert_eq!(r.len(), 2);
         // Last CPU reserved for cgroup 0 → 7 usable
         let total: usize = r.iter().map(|s| s.len()).sum();
@@ -1083,7 +1109,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_llc_aligned() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::LlcAligned, 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::LlcAligned, 2, &t).unwrap();
         assert_eq!(r.len(), 2);
         // Both sets non-empty
         assert!(!r[0].is_empty());
@@ -1093,14 +1119,14 @@ mod tests {
     #[test]
     fn resolve_cpusets_uneven() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::Uneven(0.75), 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::Uneven(0.75), 2, &t).unwrap();
         assert!(r[0].len() > r[1].len(), "75/25 split should be uneven");
     }
 
     #[test]
     fn resolve_cpusets_holdback() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::Holdback(0.5), 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::Holdback(0.5), 2, &t).unwrap();
         let total: usize = r.iter().map(|s| s.len()).sum();
         assert!(total < 8, "holdback should use fewer CPUs");
     }
@@ -1108,7 +1134,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_overlap() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::Overlap(0.5), 3, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::Overlap(0.5), 3, &t).unwrap();
         assert_eq!(r.len(), 3);
     }
 
@@ -1196,7 +1222,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_split_misaligned() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::SplitMisaligned, 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::SplitMisaligned, 2, &t).unwrap();
         assert_eq!(r.len(), 2);
         let total: usize = r.iter().map(|s| s.len()).sum();
         assert!(total > 0);
@@ -1207,7 +1233,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_llc_aligned_single_llc() {
         let t = crate::topology::TestTopology::synthetic(4, 1);
-        let r = resolve_cpusets(&CpusetMode::LlcAligned, 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::LlcAligned, 2, &t).unwrap();
         // With 1 LLC, can only make 1 set -> returns empty for missing
         assert!(
             r.iter().any(|s| s.is_empty()),
@@ -1218,7 +1244,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_small_topology() {
         let t = crate::topology::TestTopology::synthetic(2, 1);
-        let r = resolve_cpusets(&CpusetMode::SplitHalf, 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::SplitHalf, 2, &t).unwrap();
         assert_eq!(r.len(), 2);
         // 2 CPUs, no reserve (too small), each gets 1
         assert_eq!(r[0].len(), 1);
@@ -1307,7 +1333,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_holdback_reserves_cpus() {
         let t = crate::topology::TestTopology::synthetic(12, 3);
-        let r = resolve_cpusets(&CpusetMode::Holdback(0.33), 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::Holdback(0.33), 2, &t).unwrap();
         let total: usize = r.iter().map(|s| s.len()).sum();
         // 12 CPUs, holdback 33%: keep = 12 - floor(12*0.33) = 12 - 3 = 9
         assert_eq!(total, 9, "holdback 33% of 12 should keep 9");
@@ -1318,7 +1344,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_overlap_sets_overlap() {
         let t = crate::topology::TestTopology::synthetic(12, 1);
-        let r = resolve_cpusets(&CpusetMode::Overlap(0.5), 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::Overlap(0.5), 2, &t).unwrap();
         let overlap: BTreeSet<usize> = r[0].intersection(&r[1]).copied().collect();
         assert!(
             !overlap.is_empty(),
@@ -1548,7 +1574,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_split_misaligned_single_llc() {
         let t = crate::topology::TestTopology::synthetic(8, 1);
-        let r = resolve_cpusets(&CpusetMode::SplitMisaligned, 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::SplitMisaligned, 2, &t).unwrap();
         assert_eq!(r.len(), 2);
         let total: usize = r.iter().map(|s| s.len()).sum();
         assert!(total > 0);
@@ -1557,7 +1583,7 @@ mod tests {
     #[test]
     fn resolve_cpusets_uneven_small_frac() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::Uneven(0.1), 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::Uneven(0.1), 2, &t).unwrap();
         assert!(
             r[0].len() < r[1].len(),
             "0.1 fraction should give smaller first set"
@@ -1699,7 +1725,7 @@ mod tests {
         // synthetic(8, 2) -> all_cpus=[0..7], usable=[0..6] (7 reserved).
         // SplitHalf: mid=3, first=[0,1,2], second=[3,4,5,6].
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::SplitHalf, 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::SplitHalf, 2, &t).unwrap();
         assert_eq!(r[0], [0, 1, 2].into_iter().collect());
         assert_eq!(r[1], [3, 4, 5, 6].into_iter().collect());
     }
@@ -1710,7 +1736,7 @@ mod tests {
         // Uneven(0.75): split = floor(7 * 0.75) = 5.
         // first=[0,1,2,3,4], second=[5,6].
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::Uneven(0.75), 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::Uneven(0.75), 2, &t).unwrap();
         assert_eq!(r[0].len(), 5);
         assert_eq!(r[1].len(), 2);
         assert_eq!(r[0], [0, 1, 2, 3, 4].into_iter().collect());
@@ -1723,7 +1749,7 @@ mod tests {
         // Holdback(0.5): keep = 8 - floor(8*0.5) = 4. mid=2.
         // first=[0,1], second=[2,3].
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetMode::Holdback(0.5), 2, &t).unwrap();
+        let r = resolve_cpusets(&CpusetPartition::Holdback(0.5), 2, &t).unwrap();
         let total: usize = r.iter().map(|s| s.len()).sum();
         assert_eq!(total, 4, "holdback 50% of 8 should keep 4");
         assert_eq!(r[0], [0, 1].into_iter().collect());

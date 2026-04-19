@@ -1,7 +1,7 @@
 //! CPU topology abstraction.
 //!
 //! [`TestTopology`] reads sysfs to discover CPUs, LLCs, and NUMA nodes.
-//! Provides cpuset generation methods used by [`CpusetMode`](crate::scenario::CpusetMode)
+//! Provides cpuset generation methods used by [`CpusetPartition`](crate::scenario::CpusetPartition)
 //! and [`CpusetSpec`](crate::scenario::ops::CpusetSpec).
 //!
 //! See the [Scenarios](https://likewhatevs.github.io/ktstr/guide/concepts/scenarios.html)

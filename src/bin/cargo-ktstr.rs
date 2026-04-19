@@ -354,8 +354,7 @@ fn run_coverage(
 fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
     match command {
         None => {
-            let output = cli::print_stats_report();
-            if !output.is_empty() {
+            if let Some(output) = cli::print_stats_report() {
                 print!("{output}");
             }
             Ok(())

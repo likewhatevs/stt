@@ -132,7 +132,7 @@ nodes to populate `NodeMemInfo`. When `None`, memory info is omitted.
 
 **`overlapping_cpusets(n, overlap_frac) -> Vec<BTreeSet<usize>>`** --
 generates `n` cpusets with `overlap_frac` overlap between adjacent
-sets. Used by `CpusetMode::Overlap`.
+sets. Used by `CpusetPartition::Overlap`.
 
 **`cpuset_string(cpus) -> String`** -- formats a CPU set as a compact
 range string (e.g. `"0-3,5,7-9"`). Used when writing `cpuset.cpus`.
@@ -160,9 +160,9 @@ topologies).
 ## How scenarios use topology
 
 `TestTopology` is available to scenarios via `Ctx.topo`. The
-`CpusetMode` variants use topology methods to partition CPUs:
+`CpusetPartition` variants use topology methods to partition CPUs:
 
-| CpusetMode | Topology method |
+| CpusetPartition | Topology method |
 |---|---|
 | `LlcAligned` | `split_by_llc()` |
 | `SplitHalf` | `usable_cpus()` split at midpoint |
@@ -197,5 +197,5 @@ See also: [CgroupManager](../architecture/cgroup-manager.md) for
 `set_cpuset()` which consumes cpuset strings,
 [CgroupGroup](../architecture/cgroup-group.md) for RAII cgroup
 management, [WorkloadHandle](../architecture/workload-handle.md) for
-worker lifecycle, [Scenarios](scenarios.md) for how `CpusetMode`
+worker lifecycle, [Scenarios](scenarios.md) for how `CpusetPartition`
 drives cpuset partitioning.

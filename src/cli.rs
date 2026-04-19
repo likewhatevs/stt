@@ -696,21 +696,20 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 /// reconstruct the `{kernel}-{git_short}` key the test process used; the
 /// mtime fallback mirrors "show me the report from my last test run."
 ///
-/// Returns an empty report with a warning on stderr when no sidecars
-/// are found. This is not an error -- regular test runs that skip
-/// gauntlet tests produce no sidecar files.
-pub fn print_stats_report() -> String {
+/// Returns `None` with a warning on stderr when no sidecars are found.
+/// This is not an error -- regular test runs that skip gauntlet tests
+/// produce no sidecar files.
+pub fn print_stats_report() -> Option<String> {
     let dir = match std::env::var("KTSTR_SIDECAR_DIR") {
         Ok(d) if !d.is_empty() => Some(std::path::PathBuf::from(d)),
         _ => crate::test_support::newest_run_dir(),
     };
-    let report = match dir.as_deref() {
-        Some(d) => crate::test_support::analyze_sidecars(Some(d)),
-        None => String::new(),
-    };
-    if report.is_empty() {
+    let report = dir
+        .as_deref()
+        .map(|d| crate::test_support::analyze_sidecars(Some(d)))
+        .filter(|r| !r.is_empty());
+    if report.is_none() {
         eprintln!("cargo ktstr: no sidecar data found (skipped)");
-        return String::new();
     }
     report
 }
