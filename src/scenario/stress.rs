@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn per_cpu_factory_produces_cgroup_per_cpu_capped_at_64() {
         let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
         let ctx = ctx_for_test(&cgroups, &topo);
 
         let steps = cgroup_per_cpu_steps(&ctx);
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn exhaust_reuse_builds_three_phases_with_matching_add_remove_counts() {
         let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::from_spec(1, 1, 8, 1);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 8, 1));
         let ctx = ctx_for_test(&cgroups, &topo);
 
         let steps = cgroup_exhaust_reuse_steps(&ctx);

@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn runner_new_rejects_zero_duration() {
-        let topo = TestTopology::from_spec(1, 2, 4, 2);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 2));
         let cfg = RunConfig {
             duration: Duration::ZERO,
             ..Default::default()
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn runner_new_rejects_zero_workers() {
-        let topo = TestTopology::from_spec(1, 2, 4, 2);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 2));
         let cfg = RunConfig {
             workers_per_cgroup: 0,
             ..Default::default()
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn runner_new_preserves_config() {
-        let topo = TestTopology::from_spec(1, 2, 4, 2);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 2));
         let config = RunConfig {
             duration: Duration::from_secs(30),
             workers_per_cgroup: 8,

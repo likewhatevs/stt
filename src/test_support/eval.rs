@@ -28,8 +28,8 @@ use crate::timeline::StimulusEvent;
 use crate::vmm;
 
 use super::output::{
-    SCHED_OUTPUT_START, classify_init_stage, ensure_kvm, extract_kernel_version,
-    extract_panic_message, extract_sched_ext_dump, format_console_diagnostics, parse_assert_result,
+    SCHED_OUTPUT_START, classify_init_stage, extract_kernel_version, extract_panic_message,
+    extract_sched_ext_dump, format_console_diagnostics, parse_assert_result,
     parse_assert_result_shm, parse_sched_output, sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
@@ -745,6 +745,24 @@ pub(crate) fn trim_settle_samples(
         preemption_threshold_ns: report.preemption_threshold_ns,
         watchdog_observation: report.watchdog_observation,
     }
+}
+
+/// Verify that `/dev/kvm` is accessible for read+write.
+///
+/// Pre-flight check for VM-booting test runs: every ktstr test needs
+/// a KVM fd, and failing fast here yields an actionable error
+/// ("add your user to the kvm group") before the VM builder starts
+/// allocating memory / fetching kernels.
+pub(crate) fn ensure_kvm() -> Result<()> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .context(
+            "/dev/kvm not accessible — KVM is required for ktstr_test. \
+             Check that KVM is enabled and your user is in the kvm group.",
+        )?;
+    Ok(())
 }
 
 /// Setup function for nextest `setup-script` integration.

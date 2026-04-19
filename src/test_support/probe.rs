@@ -546,7 +546,7 @@ pub(crate) fn format_probe_diagnostics(
 /// process args (the caller reads `/args` from the initramfs).
 /// Returns `Some(exit_code)` if dispatched, `None` if not an
 /// ktstr_test invocation.
-pub fn maybe_dispatch_vm_test() -> Option<i32> {
+pub(crate) fn maybe_dispatch_vm_test() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
     maybe_dispatch_vm_test_with_args(&args)
 }
@@ -712,7 +712,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     });
 
     // Sysfs is ground truth: CPUID, ACPI MADT, and MPTABLE all express
-    // the VM's actual topology. Only fall back to from_spec on error.
+    // the VM's actual topology. Only fall back to from_vm_topology on error.
     let topo = match crate::topology::TestTopology::from_system() {
         Ok(sys) => sys,
         Err(e) => {

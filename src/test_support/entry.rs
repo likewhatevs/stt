@@ -568,7 +568,16 @@ pub struct KtstrTestEntry {
     pub host_only: bool,
 }
 
-/// Placeholder function for `KtstrTestEntry::DEFAULT`. Panics if called.
+/// Placeholder function for [`KtstrTestEntry::DEFAULT`].
+///
+/// Returns `Err` — NOT a panic — so a programmatic caller that
+/// accidentally uses `KtstrTestEntry::DEFAULT` without overriding
+/// `func` gets an immediate actionable failure inside the test-run
+/// loop rather than taking down the whole dispatch process. The
+/// `..KtstrTestEntry::DEFAULT` struct-update spread only populates
+/// unfilled fields; if the caller spread the default without
+/// setting `func`, this stub runs and bails with a message pointing
+/// at the mistake.
 fn default_test_func(_ctx: &Ctx) -> Result<AssertResult> {
     anyhow::bail!("KtstrTestEntry::DEFAULT func called — override func before use")
 }
@@ -729,5 +738,101 @@ pub(crate) fn validate_entry_flags(entry: &KtstrTestEntry) {
                 entry.name, flag,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scenario::Ctx;
+
+    /// Minimal Ctx for invoking `default_test_func` without booting a
+    /// real workload. The func signature only requires `&Ctx`; the
+    /// stub returns Err unconditionally so no field on Ctx is read.
+    fn dummy_ctx() -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
+        let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/ktstr-dummy");
+        let topo = crate::topology::TestTopology::from_vm_topology(&Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        });
+        (cgroups, topo)
+    }
+
+    #[test]
+    fn ktstr_test_entry_default_fields() {
+        let d = KtstrTestEntry::DEFAULT;
+        assert_eq!(d.name, "");
+        // func is the stub — verified separately in
+        // default_test_func_returns_err.
+        assert_eq!(d.topology.llcs, 1);
+        assert_eq!(d.topology.cores_per_llc, 2);
+        assert_eq!(d.topology.threads_per_core, 1);
+        assert_eq!(d.topology.numa_nodes, 1);
+        assert!(d.topology.nodes.is_none());
+        assert!(d.topology.distances.is_none());
+        assert_eq!(d.constraints, TopologyConstraints::DEFAULT);
+        assert_eq!(d.memory_mb, 2048);
+        // scheduler defaults to the crate's &Scheduler::EEVDF.
+        assert_eq!(d.scheduler.name, "eevdf");
+        assert!(!d.scheduler.binary.has_active_scheduling());
+        assert!(d.auto_repro);
+        assert_eq!(d.replicas, 1);
+        assert!(d.extra_sched_args.is_empty());
+        assert_eq!(d.watchdog_timeout, Duration::from_secs(4));
+        assert!(d.bpf_map_write.is_none());
+        assert!(d.required_flags.is_empty());
+        assert!(d.excluded_flags.is_empty());
+        assert!(!d.performance_mode);
+        assert_eq!(d.duration, Duration::from_secs(2));
+        assert_eq!(d.workers_per_cgroup, 2);
+        assert!(!d.expect_err);
+        assert!(!d.host_only);
+    }
+
+    #[test]
+    fn ktstr_test_entry_default_passes_own_validation() {
+        // DEFAULT has name = "" which validate() rejects — so the
+        // stub entry cannot accidentally dispatch. This pins that
+        // invariant.
+        let err = KtstrTestEntry::DEFAULT.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("name") && msg.contains("non-empty"),
+            "expected name-non-empty bail, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn default_test_func_returns_err() {
+        // The stub bails with Err — NOT a panic. Callers that
+        // accidentally leave `func: default_test_func` in their
+        // entry must see a clean Err to surface the mistake.
+        let (cgroups, topo) = dummy_ctx();
+        let ctx = Ctx {
+            cgroups: &cgroups,
+            topo: &topo,
+            duration: Duration::from_millis(1),
+            workers_per_cgroup: 1,
+            sched_pid: 0,
+            settle: Duration::from_millis(0),
+            work_type_override: None,
+            assert: crate::assert::Assert::NONE,
+            wait_for_map_write: false,
+        };
+        let result = default_test_func(&ctx);
+        let err = result.expect_err("default_test_func must return Err, not Ok");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("KtstrTestEntry::DEFAULT func called"),
+            "expected DEFAULT-called bail message, got: {msg}"
+        );
+        assert!(
+            msg.contains("override func before use"),
+            "expected actionable hint, got: {msg}"
+        );
     }
 }

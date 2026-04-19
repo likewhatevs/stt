@@ -71,8 +71,11 @@ impl NodeMemInfo {
 ///
 /// Provides LLC-aware CPU partitioning, cpuset generation, NUMA
 /// distance queries, and per-node memory introspection. Built from
-/// sysfs (`from_system()`), a VM spec (`from_spec()`), or synthetic
-/// parameters (test-only).
+/// sysfs ([`from_system`](Self::from_system)), a VM spec
+/// ([`from_vm_topology`](Self::from_vm_topology) — takes a
+/// [`crate::vmm::topology::Topology`] built via
+/// `Topology::new(numa, llcs, cores, threads)`), or synthetic
+/// parameters ([`synthetic`](Self::synthetic), test-only).
 #[derive(Debug, Clone)]
 pub struct TestTopology {
     cpus: Vec<usize>,
@@ -712,17 +715,6 @@ impl TestTopology {
         ranges.join(",")
     }
 
-    /// Build a topology from a VM spec (NUMA nodes x LLCs x cores x threads).
-    ///
-    /// Parameters are big-to-little: NUMA nodes, LLCs, cores per LLC,
-    /// threads per core. Multiple LLCs can share a NUMA node when
-    /// `numa_nodes < llcs`. CPUs are numbered sequentially. Used as a
-    /// fallback when sysfs is incomplete inside a guest VM.
-    pub fn from_spec(numa_nodes: u32, llcs: u32, cores: u32, threads: u32) -> Self {
-        let topo = crate::vmm::topology::Topology::new(numa_nodes, llcs, cores, threads);
-        Self::from_vm_topology(&topo)
-    }
-
     /// Build a [`TestTopology`] from a [`Topology`](crate::vmm::topology::Topology).
     ///
     /// Populates LLCs, NUMA nodes, distances, per-node memory info,
@@ -975,7 +967,7 @@ mod tests {
 
     #[test]
     fn from_spec_single_llc() {
-        let t = TestTopology::from_spec(1, 1, 4, 2);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 2));
         assert_eq!(t.total_cpus(), 8);
         assert_eq!(t.num_llcs(), 1);
         assert_eq!(t.num_numa_nodes(), 1);
@@ -985,7 +977,7 @@ mod tests {
 
     #[test]
     fn from_spec_multi_llc() {
-        let t = TestTopology::from_spec(1, 2, 4, 2);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 2));
         assert_eq!(t.total_cpus(), 16);
         assert_eq!(t.num_llcs(), 2);
         assert_eq!(t.num_numa_nodes(), 1);
@@ -995,7 +987,7 @@ mod tests {
 
     #[test]
     fn from_spec_no_smt() {
-        let t = TestTopology::from_spec(1, 2, 2, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 2, 1));
         assert_eq!(t.total_cpus(), 4);
         assert_eq!(t.num_llcs(), 2);
         assert_eq!(t.cpus_in_llc(0), &[0, 1]);
@@ -1004,7 +996,7 @@ mod tests {
 
     #[test]
     fn from_spec_minimal() {
-        let t = TestTopology::from_spec(1, 1, 1, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 1, 1));
         assert_eq!(t.total_cpus(), 1);
         assert_eq!(t.num_llcs(), 1);
         assert_eq!(t.all_cpus(), &[0]);
@@ -1012,7 +1004,7 @@ mod tests {
 
     #[test]
     fn from_spec_multi_numa() {
-        let t = TestTopology::from_spec(2, 4, 4, 2);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 2));
         assert_eq!(t.total_cpus(), 32);
         assert_eq!(t.num_llcs(), 4);
         assert_eq!(t.num_numa_nodes(), 2);
@@ -1092,7 +1084,7 @@ mod tests {
     /// llc_sets[1].
     #[test]
     fn split_by_llc_two_llc_regression() {
-        let t = TestTopology::from_spec(1, 2, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 1));
         assert_eq!(t.total_cpus(), 8);
         assert_eq!(t.num_llcs(), 2);
 
@@ -1168,7 +1160,7 @@ mod tests {
 
     #[test]
     fn from_spec_large() {
-        let t = TestTopology::from_spec(1, 4, 8, 2);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 4, 8, 2));
         assert_eq!(t.total_cpus(), 64);
         assert_eq!(t.num_llcs(), 4);
         assert_eq!(t.num_numa_nodes(), 1);
@@ -1187,7 +1179,7 @@ mod tests {
 
     #[test]
     fn from_spec_cores_populated() {
-        let t = TestTopology::from_spec(1, 2, 4, 2);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 2));
         let llc0 = &t.llcs()[0];
         assert_eq!(llc0.num_cores(), 4);
         assert_eq!(llc0.cores().len(), 4);
@@ -1201,7 +1193,7 @@ mod tests {
 
     #[test]
     fn from_spec_no_smt_cores() {
-        let t = TestTopology::from_spec(1, 1, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
         let llc = &t.llcs()[0];
         assert_eq!(llc.num_cores(), 4);
         assert_eq!(llc.cores()[&0], vec![0]);
@@ -1306,7 +1298,7 @@ mod tests {
         // NUMA 1: LLCs 2,3 → CPUs 8-11, 12-15 = 8-15 (but only 16 CPUs)
         //
         // from_spec(2, 4, 4, 1) → 4 LLCs × 4 cores × 1 thread = 16 CPUs
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert_eq!(t.total_cpus(), 16);
         assert_eq!(t.num_numa_nodes(), 2);
         assert_eq!(t.num_llcs(), 4);
@@ -1386,14 +1378,14 @@ mod tests {
 
     #[test]
     fn numa_nodes_for_cpuset_single_node() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         let cpuset: BTreeSet<usize> = (0..4).collect(); // LLC 0, NUMA 0
         assert_eq!(t.numa_nodes_for_cpuset(&cpuset), [0].into_iter().collect());
     }
 
     #[test]
     fn numa_nodes_for_cpuset_both_nodes() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         let cpuset: BTreeSet<usize> = [0, 8].into_iter().collect(); // NUMA 0 + NUMA 1
         assert_eq!(
             t.numa_nodes_for_cpuset(&cpuset),
@@ -1403,7 +1395,7 @@ mod tests {
 
     #[test]
     fn numa_nodes_for_cpuset_empty() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert!(t.numa_nodes_for_cpuset(&BTreeSet::new()).is_empty());
     }
 
@@ -1411,27 +1403,27 @@ mod tests {
 
     #[test]
     fn from_spec_numa_distance_local() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert_eq!(t.numa_distance(0, 0), 10);
         assert_eq!(t.numa_distance(1, 1), 10);
     }
 
     #[test]
     fn from_spec_numa_distance_remote() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert_eq!(t.numa_distance(0, 1), 20);
         assert_eq!(t.numa_distance(1, 0), 20);
     }
 
     #[test]
     fn from_spec_numa_distance_single_node() {
-        let t = TestTopology::from_spec(1, 2, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 1));
         assert_eq!(t.numa_distance(0, 0), 10);
     }
 
     #[test]
     fn numa_distance_invalid_node() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert_eq!(t.numa_distance(0, 99), 255);
         assert_eq!(t.numa_distance(99, 0), 255);
     }
@@ -1466,7 +1458,7 @@ mod tests {
 
     #[test]
     fn from_spec_no_meminfo() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert!(t.node_meminfo(0).is_none());
         assert!(t.node_meminfo(1).is_none());
     }
@@ -1481,14 +1473,14 @@ mod tests {
 
     #[test]
     fn from_spec_not_memory_only() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert!(!t.is_memory_only(0));
         assert!(!t.is_memory_only(1));
     }
 
     #[test]
     fn is_memory_only_nonexistent_node() {
-        let t = TestTopology::from_spec(2, 4, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(2, 4, 4, 1));
         assert!(!t.is_memory_only(99));
     }
 
@@ -1498,7 +1490,7 @@ mod tests {
     /// than crashing the test run.
     #[test]
     fn llc_aligned_cpuset_out_of_range_returns_empty() {
-        let t = TestTopology::from_spec(1, 2, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 1));
         assert_eq!(t.num_llcs(), 2);
         let empty = t.llc_aligned_cpuset(99);
         assert!(
@@ -1510,7 +1502,7 @@ mod tests {
     /// Companion for `cpus_in_llc` — same out-of-range handling.
     #[test]
     fn cpus_in_llc_out_of_range_returns_empty_slice() {
-        let t = TestTopology::from_spec(1, 2, 4, 1);
+        let t = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 1));
         assert_eq!(t.cpus_in_llc(99), &[] as &[usize]);
     }
 
@@ -1556,7 +1548,7 @@ mod tests {
     fn every_constructor_produces_nonzero_llcs() {
         let a = TestTopology::synthetic(8, 2);
         assert!(a.num_llcs() >= 1);
-        let b = TestTopology::from_spec(1, 2, 4, 1);
+        let b = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 4, 1));
         assert!(b.num_llcs() >= 1);
         // `from_system` depends on /sys; skip when unavailable.
         if let Ok(c) = TestTopology::from_system() {

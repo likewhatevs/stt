@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn host_cgroup_contention_builds_two_defs_and_host_spawn() {
         let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
         let ctx = ctx_for_test(&cgroups, &topo);
 
         let steps = host_cgroup_contention_steps(&ctx);
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn sched_mixed_builds_two_add_cgroups_and_eight_spawns() {
         let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
         let ctx = ctx_for_test(&cgroups, &topo);
 
         let steps = sched_mixed_steps(&ctx);
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn cgroup_pipe_io_spawn_counts_follow_workers_per_cgroup() {
         let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
         let ctx = ctx_for_test(&cgroups, &topo);
 
         let steps = cgroup_pipe_io_steps(&ctx);

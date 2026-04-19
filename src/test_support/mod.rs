@@ -88,19 +88,22 @@ pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
 // host-side reader (eval.rs / probe.rs) which parses them back. Single
 // source of truth for the wire format — a rename stays in sync.
 #[cfg(test)]
+pub(crate) use eval::ensure_kvm;
+#[cfg(test)]
 pub(crate) use output::{
-    RESULT_END, RESULT_START, classify_init_stage, ensure_kvm, extract_kernel_version,
-    extract_panic_message, extract_sched_ext_dump, format_console_diagnostics, parse_assert_result,
-    parse_sched_output, sched_log_fingerprint,
+    RESULT_END, RESULT_START, classify_init_stage, extract_kernel_version, extract_panic_message,
+    extract_sched_ext_dump, format_console_diagnostics, parse_assert_result, parse_sched_output,
+    sched_log_fingerprint,
 };
 pub(crate) use output::{SCHED_OUTPUT_END, SCHED_OUTPUT_START};
+pub(crate) use probe::maybe_dispatch_vm_test;
+pub use probe::propagate_rust_env_from_cmdline;
 #[cfg(test)]
 pub(crate) use probe::{PROBE_OUTPUT_END, PROBE_OUTPUT_START, ProbePayload, extract_probe_output};
 pub(crate) use probe::{
     PipelineDiagnostics, format_probe_diagnostics, maybe_dispatch_vm_test_with_args,
     maybe_dispatch_vm_test_with_phase_a, start_probe_phase_a,
 };
-pub use probe::{maybe_dispatch_vm_test, propagate_rust_env_from_cmdline};
 #[cfg(test)]
 pub(crate) use profraw::MSG_TYPE_PROFRAW;
 pub(crate) use profraw::try_flush_profraw;

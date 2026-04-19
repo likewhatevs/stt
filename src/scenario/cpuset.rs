@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn apply_midrun_builds_two_phase_steps() {
         let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
         let ctx = ctx_for_test(&cgroups, &topo);
 
         let steps = cgroup_cpuset_apply_midrun_steps(&ctx);
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn resize_builds_three_phase_range_progression() {
         let cgroups = CgroupManager::new("/nonexistent");
-        let topo = TestTopology::from_spec(1, 1, 4, 1);
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
         let ctx = ctx_for_test(&cgroups, &topo);
 
         let steps = cgroup_cpuset_resize_steps(&ctx);

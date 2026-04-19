@@ -1667,7 +1667,9 @@ mod tests {
     fn cpusetspec_exact_is_passthrough() {
         let cpus: BTreeSet<usize> = [0, 2, 4].iter().copied().collect();
         let spec = CpusetSpec::Exact(cpus.clone());
-        let topo = crate::topology::TestTopology::from_spec(1, 1, 4, 1);
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(1, 1, 4, 1),
+        );
         let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
         let ctx = Ctx {
             cgroups: &cgroups,
@@ -1707,7 +1709,9 @@ mod tests {
         threads: u32,
     ) -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
         let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
-        let topo = crate::topology::TestTopology::from_spec(1, llcs, cores, threads);
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(1, llcs, cores, threads),
+        );
         (cgroups, topo)
     }
 
@@ -1948,7 +1952,9 @@ mod tests {
         threads: u32,
     ) -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
         let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
-        let topo = crate::topology::TestTopology::from_spec(numa_nodes, llcs, cores, threads);
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(numa_nodes, llcs, cores, threads),
+        );
         (cgroups, topo)
     }
 
@@ -2448,7 +2454,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&parent);
         std::fs::create_dir_all(&parent).unwrap();
         let cgroups = crate::cgroup::CgroupManager::new(parent.to_str().unwrap());
-        let topo = crate::topology::TestTopology::from_spec(1, 1, 4, 1);
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(1, 1, 4, 1),
+        );
         let ctx = ctx_from(&cgroups, &topo);
         let cg_name = "should_never_exist";
         let step = Step::new(

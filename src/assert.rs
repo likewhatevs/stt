@@ -207,7 +207,10 @@ impl AssertDetail {
 impl From<String> for AssertDetail {
     /// Conversion for uncategorized messages; defaults `kind` to
     /// [`DetailKind::Other`]. Prefer [`AssertDetail::new`] when the
-    /// detail has a meaningful category.
+    /// detail has a meaningful category — the `DetailKind` is serialized
+    /// into the sidecar JSON and consumed by stats tooling to bucket
+    /// failures, so losing the category bucket makes post-run
+    /// categorization rely on free-text regex against `message`.
     fn from(message: String) -> Self {
         Self {
             kind: DetailKind::Other,
@@ -217,6 +220,12 @@ impl From<String> for AssertDetail {
 }
 
 impl From<&str> for AssertDetail {
+    /// Conversion for uncategorized messages; defaults `kind` to
+    /// [`DetailKind::Other`]. Prefer [`AssertDetail::new`] when the
+    /// detail has a meaningful category — the `DetailKind` is serialized
+    /// into the sidecar JSON and consumed by stats tooling to bucket
+    /// failures, so losing the category bucket makes post-run
+    /// categorization rely on free-text regex against `message`.
     fn from(s: &str) -> Self {
         Self {
             kind: DetailKind::Other,

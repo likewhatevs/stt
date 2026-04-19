@@ -29,9 +29,6 @@
 //!   lifecycle a silent failure happened.
 //! - [`format_console_diagnostics`] composes the `--- diagnostics ---`
 //!   block appended to failed-test error output.
-//! - [`ensure_kvm`] is the pre-flight check that aborts early if
-//!   `/dev/kvm` isn't readable/writable — no point constructing a VM
-//!   builder if the kernel won't let us open the device.
 
 use anyhow::{Context, Result};
 
@@ -217,17 +214,4 @@ pub(crate) fn format_console_diagnostics(
         ));
     }
     format!("\n\n--- diagnostics ---\n{}", parts.join("\n"))
-}
-
-/// Verify that `/dev/kvm` is accessible for read+write.
-pub(crate) fn ensure_kvm() -> Result<()> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .context(
-            "/dev/kvm not accessible — KVM is required for ktstr_test. \
-             Check that KVM is enabled and your user is in the kvm group.",
-        )?;
-    Ok(())
 }
