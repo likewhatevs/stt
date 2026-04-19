@@ -30,6 +30,28 @@ pub mod idr;
 pub mod reader;
 pub mod symbols;
 
+/// Guest physical address of the top-level page-table page (CR3 on x86,
+/// TTBR1 on aarch64). Newtype around `u64` so address kinds can't
+/// accidentally mix — passing a `PageOffset` where a `Cr3Pa` is
+/// expected fails to compile instead of silently walking the wrong
+/// tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Cr3Pa(pub u64);
+
+/// Kernel direct-map base (x86-64 `PAGE_OFFSET`, aarch64 linear map
+/// base). Adding this to a DRAM offset yields a KVA; subtracting it
+/// from a KVA yields the DRAM offset that `GuestMem` reads use.
+/// Newtype around `u64`; see [`Cr3Pa`] for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PageOffset(pub u64);
+
+/// A kernel virtual address. Translated to a physical address via the
+/// text mapping (symbol addresses), the direct mapping (SLAB / kmalloc),
+/// or a full page-table walk (vmalloc / .bss). Newtype around `u64`;
+/// see [`Cr3Pa`] for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Kva(pub u64);
+
 /// DSQ depth above this value indicates uninitialized guest memory.
 /// Real kernels never queue this many tasks on a single CPU's local DSQ.
 pub const DSQ_PLAUSIBILITY_CEILING: u32 = 10_000;
@@ -273,11 +295,13 @@ pub struct WatchdogObservation {
 
 /// Tracks consecutive threshold violations and records the worst run.
 ///
-/// Used by `MonitorThresholds::evaluate` for imbalance, DSQ depth, fallback
-/// rate, keep-last rate, and stall checks. Call `record(true)` on
-/// violation, `record(false)` on pass.
+/// Used by `MonitorThresholds::evaluate` (post-hoc, from the collected
+/// sample vector) and the reactive `monitor_loop` dump path. Both paths
+/// share the tracker so "sustained for N samples" means exactly the
+/// same thing to the inline SysRq-D trigger and the after-the-fact
+/// verdict. Call `record(true)` on violation, `record(false)` on pass.
 #[derive(Debug, Clone, Default)]
-struct SustainedViolationTracker {
+pub(crate) struct SustainedViolationTracker {
     consecutive: usize,
     worst_run: usize,
     worst_value: f64,
@@ -287,7 +311,7 @@ struct SustainedViolationTracker {
 impl SustainedViolationTracker {
     /// Record a sample. `violated`: whether the threshold was exceeded.
     /// `value`: the metric value for this sample. `at`: sample index.
-    fn record(&mut self, violated: bool, value: f64, at: usize) {
+    pub(crate) fn record(&mut self, violated: bool, value: f64, at: usize) {
         if violated {
             self.consecutive += 1;
             if self.consecutive > self.worst_run {
@@ -301,7 +325,7 @@ impl SustainedViolationTracker {
     }
 
     /// Whether the worst run met or exceeded the sustained threshold.
-    fn sustained(&self, threshold: usize) -> bool {
+    pub(crate) fn sustained(&self, threshold: usize) -> bool {
         self.worst_run >= threshold
     }
 }

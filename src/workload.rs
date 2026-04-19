@@ -1660,6 +1660,49 @@ use std::os::unix::io::FromRawFd;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
+/// Wrap `FUTEX_WAKE` on `futex_ptr`, waking up to `n_waiters` tasks.
+/// Thin wrapper around `libc::syscall(SYS_futex, ...)` — callers of the
+/// wake path duplicate the 7-arg layout in every spot otherwise.
+///
+/// # Safety
+/// `futex_ptr` must point to a live `u32` reachable by every thread
+/// that might block on this futex word.
+unsafe fn futex_wake(futex_ptr: *mut u32, n_waiters: i32) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            futex_ptr,
+            libc::FUTEX_WAKE,
+            n_waiters,
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<u32>(),
+            0u32,
+        );
+    }
+}
+
+/// Wrap `FUTEX_WAIT` on `futex_ptr` with expected value `expected` and
+/// the given timespec. Returns once the wait returns (wake, timeout, or
+/// value mismatch) without inspecting the outcome — callers typically
+/// re-check the state via `read_volatile`.
+///
+/// # Safety
+/// `futex_ptr` must point to a live `u32` reachable by every thread
+/// that might wake this futex word.
+unsafe fn futex_wait(futex_ptr: *mut u32, expected: u32, ts: &libc::timespec) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            futex_ptr,
+            libc::FUTEX_WAIT,
+            expected,
+            ts as *const libc::timespec,
+            std::ptr::null::<u32>(),
+            0u32,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_main(
     affinity: Option<BTreeSet<usize>>,
@@ -1876,15 +1919,7 @@ fn worker_main(
                 // Wake partner
                 unsafe {
                     std::ptr::write_volatile(futex_ptr, partner_val);
-                    libc::syscall(
-                        libc::SYS_futex,
-                        futex_ptr,
-                        libc::FUTEX_WAKE,
-                        1, // wake one waiter
-                        std::ptr::null::<libc::timespec>(),
-                        std::ptr::null::<u32>(),
-                        0u32,
-                    );
+                    futex_wake(futex_ptr, 1);
                 }
                 // Wait for partner to set our expected value, with timeout
                 // to avoid blocking forever if partner has stopped.
@@ -1907,17 +1942,7 @@ fn worker_main(
                         );
                         break;
                     }
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_futex,
-                            futex_ptr,
-                            libc::FUTEX_WAIT,
-                            partner_val, // expected value
-                            &ts as *const libc::timespec,
-                            std::ptr::null::<u32>(),
-                            0u32,
-                        );
-                    }
+                    unsafe { futex_wait(futex_ptr, partner_val, &ts) };
                 }
                 // Reset last_iter_time after blocking step
                 last_iter_time = Instant::now();
@@ -1984,15 +2009,7 @@ fn worker_main(
                     let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
                     unsafe {
                         std::ptr::write_volatile(futex_ptr, next);
-                        libc::syscall(
-                            libc::SYS_futex,
-                            futex_ptr,
-                            libc::FUTEX_WAKE,
-                            fan_out as i32,
-                            std::ptr::null::<libc::timespec>(),
-                            std::ptr::null::<u32>(),
-                            0u32,
-                        );
+                        futex_wake(futex_ptr, fan_out as i32);
                     }
                     // Short spin to let receivers run before next wake cycle.
                     for _ in 0..256 {
@@ -2020,17 +2037,7 @@ fn worker_main(
                             );
                             break;
                         }
-                        unsafe {
-                            libc::syscall(
-                                libc::SYS_futex,
-                                futex_ptr,
-                                libc::FUTEX_WAIT,
-                                expected,
-                                &ts as *const libc::timespec,
-                                std::ptr::null::<u32>(),
-                                0u32,
-                            );
-                        }
+                        unsafe { futex_wait(futex_ptr, expected, &ts) };
                     }
                 }
                 last_iter_time = Instant::now();
@@ -2243,15 +2250,7 @@ fn worker_main(
                     let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
                     unsafe {
                         std::ptr::write_volatile(futex_ptr, next);
-                        libc::syscall(
-                            libc::SYS_futex,
-                            futex_ptr,
-                            libc::FUTEX_WAKE,
-                            fan_out as i32,
-                            std::ptr::null::<libc::timespec>(),
-                            std::ptr::null::<u32>(),
-                            0u32,
-                        );
+                        futex_wake(futex_ptr, fan_out as i32);
                     }
                     spin_burst(&mut work_units, 256);
                 } else {
@@ -2284,17 +2283,7 @@ fn worker_main(
                             );
                             break;
                         }
-                        unsafe {
-                            libc::syscall(
-                                libc::SYS_futex,
-                                futex_ptr,
-                                libc::FUTEX_WAIT,
-                                expected,
-                                &ts as *const libc::timespec,
-                                std::ptr::null::<u32>(),
-                                0u32,
-                            );
-                        }
+                        unsafe { futex_wait(futex_ptr, expected, &ts) };
                     }
                     if sleep_usec > 0 && !STOP.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_micros(sleep_usec));
@@ -2390,16 +2379,8 @@ fn worker_main(
                         tv_nsec: 100_000_000, // 100ms
                     };
                     unsafe {
-                        libc::syscall(
-                            libc::SYS_futex,
-                            futex_ptr,
-                            libc::FUTEX_WAIT,
-                            1u32, // expected value (locked)
-                            &ts as *const libc::timespec,
-                            std::ptr::null::<u32>(),
-                            0u32,
-                        );
-                    }
+                        futex_wait(futex_ptr, 1u32 /* expected value (locked) */, &ts)
+                    };
                     reservoir_push(
                         &mut resume_latencies_ns,
                         &mut wake_sample_count,
@@ -2412,17 +2393,7 @@ fn worker_main(
                 // Release: atomic store with Release ordering ensures
                 // critical section work is visible before the unlock.
                 atom.store(0, Ordering::Release);
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_futex,
-                        futex_ptr,
-                        libc::FUTEX_WAKE,
-                        1,
-                        std::ptr::null::<libc::timespec>(),
-                        std::ptr::null::<u32>(),
-                        0u32,
-                    );
-                }
+                unsafe { futex_wake(futex_ptr, 1) };
                 last_iter_time = Instant::now();
                 iterations += 1;
             }

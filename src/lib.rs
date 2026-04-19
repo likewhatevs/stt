@@ -315,6 +315,15 @@ pub use crate::probe::process::resolve_func_ip;
 pub mod prelude {
     pub use anyhow::Result;
 
+    // `Scheduler` exists in both the type namespace (the
+    // `test_support::Scheduler` *struct* — the scheduler-definition
+    // record test authors build) and the macro namespace (the
+    // `#[derive(Scheduler)]` *derive macro* from `ktstr-macros`).
+    // Rust separates these, so `let s: Scheduler = ...` and
+    // `#[derive(Scheduler)]` both resolve unambiguously. The double
+    // spelling is intentional: `#[derive(Scheduler)]` generates a
+    // `static` of type `Scheduler`, and matching the derive-macro
+    // name to its emitted type reads naturally at the call site.
     pub use crate::Scheduler;
     pub use crate::assert::{Assert, AssertResult};
     pub use crate::cgroup::CgroupManager;

@@ -978,9 +978,14 @@ pub(crate) fn monitor_loop(
         super::vcpu_preemption_threshold_ns(None)
     };
     let mut samples: Vec<MonitorSample> = Vec::new();
-    let mut consecutive_imbalance = 0usize;
-    let mut consecutive_dsq = 0usize;
-    let mut consecutive_stall = vec![0usize; rq_pas.len()];
+    // Reactive threshold trackers — reuse the post-hoc
+    // `SustainedViolationTracker` so "sustained for N samples"
+    // means the same thing to the reactive SysRq-D dump and to
+    // `MonitorThresholds::evaluate` running over the full sample vec.
+    let mut imbalance_tracker = super::SustainedViolationTracker::default();
+    let mut dsq_tracker = super::SustainedViolationTracker::default();
+    let mut stall_trackers: Vec<super::SustainedViolationTracker> =
+        vec![super::SustainedViolationTracker::default(); rq_pas.len()];
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(rq_pas.len());
     let mut prev_vcpu_times: Option<Vec<Option<u64>>> = None;
@@ -1068,36 +1073,36 @@ pub(crate) fn monitor_loop(
             }
         }
 
-        // Inline threshold evaluation for reactive dump.
+        // Inline threshold evaluation for reactive dump. The violation
+        // predicates mirror `MonitorThresholds::evaluate`: the same
+        // `SustainedViolationTracker`, the same `evaluate_preempted`
+        // helper, the same `imbalance_ratio`/`local_dsq_depth` reads.
+        // Any drift would let the reactive SysRq-D trigger fire on
+        // conditions the post-hoc verdict accepts (or vice versa).
         if let Some(trigger) = dump_trigger
             && !dump_requested
             && !cpus.is_empty()
         {
             let t = &trigger.thresholds;
+            let sample_idx = samples.len();
 
-            // Imbalance check.
-            let mut min_nr = u32::MAX;
-            let mut max_nr = 0u32;
-            for cpu in &cpus {
-                min_nr = min_nr.min(cpu.nr_running);
-                max_nr = max_nr.max(cpu.nr_running);
-            }
-            let ratio = max_nr as f64 / min_nr.max(1) as f64;
-            if ratio > t.max_imbalance_ratio {
-                consecutive_imbalance += 1;
-            } else {
-                consecutive_imbalance = 0;
-            }
+            // Imbalance check — use the shared sample method so the
+            // min_nr.max(1)/max_nr calculation matches post-hoc.
+            let tmp_sample = MonitorSample {
+                elapsed_ms: 0,
+                cpus: cpus.clone(),
+                prog_stats: None,
+            };
+            let ratio = tmp_sample.imbalance_ratio();
+            imbalance_tracker.record(ratio > t.max_imbalance_ratio, ratio, sample_idx);
 
             // DSQ depth check.
-            if cpus
-                .iter()
-                .any(|c| c.local_dsq_depth > t.max_local_dsq_depth)
-            {
-                consecutive_dsq += 1;
-            } else {
-                consecutive_dsq = 0;
-            }
+            let worst_dsq = cpus.iter().map(|c| c.local_dsq_depth).max().unwrap_or(0);
+            dsq_tracker.record(
+                worst_dsq > t.max_local_dsq_depth,
+                worst_dsq as f64,
+                sample_idx,
+            );
 
             // Stall check: per-CPU sustained window, exempt idle CPUs
             // (nr_running==0 in both samples: NOHZ tick stopped) and
@@ -1105,7 +1110,7 @@ pub(crate) fn monitor_loop(
             if t.fail_on_stall
                 && let Some(prev) = samples.last()
             {
-                let n = prev.cpus.len().min(cpus.len());
+                let n = prev.cpus.len().min(cpus.len()).min(stall_trackers.len());
                 for i in 0..n {
                     let idle = cpus[i].nr_running == 0 && prev.cpus[i].nr_running == 0;
                     // Delegate to the shared pure predicate so reactive
@@ -1126,16 +1131,14 @@ pub(crate) fn monitor_loop(
                         && cpus[i].rq_clock == prev.cpus[i].rq_clock
                         && !idle
                         && !preempted;
-                    if is_stall {
-                        consecutive_stall[i] += 1;
-                    } else {
-                        consecutive_stall[i] = 0;
-                    }
+                    stall_trackers[i].record(is_stall, cpus[i].rq_clock as f64, sample_idx);
                 }
             }
-            let sustained = consecutive_imbalance >= t.sustained_samples
-                || consecutive_dsq >= t.sustained_samples
-                || consecutive_stall.iter().any(|&c| c >= t.sustained_samples);
+            let sustained = imbalance_tracker.sustained(t.sustained_samples)
+                || dsq_tracker.sustained(t.sustained_samples)
+                || stall_trackers
+                    .iter()
+                    .any(|s| s.sustained(t.sustained_samples));
 
             if sustained {
                 mem.write_u8(

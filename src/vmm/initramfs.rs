@@ -752,6 +752,22 @@ fn is_deleted_self(path: &Path) -> bool {
 ///
 /// When `busybox` is true, embeds busybox at `bin/busybox` for shell mode.
 ///
+/// Expand `guest_path`'s parent into every ancestor directory component
+/// and insert each into `dirs`. No-op when the path has no parent
+/// (e.g. top-level files like `init`). The component walk produces every
+/// intermediate directory, e.g. `include-files/sub/f` registers
+/// `include-files` and `include-files/sub`.
+fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
+    let Some(parent) = Path::new(guest_path).parent() else {
+        return;
+    };
+    let mut dir = PathBuf::new();
+    for component in parent.components() {
+        dir.push(component);
+        dirs.insert(dir.to_string_lossy().to_string());
+    }
+}
+
 /// `include_files` adds files verbatim to the archive (no strip_debug).
 /// Each entry is `(archive_path, host_path)`. ELF files get shared library
 /// resolution; non-ELF files are copied as-is. Only regular files are
@@ -872,13 +888,7 @@ pub fn create_initramfs_base(
                     .strip_prefix('/')
                     .unwrap_or(&canon_str)
                     .to_string();
-                if let Some(parent) = Path::new(&guest).parent() {
-                    let mut dir = PathBuf::new();
-                    for component in parent.components() {
-                        dir.push(component);
-                        dirs.insert(dir.to_string_lossy().to_string());
-                    }
-                }
+                register_parent_dirs(&mut dirs, &guest);
                 tracing::debug!(
                     canonical_guest = %guest,
                     canonical_host = %canonical.display(),
@@ -894,13 +904,7 @@ pub fn create_initramfs_base(
                         canonical_guest = %guest,
                         "packing interpreter original (non-canonical) path"
                     );
-                    if let Some(parent) = Path::new(&orig_guest).parent() {
-                        let mut dir = PathBuf::new();
-                        for component in parent.components() {
-                            dir.push(component);
-                            dirs.insert(dir.to_string_lossy().to_string());
-                        }
-                    }
+                    register_parent_dirs(&mut dirs, &orig_guest);
                     shared_libs.push((orig_guest, canonical));
                 } else {
                     tracing::debug!("interpreter original path matches canonical, no alias needed");
@@ -912,13 +916,7 @@ pub fn create_initramfs_base(
                     && let Ok(interp_result) = resolve_shared_libs(interp_path)
                 {
                     for (g, h) in interp_result.found {
-                        if let Some(parent) = Path::new(&g).parent() {
-                            let mut dir = PathBuf::new();
-                            for component in parent.components() {
-                                dir.push(component);
-                                dirs.insert(dir.to_string_lossy().to_string());
-                            }
-                        }
+                        register_parent_dirs(&mut dirs, &g);
                         shared_libs.push((g, h));
                     }
                 }
@@ -926,13 +924,7 @@ pub fn create_initramfs_base(
         }
 
         for (guest_path, host_path) in result.found {
-            if let Some(parent) = Path::new(&guest_path).parent() {
-                let mut dir = PathBuf::new();
-                for component in parent.components() {
-                    dir.push(component);
-                    dirs.insert(dir.to_string_lossy().to_string());
-                }
-            }
+            register_parent_dirs(&mut dirs, &guest_path);
             shared_libs.push((guest_path, host_path));
         }
     }
@@ -954,13 +946,7 @@ pub fn create_initramfs_base(
     // The component walk produces all ancestors (e.g. "include-files/sub/f"
     // yields "include-files" and "include-files/sub").
     for (archive_path, _, _) in &validated_includes {
-        if let Some(parent) = Path::new(archive_path).parent() {
-            let mut dir = PathBuf::new();
-            for component in parent.components() {
-                dir.push(component);
-                dirs.insert(dir.to_string_lossy().to_string());
-            }
-        }
+        register_parent_dirs(&mut dirs, archive_path);
     }
 
     drop(_s_resolve);

@@ -17,6 +17,7 @@ use super::btf_offsets::BpfMapOffsets;
 use super::idr::{translate_any_kva, xa_load};
 use super::reader::GuestMem;
 use super::symbols::text_kva_to_pa;
+use super::{Cr3Pa, PageOffset};
 
 /// Bundle of borrow-held state every map-access routine threads
 /// through the page-table walk, bounds check, and byte read/write path.
@@ -28,11 +29,12 @@ use super::symbols::text_kva_to_pa;
 /// originate on the accessor. Grouping them here drops the duplication
 /// and lets additional shared context (per-CPU offset cache, BTF
 /// cache, etc.) ride the same lifetime without touching every
-/// signature.
+/// signature. `cr3_pa` and `page_offset` are newtyped so the page-
+/// walker can't silently swap them at a call site.
 pub(crate) struct AccessorCtx<'a> {
     pub mem: &'a GuestMem,
-    pub cr3_pa: u64,
-    pub page_offset: u64,
+    pub cr3_pa: Cr3Pa,
+    pub page_offset: PageOffset,
     pub offsets: &'a BpfMapOffsets,
     pub l5: bool,
 }
@@ -106,7 +108,7 @@ pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<
     for id in 0..idr_next {
         let Some(entry) = xa_load(
             ctx.mem,
-            ctx.page_offset,
+            ctx.page_offset.0,
             xa_head,
             id as u64,
             offsets.xa_node_slots,
@@ -118,7 +120,8 @@ pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<
             continue;
         }
 
-        let Some(map_pa) = translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, entry, ctx.l5)
+        let Some(map_pa) =
+            translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, entry, ctx.l5)
         else {
             continue;
         };
@@ -205,7 +208,7 @@ pub(crate) fn write_bpf_map_value(
     // Write byte-by-byte across potential page boundaries.
     for (i, &byte) in data.iter().enumerate() {
         let kva = target_kva + i as u64;
-        let Some(pa) = ctx.mem.translate_kva(ctx.cr3_pa, kva, ctx.l5) else {
+        let Some(pa) = ctx.mem.translate_kva(ctx.cr3_pa.0, kva, ctx.l5) else {
             return false;
         };
         ctx.mem.write_u8(pa, 0, byte);
@@ -246,7 +249,7 @@ pub(crate) fn read_bpf_map_value(
     // Read byte-by-byte across potential page boundaries.
     for (i, byte) in buf.iter_mut().enumerate() {
         let kva = target_kva + i as u64;
-        let pa = ctx.mem.translate_kva(ctx.cr3_pa, kva, ctx.l5)?;
+        let pa = ctx.mem.translate_kva(ctx.cr3_pa.0, kva, ctx.l5)?;
         *byte = ctx.mem.read_u8(pa, 0);
     }
     Some(buf)
@@ -295,7 +298,8 @@ fn iter_htab_entries(ctx: &AccessorCtx<'_>, map: &BpfMapInfo) -> Vec<(Vec<u8>, V
     let htab_kva = map.map_kva;
 
     // Read n_buckets and buckets pointer from the bpf_htab struct.
-    let Some(htab_pa) = translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, htab_kva, ctx.l5)
+    let Some(htab_pa) =
+        translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, htab_kva, ctx.l5)
     else {
         return Vec::new();
     };
@@ -318,7 +322,7 @@ fn iter_htab_entries(ctx: &AccessorCtx<'_>, map: &BpfMapInfo) -> Vec<(Vec<u8>, V
         // bucket[i] is at buckets_kva + i * bucket_size.
         let bucket_kva = buckets_kva + (i as u64) * (htab.bucket_size as u64);
         let Some(bucket_pa) =
-            translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, bucket_kva, ctx.l5)
+            translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, bucket_kva, ctx.l5)
         else {
             continue;
         };
@@ -345,7 +349,7 @@ fn iter_htab_entries(ctx: &AccessorCtx<'_>, map: &BpfMapInfo) -> Vec<(Vec<u8>, V
             // So elem_kva == node_ptr.
             let elem_kva = node_ptr;
             let Some(elem_pa) =
-                translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, elem_kva, ctx.l5)
+                translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, elem_kva, ctx.l5)
             else {
                 break;
             };
@@ -401,7 +405,8 @@ fn read_percpu_array_value(
     let pptr_kva = pptrs_kva + (key as u64) * 8;
 
     // bpf_array may be kmalloc'd or vmalloc'd — try direct mapping first.
-    let Some(pptr_pa) = translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, pptr_kva, ctx.l5)
+    let Some(pptr_pa) =
+        translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, pptr_kva, ctx.l5)
     else {
         return Vec::new();
     };
@@ -415,7 +420,7 @@ fn read_percpu_array_value(
 
     for &cpu_off in per_cpu_offsets {
         let cpu_kva = percpu_base.wrapping_add(cpu_off);
-        let cpu_pa = super::symbols::kva_to_pa(cpu_kva, ctx.page_offset);
+        let cpu_pa = super::symbols::kva_to_pa(cpu_kva, ctx.page_offset.0);
         if cpu_pa + value_size as u64 <= ctx.mem.size() {
             let mut buf = vec![0u8; value_size];
             ctx.mem.read_bytes(cpu_pa, &mut buf);
@@ -716,8 +721,8 @@ impl<'a> BpfMapAccessor<'a> {
     fn ctx(&self) -> AccessorCtx<'_> {
         AccessorCtx {
             mem: self.kernel.mem(),
-            cr3_pa: self.kernel.cr3_pa(),
-            page_offset: self.kernel.page_offset(),
+            cr3_pa: Cr3Pa(self.kernel.cr3_pa()),
+            page_offset: PageOffset(self.kernel.page_offset()),
             offsets: self.offsets,
             l5: self.kernel.l5(),
         }
@@ -946,8 +951,8 @@ mod tests {
     fn value_ctx<'a>(mem: &'a GuestMem, cr3_pa: u64, l5: bool) -> AccessorCtx<'a> {
         AccessorCtx {
             mem,
-            cr3_pa,
-            page_offset: 0,
+            cr3_pa: Cr3Pa(cr3_pa),
+            page_offset: PageOffset(0),
             offsets: &BpfMapOffsets::EMPTY,
             l5,
         }
@@ -962,8 +967,8 @@ mod tests {
     ) -> AccessorCtx<'a> {
         AccessorCtx {
             mem,
-            cr3_pa,
-            page_offset,
+            cr3_pa: Cr3Pa(cr3_pa),
+            page_offset: PageOffset(page_offset),
             offsets,
             l5,
         }
