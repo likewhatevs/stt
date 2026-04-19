@@ -4144,6 +4144,17 @@ impl KtstrVmBuilder {
         anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
         anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
         anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
+        // `memory_mb == Some(0)` would forward a literal `-m 0` to the
+        // VMM backend (KVM rejects it at ioctl time with an opaque
+        // error). Catch it here with a clear message so the caller
+        // learns they set 0 explicitly rather than seeing a generic
+        // kvm failure later. `None` falls back to the default (256 MB).
+        if matches!(self.memory_mb, Some(0)) {
+            anyhow::bail!(
+                "memory_mb must be > 0 (a VM with zero memory cannot boot); \
+                 omit `.memory_mb(...)` to use the builder default"
+            );
+        }
         if let Some(ref bin) = self.init_binary
             && !bin.starts_with("/proc/")
         {

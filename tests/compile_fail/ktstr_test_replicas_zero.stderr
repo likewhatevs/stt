@@ -1,4 +1,4 @@
-error: replicas must be > 0
+error: replicas must be > 0 (a zero-replica entry runs no scenarios and passes every assertion vacuously)
  --> tests/compile_fail/ktstr_test_replicas_zero.rs:6:1
   |
 6 | #[ktstr_test(replicas = 0)]

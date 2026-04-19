@@ -725,6 +725,29 @@ impl CpusetSpec {
                  cgroup would become unschedulable"
                     .into())
             }
+            CpusetSpec::Exact(cpus) => {
+                // Reject only CPUs the topology doesn't physically have
+                // (`all_cpuset`), not the ones outside `usable_cpuset`.
+                // A scheduler author may intentionally pin to an
+                // isolated CPU (e.g. the root-reserved one) for
+                // testing; writing it to cpuset.cpus is a legitimate
+                // operation and the kernel is the final authority on
+                // whether the write succeeds. Only truly-nonexistent
+                // CPU indices are guaranteed to produce EINVAL.
+                let all = ctx.topo.all_cpuset();
+                let missing: Vec<usize> =
+                    cpus.iter().copied().filter(|c| !all.contains(c)).collect();
+                if !missing.is_empty() {
+                    return Err(format!(
+                        "CpusetSpec::Exact contains CPU(s) {missing:?} \
+                         outside the topology's physical CPU set (max \
+                         CPU index: {}); writing them to cpuset.cpus \
+                         would fail with EINVAL",
+                        all.iter().next_back().copied().unwrap_or(0),
+                    ));
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1198,7 +1221,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                                 }
                             }
                             crate::workload::AffinityMode::Random { from, count }
-                                if !from.is_empty() =>
+                                if !from.is_empty() && *count > 0 =>
                             {
                                 use rand::seq::IndexedRandom;
                                 let v: Vec<usize> = from.iter().copied().collect();
@@ -1208,10 +1231,18 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                                     let _ = handle.set_affinity(idx, &chosen);
                                 }
                             }
-                            // Empty Random pool: matches workload::resolve_affinity
-                            // — leave affinity unchanged rather than hand
-                            // sched_setaffinity an empty mask (which it
-                            // rejects with EINVAL).
+                            // Empty pool OR count == 0: divergence from
+                            // `workload::resolve_affinity`, which BAILS
+                            // on count == 0 because it runs during
+                            // workload setup where a zero-sample is a
+                            // caller-config bug. Here at the
+                            // step-execution layer the affinity was
+                            // already applied at spawn and this op is
+                            // re-applying; a zero-sample is a harmless
+                            // skip, not a caller error. No-op rather
+                            // than bail so a mid-run SetAffinity with
+                            // a degenerate Random spec doesn't abort
+                            // the whole scenario.
                             crate::workload::AffinityMode::Random { .. } => {}
                             crate::workload::AffinityMode::SingleCpu(cpu) => {
                                 let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
@@ -2345,10 +2376,11 @@ mod tests {
     }
 
     #[test]
-    fn cpusetspec_validate_exact_nonempty_ok() {
+    fn cpusetspec_validate_exact_in_range_ok() {
+        // 1 LLC * 4 cores * 1 thread = CPUs 0..=3 physically present.
         let (cg, topo) = make_ctx(1, 4, 1);
         let ctx = ctx_from(&cg, &topo);
-        let spec = CpusetSpec::exact([99]);
+        let spec = CpusetSpec::exact([0, 2]);
         assert!(spec.validate(&ctx).is_ok());
     }
 
@@ -2359,6 +2391,48 @@ mod tests {
         let spec = CpusetSpec::Exact(BTreeSet::new());
         let err = spec.validate(&ctx).unwrap_err();
         assert!(err.contains("Exact") && err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_exact_out_of_range_rejected() {
+        // Topology has CPUs 0..=3; 99 is not physically present.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::exact([99]);
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(
+            err.contains("99") && err.contains("physical CPU set"),
+            "error must name the offending CPU and call it physical: {err}"
+        );
+    }
+
+    /// Regression: the reserved last CPU (when `total_cpus > 2`,
+    /// `usable_cpus` drops the last one to leave the root cgroup a
+    /// home) is still PHYSICALLY present. A scheduler author pinning
+    /// a cgroup to that CPU for testing is legitimate — validate
+    /// must NOT reject on `usable_cpuset` membership. Accepting it
+    /// here is the contract that lets isolated-CPU tests compile.
+    #[test]
+    fn cpusetspec_validate_exact_accepts_reserved_last_cpu() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let total = ctx.topo.all_cpus().len();
+        assert!(total > 2, "test requires a topology that reserves a CPU");
+        let reserved_cpu = total - 1;
+        assert!(
+            !ctx.topo.usable_cpuset().contains(&reserved_cpu),
+            "precondition: reserved CPU {reserved_cpu} must sit outside usable_cpuset",
+        );
+        assert!(
+            ctx.topo.all_cpuset().contains(&reserved_cpu),
+            "precondition: reserved CPU {reserved_cpu} must be physically present",
+        );
+        let spec = CpusetSpec::exact([reserved_cpu]);
+        assert!(
+            spec.validate(&ctx).is_ok(),
+            "validate must accept the reserved CPU — physical presence, not \
+             usable-set membership, is the bar",
+        );
     }
 
     /// Regression guard for the HoldSpec pre-loop validation:

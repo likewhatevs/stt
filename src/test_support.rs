@@ -866,6 +866,64 @@ impl KtstrTestEntry {
         expect_err: false,
         host_only: false,
     };
+
+    /// Reject values that would boot a broken VM or leave assertions
+    /// vacuously passing. The `#[ktstr_test]` proc macro enforces the
+    /// same constraints at compile time for attribute-built entries;
+    /// this method covers directly-constructed entries (library
+    /// callers building `KtstrTestEntry` values to push into
+    /// [`KTSTR_TESTS`] programmatically).
+    ///
+    /// Rules:
+    /// - `name` must be non-empty (empty names collapse into each
+    ///   other in nextest output and in sidecar lookups).
+    /// - `memory_mb` must be `> 0` (a VM with zero memory cannot boot).
+    /// - `replicas` must be `> 0` (zero replicas runs zero scenarios —
+    ///   assertion count is zero, so every assertion passes vacuously).
+    /// - `duration` must be `> 0` (a zero-duration run never exercises
+    ///   the scheduler and produces no telemetry).
+    /// - `workers_per_cgroup` must be `> 0` (zero workers emit no
+    ///   `WorkerReport`s so assertions again pass vacuously).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.name.is_empty() {
+            anyhow::bail!(
+                "KtstrTestEntry.name must be non-empty (empty names \
+                 collide in nextest output and sidecar lookups)"
+            );
+        }
+        if self.memory_mb == 0 {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.memory_mb must be > 0 (a VM with \
+                 zero memory cannot boot)",
+                self.name,
+            );
+        }
+        if self.replicas == 0 {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.replicas must be > 0 (a zero-replica \
+                 entry runs no scenarios and passes every assertion \
+                 vacuously)",
+                self.name,
+            );
+        }
+        if self.duration.is_zero() {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.duration must be > 0 (a zero-duration \
+                 run never exercises the scheduler and produces no data \
+                 for assertions)",
+                self.name,
+            );
+        }
+        if self.workers_per_cgroup == 0 {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.workers_per_cgroup must be > 0 (a \
+                 zero-worker cgroup emits no WorkerReports and assertions \
+                 vacuously pass)",
+                self.name,
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Distributed slice collecting all `#[ktstr_test]` entries via linkme.
@@ -945,16 +1003,34 @@ impl TopoOverride {
     /// with zero memory, which is a silent configuration error.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.numa_nodes == 0 {
-            anyhow::bail!("TopoOverride.numa_nodes must be > 0");
+            anyhow::bail!(
+                "TopoOverride.numa_nodes must be > 0 (a topology with zero \
+                 NUMA nodes has nothing to attach LLCs or memory to; every \
+                 downstream accessor would observe an empty node set)"
+            );
         }
         if self.llcs == 0 {
-            anyhow::bail!("TopoOverride.llcs must be > 0");
+            anyhow::bail!(
+                "TopoOverride.llcs must be > 0 (a topology with zero LLCs \
+                 has zero CPUs — `total_cpus = llcs * cores * threads` — \
+                 so the VM would boot with no addressable processors)"
+            );
         }
         if self.cores == 0 {
-            anyhow::bail!("TopoOverride.cores must be > 0");
+            anyhow::bail!(
+                "TopoOverride.cores must be > 0 (a topology with zero cores \
+                 per LLC has zero CPUs — `total_cpus = llcs * cores * \
+                 threads` — so the VM would boot with no addressable \
+                 processors)"
+            );
         }
         if self.threads == 0 {
-            anyhow::bail!("TopoOverride.threads must be > 0");
+            anyhow::bail!(
+                "TopoOverride.threads must be > 0 (a topology with zero \
+                 threads per core has zero CPUs — `total_cpus = llcs * \
+                 cores * threads` — so the VM would boot with no \
+                 addressable processors)"
+            );
         }
         if self.memory_mb == 0 {
             anyhow::bail!(
@@ -1029,6 +1105,12 @@ fn parse_topo_string_new(s: &str) -> Option<(u32, u32, u32, u32)> {
 /// Validates KVM access and auto-discovers a kernel image via
 /// `resolve_test_kernel()` when `KTSTR_TEST_KERNEL` is not set.
 pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
+    // Directly-constructed entries bypass the proc-macro's
+    // compile-time checks. Call `validate` here so programmatic
+    // consumers (library callers pushing into `KTSTR_TESTS`
+    // dynamically) hit the same bail messages the macro produces at
+    // compile time.
+    entry.validate()?;
     if entry.host_only {
         return run_host_only_test_inner(entry);
     }
@@ -1695,6 +1777,7 @@ fn run_ktstr_test_inner(
     topo: Option<&TopoOverride>,
     active_flags: &[String],
 ) -> Result<AssertResult> {
+    entry.validate().context("KtstrTestEntry validation")?;
     if let Some(t) = topo {
         t.validate().context("TopoOverride validation")?;
     }

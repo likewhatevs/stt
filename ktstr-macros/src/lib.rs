@@ -510,9 +510,12 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     if memory_mb == 0 {
-        return syn::Error::new(proc_macro2::Span::call_site(), "memory_mb must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "memory_mb must be > 0 (a VM with zero memory cannot boot)",
+        )
+        .to_compile_error()
+        .into();
     }
     if duration_s == 0 {
         return syn::Error::new(
@@ -533,27 +536,46 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     if replicas == 0 {
-        return syn::Error::new(proc_macro2::Span::call_site(), "replicas must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "replicas must be > 0 (a zero-replica entry runs no scenarios \
+             and passes every assertion vacuously)",
+        )
+        .to_compile_error()
+        .into();
     }
     // Validate explicitly set constraint values. When a field is
     // inherited from the scheduler, the proc macro doesn't know the
     // value so cross-field validation is deferred to runtime.
     if max_llcs_set && max_llcs == Some(0) {
-        return syn::Error::new(proc_macro2::Span::call_site(), "max_llcs must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "max_llcs must be > 0 (a zero cap excludes every host from \
+             the gauntlet — use a non-zero cap, or omit the field to \
+             use the default)",
+        )
+        .to_compile_error()
+        .into();
     }
     if max_numa_nodes_set && max_numa_nodes == Some(0) {
-        return syn::Error::new(proc_macro2::Span::call_site(), "max_numa_nodes must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "max_numa_nodes must be > 0 (a zero cap excludes every host \
+             from the gauntlet — use a non-zero cap, or omit the field \
+             to inherit the scheduler-level default)",
+        )
+        .to_compile_error()
+        .into();
     }
     if max_cpus_set && max_cpus == Some(0) {
-        return syn::Error::new(proc_macro2::Span::call_site(), "max_cpus must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "max_cpus must be > 0 (a zero cap excludes every host from \
+             the gauntlet — use a non-zero cap, or omit the field to \
+             use the default)",
+        )
+        .to_compile_error()
+        .into();
     }
     if min_llcs_set && max_llcs_set && matches!(max_llcs, Some(m) if m < min_llcs) {
         let m = max_llcs.unwrap();

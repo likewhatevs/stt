@@ -1,4 +1,4 @@
-error: max_llcs must be > 0
+error: max_llcs must be > 0 (a zero cap excludes every host from the gauntlet — use a non-zero cap, or omit the field to inherit the scheduler-level default)
  --> tests/compile_fail/ktstr_test_max_llcs_zero.rs:6:1
   |
 6 | #[ktstr_test(max_llcs = 0)]

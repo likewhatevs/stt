@@ -1,4 +1,4 @@
-error: memory_mb must be > 0
+error: memory_mb must be > 0 (a VM with zero memory cannot boot)
  --> tests/compile_fail/ktstr_test_memory_mb_zero.rs:6:1
   |
 6 | #[ktstr_test(memory_mb = 0)]

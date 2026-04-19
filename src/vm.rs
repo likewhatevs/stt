@@ -43,15 +43,29 @@ impl Default for VmConfig {
     }
 }
 
+impl VmConfig {
+    /// Reject values that would leave the VM unbootable. Mirrors the
+    /// `RunConfig::validate` / `TopoOverride::validate` /
+    /// `KtstrTestEntry::validate` pattern so every directly-constructed
+    /// config has one consistent entry point for up-front checks.
+    ///
+    /// Rules:
+    /// - `memory_mb` must be `> 0` (a VM with zero memory cannot boot).
+    pub fn validate(&self) -> Result<()> {
+        if self.memory_mb == 0 {
+            anyhow::bail!("VmConfig.memory_mb must be > 0 (a VM with zero memory cannot boot)");
+        }
+        Ok(())
+    }
+}
+
 /// Boot a KVM VM with the given config and run ktstr inside it.
 ///
 /// Resolves the kernel image, builds the initramfs (ktstr binary +
 /// optional scheduler), and boots the VM. Returns the VM's exit
 /// result including serial output.
 pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
-    if cfg.memory_mb == 0 {
-        anyhow::bail!("VmConfig.memory_mb must be > 0 (a VM with zero memory cannot boot)");
-    }
+    cfg.validate()?;
     // Resolve kernel
     let kernel = if let Some(ref kd) = cfg.kernel_dir {
         #[cfg(target_arch = "x86_64")]

@@ -24,9 +24,17 @@ pub struct RunConfig {
     /// created.
     pub parent_cgroup: String,
     /// Wall-clock duration each scenario runs for before teardown.
+    ///
+    /// Must be `> 0`; see [`validate`](Self::validate) — a zero
+    /// duration never exercises the scheduler and leaves assertions
+    /// vacuously passing.
     pub duration: Duration,
     /// Default number of worker processes spawned per cgroup when a
     /// scenario does not specify its own count.
+    ///
+    /// Must be `> 0`; see [`validate`](Self::validate) — zero
+    /// workers emit no `WorkerReport`s so assertions again pass
+    /// vacuously.
     pub workers_per_cgroup: usize,
     /// Flag selection: `None` expands to every valid profile,
     /// `Some([])` runs the default profile only, `Some([flags..])`
