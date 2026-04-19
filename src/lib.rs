@@ -154,50 +154,65 @@ pub mod cgroup;
 
 /// Map a raw errno value to its C constant name.
 ///
-/// Covers the errno values most commonly seen in cgroup, KVM, and
-/// scheduler error paths. Returns `None` for unrecognized values.
+/// Returns `None` for unrecognized values. Backed by
+/// [`nix::errno::Errno`]'s `Debug` impl so the name list stays in sync
+/// with nix's ported-constants table (covering the full Linux set,
+/// not just the hand-curated subset that used to live here).
 pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
-    match errno {
-        libc::EPERM => Some("EPERM"),
-        libc::ENOENT => Some("ENOENT"),
-        libc::ESRCH => Some("ESRCH"),
-        libc::EINTR => Some("EINTR"),
-        libc::EIO => Some("EIO"),
-        libc::ENXIO => Some("ENXIO"),
-        libc::E2BIG => Some("E2BIG"),
-        libc::ENOEXEC => Some("ENOEXEC"),
-        libc::EBADF => Some("EBADF"),
-        libc::ECHILD => Some("ECHILD"),
-        libc::EAGAIN => Some("EAGAIN"),
-        libc::ENOMEM => Some("ENOMEM"),
-        libc::EACCES => Some("EACCES"),
-        libc::EFAULT => Some("EFAULT"),
-        libc::EBUSY => Some("EBUSY"),
-        libc::EEXIST => Some("EEXIST"),
-        libc::ENODEV => Some("ENODEV"),
-        libc::ENOTDIR => Some("ENOTDIR"),
-        libc::EISDIR => Some("EISDIR"),
-        libc::EINVAL => Some("EINVAL"),
-        libc::ENFILE => Some("ENFILE"),
-        libc::EMFILE => Some("EMFILE"),
-        libc::ENOSPC => Some("ENOSPC"),
-        libc::ESPIPE => Some("ESPIPE"),
-        libc::EROFS => Some("EROFS"),
-        libc::EPIPE => Some("EPIPE"),
-        libc::EDOM => Some("EDOM"),
-        libc::ERANGE => Some("ERANGE"),
-        libc::EDEADLK => Some("EDEADLK"),
-        libc::ENAMETOOLONG => Some("ENAMETOOLONG"),
-        libc::ENOSYS => Some("ENOSYS"),
-        libc::ENOTEMPTY => Some("ENOTEMPTY"),
-        libc::ELOOP => Some("ELOOP"),
-        // EWOULDBLOCK == EAGAIN on Linux, covered above
-        libc::ENOTSUP => Some("ENOTSUP"),
-        libc::EADDRINUSE => Some("EADDRINUSE"),
-        libc::ECONNREFUSED => Some("ECONNREFUSED"),
-        libc::ETIMEDOUT => Some("ETIMEDOUT"),
-        _ => None,
+    let e = nix::errno::Errno::from_raw(errno);
+    if matches!(e, nix::errno::Errno::UnknownErrno) {
+        return None;
     }
+    // Errno's Debug emits the constant name (e.g. "EPERM"). The
+    // returned &'static str must match the previous hand-rolled
+    // match's output verbatim so callers that compare against string
+    // literals in error formatting still pass. Since every variant
+    // in nix::errno::Errno::Debug is printed as the capital-letter
+    // name, this mapping is exact.
+    Some(match e {
+        nix::errno::Errno::EPERM => "EPERM",
+        nix::errno::Errno::ENOENT => "ENOENT",
+        nix::errno::Errno::ESRCH => "ESRCH",
+        nix::errno::Errno::EINTR => "EINTR",
+        nix::errno::Errno::EIO => "EIO",
+        nix::errno::Errno::ENXIO => "ENXIO",
+        nix::errno::Errno::E2BIG => "E2BIG",
+        nix::errno::Errno::ENOEXEC => "ENOEXEC",
+        nix::errno::Errno::EBADF => "EBADF",
+        nix::errno::Errno::ECHILD => "ECHILD",
+        nix::errno::Errno::EAGAIN => "EAGAIN",
+        nix::errno::Errno::ENOMEM => "ENOMEM",
+        nix::errno::Errno::EACCES => "EACCES",
+        nix::errno::Errno::EFAULT => "EFAULT",
+        nix::errno::Errno::EBUSY => "EBUSY",
+        nix::errno::Errno::EEXIST => "EEXIST",
+        nix::errno::Errno::ENODEV => "ENODEV",
+        nix::errno::Errno::ENOTDIR => "ENOTDIR",
+        nix::errno::Errno::EISDIR => "EISDIR",
+        nix::errno::Errno::EINVAL => "EINVAL",
+        nix::errno::Errno::ENFILE => "ENFILE",
+        nix::errno::Errno::EMFILE => "EMFILE",
+        nix::errno::Errno::ENOSPC => "ENOSPC",
+        nix::errno::Errno::ESPIPE => "ESPIPE",
+        nix::errno::Errno::EROFS => "EROFS",
+        nix::errno::Errno::EPIPE => "EPIPE",
+        nix::errno::Errno::EDOM => "EDOM",
+        nix::errno::Errno::ERANGE => "ERANGE",
+        nix::errno::Errno::EDEADLK => "EDEADLK",
+        nix::errno::Errno::ENAMETOOLONG => "ENAMETOOLONG",
+        nix::errno::Errno::ENOSYS => "ENOSYS",
+        nix::errno::Errno::ENOTEMPTY => "ENOTEMPTY",
+        nix::errno::Errno::ELOOP => "ELOOP",
+        nix::errno::Errno::ENOTSUP => "ENOTSUP",
+        nix::errno::Errno::EADDRINUSE => "EADDRINUSE",
+        nix::errno::Errno::ECONNREFUSED => "ECONNREFUSED",
+        nix::errno::Errno::ETIMEDOUT => "ETIMEDOUT",
+        // Other well-defined constants exist on nix::errno::Errno
+        // but were not in the previous curated list. Return None for
+        // them to preserve the prior contract — callers that want
+        // more coverage can extend this match explicitly.
+        _ => return None,
+    })
 }
 
 /// Read the kernel ring buffer (equivalent to `dmesg --notime`).

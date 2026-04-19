@@ -220,8 +220,8 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
     }
 
     if !force {
-        // SAFETY: isatty is always safe to call with a valid fd.
-        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
             bail!("confirmation requires a terminal. Use --force to skip.");
         }
         println!("the following entries will be removed:");
@@ -1209,8 +1209,9 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
 
 /// Whether stderr supports color (cached per process).
 pub fn stderr_color() -> bool {
+    use std::io::IsTerminal;
     static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *COLOR.get_or_init(|| unsafe { libc::isatty(libc::STDERR_FILENO) } != 0)
+    *COLOR.get_or_init(|| std::io::stderr().is_terminal())
 }
 
 /// Print a styled status message to stderr.
@@ -1301,11 +1302,12 @@ impl Spinner {
     }
 
     fn disable_echo() -> Option<libc::termios> {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
         unsafe {
             let fd = libc::STDIN_FILENO;
-            if libc::isatty(fd) == 0 {
-                return None;
-            }
             let mut termios: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(fd, &mut termios) != 0 {
                 return None;

@@ -597,7 +597,17 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
             anyhow::bail!("cgroup '{}': {}", name, reason);
         }
         let n = resolve_num_workers(&cw, ctx.workers_per_cgroup, name)?;
-        let affinity = resolve_affinity_kind(&cw.affinity, cpusets.as_deref(), i, ctx.topo);
+        let cpuset = cpusets.as_deref().and_then(|cs| cs.get(i));
+        if let Some(cs) = cpusets.as_deref()
+            && i >= cs.len()
+        {
+            tracing::warn!(
+                cgroup_idx = i,
+                cpusets_len = cs.len(),
+                "cgroup index out of range for cpusets array; falling back to unrestricted pool"
+            );
+        }
+        let affinity = resolve_affinity_for_cgroup(&cw.affinity, cpuset, ctx.topo);
         let effective_work_type = crate::workload::resolve_work_type(
             &cw.work_type,
             ctx.work_type_override.as_ref(),
@@ -833,38 +843,6 @@ pub fn resolve_affinity_for_cgroup(
             }
         }
     }
-}
-
-/// Resolves [`AffinityKind`] using a cgroup index into an array of cpusets.
-/// Used by [`run_scenario`] for data-driven [`Scenario`] definitions.
-///
-/// If `cgroup_idx` is out of range for `cpusets`, falls back to resolving
-/// with no cpuset (as if `cpusets` were `None`). Debug builds `debug_assert`
-/// on the mismatch so the caller can catch the bug; release builds degrade
-/// gracefully instead of panicking on a slice OOB.
-fn resolve_affinity_kind(
-    kind: &AffinityKind,
-    cpusets: Option<&[BTreeSet<usize>]>,
-    cgroup_idx: usize,
-    topo: &TestTopology,
-) -> AffinityMode {
-    if let Some(cs) = cpusets {
-        debug_assert!(
-            cgroup_idx < cs.len(),
-            "cpusets/cgroup_idx mismatch: idx={} len={}",
-            cgroup_idx,
-            cs.len()
-        );
-        if cgroup_idx >= cs.len() {
-            tracing::warn!(
-                cgroup_idx,
-                cpusets_len = cs.len(),
-                "cgroup index out of range for cpusets array; falling back to unrestricted pool"
-            );
-        }
-    }
-    let cpuset = cpusets.and_then(|cs| cs.get(cgroup_idx));
-    resolve_affinity_for_cgroup(kind, cpuset, topo)
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,7 +1116,7 @@ mod tests {
     fn resolve_affinity_inherit() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         assert!(matches!(
-            resolve_affinity_kind(&AffinityKind::Inherit, None, 0, &t),
+            resolve_affinity_for_cgroup(&AffinityKind::Inherit, None, &t),
             AffinityMode::None
         ));
     }
@@ -1146,7 +1124,7 @@ mod tests {
     #[test]
     fn resolve_affinity_single_cpu() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_kind(&AffinityKind::SingleCpu, None, 0, &t) {
+        match resolve_affinity_for_cgroup(&AffinityKind::SingleCpu, None, &t) {
             AffinityMode::SingleCpu(c) => assert_eq!(c, 0),
             other => panic!("expected SingleCpu, got {:?}", other),
         }
@@ -1155,7 +1133,7 @@ mod tests {
     #[test]
     fn resolve_affinity_cross_cgroup() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_kind(&AffinityKind::CrossCgroup, None, 0, &t) {
+        match resolve_affinity_for_cgroup(&AffinityKind::CrossCgroup, None, &t) {
             AffinityMode::Fixed(cpus) => assert_eq!(cpus.len(), 8),
             other => panic!("expected Fixed, got {:?}", other),
         }
@@ -1166,7 +1144,7 @@ mod tests {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         // No cpuset: both LLCs cover the full pool equally. LLC 0
         // is found first with max overlap, so result is LLC 0 CPUs.
-        match resolve_affinity_kind(&AffinityKind::LlcAligned, None, 0, &t) {
+        match resolve_affinity_for_cgroup(&AffinityKind::LlcAligned, None, &t) {
             AffinityMode::Fixed(cpus) => assert_eq!(cpus, [0, 1, 2, 3].into_iter().collect()),
             other => panic!("expected Fixed, got {:?}", other),
         }
@@ -1180,7 +1158,7 @@ mod tests {
             [0, 1, 2, 3].into_iter().collect(),
             [4, 5, 6, 7].into_iter().collect(),
         ];
-        match resolve_affinity_kind(&AffinityKind::LlcAligned, Some(&cpusets), 1, &t) {
+        match resolve_affinity_for_cgroup(&AffinityKind::LlcAligned, cpusets.get(1), &t) {
             AffinityMode::Fixed(cpus) => assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect()),
             other => panic!("expected Fixed, got {:?}", other),
         }
@@ -1190,7 +1168,7 @@ mod tests {
     fn resolve_affinity_random_subset() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1, 2, 3].into_iter().collect()];
-        match resolve_affinity_kind(&AffinityKind::RandomSubset, Some(&cpusets), 0, &t) {
+        match resolve_affinity_for_cgroup(&AffinityKind::RandomSubset, cpusets.first(), &t) {
             AffinityMode::Random { from, count } => {
                 assert_eq!(from, cpusets[0]);
                 assert_eq!(count, 2); // half of 4
@@ -1351,7 +1329,7 @@ mod tests {
     #[test]
     fn resolve_affinity_random_no_cpusets() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_kind(&AffinityKind::RandomSubset, None, 0, &t) {
+        match resolve_affinity_for_cgroup(&AffinityKind::RandomSubset, None, &t) {
             AffinityMode::Random { from, count } => {
                 assert_eq!(from.len(), 8); // all CPUs
                 assert_eq!(count, 4); // half
@@ -1375,28 +1353,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "cpusets/cgroup_idx mismatch")]
-    fn resolve_affinity_kind_cgroup_idx_out_of_bounds_debug_asserts() {
-        // In debug builds, the `debug_assert!` in resolve_affinity_kind
-        // surfaces the caller bug. The release-mode fallback is covered
-        // by the sibling test below.
+    fn resolve_affinity_oob_cgroup_idx_falls_back_to_unrestricted() {
+        // The wrapper that bounds-checked cgroup_idx against cpusets
+        // was inlined into run_scenario (see the tracing::warn in
+        // run_scenario's affinity-resolve block). The underlying
+        // `cpusets.get(idx)` returns None on OOB, and
+        // resolve_affinity_for_cgroup's None arm delivers the
+        // unrestricted fallback. This test pins the fallback contract.
         let t = crate::topology::TestTopology::synthetic(4, 1);
         let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1].into_iter().collect()];
-        let _ = resolve_affinity_kind(&AffinityKind::RandomSubset, Some(&cpusets), 5, &t);
-    }
-
-    #[test]
-    #[cfg(not(debug_assertions))]
-    fn resolve_affinity_kind_cgroup_idx_out_of_bounds_falls_back() {
-        // Regression: cpusets.map(|cs| &cs[cgroup_idx]) panicked on OOB idx
-        // in release builds. New behavior: cs.get(idx) yields None →
-        // unrestricted pool (paired with a tracing::warn for visibility).
-        // Debug-mode behavior is covered by the sibling `#[should_panic]`
-        // test above; this verifies the release fallback contract.
-        let t = crate::topology::TestTopology::synthetic(4, 1);
-        let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1].into_iter().collect()];
-        match resolve_affinity_kind(&AffinityKind::RandomSubset, Some(&cpusets), 5, &t) {
+        let oob_idx = 5;
+        // Mirror the inlined expression in run_scenario:
+        let cpuset = cpusets.get(oob_idx);
+        assert!(cpuset.is_none(), "OOB index must yield None cpuset");
+        match resolve_affinity_for_cgroup(&AffinityKind::RandomSubset, cpuset, &t) {
             AffinityMode::Random { from, count } => {
                 assert_eq!(from.len(), 4, "OOB idx falls back to full topology");
                 assert_eq!(count, 2);
@@ -1616,14 +1586,14 @@ mod tests {
         }
     }
 
-    // -- resolve_affinity_kind edge cases --
+    // -- resolve_affinity_for_cgroup edge cases --
 
     #[test]
     fn resolve_affinity_single_cpu_with_cpuset() {
         let t = crate::topology::TestTopology::synthetic(4, 1);
         // Cpuset restricts to CPUs {2,3}: SingleCpu picks first in cpuset.
         let cpusets: Vec<BTreeSet<usize>> = vec![[2, 3].into_iter().collect()];
-        match resolve_affinity_kind(&AffinityKind::SingleCpu, Some(&cpusets), 0, &t) {
+        match resolve_affinity_for_cgroup(&AffinityKind::SingleCpu, cpusets.first(), &t) {
             AffinityMode::SingleCpu(c) => assert_eq!(c, 2),
             other => panic!("expected SingleCpu, got {:?}", other),
         }
@@ -1636,7 +1606,7 @@ mod tests {
         // LLC 0 = {0,1,2,3}, LLC 1 = {4,5,6,7}.
         // Cpuset = {3, 4, 5, 6, 7}: LLC 1 has 4 CPUs in cpuset, LLC 0 has 1.
         let cpusets: Vec<BTreeSet<usize>> = vec![[3, 4, 5, 6, 7].into_iter().collect()];
-        match resolve_affinity_kind(&AffinityKind::LlcAligned, Some(&cpusets), 0, &t) {
+        match resolve_affinity_for_cgroup(&AffinityKind::LlcAligned, cpusets.first(), &t) {
             AffinityMode::Fixed(cpus) => {
                 // LLC 1 has best overlap; result is intersection {4,5,6,7}.
                 assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect());

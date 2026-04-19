@@ -20,9 +20,7 @@ use nix::mount::{MsFlags, mount};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::openpty;
 use nix::sys::reboot::{RebootMode, reboot};
-use nix::sys::stat::Mode;
 use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
-use nix::unistd::mkdir;
 
 /// COM2 device path for sentinel and diagnostic output.
 const COM2: &str = "/dev/ttyS1";
@@ -874,19 +872,15 @@ fn mount_filesystems() {
     let _ = std::os::unix::fs::symlink("/proc/self/fd/2", "/dev/stderr");
 }
 
-/// Recursive mkdir -p equivalent.
+/// Recursive mkdir -p equivalent. `std::fs::create_dir_all` is
+/// idempotent (returns Ok when the path already exists as a
+/// directory) and walks parents internally, so the hand-rolled
+/// recursion this replaced was redundant. Errors are swallowed to
+/// match the previous behavior — the early guest init best-effort
+/// creates each mount point and continues regardless, since any
+/// real failure surfaces downstream when `mount()` itself fails.
 fn mkdir_p(path: &str) {
-    let p = Path::new(path);
-    if p.exists() {
-        return;
-    }
-    if let Some(parent) = p.parent() {
-        let ps = parent.to_str().unwrap_or("");
-        if !ps.is_empty() && ps != "/" && !parent.exists() {
-            mkdir_p(ps);
-        }
-    }
-    let _ = mkdir(p, Mode::from_bits_truncate(0o755));
+    let _ = std::fs::create_dir_all(path);
 }
 
 /// Write a line to COM2 (the application serial port).
