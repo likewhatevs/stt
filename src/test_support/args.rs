@@ -193,8 +193,8 @@ mod tests {
 
     #[test]
     fn extract_topo_arg_equals() {
-        let args = vec!["bin".into(), "--ktstr-topo=2s4c2t".into()];
-        assert_eq!(extract_topo_arg(&args), Some("2s4c2t".to_string()));
+        let args = vec!["bin".into(), "--ktstr-topo=1n2l4c2t".into()];
+        assert_eq!(extract_topo_arg(&args), Some("1n2l4c2t".to_string()));
     }
 
     #[test]
@@ -214,9 +214,9 @@ mod tests {
         let args = vec![
             "bin".into(),
             "--ktstr-test-fn=my_test".into(),
-            "--ktstr-topo=1s2c1t".into(),
+            "--ktstr-topo=1n1l2c1t".into(),
         ];
-        assert_eq!(extract_topo_arg(&args), Some("1s2c1t".to_string()));
+        assert_eq!(extract_topo_arg(&args), Some("1n1l2c1t".to_string()));
     }
 
     // -- extract_work_type_arg --

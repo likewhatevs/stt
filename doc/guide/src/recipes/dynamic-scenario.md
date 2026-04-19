@@ -60,7 +60,7 @@ Scenario {
     num_cgroups: 0,
     cpuset_partition: CpusetPartition::None,
     cgroup_works: vec![],
-    action: Action::Custom(my_resize_scenario),
+    action: Action::custom(my_resize_scenario),
 }
 ```
 

@@ -41,7 +41,7 @@ macro_rules! custom {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom($fn),
+            action: Action::custom($fn),
         }
     };
 }
@@ -329,7 +329,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 2,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: dfl(),
-            action: Action::Custom(custom_cgroup_affinity_change),
+            action: Action::custom(custom_cgroup_affinity_change),
         },
         // Cgroup lifecycle
         custom!(
@@ -458,7 +458,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_workload_imbalance),
+            action: Action::custom(custom_cgroup_cpuset_workload_imbalance),
         },
         // Load rebalancing + cpusets
         Scenario {
@@ -470,7 +470,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_load_shift),
+            action: Action::custom(custom_cgroup_cpuset_load_shift),
         },
         // Load rebalancing + dynamic cgroup add
         Scenario {
@@ -482,7 +482,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_add_load_imbalance),
+            action: Action::custom(custom_cgroup_add_load_imbalance),
         },
         // Work conservation + rebalancing
         Scenario {
@@ -494,7 +494,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_imbalance_mixed_workload),
+            action: Action::custom(custom_cgroup_imbalance_mixed_workload),
         },
         // Affinity rejection
         Scenario {
@@ -506,7 +506,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_multicpu_pin),
+            action: Action::custom(custom_cgroup_multicpu_pin),
         },
         // No controller + rapid cgroup moves
         Scenario {
@@ -518,7 +518,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_noctrl_task_migration),
+            action: Action::custom(custom_cgroup_noctrl_task_migration),
         },
         // Work conservation + cpuset change
         Scenario {
@@ -530,7 +530,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_change_imbalance),
+            action: Action::custom(custom_cgroup_cpuset_change_imbalance),
         },
         // Load oscillation
         Scenario {
@@ -542,7 +542,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_load_oscillation),
+            action: Action::custom(custom_cgroup_load_oscillation),
         },
         // No controller + nested cgroups
         Scenario {
@@ -554,7 +554,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_nested_cgroup_noctrl),
+            action: Action::custom(custom_nested_cgroup_noctrl),
         },
         // Cpuset swap to disjoint range
         Scenario {
@@ -566,7 +566,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_swap_disjoint),
+            action: Action::custom(custom_cgroup_cpuset_swap_disjoint),
         },
         // IO + work conservation
         Scenario {
@@ -578,7 +578,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_io_compute_imbalance),
+            action: Action::custom(custom_cgroup_io_compute_imbalance),
         },
         // 4-way load imbalance
         Scenario {
@@ -590,7 +590,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_4way_load_imbalance),
+            action: Action::custom(custom_cgroup_4way_load_imbalance),
         },
         // Work conservation + overlapping cpusets
         Scenario {
@@ -708,7 +708,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_imbalance_combined),
+            action: Action::custom(custom_cgroup_cpuset_imbalance_combined),
         },
         Scenario {
             name: "cgroup_cpuset_overlap_imbalance_combined",
@@ -719,7 +719,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_overlap_imbalance_combined),
+            action: Action::custom(custom_cgroup_cpuset_overlap_imbalance_combined),
         },
         // No controller + work conservation
         Scenario {
@@ -731,7 +731,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_noctrl_imbalance),
+            action: Action::custom(custom_cgroup_noctrl_imbalance),
         },
         // No controller + cpusets
         Scenario {
@@ -743,7 +743,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_noctrl_cpuset_change),
+            action: Action::custom(custom_cgroup_noctrl_cpuset_change),
         },
         // No controller + rebalancing
         Scenario {
@@ -755,7 +755,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_noctrl_load_imbalance),
+            action: Action::custom(custom_cgroup_noctrl_load_imbalance),
         },
         // Affinity rejection + cpusets
         Scenario {
@@ -767,7 +767,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_multicpu_pin),
+            action: Action::custom(custom_cgroup_cpuset_multicpu_pin),
         },
         // Cgroup add/remove + cpusets
         Scenario {
@@ -779,7 +779,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_add_remove),
+            action: Action::custom(custom_cgroup_cpuset_add_remove),
         },
         // Cgroup add during imbalance
         Scenario {
@@ -791,7 +791,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_add_during_imbalance),
+            action: Action::custom(custom_cgroup_add_during_imbalance),
         },
         // Nested + work conservation
         Scenario {
@@ -803,7 +803,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_nested_cgroup_imbalance),
+            action: Action::custom(custom_nested_cgroup_imbalance),
         },
         // Dispatch contention
         custom!(
@@ -841,7 +841,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cgroup_cpuset_crossllc_race),
+            action: Action::custom(custom_cgroup_cpuset_crossllc_race),
         },
         // Performance: cache pressure vs compute imbalance
         Scenario {
@@ -853,7 +853,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cache_pressure_imbalance),
+            action: Action::custom(custom_cache_pressure_imbalance),
         },
         // Performance: cache yield wake-affine placement
         Scenario {
@@ -865,7 +865,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cache_yield_wake_affine),
+            action: Action::custom(custom_cache_yield_wake_affine),
         },
         // Performance: cache pipe + compute imbalance
         Scenario {
@@ -877,7 +877,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_cache_pipe_io_compute_imbalance),
+            action: Action::custom(custom_cache_pipe_io_compute_imbalance),
         },
         // Performance: 1:N fan-out wake pattern
         Scenario {
@@ -889,7 +889,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_fanout_wake),
+            action: Action::custom(custom_fanout_wake),
         },
         // Performance: schbench-style messenger/worker workload
         Scenario {
@@ -901,7 +901,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
             cgroup_works: vec![],
-            action: Action::Custom(custom_schbench_style),
+            action: Action::custom(custom_schbench_style),
         },
         // Stress: task creation/destruction churn
         s!(

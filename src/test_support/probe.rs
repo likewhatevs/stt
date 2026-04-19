@@ -630,7 +630,8 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     });
 
     // Set up BPF probes if --ktstr-probe-stack was provided.
-    let probe_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pipeline = ProbePipeline::new();
+    let probe_stop = pipeline.stop.clone();
     let probe_handle: Option<ProbeHandle> = probe_stack.as_ref().and_then(|stack_input| {
         use crate::probe::stack::load_probe_stack;
 
@@ -711,22 +712,18 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         let rhints = crate::probe::output::build_render_hints(&btf_funcs);
         let pnames_thread = pnames.clone();
         let rhints_thread = rhints.clone();
-        let stop = probe_stop.clone();
+        let thread_pipeline = pipeline.clone();
         let funcs = functions.clone();
         let fn_names = func_names.clone();
         let pd = pipe_diag.clone();
-        let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let output_done_thread = output_done.clone();
-        let probes_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let probes_ready_thread = probes_ready.clone();
         let handle = std::thread::spawn(move || {
             use crate::probe::process::run_probe_skeleton;
             let (events, diag, accumulated_fn_names) = run_probe_skeleton(
                 &funcs,
                 &btf_funcs,
-                &stop,
+                &thread_pipeline.stop,
                 &bpf_fds,
-                &probes_ready_thread,
+                &thread_pipeline.probes_ready,
                 None,
             );
             let emit_fn_names = if accumulated_fn_names.is_empty() {
@@ -745,14 +742,19 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
                 &pnames_thread,
                 &rhints_thread,
             );
-            output_done_thread.store(true, std::sync::atomic::Ordering::Release);
+            thread_pipeline
+                .output_done
+                .store(true, std::sync::atomic::Ordering::Release);
             (events, diag, accumulated_fn_names)
         });
 
         // Wait for probes to attach before starting the test function.
         // Without this, the test may crash the scheduler before probes
         // are active, resulting in 0 captured events.
-        while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
+        while !pipeline
+            .probes_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -760,7 +762,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             thread: handle,
             func_names,
             pipeline_diag: pipe_diag,
-            output_done,
+            output_done: pipeline.output_done.clone(),
             param_names: pnames,
             render_hints: rhints,
         })
@@ -825,6 +827,29 @@ struct ProbeHandle {
     output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     param_names: std::collections::HashMap<String, Vec<(String, String)>>,
     render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
+}
+
+/// Cross-thread probe pipeline atomics.
+///
+/// Groups the three `Arc<AtomicBool>` signals the probe setup path
+/// has to hand to its worker thread: `stop` (main thread asks the
+/// probe thread to shut down), `output_done` (probe thread tells
+/// the main thread it has already emitted `PROBE_PAYLOAD_*`), and
+/// `probes_ready` (probe thread signals the main thread that
+/// kprobes/kfentries have attached). [`Clone`] is the expected way
+/// to produce the thread-side view before calling
+/// `std::thread::spawn` — each clone bumps refcounts only.
+#[derive(Clone, Default)]
+pub(crate) struct ProbePipeline {
+    pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub probes_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProbePipeline {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// Pre-skeleton pipeline diagnostics captured during guest probe setup.
@@ -906,15 +931,11 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
     let param_names = crate::probe::output::build_param_names(&btf_funcs);
     let render_hints = crate::probe::output::build_render_hints(&btf_funcs);
 
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let probes_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pipeline = ProbePipeline::new();
 
     let (phase_b_tx, phase_b_rx) = std::sync::mpsc::channel();
 
-    let stop_clone = stop.clone();
-    let output_done_clone = output_done.clone();
-    let probes_ready_clone = probes_ready.clone();
+    let thread_pipeline = pipeline.clone();
     let funcs = kernel_functions.clone();
     let btf = btf_funcs.clone();
     let fn_names = func_names.clone();
@@ -926,9 +947,9 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
         let (events, diag, accumulated_fn_names) = crate::probe::process::run_probe_skeleton(
             &funcs,
             &btf,
-            &stop_clone,
+            &thread_pipeline.stop,
             &bpf_fds,
-            &probes_ready_clone,
+            &thread_pipeline.probes_ready,
             Some(phase_b_rx),
         );
         let emit_fn_names = if accumulated_fn_names.is_empty() {
@@ -944,12 +965,17 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
             &pnames,
             &rhints,
         );
-        output_done_clone.store(true, std::sync::atomic::Ordering::Release);
+        thread_pipeline
+            .output_done
+            .store(true, std::sync::atomic::Ordering::Release);
         (events, diag, accumulated_fn_names)
     });
 
     // Wait for Phase A probes (kprobes + trigger + kernel fexit) to attach.
-    while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
+    while !pipeline
+        .probes_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
@@ -963,11 +989,11 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
     Some(ProbePhaseAState {
         handle,
         phase_b_tx,
-        stop,
+        stop: pipeline.stop.clone(),
         kernel_func_names: func_names,
         kernel_func_count,
         pipe_diag,
-        output_done,
+        output_done: pipeline.output_done.clone(),
         param_names,
         render_hints,
     })

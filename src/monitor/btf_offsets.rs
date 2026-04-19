@@ -713,6 +713,32 @@ pub struct BpfMapOffsets {
 }
 
 impl BpfMapOffsets {
+    /// All-zero offsets. Useful for tests that exercise functions which
+    /// do not need any `BpfMapOffsets` field — e.g. the `write_value`
+    /// / `read_value` path, which only walks page tables to reach the
+    /// value KVA and never reads an offset from `self`. Production code
+    /// must use [`from_vmlinux`](Self::from_vmlinux) or
+    /// [`from_btf`](Self::from_btf).
+    #[cfg(test)]
+    pub(crate) const EMPTY: Self = Self {
+        map_name: 0,
+        map_type: 0,
+        map_flags: 0,
+        key_size: 0,
+        value_size: 0,
+        max_entries: 0,
+        array_value: 0,
+        xa_node_slots: 0,
+        xa_node_shift: 0,
+        idr_xa_head: 0,
+        idr_next: 0,
+        map_btf: 0,
+        map_btf_value_type_id: 0,
+        btf_data: 0,
+        btf_data_size: 0,
+        htab_offsets: None,
+    };
+
     /// Parse BTF from a vmlinux ELF and resolve BPF map field offsets.
     pub fn from_vmlinux(path: &Path) -> Result<Self> {
         let btf =

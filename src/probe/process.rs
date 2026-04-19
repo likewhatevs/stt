@@ -118,19 +118,38 @@ pub struct ProbeEvent {
     pub exit_ts: Option<u64>,
 }
 
-/// Resolve a kernel function name to its address via /proc/kallsyms.
-pub fn resolve_func_ip(name: &str) -> Option<u64> {
-    let kallsyms = std::fs::read_to_string("/proc/kallsyms").ok()?;
-    for line in kallsyms.lines() {
+/// Parse `/proc/kallsyms` into a `name -> address` map. Returns `None`
+/// when the file is unreadable (expected outside a privileged context).
+fn load_kallsyms() -> Option<std::collections::HashMap<String, u64>> {
+    let raw = std::fs::read_to_string("/proc/kallsyms").ok()?;
+    let mut map = std::collections::HashMap::with_capacity(raw.lines().count());
+    for line in raw.lines() {
         let mut parts = line.split_whitespace();
-        let addr = parts.next()?;
-        let _ty = parts.next()?;
-        let sym = parts.next()?;
-        if sym == name {
-            return u64::from_str_radix(addr, 16).ok();
-        }
+        let Some(addr) = parts.next() else { continue };
+        let _ty = parts.next();
+        let Some(sym) = parts.next() else { continue };
+        let Ok(addr) = u64::from_str_radix(addr, 16) else {
+            continue;
+        };
+        map.insert(sym.to_string(), addr);
     }
-    None
+    Some(map)
+}
+
+/// Resolve a kernel function name to its address via /proc/kallsyms.
+///
+/// The parsed `name -> address` map is cached on first call so later
+/// lookups avoid re-reading and re-splitting ~200k lines. Callers that
+/// resolve many functions in a batch (auto-probe attach, probe-stack
+/// load) dropped from O(N\*M) line scans to O(N) hash lookups.
+pub fn resolve_func_ip(name: &str) -> Option<u64> {
+    static CACHE: std::sync::OnceLock<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(load_kallsyms)
+        .as_ref()?
+        .get(name)
+        .copied()
 }
 
 /// Populate a `func_meta` with field specs from BTF-resolved offsets.

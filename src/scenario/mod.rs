@@ -344,17 +344,41 @@ pub enum CpusetPartition {
     Holdback(f64),
 }
 
+/// Callable body for [`Action::Custom`].
+///
+/// Wrapped in [`std::sync::Arc`] so [`Action`] (and the enclosing
+/// [`Scenario`]) stays cheaply [`Clone`] while allowing closures that
+/// capture state. Bare `fn` pointers forced callers to hoist state
+/// into static or thread-local slots; `Arc<dyn Fn>` keeps captures
+/// where the scenario is built. The `Send + Sync` bounds mirror
+/// [`Scenario`]'s — catalog entries are shared across the worker
+/// dispatch pool.
+pub type CustomFn = std::sync::Arc<dyn Fn(&Ctx) -> Result<AssertResult> + Send + Sync>;
+
 /// What happens during a scenario's workload phase.
 ///
 /// `Steady` runs workers for the configured duration with no dynamic
-/// operations. `Custom` allows arbitrary test logic via a function
-/// that receives the [`Ctx`].
+/// operations. `Custom` wraps an arbitrary [`CustomFn`] that receives
+/// the [`Ctx`] — typically built from a `fn`-pointer-shaped free
+/// function or a closure that captures setup state.
 #[derive(Clone)]
 pub enum Action {
     /// Run workers for the configured duration with no dynamic operations.
     Steady,
     /// Execute custom scenario logic with access to the full test context.
-    Custom(fn(&Ctx) -> Result<AssertResult>),
+    Custom(CustomFn),
+}
+
+impl Action {
+    /// Build a [`Custom`](Self::Custom) from any closure. Wraps the
+    /// body in the shared [`CustomFn`] `Arc` so callers avoid spelling
+    /// out `Arc::new(...)` at every catalog entry.
+    pub fn custom<F>(f: F) -> Self
+    where
+        F: Fn(&Ctx) -> Result<AssertResult> + Send + Sync + 'static,
+    {
+        Action::Custom(std::sync::Arc::new(f))
+    }
 }
 
 impl std::fmt::Debug for Action {

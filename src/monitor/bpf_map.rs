@@ -18,6 +18,25 @@ use super::idr::{translate_any_kva, xa_load};
 use super::reader::GuestMem;
 use super::symbols::text_kva_to_pa;
 
+/// Bundle of borrow-held state every map-access routine threads
+/// through the page-table walk, bounds check, and byte read/write path.
+///
+/// Every free function in this module previously took the same four-
+/// to eight-argument fan of `mem`, `cr3_pa`, `page_offset`, `offsets`,
+/// `l5` (some also took `map_idr_kva`); callers invariably forwarded
+/// the same fields from their [`BpfMapAccessor`] because all six
+/// originate on the accessor. Grouping them here drops the duplication
+/// and lets additional shared context (per-CPU offset cache, BTF
+/// cache, etc.) ride the same lifetime without touching every
+/// signature.
+pub(crate) struct AccessorCtx<'a> {
+    pub mem: &'a GuestMem,
+    pub cr3_pa: u64,
+    pub page_offset: u64,
+    pub offsets: &'a BpfMapOffsets,
+    pub l5: bool,
+}
+
 /// BPF_MAP_TYPE_HASH from include/uapi/linux/bpf.h.
 pub const BPF_MAP_TYPE_HASH: u32 = 1;
 
@@ -69,31 +88,25 @@ pub struct BpfMapInfo {
 ///
 /// `value_kva` is `Some` only for `BPF_MAP_TYPE_ARRAY` maps where
 /// the value data is inline at the `bpf_array.value` flex array offset.
-pub(crate) fn find_all_bpf_maps(
-    mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    map_idr_kva: u64,
-    offsets: &BpfMapOffsets,
-    l5: bool,
-) -> Vec<BpfMapInfo> {
+pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<BpfMapInfo> {
     let idr_pa = text_kva_to_pa(map_idr_kva);
+    let offsets = ctx.offsets;
 
-    let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
+    let xa_head = ctx.mem.read_u64(idr_pa, offsets.idr_xa_head);
     if xa_head == 0 {
         return Vec::new();
     }
     // idr_next is the next ID the kernel will allocate. All live entries
     // have IDs in 0..idr_next, so scanning beyond it only hits empty or
     // wrapped slots.
-    let idr_next = mem.read_u32(idr_pa, offsets.idr_next);
+    let idr_next = ctx.mem.read_u32(idr_pa, offsets.idr_next);
 
     let mut maps = Vec::new();
 
     for id in 0..idr_next {
         let Some(entry) = xa_load(
-            mem,
-            page_offset,
+            ctx.mem,
+            ctx.page_offset,
             xa_head,
             id as u64,
             offsets.xa_node_slots,
@@ -105,23 +118,25 @@ pub(crate) fn find_all_bpf_maps(
             continue;
         }
 
-        let Some(map_pa) = translate_any_kva(mem, cr3_pa, page_offset, entry, l5) else {
+        let Some(map_pa) = translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, entry, ctx.l5)
+        else {
             continue;
         };
 
         let mut name_buf = [0u8; BPF_OBJ_NAME_LEN];
-        mem.read_bytes(map_pa + offsets.map_name as u64, &mut name_buf);
+        ctx.mem
+            .read_bytes(map_pa + offsets.map_name as u64, &mut name_buf);
         let name_len = name_buf
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(BPF_OBJ_NAME_LEN);
         let name = String::from_utf8_lossy(&name_buf[..name_len]).to_string();
 
-        let map_type = mem.read_u32(map_pa, offsets.map_type);
-        let map_flags = mem.read_u32(map_pa, offsets.map_flags);
-        let key_size = mem.read_u32(map_pa, offsets.key_size);
-        let value_size = mem.read_u32(map_pa, offsets.value_size);
-        let max_entries = mem.read_u32(map_pa, offsets.max_entries);
+        let map_type = ctx.mem.read_u32(map_pa, offsets.map_type);
+        let map_flags = ctx.mem.read_u32(map_pa, offsets.map_flags);
+        let key_size = ctx.mem.read_u32(map_pa, offsets.key_size);
+        let value_size = ctx.mem.read_u32(map_pa, offsets.value_size);
+        let max_entries = ctx.mem.read_u32(map_pa, offsets.max_entries);
 
         // value_kva is only meaningful for ARRAY maps where bpf_array
         // embeds bpf_map at offset 0 and the value flex array is inline.
@@ -131,8 +146,8 @@ pub(crate) fn find_all_bpf_maps(
             None
         };
 
-        let btf_kva = mem.read_u64(map_pa, offsets.map_btf);
-        let btf_value_type_id = mem.read_u32(map_pa, offsets.map_btf_value_type_id);
+        let btf_kva = ctx.mem.read_u64(map_pa, offsets.map_btf);
+        let btf_value_type_id = ctx.mem.read_u32(map_pa, offsets.map_btf_value_type_id);
 
         maps.push(BpfMapInfo {
             map_pa,
@@ -157,15 +172,11 @@ pub(crate) fn find_all_bpf_maps(
 /// Only returns `BPF_MAP_TYPE_ARRAY` maps. Use [`find_all_bpf_maps`]
 /// to enumerate maps of all types.
 pub(crate) fn find_bpf_map(
-    mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
+    ctx: &AccessorCtx<'_>,
     map_idr_kva: u64,
     name_suffix: &str,
-    offsets: &BpfMapOffsets,
-    l5: bool,
 ) -> Option<BpfMapInfo> {
-    find_all_bpf_maps(mem, cr3_pa, page_offset, map_idr_kva, offsets, l5)
+    find_all_bpf_maps(ctx, map_idr_kva)
         .into_iter()
         .find(|m| m.map_type == BPF_MAP_TYPE_ARRAY && m.name.ends_with(name_suffix))
 }
@@ -178,12 +189,10 @@ pub(crate) fn find_bpf_map(
 /// `offset + data.len()` exceeds `value_size`, or any page in the
 /// range is unmapped.
 pub(crate) fn write_bpf_map_value(
-    mem: &GuestMem,
-    cr3_pa: u64,
+    ctx: &AccessorCtx<'_>,
     map_info: &BpfMapInfo,
     offset: usize,
     data: &[u8],
-    l5: bool,
 ) -> bool {
     let Some(base_kva) = map_info.value_kva else {
         return false;
@@ -196,24 +205,22 @@ pub(crate) fn write_bpf_map_value(
     // Write byte-by-byte across potential page boundaries.
     for (i, &byte) in data.iter().enumerate() {
         let kva = target_kva + i as u64;
-        let Some(pa) = mem.translate_kva(cr3_pa, kva, l5) else {
+        let Some(pa) = ctx.mem.translate_kva(ctx.cr3_pa, kva, ctx.l5) else {
             return false;
         };
-        mem.write_u8(pa, 0, byte);
+        ctx.mem.write_u8(pa, 0, byte);
     }
     true
 }
 
 /// Write a u32 to a BPF map's value region at `offset`.
 pub(crate) fn write_bpf_map_value_u32(
-    mem: &GuestMem,
-    cr3_pa: u64,
+    ctx: &AccessorCtx<'_>,
     map_info: &BpfMapInfo,
     offset: usize,
     val: u32,
-    l5: bool,
 ) -> bool {
-    write_bpf_map_value(mem, cr3_pa, map_info, offset, &val.to_ne_bytes(), l5)
+    write_bpf_map_value(ctx, map_info, offset, &val.to_ne_bytes())
 }
 
 /// Read bytes from a BPF map's value region at `offset`.
@@ -224,12 +231,10 @@ pub(crate) fn write_bpf_map_value_u32(
 /// `offset + len` exceeds `value_size`, or any page in the range
 /// is unmapped.
 pub(crate) fn read_bpf_map_value(
-    mem: &GuestMem,
-    cr3_pa: u64,
+    ctx: &AccessorCtx<'_>,
     map_info: &BpfMapInfo,
     offset: usize,
     len: usize,
-    l5: bool,
 ) -> Option<Vec<u8>> {
     let base_kva = map_info.value_kva?;
     if offset + len > map_info.value_size as usize {
@@ -241,21 +246,19 @@ pub(crate) fn read_bpf_map_value(
     // Read byte-by-byte across potential page boundaries.
     for (i, byte) in buf.iter_mut().enumerate() {
         let kva = target_kva + i as u64;
-        let pa = mem.translate_kva(cr3_pa, kva, l5)?;
-        *byte = mem.read_u8(pa, 0);
+        let pa = ctx.mem.translate_kva(ctx.cr3_pa, kva, ctx.l5)?;
+        *byte = ctx.mem.read_u8(pa, 0);
     }
     Some(buf)
 }
 
 /// Read a u32 from a BPF map's value region at `offset`.
 pub(crate) fn read_bpf_map_value_u32(
-    mem: &GuestMem,
-    cr3_pa: u64,
+    ctx: &AccessorCtx<'_>,
     map_info: &BpfMapInfo,
     offset: usize,
-    l5: bool,
 ) -> Option<u32> {
-    let bytes = read_bpf_map_value(mem, cr3_pa, map_info, offset, 4, l5)?;
+    let bytes = read_bpf_map_value(ctx, map_info, offset, 4)?;
     Some(u32::from_ne_bytes(bytes.try_into().unwrap()))
 }
 
@@ -280,18 +283,11 @@ const HTAB_ITER_MAX: usize = 1_000_000;
 /// offsets are unavailable, or the htab struct itself is untranslatable.
 /// Untranslatable buckets are skipped; an untranslatable element breaks
 /// the current bucket's chain and advances to the next bucket.
-fn iter_htab_entries(
-    mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    map: &BpfMapInfo,
-    offsets: &BpfMapOffsets,
-    l5: bool,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn iter_htab_entries(ctx: &AccessorCtx<'_>, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
     if map.map_type != BPF_MAP_TYPE_HASH {
         return Vec::new();
     }
-    let Some(htab) = &offsets.htab_offsets else {
+    let Some(htab) = &ctx.offsets.htab_offsets else {
         return Vec::new();
     };
 
@@ -299,11 +295,12 @@ fn iter_htab_entries(
     let htab_kva = map.map_kva;
 
     // Read n_buckets and buckets pointer from the bpf_htab struct.
-    let Some(htab_pa) = translate_any_kva(mem, cr3_pa, page_offset, htab_kva, l5) else {
+    let Some(htab_pa) = translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, htab_kva, ctx.l5)
+    else {
         return Vec::new();
     };
-    let n_buckets = mem.read_u32(htab_pa, htab.htab_n_buckets);
-    let buckets_kva = mem.read_u64(htab_pa, htab.htab_buckets);
+    let n_buckets = ctx.mem.read_u32(htab_pa, htab.htab_n_buckets);
+    let buckets_kva = ctx.mem.read_u64(htab_pa, htab.htab_buckets);
     if n_buckets == 0 || buckets_kva == 0 {
         return Vec::new();
     }
@@ -320,12 +317,16 @@ fn iter_htab_entries(
     for i in 0..n_buckets {
         // bucket[i] is at buckets_kva + i * bucket_size.
         let bucket_kva = buckets_kva + (i as u64) * (htab.bucket_size as u64);
-        let Some(bucket_pa) = translate_any_kva(mem, cr3_pa, page_offset, bucket_kva, l5) else {
+        let Some(bucket_pa) =
+            translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, bucket_kva, ctx.l5)
+        else {
             continue;
         };
 
         // Read hlist_nulls_head.first from the bucket.
-        let first_ptr = mem.read_u64(bucket_pa, htab.bucket_head + htab.hlist_nulls_head_first);
+        let first_ptr = ctx
+            .mem
+            .read_u64(bucket_pa, htab.bucket_head + htab.hlist_nulls_head_first);
 
         // Walk the hlist_nulls chain.
         let mut node_ptr = first_ptr;
@@ -343,23 +344,27 @@ fn iter_htab_entries(
             // offset 0 of htab_elem (hash_node is first in the union).
             // So elem_kva == node_ptr.
             let elem_kva = node_ptr;
-            let Some(elem_pa) = translate_any_kva(mem, cr3_pa, page_offset, elem_kva, l5) else {
+            let Some(elem_pa) =
+                translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, elem_kva, ctx.l5)
+            else {
                 break;
             };
 
             // Read key bytes.
             let mut key_buf = vec![0u8; key_size];
-            mem.read_bytes(elem_pa + key_off_in_elem as u64, &mut key_buf);
+            ctx.mem
+                .read_bytes(elem_pa + key_off_in_elem as u64, &mut key_buf);
 
             // Read value bytes.
             let mut val_buf = vec![0u8; value_size];
-            mem.read_bytes(elem_pa + value_off_in_elem as u64, &mut val_buf);
+            ctx.mem
+                .read_bytes(elem_pa + value_off_in_elem as u64, &mut val_buf);
 
             entries.push((key_buf, val_buf));
 
             // Follow next pointer. hlist_nulls_node.next is at
             // hlist_nulls_node_next offset within the node.
-            node_ptr = mem.read_u64(elem_pa, htab.hlist_nulls_node_next);
+            node_ptr = ctx.mem.read_u64(elem_pa, htab.hlist_nulls_node_next);
         }
     }
 
@@ -377,16 +382,11 @@ fn iter_htab_entries(
 /// does not. Returns an empty vec if the map is not
 /// `BPF_MAP_TYPE_PERCPU_ARRAY`, `key >= max_entries`, or the percpu
 /// pointer is zero.
-#[allow(clippy::too_many_arguments)]
 fn read_percpu_array_value(
-    mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
+    ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
     key: u32,
-    offsets: &BpfMapOffsets,
     per_cpu_offsets: &[u64],
-    l5: bool,
 ) -> Vec<Option<Vec<u8>>> {
     if map.map_type != BPF_MAP_TYPE_PERCPU_ARRAY {
         return Vec::new();
@@ -396,15 +396,16 @@ fn read_percpu_array_value(
     }
 
     // pptrs is at the same offset as value (union in bpf_array).
-    let pptrs_kva = map.map_kva + offsets.array_value as u64;
+    let pptrs_kva = map.map_kva + ctx.offsets.array_value as u64;
     // pptrs[key] is a void __percpu * — 8 bytes.
     let pptr_kva = pptrs_kva + (key as u64) * 8;
 
     // bpf_array may be kmalloc'd or vmalloc'd — try direct mapping first.
-    let Some(pptr_pa) = translate_any_kva(mem, cr3_pa, page_offset, pptr_kva, l5) else {
+    let Some(pptr_pa) = translate_any_kva(ctx.mem, ctx.cr3_pa, ctx.page_offset, pptr_kva, ctx.l5)
+    else {
         return Vec::new();
     };
-    let percpu_base = mem.read_u64(pptr_pa, 0);
+    let percpu_base = ctx.mem.read_u64(pptr_pa, 0);
     if percpu_base == 0 {
         return Vec::new();
     }
@@ -414,10 +415,10 @@ fn read_percpu_array_value(
 
     for &cpu_off in per_cpu_offsets {
         let cpu_kva = percpu_base.wrapping_add(cpu_off);
-        let cpu_pa = super::symbols::kva_to_pa(cpu_kva, page_offset);
-        if cpu_pa + value_size as u64 <= mem.size() {
+        let cpu_pa = super::symbols::kva_to_pa(cpu_kva, ctx.page_offset);
+        if cpu_pa + value_size as u64 <= ctx.mem.size() {
             let mut buf = vec![0u8; value_size];
-            mem.read_bytes(cpu_pa, &mut buf);
+            ctx.mem.read_bytes(cpu_pa, &mut buf);
             result.push(Some(buf));
         } else {
             result.push(None);
@@ -625,13 +626,11 @@ fn resolve_field_kind(btf: &btf_rs::Btf, member: &btf_rs::Member) -> Option<(Bpf
 
 /// Read a typed field from a BPF map's value region.
 fn read_typed_field(
-    mem: &GuestMem,
-    cr3_pa: u64,
+    ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
     field: &BpfFieldInfo,
-    l5: bool,
 ) -> Option<BpfValue> {
-    let bytes = read_bpf_map_value(mem, cr3_pa, map, field.offset, field.size, l5)?;
+    let bytes = read_bpf_map_value(ctx, map, field.offset, field.size)?;
     Some(match &field.kind {
         BpfFieldKind::Bool => BpfValue::Bool(bytes[0] != 0),
         BpfFieldKind::U8 => BpfValue::U8(bytes[0]),
@@ -648,12 +647,10 @@ fn read_typed_field(
 
 /// Write a typed field to a BPF map's value region.
 fn write_typed_field(
-    mem: &GuestMem,
-    cr3_pa: u64,
+    ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
     field: &BpfFieldInfo,
     val: BpfValue,
-    l5: bool,
 ) -> bool {
     let bytes: Vec<u8> = match (&field.kind, &val) {
         (BpfFieldKind::Bool, BpfValue::Bool(v)) => vec![*v as u8],
@@ -668,7 +665,7 @@ fn write_typed_field(
         (BpfFieldKind::Bytes(n), BpfValue::Bytes(v)) if v.len() == *n => v.clone(),
         _ => return false,
     };
-    write_bpf_map_value(mem, cr3_pa, map, field.offset, &bytes, l5)
+    write_bpf_map_value(ctx, map, field.offset, &bytes)
 }
 
 /// Host-side BPF map accessor for a running guest VM.
@@ -715,19 +712,23 @@ impl<'a> BpfMapAccessor<'a> {
         })
     }
 
+    /// Build the [`AccessorCtx`] used by every map-read/write routine.
+    fn ctx(&self) -> AccessorCtx<'_> {
+        AccessorCtx {
+            mem: self.kernel.mem(),
+            cr3_pa: self.kernel.cr3_pa(),
+            page_offset: self.kernel.page_offset(),
+            offsets: self.offsets,
+            l5: self.kernel.l5(),
+        }
+    }
+
     /// Enumerate all BPF maps in the kernel's `map_idr`.
     ///
     /// Returns metadata for every map whose KVA can be translated.
     /// No filtering by type or name.
     pub fn maps(&self) -> Vec<BpfMapInfo> {
-        find_all_bpf_maps(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            self.kernel.page_offset(),
-            self.map_idr_kva,
-            self.offsets,
-            self.kernel.l5(),
-        )
+        find_all_bpf_maps(&self.ctx(), self.map_idr_kva)
     }
 
     /// Find the first BPF ARRAY map whose name ends with `name_suffix`.
@@ -735,15 +736,7 @@ impl<'a> BpfMapAccessor<'a> {
     /// Only returns `BPF_MAP_TYPE_ARRAY` maps. Use [`maps`](Self::maps)
     /// to enumerate maps of all types.
     pub fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
-        find_bpf_map(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            self.kernel.page_offset(),
-            self.map_idr_kva,
-            name_suffix,
-            self.offsets,
-            self.kernel.l5(),
-        )
+        find_bpf_map(&self.ctx(), self.map_idr_kva, name_suffix)
     }
 
     /// Read bytes from a map's value region.
@@ -751,14 +744,7 @@ impl<'a> BpfMapAccessor<'a> {
     /// Returns `None` if the map has no value KVA (non-ARRAY map)
     /// or any page in the range is unmapped.
     pub fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>> {
-        read_bpf_map_value(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            map,
-            offset,
-            len,
-            self.kernel.l5(),
-        )
+        read_bpf_map_value(&self.ctx(), map, offset, len)
     }
 
     /// Write bytes to a map's value region.
@@ -766,49 +752,22 @@ impl<'a> BpfMapAccessor<'a> {
     /// Returns `false` if the map has no value KVA (non-ARRAY map)
     /// or any page in the range is unmapped.
     pub fn write_value(&self, map: &BpfMapInfo, offset: usize, data: &[u8]) -> bool {
-        write_bpf_map_value(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            map,
-            offset,
-            data,
-            self.kernel.l5(),
-        )
+        write_bpf_map_value(&self.ctx(), map, offset, data)
     }
 
     /// Write a u32 to a map's value region.
     pub fn write_value_u32(&self, map: &BpfMapInfo, offset: usize, val: u32) -> bool {
-        write_bpf_map_value_u32(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            map,
-            offset,
-            val,
-            self.kernel.l5(),
-        )
+        write_bpf_map_value_u32(&self.ctx(), map, offset, val)
     }
 
     /// Read a u32 from a map's value region.
     pub fn read_value_u32(&self, map: &BpfMapInfo, offset: usize) -> Option<u32> {
-        read_bpf_map_value_u32(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            map,
-            offset,
-            self.kernel.l5(),
-        )
+        read_bpf_map_value_u32(&self.ctx(), map, offset)
     }
 
     /// Iterate all entries in a `BPF_MAP_TYPE_HASH` map.
     pub fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
-        iter_htab_entries(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            self.kernel.page_offset(),
-            map,
-            self.offsets,
-            self.kernel.l5(),
-        )
+        iter_htab_entries(&self.ctx(), map)
     }
 
     /// Read per-CPU values for a key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
@@ -835,16 +794,7 @@ impl<'a> BpfMapAccessor<'a> {
         let per_cpu_offsets =
             super::symbols::read_per_cpu_offsets(self.kernel.mem(), pco_pa, num_cpus);
 
-        read_percpu_array_value(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            self.kernel.page_offset(),
-            map,
-            key,
-            self.offsets,
-            &per_cpu_offsets,
-            self.kernel.l5(),
-        )
+        read_percpu_array_value(&self.ctx(), map, key, &per_cpu_offsets)
     }
 
     /// Resolve the value layout from the map's BTF.
@@ -892,13 +842,7 @@ impl<'a> BpfMapAccessor<'a> {
         field: &str,
     ) -> Option<BpfValue> {
         let fi = layout.field(field)?;
-        read_typed_field(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            map,
-            fi,
-            self.kernel.l5(),
-        )
+        read_typed_field(&self.ctx(), map, fi)
     }
 
     /// Write a typed field to a map's value region.
@@ -915,14 +859,7 @@ impl<'a> BpfMapAccessor<'a> {
         let Some(fi) = layout.field(field) else {
             return false;
         };
-        write_typed_field(
-            self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            map,
-            fi,
-            val,
-            self.kernel.l5(),
-        )
+        write_typed_field(&self.ctx(), map, fi, val)
     }
 }
 
@@ -1070,6 +1007,36 @@ mod tests {
     use super::*;
     use crate::monitor::idr::{XA_CHUNK_SIZE, xa_node_shift};
     use crate::monitor::symbols::START_KERNEL_MAP;
+
+    /// Test-only alias: many value-I/O tests don't thread an
+    /// `&BpfMapOffsets` through, because `read_value` / `write_value`
+    /// never touch one. Build the full [`AccessorCtx`] by borrowing
+    /// [`BpfMapOffsets::EMPTY`] so those call sites stay terse.
+    fn value_ctx<'a>(mem: &'a GuestMem, cr3_pa: u64, l5: bool) -> AccessorCtx<'a> {
+        AccessorCtx {
+            mem,
+            cr3_pa,
+            page_offset: 0,
+            offsets: &BpfMapOffsets::EMPTY,
+            l5,
+        }
+    }
+
+    fn lookup_ctx<'a>(
+        mem: &'a GuestMem,
+        cr3_pa: u64,
+        page_offset: u64,
+        offsets: &'a BpfMapOffsets,
+        l5: bool,
+    ) -> AccessorCtx<'a> {
+        AccessorCtx {
+            mem,
+            cr3_pa,
+            page_offset,
+            offsets,
+            l5,
+        }
+    }
 
     // On aarch64, page table entries contain GPAs starting at DRAM_START.
     // The walker subtracts DRAM_START to produce GuestMem offsets. Test
@@ -1402,12 +1369,10 @@ mod tests {
 
         // Write u32 at offset 4 within the value region.
         assert!(write_bpf_map_value_u32(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             4,
             0xABCD_1234,
-            false
         ));
         // Read it back via direct PA access.
         assert_eq!(mem.read_u32(data_pa, 4), 0xABCD_1234);
@@ -1691,13 +1656,9 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000, // page_offset (unused for this path)
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
             ".bss",
-            &offsets,
-            false,
         );
 
         let info = result.expect("should find the map");
@@ -1719,13 +1680,9 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
             ".data",
-            &offsets,
-            false,
         );
         assert!(result.is_none());
     }
@@ -1739,13 +1696,9 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
             ".bss",
-            &offsets,
-            false,
         );
         assert!(result.is_none());
     }
@@ -1781,13 +1734,9 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = find_bpf_map(
-            &mem,
-            0x10000,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, 0x10000, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
             ".bss",
-            &offsets,
-            false,
         );
         assert!(result.is_none());
     }
@@ -1912,7 +1861,12 @@ mod tests {
         };
 
         let payload = [0xDE, 0xAD, 0xBE, 0xEF];
-        assert!(write_bpf_map_value(&mem, cr3_pa, &info, 0, &payload, false));
+        assert!(write_bpf_map_value(
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            0,
+            &payload
+        ));
 
         // Verify each byte was written.
         for (i, &expected) in payload.iter().enumerate() {
@@ -1941,7 +1895,12 @@ mod tests {
             btf_value_type_id: 0,
         };
 
-        assert!(!write_bpf_map_value(&mem, cr3_pa, &info, 0, &[0xFF], false));
+        assert!(!write_bpf_map_value(
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            0,
+            &[0xFF]
+        ));
     }
 
     // -- two-level xarray traversal --
@@ -2204,7 +2163,11 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
-        let result = find_bpf_map(&mem, cr3_pa, page_offset, idr_kva, ".bss", &offsets, false);
+        let result = find_bpf_map(
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
+            idr_kva,
+            ".bss",
+        );
         let info = result.expect("should find second map");
         assert_eq!(info.name, "mitosis.bss");
         assert_eq!(info.map_pa, 0x15000);
@@ -2223,13 +2186,9 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = find_bpf_map(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
             ".bss",
-            &offsets,
-            false,
         );
         let info = result.expect("should find map with 15-char name");
         assert_eq!(info.name, full_name);
@@ -2252,13 +2211,9 @@ mod tests {
 
         // The name doesn't end with ".bss" — the '!' is the 16th char.
         let result = find_bpf_map(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
             ".bss",
-            &offsets,
-            false,
         );
         assert!(
             result.is_none(),
@@ -2293,7 +2248,12 @@ mod tests {
 
         // Write at offset 8 within the value region.
         let payload = [0x11, 0x22, 0x33, 0x44];
-        assert!(write_bpf_map_value(&mem, cr3_pa, &info, 8, &payload, false));
+        assert!(write_bpf_map_value(
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            8,
+            &payload
+        ));
 
         for (i, &expected) in payload.iter().enumerate() {
             assert_eq!(buf[data_pa as usize + 8 + i], expected);
@@ -2326,7 +2286,12 @@ mod tests {
         };
 
         // Zero-length write should succeed without doing anything.
-        assert!(write_bpf_map_value(&mem, cr3_pa, &info, 0, &[], false));
+        assert!(write_bpf_map_value(
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            0,
+            &[]
+        ));
     }
 
     // -- write_bpf_map_value_u32 with 5-level paging --
@@ -2353,12 +2318,10 @@ mod tests {
         };
 
         assert!(write_bpf_map_value_u32(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, true),
             &info,
             0,
             0xCAFE_BABE,
-            true
         ));
         assert_eq!(mem.read_u32(data_pa, 0), 0xCAFE_BABE);
     }
@@ -2521,13 +2484,9 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = find_bpf_map(
-            &mem,
-            pgd_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, pgd_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
             ".bss",
-            &offsets,
-            false,
         );
         assert!(result.is_none());
     }
@@ -2614,13 +2573,9 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = find_bpf_map(
-            &mem,
-            pml5_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, pml5_pa, 0xFFFF_8880_0000_0000, &offsets, true),
             idr_kva,
             ".bss",
-            &offsets,
-            true,
         );
 
         let info = result.expect("should find map via 5-level walk");
@@ -2695,7 +2650,10 @@ mod tests {
         // bytes 2..4 land on page 2 (PA page2_pa + 0x000..0x002).
         let val: u32 = 0xAABB_CCDD;
         assert!(write_bpf_map_value_u32(
-            &mem, cr3_pa, &info, 0xFFE, val, false
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            0xFFE,
+            val,
         ));
 
         // Verify bytes on page 1 (last 2 bytes of the page).
@@ -2730,12 +2688,10 @@ mod tests {
 
         // Write exactly at offset 0x1000 — first byte of page 2.
         assert!(write_bpf_map_value(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             0x1000,
             &[0x42],
-            false
         ));
         assert_eq!(buf[page2_pa as usize], 0x42);
     }
@@ -2851,7 +2807,11 @@ mod tests {
 
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let result = find_bpf_map(&mem, pgd_pa, page_offset, idr_kva, ".bss", &offsets, false);
+        let result = find_bpf_map(
+            &lookup_ctx(&mem, pgd_pa, page_offset, &offsets, false),
+            idr_kva,
+            ".bss",
+        );
 
         let info = result.expect("should skip untranslatable entry and find the second");
         assert_eq!(info.name, "target.bss");
@@ -2885,7 +2845,7 @@ mod tests {
             btf_value_type_id: 0,
         };
 
-        let val = read_bpf_map_value_u32(&mem, cr3_pa, &info, 4, false);
+        let val = read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, false), &info, 4);
         assert_eq!(val, Some(0xCAFE_BABE));
     }
 
@@ -2911,7 +2871,7 @@ mod tests {
             btf_value_type_id: 0,
         };
 
-        let bytes = read_bpf_map_value(&mem, cr3_pa, &info, 0, 4, false);
+        let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 4);
         assert_eq!(bytes, Some(vec![0xAA, 0xBB, 0xCC, 0xDD]));
     }
 
@@ -2936,7 +2896,7 @@ mod tests {
             btf_value_type_id: 0,
         };
 
-        let bytes = read_bpf_map_value(&mem, cr3_pa, &info, 0, 0, false);
+        let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 0);
         assert_eq!(bytes, Some(vec![]));
     }
 
@@ -2961,8 +2921,14 @@ mod tests {
             btf_value_type_id: 0,
         };
 
-        assert_eq!(read_bpf_map_value(&mem, cr3_pa, &info, 0, 4, false), None);
-        assert_eq!(read_bpf_map_value_u32(&mem, cr3_pa, &info, 0, false), None);
+        assert_eq!(
+            read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 4),
+            None
+        );
+        assert_eq!(
+            read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, false), &info, 0),
+            None
+        );
     }
 
     #[test]
@@ -2988,25 +2954,26 @@ mod tests {
 
         // Write then read u32.
         assert!(write_bpf_map_value_u32(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             8,
             0x1234_5678,
-            false
         ));
         assert_eq!(
-            read_bpf_map_value_u32(&mem, cr3_pa, &info, 8, false),
+            read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, false), &info, 8),
             Some(0x1234_5678)
         );
 
         // Write then read bytes.
         let payload = [0x11, 0x22, 0x33, 0x44, 0x55];
         assert!(write_bpf_map_value(
-            &mem, cr3_pa, &info, 16, &payload, false
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            16,
+            &payload,
         ));
         assert_eq!(
-            read_bpf_map_value(&mem, cr3_pa, &info, 16, 5, false),
+            read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 16, 5),
             Some(payload.to_vec()),
         );
     }
@@ -3038,7 +3005,7 @@ mod tests {
             btf_value_type_id: 0,
         };
 
-        let bytes = read_bpf_map_value(&mem, cr3_pa, &info, 0xFFE, 4, false);
+        let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0xFFE, 4);
         assert_eq!(bytes, Some(vec![0xAA, 0xBB, 0xCC, 0xDD]));
     }
 
@@ -3065,7 +3032,7 @@ mod tests {
         };
 
         assert_eq!(
-            read_bpf_map_value_u32(&mem, cr3_pa, &info, 0, true),
+            read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, true), &info, 0),
             Some(0xDEAD_BEEF)
         );
     }
@@ -3088,7 +3055,10 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
-        let maps = find_all_bpf_maps(&mem, cr3_pa, page_offset, idr_kva, &offsets, false);
+        let maps = find_all_bpf_maps(
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
+            idr_kva,
+        );
         assert_eq!(maps.len(), 2);
         let hash_map = maps.iter().find(|m| m.name == "other.data");
         let array_map = maps.iter().find(|m| m.name == "mitosis.bss");
@@ -3109,12 +3079,8 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let maps = find_all_bpf_maps(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
-            &offsets,
-            false,
         );
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].name, "test.bss");
@@ -3147,12 +3113,8 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let maps = find_all_bpf_maps(
-            &mem,
-            0x10000,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, 0x10000, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
-            &offsets,
-            false,
         );
         assert!(maps.is_empty());
     }
@@ -3180,8 +3142,8 @@ mod tests {
             btf_value_type_id: 0,
         };
 
-        assert!(read_bpf_map_value(&mem, cr3_pa, &info, 0, 4, false).is_none());
-        assert!(read_bpf_map_value_u32(&mem, cr3_pa, &info, 0, false).is_none());
+        assert!(read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 4).is_none());
+        assert!(read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, false), &info, 0).is_none());
     }
 
     #[test]
@@ -3206,14 +3168,17 @@ mod tests {
         };
 
         assert!(!write_bpf_map_value(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             0,
             &[1, 2, 3, 4],
-            false
         ));
-        assert!(!write_bpf_map_value_u32(&mem, cr3_pa, &info, 0, 42, false));
+        assert!(!write_bpf_map_value_u32(
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            0,
+            42
+        ));
     }
 
     // -- map_flags test (fix #5) --
@@ -3231,12 +3196,8 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let maps = find_all_bpf_maps(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
-            &offsets,
-            false,
         );
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].map_flags, 0x0400);
@@ -3363,7 +3324,10 @@ mod tests {
 
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let maps = find_all_bpf_maps(&mem, pgd_pa, page_offset, idr_kva, &offsets, false);
+        let maps = find_all_bpf_maps(
+            &lookup_ctx(&mem, pgd_pa, page_offset, &offsets, false),
+            idr_kva,
+        );
 
         // Should find the second map despite the first being untranslatable.
         let good = maps.iter().find(|m| m.name == "good.bss");
@@ -3398,13 +3362,13 @@ mod tests {
         };
 
         // Exactly at boundary: offset=4, len=4 -> 4+4=8 == value_size, ok.
-        assert!(read_bpf_map_value(&mem, cr3_pa, &info, 4, 4, false).is_some());
+        assert!(read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 4, 4).is_some());
         // One past: offset=4, len=5 -> 4+5=9 > 8, rejected.
-        assert!(read_bpf_map_value(&mem, cr3_pa, &info, 4, 5, false).is_none());
+        assert!(read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 4, 5).is_none());
         // Offset past end: offset=9, len=1 -> 9+1=10 > 8, rejected.
-        assert!(read_bpf_map_value(&mem, cr3_pa, &info, 9, 1, false).is_none());
+        assert!(read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 9, 1).is_none());
         // u32 past end: offset=6, 6+4=10 > 8, rejected.
-        assert!(read_bpf_map_value_u32(&mem, cr3_pa, &info, 6, false).is_none());
+        assert!(read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, false), &info, 6).is_none());
     }
 
     #[test]
@@ -3430,16 +3394,32 @@ mod tests {
 
         // Within bounds: offset=0, len=8.
         assert!(write_bpf_map_value(
-            &mem, cr3_pa, &info, 0, &[0u8; 8], false
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            0,
+            &[0u8; 8],
         ));
         // Past end: offset=0, len=9.
         assert!(!write_bpf_map_value(
-            &mem, cr3_pa, &info, 0, &[0u8; 9], false
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            0,
+            &[0u8; 9],
         ));
         // u32 past end: offset=6, 6+4=10 > 8.
-        assert!(!write_bpf_map_value_u32(&mem, cr3_pa, &info, 6, 42, false));
+        assert!(!write_bpf_map_value_u32(
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            6,
+            42
+        ));
         // u32 at boundary: offset=4, 4+4=8, ok.
-        assert!(write_bpf_map_value_u32(&mem, cr3_pa, &info, 4, 42, false));
+        assert!(write_bpf_map_value_u32(
+            &value_ctx(&mem, cr3_pa, false),
+            &info,
+            4,
+            42
+        ));
     }
 
     // -- BpfValueLayout tests --
@@ -3536,14 +3516,12 @@ mod tests {
         };
 
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &field_u32,
             BpfValue::U32(42),
-            false
         ));
-        let val = read_typed_field(&mem, cr3_pa, &info, &field_u32, false);
+        let val = read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &field_u32);
         assert_eq!(val, Some(BpfValue::U32(42)));
     }
 
@@ -3576,15 +3554,13 @@ mod tests {
             kind: BpfFieldKind::Bool,
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::Bool(true),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::Bool(true))
         );
 
@@ -3596,15 +3572,13 @@ mod tests {
             kind: BpfFieldKind::U8,
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::U8(0xAB),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::U8(0xAB))
         );
 
@@ -3616,15 +3590,13 @@ mod tests {
             kind: BpfFieldKind::I8,
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::I8(-5),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::I8(-5))
         );
 
@@ -3636,15 +3608,13 @@ mod tests {
             kind: BpfFieldKind::U16,
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::U16(1234),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::U16(1234))
         );
 
@@ -3656,15 +3626,13 @@ mod tests {
             kind: BpfFieldKind::I16,
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::I16(-100),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::I16(-100))
         );
 
@@ -3676,15 +3644,13 @@ mod tests {
             kind: BpfFieldKind::U64,
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::U64(0xDEAD_BEEF),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::U64(0xDEAD_BEEF))
         );
 
@@ -3696,15 +3662,13 @@ mod tests {
             kind: BpfFieldKind::I64,
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::I64(-999),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::I64(-999))
         );
 
@@ -3716,15 +3680,13 @@ mod tests {
             kind: BpfFieldKind::I32,
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::I32(-42),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::I32(-42))
         );
 
@@ -3736,15 +3698,13 @@ mod tests {
             kind: BpfFieldKind::Bytes(3),
         };
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &f,
             BpfValue::Bytes(vec![1, 2, 3]),
-            false
         ));
         assert_eq!(
-            read_typed_field(&mem, cr3_pa, &info, &f, false),
+            read_typed_field(&value_ctx(&mem, cr3_pa, false), &info, &f),
             Some(BpfValue::Bytes(vec![1, 2, 3]))
         );
     }
@@ -3778,28 +3738,22 @@ mod tests {
             kind: BpfFieldKind::U32,
         };
         assert!(!write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &field,
             BpfValue::U64(1),
-            false
         ));
         assert!(!write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &field,
             BpfValue::Bool(true),
-            false
         ));
         assert!(!write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &field,
             BpfValue::I32(-1),
-            false
         ));
 
         // Bytes field: wrong length.
@@ -3810,29 +3764,23 @@ mod tests {
             kind: BpfFieldKind::Bytes(3),
         };
         assert!(!write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &field_bytes,
             BpfValue::Bytes(vec![1, 2]),
-            false
         ));
         assert!(!write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &field_bytes,
             BpfValue::Bytes(vec![1, 2, 3, 4]),
-            false
         ));
         // Correct length works.
         assert!(write_typed_field(
-            &mem,
-            cr3_pa,
+            &value_ctx(&mem, cr3_pa, false),
             &info,
             &field_bytes,
             BpfValue::Bytes(vec![1, 2, 3]),
-            false
         ));
     }
 
@@ -3894,12 +3842,8 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let maps = find_all_bpf_maps(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
-            &offsets,
-            false,
         );
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].btf_kva, 0);
@@ -3913,12 +3857,8 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let maps = find_all_bpf_maps(
-            &mem,
-            cr3_pa,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, cr3_pa, 0xFFFF_8880_0000_0000, &offsets, false),
             idr_kva,
-            &offsets,
-            false,
         );
         assert_eq!(maps[0].btf_kva, btf_kva_val);
         assert_eq!(maps[0].btf_value_type_id, 7);
@@ -4053,7 +3993,10 @@ mod tests {
 
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let maps = find_all_bpf_maps(&mem, pgd_pa, page_offset, idr_kva, &offsets, false);
+        let maps = find_all_bpf_maps(
+            &lookup_ctx(&mem, pgd_pa, page_offset, &offsets, false),
+            idr_kva,
+        );
 
         // Only 2 maps should be found (idr_next=2 means scan 0..2).
         assert_eq!(maps.len(), 2);
@@ -4261,7 +4204,7 @@ mod tests {
             btf_kva: 0,
             btf_value_type_id: 0,
         };
-        let entries = iter_htab_entries(&mem, 0, 0, &map, &offsets, false);
+        let entries = iter_htab_entries(&lookup_ctx(&mem, 0, 0, &offsets, false), &map);
         assert!(entries.is_empty());
     }
 
@@ -4285,7 +4228,7 @@ mod tests {
             btf_kva: 0,
             btf_value_type_id: 0,
         };
-        let entries = iter_htab_entries(&mem, 0, 0, &map, &offsets, false);
+        let entries = iter_htab_entries(&lookup_ctx(&mem, 0, 0, &offsets, false), &map);
         assert!(entries.is_empty());
     }
 
@@ -4418,7 +4361,7 @@ mod tests {
         let (buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[], 4);
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert!(entries.is_empty());
     }
 
@@ -4429,7 +4372,7 @@ mod tests {
         let (buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, key);
         assert_eq!(entries[0].1, val);
@@ -4447,7 +4390,7 @@ mod tests {
             setup_htab_direct(4, 8, &[(&k1, &v1), (&k2, &v2), (&k3, &v3)], 4);
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert_eq!(entries.len(), 3);
         // All entries are in bucket 0, chained in order.
         assert_eq!(entries[0].0, k1);
@@ -4468,7 +4411,7 @@ mod tests {
         buf[htab.htab_n_buckets..htab.htab_n_buckets + 4].copy_from_slice(&0u32.to_ne_bytes());
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert!(entries.is_empty());
     }
 
@@ -4483,7 +4426,7 @@ mod tests {
         let (buf, page_offset, map, offsets) = setup_htab_direct(8, 16, &[(&key, &val)], 2);
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, key);
         assert_eq!(entries[0].1, val);
@@ -4572,7 +4515,7 @@ mod tests {
 
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let entries = iter_htab_entries(&mem, 0, page_offset, &map, &offsets, false);
+        let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, key_bytes);
         assert_eq!(entries[0].1, val_bytes);
@@ -4706,14 +4649,10 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
-            &mem,
-            cr3_pa,
-            page_offset,
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
             &info,
             0,
-            &offsets,
             &per_cpu_offsets,
-            false,
         );
 
         assert_eq!(result.len(), num_cpus as usize);
@@ -4734,14 +4673,10 @@ mod tests {
 
         // key=1 is out of bounds for max_entries=1.
         let result = read_percpu_array_value(
-            &mem,
-            cr3_pa,
-            page_offset,
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
             &info,
             1,
-            &offsets,
             &per_cpu_offsets,
-            false,
         );
         assert!(result.is_empty());
     }
@@ -4756,14 +4691,10 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
         let result = read_percpu_array_value(
-            &mem,
-            cr3_pa,
-            page_offset,
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
             &info,
             0,
-            &offsets,
             &per_cpu_offsets,
-            false,
         );
         assert!(result.is_empty());
     }
@@ -4781,14 +4712,10 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
-            &mem,
-            cr3_pa,
-            page_offset,
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
             &info,
             0,
-            &offsets,
             &per_cpu_offsets,
-            false,
         );
         assert!(result.is_empty());
     }
@@ -4819,14 +4746,10 @@ mod tests {
 
         for key in 0..max_entries {
             let result = read_percpu_array_value(
-                &mem,
-                cr3_pa,
-                page_offset,
+                &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
                 &info,
                 key,
-                &offsets,
                 &per_cpu_offsets,
-                false,
             );
             assert_eq!(result.len(), num_cpus as usize);
             for (cpu, entry) in result.iter().enumerate() {
@@ -4849,14 +4772,10 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
-            &mem,
-            cr3_pa,
-            page_offset,
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
             &info,
             0,
-            &offsets,
             &per_cpu_offsets,
-            false,
         );
 
         assert_eq!(result.len(), 2);
@@ -4881,14 +4800,10 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
-            &mem,
-            cr3_pa,
-            page_offset,
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
             &info,
             0,
-            &offsets,
             &per_cpu_offsets,
-            false,
         );
         assert!(result.is_empty(), "zero CPUs should produce empty result");
     }
@@ -4917,14 +4832,10 @@ mod tests {
         // SAFETY: buf is a live Vec<u8> owned for the test's duration.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let result = read_percpu_array_value(
-            &mem,
-            cr3_pa,
-            page_offset,
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
             &info,
             0,
-            &offsets,
             &per_cpu_offsets,
-            false,
         );
 
         assert_eq!(result.len(), 4);
@@ -4984,14 +4895,10 @@ mod tests {
 
         let per_cpu_offsets = vec![0u64, 0x1000];
         let result = read_percpu_array_value(
-            &mem,
-            0,
-            0xFFFF_8880_0000_0000,
+            &lookup_ctx(&mem, 0, 0xFFFF_8880_0000_0000, &offsets, false),
             &info,
             0,
-            &offsets,
             &per_cpu_offsets,
-            false,
         );
         assert!(
             result.is_empty(),

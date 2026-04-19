@@ -593,7 +593,7 @@ mod tests {
     fn sidecar_result_roundtrip() {
         let sc = SidecarResult {
             test_name: "my_test".to_string(),
-            topology: "2s4c2t".to_string(),
+            topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             passed: true,
             skipped: false,
@@ -658,7 +658,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.test_name, "my_test");
-        assert_eq!(loaded.topology, "2s4c2t");
+        assert_eq!(loaded.topology, "1n2l4c2t");
         assert_eq!(loaded.scheduler, "scx_mitosis");
         assert!(loaded.passed);
         assert_eq!(loaded.stats.total_workers, 4);
@@ -681,7 +681,7 @@ mod tests {
     fn sidecar_result_roundtrip_no_monitor() {
         let sc = SidecarResult {
             test_name: "eevdf_test".to_string(),
-            topology: "1s2c1t".to_string(),
+            topology: "1n1l2c1t".to_string(),
             scheduler: "eevdf".to_string(),
             passed: false,
             skipped: false,
@@ -731,7 +731,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let sc = SidecarResult {
             test_name: "test_x".to_string(),
-            topology: "1s2c1t".to_string(),
+            topology: "1n1l2c1t".to_string(),
             scheduler: "eevdf".to_string(),
             passed: true,
             skipped: false,
@@ -765,7 +765,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let sc = SidecarResult {
             test_name: "nested_test".to_string(),
-            topology: "2s4c2t".to_string(),
+            topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             passed: false,
             skipped: false,
@@ -808,7 +808,7 @@ mod tests {
 
         let sc = |name: &str| SidecarResult {
             test_name: name.to_string(),
-            topology: "1s1c1t".to_string(),
+            topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             passed: true,
             skipped: false,
@@ -874,7 +874,7 @@ mod tests {
     fn sidecar_result_work_type_field() {
         let sc = SidecarResult {
             test_name: "t".to_string(),
-            topology: "1s1c1t".to_string(),
+            topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             passed: true,
             skipped: false,
@@ -1231,7 +1231,7 @@ mod tests {
     ) -> SidecarResult {
         SidecarResult {
             test_name: "t".to_string(),
-            topology: "1s1c1t".to_string(),
+            topology: "1n1l1c1t".to_string(),
             scheduler: "test".to_string(),
             passed: true,
             skipped: false,

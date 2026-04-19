@@ -2306,7 +2306,7 @@ mod tests {
         use crate::test_support;
         let sc = test_support::SidecarResult {
             test_name: "my_test".to_string(),
-            topology: "2s4c2t".to_string(),
+            topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             passed: true,
             skipped: false,
@@ -2353,7 +2353,7 @@ mod tests {
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "my_test");
-        assert_eq!(row.topology, "2s4c2t");
+        assert_eq!(row.topology, "1n2l4c2t");
         assert!(row.passed);
         assert_eq!(row.spread, 15.0);
         assert_eq!(row.gap_ms, 200);
@@ -2372,7 +2372,7 @@ mod tests {
         use crate::test_support;
         let sc = test_support::SidecarResult {
             test_name: "eevdf_test".to_string(),
-            topology: "1s2c1t".to_string(),
+            topology: "1n1l2c1t".to_string(),
             scheduler: "eevdf".to_string(),
             skipped: false,
             passed: false,
@@ -2405,7 +2405,7 @@ mod tests {
         use crate::test_support;
         let sc = test_support::SidecarResult {
             test_name: "t".to_string(),
-            topology: "1s1c1t".to_string(),
+            topology: "1n1l1c1t".to_string(),
             skipped: false,
             scheduler: "test".to_string(),
             passed: true,
