@@ -2857,12 +2857,21 @@ mod tests {
         data[stride + 8] = 1;
         schbench_matrix_multiply(&mut data, size);
         let c = &data[2 * stride..3 * stride];
+        // Diagonal entries carry A's diagonal because B = I.
         assert_eq!(c[0], 2);
         assert_eq!(c[4], 3);
         assert_eq!(c[8], 5);
-        // Off-diagonal entries remain 0.
+        // All 6 off-diagonal entries must be 0 for A*I. Sparse
+        // coverage (just c[1], c[3]) left 4 positions unverified,
+        // which would mask a transposition bug that mis-writes
+        // rows/columns of an identity product — this assertion
+        // fingerprints the full matrix identity.
         assert_eq!(c[1], 0);
+        assert_eq!(c[2], 0);
         assert_eq!(c[3], 0);
+        assert_eq!(c[5], 0);
+        assert_eq!(c[6], 0);
+        assert_eq!(c[7], 0);
     }
 
     #[test]

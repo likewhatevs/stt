@@ -122,7 +122,27 @@ pub struct ProbeEvent {
 /// when the file is unreadable (expected outside a privileged context).
 fn load_kallsyms() -> Option<std::collections::HashMap<String, u64>> {
     let raw = std::fs::read_to_string("/proc/kallsyms").ok()?;
-    let mut map = std::collections::HashMap::with_capacity(raw.lines().count());
+    Some(parse_kallsyms(&raw))
+}
+
+/// Parse kallsyms-format text (one `HEX TYPE NAME ...` line per
+/// symbol) into a `name -> address` map. Extracted from
+/// [`load_kallsyms`] so unit tests can exercise the parser without
+/// touching `/proc/kallsyms`, which is usually unreadable in the
+/// unprivileged contexts the crate runs under.
+///
+/// Skipped lines (silently, without affecting other symbols):
+/// - lines with fewer than 3 whitespace-separated tokens (addr,
+///   type, name — all three are required; the type column is
+///   accepted but ignored)
+/// - lines whose first token is not a hex-parseable `u64`
+///
+/// A permanently-empty map is a valid return value — callers treat
+/// it as "no symbols found" rather than an error.
+fn parse_kallsyms(raw: &str) -> std::collections::HashMap<String, u64> {
+    // No pre-scan — HashMap grows from empty in a single pass over
+    // `raw`.
+    let mut map = std::collections::HashMap::new();
     for line in raw.lines() {
         let mut parts = line.split_whitespace();
         let Some(addr) = parts.next() else { continue };
@@ -133,7 +153,7 @@ fn load_kallsyms() -> Option<std::collections::HashMap<String, u64>> {
         };
         map.insert(sym.to_string(), addr);
     }
-    Some(map)
+    map
 }
 
 /// Resolve a kernel function name to its address via /proc/kallsyms.
@@ -1910,6 +1930,78 @@ fn attach_phase_b_fentry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- parse_kallsyms --
+
+    #[test]
+    fn parse_kallsyms_happy_path() {
+        // Canonical kallsyms layout: `HEX TYPE NAME`. The type column
+        // is accepted but ignored by the parser.
+        let raw = "ffffffff81000000 T _stext\n\
+                   ffffffff81000010 T schedule\n\
+                   ffffffff82000000 D init_mm\n";
+        let map = parse_kallsyms(raw);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["_stext"], 0xffffffff81000000);
+        assert_eq!(map["schedule"], 0xffffffff81000010);
+        assert_eq!(map["init_mm"], 0xffffffff82000000);
+    }
+
+    #[test]
+    fn parse_kallsyms_skips_lines_missing_name() {
+        // Lines with fewer than 3 tokens (addr, type, name — all
+        // required) are dropped silently; the rest still parse.
+        let raw = "\
+            \n\
+            ffffffff81000000\n\
+            ffffffff81000010 T\n\
+            ffffffff81000020 T real_sym\n";
+        let map = parse_kallsyms(raw);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["real_sym"], 0xffffffff81000020);
+    }
+
+    #[test]
+    fn parse_kallsyms_skips_nonhex_addr() {
+        // First token must parse as u64 hex; otherwise the line is
+        // skipped and parsing continues on the next line.
+        let raw = "garbage T should_skip\n\
+                   ffffffff81000000 T kept\n";
+        let map = parse_kallsyms(raw);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["kept"], 0xffffffff81000000);
+    }
+
+    #[test]
+    fn parse_kallsyms_empty_input_yields_empty_map() {
+        // Permanently-empty input is a valid parse, returning an empty
+        // map rather than an error.
+        let map = parse_kallsyms("");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_kallsyms_duplicate_name_keeps_last() {
+        // HashMap::insert semantics: duplicate keys overwrite, so the
+        // last occurrence wins. Callers that care about multiple
+        // symbols with the same name would need a different parser.
+        let raw = "ffffffff81000000 T dup\n\
+                   ffffffff82000000 T dup\n";
+        let map = parse_kallsyms(raw);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["dup"], 0xffffffff82000000);
+    }
+
+    #[test]
+    fn parse_kallsyms_ignores_trailing_module_tag() {
+        // Kernel-built-in symbols omit the trailing `[module]` tag;
+        // module symbols include it. The parser only uses the first
+        // 3 tokens, so trailing tokens (like `[mptcp]`) are dropped.
+        let raw = "ffffffff81000000 T mod_sym\t[mptcp]\n";
+        let map = parse_kallsyms(raw);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["mod_sym"], 0xffffffff81000000);
+    }
 
     #[test]
     fn build_field_keys_known_struct() {

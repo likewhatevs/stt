@@ -878,7 +878,7 @@ fn mount_filesystems() {
     let _ = std::os::unix::fs::symlink("/proc/self/fd/2", "/dev/stderr");
 }
 
-/// Recursive mkdir -p equivalent. `std::fs::create_dir_all` is
+/// Recursive mkdir -p equivalent. `DirBuilder::recursive(true)` is
 /// idempotent (returns Ok when the path already exists as a
 /// directory) and walks parents internally, so the hand-rolled
 /// recursion this replaced was redundant. Errors are swallowed to
@@ -886,13 +886,19 @@ fn mount_filesystems() {
 /// creates each mount point and continues regardless, since any
 /// real failure surfaces downstream when `mount()` itself fails.
 ///
-/// Directory mode: std's `create_dir_all` creates directories with
-/// mode 0o777 masked by the process umask (default 0o022 yields
-/// 0o755). The guest init process inherits umask 0o022, so the
-/// resulting permissions match the `mkdir -p` default of 0o755 that
-/// this function replaced.
+/// Directory mode is pinned explicitly at 0o755 via
+/// `DirBuilder::mode`. Relying on the default (0o777 & !umask) is
+/// fragile: the guest init's umask is process state inherited from
+/// the kernel/caller, and a caller that sets umask=0 before exec
+/// would produce world-writable mount points. Pinning the mode in
+/// the mkdir syscall itself keeps the traversal bit stable
+/// regardless of umask.
 fn mkdir_p(path: &str) {
-    let _ = std::fs::create_dir_all(path);
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(path);
 }
 
 /// Write a line to COM2 (the application serial port).

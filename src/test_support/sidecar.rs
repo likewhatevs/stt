@@ -1400,4 +1400,112 @@ mod tests {
         let (name, _, _) = scheduler_fingerprint(&entry);
         assert_eq!(name, "scx_relaxed");
     }
+
+    // -- write_skip_sidecar --
+
+    /// `write_skip_sidecar` is the path covered by the ResourceContention
+    /// skip branch and any early-exit that bails before `run_ktstr_test_inner`
+    /// reaches the VM-run call site. The sidecar must be flagged
+    /// `skipped: true, passed: true` so stats tooling that subtracts
+    /// skipped runs from pass counts sees a recorded skip instead of
+    /// a missing file. This regression guards that contract against a
+    /// future change that forgets the passed-true flag or drops skip
+    /// sidecars entirely for non-VM early exits.
+    #[test]
+    fn write_skip_sidecar_records_passed_true_skipped_true() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-writes-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__skip_sidecar_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let active_flags: Vec<String> = vec!["llc".to_string()];
+        write_skip_sidecar(&entry, &active_flags).expect("skip sidecar must write");
+
+        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
+            .expect("skip sidecar dir was created")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("__skip_sidecar_test__-") && n.ends_with(".ktstr.json")
+                })
+            })
+            .expect("skip sidecar file with variant suffix should be written");
+        let data = std::fs::read_to_string(&path).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
+        assert_eq!(loaded.test_name, "__skip_sidecar_test__");
+        assert!(
+            loaded.passed,
+            "skip sidecar must set passed=true so the verdict gate does not flip fail",
+        );
+        assert!(
+            loaded.skipped,
+            "skip sidecar must set skipped=true so stats tooling excludes from pass count",
+        );
+        assert_eq!(
+            loaded.work_type, "skipped",
+            "skip path uses the 'skipped' work_type bucket so grouping keeps the skip distinguishable",
+        );
+        assert_eq!(loaded.active_flags, active_flags);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// When the sidecar directory cannot be created (path collision
+    /// with a regular file), `write_skip_sidecar` must return `Err`
+    /// rather than silently eating the failure. Stats tooling relies
+    /// on the error chain to diagnose missing sidecars; a swallowed
+    /// error would make skips invisible to post-run analysis.
+    #[test]
+    fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+
+        // Create a regular file, then try to use it as the sidecar
+        // directory. `create_dir_all` fails because the path exists
+        // but is not a directory.
+        let blocker = std::env::temp_dir().join("ktstr-sidecar-skip-blocker");
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, blocker.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__skip_sidecar_err_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let result = write_skip_sidecar(&entry, &[]);
+        assert!(
+            result.is_err(),
+            "skip sidecar write must return Err when the target is a regular file",
+        );
+
+        let _ = std::fs::remove_file(&blocker);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
 }

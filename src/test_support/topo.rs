@@ -105,6 +105,47 @@ impl TopoOverride {
     }
 }
 
+/// Recognise the pre-1.0 legacy topology forms `NsNcNt` and
+/// `NsNlNcNt` strictly enough to avoid false positives on arbitrary
+/// input. Returns `true` when `s` contains no `n` axis letter AND has
+/// the legacy axis letters (`s`, `c`, `t`) in order, each preceded by
+/// at least one digit. Inputs like `"sched"` or `"abcs"` — which
+/// satisfy the older loose `contains('s') && !contains('n')` check —
+/// fall through here because their `s` is not preceded by a digit or
+/// the remaining axis letters are missing.
+fn looks_like_legacy_topo(s: &str) -> bool {
+    if s.contains('n') {
+        return false;
+    }
+    let Some(s_pos) = s.find('s') else {
+        return false;
+    };
+    let Some(c_pos) = s.find('c') else {
+        return false;
+    };
+    let Some(t_pos) = s.find('t') else {
+        return false;
+    };
+    if s_pos >= c_pos || c_pos >= t_pos {
+        return false;
+    }
+    // Digit must precede each axis letter: `NsNcNt` / `NsNlNcNt`.
+    // The span between `s` and `c` allows an optional `l` axis (LLCs)
+    // with digits on both sides so the `NsNlNcNt` form (e.g.
+    // `1s2l4c2t`) still trips the warn — the earlier
+    // digit-only-between-s-and-c check missed it and the docstring
+    // and warn message lied about the coverage.
+    let prefix_is_digits =
+        |slice: &str| !slice.is_empty() && slice.chars().all(|c| c.is_ascii_digit());
+    let s_to_c = &s[s_pos + 1..c_pos];
+    let s_to_c_ok = if let Some(l_pos) = s_to_c.find('l') {
+        prefix_is_digits(&s_to_c[..l_pos]) && prefix_is_digits(&s_to_c[l_pos + 1..])
+    } else {
+        prefix_is_digits(s_to_c)
+    };
+    prefix_is_digits(&s[..s_pos]) && s_to_c_ok && prefix_is_digits(&s[c_pos + 1..t_pos])
+}
+
 /// Parse a topology string in "NnNlNcNt" form (e.g. `"1n2l4c2t"`).
 /// `n` = NUMA nodes, `l` = LLCs per node, `c` = cores per LLC,
 /// `t` = threads per core. Returns `(numa_nodes, llcs, cores, threads)`
@@ -115,7 +156,14 @@ impl TopoOverride {
 /// letter) are flagged with a [`tracing::warn!`] before returning
 /// `None`, so stale cached args surface instead of silently failing.
 pub(crate) fn parse_topo_string(s: &str) -> Option<(u32, u32, u32, u32)> {
-    if s.contains('s') && !s.contains('n') {
+    // Legacy-form heuristic: require the full axis structure with
+    // the `s` axis letter (digit-s, digit-c, digit-t in order) and
+    // no `n` axis letter anywhere. The earlier
+    // `s.contains('s') && !s.contains('n')` tripped on any string
+    // with an 's' and no 'n' (e.g. "sched", "abcs"); guarding on
+    // the structural pattern keeps false positives off the tracing
+    // stream when users pass arbitrary garbage.
+    if looks_like_legacy_topo(s) {
         tracing::warn!(
             topo = s,
             "legacy NsNcNt / NsNlNcNt topology form detected; use NnNlNcNt (e.g. 1n2l4c2t)"
@@ -223,6 +271,34 @@ mod tests {
         // reads as a typo-matching accidental success.
         assert!(parse_topo_string("2s4c2t").is_none());
         assert!(parse_topo_string("1s2l4c2t").is_none());
+    }
+
+    #[test]
+    fn looks_like_legacy_topo_matches_both_legacy_forms() {
+        // Direct unit test for the structural heuristic — both the
+        // 3-axis NsNcNt and the 4-axis NsNlNcNt forms must trip the
+        // warn. Earlier version only matched the 3-axis form because
+        // the `l` in the middle of the span broke the digit-only
+        // check between `s` and `c`.
+        assert!(looks_like_legacy_topo("2s4c2t"));
+        assert!(looks_like_legacy_topo("1s2l4c2t"));
+    }
+
+    #[test]
+    fn looks_like_legacy_topo_rejects_false_positives() {
+        // Structural heuristic must not fire on arbitrary input that
+        // happens to contain an `s` without an `n` — the earlier
+        // `contains('s') && !contains('n')` check tripped on these.
+        assert!(!looks_like_legacy_topo("sched"));
+        assert!(!looks_like_legacy_topo("abcs"));
+        assert!(!looks_like_legacy_topo(""));
+        assert!(!looks_like_legacy_topo("1s"));
+        assert!(!looks_like_legacy_topo("1s2c"));
+        // Contains `n` → NnNlNcNt form, not a legacy warning target.
+        assert!(!looks_like_legacy_topo("1n2l4c2t"));
+        // `l` span with empty sides should not pass.
+        assert!(!looks_like_legacy_topo("1sl4c2t"));
+        assert!(!looks_like_legacy_topo("1s2lc2t"));
     }
 
     #[test]

@@ -864,4 +864,36 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn for_each_gauntlet_variant_monotonic_in_host_capacity() {
+        // Comparative-baseline: giving the function MORE host capacity
+        // can only let MORE presets pass the cap-size filter, never
+        // fewer. The upper-bound assertion in
+        // `for_each_gauntlet_variant_skips_presets_exceeding_host_capacity`
+        // and the lower-bound assertion in
+        // `..._visits_every_fitting_preset_x_profile` both check one
+        // extreme; this test anchors the monotonic relationship
+        // between them. A regression that inverted the host-cap
+        // comparison (e.g. `host_cpus < preset_cpus` → accept) would
+        // pass both endpoint tests but fail here.
+        let presets = crate::vm::gauntlet_presets();
+        if presets.is_empty() {
+            return;
+        }
+        let entry = find_test("__unit_test_dummy__").unwrap();
+        let count_for = |cpus: u32, llcs: u32| {
+            let mut n = 0;
+            for_each_gauntlet_variant(entry, &presets, cpus, llcs, u32::MAX, |_, _| n += 1);
+            n
+        };
+        let tight = count_for(1, 1);
+        let loose = count_for(u32::MAX, u32::MAX);
+        assert!(
+            loose >= tight,
+            "host-capacity monotonicity violated: tight=(1,1) yielded {tight} \
+             visits, loose=(u32::MAX,u32::MAX) yielded {loose}; loose \
+             must admit at least as many presets as tight",
+        );
+    }
 }

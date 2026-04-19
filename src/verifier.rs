@@ -1492,4 +1492,57 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
         }];
         insta::assert_snapshot!(format_verifier_diff("A", &stats_a, "B", &stats_b));
     }
+
+    // -----------------------------------------------------------------------
+    // extract_verifier_log — log extraction + cross-check against
+    // parse_sched_output so the two slicers stay consistent on shared input.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_verifier_log_between_begin_end_markers() {
+        // libbpf wraps the verifier log between explicit marker lines;
+        // the extractor returns the content between them, trimmed of
+        // the BEGIN newline and the trailing libbpf END prefix.
+        let blob = "\
+            unrelated preamble\n\
+            libbpf: -- BEGIN PROG LOAD LOG --\n\
+            processed 1234 insns (limit 1000000) max_states_per_insn 5 total_states 200 peak_states 50 mark_read 10\n\
+            libbpf: -- END PROG LOAD LOG --\n\
+            trailing diagnostics\n";
+        let log = extract_verifier_log(blob).expect("markers present");
+        assert!(log.contains("processed 1234 insns"));
+        assert!(!log.contains("BEGIN PROG LOAD LOG"));
+        assert!(!log.contains("END PROG LOAD LOG"));
+    }
+
+    #[test]
+    fn extract_verifier_log_returns_none_when_markers_absent() {
+        // Backward compat: logs without the libbpf markers are treated
+        // as "no markers" — the caller falls back to using the raw blob.
+        assert!(extract_verifier_log("no markers in here").is_none());
+        assert!(extract_verifier_log("only BEGIN marker -- BEGIN PROG LOAD LOG --").is_none());
+    }
+
+    #[test]
+    fn extract_verifier_log_consistent_with_parse_sched_output() {
+        // `collect_verifier_output` chains parse_sched_output →
+        // extract_verifier_log on the VM stdout blob. Both slicers
+        // operate on the same input without duplicating work, so a
+        // single SCHED_OUTPUT block that wraps a libbpf-marked verifier
+        // log must produce the same verifier text when extracted in
+        // that order.
+        use crate::test_support::{SCHED_OUTPUT_END, SCHED_OUTPUT_START, parse_sched_output};
+        let sched_inner = "\
+            libbpf: -- BEGIN PROG LOAD LOG --\n\
+            processed 7 insns (limit 1000000) max_states_per_insn 1 total_states 1 peak_states 1 mark_read 0\n\
+            libbpf: -- END PROG LOAD LOG --\n";
+        let vm_output = format!(
+            "kernel boot junk\n{SCHED_OUTPUT_START}\n{sched_inner}{SCHED_OUTPUT_END}\nafterward\n",
+        );
+        let sched = parse_sched_output(&vm_output).expect("SCHED_OUTPUT block");
+        let verifier_log = extract_verifier_log(sched).expect("verifier markers");
+        assert!(verifier_log.contains("processed 7 insns"));
+        assert!(!verifier_log.contains("SCHED_OUTPUT"));
+        assert!(!verifier_log.contains("BEGIN PROG LOAD LOG"));
+    }
 }
