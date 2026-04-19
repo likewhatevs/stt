@@ -56,8 +56,21 @@ use crate::workload::*;
 /// Returns `false` for pid 0: `kill(0, ...)` targets the caller's
 /// process group rather than a single process, so the syscall would
 /// always report success and falsely mark "no process" as alive.
+///
+/// Also returns `false` for pid > i32::MAX. Linux `PID_MAX_LIMIT` is
+/// 2^22 (4 million) on 64-bit — well below i32::MAX. A u32 pid
+/// exceeding i32::MAX is therefore invalid input rather than a live
+/// pid, and must not be cast to a negative `i32` —
+/// `kill(negative, ...)` targets a process group.
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
+        return false;
+    }
+    if pid > i32::MAX as u32 {
+        tracing::warn!(
+            pid,
+            "process_alive: pid exceeds i32::MAX; treating as invalid input rather than probing a process group"
+        );
         return false;
     }
     kill(Pid::from_raw(pid as i32), None).is_ok()
@@ -1406,17 +1419,33 @@ mod tests {
     }
 
     #[test]
-    fn process_alive_current_pid() {
-        let pid = std::process::id();
-        assert!(process_alive(pid));
+    fn process_alive_self_is_true() {
+        assert!(process_alive(std::process::id()));
     }
 
     #[test]
-    fn process_alive_pid_zero_is_not_alive() {
+    fn process_alive_zero_is_false() {
         // kill(0, sig) targets the caller's process group, so without
         // an explicit guard kill(0, 0) succeeds and would falsely
         // report "process 0" as alive.
         assert!(!process_alive(0));
+    }
+
+    #[test]
+    fn process_alive_above_i32_max_is_false() {
+        // Regression: u32 values > i32::MAX wrap to a negative i32 when
+        // cast, and `kill(negative, 0)` targets a process group rather
+        // than a single process. Guard rejects these as bad input.
+        assert!(!process_alive(i32::MAX as u32 + 1));
+    }
+
+    #[test]
+    fn process_alive_u32_max_is_false() {
+        // u32::MAX (0xFFFF_FFFF) casts to i32 = -1. `kill(-1, 0)` on
+        // Linux means "probe every process the caller may signal";
+        // without the guard, this would return true whenever the
+        // caller has any signaling permissions at all.
+        assert!(!process_alive(u32::MAX));
     }
 
     #[test]

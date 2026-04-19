@@ -1205,15 +1205,45 @@ fn shm_store(name: &std::ffi::CStr, data: &[u8]) -> Result<()> {
             data_len = data.len(),
             "shm_store: waiting for LOCK_EX"
         );
+        // Post-flock error paths (ftruncate/mmap failure) call shm_unlink
+        // before close so a half-initialized segment (empty / corrupt /
+        // wrong size) does not persist in /dev/shm where the next caller
+        // would read it. Those paths hold LOCK_EX, so the segment is
+        // either newly created by this call or being exclusively
+        // rewritten — destroying it is safe. Unlinking may also remove
+        // a pre-existing valid segment that the caller had just opened
+        // then failed to rewrite; content-addressing makes recovery
+        // cheap — the next writer re-creates with the same hash.
+        //
+        // Pre-flock (shm_open succeeded, flock failed) does NOT unlink:
+        // the segment may be a pre-existing valid one that a peer writer
+        // holds LOCK_EX on, and we must not destroy another process's
+        // cache entry on our own flock error.
+        //
+        // Error paths capture `last_os_error()` BEFORE shm_unlink so
+        // the bail! message reports the original failure rather than
+        // any errno that shm_unlink itself might set (e.g. ENOENT on
+        // a race with a concurrent writer).
+        //
+        // Success path does NOT unlink — the segment IS the cache.
         if libc::flock(fd, libc::LOCK_EX) != 0 {
+            let err = std::io::Error::last_os_error();
             libc::close(fd);
-            anyhow::bail!("flock: {}", std::io::Error::last_os_error());
+            anyhow::bail!("flock: {err}");
         }
 
         if libc::ftruncate(fd, data.len() as libc::off_t) != 0 {
+            let err = std::io::Error::last_os_error();
+            if libc::shm_unlink(name.as_ptr()) != 0 {
+                tracing::warn!(
+                    err = %std::io::Error::last_os_error(),
+                    segment = name.to_string_lossy().as_ref(),
+                    "shm_unlink failed on ftruncate error path"
+                );
+            }
             libc::flock(fd, libc::LOCK_UN);
             libc::close(fd);
-            anyhow::bail!("ftruncate: {}", std::io::Error::last_os_error());
+            anyhow::bail!("ftruncate: {err}");
         }
 
         let ptr = libc::mmap(
@@ -1225,9 +1255,17 @@ fn shm_store(name: &std::ffi::CStr, data: &[u8]) -> Result<()> {
             0,
         );
         if ptr == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error();
+            if libc::shm_unlink(name.as_ptr()) != 0 {
+                tracing::warn!(
+                    err = %std::io::Error::last_os_error(),
+                    segment = name.to_string_lossy().as_ref(),
+                    "shm_unlink failed on mmap error path"
+                );
+            }
             libc::flock(fd, libc::LOCK_UN);
             libc::close(fd);
-            anyhow::bail!("mmap: {}", std::io::Error::last_os_error());
+            anyhow::bail!("mmap: {err}");
         }
 
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());

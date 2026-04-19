@@ -561,8 +561,9 @@ fn read_sd_name(mem: &GuestMem, sd_pa: u64, name_offset: usize, page_offset: u64
 /// offline). Returns an empty `Vec` if the first domain pointer cannot
 /// be translated.
 ///
-/// Maximum depth is bounded to 8 levels to prevent infinite loops from
-/// corrupted `sd->parent` chains.
+/// Maximum depth is bounded to 8 levels and a visited-set of domain
+/// KVAs breaks `sd->parent` cycles — a corrupted or self-referential
+/// chain would otherwise emit the same domain up to MAX_DEPTH times.
 pub(crate) fn read_sched_domain_tree(
     mem: &GuestMem,
     rq_pa: u64,
@@ -579,9 +580,19 @@ pub(crate) fn read_sched_domain_tree(
 
     let mut domains = Vec::new();
     let mut current_kva = sd_kva;
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     for _ in 0..MAX_DEPTH {
         if current_kva == 0 {
+            break;
+        }
+        if !visited.insert(current_kva) {
+            // Cycle or self-reference: same KVA already emitted. Stop
+            // so we do not inflate the tree with duplicate snapshots.
+            tracing::warn!(
+                sd_kva = format_args!("{current_kva:#x}"),
+                "sched_domain cycle detected; truncating tree"
+            );
             break;
         }
 
@@ -2821,13 +2832,14 @@ mod tests {
     }
 
     #[test]
-    fn read_sched_domain_tree_max_depth_bound() {
+    fn read_sched_domain_tree_self_reference_breaks_cycle() {
         let sd_off = test_sched_domain_offsets();
 
-        // Create a circular chain: sd->parent points to itself.
-        // The MAX_DEPTH bound (8) should prevent infinite loop.
+        // Self-referential: sd->parent == sd. With the visited-set
+        // cycle check, the walker emits sd exactly once and stops on
+        // the next iteration rather than emitting the same domain
+        // MAX_DEPTH times.
         let sd_pa: u64 = 1024;
-        // Self-referential: parent == self.
         let sd_buf = make_sd_buffer(&sd_off, sd_pa, 0, 0, 0, 1, 0, 0, 0, 0, 0);
 
         let total_size = sd_pa as usize + sd_buf.len();
@@ -2838,8 +2850,52 @@ mod tests {
         let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
         let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
 
-        // Should stop at MAX_DEPTH=8.
-        assert_eq!(domains.len(), 8);
+        assert_eq!(
+            domains.len(),
+            1,
+            "self-referential sd should produce exactly one snapshot"
+        );
+    }
+
+    #[test]
+    fn read_sched_domain_tree_max_depth_bound_on_long_chain() {
+        let sd_off = test_sched_domain_offsets();
+        // Per-struct size matches make_sd_buffer's internal layout
+        // (sd_ttwu_move_balance=232 + 4 bytes for that u32 + 8 bytes
+        // guard = 244). Each sched_domain lives at a distinct PA and
+        // points at the next via sd->parent, forming an acyclic chain
+        // longer than MAX_DEPTH so the depth bound — not the visited
+        // set — is what stops the walk.
+        const SD_SIZE: u64 = 244;
+        const CHAIN_LEN: usize = 10;
+        let first_pa: u64 = 1024;
+
+        let pa = |i: usize| first_pa + (i as u64) * SD_SIZE;
+        let total_size = pa(CHAIN_LEN) as usize;
+        let mut buf = vec![0u8; total_size];
+
+        // rq->sd -> first domain.
+        buf[sd_off.rq_sd..sd_off.rq_sd + 8].copy_from_slice(&pa(0).to_ne_bytes());
+
+        for i in 0..CHAIN_LEN {
+            let parent_kva = if i + 1 == CHAIN_LEN { 0 } else { pa(i + 1) };
+            let sd_buf = make_sd_buffer(&sd_off, parent_kva, i as i32, 0, 0, 1, 0, 0, 0, 0, 0);
+            let start = pa(i) as usize;
+            buf[start..start + sd_buf.len()].copy_from_slice(&sd_buf);
+        }
+
+        let mem = GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64);
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+
+        assert_eq!(
+            domains.len(),
+            8,
+            "acyclic chain of {CHAIN_LEN} levels must truncate at MAX_DEPTH=8"
+        );
+        // Sanity: the emitted levels are the first 8 in order.
+        for (i, snap) in domains.iter().enumerate() {
+            assert_eq!(snap.level, i as i32, "level mismatch at index {i}");
+        }
     }
 
     #[test]
