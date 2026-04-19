@@ -447,7 +447,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
 /// Handles base tests (`ktstr/{name}`), gauntlet variants
 /// (`gauntlet/{name}/{preset}/{profile}`), and bare names
 /// (backward compat). Returns an exit code.
-fn run_named_test(test_name: &str) -> i32 {
+pub(crate) fn run_named_test(test_name: &str) -> i32 {
     if let Some(rest) = test_name.strip_prefix("gauntlet/") {
         return run_gauntlet_test(rest);
     }
@@ -531,7 +531,7 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
 }
 
 /// Run a gauntlet variant test. `rest` is `{name}/{preset}/{profile}`.
-fn run_gauntlet_test(rest: &str) -> i32 {
+pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
     let parts: Vec<&str> = rest.splitn(3, '/').collect();
     if parts.len() != 3 {
         eprintln!("invalid gauntlet test name: gauntlet/{rest}");

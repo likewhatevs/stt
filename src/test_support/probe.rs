@@ -550,6 +550,57 @@ pub(crate) fn maybe_dispatch_vm_test() -> Option<i32> {
     maybe_dispatch_vm_test_with_args(&args)
 }
 
+/// Guest-side scenario context prelude shared by every VM-dispatch
+/// entry point in this module.
+///
+/// `maybe_dispatch_vm_test_with_args` and
+/// `maybe_dispatch_vm_test_with_phase_a` both construct a
+/// [`crate::scenario::Ctx`] around the same topology / cgroup /
+/// sched_pid / assert-merge inputs — the only difference is whether
+/// a probe thread is attached. Moving the inputs into a single
+/// helper keeps the two dispatch paths in sync so a change to the
+/// settle duration, assert merge chain, or sysfs fallback behaviour
+/// lands in both without drift.
+///
+/// Returns `(topo, cgroups, sched_pid, merged_assert)`. The caller
+/// owns the returned values for the lifetime of the `Ctx` it builds;
+/// `Ctx` fields that borrow from them (`&topo`, `&cgroups`) stay
+/// valid until the caller drops this tuple.
+fn build_dispatch_ctx_parts(
+    entry: &KtstrTestEntry,
+    args: &[String],
+) -> (
+    crate::topology::TestTopology,
+    crate::cgroup::CgroupManager,
+    libc::pid_t,
+    crate::assert::Assert,
+) {
+    // Sysfs is ground truth: CPUID, ACPI MADT, and MPTABLE all
+    // express the VM's actual topology. Fall back to from_vm_topology
+    // only when sysfs read fails.
+    let topo = match crate::topology::TestTopology::from_system() {
+        Ok(sys) => sys,
+        Err(e) => {
+            eprintln!("ktstr_test: topology from sysfs failed ({e}), using VM spec fallback");
+            crate::topology::TestTopology::from_vm_topology(&entry.topology)
+        }
+    };
+    let cgroup_root = resolve_cgroup_root(args);
+    let cgroups = crate::cgroup::CgroupManager::new(&cgroup_root);
+    if let Err(e) = cgroups.setup(false) {
+        eprintln!("ktstr_test: cgroup setup failed: {e}");
+    }
+    let sched_pid = std::env::var("SCHED_PID")
+        .ok()
+        .and_then(|s| s.parse::<libc::pid_t>().ok())
+        .unwrap_or(0);
+    // Three-layer merge: default_checks → scheduler.assert → entry.assert.
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(&entry.scheduler.assert)
+        .merge(&entry.assert);
+    (topo, cgroups, sched_pid, merged_assert)
+}
+
 /// Like `maybe_dispatch_vm_test` but with explicit args. Used by
 /// `ktstr_guest_init()` which reads args from `/args` in the initramfs.
 ///
@@ -710,34 +761,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         Some((handle, func_names, pipe_diag, output_done, pnames, rhints))
     });
 
-    // Sysfs is ground truth: CPUID, ACPI MADT, and MPTABLE all express
-    // the VM's actual topology. Only fall back to from_vm_topology on error.
-    let topo = match crate::topology::TestTopology::from_system() {
-        Ok(sys) => sys,
-        Err(e) => {
-            eprintln!("ktstr_test: topology from sysfs failed ({e}), using VM spec fallback");
-            crate::topology::TestTopology::from_vm_topology(&entry.topology)
-        }
-    };
-    let cgroup_root = resolve_cgroup_root(args);
-    let cgroups = crate::cgroup::CgroupManager::new(&cgroup_root);
-    if let Err(e) = cgroups.setup(false) {
-        eprintln!("ktstr_test: cgroup setup failed: {e}");
-    }
-    let sched_pid = std::env::var("SCHED_PID")
-        .ok()
-        .and_then(|s| s.parse::<libc::pid_t>().ok())
-        .unwrap_or(0);
-    let workers_per_cgroup = entry.workers_per_cgroup as usize;
-    // Three-layer merge: default_checks -> scheduler.assert -> entry.assert.
-    let merged_assert = crate::assert::Assert::default_checks()
-        .merge(&entry.scheduler.assert)
-        .merge(&entry.assert);
+    let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
     let ctx = crate::scenario::Ctx {
         cgroups: &cgroups,
         topo: &topo,
         duration: entry.duration,
-        workers_per_cgroup,
+        workers_per_cgroup: entry.workers_per_cgroup as usize,
         sched_pid,
         settle: Duration::from_millis(500),
         work_type_override,
@@ -1035,32 +1064,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         drop(pa.phase_b_tx);
     }
 
-    // Run the test function (same as maybe_dispatch_vm_test_with_args).
-    let topo = match crate::topology::TestTopology::from_system() {
-        Ok(sys) => sys,
-        Err(e) => {
-            eprintln!("ktstr_test: topology from sysfs failed ({e}), using VM spec fallback");
-            crate::topology::TestTopology::from_vm_topology(&entry.topology)
-        }
-    };
-    let cgroup_root = resolve_cgroup_root(args);
-    let cgroups = crate::cgroup::CgroupManager::new(&cgroup_root);
-    if let Err(e) = cgroups.setup(false) {
-        eprintln!("ktstr_test: cgroup setup failed: {e}");
-    }
-    let sched_pid = std::env::var("SCHED_PID")
-        .ok()
-        .and_then(|s| s.parse::<libc::pid_t>().ok())
-        .unwrap_or(0);
-    let workers_per_cgroup = entry.workers_per_cgroup as usize;
-    let merged_assert = crate::assert::Assert::default_checks()
-        .merge(&entry.scheduler.assert)
-        .merge(&entry.assert);
+    let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
     let ctx = crate::scenario::Ctx {
         cgroups: &cgroups,
         topo: &topo,
         duration: entry.duration,
-        workers_per_cgroup,
+        workers_per_cgroup: entry.workers_per_cgroup as usize,
         sched_pid,
         settle: std::time::Duration::from_millis(500),
         work_type_override,
