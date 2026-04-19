@@ -240,22 +240,57 @@ impl HostTopology {
 
     /// Build the virtual LLC to host LLC index mapping.
     ///
-    /// When `numa_nodes <= 1`, falls back to sequential offset mapping
-    /// (original behavior). When `numa_nodes > 1`, groups host LLCs by
-    /// their physical NUMA node and assigns each guest NUMA node's LLCs
-    /// to host LLCs on the same physical node. Falls back to sequential
-    /// mapping when the host lacks enough NUMA-aligned LLCs.
+    /// Falls back to sequential offset mapping when any of these hold:
+    /// `numa_nodes == 0` (avoids divide-by-zero), `numa_nodes == 1`
+    /// (no NUMA-awareness needed), `cpu_to_node` is empty (no NUMA
+    /// map available), `llcs < numa_nodes` (base-per-node would be 0
+    /// and leave guest nodes empty), or the host lacks enough
+    /// NUMA-aligned LLCs.
+    ///
+    /// Otherwise, distributes `llcs` across `numa_nodes` guest nodes:
+    /// the first `llcs % numa_nodes` guest nodes receive
+    /// `base + 1 = ceil(llcs / numa_nodes)` LLCs each; the rest
+    /// receive `base = floor(llcs / numa_nodes)` LLCs. This preserves
+    /// the remainder that floor-only division would silently drop
+    /// (e.g. `llcs=5, numa_nodes=2` yields counts 3+2 = 5).
+    /// Eligibility requires each host NUMA node to supply at least
+    /// `ceil(llcs / numa_nodes)` (the max any single guest node will
+    /// claim) — stricter than the prior floor-based check, so the
+    /// "+1" guest nodes always land on a node with capacity.
     fn numa_aware_llc_order(&self, numa_nodes: u32, llcs: u32, llc_offset: usize) -> Vec<usize> {
         let num_host_llcs = self.llc_groups.len();
 
-        if numa_nodes <= 1 || self.cpu_to_node.is_empty() {
-            // Sequential offset mapping (original behavior).
-            return (0..llcs as usize)
+        // Sequential fallback used by the degenerate cases below.
+        let sequential_fallback = || -> Vec<usize> {
+            (0..llcs as usize)
                 .map(|i| (i + llc_offset) % num_host_llcs)
-                .collect();
+                .collect()
+        };
+
+        // Defensive: zero NUMA nodes would divide-by-zero below. Also
+        // handles the single-node case (no NUMA-awareness needed) and
+        // the "cpu_to_node map unavailable" case.
+        if numa_nodes == 0 || numa_nodes == 1 || self.cpu_to_node.is_empty() {
+            return sequential_fallback();
         }
 
-        let llcs_per_node = llcs / numa_nodes;
+        // If the guest has fewer LLCs than NUMA nodes, a per-node base
+        // of 0 would leave some guest nodes empty. Fall back rather
+        // than silently dropping those nodes' LLCs.
+        if llcs < numa_nodes {
+            return sequential_fallback();
+        }
+
+        // Distribute LLCs across guest NUMA nodes. Integer division
+        // alone drops the remainder (e.g. llcs=5, numa_nodes=2 gave
+        // 2 per node = 4 LLCs assigned, 5th dropped). Fix: the first
+        // `remainder` nodes get `base + 1`, the rest get `base`.
+        let base_per_node = (llcs / numa_nodes) as usize;
+        let remainder = (llcs % numa_nodes) as usize;
+        // Ceiling-per-node — the largest count any single guest node
+        // will claim. Host NUMA nodes must supply at least this many
+        // to remain eligible.
+        let max_per_node = base_per_node + if remainder > 0 { 1 } else { 0 };
 
         // Group host LLC indices by their physical NUMA node.
         let mut host_node_llcs: std::collections::BTreeMap<usize, Vec<usize>> =
@@ -265,32 +300,37 @@ impl HostTopology {
             host_node_llcs.entry(node).or_default().push(idx);
         }
 
-        // Collect host NUMA nodes that have enough LLCs for one guest
-        // NUMA node's worth.
+        // Collect host NUMA nodes that can supply the ceiling (max)
+        // per-node count — so any guest node can land there regardless
+        // of whether it's one of the `remainder` "+1" nodes.
         let eligible_nodes: Vec<(usize, &Vec<usize>)> = host_node_llcs
             .iter()
-            .filter(|(_, llcs_vec)| llcs_vec.len() >= llcs_per_node as usize)
+            .filter(|(_, llcs_vec)| llcs_vec.len() >= max_per_node)
             .map(|(&node, llcs_vec)| (node, llcs_vec))
             .collect();
 
         // Need at least numa_nodes distinct host NUMA nodes with enough
         // LLCs each.
         if eligible_nodes.len() < numa_nodes as usize {
-            // Fall back to sequential offset mapping.
-            return (0..llcs as usize)
-                .map(|i| (i + llc_offset) % num_host_llcs)
-                .collect();
+            return sequential_fallback();
         }
 
         // Assign guest NUMA nodes to host NUMA nodes, rotating by
         // llc_offset to spread concurrent VMs.
         let mut order = Vec::with_capacity(llcs as usize);
-        let node_offset = llc_offset / llcs_per_node.max(1) as usize;
-        for guest_node in 0..numa_nodes {
-            let host_idx = (guest_node as usize + node_offset) % eligible_nodes.len();
+        let node_offset = llc_offset / max_per_node.max(1);
+        for guest_node in 0..numa_nodes as usize {
+            let host_idx = (guest_node + node_offset) % eligible_nodes.len();
             let (_, host_llcs) = &eligible_nodes[host_idx];
             let within_offset = llc_offset % host_llcs.len();
-            for i in 0..llcs_per_node as usize {
+            // First `remainder` guest nodes get `base + 1` LLCs; rest
+            // get `base`. Total assigned == llcs (remainder preserved).
+            let count = if guest_node < remainder {
+                base_per_node + 1
+            } else {
+                base_per_node
+            };
+            for i in 0..count {
                 let llc_idx = host_llcs[(i + within_offset) % host_llcs.len()];
                 order.push(llc_idx);
             }
@@ -1196,6 +1236,89 @@ mod tests {
         assert_ne!(
             node_0_host_nodes[0], node_1_host_nodes[0],
             "guest NUMA nodes should map to different host NUMA nodes",
+        );
+    }
+
+    #[test]
+    fn numa_aware_llc_order_uneven_llcs_preserves_remainder() {
+        // Regression for #31: with llcs=5 and numa_nodes=2, integer
+        // division yielded llcs_per_node=2 → only 4 entries in `order`,
+        // dropping the remainder LLC. Fixed to distribute the
+        // remainder across the first `llcs % numa_nodes` guest nodes:
+        // node 0 → 3 LLCs, node 1 → 2 LLCs, total 5.
+        //
+        // Host: 6 LLCs, 3 per NUMA node — satisfies the ceiling
+        // eligibility check (each host node must supply max_per_node=3).
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1]),
+            (0, vec![2, 3]),
+            (0, vec![4, 5]),
+            (1, vec![6, 7]),
+            (1, vec![8, 9]),
+            (1, vec![10, 11]),
+        ]);
+        let order = topo.numa_aware_llc_order(2, 5, 0);
+        assert_eq!(
+            order.len(),
+            5,
+            "uneven llc distribution must preserve all LLCs, got {order:?}"
+        );
+        // First 3 entries belong to the host's first eligible NUMA
+        // node; last 2 to the second.
+        let first_three_nodes: std::collections::BTreeSet<usize> = order[..3]
+            .iter()
+            .map(|&idx| topo.llc_numa_node(idx))
+            .collect();
+        let last_two_nodes: std::collections::BTreeSet<usize> = order[3..]
+            .iter()
+            .map(|&idx| topo.llc_numa_node(idx))
+            .collect();
+        assert_eq!(
+            first_three_nodes.len(),
+            1,
+            "first 3 LLCs must share a host node"
+        );
+        assert_eq!(
+            last_two_nodes.len(),
+            1,
+            "last 2 LLCs must share a host node"
+        );
+        assert_ne!(
+            first_three_nodes, last_two_nodes,
+            "two guest NUMA nodes must map to distinct host nodes"
+        );
+    }
+
+    #[test]
+    fn numa_aware_llc_order_zero_numa_nodes_is_safe() {
+        // Regression for #31 guard: numa_nodes=0 formerly
+        // divide-by-zero'd on `llcs / numa_nodes`. Now falls back to
+        // sequential mapping.
+        let topo = synthetic_topo_numa(vec![(0, vec![0, 1]), (0, vec![2, 3])]);
+        let order = topo.numa_aware_llc_order(0, 2, 0);
+        assert_eq!(
+            order.len(),
+            2,
+            "zero-numa fallback must still produce an order"
+        );
+    }
+
+    #[test]
+    fn numa_aware_llc_order_fewer_llcs_than_nodes_falls_back() {
+        // Regression for #31 guard: llcs < numa_nodes would give
+        // base_per_node = 0 and leave some guest nodes empty. Fall
+        // back to sequential mapping so all requested LLCs land.
+        let topo = synthetic_topo_numa(vec![
+            (0, vec![0, 1]),
+            (0, vec![2, 3]),
+            (1, vec![4, 5]),
+            (1, vec![6, 7]),
+        ]);
+        let order = topo.numa_aware_llc_order(4, 2, 0);
+        assert_eq!(
+            order.len(),
+            2,
+            "fewer-llcs-than-nodes fallback must still produce 2 entries"
         );
     }
 

@@ -226,11 +226,21 @@ impl<T> Drop for PiMutexGuard<'_, T> {
 pub(crate) struct BaseKey(u64);
 
 /// Hash a file's content for cache keying via streaming reads.
+///
+/// Uses [`siphasher::sip::SipHasher13`] with fixed zero keys rather
+/// than [`std::hash::DefaultHasher`]. DefaultHasher's concrete
+/// algorithm is explicitly not guaranteed stable across Rust
+/// toolchain versions, so cache keys computed with it would silently
+/// shift when the compiler was upgraded — invalidating every cached
+/// initramfs blob. SipHash13 with pinned keys is version-stable by
+/// the siphasher crate's contract.
 pub(crate) fn hash_file(path: &Path) -> Result<u64> {
+    use siphasher::sip::SipHasher13;
+    use std::hash::Hasher;
     use std::io::Read;
     let mut f =
         std::fs::File::open(path).with_context(|| format!("open for hash: {}", path.display()))?;
-    let mut hasher = std::hash::DefaultHasher::new();
+    let mut hasher = SipHasher13::new_with_keys(0, 0);
     let mut buf = [0u8; 65536];
     loop {
         let n = f
@@ -248,7 +258,8 @@ impl BaseKey {
     /// Hashes the payload binary content, payload shared libs, and
     /// optional scheduler binary content and shared libs.
     pub(crate) fn new(payload: &Path, scheduler: Option<&Path>) -> Result<Self> {
-        let mut hasher = std::hash::DefaultHasher::new();
+        use siphasher::sip::SipHasher13;
+        let mut hasher = SipHasher13::new_with_keys(0, 0);
 
         hash_file(payload)?.hash(&mut hasher);
         Self::hash_shared_libs(payload, &mut hasher);
@@ -276,7 +287,8 @@ impl BaseKey {
         include_files: &[(String, PathBuf)],
         busybox: bool,
     ) -> Result<Self> {
-        let mut hasher = std::hash::DefaultHasher::new();
+        use siphasher::sip::SipHasher13;
+        let mut hasher = SipHasher13::new_with_keys(0, 0);
 
         "ktstr-shell".hash(&mut hasher);
         busybox.hash(&mut hasher);
@@ -312,7 +324,7 @@ impl BaseKey {
 
     /// Hash shared library paths and content samples for a binary so
     /// the cache key changes when any shared lib is updated on the host.
-    fn hash_shared_libs(binary: &Path, hasher: &mut std::hash::DefaultHasher) {
+    fn hash_shared_libs(binary: &Path, hasher: &mut siphasher::sip::SipHasher13) {
         if let Ok(result) = initramfs::resolve_shared_libs(binary) {
             let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
             entries.sort();
@@ -5570,6 +5582,35 @@ mod tests {
         let k1 = BaseKey::new(&exe, None).unwrap();
         let k2 = BaseKey::new(&exe, Some(&exe)).unwrap();
         assert_ne!(k1, k2, "with vs without scheduler should differ");
+    }
+
+    #[test]
+    fn hash_file_is_siphash13_stable_golden() {
+        // Regression for #28: hash_file must use SipHasher13 with
+        // zero keys so the value is stable across Rust toolchain
+        // versions. Golden check pins the concrete algorithm —
+        // if this value changes, the cache is about to silently
+        // invalidate every prior artifact.
+        let tmp =
+            std::env::temp_dir().join(format!("ktstr-hash-golden-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let f = tmp.join("known");
+        std::fs::write(&f, b"ktstr cache key probe").unwrap();
+        let observed = hash_file(&f).unwrap();
+
+        // Cross-check against a direct SipHasher13 invocation so the
+        // test will fail loudly if someone swaps the algorithm.
+        use siphasher::sip::SipHasher13;
+        use std::hash::Hasher;
+        let mut h = SipHasher13::new_with_keys(0, 0);
+        h.write(b"ktstr cache key probe");
+        let expected = h.finish();
+        assert_eq!(
+            observed, expected,
+            "hash_file must match SipHasher13::new_with_keys(0, 0)"
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

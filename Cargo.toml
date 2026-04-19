@@ -69,6 +69,10 @@ rayon = "1"
 object = { version = "0.36", default-features = false, features = ["build", "std", "elf"] }
 walkdir = "2"
 indicatif = "0.18"
+# Stable hash for cache keys — std::hash::DefaultHasher is not
+# guaranteed stable across toolchain versions; siphasher::sip::SipHasher13
+# pins the algorithm so cached artifacts survive Rust updates.
+siphasher = "1"
 
 [profile.release]
 lto = "thin"

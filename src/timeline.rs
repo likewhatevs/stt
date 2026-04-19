@@ -352,7 +352,12 @@ impl Timeline {
                 out.push_str(part);
                 out.push_str("  ");
             }
-            out.truncate(out.len() - 2); // trim trailing "  "
+            // Trim trailing "  " appended by the last iteration.
+            // Explicit length guard so a future edit that stops
+            // appending the separator here can't underflow.
+            if out.len() >= 2 {
+                out.truncate(out.len() - 2);
+            }
             out.push('\n');
         }
 
@@ -543,12 +548,20 @@ fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
     let (fallback_rate, keep_last_rate) = match (first_ev, last_ev) {
         (Some(first), Some(last)) if first.elapsed_ms < last.elapsed_ms => {
             let duration_s = (last.elapsed_ms - first.elapsed_ms) as f64 / 1000.0;
-            let fb_delta = last.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0)
-                - first
+            // Event counters can reset mid-run (scheduler restart) and
+            // produce a negative raw delta. Shared helper clamps to
+            // >= 0 so the computed rate never goes negative; same
+            // semantics as MonitorSummary::compute_event_deltas.
+            let fb_delta = crate::monitor::counter_delta(
+                last.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0),
+                first
                     .sum_event_field(|e| e.select_cpu_fallback)
-                    .unwrap_or(0);
-            let kl_delta = last.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0)
-                - first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0);
+                    .unwrap_or(0),
+            );
+            let kl_delta = crate::monitor::counter_delta(
+                last.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
+                first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
+            );
             (
                 Some(fb_delta as f64 / duration_s),
                 Some(kl_delta as f64 / duration_s),
@@ -913,6 +926,68 @@ mod tests {
         let m = compute_metrics(&refs);
         assert!(m.fallback_rate.is_none());
         assert!(m.keep_last_rate.is_none());
+    }
+
+    #[test]
+    fn compute_metrics_counter_reset_clamps_rates_to_non_negative() {
+        // Regression for #30 (via #29's shared counter_delta helper):
+        // a scheduler restart between samples resets the event
+        // counters to smaller (or zero) values. Raw `last - first`
+        // then produces a negative delta, which downstream would
+        // flow into `fallback_rate = delta / duration` and report a
+        // negative rate. The shared clamp must prevent that.
+        use crate::monitor::ScxEventCounters;
+
+        let s1 = MonitorSample {
+            prog_stats: None,
+            elapsed_ms: 0,
+            cpus: vec![CpuSnapshot {
+                nr_running: 2,
+                local_dsq_depth: 1,
+                rq_clock: 100,
+                scx_nr_running: 0,
+                scx_flags: 0,
+                event_counters: Some(ScxEventCounters {
+                    select_cpu_fallback: 1000,
+                    dispatch_keep_last: 500,
+                    ..Default::default()
+                }),
+                schedstat: None,
+                vcpu_cpu_time_ns: None,
+                sched_domains: None,
+            }],
+        };
+        let s2 = MonitorSample {
+            prog_stats: None,
+            elapsed_ms: 1000,
+            cpus: vec![CpuSnapshot {
+                nr_running: 2,
+                local_dsq_depth: 1,
+                rq_clock: 200,
+                scx_nr_running: 0,
+                scx_flags: 0,
+                event_counters: Some(ScxEventCounters {
+                    select_cpu_fallback: 5,
+                    dispatch_keep_last: 2,
+                    ..Default::default()
+                }),
+                schedstat: None,
+                vcpu_cpu_time_ns: None,
+                sched_domains: None,
+            }],
+        };
+        let refs: Vec<&MonitorSample> = vec![&s1, &s2];
+        let m = compute_metrics(&refs);
+        let fb = m.fallback_rate.expect("reset still produces Some rate");
+        let kl = m.keep_last_rate.expect("reset still produces Some rate");
+        assert!(
+            fb >= 0.0,
+            "reset must not produce negative fallback_rate, got {fb}"
+        );
+        assert!(
+            kl >= 0.0,
+            "reset must not produce negative keep_last_rate, got {kl}"
+        );
     }
 
     // -- format with stalls --

@@ -26,6 +26,18 @@ pub mod symbols;
 /// Real kernels never queue this many tasks on a single CPU's local DSQ.
 pub const DSQ_PLAUSIBILITY_CEILING: u32 = 10_000;
 
+/// Non-negative delta between two samples of a monotonic counter.
+///
+/// BPF / kernel counters can reset mid-run (scheduler restart, counter
+/// re-init) so the raw `last - first` can be negative. Callers want a
+/// rate-computation-safe value, so clamp to zero.
+///
+/// Shared with [`crate::timeline`] so both derivation paths agree on
+/// the clamp semantics instead of each reinventing the same closure.
+pub(crate) fn counter_delta(last: i64, first: i64) -> i64 {
+    (last - first).max(0)
+}
+
 /// Number of tick periods a vCPU must have run before rq_clock is expected
 /// to have advanced. 10 ticks gives the scheduler tick multiple chances
 /// to fire and update rq_clock.
@@ -774,12 +786,16 @@ impl MonitorSummary {
         let first = samples.iter().find(|s| has_events(s))?;
         let last = samples.iter().rev().find(|s| has_events(s))?;
 
-        let total_fallback = last.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0)
-            - first
+        let total_fallback = counter_delta(
+            last.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0),
+            first
                 .sum_event_field(|e| e.select_cpu_fallback)
-                .unwrap_or(0);
-        let total_keep_last = last.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0)
-            - first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0);
+                .unwrap_or(0),
+        );
+        let total_keep_last = counter_delta(
+            last.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
+            first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
+        );
 
         // Compute rates.
         let duration_ms = last.elapsed_ms.saturating_sub(first.elapsed_ms);
@@ -796,19 +812,24 @@ impl MonitorSummary {
         };
 
         // Max per-sample fallback burst: largest delta between consecutive
-        // samples, summed across all CPUs.
+        // samples, summed across all CPUs. A counter reset between
+        // samples yields a negative raw delta — ignore it rather than
+        // letting it decrease the running max.
         let mut max_fallback_burst: i64 = 0;
         for w in samples.windows(2) {
             let prev_sum = w[0].sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0);
             let curr_sum = w[1].sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0);
-            let delta = curr_sum - prev_sum;
+            let delta = counter_delta(curr_sum, prev_sum);
             if delta > max_fallback_burst {
                 max_fallback_burst = delta;
             }
         }
 
         let delta = |f: fn(&ScxEventCounters) -> i64| -> i64 {
-            last.sum_event_field(f).unwrap_or(0) - first.sum_event_field(f).unwrap_or(0)
+            counter_delta(
+                last.sum_event_field(f).unwrap_or(0),
+                first.sum_event_field(f).unwrap_or(0),
+            )
         };
 
         Some(ScxEventDeltas {
@@ -2599,6 +2620,44 @@ mod tests {
         let deltas = summary.event_deltas.unwrap();
         // Per-CPU: burst is (100-5)*2 = 190 across 2 CPUs.
         assert!(deltas.max_fallback_burst > 0);
+    }
+
+    #[test]
+    fn event_deltas_counter_reset_clamps_to_zero() {
+        // Regression for #29: a scheduler restart between samples
+        // resets the per-CPU counters to smaller (or zero) values. The
+        // raw delta `last - first` is then negative — which, before the
+        // fix, flowed through as a negative fallback_rate / negative
+        // total. Clamp to zero so the downstream rate is sane.
+        //
+        // Sample 0 at t=0ms has high counters (pre-restart).
+        // Sample 1 at t=1000ms has low counters (post-restart).
+        let samples = vec![
+            sample_with_events(0, 1000, 1000, 500),
+            sample_with_events(1000, 2000, 5, 2),
+        ];
+        let summary = MonitorSummary::from_samples(&samples);
+        let deltas = summary.event_deltas.unwrap();
+        assert!(
+            deltas.total_fallback >= 0,
+            "reset must not produce negative total_fallback, got {}",
+            deltas.total_fallback
+        );
+        assert!(
+            deltas.fallback_rate >= 0.0,
+            "reset must not produce negative fallback_rate, got {}",
+            deltas.fallback_rate
+        );
+        assert!(
+            deltas.total_dispatch_keep_last >= 0,
+            "reset must not produce negative keep_last total, got {}",
+            deltas.total_dispatch_keep_last
+        );
+        assert!(
+            deltas.keep_last_rate >= 0.0,
+            "reset must not produce negative keep_last_rate, got {}",
+            deltas.keep_last_rate
+        );
     }
 
     #[test]
