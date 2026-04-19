@@ -158,6 +158,18 @@ pub(crate) const SENTINEL_INIT_STARTED: &str = "KTSTR_INIT_STARTED";
 /// function is called.
 pub(crate) const SENTINEL_PAYLOAD_STARTING: &str = "KTSTR_PAYLOAD_STARTING";
 
+/// Prefix written by guest init on final exit. The full marker is
+/// `KTSTR_EXIT=<code>`; callers that need the code parse the suffix.
+pub(crate) const SENTINEL_EXIT_PREFIX: &str = "KTSTR_EXIT=";
+
+/// Prefix written by `shell --exec` after the user command returns.
+/// Carries the exec'd process's exit code (`KTSTR_EXEC_EXIT=<code>`).
+pub(crate) const SENTINEL_EXEC_EXIT_PREFIX: &str = "KTSTR_EXEC_EXIT=";
+
+/// Written by guest init when the scheduler process dies during
+/// startup. Paired with `KTSTR_EXIT=1` on the surrounding lines.
+pub(crate) const SENTINEL_SCHEDULER_DIED: &str = "SCHEDULER_DIED";
+
 /// Classify the failure stage based on which sentinels appear in COM2 output.
 pub(crate) fn classify_init_stage(output: &str) -> &'static str {
     if output.contains(SENTINEL_PAYLOAD_STARTING) {

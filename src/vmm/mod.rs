@@ -1636,7 +1636,7 @@ impl KtstrVm {
                 use std::io::Write;
                 let mut stdout = std::io::stdout().lock();
                 for line in app_output.lines() {
-                    if !line.starts_with("KTSTR_EXEC_EXIT=") {
+                    if !line.starts_with(crate::test_support::SENTINEL_EXEC_EXIT_PREFIX) {
                         let _ = writeln!(stdout, "{line}");
                     }
                 }
@@ -3180,8 +3180,11 @@ impl KtstrVm {
         } else if let Some(line) = app_output
             .lines()
             .rev()
-            .find(|l| l.starts_with("KTSTR_EXIT="))
-            && let Ok(code) = line.trim_start_matches("KTSTR_EXIT=").trim().parse::<i32>()
+            .find(|l| l.starts_with(crate::test_support::SENTINEL_EXIT_PREFIX))
+            && let Ok(code) = line
+                .trim_start_matches(crate::test_support::SENTINEL_EXIT_PREFIX)
+                .trim()
+                .parse::<i32>()
         {
             exit_code = code;
         }

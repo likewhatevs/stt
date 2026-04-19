@@ -544,58 +544,42 @@ fn query_scheduler_flags(
 
 /// Generate flag profiles from flag declarations.
 ///
-/// Produces the power set of flags, filtered by requires constraints.
-/// Each profile's flags are sorted in declaration order (matching the
-/// library's `Scheduler::generate_profiles`).
+/// Produces the power set of flags, filtered by requires constraints,
+/// via the shared [`ktstr::scenario::compute_flag_profiles`] generator.
+/// Each profile's flags are sorted in declaration order. The profile
+/// name is the flags joined with `+`, or `"default"` when empty.
 fn generate_flag_profiles(
     flags: &[ktstr::scenario::flags::FlagDeclJson],
 ) -> Vec<(String, Vec<String>)> {
     let n = flags.len();
-    let mut profiles = Vec::new();
-
     if n > 31 {
         eprintln!(
             "cargo ktstr: error: scheduler has {n} flags, power set too large (2^{n}). \
              Use --profiles to select specific profiles."
         );
-        return profiles;
+        return Vec::new();
     }
 
-    for mask in 0..(1u32 << n) {
-        let active: Vec<&ktstr::scenario::flags::FlagDeclJson> = (0..n)
-            .filter(|i| mask & (1 << i) != 0)
-            .map(|i| &flags[i])
-            .collect();
-        let active_names: Vec<&str> = active.iter().map(|f| f.name.as_str()).collect();
+    let all: Vec<String> = flags.iter().map(|f| f.name.clone()).collect();
+    let requires_fn = |name: &String| -> Vec<String> {
+        flags
+            .iter()
+            .find(|f| f.name == *name)
+            .map(|f| f.requires.clone())
+            .unwrap_or_default()
+    };
 
-        // Check requires constraints: every active flag's requires
-        // must also be in the active set.
-        let valid = active.iter().all(|f| {
-            f.requires
-                .iter()
-                .all(|r| active_names.contains(&r.as_str()))
-        });
-        if !valid {
-            continue;
-        }
-
-        // Sort by declaration order (position in the input slice).
-        let mut flag_names: Vec<String> = active.iter().map(|f| f.name.clone()).collect();
-        flag_names.sort_by_key(|name| {
-            flags
-                .iter()
-                .position(|f| f.name == *name)
-                .unwrap_or(usize::MAX)
-        });
-        let name = if flag_names.is_empty() {
-            "default".to_string()
-        } else {
-            flag_names.join("+")
-        };
-        profiles.push((name, flag_names));
-    }
-
-    profiles
+    ktstr::scenario::compute_flag_profiles(&all, requires_fn, &[], &[])
+        .into_iter()
+        .map(|flag_names| {
+            let name = if flag_names.is_empty() {
+                "default".to_string()
+            } else {
+                flag_names.join("+")
+            };
+            (name, flag_names)
+        })
+        .collect()
 }
 
 /// Collect the extra scheduler args for a set of active flags.

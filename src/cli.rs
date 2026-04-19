@@ -476,38 +476,51 @@ pub fn has_sched_ext(kernel_dir: &std::path::Path) -> bool {
 ///
 /// Call after `make` succeeds. Returns `Err` with a diagnostic
 /// message listing missing options and likely causes.
+/// Critical `.config` options checked by [`validate_kernel_config`].
+///
+/// Each entry pairs a `CONFIG_X` name with a diagnostic hint —
+/// human-readable context on the dependency that typically causes the
+/// option to be silently dropped during `make`. The list is curated:
+/// every entry here is an option whose absence at the post-build
+/// check has historically surfaced as a specific tool-install or
+/// arch-default-override. The companion test
+/// `critical_options_are_in_embedded_kconfig` proves every name is
+/// present in [`EMBEDDED_KCONFIG`] as `=y`, so a kconfig edit that
+/// removes a critical entry fails the test immediately instead of
+/// surfacing later as a build that passes validation but behaves
+/// differently.
+const VALIDATE_CONFIG_CRITICAL: &[(&str, &str)] = &[
+    (
+        "CONFIG_SCHED_CLASS_EXT",
+        "depends on CONFIG_DEBUG_INFO_BTF — ensure pahole >= 1.16 is installed (dwarves package)",
+    ),
+    (
+        "CONFIG_DEBUG_INFO_BTF",
+        "requires pahole >= 1.16 (dwarves package)",
+    ),
+    ("CONFIG_BPF_SYSCALL", "required for BPF program loading"),
+    (
+        "CONFIG_FTRACE",
+        "gate for all tracing infrastructure — arm64 defconfig disables it, \
+         silently dropping KPROBE_EVENTS and BPF_EVENTS",
+    ),
+    (
+        "CONFIG_KPROBE_EVENTS",
+        "required for ktstr probe pipeline (depends on FTRACE + KPROBES)",
+    ),
+    (
+        "CONFIG_BPF_EVENTS",
+        "required for BPF kprobe/tracepoint attachment (depends on KPROBE_EVENTS + PERF_EVENTS)",
+    ),
+];
+
 pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
     let config_path = kernel_dir.join(".config");
     let config = std::fs::read_to_string(&config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
 
-    let required: &[(&str, &str)] = &[
-        (
-            "CONFIG_SCHED_CLASS_EXT",
-            "depends on CONFIG_DEBUG_INFO_BTF — ensure pahole >= 1.16 is installed (dwarves package)",
-        ),
-        (
-            "CONFIG_DEBUG_INFO_BTF",
-            "requires pahole >= 1.16 (dwarves package)",
-        ),
-        ("CONFIG_BPF_SYSCALL", "required for BPF program loading"),
-        (
-            "CONFIG_FTRACE",
-            "gate for all tracing infrastructure — arm64 defconfig disables it, \
-             silently dropping KPROBE_EVENTS and BPF_EVENTS",
-        ),
-        (
-            "CONFIG_KPROBE_EVENTS",
-            "required for ktstr probe pipeline (depends on FTRACE + KPROBES)",
-        ),
-        (
-            "CONFIG_BPF_EVENTS",
-            "required for BPF kprobe/tracepoint attachment (depends on KPROBE_EVENTS + PERF_EVENTS)",
-        ),
-    ];
-
     let mut missing = Vec::new();
-    for &(option, hint) in required {
+    for &(option, hint) in VALIDATE_CONFIG_CRITICAL {
         let enabled = format!("{option}=y");
         if !config.lines().any(|l| l == enabled) {
             missing.push((option, hint));
@@ -1709,6 +1722,26 @@ mod tests {
     // since the single implementation now lives there.
 
     // -- validate_kernel_config --
+
+    /// Every entry in `VALIDATE_CONFIG_CRITICAL` must appear as `=y`
+    /// in the embedded kconfig fragment. If a critical option is
+    /// dropped from the fragment, builds would skip the option but
+    /// validation would keep flagging it as missing — the user sees
+    /// a build failure that no amount of tool installation fixes.
+    /// This test catches the drift at compile-test time.
+    #[test]
+    fn critical_options_are_in_embedded_kconfig() {
+        let fragment = crate::EMBEDDED_KCONFIG;
+        for &(option, _) in VALIDATE_CONFIG_CRITICAL {
+            let enabled = format!("{option}=y");
+            assert!(
+                fragment.lines().any(|l| l.trim() == enabled),
+                "VALIDATE_CONFIG_CRITICAL lists {option:?} but ktstr.kconfig does not \
+                 enable it; either add `{option}=y` to the fragment or drop the entry \
+                 from VALIDATE_CONFIG_CRITICAL",
+            );
+        }
+    }
 
     #[test]
     fn validate_kernel_config_all_present() {

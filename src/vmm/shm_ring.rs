@@ -12,7 +12,7 @@
 /// (no E820 entry covers it), on aarch64 via FDT /reserved-memory and
 /// /memreserve/. The guest init binary discovers the region via KTSTR_SHM_BASE
 /// and KTSTR_SHM_SIZE environment variables on the kernel command line.
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Result of a successful `/dev/mem` mmap of the SHM region.
 pub(crate) struct ShmMmap {
@@ -318,7 +318,9 @@ pub(crate) fn parse_shm_params_from_str(cmdline: &str) -> Option<(u64, u64)> {
 /// write_ptr and read_ptr are monotonically increasing byte offsets into
 /// the data area. Actual position = ptr % capacity.
 #[repr(C)]
-#[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone, Copy, Default, FromBytes, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
+)]
 pub struct ShmRingHeader {
     pub magic: u32,
     pub version: u32,
@@ -347,7 +349,9 @@ const _HEADER_SIZE: () = assert!(std::mem::size_of::<ShmRingHeader>() == 40);
 ///
 /// CRC32 covers only the payload bytes (not this header).
 #[repr(C)]
-#[derive(Clone, Copy, Default, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone, Copy, Default, FromBytes, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
+)]
 pub struct ShmMessage {
     pub msg_type: u32,
     pub length: u32,
@@ -466,18 +470,17 @@ pub fn shm_init(buf: &mut [u8], shm_offset: usize, shm_size: usize) {
     buf[data_start..data_end].fill(0);
 }
 
-/// Read the ring header from guest memory.
+/// Read the ring header from guest memory via zerocopy.
+///
+/// `ShmRingHeader` derives `FromBytes` + `Immutable` + `KnownLayout`,
+/// so any byte slice sized exactly `HEADER_SIZE` is a valid header —
+/// all fields are fixed-width scalars with no invalid bit patterns.
+/// `read_from_bytes` returns a `Result<Self>` that only fails on
+/// size mismatch; the slice is always exactly `HEADER_SIZE` bytes by
+/// construction, so `.unwrap()` is justified.
 fn read_header(buf: &[u8], shm_offset: usize) -> ShmRingHeader {
     let s = &buf[shm_offset..shm_offset + HEADER_SIZE];
-    ShmRingHeader {
-        magic: u32::from_ne_bytes(s[0..4].try_into().unwrap()),
-        version: u32::from_ne_bytes(s[4..8].try_into().unwrap()),
-        capacity: u32::from_ne_bytes(s[8..12].try_into().unwrap()),
-        control_bytes: u32::from_ne_bytes(s[12..16].try_into().unwrap()),
-        write_ptr: u64::from_ne_bytes(s[16..24].try_into().unwrap()),
-        read_ptr: u64::from_ne_bytes(s[24..32].try_into().unwrap()),
-        drops: u64::from_ne_bytes(s[32..40].try_into().unwrap()),
-    }
+    ShmRingHeader::read_from_bytes(s).unwrap()
 }
 
 /// Read `len` bytes from the ring's data area starting at monotonic offset
@@ -529,12 +532,7 @@ pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
     while read_pos + MSG_HEADER_SIZE as u64 <= write_pos {
         let mut hdr_buf = [0u8; MSG_HEADER_SIZE];
         read_ring_into(buf, data_start, capacity, read_pos, &mut hdr_buf);
-        let msg = ShmMessage {
-            msg_type: u32::from_ne_bytes(hdr_buf[0..4].try_into().unwrap()),
-            length: u32::from_ne_bytes(hdr_buf[4..8].try_into().unwrap()),
-            crc32: u32::from_ne_bytes(hdr_buf[8..12].try_into().unwrap()),
-            _pad: u32::from_ne_bytes(hdr_buf[12..16].try_into().unwrap()),
-        };
+        let msg = ShmMessage::read_from_bytes(&hdr_buf).unwrap();
 
         let total_msg_size = MSG_HEADER_SIZE as u64 + msg.length as u64;
         if read_pos + total_msg_size > write_pos {
@@ -596,12 +594,7 @@ pub fn shm_drain_live(mem: &crate::monitor::reader::GuestMem, shm_base_pa: u64) 
         // Read message header via volatile.
         let mut hdr_buf = [0u8; MSG_HEADER_SIZE];
         read_ring_volatile(mem, data_start_pa, capacity, read_pos, &mut hdr_buf);
-        let msg = ShmMessage {
-            msg_type: u32::from_ne_bytes(hdr_buf[0..4].try_into().unwrap()),
-            length: u32::from_ne_bytes(hdr_buf[4..8].try_into().unwrap()),
-            crc32: u32::from_ne_bytes(hdr_buf[8..12].try_into().unwrap()),
-            _pad: u32::from_ne_bytes(hdr_buf[12..16].try_into().unwrap()),
-        };
+        let msg = ShmMessage::read_from_bytes(&hdr_buf).unwrap();
 
         let total_msg_size = MSG_HEADER_SIZE as u64 + msg.length as u64;
         if read_pos + total_msg_size > write_ptr {

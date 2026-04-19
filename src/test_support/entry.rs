@@ -486,34 +486,21 @@ impl Scheduler {
         required: &[&'static str],
         excluded: &[&'static str],
     ) -> Vec<crate::scenario::FlagProfile> {
-        let optional: Vec<&'static str> = self
-            .flags
-            .iter()
-            .map(|f| f.name)
-            .filter(|f| !required.contains(f) && !excluded.contains(f))
-            .collect();
-        let mut out = Vec::new();
-        for mask in 0..(1u32 << optional.len()) {
-            let mut fl: Vec<&'static str> = required.to_vec();
-            for (i, &f) in optional.iter().enumerate() {
-                if mask & (1 << i) != 0 {
-                    fl.push(f);
-                }
-            }
-            let valid = fl
-                .iter()
-                .all(|f| self.flag_requires(f).iter().all(|r| fl.contains(r)));
-            if valid {
-                fl.sort_by_key(|f| {
-                    self.flags
-                        .iter()
-                        .position(|d| d.name == *f)
-                        .unwrap_or(usize::MAX)
-                });
-                out.push(crate::scenario::FlagProfile { flags: fl });
-            }
-        }
-        out
+        let all: Vec<&'static str> = self.flags.iter().map(|f| f.name).collect();
+        // Requires edges come from each declaration's `requires` list.
+        // Promote from `Vec<&str>` to `Vec<&'static str>` via a fixed
+        // lookup against `self.flags` so the shared generator's
+        // lifetime-unified input type is satisfied.
+        let requires_fn = |&f: &&'static str| -> Vec<&'static str> {
+            self.flag_requires(f)
+                .into_iter()
+                .filter_map(|name| self.flags.iter().map(|d| d.name).find(|n| *n == name))
+                .collect()
+        };
+        crate::scenario::compute_flag_profiles(&all, requires_fn, required, excluded)
+            .into_iter()
+            .map(|flags| crate::scenario::FlagProfile { flags })
+            .collect()
     }
 }
 

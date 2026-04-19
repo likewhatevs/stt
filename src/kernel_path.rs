@@ -1,8 +1,31 @@
 // Shared kernel directory resolution.
 //
-// Used by both build.rs (via include!) and lib.rs (via mod).
-// Only uses std — no external crate dependencies.
-// All functions are pure: callers supply inputs, handle caching.
+// Used by both build.rs (via `include!("src/kernel_path.rs")`) and
+// lib.rs (via `pub mod kernel_path`). The `include!` is deliberate:
+// build.rs runs before the crate compiles, so it cannot `use ktstr::...`.
+// Duplicating the resolution logic would drift between build-time
+// BTF discovery (vmlinux.h generation) and run-time kernel selection.
+//
+// Constraints that every edit to this file must satisfy — breaking
+// any of them surfaces as either a cryptic build-script error or a
+// runtime/build-time behaviour mismatch:
+//
+// 1. **No non-std imports.** build.rs has its own dependency graph
+//    (`libbpf-cargo`, `tempfile`, etc.). A `use foo::bar` here would
+//    compile inside lib.rs (via the `pub mod` path) but fail inside
+//    build.rs because build.rs hasn't declared `foo` as a build-dep.
+// 2. **No `pub(crate)` items.** `pub(crate)` is meaningless inside
+//    an `include!`'d fragment — build.rs isn't a crate, so the item
+//    resolves at crate-root visibility there. Use `pub` for items
+//    build.rs needs, `fn` (private) for items lib.rs alone uses.
+// 3. **No `#[cfg(test)]` items referencing non-std test helpers.**
+//    build.rs still compiles them. Keep test helpers `use`-less or
+//    gate them behind `#[cfg(all(test, not(build)))]` if they need
+//    crates unavailable to build.rs.
+// 4. **All functions are pure.** Callers supply inputs and handle
+//    caching — no global state, no `std::env::set_var`, no FS
+//    writes outside the caller-provided paths. Pure is what makes
+//    the double-consumer (build + runtime) safe.
 
 /// Kernel identifier: filesystem path, version string, or cache key.
 ///

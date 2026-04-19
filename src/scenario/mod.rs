@@ -281,29 +281,59 @@ fn flag_requires(flag: &str) -> Vec<&'static str> {
         .unwrap_or_default()
 }
 
-fn generate_profiles(required: &[&'static str], excluded: &[&'static str]) -> Vec<FlagProfile> {
-    let optional: Vec<&'static str> = flags::ALL
+/// Enumerate flag profiles from a flag-name universe, a
+/// requires-edge resolver, and required/excluded constraints.
+///
+/// Shared with [`Scheduler::generate_profiles`](crate::test_support::Scheduler::generate_profiles)
+/// and the `cargo ktstr verifier --all-profiles` generator — each
+/// previously hand-rolled the same power-set + requires-filter +
+/// sort logic against a different flag-source type. `all_names` is
+/// the canonical flag ordering (profiles are sorted in this order);
+/// `requires_fn(f)` returns the flags that must also be present
+/// when `f` is. `required` and `excluded` filter the optional set.
+///
+/// Caller maps the result back to its own profile type — the return
+/// `Vec<Vec<T>>` keeps the generic free of either `FlagProfile` or
+/// `(name, Vec<String>)` plumbing.
+pub fn compute_flag_profiles<T, F>(
+    all_names: &[T],
+    requires_fn: F,
+    required: &[T],
+    excluded: &[T],
+) -> Vec<Vec<T>>
+where
+    T: Clone + PartialEq,
+    F: Fn(&T) -> Vec<T>,
+{
+    let optional: Vec<T> = all_names
         .iter()
-        .copied()
         .filter(|f| !required.contains(f) && !excluded.contains(f))
+        .cloned()
         .collect();
     let mut out = Vec::new();
     for mask in 0..(1u32 << optional.len()) {
-        let mut fl: Vec<&'static str> = required.to_vec();
-        for (i, &f) in optional.iter().enumerate() {
+        let mut fl: Vec<T> = required.to_vec();
+        for (i, f) in optional.iter().enumerate() {
             if mask & (1 << i) != 0 {
-                fl.push(f);
+                fl.push(f.clone());
             }
         }
         let valid = fl
             .iter()
-            .all(|f| flag_requires(f).iter().all(|r| fl.contains(r)));
+            .all(|f| requires_fn(f).iter().all(|r| fl.contains(r)));
         if valid {
-            fl.sort_by_key(|f| flags::ALL.iter().position(|a| a == f).unwrap_or(usize::MAX));
-            out.push(FlagProfile { flags: fl });
+            fl.sort_by_key(|f| all_names.iter().position(|a| a == f).unwrap_or(usize::MAX));
+            out.push(fl);
         }
     }
     out
+}
+
+fn generate_profiles(required: &[&'static str], excluded: &[&'static str]) -> Vec<FlagProfile> {
+    compute_flag_profiles(flags::ALL, |&f| flag_requires(f), required, excluded)
+        .into_iter()
+        .map(|flags| FlagProfile { flags })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

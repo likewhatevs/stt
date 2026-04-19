@@ -292,7 +292,7 @@ pub(crate) fn attempt_auto_repro(
         let status = if repro_result.timed_out {
             "repro VM: timed out".to_string()
         } else if repro_result.crash_message.is_some()
-            || repro_result.output.contains("SCHEDULER_DIED")
+            || repro_result.output.contains(super::SENTINEL_SCHEDULER_DIED)
         {
             format!(
                 "repro VM: scheduler crashed (exit code {})",

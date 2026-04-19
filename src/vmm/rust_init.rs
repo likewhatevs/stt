@@ -131,7 +131,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // harness on the host; shell mode doesn't need it and it would leak
     // to the user's terminal via COM2 stdout drain.
     if !shell_mode_requested() {
-        write_com2("KTSTR_INIT_STARTED");
+        write_com2(crate::test_support::SENTINEL_INIT_STARTED);
     }
     redirect_stdio_to_com2();
     let t_stdio = t0.elapsed();
@@ -231,7 +231,10 @@ pub(crate) fn ktstr_guest_init() -> ! {
             };
             // Exit code on stderr so it does not pollute captured
             // command output on stdout.
-            eprintln!("KTSTR_EXEC_EXIT={code}");
+            eprintln!(
+                "{prefix}{code}",
+                prefix = crate::test_support::SENTINEL_EXEC_EXIT_PREFIX,
+            );
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
             // Drain the tty and allow the host stdout thread time to
@@ -341,7 +344,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
     tracing::debug!("dispatching test");
-    write_com2("KTSTR_PAYLOAD_STARTING");
+    write_com2(crate::test_support::SENTINEL_PAYLOAD_STARTING);
     let code = if let Some(pa) = probe_phase_a {
         // Phase A/B split path: Phase A already attached, dispatch
         // with Phase B for BPF fentry after scheduler is running.
@@ -408,7 +411,10 @@ pub(crate) fn ktstr_guest_init() -> ! {
         crate::vmm::shm_ring::MSG_TYPE_EXIT,
         &(code as i32).to_ne_bytes(),
     );
-    write_com2(&format!("KTSTR_EXIT={code}"));
+    write_com2(&format!(
+        "{prefix}{code}",
+        prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
+    ));
 
     // Drain COM2 UART after writing the exit sentinel.
     if let Ok(com2) = fs::OpenOptions::new().write(true).open(COM2) {
@@ -1131,8 +1137,11 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                     write_com2(crate::test_support::SCHED_OUTPUT_START);
                     dump_file_to_com2(log_path);
                     write_com2(crate::test_support::SCHED_OUTPUT_END);
-                    write_com2("SCHEDULER_DIED");
-                    write_com2("KTSTR_EXIT=1");
+                    write_com2(crate::test_support::SENTINEL_SCHEDULER_DIED);
+                    write_com2(&format!(
+                        "{prefix}1",
+                        prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
+                    ));
                     force_reboot();
                 }
                 StartupStatus::Alive => {
