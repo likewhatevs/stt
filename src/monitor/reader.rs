@@ -308,10 +308,18 @@ impl GuestMem {
     /// Returns `None` if any level is not present or the address is
     /// out of guest memory bounds.
     pub fn translate_kva(&self, cr3_pa: u64, kva: u64, l5: bool) -> Option<u64> {
-        if l5 {
-            self.walk_5level(cr3_pa, kva)
-        } else {
-            self.walk_4level(cr3_pa, kva)
+        #[cfg(target_arch = "x86_64")]
+        {
+            if l5 {
+                self.walk_5level(cr3_pa, kva)
+            } else {
+                self.walk_4level(cr3_pa, kva)
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = l5; // x86-only flag; aarch64 here always uses the 3-level 64KB granule path
+            self.walk_3level_aarch64_64k(cr3_pa, kva)
         }
     }
 
@@ -389,7 +397,7 @@ impl GuestMem {
     /// GuestMem is mapped at DRAM_START, all GPAs are adjusted by
     /// subtracting DRAM_START to produce offsets into the memory region.
     #[cfg(target_arch = "aarch64")]
-    fn walk_4level(&self, ttbr_pa: u64, kva: u64) -> Option<u64> {
+    fn walk_3level_aarch64_64k(&self, ttbr_pa: u64, kva: u64) -> Option<u64> {
         use crate::vmm::kvm::DRAM_START;
 
         const VALID: u64 = 1;

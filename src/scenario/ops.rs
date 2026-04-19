@@ -756,20 +756,17 @@ impl CpusetSpec {
     ///
     /// **Callers MUST run [`validate`] first and propagate its error.**
     /// `apply_setup` and `apply_ops::SetCpuset` do so via `anyhow::bail!`.
-    /// Among rejected inputs, `Disjoint`/`Overlap` with `of == 0` and
-    /// inverted `Range` fracs panic here (div-by-zero and slice OOB);
-    /// non-finite fracs and out-of-bounds `Overlap.frac` may produce
-    /// silently-wrong cpusets or panics depending on the value (e.g.
-    /// NaN saturates to 0, inverting a Range and triggering a slice
-    /// OOB). Validate rejects all of these before resolve runs.
     ///
-    /// Out-of-range `Llc` and `Numa` indices are defensively clamped
-    /// to the largest valid index with a `tracing::warn!` rather than
-    /// panicking, so a late-bound topology mismatch (e.g. a scenario
-    /// authored against 4 LLCs run on a 2-LLC host after validate has
-    /// been skipped) degrades into a usable cpuset instead of a crash.
-    /// This defense-in-depth is for the Llc/Numa variants only; the
-    /// frac/partition variants rely on `validate`.
+    /// Defense-in-depth: every malformed input that `validate`
+    /// rejects (out-of-range `Llc`/`Numa`, partition `of == 0`,
+    /// `index >= of`, inverted or non-finite `Range.start_frac` /
+    /// `end_frac`, out-of-bounds `Overlap.frac`) also has a
+    /// panic-free fallback here — out-of-range indices clamp to the
+    /// last valid index with a `tracing::warn!`, `of == 0` returns
+    /// an empty set with a warn, and inverted/non-finite fracs clamp
+    /// to `[0, len]` so the resulting slice never inverts. Skipping
+    /// `validate` therefore degrades into a usable (possibly empty)
+    /// cpuset rather than crashing the caller.
     pub fn resolve(&self, ctx: &Ctx) -> BTreeSet<usize> {
         let usable = ctx.topo.usable_cpus();
         match self {
@@ -806,14 +803,36 @@ impl CpusetSpec {
                 start_frac,
                 end_frac,
             } => {
-                let start = (usable.len() as f64 * start_frac) as usize;
-                let end = (usable.len() as f64 * end_frac) as usize;
-                usable[start.min(usable.len())..end.min(usable.len())]
-                    .iter()
-                    .copied()
-                    .collect()
+                let len = usable.len();
+                // Defense-in-depth: clamp non-finite fracs to 0 (NaN
+                // would saturate to 0 via `as usize` anyway; explicit
+                // check matches validate's rejection reason).
+                let sf = if start_frac.is_finite() {
+                    *start_frac
+                } else {
+                    0.0
+                };
+                let ef = if end_frac.is_finite() { *end_frac } else { 0.0 };
+                let start = (len as f64 * sf) as usize;
+                let end = (len as f64 * ef) as usize;
+                // Guard against inverted Range (start_frac > end_frac)
+                // — `&usable[start..end]` panics when start > end even
+                // if both are clamped to `len`. `start.min(end)` keeps
+                // the slice empty in that case instead of panicking.
+                let s = start.min(len);
+                let e = end.min(len).max(s);
+                usable[s..e].iter().copied().collect()
             }
             CpusetSpec::Disjoint { index, of } => {
+                if *of == 0 {
+                    // Defense-in-depth: `validate` rejects of==0 with a
+                    // clear error. If a caller reaches `resolve` with
+                    // of==0 anyway (skipped validate, or used a
+                    // malformed programmatic spec), returning an empty
+                    // set is safer than the div-by-zero panic.
+                    tracing::warn!("CpusetSpec::Disjoint with of=0 — returning empty cpuset");
+                    return BTreeSet::new();
+                }
                 let chunk = usable.len() / of;
                 let start = index * chunk;
                 let end = if *index == of - 1 {
@@ -821,10 +840,23 @@ impl CpusetSpec {
                 } else {
                     (index + 1) * chunk
                 };
-                usable[start..end].iter().copied().collect()
+                let s = start.min(usable.len());
+                let e = end.min(usable.len()).max(s);
+                usable[s..e].iter().copied().collect()
             }
             CpusetSpec::Overlap { index, of, frac } => {
+                if *of == 0 {
+                    tracing::warn!("CpusetSpec::Overlap with of=0 — returning empty cpuset");
+                    return BTreeSet::new();
+                }
                 let chunk = usable.len() / of;
+                // Clamp non-finite / out-of-range frac to 0 so the
+                // overlap computation stays bounded.
+                let frac = if frac.is_finite() {
+                    frac.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
                 let overlap = (chunk as f64 * frac) as usize;
                 let start = if *index == 0 {
                     0
@@ -836,7 +868,9 @@ impl CpusetSpec {
                 } else {
                     ((index + 1) * chunk + overlap).min(usable.len())
                 };
-                usable[start..end].iter().copied().collect()
+                let s = start.min(usable.len());
+                let e = end.min(usable.len()).max(s);
+                usable[s..e].iter().copied().collect()
             }
             CpusetSpec::Exact(cpus) => cpus.clone(),
         }
@@ -1684,6 +1718,78 @@ mod tests {
         };
         let resolved = spec.resolve(&ctx);
         assert_eq!(resolved, cpus);
+    }
+
+    // -- Defense-in-depth: resolve must not panic on spec shapes that
+    // -- validate rejects. Each test exercises a concrete panic that
+    // -- would fire before the #81 hardening.
+
+    #[test]
+    fn resolve_disjoint_of_zero_returns_empty_instead_of_panicking() {
+        // Pre-#81: `usable.len() / of` with of=0 panics. Post-fix:
+        // returns an empty BTreeSet with a tracing::warn.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 0, of: 0 };
+        assert!(spec.resolve(&ctx).is_empty());
+    }
+
+    #[test]
+    fn resolve_overlap_of_zero_returns_empty_instead_of_panicking() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 0,
+            frac: 0.5,
+        };
+        assert!(spec.resolve(&ctx).is_empty());
+    }
+
+    #[test]
+    fn resolve_range_inverted_fracs_returns_empty_instead_of_panicking() {
+        // Pre-#81: `usable[start.min(len)..end.min(len)]` with
+        // start_frac > end_frac produced start > end after clamping
+        // and panicked the slice operation. Post-fix: the slice is
+        // clamped to length-zero instead.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.8,
+            end_frac: 0.2,
+        };
+        assert!(spec.resolve(&ctx).is_empty());
+    }
+
+    #[test]
+    fn resolve_range_nan_fracs_clamps_to_zero_instead_of_panicking() {
+        // NaN as usize saturates to 0 on stable Rust, but inverted
+        // start/end after both saturate is still fine post-fix.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: f64::NAN,
+            end_frac: f64::NAN,
+        };
+        assert!(spec.resolve(&ctx).is_empty());
+    }
+
+    #[test]
+    fn resolve_overlap_nonfinite_frac_clamps_to_zero() {
+        // NaN frac pre-fix flowed through `(chunk as f64 * frac) as
+        // usize` and could produce an out-of-range overlap. Post-fix
+        // clamps NaN to 0, yielding the same partition boundaries as
+        // Disjoint.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: f64::NAN,
+        };
+        // No panic; result must be non-empty because index/of are valid.
+        let result = spec.resolve(&ctx);
+        assert!(!result.is_empty());
     }
 
     // -- parse_shm_params_from_str (from shm_ring) --
