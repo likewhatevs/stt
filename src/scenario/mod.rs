@@ -57,23 +57,16 @@ use crate::workload::*;
 /// process group rather than a single process, so the syscall would
 /// always report success and falsely mark "no process" as alive.
 ///
-/// Also returns `false` for pid > i32::MAX. Linux `PID_MAX_LIMIT` is
-/// 2^22 (4 million) on 64-bit — well below i32::MAX. A u32 pid
-/// exceeding i32::MAX is therefore invalid input rather than a live
-/// pid, and must not be cast to a negative `i32` —
-/// `kill(negative, ...)` targets a process group.
-fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
+/// Returns `false` for `pid <= 0`. Non-positive pid_t values are
+/// invalid targets — `kill(0, ...)` signals the caller's process
+/// group and `kill(-1, ...)` signals every process the caller is
+/// permitted to signal. Neither matches "is this specific process
+/// alive?", so we refuse rather than probe.
+fn process_alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
         return false;
     }
-    if pid > i32::MAX as u32 {
-        tracing::warn!(
-            pid,
-            "process_alive: pid exceeds i32::MAX; treating as invalid input rather than probing a process group"
-        );
-        return false;
-    }
-    kill(Pid::from_raw(pid as i32), None).is_ok()
+    kill(Pid::from_raw(pid), None).is_ok()
 }
 
 pub(crate) use crate::read_kmsg;
@@ -495,8 +488,10 @@ pub struct Ctx<'a> {
     pub duration: Duration,
     /// Default number of workers per cgroup.
     pub workers_per_cgroup: usize,
-    /// PID of the running scheduler (for liveness checks).
-    pub sched_pid: u32,
+    /// PID of the running scheduler (for liveness checks). Stored as
+    /// `pid_t` to match the kernel's native type — avoids u32→i32
+    /// sign-cast wraparound at the `kill`/`process_alive` boundary.
+    pub sched_pid: libc::pid_t,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
     /// Override work type for scenarios that use `CpuSpin` by default.
@@ -1443,7 +1438,8 @@ mod tests {
 
     #[test]
     fn process_alive_self_is_true() {
-        assert!(process_alive(std::process::id()));
+        let pid: libc::pid_t = unsafe { libc::getpid() };
+        assert!(process_alive(pid));
     }
 
     #[test]
@@ -1455,20 +1451,12 @@ mod tests {
     }
 
     #[test]
-    fn process_alive_above_i32_max_is_false() {
-        // Regression: u32 values > i32::MAX wrap to a negative i32 when
-        // cast, and `kill(negative, 0)` targets a process group rather
-        // than a single process. Guard rejects these as bad input.
-        assert!(!process_alive(i32::MAX as u32 + 1));
-    }
-
-    #[test]
-    fn process_alive_u32_max_is_false() {
-        // u32::MAX (0xFFFF_FFFF) casts to i32 = -1. `kill(-1, 0)` on
-        // Linux means "probe every process the caller may signal";
-        // without the guard, this would return true whenever the
-        // caller has any signaling permissions at all.
-        assert!(!process_alive(u32::MAX));
+    fn process_alive_negative_is_false() {
+        // kill(negative, sig) targets a process group (or, for -1,
+        // every process the caller can signal). A pid_t <= 0 is
+        // never a live-process query and must return false.
+        assert!(!process_alive(-1));
+        assert!(!process_alive(libc::pid_t::MIN));
     }
 
     #[test]
@@ -1491,7 +1479,7 @@ mod tests {
             "waitpid failed: {}",
             std::io::Error::last_os_error()
         );
-        assert!(!process_alive(pid as u32));
+        assert!(!process_alive(pid));
     }
 
     #[test]

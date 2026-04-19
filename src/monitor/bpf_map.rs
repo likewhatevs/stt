@@ -681,22 +681,29 @@ fn write_typed_field(
 pub struct BpfMapAccessor<'a> {
     kernel: &'a super::guest::GuestKernel<'a>,
     map_idr_kva: u64,
-    offsets: BpfMapOffsets,
+    /// Borrowed from the `BpfMapAccessorOwned` that produced this
+    /// accessor via `as_accessor`, or provided by the caller to
+    /// `from_guest_kernel`. Borrowing avoids the ~160-byte
+    /// `BpfMapOffsets` clone that the old owned-field design paid
+    /// on every `as_accessor()` call.
+    offsets: &'a BpfMapOffsets,
 }
 
 impl<'a> BpfMapAccessor<'a> {
-    /// Create from an existing [`GuestKernel`] and vmlinux path.
+    /// Create from an existing [`GuestKernel`] and a caller-owned
+    /// [`BpfMapOffsets`].
     ///
-    /// Only parses BTF from the vmlinux (not the full ELF symbol table,
-    /// which the `GuestKernel` already has).
+    /// The accessor borrows the offsets for its lifetime, so callers
+    /// typically stash them in a `BpfMapAccessorOwned` (or another
+    /// stable location) before calling this. Build `offsets` once via
+    /// [`BpfMapOffsets::from_vmlinux`] and reuse — they're per-kernel,
+    /// not per-call.
     ///
     /// [`GuestKernel`]: super::guest::GuestKernel
     pub fn from_guest_kernel(
         kernel: &'a super::guest::GuestKernel<'a>,
-        vmlinux: &std::path::Path,
+        offsets: &'a BpfMapOffsets,
     ) -> anyhow::Result<Self> {
-        let offsets = BpfMapOffsets::from_vmlinux(vmlinux)?;
-
         let map_idr_kva = kernel
             .symbol_kva("map_idr")
             .ok_or_else(|| anyhow::anyhow!("map_idr symbol not found in vmlinux"))?;
@@ -718,7 +725,7 @@ impl<'a> BpfMapAccessor<'a> {
             self.kernel.cr3_pa(),
             self.kernel.page_offset(),
             self.map_idr_kva,
-            &self.offsets,
+            self.offsets,
             self.kernel.l5(),
         )
     }
@@ -734,7 +741,7 @@ impl<'a> BpfMapAccessor<'a> {
             self.kernel.page_offset(),
             self.map_idr_kva,
             name_suffix,
-            &self.offsets,
+            self.offsets,
             self.kernel.l5(),
         )
     }
@@ -799,7 +806,7 @@ impl<'a> BpfMapAccessor<'a> {
             self.kernel.cr3_pa(),
             self.kernel.page_offset(),
             map,
-            &self.offsets,
+            self.offsets,
             self.kernel.l5(),
         )
     }
@@ -837,7 +844,7 @@ impl<'a> BpfMapAccessor<'a> {
             self.kernel.page_offset(),
             map,
             key,
-            &self.offsets,
+            self.offsets,
             &per_cpu_offsets,
             self.kernel.l5(),
         )
@@ -938,11 +945,18 @@ pub struct BpfMapAccessorOwned<'a> {
 impl<'a> BpfMapAccessorOwned<'a> {
     /// Create from GuestMem and vmlinux path.
     ///
-    /// Builds a [`GuestKernel`] internally, resolves BTF offsets,
-    /// and locates the `map_idr` symbol.
+    /// One-shot constructor: builds a [`GuestKernel`] from `vmlinux`,
+    /// parses BTF to resolve the map-related struct offsets, and
+    /// locates the `map_idr` symbol. The resulting handle owns both
+    /// the `GuestKernel` and the `BpfMapOffsets`.
     ///
     /// Prefer [`BpfMapAccessor::from_guest_kernel`] when you already
-    /// have a `GuestKernel` to avoid re-parsing the ELF.
+    /// hold a `GuestKernel` **and** a pre-built `&BpfMapOffsets` — it
+    /// builds a borrowed accessor without taking ownership of either,
+    /// so callers that maintain their own offsets cache (e.g. across
+    /// multiple map probes in the same poll cycle) don't pay repeat
+    /// BTF parses. `new` is the convenience path when you want the
+    /// accessor to own its offsets.
     ///
     /// [`GuestKernel`]: super::guest::GuestKernel
     pub fn new(mem: &'a GuestMem, vmlinux: &std::path::Path) -> anyhow::Result<Self> {
@@ -961,11 +975,14 @@ impl<'a> BpfMapAccessorOwned<'a> {
     }
 
     /// Borrow as a [`BpfMapAccessor`] for map operations.
+    ///
+    /// The returned accessor borrows `self.offsets`; no clone on
+    /// the hot path.
     pub fn as_accessor(&self) -> BpfMapAccessor<'_> {
         BpfMapAccessor {
             kernel: &self.kernel,
             map_idr_kva: self.map_idr_kva,
-            offsets: self.offsets.clone(),
+            offsets: &self.offsets,
         }
     }
 

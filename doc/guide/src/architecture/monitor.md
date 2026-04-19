@@ -187,7 +187,8 @@ reads the guest's `struct btf` and its `data` blob, parses it with
 Find a scheduler's `.bss` map and write a crash variable:
 
 ```rust,ignore
-let accessor = BpfMapAccessor::from_guest_kernel(&kernel, vmlinux)?;
+let offsets = BpfMapOffsets::from_vmlinux(vmlinux)?;
+let accessor = BpfMapAccessor::from_guest_kernel(&kernel, &offsets)?;
 let bss = accessor.find_map(".bss").expect(".bss map not found");
 accessor.write_value_u32(&bss, crash_offset, 1);
 ```

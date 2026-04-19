@@ -3027,7 +3027,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     }
     let sched_pid = std::env::var("SCHED_PID")
         .ok()
-        .and_then(|s| s.parse::<u32>().ok())
+        .and_then(|s| s.parse::<libc::pid_t>().ok())
         .unwrap_or(0);
     let workers_per_cgroup = entry.workers_per_cgroup as usize;
     // Three-layer merge: default_checks -> scheduler.assert -> entry.assert.
@@ -3365,7 +3365,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     }
     let sched_pid = std::env::var("SCHED_PID")
         .ok()
-        .and_then(|s| s.parse::<u32>().ok())
+        .and_then(|s| s.parse::<libc::pid_t>().ok())
         .unwrap_or(0);
     let workers_per_cgroup = entry.workers_per_cgroup as usize;
     let merged_assert = crate::assert::Assert::default_checks()

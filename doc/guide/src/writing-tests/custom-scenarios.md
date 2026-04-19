@@ -58,7 +58,7 @@ pub struct Ctx<'a> {
     pub topo: &'a TestTopology,
     pub duration: Duration,
     pub workers_per_cgroup: usize,
-    pub sched_pid: u32,
+    pub sched_pid: libc::pid_t,
     pub settle: Duration,
     pub work_type_override: Option<WorkType>,
     pub assert: Assert,
@@ -74,7 +74,9 @@ distances). Provides CPU enumeration, LLC/NUMA partitioning, cpuset
 generation, and inter-node distance queries. See
 [TestTopology](../concepts/topology.md) for the full API reference.
 
-**`sched_pid`** -- scheduler process ID for liveness checks.
+**`sched_pid`** -- scheduler process ID (`libc::pid_t`, the kernel's
+native type) for liveness checks. Pass it to `process_alive` or
+`kill(Pid::from_raw(pid), None)` without casting.
 
 **`settle`** -- time to wait after cgroup creation for the scheduler
 to stabilize.
