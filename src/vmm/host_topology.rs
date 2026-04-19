@@ -364,34 +364,38 @@ pub enum LockOutcome {
     Unavailable(String),
 }
 
+/// Requested sharing mode for [`try_flock`]. Translated to the
+/// corresponding non-blocking [`rustix::fs::FlockOperation`] internally;
+/// callers never see the libc-specific constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlockMode {
+    /// Exclusive (`LOCK_EX`) — sole access to the lock file.
+    Exclusive,
+    /// Shared (`LOCK_SH`) — multiple holders can coexist.
+    Shared,
+}
+
 /// Open a lock file and attempt flock with LOCK_NB.
 /// Returns the OwnedFd on success, None on EWOULDBLOCK, or
-/// propagates other errors.
-fn try_flock(path: &str, mode: i32) -> Result<Option<std::os::fd::OwnedFd>> {
-    use std::os::fd::FromRawFd;
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let fd = unsafe {
-        libc::open(
-            cpath.as_ptr(),
-            libc::O_CREAT | libc::O_RDWR,
-            0o666 as libc::mode_t,
-        )
+/// propagates other errors. Uses rustix so file descriptor ownership
+/// and errno handling are not open-coded per call.
+fn try_flock(path: &str, mode: FlockMode) -> Result<Option<std::os::fd::OwnedFd>> {
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+
+    let fd = open(
+        path,
+        OFlags::CREATE | OFlags::RDWR,
+        Mode::from_raw_mode(0o666),
+    )
+    .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
+    let op = match mode {
+        FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
+        FlockMode::Shared => FlockOperation::NonBlockingLockShared,
     };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        anyhow::bail!("open {path}: {err}");
-    }
-    let rc = unsafe { libc::flock(fd, mode | libc::LOCK_NB) };
-    if rc == 0 {
-        Ok(Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
-    } else {
-        let err = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Ok(None)
-        } else {
-            anyhow::bail!("flock {path}: {err}");
-        }
+    match flock(&fd, op) {
+        Ok(()) => Ok(Some(fd)),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
+        Err(e) => anyhow::bail!("flock {path}: {e}"),
     }
 }
 
@@ -432,8 +436,8 @@ fn try_acquire_all(
     llc_mode: LlcLockMode,
 ) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
     let flock_mode = match llc_mode {
-        LlcLockMode::Exclusive => libc::LOCK_EX,
-        LlcLockMode::Shared => libc::LOCK_SH,
+        LlcLockMode::Exclusive => FlockMode::Exclusive,
+        LlcLockMode::Shared => FlockMode::Shared,
     };
     let mut locks = Vec::new();
 
@@ -452,7 +456,7 @@ fn try_acquire_all(
     if llc_mode != LlcLockMode::Exclusive {
         for &(_vcpu, host_cpu) in &plan.assignments {
             let path = format!("/tmp/ktstr-cpu-{host_cpu}.lock");
-            match try_flock(&path, libc::LOCK_EX) {
+            match try_flock(&path, FlockMode::Exclusive) {
                 Ok(Some(fd)) => locks.push(fd),
                 Ok(None) => return Err(format!("CPU {host_cpu} busy")),
                 Err(e) => return Err(format!("CPU {host_cpu}: {e}")),
@@ -460,7 +464,7 @@ fn try_acquire_all(
         }
         if let Some(cpu) = plan.service_cpu {
             let path = format!("/tmp/ktstr-cpu-{cpu}.lock");
-            match try_flock(&path, libc::LOCK_EX) {
+            match try_flock(&path, FlockMode::Exclusive) {
                 Ok(Some(fd)) => locks.push(fd),
                 Ok(None) => return Err(format!("service CPU {cpu} busy")),
                 Err(e) => return Err(format!("service CPU {cpu}: {e}")),
@@ -542,7 +546,7 @@ fn acquire_llc_shared_locks(
     let mut locks = Vec::new();
     for &llc_idx in &llc_indices {
         let path = format!("/tmp/ktstr-llc-{llc_idx}.lock");
-        match try_flock(&path, libc::LOCK_SH) {
+        match try_flock(&path, FlockMode::Shared) {
             Ok(Some(fd)) => locks.push(fd),
             Ok(None) => return Err(format!("LLC {llc_idx} exclusively held")),
             Err(e) => return Err(format!("LLC {llc_idx}: {e}")),
@@ -560,7 +564,7 @@ fn try_acquire_cpu_window(
     let mut locks = Vec::with_capacity(count);
     for cpu in offset..offset + count {
         let path = format!("/tmp/ktstr-cpu-{cpu}.lock");
-        match try_flock(&path, libc::LOCK_EX) {
+        match try_flock(&path, FlockMode::Exclusive) {
             Ok(Some(fd)) => locks.push(fd),
             Ok(None) => return Err(format!("CPU {cpu} busy")),
             Err(e) => return Err(format!("CPU {cpu}: {e}")),
@@ -1632,7 +1636,7 @@ mod tests {
     fn resource_lock_exclusive_acquires() {
         let path = "/tmp/ktstr-test-flock-excl-acquires.lock";
         cleanup_lock(path);
-        let fd = try_flock(path, libc::LOCK_EX).expect("open should succeed");
+        let fd = try_flock(path, FlockMode::Exclusive).expect("open should succeed");
         assert!(fd.is_some(), "exclusive lock on fresh file should succeed");
         cleanup_lock(path);
     }
@@ -1641,7 +1645,7 @@ mod tests {
     fn resource_lock_shared_acquires() {
         let path = "/tmp/ktstr-test-flock-shared-acquires.lock";
         cleanup_lock(path);
-        let fd = try_flock(path, libc::LOCK_SH).expect("open should succeed");
+        let fd = try_flock(path, FlockMode::Shared).expect("open should succeed");
         assert!(fd.is_some(), "shared lock on fresh file should succeed");
         cleanup_lock(path);
     }
@@ -1650,10 +1654,10 @@ mod tests {
     fn resource_lock_exclusive_contention() {
         let path = "/tmp/ktstr-test-flock-excl-contention.lock";
         cleanup_lock(path);
-        let holder = try_flock(path, libc::LOCK_EX)
+        let holder = try_flock(path, FlockMode::Exclusive)
             .expect("open should succeed")
             .expect("first lock should succeed");
-        let second = try_flock(path, libc::LOCK_EX).expect("open should succeed");
+        let second = try_flock(path, FlockMode::Exclusive).expect("open should succeed");
         assert!(
             second.is_none(),
             "second exclusive lock while held should return None",
@@ -1666,10 +1670,10 @@ mod tests {
     fn resource_lock_shared_coexist() {
         let path = "/tmp/ktstr-test-flock-shared-coexist.lock";
         cleanup_lock(path);
-        let h1 = try_flock(path, libc::LOCK_SH)
+        let h1 = try_flock(path, FlockMode::Shared)
             .expect("open should succeed")
             .expect("first shared lock should succeed");
-        let h2 = try_flock(path, libc::LOCK_SH)
+        let h2 = try_flock(path, FlockMode::Shared)
             .expect("open should succeed")
             .expect("second shared lock should succeed");
         // Both held simultaneously.
@@ -1682,10 +1686,10 @@ mod tests {
     fn resource_lock_exclusive_blocks_shared() {
         let path = "/tmp/ktstr-test-flock-excl-blocks-sh.lock";
         cleanup_lock(path);
-        let holder = try_flock(path, libc::LOCK_EX)
+        let holder = try_flock(path, FlockMode::Exclusive)
             .expect("open should succeed")
             .expect("exclusive lock should succeed");
-        let shared = try_flock(path, libc::LOCK_SH).expect("open should succeed");
+        let shared = try_flock(path, FlockMode::Shared).expect("open should succeed");
         assert!(
             shared.is_none(),
             "shared lock should fail while exclusive is held",
@@ -1698,10 +1702,10 @@ mod tests {
     fn resource_lock_shared_blocks_exclusive() {
         let path = "/tmp/ktstr-test-flock-sh-blocks-excl.lock";
         cleanup_lock(path);
-        let holder = try_flock(path, libc::LOCK_SH)
+        let holder = try_flock(path, FlockMode::Shared)
             .expect("open should succeed")
             .expect("shared lock should succeed");
-        let excl = try_flock(path, libc::LOCK_EX).expect("open should succeed");
+        let excl = try_flock(path, FlockMode::Exclusive).expect("open should succeed");
         assert!(
             excl.is_none(),
             "exclusive lock should fail while shared is held",
@@ -1715,12 +1719,12 @@ mod tests {
         let path = "/tmp/ktstr-test-flock-release-drop.lock";
         cleanup_lock(path);
         {
-            let _holder = try_flock(path, libc::LOCK_EX)
+            let _holder = try_flock(path, FlockMode::Exclusive)
                 .expect("open should succeed")
                 .expect("lock should succeed");
         }
         // After drop, the lock should be available again.
-        let fd = try_flock(path, libc::LOCK_EX)
+        let fd = try_flock(path, FlockMode::Exclusive)
             .expect("open should succeed")
             .expect("lock should be available after drop");
         drop(fd);
@@ -1845,7 +1849,7 @@ mod tests {
         let llc_indices = &[90500usize];
         cleanup_lock("/tmp/ktstr-llc-90500.lock");
 
-        let holder = try_flock("/tmp/ktstr-llc-90500.lock", libc::LOCK_EX)
+        let holder = try_flock("/tmp/ktstr-llc-90500.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
 
@@ -1879,7 +1883,7 @@ mod tests {
         cleanup_lock("/tmp/ktstr-llc-90600.lock");
         cleanup_lock("/tmp/ktstr-llc-90601.lock");
 
-        let holder = try_flock("/tmp/ktstr-llc-90601.lock", libc::LOCK_EX)
+        let holder = try_flock("/tmp/ktstr-llc-90601.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
 
@@ -1891,7 +1895,7 @@ mod tests {
 
         // LLC 90600 should be released (all-or-nothing). Verify by
         // acquiring it successfully.
-        let reacquire = try_flock("/tmp/ktstr-llc-90600.lock", libc::LOCK_EX)
+        let reacquire = try_flock("/tmp/ktstr-llc-90600.lock", FlockMode::Exclusive)
             .unwrap()
             .expect("LLC 90600 should be released after all-or-nothing failure");
         drop(reacquire);
@@ -1913,7 +1917,7 @@ mod tests {
         cleanup_lock("/tmp/ktstr-llc-90700.lock");
         cleanup_lock("/tmp/ktstr-cpu-90700.lock");
 
-        let holder = try_flock("/tmp/ktstr-cpu-90700.lock", libc::LOCK_EX)
+        let holder = try_flock("/tmp/ktstr-cpu-90700.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
 
@@ -1924,7 +1928,7 @@ mod tests {
         );
 
         // LLC lock should be released (all-or-nothing).
-        let reacquire = try_flock("/tmp/ktstr-llc-90700.lock", libc::LOCK_SH)
+        let reacquire = try_flock("/tmp/ktstr-llc-90700.lock", FlockMode::Shared)
             .unwrap()
             .expect("LLC 90700 should be released after CPU contention");
         drop(reacquire);
@@ -1972,7 +1976,7 @@ mod tests {
         cleanup_lock("/tmp/ktstr-cpu-90901.lock");
 
         // Hold the service CPU lock.
-        let holder = try_flock("/tmp/ktstr-cpu-90901.lock", libc::LOCK_EX)
+        let holder = try_flock("/tmp/ktstr-cpu-90901.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
 
@@ -1990,10 +1994,10 @@ mod tests {
         }
 
         // All prior locks should be released (all-or-nothing).
-        let reacquire_llc = try_flock("/tmp/ktstr-llc-90850.lock", libc::LOCK_SH)
+        let reacquire_llc = try_flock("/tmp/ktstr-llc-90850.lock", FlockMode::Shared)
             .unwrap()
             .expect("LLC 90850 should be released after service CPU contention");
-        let reacquire_cpu = try_flock("/tmp/ktstr-cpu-90900.lock", libc::LOCK_EX)
+        let reacquire_cpu = try_flock("/tmp/ktstr-cpu-90900.lock", FlockMode::Exclusive)
             .unwrap()
             .expect("CPU 90900 should be released after service CPU contention");
         drop(reacquire_llc);
@@ -2021,7 +2025,7 @@ mod tests {
         cleanup_lock("/tmp/ktstr-cpu-91400.lock");
         cleanup_lock("/tmp/ktstr-cpu-91401.lock");
 
-        let holder = try_flock("/tmp/ktstr-cpu-91400.lock", libc::LOCK_EX)
+        let holder = try_flock("/tmp/ktstr-cpu-91400.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
 
@@ -2031,7 +2035,7 @@ mod tests {
         // Hold 91401 instead — 91400 acquires then drops on failure.
         drop(holder);
 
-        let holder2 = try_flock("/tmp/ktstr-cpu-91401.lock", libc::LOCK_EX)
+        let holder2 = try_flock("/tmp/ktstr-cpu-91401.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
         let result2 = try_acquire_cpu_window(91400, 2);
@@ -2039,7 +2043,7 @@ mod tests {
 
         // 91400 was acquired then dropped (all-or-nothing). Verify
         // it's available.
-        let reacquire = try_flock("/tmp/ktstr-cpu-91400.lock", libc::LOCK_EX)
+        let reacquire = try_flock("/tmp/ktstr-cpu-91400.lock", FlockMode::Exclusive)
             .unwrap()
             .expect("CPU 91400 should be released after all-or-nothing");
         drop(reacquire);
@@ -2062,7 +2066,7 @@ mod tests {
             cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
         }
 
-        let holder = try_flock("/tmp/ktstr-cpu-91500.lock", libc::LOCK_EX)
+        let holder = try_flock("/tmp/ktstr-cpu-91500.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
 
@@ -2094,7 +2098,7 @@ mod tests {
         // past window [0,1] and finds a free window. Headroom of
         // 100 CPUs absorbs parallel test interference.
         cleanup_lock("/tmp/ktstr-cpu-0.lock");
-        let holder = try_flock("/tmp/ktstr-cpu-0.lock", libc::LOCK_EX)
+        let holder = try_flock("/tmp/ktstr-cpu-0.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
 
@@ -2139,11 +2143,11 @@ mod tests {
         assert_eq!(locks.len(), 3);
 
         // The LLC lock is shared — another shared should coexist.
-        let shared2 = try_flock("/tmp/ktstr-llc-92000.lock", libc::LOCK_SH)
+        let shared2 = try_flock("/tmp/ktstr-llc-92000.lock", FlockMode::Shared)
             .unwrap()
             .expect("second shared LLC should coexist");
         // Exclusive should fail while shared is held.
-        let excl = try_flock("/tmp/ktstr-llc-92000.lock", libc::LOCK_EX).unwrap();
+        let excl = try_flock("/tmp/ktstr-llc-92000.lock", FlockMode::Exclusive).unwrap();
         assert!(
             excl.is_none(),
             "exclusive LLC should fail while shared is held",
@@ -2174,10 +2178,10 @@ mod tests {
         let llc_locks = acquire_llc_shared_locks(&topo, &cpus).unwrap();
         assert_eq!(llc_locks.len(), 1);
 
-        let shared2 = try_flock("/tmp/ktstr-llc-92100.lock", libc::LOCK_SH)
+        let shared2 = try_flock("/tmp/ktstr-llc-92100.lock", FlockMode::Shared)
             .unwrap()
             .expect("second shared LLC should coexist");
-        let excl = try_flock("/tmp/ktstr-llc-92100.lock", libc::LOCK_EX).unwrap();
+        let excl = try_flock("/tmp/ktstr-llc-92100.lock", FlockMode::Exclusive).unwrap();
         assert!(
             excl.is_none(),
             "exclusive LLC should fail while shared is held",

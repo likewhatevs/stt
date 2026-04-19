@@ -78,6 +78,16 @@ siphasher = "1"
 # with an 8-byte needle is O(n) in naive byte compares; memmem uses
 # a two-way algorithm with x86_64 AVX2 / aarch64 Neon when available.
 memchr = "2"
+# Safe wrappers around direct syscalls — replaces ad-hoc
+# `libc::uname`/`libc::flock`/`libc::shm_open` sites that each reinvent
+# fd ownership and errno handling. Keeps the libc dep around because
+# not every call we make has a rustix equivalent we consume yet (mmap,
+# some signal paths), but the flock+uname+shm surface migrates cleanly.
+rustix = { version = "1", features = ["fs", "shm", "system"] }
+# Derive macros for enum-level operations. `VariantNames` auto-generates
+# the list of variant names so `WorkType::ALL_NAMES` stays in lock-step
+# with the enum definition without a hand-maintained parallel table.
+strum = { version = "0.27", features = ["derive"] }
 
 [profile.release]
 lto = "thin"

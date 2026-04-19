@@ -381,9 +381,11 @@ pub mod prelude {
 pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
     use kernel_path::KernelId;
 
-    let release = nix::sys::utsname::uname()
+    let release = rustix::system::uname()
+        .release()
+        .to_str()
         .ok()
-        .map(|u| u.release().to_string_lossy().into_owned());
+        .map(str::to_owned);
     let release_ref = release.as_deref();
 
     // Track whether KTSTR_KERNEL was set with a non-path value.

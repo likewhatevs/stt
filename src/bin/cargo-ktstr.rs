@@ -5,6 +5,7 @@ use std::process::Command;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cache::{CacheDir, CacheEntry};
 use ktstr::cli;
+use ktstr::cli::KernelCommand;
 use ktstr::cli::{KERNEL_HELP_NO_RAW, KERNEL_HELP_RAW_OK};
 use ktstr::fetch;
 
@@ -178,64 +179,6 @@ enum StatsCommand {
         /// Omit to use each metric's built-in default.
         #[arg(long)]
         threshold: Option<f64>,
-    },
-}
-
-#[derive(Subcommand)]
-enum KernelCommand {
-    /// List cached kernel images.
-    List {
-        /// Output in JSON format for CI scripting. Each entry's
-        /// `eol` boolean is derived by fetching kernel.org's
-        /// `releases.json` to learn the active series prefixes; on
-        /// fetch failure (offline, kernel.org unreachable, response
-        /// malformed) the active list is empty and no entry is
-        /// flagged EOL. The cache listing itself is local and
-        /// always succeeds; only the EOL annotation degrades.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Download, build, and cache a kernel image.
-    Build {
-        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3). A
-        /// major.minor prefix (e.g. 6.12) resolves to the highest
-        /// patch release in that series, falling back to probing
-        /// cdn.kernel.org for EOL series no longer in releases.json.
-        #[arg(conflicts_with_all = ["source", "git"])]
-        version: Option<String>,
-        /// Path to existing kernel source directory.
-        #[arg(long, conflicts_with_all = ["version", "git"])]
-        source: Option<PathBuf>,
-        /// Git URL to clone kernel source from. Cloned shallow (depth 1)
-        /// at the ref supplied via --ref.
-        #[arg(long, requires = "git_ref", conflicts_with_all = ["version", "source"])]
-        git: Option<String>,
-        /// Git ref to checkout (branch, tag, commit). Required with --git.
-        #[arg(long = "ref", requires = "git")]
-        git_ref: Option<String>,
-        /// Rebuild even if a cached image exists.
-        #[arg(long)]
-        force: bool,
-        /// Run `make mrproper` before configuring. Only meaningful
-        /// with `--source`: downloaded tarball and freshly cloned
-        /// git sources start clean, so this flag prints a notice
-        /// and is ignored in those modes.
-        #[arg(long)]
-        clean: bool,
-    },
-    /// Remove cached kernel images.
-    Clean {
-        /// Keep the N most recent cached kernels. When absent, removes
-        /// every cached entry.
-        #[arg(long)]
-        keep: Option<usize>,
-        /// Skip the y/N confirmation prompt before deleting. Always
-        /// required in non-interactive contexts: without `--force`
-        /// the command bails on a non-tty stdin rather than hang
-        /// waiting for input. In an interactive shell, omit
-        /// `--force` to be prompted.
-        #[arg(long)]
-        force: bool,
     },
 }
 

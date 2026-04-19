@@ -848,6 +848,45 @@ pub(crate) fn evaluate_preempted(prev: Option<u64>, curr: Option<u64>, threshold
     }
 }
 
+/// Decide whether a CPU stalled between two consecutive samples.
+///
+/// A stall means the scheduler made no progress on this CPU: `rq_clock`
+/// did not advance AND the CPU was not legitimately quiescent. The two
+/// legitimate exemptions — NOHZ idle (both samples show `nr_running==0`)
+/// and vCPU preemption (host scheduled the vCPU thread off-CPU, so the
+/// vCPU couldn't tick the clock) — are recognized here so callers don't
+/// re-derive the predicate.
+///
+/// This helper exists to keep the post-hoc `MonitorSummary::from_samples`
+/// path and the reactive `MonitorThresholds::evaluate` path in lock-step:
+/// previously each site re-implemented the same four-condition conjunction
+/// and drifting one half would let the SysRq-D trigger fire on conditions
+/// the post-hoc verdict accepted (or vice versa). Both callers now agree
+/// on a single definition of "stall" by construction.
+///
+/// `rq_clock == 0` is treated as "never sampled" and returns false —
+/// the first sample interval typically reads zero before the kernel
+/// writes rq_clock, and a zero-to-zero comparison must not fire a stall.
+pub(crate) fn is_cpu_stalled(
+    prev: &super::CpuSnapshot,
+    curr: &super::CpuSnapshot,
+    preemption_threshold_ns: u64,
+) -> bool {
+    if curr.rq_clock == 0 || curr.rq_clock != prev.rq_clock {
+        return false;
+    }
+    let idle = curr.nr_running == 0 && prev.nr_running == 0;
+    if idle {
+        return false;
+    }
+    let preempted = evaluate_preempted(
+        prev.vcpu_cpu_time_ns,
+        curr.vcpu_cpu_time_ns,
+        preemption_threshold_ns,
+    );
+    !preempted
+}
+
 /// Configuration for reactive SysRq-D dump triggering.
 ///
 /// When provided to `monitor_loop`, the monitor evaluates thresholds inline

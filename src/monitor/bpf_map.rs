@@ -184,13 +184,62 @@ pub(crate) fn find_bpf_map(
         .find(|m| m.map_type == BPF_MAP_TYPE_ARRAY && m.name.ends_with(name_suffix))
 }
 
+/// Smallest page granule that `translate_kva` always resolves contiguously.
+///
+/// x86-64 and aarch64 both partition KVA into 4 KiB pages at the lowest
+/// level; larger entries (2 MiB PMD block, 1 GiB PUD block, aarch64 64 KiB
+/// base) are strictly coarser, so chunking at 4 KiB means a single
+/// `translate_kva` call covers the rest of the page regardless of the
+/// entry granule. Bumping this to a larger value would break 4 KiB
+/// huge-page-absent paths because a single translate result would no
+/// longer be guaranteed to span the chunk.
+const BPF_MAP_PAGE_CHUNK: u64 = 4096;
+
+/// Copy a contiguous byte range to or from a map's value region,
+/// chunking at page boundaries so each chunk takes one `translate_kva`
+/// call plus one bulk DRAM copy.
+///
+/// This replaces the former byte-by-byte loop that issued one
+/// translate per byte — a 4 KiB value read translated 4096 times and
+/// paid 4096 copy_nonoverlapping-of-one-byte calls. A full page now
+/// takes one translate + one bulk copy (up to BPF_MAP_PAGE_CHUNK
+/// bytes); a range that crosses a page boundary splits into N
+/// translate+copy pairs where N is the number of pages touched.
+///
+/// `ctx` supplies the CR3 / L5 flag and the DRAM accessor. `target_kva`
+/// is the starting guest virtual address; `len` is the total length.
+/// `chunk_fn` receives the resolved guest PA and the chunk buffer
+/// (mutable for reads, immutable for writes) and performs the actual
+/// memcpy. Returns `false` when any chunk fails to translate.
+fn chunked_kva_io<F>(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize, mut chunk_fn: F) -> bool
+where
+    F: FnMut(u64, u64, usize),
+{
+    let mut consumed: u64 = 0;
+    let total = len as u64;
+    while consumed < total {
+        let kva = target_kva + consumed;
+        let Some(pa) = ctx.mem.translate_kva(ctx.cr3_pa.0, kva, ctx.l5) else {
+            return false;
+        };
+        // Advance at most to the next page boundary so the next
+        // translate_kva lands on a fresh resolved page.
+        let page_end = (kva & !(BPF_MAP_PAGE_CHUNK - 1)) + BPF_MAP_PAGE_CHUNK;
+        let chunk_len = (page_end - kva).min(total - consumed) as usize;
+        chunk_fn(pa, consumed, chunk_len);
+        consumed += chunk_len as u64;
+    }
+    true
+}
+
 /// Write bytes to a BPF map's value region at `offset`.
 ///
 /// Translates the value KVA (vmalloc'd for .bss maps) through the
 /// page table to find the guest physical address, then writes directly.
 /// Returns `false` if the map has no value KVA (non-ARRAY map),
 /// `offset + data.len()` exceeds `value_size`, or any page in the
-/// range is unmapped.
+/// range is unmapped. Uses [`chunked_kva_io`] to pay one translate per
+/// 4 KiB page rather than one per byte.
 pub(crate) fn write_bpf_map_value(
     ctx: &AccessorCtx<'_>,
     map_info: &BpfMapInfo,
@@ -205,15 +254,16 @@ pub(crate) fn write_bpf_map_value(
     }
     let target_kva = base_kva + offset as u64;
 
-    // Write byte-by-byte across potential page boundaries.
-    for (i, &byte) in data.iter().enumerate() {
-        let kva = target_kva + i as u64;
-        let Some(pa) = ctx.mem.translate_kva(ctx.cr3_pa.0, kva, ctx.l5) else {
-            return false;
-        };
-        ctx.mem.write_u8(pa, 0, byte);
-    }
-    true
+    chunked_kva_io(ctx, target_kva, data.len(), |pa, src_off, chunk_len| {
+        // GuestMem exposes only byte-wise volatile writes for arbitrary
+        // lengths; the savings come from paying one translate per page
+        // instead of per byte. A block-write primitive in reader.rs
+        // could let this become one copy_nonoverlapping per chunk.
+        let src_off = src_off as usize;
+        for (i, &byte) in data[src_off..src_off + chunk_len].iter().enumerate() {
+            ctx.mem.write_u8(pa, i, byte);
+        }
+    })
 }
 
 /// Write a u32 to a BPF map's value region at `offset`.
@@ -232,7 +282,9 @@ pub(crate) fn write_bpf_map_value_u32(
 /// page table to find the guest physical address, then reads directly.
 /// Returns `None` if the map has no value KVA (non-ARRAY map),
 /// `offset + len` exceeds `value_size`, or any page in the range
-/// is unmapped.
+/// is unmapped. Uses [`chunked_kva_io`] to pay one translate per 4 KiB
+/// page plus one bulk [`GuestMem::read_bytes`] call, instead of one
+/// translate and one-byte copy per byte.
 pub(crate) fn read_bpf_map_value(
     ctx: &AccessorCtx<'_>,
     map_info: &BpfMapInfo,
@@ -246,11 +298,26 @@ pub(crate) fn read_bpf_map_value(
     let target_kva = base_kva + offset as u64;
     let mut buf = vec![0u8; len];
 
-    // Read byte-by-byte across potential page boundaries.
-    for (i, byte) in buf.iter_mut().enumerate() {
-        let kva = target_kva + i as u64;
-        let pa = ctx.mem.translate_kva(ctx.cr3_pa.0, kva, ctx.l5)?;
-        *byte = ctx.mem.read_u8(pa, 0);
+    // Safety / correctness: `chunked_kva_io` returns false when any
+    // page in the range is unmapped; propagate that to None so callers
+    // see "unreadable" rather than a partial buffer.
+    let buf_ptr = buf.as_mut_ptr();
+    let ok = chunked_kva_io(ctx, target_kva, len, |pa, dst_off, chunk_len| {
+        // SAFETY: dst_off + chunk_len <= len <= buf.len(); the slice
+        // borrows the heap-allocated Vec whose backing storage is live
+        // for the duration of this call (the Vec is pinned in `buf`
+        // above and reborrowed here only through its mutable pointer).
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(buf_ptr.add(dst_off as usize), chunk_len) };
+        // GuestMem::read_bytes returns the count actually copied; the
+        // caller has bounds-checked value_size and translate_kva has
+        // confirmed the page is mapped, so a short read here means
+        // the page crosses end-of-DRAM, which the original byte loop
+        // would also have silently short-copied.
+        let _ = ctx.mem.read_bytes(pa, slice);
+    });
+    if !ok {
+        return None;
     }
     Some(buf)
 }

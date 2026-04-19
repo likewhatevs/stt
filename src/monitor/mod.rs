@@ -198,13 +198,8 @@ fn read_hz_from_kernel_dir(kernel_path: &std::path::Path) -> Option<u64> {
 
 /// Parse CONFIG_HZ=N from `/boot/config-$(uname -r)`.
 fn read_hz_from_boot_config() -> Option<u64> {
-    let mut uname: libc::utsname = unsafe { std::mem::zeroed() };
-    if unsafe { libc::uname(&mut uname) } != 0 {
-        return None;
-    }
-    let release = unsafe { std::ffi::CStr::from_ptr(uname.release.as_ptr()) }
-        .to_str()
-        .ok()?;
+    let uname = rustix::system::uname();
+    let release = uname.release().to_str().ok()?;
     let path = format!("/boot/config-{release}");
     let contents = std::fs::read_to_string(path).ok()?;
     parse_config_hz(&contents)
@@ -795,20 +790,7 @@ impl MonitorSummary {
             let curr = w[1];
             let cpu_count = prev.cpus.len().min(curr.cpus.len());
             for cpu in 0..cpu_count {
-                let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
-                // Delegate to the shared predicate so post-hoc
-                // evaluate() and reactive monitor_loop() cannot drift
-                // apart. `!preempted` == advanced (or unknown).
-                let preempted = reader::evaluate_preempted(
-                    prev.cpus[cpu].vcpu_cpu_time_ns,
-                    curr.cpus[cpu].vcpu_cpu_time_ns,
-                    threshold,
-                );
-                if curr.cpus[cpu].rq_clock != 0
-                    && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
-                    && !idle
-                    && !preempted
-                {
+                if reader::is_cpu_stalled(&prev.cpus[cpu], &curr.cpus[cpu], threshold) {
                     stall_detected = true;
                     break;
                 }
@@ -1197,16 +1179,8 @@ impl MonitorThresholds {
                 #[allow(clippy::needless_range_loop)]
                 // indexes stall[cpu], prev.cpus[cpu], curr.cpus[cpu]
                 for cpu in 0..cpu_count {
-                    let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
-                    let preempted = reader::evaluate_preempted(
-                        prev.cpus[cpu].vcpu_cpu_time_ns,
-                        curr.cpus[cpu].vcpu_cpu_time_ns,
-                        threshold,
-                    );
-                    let is_stall = curr.cpus[cpu].rq_clock != 0
-                        && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
-                        && !idle
-                        && !preempted;
+                    let is_stall =
+                        reader::is_cpu_stalled(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
                     stall[cpu].record(is_stall, curr.cpus[cpu].rq_clock as f64, i);
                 }
             }

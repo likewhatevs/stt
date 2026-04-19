@@ -4,15 +4,80 @@
 //! by both binaries.
 
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use clap::Subcommand;
 
 use crate::cache::{CacheDir, CacheEntry};
 use crate::runner::RunConfig;
 use crate::scenario::{Scenario, flags};
 use crate::workload::WorkType;
+
+/// Shared `kernel` subcommand tree used by both `ktstr` and
+/// `cargo ktstr`. The two binaries embed this as
+/// `ktstr kernel <subcmd>` / `cargo ktstr kernel <subcmd>` and
+/// dispatch identically; defining the variants once means a new
+/// `kernel` subcommand (or a flag change) lands in both surfaces by
+/// construction.
+#[derive(Subcommand)]
+pub enum KernelCommand {
+    /// List cached kernel images.
+    List {
+        /// Output in JSON format for CI scripting. Each entry's
+        /// `eol` boolean is derived by fetching kernel.org's
+        /// `releases.json` to learn the active series prefixes; on
+        /// fetch failure (offline, kernel.org unreachable, response
+        /// malformed) the active list is empty and no entry is
+        /// flagged EOL. The cache listing itself is local and
+        /// always succeeds; only the EOL annotation degrades.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download, build, and cache a kernel image.
+    Build {
+        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3). A
+        /// major.minor prefix (e.g. 6.12) resolves to the highest
+        /// patch release in that series, falling back to probing
+        /// cdn.kernel.org for EOL series no longer in releases.json.
+        #[arg(conflicts_with_all = ["source", "git"])]
+        version: Option<String>,
+        /// Path to existing kernel source directory.
+        #[arg(long, conflicts_with_all = ["version", "git"])]
+        source: Option<PathBuf>,
+        /// Git URL to clone kernel source from. Cloned shallow (depth 1)
+        /// at the ref supplied via --ref.
+        #[arg(long, requires = "git_ref", conflicts_with_all = ["version", "source"])]
+        git: Option<String>,
+        /// Git ref to checkout (branch, tag, commit). Required with --git.
+        #[arg(long = "ref", requires = "git")]
+        git_ref: Option<String>,
+        /// Rebuild even if a cached image exists.
+        #[arg(long)]
+        force: bool,
+        /// Run `make mrproper` before configuring. Only meaningful
+        /// with `--source`: downloaded tarball and freshly cloned
+        /// git sources start clean, so this flag prints a notice
+        /// and is ignored in those modes.
+        #[arg(long)]
+        clean: bool,
+    },
+    /// Remove cached kernel images.
+    Clean {
+        /// Keep the N most recent cached kernels. When absent, removes
+        /// every cached entry.
+        #[arg(long)]
+        keep: Option<usize>,
+        /// Skip the y/N confirmation prompt before deleting. Always
+        /// required in non-interactive contexts: without `--force`
+        /// the command bails on a non-tty stdin rather than hang
+        /// waiting for input. In an interactive shell, omit
+        /// `--force` to be prompted.
+        #[arg(long)]
+        force: bool,
+    },
+}
 
 /// Help text for `--kernel` in contexts that reject raw image files:
 /// `cargo ktstr test`, `cargo ktstr coverage`, and `ktstr shell`.

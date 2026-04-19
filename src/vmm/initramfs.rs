@@ -1094,7 +1094,7 @@ pub(crate) fn shm_segment_name(content_hash: u64) -> String {
 pub(crate) struct MappedShm {
     ptr: *const u8,
     len: usize,
-    fd: std::os::unix::io::RawFd,
+    fd: std::os::fd::OwnedFd,
 }
 
 // SAFETY: The mmap is MAP_SHARED|PROT_READ over a shm segment whose
@@ -1117,15 +1117,15 @@ impl AsRef<[u8]> for MappedShm {
 
 impl Drop for MappedShm {
     fn drop(&mut self) {
-        // SAFETY: ptr/len are from mmap; fd is from shm_open with
-        // LOCK_SH held. Release the mapping first, then the flock, then
-        // the fd — order matters so the lock protects the mapping right
-        // up until it is torn down.
+        // SAFETY: ptr/len are from mmap; fd is an OwnedFd opened via
+        // rustix::shm::open with LOCK_SH held. Release the mapping
+        // first so the lock still protects it, then drop the flock
+        // explicitly. The OwnedFd's own drop closes the descriptor
+        // after this function returns.
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
-            libc::flock(self.fd, libc::LOCK_UN);
-            libc::close(self.fd);
         }
+        let _ = rustix::fs::flock(&self.fd, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -1148,51 +1148,53 @@ impl Drop for MappedShm {
 /// this crate cooperate, which is the closed-world guarantee we
 /// rely on.
 pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
-    let name = std::ffi::CString::new(shm_segment_name(content_hash)).ok()?;
-    unsafe {
-        let fd = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
-        if fd < 0 {
-            return None;
-        }
+    use std::os::fd::AsRawFd;
 
-        // Shared lock -- blocks until any concurrent writer releases
-        // LOCK_EX. Held for the mapping's lifetime; released in
-        // MappedShm::drop.
-        if libc::flock(fd, libc::LOCK_SH) != 0 {
-            libc::close(fd);
-            return None;
-        }
+    let name = shm_segment_name(content_hash);
+    let fd = rustix::shm::open(
+        name.as_str(),
+        rustix::shm::OFlags::RDONLY,
+        rustix::fs::Mode::empty(),
+    )
+    .ok()?;
 
-        // Get segment size via fstat.
-        let mut stat: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut stat) != 0 || stat.st_size <= 0 {
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
-            return None;
-        }
-        let len = stat.st_size as usize;
+    // Shared lock — blocks until any concurrent writer releases
+    // LOCK_EX. Held for the mapping's lifetime; released in
+    // MappedShm::drop. The fd is dropped on the early-return paths,
+    // which implicitly closes the descriptor.
+    rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockShared).ok()?;
 
-        let ptr = libc::mmap(
+    let stat = rustix::fs::fstat(&fd).ok()?;
+    if stat.st_size <= 0 {
+        let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+        return None;
+    }
+    let len = stat.st_size as usize;
+
+    // SAFETY: mmap consumes the raw fd value but does not take
+    // ownership; the OwnedFd lives on in `fd` and ultimately closes
+    // in `MappedShm::drop` after munmap.
+    let ptr = unsafe {
+        libc::mmap(
             std::ptr::null_mut(),
             len,
             libc::PROT_READ,
             libc::MAP_SHARED,
-            fd,
+            fd.as_raw_fd(),
             0,
-        );
+        )
+    };
 
-        if ptr == libc::MAP_FAILED {
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
-            return None;
-        }
-
-        Some(MappedShm {
-            ptr: ptr as *const u8,
-            len,
-            fd,
-        })
+    if ptr == libc::MAP_FAILED {
+        let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+        return None;
     }
+
+    Some(MappedShm {
+        ptr: ptr as *const u8,
+        len,
+        fd,
+    })
 }
 
 /// Write `data` to a POSIX SHM segment identified by `name`.
@@ -1215,57 +1217,56 @@ pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
 /// that writes DIFFERENT data to an already-used hash (e.g. the
 /// rename-test pattern) will overwrite — the store does not enforce
 /// idempotence itself.
-fn shm_store(name: &std::ffi::CStr, data: &[u8]) -> Result<()> {
+fn shm_store(name: &str, data: &[u8]) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let fd = rustix::shm::open(
+        name,
+        rustix::shm::OFlags::CREATE | rustix::shm::OFlags::RDWR,
+        rustix::fs::Mode::from_raw_mode(0o644),
+    )
+    .map_err(|e| anyhow::anyhow!("shm_open: {e}"))?;
+
+    // Surfaces the wait explicitly: with readers holding LOCK_SH
+    // for VM lifetime, concurrent test runs can block here for
+    // seconds. Without this, the user sees silent hang.
+    tracing::info!(
+        segment = name,
+        data_len = data.len(),
+        "shm_store: waiting for LOCK_EX"
+    );
+    // Post-flock error paths (ftruncate/mmap failure) call shm_unlink
+    // before the OwnedFd drop so a half-initialized segment (empty /
+    // corrupt / wrong size) does not persist in /dev/shm where the
+    // next caller would read it. Those paths hold LOCK_EX, so the
+    // segment is either newly created by this call or being
+    // exclusively rewritten — destroying it is safe. Unlinking may
+    // also remove a pre-existing valid segment that the caller had
+    // just opened then failed to rewrite; content-addressing makes
+    // recovery cheap — the next writer re-creates with the same hash.
+    //
+    // Pre-flock (shm_open succeeded, flock failed) does NOT unlink:
+    // the segment may be a pre-existing valid one that a peer writer
+    // holds LOCK_EX on, and we must not destroy another process's
+    // cache entry on our own flock error.
+    //
+    // Success path does NOT unlink — the segment IS the cache. The
+    // OwnedFd's drop handles close() on every path.
+    rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| anyhow::anyhow!("flock: {e}"))?;
+
+    let raw_fd = fd.as_raw_fd();
     unsafe {
-        let fd = libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644);
-        anyhow::ensure!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
-
-        // Surfaces the wait explicitly: with readers holding LOCK_SH
-        // for VM lifetime, concurrent test runs can block here for
-        // seconds. Without this, the user sees silent hang.
-        tracing::info!(
-            segment = name.to_string_lossy().as_ref(),
-            data_len = data.len(),
-            "shm_store: waiting for LOCK_EX"
-        );
-        // Post-flock error paths (ftruncate/mmap failure) call shm_unlink
-        // before close so a half-initialized segment (empty / corrupt /
-        // wrong size) does not persist in /dev/shm where the next caller
-        // would read it. Those paths hold LOCK_EX, so the segment is
-        // either newly created by this call or being exclusively
-        // rewritten — destroying it is safe. Unlinking may also remove
-        // a pre-existing valid segment that the caller had just opened
-        // then failed to rewrite; content-addressing makes recovery
-        // cheap — the next writer re-creates with the same hash.
-        //
-        // Pre-flock (shm_open succeeded, flock failed) does NOT unlink:
-        // the segment may be a pre-existing valid one that a peer writer
-        // holds LOCK_EX on, and we must not destroy another process's
-        // cache entry on our own flock error.
-        //
-        // Error paths capture `last_os_error()` BEFORE shm_unlink so
-        // the bail! message reports the original failure rather than
-        // any errno that shm_unlink itself might set (e.g. ENOENT on
-        // a race with a concurrent writer).
-        //
-        // Success path does NOT unlink — the segment IS the cache.
-        if libc::flock(fd, libc::LOCK_EX) != 0 {
+        if libc::ftruncate(raw_fd, data.len() as libc::off_t) != 0 {
             let err = std::io::Error::last_os_error();
-            libc::close(fd);
-            anyhow::bail!("flock: {err}");
-        }
-
-        if libc::ftruncate(fd, data.len() as libc::off_t) != 0 {
-            let err = std::io::Error::last_os_error();
-            if libc::shm_unlink(name.as_ptr()) != 0 {
+            if let Err(e) = rustix::shm::unlink(name) {
                 tracing::warn!(
-                    err = %std::io::Error::last_os_error(),
-                    segment = name.to_string_lossy().as_ref(),
+                    err = %e,
+                    segment = name,
                     "shm_unlink failed on ftruncate error path"
                 );
             }
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
+            let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
             anyhow::bail!("ftruncate: {err}");
         }
 
@@ -1274,46 +1275,38 @@ fn shm_store(name: &std::ffi::CStr, data: &[u8]) -> Result<()> {
             data.len(),
             libc::PROT_WRITE,
             libc::MAP_SHARED,
-            fd,
+            raw_fd,
             0,
         );
         if ptr == libc::MAP_FAILED {
             let err = std::io::Error::last_os_error();
-            if libc::shm_unlink(name.as_ptr()) != 0 {
+            if let Err(e) = rustix::shm::unlink(name) {
                 tracing::warn!(
-                    err = %std::io::Error::last_os_error(),
-                    segment = name.to_string_lossy().as_ref(),
+                    err = %e,
+                    segment = name,
                     "shm_unlink failed on mmap error path"
                 );
             }
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
+            let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
             anyhow::bail!("mmap: {err}");
         }
 
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
         libc::munmap(ptr, data.len());
-
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
     }
+    let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+    // fd drops here → close(fd).
     Ok(())
 }
 
 pub(crate) fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
-    let name =
-        std::ffi::CString::new(shm_segment_name(content_hash)).context("shm segment name")?;
-    shm_store(&name, data)
+    shm_store(&shm_segment_name(content_hash), data)
 }
 
 /// Remove the POSIX shared-memory segment identified by `content_hash`.
 #[allow(dead_code)]
 pub(crate) fn shm_unlink_base(content_hash: u64) {
-    if let Ok(name) = std::ffi::CString::new(shm_segment_name(content_hash)) {
-        unsafe {
-            libc::shm_unlink(name.as_ptr());
-        }
-    }
+    let _ = rustix::shm::unlink(shm_segment_name(content_hash).as_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,35 +1321,30 @@ fn shm_lz4_segment_name(content_hash: u64) -> String {
     format!("/ktstr-lz4-{content_hash:016x}")
 }
 
-/// Open the compressed SHM segment and return a held fd + size.
-/// The fd has a shared flock held — caller must close it when done.
+/// Open the compressed SHM segment and return a held OwnedFd + size.
+/// The fd has a shared flock held; drop the OwnedFd (via
+/// [`shm_close_fd`] or scope exit) to release the lock and close.
 /// Returns `None` on miss or error.
-pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::unix::io::RawFd, usize)> {
-    let name = std::ffi::CString::new(shm_lz4_segment_name(content_hash)).ok()?;
-    unsafe {
-        let fd = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
-        if fd < 0 {
-            return None;
-        }
-        if libc::flock(fd, libc::LOCK_SH) != 0 {
-            libc::close(fd);
-            return None;
-        }
-        let mut stat: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut stat) != 0 || stat.st_size <= 0 {
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
-            return None;
-        }
-        Some((fd, stat.st_size as usize))
+pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, usize)> {
+    let name = shm_lz4_segment_name(content_hash);
+    let fd = rustix::shm::open(
+        name.as_str(),
+        rustix::shm::OFlags::RDONLY,
+        rustix::fs::Mode::empty(),
+    )
+    .ok()?;
+    rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockShared).ok()?;
+    let stat = rustix::fs::fstat(&fd).ok()?;
+    if stat.st_size <= 0 {
+        let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+        return None;
     }
+    Some((fd, stat.st_size as usize))
 }
 
 /// Store compressed initramfs data into an LZ4 SHM segment.
 pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
-    let name =
-        std::ffi::CString::new(shm_lz4_segment_name(content_hash)).context("shm lz4 name")?;
-    shm_store(&name, data)
+    shm_store(&shm_lz4_segment_name(content_hash), data)
 }
 
 /// RAII guard for a live COW-overlay mapping.
@@ -1376,28 +1364,22 @@ pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
 /// reservation drops — which must happen BEFORE this guard drops,
 /// so the lock protects the mapping right up until tear-down.
 pub(crate) struct CowOverlayGuard {
-    fd: std::os::unix::io::RawFd,
+    fd: std::os::fd::OwnedFd,
 }
 
 impl CowOverlayGuard {
-    fn new(fd: std::os::unix::io::RawFd) -> Self {
+    fn new(fd: std::os::fd::OwnedFd) -> Self {
         Self { fd }
     }
 }
 
-// SAFETY: The fd is owned by this guard; no other code reads or
-// closes it. flock/close are thread-safe syscalls.
-unsafe impl Send for CowOverlayGuard {}
-unsafe impl Sync for CowOverlayGuard {}
-
 impl Drop for CowOverlayGuard {
     fn drop(&mut self) {
-        // SAFETY: fd was obtained via shm_open in the COW overlay
-        // path; we own it and release LOCK_SH before close.
-        unsafe {
-            libc::flock(self.fd, libc::LOCK_UN);
-            libc::close(self.fd);
-        }
+        // fd was obtained via shm_open in the COW overlay path; release
+        // LOCK_SH explicitly so cooperating writers waiting on LOCK_EX
+        // observe ordering with the VM's reads. The OwnedFd's own drop
+        // closes the descriptor after this function returns.
+        let _ = rustix::fs::flock(&self.fd, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -1434,8 +1416,10 @@ impl Drop for CowOverlayGuard {
 pub(crate) unsafe fn cow_overlay(
     host_addr: *mut u8,
     len: usize,
-    shm_fd: std::os::unix::io::RawFd,
+    shm_fd: std::os::fd::OwnedFd,
 ) -> Option<CowOverlayGuard> {
+    use std::os::fd::AsRawFd;
+
     // SAFETY: caller guarantees [host_addr, host_addr + len) is
     // entirely within a single valid guest memory region and shm_fd
     // is a valid fd holding LOCK_SH. See function-level docs.
@@ -1445,28 +1429,26 @@ pub(crate) unsafe fn cow_overlay(
             len,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_POPULATE,
-            shm_fd,
+            shm_fd.as_raw_fd(),
             0,
         )
     };
     if ptr == libc::MAP_FAILED {
-        // Close and unlock fd ourselves — caller expects no cleanup
-        // responsibility on the None path.
-        unsafe {
-            libc::flock(shm_fd, libc::LOCK_UN);
-            libc::close(shm_fd);
-        }
+        // Drop the OwnedFd on the failure path so the caller expects
+        // no cleanup responsibility on the None branch; drop releases
+        // the LOCK_SH and closes the descriptor.
+        let _ = rustix::fs::flock(&shm_fd, rustix::fs::FlockOperation::Unlock);
         return None;
     }
     Some(CowOverlayGuard::new(shm_fd))
 }
 
 /// Close a SHM fd and release its shared flock.
-pub(crate) fn shm_close_fd(fd: std::os::unix::io::RawFd) {
-    unsafe {
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
-    }
+pub(crate) fn shm_close_fd(fd: std::os::fd::OwnedFd) {
+    // Explicit flock-unlock so a cooperating writer waiting on LOCK_EX
+    // observes ordering with our earlier reads (LOCK_SH); the OwnedFd
+    // drop at scope exit then closes the descriptor.
+    let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
 }
 
 /// Write one or more byte slices sequentially into guest memory as a
@@ -2106,39 +2088,34 @@ mod tests {
 
         // Open a second fd and attempt LOCK_EX|LOCK_NB. Should fail
         // with EWOULDBLOCK because the MappedShm holds LOCK_SH.
-        let name = std::ffi::CString::new(shm_segment_name(hash)).unwrap();
-        unsafe {
-            let fd2 = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
-            assert!(fd2 >= 0, "second shm_open must succeed");
-            let rc = libc::flock(fd2, libc::LOCK_EX | libc::LOCK_NB);
-            let errno = *libc::__errno_location();
-            assert_eq!(
-                rc, -1,
-                "LOCK_EX|LOCK_NB must be blocked by the live reader's LOCK_SH"
-            );
-            assert_eq!(
-                errno,
-                libc::EWOULDBLOCK,
-                "lock contention must surface as EWOULDBLOCK"
-            );
-            libc::close(fd2);
-        }
+        let name = shm_segment_name(hash);
+        let fd2 = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("second shm_open must succeed");
+        let err = rustix::fs::flock(&fd2, rustix::fs::FlockOperation::NonBlockingLockExclusive);
+        assert!(
+            matches!(err, Err(e) if e == rustix::io::Errno::WOULDBLOCK),
+            "LOCK_EX|LOCK_NB must be blocked by the live reader's LOCK_SH (got {err:?})",
+        );
+        drop(fd2);
 
         // Drop the mapping; lock releases.
         drop(loaded);
 
         // Now LOCK_EX|LOCK_NB must succeed on a fresh fd.
-        unsafe {
-            let fd3 = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
-            assert!(fd3 >= 0, "third shm_open must succeed");
-            let rc = libc::flock(fd3, libc::LOCK_EX | libc::LOCK_NB);
-            assert_eq!(
-                rc, 0,
-                "LOCK_EX|LOCK_NB must succeed after the MappedShm is dropped"
-            );
-            libc::flock(fd3, libc::LOCK_UN);
-            libc::close(fd3);
-        }
+        let fd3 = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("third shm_open must succeed");
+        rustix::fs::flock(&fd3, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("LOCK_EX|LOCK_NB must succeed after the MappedShm is dropped");
+        rustix::fs::flock(&fd3, rustix::fs::FlockOperation::Unlock).ok();
+        drop(fd3);
         shm_unlink_base(hash);
     }
 

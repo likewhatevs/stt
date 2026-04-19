@@ -501,21 +501,20 @@ fn cleanup_stale_shm(current: &BaseKey) {
             continue;
         }
         let shm_name = format!("/{name_str}");
-        let Ok(cname) = std::ffi::CString::new(shm_name) else {
+        // rustix owns the fd via OwnedFd, so flock-then-drop is the
+        // only cleanup path — no manual close required, and unlinks
+        // happen before the fd drops so the segment is gone atomically
+        // with lock release.
+        let Ok(fd) = rustix::shm::open(
+            shm_name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        ) else {
             continue;
         };
-        unsafe {
-            let fd = libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0);
-            if fd < 0 {
-                continue;
-            }
-            // Try non-blocking exclusive lock. If another process holds
-            // LOCK_SH or LOCK_EX, this fails with EWOULDBLOCK and we skip.
-            if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 {
-                libc::shm_unlink(cname.as_ptr());
-                libc::flock(fd, libc::LOCK_UN);
-            }
-            libc::close(fd);
+        if rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
+            let _ = rustix::shm::unlink(shm_name.as_str());
+            let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
         }
     }
 }
@@ -525,8 +524,9 @@ fn cleanup_stale_shm(current: &BaseKey) {
 // ---------------------------------------------------------------------------
 
 enum ShmCreateResult {
-    /// We created the segment; fd holds an exclusive flock.
-    Winner(std::os::unix::io::RawFd),
+    /// We created the segment; fd holds an exclusive flock. The fd is
+    /// owned — drop releases the lock and closes the descriptor.
+    Winner(std::os::fd::OwnedFd),
     /// Segment already exists (another process is building or built it).
     Exists,
     /// shm_open failed for a reason other than EEXIST.
@@ -536,45 +536,39 @@ enum ShmCreateResult {
 /// Try to create a POSIX shm segment with O_CREAT|O_EXCL. On success,
 /// acquire LOCK_EX and return the fd. On EEXIST, return Exists.
 fn shm_try_create_excl(name: &str) -> ShmCreateResult {
-    let Ok(cname) = std::ffi::CString::new(name) else {
-        return ShmCreateResult::Error;
+    let fd = match rustix::shm::open(
+        name,
+        rustix::shm::OFlags::CREATE | rustix::shm::OFlags::EXCL | rustix::shm::OFlags::RDWR,
+        rustix::fs::Mode::from_raw_mode(0o644),
+    ) {
+        Ok(fd) => fd,
+        Err(e) if e == rustix::io::Errno::EXIST => return ShmCreateResult::Exists,
+        Err(_) => return ShmCreateResult::Error,
     };
-    unsafe {
-        let fd = libc::shm_open(
-            cname.as_ptr(),
-            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
-            0o644,
-        );
-        if fd < 0 {
-            let err = *libc::__errno_location();
-            return if err == libc::EEXIST {
-                ShmCreateResult::Exists
-            } else {
-                ShmCreateResult::Error
-            };
-        }
 
-        // Take exclusive lock before writing.
-        if libc::flock(fd, libc::LOCK_EX) != 0 {
-            libc::close(fd);
-            return ShmCreateResult::Error;
-        }
-
-        ShmCreateResult::Winner(fd)
+    // Take exclusive (blocking) lock before writing. The fd is dropped
+    // on the error path, which closes it automatically.
+    if rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockExclusive).is_err() {
+        return ShmCreateResult::Error;
     }
+
+    ShmCreateResult::Winner(fd)
 }
 
 /// Write data to the shm fd, then release the exclusive lock and close.
 /// On failure (ftruncate or mmap), unlinks the segment so future callers
 /// don't find a corrupt/empty segment and can retry.
-fn shm_write_and_release(fd: std::os::unix::io::RawFd, data: &[u8], seg_name: &str) {
+fn shm_write_and_release(fd: std::os::fd::OwnedFd, data: &[u8], seg_name: &str) {
+    use std::os::fd::AsRawFd;
+
+    // Keep the raw fd for libc::mmap / libc::ftruncate (rustix::mm
+    // is not currently wired in); the OwnedFd still owns the close
+    // and flock-release on drop.
+    let raw = fd.as_raw_fd();
     unsafe {
-        if libc::ftruncate(fd, data.len() as libc::off_t) != 0 {
-            if let Ok(cname) = std::ffi::CString::new(seg_name) {
-                libc::shm_unlink(cname.as_ptr());
-            }
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
+        if libc::ftruncate(raw, data.len() as libc::off_t) != 0 {
+            let _ = rustix::shm::unlink(seg_name);
+            // fd drop runs flock_un + close automatically.
             return;
         }
 
@@ -583,24 +577,23 @@ fn shm_write_and_release(fd: std::os::unix::io::RawFd, data: &[u8], seg_name: &s
             data.len(),
             libc::PROT_WRITE,
             libc::MAP_SHARED,
-            fd,
+            raw,
             0,
         );
         if ptr == libc::MAP_FAILED {
             // Zero the size so readers blocked on LOCK_SH see st_size=0
             // from fstat and return None instead of mapping zero-filled bytes.
-            libc::ftruncate(fd, 0);
-            if let Ok(cname) = std::ffi::CString::new(seg_name) {
-                libc::shm_unlink(cname.as_ptr());
-            }
+            libc::ftruncate(raw, 0);
+            let _ = rustix::shm::unlink(seg_name);
         } else {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
             libc::munmap(ptr, data.len());
         }
-
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
     }
+    // Explicit unlock so readers blocked on LOCK_SH observe ordering
+    // with the final mmap before the fd-drop close hits.
+    let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+    // fd drops here → close(fd). OwnedFd::drop ignores errors.
 }
 
 // ---------------------------------------------------------------------------
@@ -2028,6 +2021,7 @@ impl KtstrVm {
     fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
         // Try loading compressed base from LZ4 SHM.
         if let Some((fd, len)) = initramfs::shm_open_lz4(key.0) {
+            use std::os::fd::AsRawFd;
             let mut buf = vec![0u8; len];
             unsafe {
                 let ptr = libc::mmap(
@@ -2035,7 +2029,7 @@ impl KtstrVm {
                     len,
                     libc::PROT_READ,
                     libc::MAP_SHARED,
-                    fd,
+                    fd.as_raw_fd(),
                     0,
                 );
                 if ptr != libc::MAP_FAILED {
@@ -2090,6 +2084,7 @@ impl KtstrVm {
             return None;
         }
         // Validate LZ4 legacy magic before COW-mapping.
+        use std::os::fd::AsRawFd;
         let mut magic = [0u8; 4];
         unsafe {
             let ptr = libc::mmap(
@@ -2097,7 +2092,7 @@ impl KtstrVm {
                 len,
                 libc::PROT_READ,
                 libc::MAP_SHARED,
-                fd,
+                fd.as_raw_fd(),
                 0,
             );
             if ptr == libc::MAP_FAILED {
@@ -4637,38 +4632,29 @@ mod tests {
 
         match shm_try_create_excl(&name) {
             ShmCreateResult::Winner(fd) => {
-                // Second attempt sees the existing segment.
+                // Second attempt sees the existing segment. OwnedFd
+                // drops close the descriptors on any early exit path.
                 match shm_try_create_excl(&name) {
                     ShmCreateResult::Exists => {}
-                    ShmCreateResult::Winner(other) => {
-                        // Impossible if O_EXCL worked; clean up and fail.
-                        unsafe { libc::close(other) };
-                        if let Ok(cname) = std::ffi::CString::new(name.clone()) {
-                            unsafe { libc::shm_unlink(cname.as_ptr()) };
-                        }
-                        unsafe { libc::close(fd) };
+                    ShmCreateResult::Winner(_other) => {
+                        let _ = rustix::shm::unlink(name.as_str());
+                        drop(fd);
                         panic!("second shm_try_create_excl must return Exists, not Winner");
                     }
                     ShmCreateResult::Error => {
-                        unsafe { libc::close(fd) };
-                        if let Ok(cname) = std::ffi::CString::new(name.clone()) {
-                            unsafe { libc::shm_unlink(cname.as_ptr()) };
-                        }
+                        let _ = rustix::shm::unlink(name.as_str());
+                        drop(fd);
                         panic!("second shm_try_create_excl returned Error");
                     }
                 }
                 // Clean up: write path then unlink so this test
                 // doesn't leave /dev/shm residue.
                 shm_write_and_release(fd, b"ok", &name);
-                if let Ok(cname) = std::ffi::CString::new(name.clone()) {
-                    unsafe { libc::shm_unlink(cname.as_ptr()) };
-                }
+                let _ = rustix::shm::unlink(name.as_str());
             }
             ShmCreateResult::Exists => {
                 // A stale segment with this name exists. Unlink and retry.
-                if let Ok(cname) = std::ffi::CString::new(name.clone()) {
-                    unsafe { libc::shm_unlink(cname.as_ptr()) };
-                }
+                let _ = rustix::shm::unlink(name.as_str());
                 panic!("test setup collision on shm name {name}");
             }
             ShmCreateResult::Error => {
@@ -4701,16 +4687,16 @@ mod tests {
         shm_write_and_release(fd, payload, &name);
 
         // Reopen read-only and verify size + contents.
-        let cname = std::ffi::CString::new(name.clone()).unwrap();
-        unsafe {
-            let rfd = libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0);
-            assert!(rfd >= 0, "shm_open for read failed");
-            let mut st: libc::stat = std::mem::zeroed();
-            assert_eq!(libc::fstat(rfd, &mut st), 0);
-            assert_eq!(st.st_size as usize, payload.len());
-            libc::close(rfd);
-            libc::shm_unlink(cname.as_ptr());
-        }
+        let rfd = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("shm_open for read failed");
+        let st = rustix::fs::fstat(&rfd).expect("fstat failed");
+        assert_eq!(st.st_size as usize, payload.len());
+        drop(rfd);
+        let _ = rustix::shm::unlink(name.as_str());
     }
 
     #[test]
