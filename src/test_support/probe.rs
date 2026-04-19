@@ -60,25 +60,29 @@ pub fn propagate_rust_env_from_cmdline() {
     let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
         return;
     };
-    let parts: Vec<&str> = cmdline.split_whitespace().collect();
-    if let Some(val) = parts
-        .iter()
-        .find(|s| s.starts_with("RUST_BACKTRACE="))
-        .and_then(|s| s.strip_prefix("RUST_BACKTRACE="))
-    {
+    for (key, val) in parse_rust_env_from_cmdline(&cmdline) {
         // SAFETY: called from ktstr_guest_init before any probe /
         // workload thread is spawned; single-threaded mutation of
         // `__environ` is sound.
-        unsafe { std::env::set_var("RUST_BACKTRACE", val) };
+        unsafe { std::env::set_var(key, val) };
     }
-    if let Some(val) = parts
-        .iter()
-        .find(|s| s.starts_with("RUST_LOG="))
-        .and_then(|s| s.strip_prefix("RUST_LOG="))
-    {
-        // SAFETY: see above.
-        unsafe { std::env::set_var("RUST_LOG", val) };
+}
+
+/// Pure parser for the cmdline side of `propagate_rust_env_from_cmdline`.
+/// Returns `(key, value)` pairs for every `RUST_BACKTRACE=...` or
+/// `RUST_LOG=...` token found in whitespace-split `cmdline`, in the
+/// order they appear. Split from the env-mutating wrapper so the
+/// parse logic is testable without touching the process environment.
+fn parse_rust_env_from_cmdline(cmdline: &str) -> Vec<(&'static str, &str)> {
+    let mut out = Vec::new();
+    for token in cmdline.split_whitespace() {
+        if let Some(val) = token.strip_prefix("RUST_BACKTRACE=") {
+            out.push(("RUST_BACKTRACE", val));
+        } else if let Some(val) = token.strip_prefix("RUST_LOG=") {
+            out.push(("RUST_LOG", val));
+        }
     }
+    out
 }
 
 /// Delimiters for probe output in guest COM2 (written by emit_probe_payload).
@@ -1379,5 +1383,94 @@ mod tests {
             formatted.contains("pick_task_scx"),
             "func pick_task_scx: {formatted}"
         );
+    }
+
+    // -- format_tail --
+
+    #[test]
+    fn format_tail_empty_text_returns_none() {
+        assert_eq!(format_tail("", 5, "scheduler"), None);
+    }
+
+    #[test]
+    fn format_tail_fewer_lines_than_n_returns_all() {
+        let out = format_tail("one\ntwo\nthree", 10, "scheduler").unwrap();
+        assert_eq!(out, "--- scheduler ---\none\ntwo\nthree");
+    }
+
+    #[test]
+    fn format_tail_trims_to_last_n_lines() {
+        let out = format_tail("1\n2\n3\n4\n5", 3, "log").unwrap();
+        assert_eq!(out, "--- log ---\n3\n4\n5");
+    }
+
+    #[test]
+    fn format_tail_zero_n_returns_empty_body_under_header() {
+        // saturating_sub keeps `start == lines.len()`, so the joined
+        // slice is empty — the header alone survives.
+        let out = format_tail("a\nb", 0, "hdr").unwrap();
+        assert_eq!(out, "--- hdr ---\n");
+    }
+
+    #[test]
+    fn format_tail_preserves_trailing_blank_lines() {
+        // `str::lines` strips a single trailing newline but keeps
+        // interior blanks. The tail should include the blank line.
+        let out = format_tail("a\n\nb", 3, "hdr").unwrap();
+        assert_eq!(out, "--- hdr ---\na\n\nb");
+    }
+
+    // -- parse_rust_env_from_cmdline --
+
+    #[test]
+    fn parse_rust_env_empty_cmdline_is_empty() {
+        assert!(parse_rust_env_from_cmdline("").is_empty());
+    }
+
+    #[test]
+    fn parse_rust_env_no_matches() {
+        assert!(parse_rust_env_from_cmdline("console=ttyS0 ro quiet").is_empty());
+    }
+
+    #[test]
+    fn parse_rust_env_backtrace_only() {
+        let parsed = parse_rust_env_from_cmdline("console=ttyS0 RUST_BACKTRACE=1 ro");
+        assert_eq!(parsed, vec![("RUST_BACKTRACE", "1")]);
+    }
+
+    #[test]
+    fn parse_rust_env_log_only() {
+        let parsed = parse_rust_env_from_cmdline("RUST_LOG=debug other=x");
+        assert_eq!(parsed, vec![("RUST_LOG", "debug")]);
+    }
+
+    #[test]
+    fn parse_rust_env_both() {
+        let parsed = parse_rust_env_from_cmdline("RUST_BACKTRACE=full RUST_LOG=trace other=y");
+        assert_eq!(
+            parsed,
+            vec![("RUST_BACKTRACE", "full"), ("RUST_LOG", "trace")]
+        );
+    }
+
+    #[test]
+    fn parse_rust_env_preserves_token_order() {
+        let parsed = parse_rust_env_from_cmdline("RUST_LOG=info RUST_BACKTRACE=1");
+        assert_eq!(parsed, vec![("RUST_LOG", "info"), ("RUST_BACKTRACE", "1")]);
+    }
+
+    #[test]
+    fn parse_rust_env_empty_value() {
+        // `RUST_LOG=` with no value yields an empty-string value,
+        // matching the split semantics of `strip_prefix`.
+        let parsed = parse_rust_env_from_cmdline("RUST_LOG=");
+        assert_eq!(parsed, vec![("RUST_LOG", "")]);
+    }
+
+    #[test]
+    fn parse_rust_env_ignores_prefix_mismatch() {
+        // Tokens that merely contain the key substring but do not
+        // start with it are ignored (e.g. `xRUST_LOG=...`).
+        assert!(parse_rust_env_from_cmdline("xRUST_LOG=x").is_empty());
     }
 }

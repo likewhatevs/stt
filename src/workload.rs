@@ -3106,6 +3106,10 @@ mod tests {
     //   12 = zombie worker process detected after SpawnGuard::Drop
     //   13 = setrlimit itself failed (harness issue, not a test
     //        failure of the guard)
+    //   14 = bail arrived via an unexpected branch (test picks the
+    //        wrong failure path)
+    //   15 = post-bail setrlimit raise failed (harness issue; would
+    //        mask a genuine fd leak as a false positive)
     //   other nonzero = unrelated failure (panic, assertion miss)
     //
     // `libc::_exit` is used instead of `std::process::exit` in the
@@ -3131,17 +3135,6 @@ mod tests {
         let mut status = 0i32;
         let ret = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         ret > 0
-    }
-
-    /// Lower RLIMIT_NOFILE to `limit`. Returns true on success.
-    /// Safe to call in the post-fork single-threaded child; not safe
-    /// to call in the parent test (would affect sibling tests).
-    fn set_rlimit_nofile(limit: u64) -> bool {
-        let rl = libc::rlimit {
-            rlim_cur: limit,
-            rlim_max: limit,
-        };
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 }
     }
 
     /// Lower RLIMIT_NPROC to the current process count so any `fork`
@@ -3222,6 +3215,20 @@ mod tests {
     fn spawn_guard_cleans_up_on_interworker_pipe_emfile() {
         let code = run_in_forked_child(|| {
             let baseline = count_open_fds();
+            // Capture the inherited RLIMIT_NOFILE so the post-bail
+            // restore uses a value the kernel will accept. The
+            // lowering path below touches only `rlim_cur` and leaves
+            // `rlim_max` at the original value, so an unprivileged
+            // process can still raise `rlim_cur` back up after the
+            // bail (without CAP_SYS_RESOURCE, which would be needed
+            // to raise a previously-lowered `rlim_max`).
+            let mut original_rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original_rlimit) } != 0 {
+                return 13;
+            }
             // RLIMIT_NOFILE is a hard limit on the highest fd
             // number + 1, not a headroom value — we need to pass a
             // value slightly above baseline so the first pipe pair
@@ -3230,8 +3237,12 @@ mod tests {
             // pipe pair (ab+ba) and 1 leftover. The second pair's
             // `pipe(ab)` needs 2 fds against that 1 slot and fails
             // with EMFILE.
-            let target = (baseline + 5) as u64;
-            if !set_rlimit_nofile(target) {
+            let target_cur = (baseline + 5) as u64;
+            let lowered = libc::rlimit {
+                rlim_cur: target_cur,
+                rlim_max: original_rlimit.rlim_max,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) } != 0 {
                 return 13;
             }
             let config = WorkloadConfig {
@@ -3246,11 +3257,16 @@ mod tests {
                 return 10; // Failure did not trigger.
             }
             // SpawnGuard::Drop has already run on the `?`/`bail!`
-            // exit. Raise the limit back up so reading
-            // /proc/self/fd for the post-check does not itself
-            // fail with EMFILE.
+            // exit. Raise rlim_cur back to its original value so
+            // reading /proc/self/fd for the post-check does not
+            // itself fail with EMFILE. Silent ignore here would mask
+            // an EMFILE in `count_open_fds` below as a fd leak;
+            // return code 15 distinguishes the harness issue from a
+            // guard defect.
             let err_msg = format!("{:#}", result.as_ref().err().unwrap());
-            let _ = set_rlimit_nofile(u64::MAX);
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original_rlimit) } != 0 {
+                return 15;
+            }
             // Prove the bail arrived via the pipe branch, not a
             // later mmap or fork. Both pipe-failure paths bail
             // with "pipe failed".

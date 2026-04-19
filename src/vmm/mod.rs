@@ -5441,9 +5441,9 @@ mod tests {
              output: {output:?}, stderr: {stderr:?}",
         );
         assert!(
-            !stderr.contains("sched_ext: disabled"),
+            !output.contains("sched_ext: disabled") && !stderr.contains("sched_ext: disabled"),
             "kernel disabled sched_ext during run — a watchdog stall or ops \
-             error fired. stderr: {stderr:?}",
+             error fired. output: {output:?}, stderr: {stderr:?}",
         );
         if let Some(ref report) = result.monitor
             && let Some(ref obs) = report.watchdog_observation

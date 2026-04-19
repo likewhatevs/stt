@@ -1886,6 +1886,25 @@ mod tests {
         assert_eq!(all, usable);
     }
 
+    #[test]
+    fn cpusetspec_disjoint_index_beyond_of_returns_empty() {
+        // Defense-in-depth: `validate` rejects index >= of with a clear
+        // error, but callers that skip validation (e.g. programmatic
+        // spec construction) must not hit the div-by-zero or panic in
+        // `resolve`. With index = 5 and of = 3 on 3 usable CPUs
+        // (4 total, 1 reserved by `usable_cpus`), chunk = 1 and
+        // start = 5 clamps past `usable.len()` to yield an empty set
+        // — a safe fallback, not a panic.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Disjoint { index: 5, of: 3 }.resolve(&ctx);
+        assert!(
+            cpus.is_empty(),
+            "Disjoint with index beyond `of` must return an empty \
+             cpuset rather than panicking, got: {cpus:?}",
+        );
+    }
+
     // -- CpusetSpec::Range --
 
     #[test]
@@ -3002,6 +3021,45 @@ mod tests {
         assert!(
             create_idx < move_idx,
             "create_cgroup must precede move_tasks for the same cgroup: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_sets_cpuset_before_move_tasks() {
+        // Ordering invariant: for a cgroup with both a cpuset spec and
+        // workers, `set_cpuset` MUST precede `move_tasks` so the
+        // kernel enforces the cpu mask on the first scheduling
+        // decision after the task enters the cgroup. Moving first
+        // would let tasks briefly run on cpus outside the intended
+        // set.
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+        };
+        let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_ordered")
+                .with_cpuset(CpusetSpec::Exact(cpus.clone()))
+                .workers(2),
+        ];
+        apply_setup(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        let set_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetCpuset(n, _) if n == "cg_ordered"))
+            .expect("set_cpuset for cg_ordered");
+        let move_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::MoveTasks(n, _) if n == "cg_ordered"))
+            .expect("move_tasks for cg_ordered");
+        assert!(
+            set_idx < move_idx,
+            "set_cpuset must precede move_tasks for the same cgroup: {calls:?}"
         );
         cleanup_state(&mut state);
     }

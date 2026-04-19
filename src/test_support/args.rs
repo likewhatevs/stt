@@ -45,7 +45,7 @@ pub(crate) fn extract_probe_stack_arg(args: &[String]) -> Option<String> {
     None
 }
 
-/// Extract `--ktstr-topo=NnNlNcNt` (or legacy `NsNcNt`) from the argument list.
+/// Extract `--ktstr-topo=NnNlNcNt` from the argument list.
 pub(crate) fn extract_topo_arg(args: &[String]) -> Option<String> {
     for a in args {
         if let Some(val) = a.strip_prefix("--ktstr-topo=")

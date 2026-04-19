@@ -199,6 +199,52 @@ pub mod flags {
     pub const REJECT_PIN: &str = ALL_DECLS[4].name;
     pub const NO_CTRL: &str = ALL_DECLS[5].name;
 
+    // Enforce positional `ALL_DECLS[i].name` invariant at build time. Any
+    // reorder, insertion, or rename of the decls that does not also update
+    // the corresponding short-name constant above triggers a compile error
+    // here, preventing silent downstream breakage.
+    const _: () = {
+        // `const fn` cannot call `str::eq` directly, so compare via byte
+        // slices with a small helper.
+        const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        assert!(
+            bytes_eq(LLC.as_bytes(), b"llc"),
+            "ALL_DECLS[0] must be `llc`"
+        );
+        assert!(
+            bytes_eq(BORROW.as_bytes(), b"borrow"),
+            "ALL_DECLS[1] must be `borrow`"
+        );
+        assert!(
+            bytes_eq(STEAL.as_bytes(), b"steal"),
+            "ALL_DECLS[2] must be `steal`"
+        );
+        assert!(
+            bytes_eq(REBAL.as_bytes(), b"rebal"),
+            "ALL_DECLS[3] must be `rebal`"
+        );
+        assert!(
+            bytes_eq(REJECT_PIN.as_bytes(), b"reject-pin"),
+            "ALL_DECLS[4] must be `reject-pin`"
+        );
+        assert!(
+            bytes_eq(NO_CTRL.as_bytes(), b"no-ctrl"),
+            "ALL_DECLS[5] must be `no-ctrl`"
+        );
+    };
+
     const fn build_all() -> [&'static str; N_FLAGS] {
         let mut out = [""; N_FLAGS];
         let mut i = 0;

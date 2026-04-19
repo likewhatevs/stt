@@ -116,7 +116,7 @@ fn maybe_dispatch_host_test() -> Option<i32> {
         Some(t) => t,
         None => {
             eprintln!(
-                "ktstr_test: invalid --ktstr-topo format '{topo_str}' (expected NnNlNcNt or NsNcNt)"
+                "ktstr_test: invalid --ktstr-topo format '{topo_str}' (expected NnNlNcNt, e.g. 1n2l4c2t)"
             );
             return Some(1);
         }

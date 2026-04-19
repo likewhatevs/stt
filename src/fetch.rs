@@ -437,9 +437,18 @@ fn probe_latest_patch(prefix: &str, cli_label: &str) -> Result<String, String> {
     /// minors with many patches still finish in log-time rounds.
     const PROBE_PATCH_INITIAL_BATCH: u32 = 16;
 
+    // Cap the window at the rayon pool size: HEAD requests beyond that
+    // cannot run in parallel anyway, they just queue behind the pool's
+    // threads and add latency without widening the probe. Floor at
+    // PROBE_PATCH_INITIAL_BATCH so small-core hosts (2-4 core CI
+    // runners) still get the log-time search — work-stealing handles
+    // the initial queuing cheaply, and the cap only kicks in on large
+    // hosts whose growth phase would otherwise run absurdly wide.
+    let pool_cap = rayon::current_num_threads().max(PROBE_PATCH_INITIAL_BATCH as usize) as u32;
+
     let mut last_good: u32 = 0;
     let mut lo: u32 = 1;
-    let mut window: u32 = PROBE_PATCH_INITIAL_BATCH;
+    let mut window: u32 = PROBE_PATCH_INITIAL_BATCH.min(pool_cap);
     'expand: loop {
         let hi = (lo + window - 1).min(PROBE_PATCH_MAX);
         // HEAD the entire window concurrently. Any transport error
@@ -460,7 +469,7 @@ fn probe_latest_patch(prefix: &str, cli_label: &str) -> Result<String, String> {
             break;
         }
         lo = hi + 1;
-        window = window.saturating_mul(2);
+        window = window.saturating_mul(2).min(pool_cap);
     }
 
     if last_good == 0 {
