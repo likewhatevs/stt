@@ -2802,6 +2802,7 @@ dependencies = [
  "ctor",
  "flate2",
  "gix",
+ "glob",
  "goblin",
  "indicatif",
  "insta",

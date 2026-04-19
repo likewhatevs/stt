@@ -37,7 +37,12 @@ pub(crate) struct MissingLib {
 /// library search paths. The format:
 /// - One directory path per line
 /// - Lines starting with `#` are comments
-/// - `include <glob>` directives match files (e.g. `/etc/ld.so.conf.d/*.conf`)
+/// - `include <glob>` directives match files. Globs are expanded via
+///   the `glob` crate, so any component of the path may contain a
+///   wildcard — e.g. `/etc/ld.so.conf.d/*.conf` (single-component,
+///   the glibc default) or `/etc/*/conf.d/*.conf` (multi-component).
+///   Relative globs are resolved against the including file's parent
+///   directory.
 /// - Empty lines are skipped
 ///
 /// Parsed once and cached for the process lifetime.
@@ -78,35 +83,57 @@ fn parse_ld_so_conf_file(
         Ok(c) => c,
         Err(_) => return,
     };
+    // Resolve relative include paths against the including file's
+    // parent directory (matches glibc's behavior), not the process
+    // CWD which is arbitrary. Fall back to "." only when the file
+    // has no parent (pathological).
+    let base = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(glob_pattern) = trimmed.strip_prefix("include") {
-            let glob_pattern = glob_pattern.trim();
+        // Require a whitespace separator after "include" — bare
+        // "include" followed by a non-whitespace char (e.g.
+        // "includelocale") is a different keyword, not an include
+        // directive. Accepts any ASCII whitespace (space, tab, etc.)
+        // so tab-separated `include\tpath.conf` parses too.
+        if let Some(rest) = trimmed.strip_prefix("include")
+            && rest.chars().next().is_some_and(|c| c.is_ascii_whitespace())
+        {
+            let glob_pattern = rest.trim();
             if glob_pattern.is_empty() {
                 continue;
             }
-            // Expand the glob by reading the parent directory and matching.
-            let pattern_path = Path::new(glob_pattern);
-            if let Some(parent) = pattern_path.parent()
-                && let Some(file_pattern) = pattern_path.file_name()
-            {
-                let pat = file_pattern.to_string_lossy();
-                if let Ok(entries) = std::fs::read_dir(parent) {
-                    let mut paths: Vec<PathBuf> = entries
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.path())
-                        .filter(|p| {
-                            p.file_name()
-                                .is_some_and(|n| glob_match(&pat, &n.to_string_lossy()))
-                        })
-                        .collect();
-                    paths.sort();
-                    for p in paths {
+            // Resolve the glob pattern against `base` so that relative
+            // includes match glibc's semantics.
+            let pattern_pathbuf = if Path::new(glob_pattern).is_absolute() {
+                PathBuf::from(glob_pattern)
+            } else {
+                base.join(glob_pattern)
+            };
+            let pattern_str = pattern_pathbuf.to_string_lossy();
+            // `glob` crate handles multi-component patterns
+            // (e.g. `subdir/*/file.conf`) correctly; the previous
+            // `file_name()`-only match silently dropped any match
+            // whose directory part contained a wildcard.
+            match glob::glob(&pattern_str) {
+                Ok(paths) => {
+                    let mut matched: Vec<PathBuf> = paths.filter_map(Result::ok).collect();
+                    matched.sort();
+                    for p in matched {
                         parse_ld_so_conf_file(&p, out, visited, depth + 1);
                     }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pattern = %pattern_str,
+                        err = %e,
+                        "ld.so.conf include: malformed glob pattern; skipping"
+                    );
                 }
             }
         } else {
@@ -206,20 +233,6 @@ fn parse_ld_so_cache(path: &Path) -> HashMap<String, PathBuf> {
 fn read_cstr(data: &[u8], offset: usize) -> Option<&str> {
     let end = data[offset..].iter().position(|&b| b == 0)?;
     std::str::from_utf8(&data[offset..offset + end]).ok()
-}
-
-/// Simple glob matching supporting only `*` as a wildcard.
-/// Matches the full string (not a substring).
-fn glob_match(pattern: &str, s: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        s.starts_with(prefix)
-    } else if let Some(suffix) = pattern.strip_prefix('*') {
-        s.ends_with(suffix)
-    } else if let Some((prefix, suffix)) = pattern.split_once('*') {
-        s.starts_with(prefix) && s[prefix.len()..].ends_with(suffix)
-    } else {
-        pattern == s
-    }
 }
 
 /// Resolve shared library dependencies for a dynamically-linked ELF binary.
@@ -2561,32 +2574,120 @@ mod tests {
         );
     }
 
-    // -- glob_match tests --
-
+    /// Regression: `strip_prefix("include")` also matched any word
+    /// starting with "include" (e.g. "includelocale") as an include
+    /// directive, silently attempting to glob whatever followed.
+    /// Requiring `"include "` with a trailing space fixes this.
     #[test]
-    fn glob_match_suffix_star() {
-        assert!(glob_match("*.conf", "test.conf"));
-        assert!(glob_match("*.conf", ".conf"));
-        assert!(!glob_match("*.conf", "test.txt"));
+    fn parse_ld_so_conf_rejects_include_without_space() {
+        // parse_ld_so_conf only records directories that actually
+        // exist, so point at real on-disk paths under the tempdir.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real-lib");
+        std::fs::create_dir(&real_dir).unwrap();
+        let locale_dir = tmp.path().join("locale");
+        std::fs::create_dir(&locale_dir).unwrap();
+        let extra = tmp.path().join("extra.conf");
+        std::fs::write(&extra, format!("{}\n", real_dir.display())).unwrap();
+        let conf = tmp.path().join("fake.conf");
+        // First line: "includelocale" — old code with
+        // `strip_prefix("include")` treats the remainder ("locale")
+        // as a glob pattern and would include whatever matches
+        // ./locale. New code requires `"include "` with a trailing
+        // space so this line is treated as a non-include, non-dir
+        // line and ignored.
+        // Second line: the real include.
+        std::fs::write(
+            &conf,
+            format!("includelocale\ninclude {}\n", extra.display()),
+        )
+        .unwrap();
+        let paths = parse_ld_so_conf(&conf);
+        assert!(
+            paths.contains(&real_dir),
+            "real include must be honored: paths={paths:?}, expected {}",
+            real_dir.display()
+        );
+        assert!(
+            !paths.contains(&locale_dir),
+            "'includelocale' (no trailing space) must not match as an \
+             include directive; ./locale dir must not appear: {paths:?}"
+        );
     }
 
+    /// Regression: tab-separated `include\tpath.conf` must parse as an
+    /// include directive too. Prior `strip_prefix("include ")` required
+    /// a literal space and silently dropped tab-separated lines, which
+    /// some system ld.so.conf generators emit.
     #[test]
-    fn glob_match_prefix_star() {
-        assert!(glob_match("test*", "test.conf"));
-        assert!(glob_match("test*", "test"));
-        assert!(!glob_match("test*", "other"));
+    fn parse_ld_so_conf_accepts_tab_separator() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lib = tmp.path().join("tab-lib");
+        std::fs::create_dir(&lib).unwrap();
+        let extra = tmp.path().join("extra.conf");
+        std::fs::write(&extra, format!("{}\n", lib.display())).unwrap();
+        let conf = tmp.path().join("root.conf");
+        // Tab between "include" and the path.
+        std::fs::write(&conf, format!("include\t{}\n", extra.display())).unwrap();
+        let paths = parse_ld_so_conf(&conf);
+        assert!(
+            paths.contains(&lib),
+            "tab-separated include must be honored: {paths:?}"
+        );
     }
 
+    /// Regression: relative include paths must resolve against the
+    /// including file's parent directory (glibc semantics), not the
+    /// process CWD. Previously a `include nested.conf` from
+    /// `/etc/ld.so.conf.d/*.conf` silently missed its sibling file
+    /// when CWD was unrelated.
     #[test]
-    fn glob_match_middle_star() {
-        assert!(glob_match("lib*.so", "libfoo.so"));
-        assert!(!glob_match("lib*.so", "libfoo.a"));
+    fn parse_ld_so_conf_resolves_relative_include_against_parent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let resolved = tmp.path().join("resolved-relative");
+        std::fs::create_dir(&resolved).unwrap();
+        let main = sub.join("main.conf");
+        let sibling = sub.join("sibling.conf");
+        std::fs::write(&main, "include sibling.conf\n").unwrap();
+        std::fs::write(&sibling, format!("{}\n", resolved.display())).unwrap();
+        let paths = parse_ld_so_conf(&main);
+        assert!(
+            paths.contains(&resolved),
+            "relative include must resolve against main.conf's parent dir: {paths:?}"
+        );
     }
 
+    /// Regression: multi-component globs like `subdir/*/file.conf`
+    /// used to silently match nothing because the old file_name()-only
+    /// matcher ignored the wildcard directory segment.
     #[test]
-    fn glob_match_no_star() {
-        assert!(glob_match("exact", "exact"));
-        assert!(!glob_match("exact", "other"));
+    fn parse_ld_so_conf_multi_component_glob_matches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner_a = tmp.path().join("a").join("inner");
+        let inner_b = tmp.path().join("b").join("inner");
+        std::fs::create_dir_all(&inner_a).unwrap();
+        std::fs::create_dir_all(&inner_b).unwrap();
+        // Real on-disk dirs that the include files point at —
+        // parse_ld_so_conf rejects non-existent directories.
+        let lib_a = tmp.path().join("lib-a");
+        let lib_b = tmp.path().join("lib-b");
+        std::fs::create_dir(&lib_a).unwrap();
+        std::fs::create_dir(&lib_b).unwrap();
+        std::fs::write(inner_a.join("lib.conf"), format!("{}\n", lib_a.display())).unwrap();
+        std::fs::write(inner_b.join("lib.conf"), format!("{}\n", lib_b.display())).unwrap();
+        let root = tmp.path().join("root.conf");
+        std::fs::write(
+            &root,
+            format!("include {}/*/inner/lib.conf\n", tmp.path().display()),
+        )
+        .unwrap();
+        let paths = parse_ld_so_conf(&root);
+        assert!(
+            paths.contains(&lib_a) && paths.contains(&lib_b),
+            "multi-component glob must expand both matching files: {paths:?}"
+        );
     }
 
     // -- ld.so.cache parsing tests --

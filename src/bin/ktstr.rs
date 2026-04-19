@@ -303,7 +303,7 @@ fn kernel_build(
         let sp = cli::Spinner::start("Downloading kernel...");
         let result = fetch::download_tarball(&ver, tmp_dir.path(), "ktstr")
             .map_err(|e| anyhow::anyhow!("{e}"));
-        sp.clear();
+        drop(sp);
         result?
     };
 

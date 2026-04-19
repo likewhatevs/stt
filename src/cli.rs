@@ -611,7 +611,7 @@ pub fn kernel_build_pipeline(
         let sp = Spinner::start("Configuring kernel...");
         let result = configure_kernel(source_dir, EMBEDDED_KCONFIG);
         if result.is_err() {
-            sp.clear();
+            drop(sp);
         } else {
             sp.finish("Kernel configured");
         }
@@ -621,7 +621,7 @@ pub fn kernel_build_pipeline(
     let sp = Spinner::start("Building kernel...");
     let result = make_kernel_with_output(source_dir, Some(&sp));
     if result.is_err() {
-        sp.clear();
+        drop(sp);
     } else {
         sp.finish("Kernel built");
     }
@@ -635,7 +635,7 @@ pub fn kernel_build_pipeline(
         let sp = Spinner::start("Generating compile_commands.json...");
         let result = run_make_with_output(source_dir, &["compile_commands.json"], Some(&sp));
         if result.is_err() {
-            sp.clear();
+            drop(sp);
         } else {
             sp.finish("compile_commands.json generated");
         }
@@ -1278,9 +1278,12 @@ fn warn(msg: &str) {
 /// ticks in the background, and disables stdin echo to prevent
 /// keypress jank. When stderr is not a TTY, skips all indicatif
 /// machinery and falls back to plain stderr writes.
-/// Call `finish` with a completion message or `clear` to remove;
-/// [`Drop`] also restores echo and clears the bar if the spinner
-/// is dropped early (panic or `?` propagation).
+/// Call `finish` with a completion message to replace it with a
+/// final line, or let it drop to remove it silently; [`Drop`] also
+/// restores echo and clears the bar so a panic or early `?`
+/// propagation leaves the terminal in a usable state. Note: Drop
+/// does NOT run on SIGINT/SIGTERM kill; if the spinner is
+/// interrupted mid-operation, run `stty sane` to restore echo.
 pub struct Spinner {
     /// None when stderr is not a TTY — no indicatif overhead.
     pb: Option<indicatif::ProgressBar>,
@@ -1347,8 +1350,10 @@ impl Spinner {
     }
 
     /// Restore stdin echo if we disabled it, consuming `saved_termios`
-    /// via [`Option::take`]. Idempotent — `finish`, `clear`, and the
-    /// `Drop` impl all call this; only the first call has any effect.
+    /// via [`Option::take`]. Idempotent — `finish` and the `Drop`
+    /// impl both call this; only the first call has any effect. The
+    /// old standalone `clear` method was consolidated into `Drop`
+    /// (calling `drop(spinner)` produces the same effect).
     fn teardown(&mut self) {
         if let Some(termios) = self.saved_termios.take() {
             unsafe {
@@ -1395,26 +1400,17 @@ impl Spinner {
             None => f(),
         }
     }
-
-    /// Clear the spinner from the terminal.
-    ///
-    /// In non-TTY mode, this is a no-op.
-    pub fn clear(mut self) {
-        self.teardown();
-        if let Some(pb) = self.pb.take() {
-            pb.finish_and_clear();
-        }
-    }
 }
 
 impl Drop for Spinner {
     /// Restore terminal echo and clear any live progress bar on drop.
     ///
-    /// `finish` and `clear` call [`Self::teardown`] and take `self.pb`
-    /// via [`Option::take`], so this impl is a no-op after an explicit
-    /// end. When the spinner is dropped implicitly (panic, `?`
-    /// propagation, early return), this restores the termios saved in
-    /// [`Self::disable_echo`] so stdin is usable afterwards.
+    /// [`finish`](Self::finish) calls [`Self::teardown`] and takes
+    /// `self.pb` via [`Option::take`], so this impl is a no-op after
+    /// an explicit end. When the spinner is dropped implicitly
+    /// (panic, `?` propagation, `drop(sp)`, or scope exit), this
+    /// restores the termios saved in [`Self::disable_echo`] and
+    /// clears the live bar so stdin is usable afterwards.
     fn drop(&mut self) {
         self.teardown();
         if let Some(pb) = self.pb.take() {
@@ -1449,12 +1445,6 @@ mod tests {
         // exercises that lifecycle end-to-end.
         let sp = Spinner::start("test");
         sp.finish("done");
-    }
-
-    #[test]
-    fn spinner_clear_then_drop_is_idempotent() {
-        let sp = Spinner::start("test");
-        sp.clear();
     }
 
     // -- resolve_flags --

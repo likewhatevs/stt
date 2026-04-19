@@ -1329,55 +1329,100 @@ impl WorkloadHandle {
                             }
                         }
                     }
-                    // After closing inherited pipe fds, sever this
-                    // child's view of the guard. `fork()` duplicated
-                    // the parent's stack, so the child's local
-                    // `guard` references the same children pids and
-                    // pipe fds as the parent's — running Drop on a
-                    // panic unwind would SIGKILL every sibling
-                    // (fratricide). `_exit` bypasses Drop on the
-                    // happy path, but any `panic!` (alloc failure,
-                    // worker_main bug, etc.) would unwind through
-                    // SpawnGuard::Drop without this forget. The
-                    // parent retains the original on its own stack.
-                    std::mem::forget(guard);
-                    // Wait for parent to move us to cgroup before starting work.
-                    // Use poll() with a 30s timeout — signal-safe after fork,
-                    // prevents hanging forever if the parent stalls.
-                    let mut pfd = libc::pollfd {
-                        fd: start_fds[0],
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let ret = unsafe { libc::poll(&mut pfd, 1, 30_000) };
-                    if ret <= 0 {
-                        unsafe {
-                            libc::_exit(1);
-                        }
-                    }
-                    let mut buf = [0u8; 1];
-                    let mut f = unsafe { std::fs::File::from_raw_fd(start_fds[0]) };
-                    let _ = f.read_exact(&mut buf);
-                    drop(f);
-                    // Reset stop flag in case SIGUSR1 arrived during wait
-                    STOP.store(false, Ordering::Relaxed);
-                    // Now run
-                    let report = worker_main(
-                        affinity,
-                        config.work_type.clone(),
-                        config.sched_policy,
-                        config.mem_policy.clone(),
-                        config.mpol_flags,
-                        worker_pipe_fds,
-                        worker_futex,
-                        iter_slot,
-                    );
-                    let json = serde_json::to_vec(&report).unwrap_or_default();
-                    let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
-                    let _ = f.write_all(&json);
-                    drop(f);
+                    // Layered defense against child-side unwinding
+                    // reaching the forked-from-parent drops:
+                    //
+                    // 1. No-op panic hook — the default hook prints a
+                    //    multi-line backtrace to stderr, which is a
+                    //    shared fd with the parent post-fork. A panic
+                    //    in the child would interleave garbled output
+                    //    with the parent's tracing log and confuse
+                    //    downstream parsers. Install a silent hook
+                    //    before catch_unwind.
+                    //
+                    // 2. `mem::forget(guard)` — `fork()` duplicated
+                    //    the parent's stack, so the child's local
+                    //    `guard` references the same children pids
+                    //    and pipe fds as the parent's. Running its
+                    //    Drop on a panic unwind would SIGKILL every
+                    //    sibling (fratricide). Forget severs the
+                    //    child's view so Drop cannot run. Placed
+                    //    INSIDE the catch_unwind closure so it runs
+                    //    before worker_main and is scoped to the
+                    //    child path only.
+                    //
+                    // 3. `panic::catch_unwind` — catches any panic
+                    //    before it escapes this arm. Belt-and-braces
+                    //    against (a) additional Drops on this
+                    //    frame's stack (e.g. future refactors that
+                    //    add more RAII) and (b) alloc/OOM panics
+                    //    during worker_main / serde_json.
+                    //
+                    //    Caveat: catch_unwind is a no-op under
+                    //    `panic = "abort"`. ktstr's Cargo.toml does
+                    //    not set abort in any profile, so default
+                    //    unwind semantics apply. If a downstream
+                    //    consumer switches the panic strategy,
+                    //    defense (2) still severs guard Drop via
+                    //    mem::forget but the abort would also skip
+                    //    the `f.write_all(&json)` call, so the
+                    //    parent's `stop_and_collect` would see a
+                    //    missing WorkerReport — acceptable, the
+                    //    parent's sentinel fallback covers that
+                    //    case.
+                    //
+                    // 4. `_exit(1)` on catch_unwind Err, `_exit(0)`
+                    //    on Ok — bypasses Rust's global static
+                    //    destructors that a plain `return` would
+                    //    run.
+                    //
+                    // `AssertUnwindSafe` is justified: the child
+                    // unconditionally _exits after this block, so no
+                    // post-unwind invariant can be observed.
+                    let _ = std::panic::take_hook();
+                    std::panic::set_hook(Box::new(|_| {}));
+                    let child_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            std::mem::forget(guard);
+                            // Wait for parent to move us to cgroup before starting work.
+                            // Use poll() with a 30s timeout — signal-safe after fork,
+                            // prevents hanging forever if the parent stalls.
+                            let mut pfd = libc::pollfd {
+                                fd: start_fds[0],
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let ret = unsafe { libc::poll(&mut pfd, 1, 30_000) };
+                            if ret <= 0 {
+                                unsafe {
+                                    libc::_exit(1);
+                                }
+                            }
+                            let mut buf = [0u8; 1];
+                            let mut f = unsafe { std::fs::File::from_raw_fd(start_fds[0]) };
+                            let _ = f.read_exact(&mut buf);
+                            drop(f);
+                            // Reset stop flag in case SIGUSR1 arrived during wait
+                            STOP.store(false, Ordering::Relaxed);
+                            // Now run
+                            let report = worker_main(
+                                affinity,
+                                config.work_type.clone(),
+                                config.sched_policy,
+                                config.mem_policy.clone(),
+                                config.mpol_flags,
+                                worker_pipe_fds,
+                                worker_futex,
+                                iter_slot,
+                            );
+                            let json = serde_json::to_vec(&report).unwrap_or_default();
+                            let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
+                            let _ = f.write_all(&json);
+                            drop(f);
+                        }));
+                    let code = if child_result.is_ok() { 0 } else { 1 };
                     unsafe {
-                        libc::_exit(0);
+                        libc::_exit(code);
                     }
                 }
                 child_pid => {

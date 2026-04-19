@@ -255,7 +255,7 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
         let result =
             cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"));
         if result.is_err() {
-            sp.clear();
+            drop(sp);
         } else {
             sp.finish("Kernel configured");
         }
@@ -265,7 +265,7 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     let sp = cli::Spinner::start("Building kernel...");
     let result = cli::make_kernel_with_output(kernel_dir, Some(&sp)).map_err(|e| format!("{e:#}"));
     if result.is_err() {
-        sp.clear();
+        drop(sp);
     } else {
         sp.finish("Kernel built");
     }
@@ -277,7 +277,7 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     let result = cli::run_make_with_output(kernel_dir, &["compile_commands.json"], Some(&sp))
         .map_err(|e| format!("{e:#}"));
     if result.is_err() {
-        sp.clear();
+        drop(sp);
     } else {
         sp.finish("Done");
     }
@@ -417,7 +417,7 @@ fn kernel_build(
         }
         let sp = cli::Spinner::start("Downloading kernel...");
         let result = fetch::download_tarball(&ver, tmp_dir.path(), "cargo ktstr");
-        sp.clear();
+        drop(sp);
         result?
     };
 
