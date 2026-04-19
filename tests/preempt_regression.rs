@@ -42,7 +42,7 @@ fn init_shared_futex() {
 /// schedulers. Neither MutexContention (no memory pressure under lock)
 /// nor PageFaultChurn (no contention) alone reproduces this interaction.
 fn fault_under_lock(stop: &AtomicBool) -> WorkerReport {
-    let tid = unsafe { libc::getpid() } as u32;
+    let tid: libc::pid_t = unsafe { libc::getpid() };
     let start = Instant::now();
     let mut work_units = 0u64;
     let mut iterations = 0u64;
@@ -176,7 +176,7 @@ fn fault_under_lock(stop: &AtomicBool) -> WorkerReport {
     }
 }
 
-fn zeroed_report(tid: u32, start: Instant) -> WorkerReport {
+fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
     WorkerReport {
         tid,
         work_units: 0,

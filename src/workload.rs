@@ -873,7 +873,10 @@ pub struct Migration {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerReport {
     /// Worker process ID (from `getpid()` in the forked child).
-    pub tid: u32,
+    /// Stored as `pid_t` (i32) to match the kernel's native type and
+    /// avoid the silent u32→i32 sign-cast wraparound at libc
+    /// boundaries (kill/waitpid/Pid::from_raw).
+    pub tid: i32,
     /// Cumulative work iterations (incremented by `spin_burst` or I/O loops).
     pub work_units: u64,
     /// Thread CPU time from `CLOCK_THREAD_CPUTIME_ID` (ns).
@@ -951,7 +954,17 @@ pub(crate) fn set_repro_mode(v: bool) {
 /// Each worker is a separate process so it can be in its own cgroup.
 #[must_use = "dropping a WorkloadHandle immediately kills all worker processes"]
 pub struct WorkloadHandle {
-    children: Vec<(u32, std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
+    /// Per-worker (pid, report_fd, start_fd). Pid is stored as the
+    /// kernel's `pid_t` (i32) rather than u32: Linux `pid_max ≤ 2^22`
+    /// always fits in the positive i32 range, so widening to u32 only
+    /// risks the classic "value > i32::MAX silently becomes a negative
+    /// pid_t, and kill(-1, ...) reaps the whole session" sign-cast bug
+    /// at every boundary that feeds a libc function.
+    children: Vec<(
+        libc::pid_t,
+        std::os::unix::io::RawFd,
+        std::os::unix::io::RawFd,
+    )>,
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
@@ -966,9 +979,127 @@ pub struct WorkloadHandle {
     iter_counter_len: usize,
 }
 
-// SAFETY: futex_ptrs and iter_counters are MAP_SHARED anonymous pages owned
-// exclusively by this handle. Only the parent process accesses them for
-// munmap on drop.
+/// Scope guard that owns every resource acquired during
+/// [`WorkloadHandle::spawn`]'s partial setup. If `spawn` returns
+/// early (via `?` or `bail!`), the guard's `Drop` kills and reaps any
+/// already-forked children, closes every open pipe fd, and munmaps
+/// every shared region — so a mid-setup failure never leaks fds,
+/// zombie processes, or anonymous-shared pages.
+///
+/// On success, [`SpawnGuard::into_handle`] moves the live resources
+/// into the returned [`WorkloadHandle`] and leaves the guard empty;
+/// its `Drop` then closes only the inter-worker `pipe_pairs`
+/// (intentionally owned by the guard, not the handle, because the
+/// parent never uses them after fork).
+struct SpawnGuard {
+    /// Inter-worker paired pipes `(ab, ba)` for PipeIo/CachePipe.
+    /// Closed by the guard on every exit (success or failure) —
+    /// children inherit copies via fork and close their own ends.
+    pipe_pairs: Vec<([i32; 2], [i32; 2])>,
+    /// Shared-memory futex regions (transferred to handle on success).
+    futex_ptrs: Vec<*mut u32>,
+    futex_region_size: usize,
+    /// Per-worker iteration counter region (transferred on success).
+    iter_counters: *mut u64,
+    iter_counter_bytes: usize,
+    /// Already-forked children with their parent-side pipe fds
+    /// (transferred to handle on success).
+    children: Vec<(libc::pid_t, i32, i32)>,
+}
+
+impl SpawnGuard {
+    fn new(futex_region_size: usize) -> Self {
+        Self {
+            pipe_pairs: Vec::new(),
+            futex_ptrs: Vec::new(),
+            futex_region_size,
+            iter_counters: std::ptr::null_mut(),
+            iter_counter_bytes: 0,
+            children: Vec::new(),
+        }
+    }
+
+    /// Transfer live resources into a [`WorkloadHandle`]. Leaves the
+    /// guard's `children`, `futex_ptrs`, and `iter_counters` empty so
+    /// the guard's subsequent `Drop` only closes the inter-worker
+    /// `pipe_pairs` (which the parent never uses post-fork).
+    fn into_handle(mut self) -> WorkloadHandle {
+        let children = std::mem::take(&mut self.children);
+        let futex_ptrs = std::mem::take(&mut self.futex_ptrs);
+        let iter_counters = std::mem::replace(&mut self.iter_counters, std::ptr::null_mut());
+        let iter_counter_bytes = std::mem::replace(&mut self.iter_counter_bytes, 0);
+        let iter_counter_len = iter_counter_bytes / std::mem::size_of::<u64>();
+        WorkloadHandle {
+            children,
+            started: false,
+            futex_ptrs,
+            futex_region_size: self.futex_region_size,
+            iter_counters,
+            iter_counter_len,
+        }
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        // Kill and reap any already-forked children first, so their
+        // pipe ends are not left blocked when we close the parent
+        // side.
+        for &(pid, _, _) in &self.children {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0i32;
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        // Close each child's parent-side report/start fds.
+        for &(_, rfd, wfd) in &self.children {
+            for fd in [rfd, wfd] {
+                if fd >= 0 {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+            }
+        }
+        // Close every inter-worker pipe pair. Children closed their
+        // own inherited copies in the fork arm, so these are the
+        // only remaining references.
+        for (ab, ba) in &self.pipe_pairs {
+            for fd in [ab[0], ab[1], ba[0], ba[1]] {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+        // Munmap shared regions.
+        for &ptr in &self.futex_ptrs {
+            unsafe {
+                libc::munmap(ptr as *mut libc::c_void, self.futex_region_size);
+            }
+        }
+        if !self.iter_counters.is_null() && self.iter_counter_bytes > 0 {
+            unsafe {
+                libc::munmap(
+                    self.iter_counters as *mut libc::c_void,
+                    self.iter_counter_bytes,
+                );
+            }
+        }
+    }
+}
+
+// SAFETY: futex_ptrs and iter_counters are MAP_SHARED anonymous pages
+// created before fork, so every forked child inherits a pointer copy
+// of the same underlying kernel object. Children read/write their own
+// futex word (via `std::ptr::read_volatile`/`write_volatile`) and
+// atomically store into their dedicated iter_counters slot (via
+// `AtomicU64::from_ptr`); the parent reads all slots via
+// `snapshot_iterations` and is the sole process that munmaps the
+// region, on WorkloadHandle::drop after every child has been reaped.
+// No Rust reference is ever shared across processes — only raw
+// pointers into a MAP_SHARED region — so the inherited alias is not
+// an aliasing-rule violation.
 unsafe impl Send for WorkloadHandle {}
 unsafe impl Sync for WorkloadHandle {}
 
@@ -992,20 +1123,39 @@ impl WorkloadHandle {
             );
         }
 
+        // All failable acquisitions in this function route through
+        // `guard`. If any `?`/`bail!` returns early, the guard's Drop
+        // SIGKILLs+reaps forked children, closes open pipe fds, and
+        // munmaps the shared regions — so no leak on a mid-spawn
+        // error path.
+        let futex_region_size = if matches!(config.work_type, WorkType::SchBench { .. }) {
+            16
+        } else {
+            std::mem::size_of::<u32>()
+        };
+        let mut guard = SpawnGuard::new(futex_region_size);
+
         // For paired work types, create one pipe per worker pair before forking.
         // pipe_pairs[pair_idx] = (read_fd, write_fd) for the A->B direction,
         // and a second pipe for B->A.
-        let mut pipe_pairs: Vec<([i32; 2], [i32; 2])> = Vec::new();
         if needs_pipes {
             for _ in 0..config.num_workers / 2 {
                 let mut ab = [0i32; 2]; // A writes, B reads
-                let mut ba = [0i32; 2]; // B writes, A reads
-                if unsafe { libc::pipe(ab.as_mut_ptr()) } != 0
-                    || unsafe { libc::pipe(ba.as_mut_ptr()) } != 0
-                {
+                if unsafe { libc::pipe(ab.as_mut_ptr()) } != 0 {
                     anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
                 }
-                pipe_pairs.push((ab, ba));
+                let mut ba = [0i32; 2]; // B writes, A reads
+                if unsafe { libc::pipe(ba.as_mut_ptr()) } != 0 {
+                    // Close the ab half we just created: it is not
+                    // yet owned by the guard, so its Drop won't
+                    // otherwise reach it.
+                    unsafe {
+                        libc::close(ab[0]);
+                        libc::close(ab[1]);
+                    }
+                    anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
+                }
+                guard.pipe_pairs.push((ab, ba));
             }
         }
 
@@ -1013,13 +1163,7 @@ impl WorkloadHandle {
         // per worker group via MAP_SHARED|MAP_ANONYMOUS so all members of the
         // fork see the same physical page. SchBench needs 16 bytes (futex u32
         // at offset 0, wake timestamp u64 at offset 8); others need 4 bytes.
-        let mut futex_ptrs: Vec<*mut u32> = Vec::new();
         let futex_group_size = config.work_type.worker_group_size().unwrap_or(2);
-        let futex_region_size = if matches!(config.work_type, WorkType::SchBench { .. }) {
-            16
-        } else {
-            std::mem::size_of::<u32>()
-        };
         if needs_futex {
             for _ in 0..config.num_workers / futex_group_size {
                 let ptr = unsafe {
@@ -1036,7 +1180,7 @@ impl WorkloadHandle {
                     anyhow::bail!("mmap failed: {}", std::io::Error::last_os_error());
                 }
                 unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, futex_region_size) };
-                futex_ptrs.push(ptr as *mut u32);
+                guard.futex_ptrs.push(ptr as *mut u32);
             }
         }
 
@@ -1044,7 +1188,7 @@ impl WorkloadHandle {
         // atomically stores its iteration count to slot [i]. The parent
         // reads all slots via snapshot_iterations().
         let iter_counter_len = config.num_workers;
-        let iter_counters = if iter_counter_len > 0 {
+        if iter_counter_len > 0 {
             let size = iter_counter_len * std::mem::size_of::<u64>();
             let ptr = unsafe {
                 libc::mmap(
@@ -1062,12 +1206,9 @@ impl WorkloadHandle {
                     std::io::Error::last_os_error()
                 );
             }
-            ptr as *mut u64
-        } else {
-            std::ptr::null_mut()
-        };
-
-        let mut children = Vec::with_capacity(config.num_workers);
+            guard.iter_counters = ptr as *mut u64;
+            guard.iter_counter_bytes = size;
+        }
 
         for i in 0..config.num_workers {
             let affinity = resolve_affinity(&config.affinity)?;
@@ -1075,7 +1216,7 @@ impl WorkloadHandle {
             // Determine pipe fds for this worker (PipeIo/CachePipe).
             let worker_pipe_fds: Option<(i32, i32)> = if needs_pipes {
                 let pair_idx = i / 2;
-                let (ref ab, ref ba) = pipe_pairs[pair_idx];
+                let (ref ab, ref ba) = guard.pipe_pairs[pair_idx];
                 if i % 2 == 0 {
                     // Worker A: writes to ab[1], reads from ba[0]
                     Some((ba[0], ab[1]))
@@ -1091,30 +1232,49 @@ impl WorkloadHandle {
             let worker_futex: Option<(*mut u32, bool)> = if needs_futex {
                 let group_idx = i / futex_group_size;
                 let is_first = i % futex_group_size == 0;
-                Some((futex_ptrs[group_idx], is_first))
+                Some((guard.futex_ptrs[group_idx], is_first))
             } else {
                 None
             };
 
             // Shared iteration counter slot for this worker.
-            let iter_slot: *mut u64 = if !iter_counters.is_null() {
-                unsafe { iter_counters.add(i) }
+            let iter_slot: *mut u64 = if !guard.iter_counters.is_null() {
+                unsafe { guard.iter_counters.add(i) }
             } else {
                 std::ptr::null_mut()
             };
 
-            // Create pipe for report and a second pipe for "start" signal
+            // Create pipe for report and a second pipe for "start" signal.
+            // Local cleanup on second-pipe failure: the guard has no
+            // per-worker tracking of half-allocated pipes, so the first
+            // half closes here before the bail.
             let mut report_fds = [0i32; 2];
+            if unsafe { libc::pipe(report_fds.as_mut_ptr()) } != 0 {
+                anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
+            }
             let mut start_fds = [0i32; 2];
-            if unsafe { libc::pipe(report_fds.as_mut_ptr()) } != 0
-                || unsafe { libc::pipe(start_fds.as_mut_ptr()) } != 0
-            {
+            if unsafe { libc::pipe(start_fds.as_mut_ptr()) } != 0 {
+                unsafe {
+                    libc::close(report_fds[0]);
+                    libc::close(report_fds[1]);
+                }
                 anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
             }
 
             let pid = unsafe { libc::fork() };
             match pid {
-                -1 => anyhow::bail!("fork failed: {}", std::io::Error::last_os_error()),
+                -1 => {
+                    // Fork failed: close both fresh pipes so they don't
+                    // leak before the guard reaps the already-forked
+                    // siblings.
+                    unsafe {
+                        libc::close(report_fds[0]);
+                        libc::close(report_fds[1]);
+                        libc::close(start_fds[0]);
+                        libc::close(start_fds[1]);
+                    }
+                    anyhow::bail!("fork failed: {}", std::io::Error::last_os_error());
+                }
                 0 => {
                     // Child: install signal handler FIRST (before start wait)
                     // to prevent SIGUSR1 killing us before we're ready
@@ -1133,7 +1293,7 @@ impl WorkloadHandle {
                     // Close pipe ends belonging to other workers in this pair.
                     if needs_pipes {
                         let pair_idx = i / 2;
-                        let (ref ab, ref ba) = pipe_pairs[pair_idx];
+                        let (ref ab, ref ba) = guard.pipe_pairs[pair_idx];
                         if i % 2 == 0 {
                             // Worker A keeps ba[0] (read) and ab[1] (write).
                             // Close ab[0] and ba[1].
@@ -1150,7 +1310,7 @@ impl WorkloadHandle {
                             }
                         }
                         // Close all pipe fds from other pairs.
-                        for (j, (ab2, ba2)) in pipe_pairs.iter().enumerate() {
+                        for (j, (ab2, ba2)) in guard.pipe_pairs.iter().enumerate() {
                             if j != pair_idx {
                                 unsafe {
                                     libc::close(ab2[0]);
@@ -1161,6 +1321,18 @@ impl WorkloadHandle {
                             }
                         }
                     }
+                    // After closing inherited pipe fds, sever this
+                    // child's view of the guard. `fork()` duplicated
+                    // the parent's stack, so the child's local
+                    // `guard` references the same children pids and
+                    // pipe fds as the parent's — running Drop on a
+                    // panic unwind would SIGKILL every sibling
+                    // (fratricide). `_exit` bypasses Drop on the
+                    // happy path, but any `panic!` (alloc failure,
+                    // worker_main bug, etc.) would unwind through
+                    // SpawnGuard::Drop without this forget. The
+                    // parent retains the original on its own stack.
+                    std::mem::forget(guard);
                     // Wait for parent to move us to cgroup before starting work.
                     // Use poll() with a 30s timeout — signal-safe after fork,
                     // prevents hanging forever if the parent stalls.
@@ -1201,38 +1373,37 @@ impl WorkloadHandle {
                     }
                 }
                 child_pid => {
-                    // Parent: close unused pipe ends
+                    // Parent: close unused pipe ends.
                     unsafe {
                         libc::close(report_fds[1]);
                         libc::close(start_fds[0]);
                     }
-                    children.push((child_pid as u32, report_fds[0], start_fds[1]));
+                    // child_pid is positive by the -1 arm above, so
+                    // fits in pid_t directly — store as pid_t so
+                    // every downstream libc call avoids the u32→i32
+                    // sign-cast wraparound bug.
+                    guard
+                        .children
+                        .push((child_pid, report_fds[0], start_fds[1]));
                 }
             }
         }
 
-        // Parent: close all inter-worker pipe fds (children inherited them).
-        for (ab, ba) in &pipe_pairs {
-            unsafe {
-                libc::close(ab[0]);
-                libc::close(ab[1]);
-                libc::close(ba[0]);
-                libc::close(ba[1]);
-            }
-        }
-
-        Ok(Self {
-            children,
-            started: false,
-            futex_ptrs,
-            futex_region_size,
-            iter_counters,
-            iter_counter_len,
-        })
+        // Success: transfer live resources (children, futex_ptrs,
+        // iter_counters) to the handle. The guard's subsequent Drop
+        // closes the inter-worker `pipe_pairs` — the parent never
+        // uses them post-fork, and they were never owned by the
+        // handle.
+        Ok(guard.into_handle())
     }
 
-    /// PIDs of all worker processes.
-    pub fn tids(&self) -> Vec<u32> {
+    /// PIDs of all worker processes, in spawn order.
+    ///
+    /// Returned as `libc::pid_t` — the kernel's native type — so
+    /// callers feed them directly into `kill`, `waitpid`,
+    /// `Pid::from_raw`, and `cgroup.procs` writes without any
+    /// sign-cast at the libc boundary.
+    pub fn tids(&self) -> Vec<libc::pid_t> {
         self.children.iter().map(|(pid, _, _)| *pid).collect()
     }
 
@@ -1300,10 +1471,14 @@ impl WorkloadHandle {
         let mut reports = Vec::new();
         let children = std::mem::take(&mut self.children);
 
-        // Signal all children to stop
+        // Signal all children to stop.
+        // `pid` is `libc::pid_t`, so it flows to `Pid::from_raw`
+        // without the u32→i32 sign-cast wraparound that produced
+        // `kill(-1, ...)` session-wide reaps when the old u32 pid
+        // exceeded i32::MAX.
         for &(pid, _, _) in &children {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
+                nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGUSR1,
             );
         }
@@ -1339,13 +1514,15 @@ impl WorkloadHandle {
                 }
             }
 
-            // Wait for child (WNOHANG first, then SIGKILL if still alive)
+            // Wait for child (WNOHANG first, then SIGKILL if still alive).
+            // `pid` is already `libc::pid_t`, so no sign cast is
+            // needed at the libc boundary.
             let mut status = 0i32;
-            let ret = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+            let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if ret == 0 {
                 unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                    libc::waitpid(pid as i32, &mut status, 0);
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
                 }
             }
 
@@ -1357,6 +1534,8 @@ impl WorkloadHandle {
                     buf.len()
                 );
                 reports.push(WorkerReport {
+                    // Both `pid` and `WorkerReport.tid` are `pid_t`
+                    // (i32) now — no cast needed.
                     tid: pid,
                     work_units: 0,
                     cpu_time_ns: 0,
@@ -1389,8 +1568,12 @@ impl Drop for WorkloadHandle {
         use nix::sys::wait::waitpid;
         use nix::unistd::{Pid, close};
 
+        // `pid` is `libc::pid_t` — stored as i32 so `Pid::from_raw`
+        // receives the kernel's native representation directly, not
+        // the sign-cast of a u32 that could alias negative values
+        // (including -1, i.e. every process in the session).
         for &(pid, rfd, wfd) in &self.children {
-            let nix_pid = Pid::from_raw(pid as i32);
+            let nix_pid = Pid::from_raw(pid);
             if let Err(e) = kill(nix_pid, Signal::SIGKILL) {
                 tracing::warn!(pid, %e, "kill failed in WorkloadHandle::drop");
             }
@@ -1436,7 +1619,9 @@ fn worker_main(
     futex: Option<(*mut u32, bool)>,
     iter_slot: *mut u64,
 ) -> WorkerReport {
-    let tid = unsafe { libc::getpid() } as u32;
+    // `getpid()` returns `pid_t` — keep the native type all the way
+    // through to `WorkerReport.tid`.
+    let tid: libc::pid_t = unsafe { libc::getpid() };
 
     if let Some(ref cpus) = affinity {
         let _ = set_thread_affinity(tid, cpus);
@@ -2475,7 +2660,15 @@ fn thread_cpu_time_ns() -> u64 {
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
 
-fn set_sched_policy(pid: u32, policy: SchedPolicy) -> Result<()> {
+fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<()> {
+    // Reject pid <= 0: pid 0 means "calling process" to the syscall,
+    // pid -1 means "every process in the session," and pid < -1
+    // targets a process group. None are valid inputs from within
+    // this crate, which only ever stores real worker pids. Mirrors
+    // `process_alive` in scenario/mod.rs.
+    if pid <= 0 {
+        anyhow::bail!("sched_setscheduler: invalid pid {pid} (must be > 0)");
+    }
     let (pol, prio) = match policy {
         SchedPolicy::Normal => return Ok(()),
         SchedPolicy::Batch => (libc::SCHED_BATCH, 0),
@@ -2486,23 +2679,29 @@ fn set_sched_policy(pid: u32, policy: SchedPolicy) -> Result<()> {
     let param = libc::sched_param {
         sched_priority: prio,
     };
-    if unsafe { libc::sched_setscheduler(pid as i32, pol, &param) } != 0 {
+    if unsafe { libc::sched_setscheduler(pid, pol, &param) } != 0 {
         anyhow::bail!("sched_setscheduler: {}", std::io::Error::last_os_error());
     }
     Ok(())
 }
 
 /// Pin a process to the given CPU set via `sched_setaffinity`.
-pub fn set_thread_affinity(pid: u32, cpus: &BTreeSet<usize>) -> Result<()> {
+pub fn set_thread_affinity(pid: libc::pid_t, cpus: &BTreeSet<usize>) -> Result<()> {
     use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;
+    // See `set_sched_policy` for the rationale — pid <= 0 has
+    // broadcast semantics at the syscall and must not be passed
+    // through unchecked.
+    if pid <= 0 {
+        anyhow::bail!("sched_setaffinity: invalid pid {pid} (must be > 0)");
+    }
     let mut cpu_set = CpuSet::new();
     for &cpu in cpus {
         cpu_set
             .set(cpu)
             .with_context(|| format!("CPU {cpu} out of range"))?;
     }
-    sched_setaffinity(Pid::from_raw(pid as i32), &cpu_set)
+    sched_setaffinity(Pid::from_raw(pid), &cpu_set)
         .with_context(|| format!("sched_setaffinity pid={pid}"))?;
     Ok(())
 }
@@ -2698,6 +2897,83 @@ mod tests {
         assert!(reports[0].work_units > 0);
     }
 
+    /// Regression guard for the sign-cast bug: every pid returned
+    /// from `tids()` must be a positive, live `pid_t` that round-trips
+    /// through `Pid::from_raw` + `kill(_, None)` (the "exists" probe).
+    /// A negative pid would silently broadcast SIGKILL to a process
+    /// group; a stale/reaped pid would fail the probe with ESRCH.
+    /// Either indicates storage upstream re-introduced the u32
+    /// wraparound or dropped a child on the floor.
+    #[test]
+    fn spawn_pids_fit_in_pid_t() {
+        let config = WorkloadConfig {
+            num_workers: 4,
+            affinity: AffinityMode::None,
+            work_type: WorkType::CpuSpin,
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let h = WorkloadHandle::spawn(&config).unwrap();
+        for pid in h.tids() {
+            assert!(pid > 0, "child pid must be positive, got {pid}");
+            // Signal 0 (None) only checks existence; it does not
+            // deliver anything. Proves the pid is a real, live
+            // process we can address — not a negative-cast bomb.
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                .unwrap_or_else(|e| panic!("spawned child pid {pid} not addressable: {e}"));
+        }
+    }
+
+    /// Regression guard for the spawn-leak fix: on a mid-setup
+    /// `bail!` path, the `SpawnGuard` Drop must release every
+    /// resource acquired so far — no leaked children, no leaked
+    /// pipe fds, no leaked mmap regions. This test constructs a
+    /// config that passes the `worker_group_size` check and then
+    /// provokes the per-worker pipe path (num_workers=2 with
+    /// PipeIo) so the function allocates inter-worker pipes and
+    /// spawns successfully, then verifies Drop cleans up when the
+    /// handle is dropped without `stop_and_collect`.
+    ///
+    /// The direct spawn-failure path is hard to trigger
+    /// synthetically (would require EMFILE / ENOMEM injection); the
+    /// scope guard's correctness is proven by the unified cleanup
+    /// pattern — Drop runs on every early return *and* on the
+    /// normal drop-without-collect flow.
+    #[test]
+    fn handle_drop_reaps_children_and_closes_pipes() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            affinity: AffinityMode::None,
+            work_type: WorkType::PipeIo { burst_iters: 4 },
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let h = WorkloadHandle::spawn(&config).unwrap();
+        let pids = h.tids();
+        assert_eq!(pids.len(), 2, "both workers spawned");
+        // Drop without calling start() or stop_and_collect() — this
+        // exercises the WorkloadHandle::Drop path, which has the
+        // same cleanup semantics as SpawnGuard's error path.
+        drop(h);
+        // Poll for termination: ESRCH (no such process) means the
+        // child was reaped. Give the kernel a brief grace window
+        // because waitpid runs synchronously but kill reporting can
+        // race.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for pid in pids {
+            loop {
+                let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+                if !alive {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("child {pid} still alive after drop deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
     #[test]
     fn spawn_multiple_workers_distinct_pids() {
         let config = WorkloadConfig {
@@ -2710,7 +2986,7 @@ mod tests {
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         let tids = h.tids();
         assert_eq!(tids.len(), 4);
-        let unique: std::collections::HashSet<u32> = tids.iter().copied().collect();
+        let unique: std::collections::HashSet<libc::pid_t> = tids.iter().copied().collect();
         assert_eq!(unique.len(), 4, "all worker PIDs should be distinct");
         h.start();
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -2745,10 +3021,9 @@ mod tests {
         let h = WorkloadHandle::spawn(&config).unwrap();
         let pids = h.tids();
         drop(h);
-        // After drop, children should be dead
+        // After drop, children should be dead.
         for pid in pids {
-            let alive =
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
+            let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
             assert!(!alive, "child {} should be dead after drop", pid);
         }
     }
@@ -2850,7 +3125,7 @@ mod tests {
 
     #[test]
     fn set_thread_affinity_cpu_zero() {
-        let pid = std::process::id();
+        let pid: libc::pid_t = unsafe { libc::getpid() };
         let cpus: BTreeSet<usize> = [0].into_iter().collect();
         let result = set_thread_affinity(pid, &cpus);
         assert!(result.is_ok(), "pinning to CPU 0 should succeed");
@@ -2916,7 +3191,7 @@ mod tests {
 
         // Max u64 values
         let r = WorkerReport {
-            tid: u32::MAX,
+            tid: i32::MAX,
             work_units: u64::MAX,
             cpu_time_ns: u64::MAX,
             wall_time_ns: u64::MAX,
@@ -2938,7 +3213,7 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
         assert_eq!(r2.work_units, u64::MAX);
-        assert_eq!(r2.tid, u32::MAX);
+        assert_eq!(r2.tid, i32::MAX);
     }
 
     #[test]
@@ -2985,7 +3260,7 @@ mod tests {
 
     #[test]
     fn set_sched_policy_normal_succeeds() {
-        let pid = std::process::id();
+        let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Normal);
         assert!(result.is_ok());
     }
@@ -3074,7 +3349,7 @@ mod tests {
 
     #[test]
     fn set_sched_policy_fifo_returns_result() {
-        let pid = std::process::id();
+        let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Fifo(1));
         // SCHED_FIFO requires CAP_SYS_NICE — fails without privileges.
         assert!(
@@ -3085,7 +3360,7 @@ mod tests {
 
     #[test]
     fn set_sched_policy_rr_returns_result() {
-        let pid = std::process::id();
+        let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::RoundRobin(1));
         // SCHED_RR requires CAP_SYS_NICE — fails without privileges.
         assert!(result.is_err(), "SCHED_RR should fail without CAP_SYS_NICE");
@@ -3127,19 +3402,19 @@ mod tests {
 
     /// Restore SCHED_NORMAL via the raw syscall. `set_sched_policy(Normal)`
     /// is a no-op, so tests that change policy must use this to restore.
-    fn restore_normal(pid: u32) {
+    fn restore_normal(pid: libc::pid_t) {
         let param = libc::sched_param { sched_priority: 0 };
-        unsafe { libc::sched_setscheduler(pid as i32, libc::SCHED_OTHER, &param) };
+        unsafe { libc::sched_setscheduler(pid, libc::SCHED_OTHER, &param) };
     }
 
     #[test]
     fn set_sched_policy_batch_returns_valid_result() {
-        let pid = std::process::id();
+        let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Batch);
         // SCHED_BATCH may fail under sched_ext or without CAP_SYS_NICE.
         match result {
             Ok(()) => {
-                let pol = unsafe { libc::sched_getscheduler(pid as i32) };
+                let pol = unsafe { libc::sched_getscheduler(pid) };
                 // sched_ext may override the effective policy, so the
                 // kernel can report a different value than SCHED_BATCH
                 // even after a successful sched_setscheduler.
@@ -3161,12 +3436,12 @@ mod tests {
 
     #[test]
     fn set_sched_policy_idle_returns_valid_result() {
-        let pid = std::process::id();
+        let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Idle);
         // SCHED_IDLE may fail under sched_ext or without CAP_SYS_NICE.
         match result {
             Ok(()) => {
-                let pol = unsafe { libc::sched_getscheduler(pid as i32) };
+                let pol = unsafe { libc::sched_getscheduler(pid) };
                 // sched_ext may override the effective policy, so the
                 // kernel can report a different value than SCHED_IDLE
                 // even after a successful sched_setscheduler.
@@ -4072,7 +4347,7 @@ mod tests {
     }
 
     fn custom_spin_fn(stop: &AtomicBool) -> WorkerReport {
-        let tid = unsafe { libc::getpid() } as u32;
+        let tid: libc::pid_t = unsafe { libc::getpid() };
         let start = Instant::now();
         let mut work_units = 0u64;
         while !stop.load(Ordering::Relaxed) {

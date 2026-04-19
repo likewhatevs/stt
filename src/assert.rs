@@ -1716,7 +1716,7 @@ mod tests {
     use crate::workload::WorkerReport;
 
     fn rpt(
-        tid: u32,
+        tid: i32,
         work: u64,
         wall_ns: u64,
         off_cpu_ns: u64,
@@ -3064,7 +3064,7 @@ mod tests {
     // -- assert_benchmarks tests --
 
     fn rpt_with_latencies(
-        tid: u32,
+        tid: i32,
         latencies: Vec<u64>,
         iterations: u64,
         wall_ns: u64,

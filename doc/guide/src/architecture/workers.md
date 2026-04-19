@@ -45,7 +45,7 @@ Each worker produces a `WorkerReport`:
 
 ```rust,ignore
 pub struct WorkerReport {
-    pub tid: u32,
+    pub tid: i32,
     pub work_units: u64,
     pub cpu_time_ns: u64,
     pub wall_time_ns: u64,

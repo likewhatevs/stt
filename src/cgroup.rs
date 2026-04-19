@@ -196,7 +196,7 @@ impl CgroupManager {
     }
 
     /// Move a single task into a child cgroup via `cgroup.procs`.
-    pub fn move_task(&self, name: &str, tid: u32) -> Result<()> {
+    pub fn move_task(&self, name: &str, tid: libc::pid_t) -> Result<()> {
         let p = self.parent.join(name).join("cgroup.procs");
         write_with_timeout(&p, &tid.to_string(), CGROUP_WRITE_TIMEOUT)
     }
@@ -208,7 +208,7 @@ impl CgroupManager {
     /// rejections from sched_ext BPF `cgroup_prep_move` callbacks
     /// (`scx_cgroup_can_attach`). Propagates EBUSY after retries
     /// exhausted. Propagates all other errors immediately.
-    pub fn move_tasks(&self, name: &str, tids: &[u32]) -> Result<()> {
+    pub fn move_tasks(&self, name: &str, tids: &[libc::pid_t]) -> Result<()> {
         for &t in tids {
             if let Err(e) = self.move_task_with_retry(name, t) {
                 if is_esrch(&e) {
@@ -222,7 +222,7 @@ impl CgroupManager {
     }
 
     /// Move a single task with bounded EBUSY retry.
-    fn move_task_with_retry(&self, name: &str, tid: u32) -> Result<()> {
+    fn move_task_with_retry(&self, name: &str, tid: libc::pid_t) -> Result<()> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: Duration = Duration::from_millis(100);
 

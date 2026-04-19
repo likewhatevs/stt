@@ -200,7 +200,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ktstr::workload::{WorkType, WorkerReport};
 
 fn my_workload(stop: &AtomicBool) -> WorkerReport {
-    let tid = unsafe { libc::getpid() } as u32;
+    let tid: libc::pid_t = unsafe { libc::getpid() };
     let start = std::time::Instant::now();
     let mut work_units = 0u64;
     while !stop.load(Ordering::Relaxed) {
