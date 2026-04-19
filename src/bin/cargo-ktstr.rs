@@ -285,38 +285,19 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn run_test(kernel: Option<String>, no_perf_mode: bool, args: Vec<String>) -> Result<(), String> {
-    use ktstr::kernel_path::KernelId;
-
-    let mut cmd = Command::new("cargo");
-    cmd.args(["nextest", "run"]).args(&args);
-
-    if no_perf_mode {
-        cmd.env("KTSTR_NO_PERF_MODE", "1");
-    }
-
-    if let Some(ref val) = kernel {
-        match KernelId::parse(val) {
-            KernelId::Path(p) => {
-                let dir = std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p));
-                build_kernel(&dir, false)?;
-                cmd.env("KTSTR_KERNEL", &dir);
-            }
-            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
-                    .map_err(|e| format!("{e:#}"))?;
-                eprintln!("cargo ktstr: using kernel {}", cache_dir.display());
-                cmd.env("KTSTR_KERNEL", &cache_dir);
-            }
-        }
-    }
-
-    eprintln!("cargo ktstr: running tests");
-    let err = cmd.exec();
-    Err(format!("exec cargo nextest run: {err}"))
-}
-
-fn run_coverage(
+/// Shared runner for `cargo ktstr test` and `cargo ktstr coverage`.
+///
+/// Both subcommands have the same plumbing: resolve `--kernel` to a
+/// cache entry or source-tree build, propagate `--no-perf-mode` via an
+/// env var, append the user's trailing args, and `exec` into the
+/// chosen cargo subcommand. The only differences are the cargo
+/// subcommand name (`["nextest","run"]` vs `["llvm-cov","nextest"]`)
+/// and the log / error-message prefix. Consolidating here ensures
+/// both flows evolve together — a kernel-resolution fix in one used
+/// to drift against the other.
+fn run_cargo_sub(
+    sub_argv: &[&str],
+    label: &str,
     kernel: Option<String>,
     no_perf_mode: bool,
     args: Vec<String>,
@@ -324,7 +305,7 @@ fn run_coverage(
     use ktstr::kernel_path::KernelId;
 
     let mut cmd = Command::new("cargo");
-    cmd.args(["llvm-cov", "nextest"]).args(&args);
+    cmd.args(sub_argv).args(&args);
 
     if no_perf_mode {
         cmd.env("KTSTR_NO_PERF_MODE", "1");
@@ -346,9 +327,27 @@ fn run_coverage(
         }
     }
 
-    eprintln!("cargo ktstr: running coverage");
+    eprintln!("cargo ktstr: running {label}");
     let err = cmd.exec();
-    Err(format!("exec cargo llvm-cov nextest: {err}"))
+    Err(format!("exec cargo {}: {err}", sub_argv.join(" ")))
+}
+
+fn run_test(kernel: Option<String>, no_perf_mode: bool, args: Vec<String>) -> Result<(), String> {
+    run_cargo_sub(&["nextest", "run"], "tests", kernel, no_perf_mode, args)
+}
+
+fn run_coverage(
+    kernel: Option<String>,
+    no_perf_mode: bool,
+    args: Vec<String>,
+) -> Result<(), String> {
+    run_cargo_sub(
+        &["llvm-cov", "nextest"],
+        "coverage",
+        kernel,
+        no_perf_mode,
+        args,
+    )
 }
 
 fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {

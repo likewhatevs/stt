@@ -43,6 +43,67 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
     Some((archive_path, PathBuf::from(config_path), guest_path))
 }
 
+/// Build the shared `cmdline=` string appended to every ktstr_test
+/// guest boot. `iomem=relaxed`, per-scheduler sysctls, per-scheduler
+/// kargs, and `RUST_BACKTRACE` / `RUST_LOG` propagation — anything
+/// the two VM-launch sites (`run_ktstr_test_inner` and
+/// `attempt_auto_repro`) previously re-implemented side-by-side.
+pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
+    let mut parts = vec!["iomem=relaxed".to_string()];
+    for s in entry.scheduler.sysctls {
+        parts.push(format!("sysctl.{}={}", s.key, s.value));
+    }
+    for &karg in entry.scheduler.kargs {
+        parts.push(karg.to_string());
+    }
+    if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
+        parts.push(format!("RUST_BACKTRACE={bt}"));
+    }
+    if let Ok(log) = std::env::var("RUST_LOG") {
+        parts.push(format!("RUST_LOG={log}"));
+    }
+    parts.join(" ")
+}
+
+/// Resolve `(vm_topology, memory_mb)` from an optional TopoOverride.
+/// When absent, derives memory from the entry's declared topology
+/// using the 64 MB-per-CPU floor (clamped to at least 256 and at
+/// least `entry.memory_mb`). Shared with `attempt_auto_repro` so the
+/// repro VM always sizes memory the same way as the first VM.
+pub(crate) fn resolve_vm_topology(
+    entry: &KtstrTestEntry,
+    topo: Option<&super::topo::TopoOverride>,
+) -> (crate::vmm::topology::Topology, u32) {
+    match topo {
+        Some(t) => (crate::vmm::topology::Topology::from(t), t.memory_mb),
+        None => {
+            let cpus = entry.topology.total_cpus();
+            let mem = (cpus * 64).max(256).max(entry.memory_mb);
+            (entry.topology, mem)
+        }
+    }
+}
+
+/// Append per-scheduler `sched_args` entries shared by both VM-launch
+/// paths: `--config <guest_path>` if the scheduler declared one, the
+/// cgroup-parent switch, the scheduler's own fixed args, and
+/// per-entry extra args. Active-flag dispatch and probe-specific args
+/// remain at the call site because they differ between the paths.
+///
+/// The caller owns the `include_files` binding on the builder;
+/// `config_file_parts` and the guest-path push are returned separately
+/// so the caller decides whether to attach include files (production
+/// does, probe-only repro pipelines that already pass `include_files`
+/// can skip it).
+pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<String>) {
+    if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
+        args.push("--cell-parent-cgroup".to_string());
+        args.push(cgroup_path.to_string());
+    }
+    args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
+    args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::entry::Scheduler;

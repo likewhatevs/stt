@@ -32,11 +32,14 @@ macro_rules! s {
 
 macro_rules! custom {
     ($name:expr, $cat:expr, $desc:expr, $fn:expr) => {
+        custom!($name, $cat, $desc, &[], $fn)
+    };
+    ($name:expr, $cat:expr, $desc:expr, $required:expr, $fn:expr) => {
         Scenario {
             name: $name,
             category: $cat,
             description: $desc,
-            required_flags: &[],
+            required_flags: $required,
             excluded_flags: &[],
             num_cgroups: 0,
             cpuset_partition: CpusetPartition::None,
@@ -449,149 +452,100 @@ pub fn all_scenarios() -> Vec<Scenario> {
             custom_nested_cgroup_cpuset
         ),
         // Work conservation + cpusets
-        Scenario {
-            name: "cgroup_cpuset_workload_imbalance",
-            category: "advanced",
-            description: "Imbalanced load with cpuset-constrained cgroups",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_workload_imbalance),
-        },
+        custom!(
+            "cgroup_cpuset_workload_imbalance",
+            "advanced",
+            "Imbalanced load with cpuset-constrained cgroups",
+            F_BORROW,
+            custom_cgroup_cpuset_workload_imbalance
+        ),
         // Load rebalancing + cpusets
-        Scenario {
-            name: "cgroup_cpuset_load_shift",
-            category: "advanced",
-            description: "Imbalanced load with cpusets, then add heavy",
-            required_flags: F_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_load_shift),
-        },
+        custom!(
+            "cgroup_cpuset_load_shift",
+            "advanced",
+            "Imbalanced load with cpusets, then add heavy",
+            F_REBAL,
+            custom_cgroup_cpuset_load_shift
+        ),
         // Load rebalancing + dynamic cgroup add
-        Scenario {
-            name: "cgroup_add_load_imbalance",
-            category: "advanced",
-            description: "Light cgroups then heavy added mid-run",
-            required_flags: F_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_add_load_imbalance),
-        },
+        custom!(
+            "cgroup_add_load_imbalance",
+            "advanced",
+            "Light cgroups then heavy added mid-run",
+            F_REBAL,
+            custom_cgroup_add_load_imbalance
+        ),
         // Work conservation + rebalancing
-        Scenario {
-            name: "cgroup_imbalance_mixed_workload",
-            category: "advanced",
-            description: "Heavy + bursty + IO cgroups",
-            required_flags: F_BORROW_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_imbalance_mixed_workload),
-        },
+        custom!(
+            "cgroup_imbalance_mixed_workload",
+            "advanced",
+            "Heavy + bursty + IO cgroups",
+            F_BORROW_REBAL,
+            custom_cgroup_imbalance_mixed_workload
+        ),
         // Affinity rejection
-        Scenario {
-            name: "cgroup_multicpu_pin",
-            category: "advanced",
-            description: "Workers pinned to 2 CPUs each",
-            required_flags: F_REJECT_PIN,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_multicpu_pin),
-        },
+        custom!(
+            "cgroup_multicpu_pin",
+            "advanced",
+            "Workers pinned to 2 CPUs each",
+            F_REJECT_PIN,
+            custom_cgroup_multicpu_pin
+        ),
         // No controller + rapid cgroup moves
-        Scenario {
-            name: "cgroup_noctrl_task_migration",
-            category: "advanced",
-            description: "Rapid per-task moves without controller",
-            required_flags: F_NO_CTRL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_noctrl_task_migration),
-        },
+        custom!(
+            "cgroup_noctrl_task_migration",
+            "advanced",
+            "Rapid per-task moves without controller",
+            F_NO_CTRL,
+            custom_cgroup_noctrl_task_migration
+        ),
         // Work conservation + cpuset change
-        Scenario {
-            name: "cgroup_cpuset_change_imbalance",
-            category: "advanced",
-            description: "Cpuset resize during imbalanced load",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_change_imbalance),
-        },
+        custom!(
+            "cgroup_cpuset_change_imbalance",
+            "advanced",
+            "Cpuset resize during imbalanced load",
+            F_BORROW,
+            custom_cgroup_cpuset_change_imbalance
+        ),
         // Load oscillation
-        Scenario {
-            name: "cgroup_load_oscillation",
-            category: "advanced",
-            description: "Alternating heavy/light cgroups",
-            required_flags: F_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_load_oscillation),
-        },
+        custom!(
+            "cgroup_load_oscillation",
+            "advanced",
+            "Alternating heavy/light cgroups",
+            F_REBAL,
+            custom_cgroup_load_oscillation
+        ),
         // No controller + nested cgroups
-        Scenario {
-            name: "nested_cgroup_noctrl",
-            category: "advanced",
-            description: "Nested cgroups without controller",
-            required_flags: F_NO_CTRL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_nested_cgroup_noctrl),
-        },
+        custom!(
+            "nested_cgroup_noctrl",
+            "advanced",
+            "Nested cgroups without controller",
+            F_NO_CTRL,
+            custom_nested_cgroup_noctrl
+        ),
         // Cpuset swap to disjoint range
-        Scenario {
-            name: "cgroup_cpuset_swap_disjoint",
-            category: "cpuset",
-            description: "Swap cpusets to non-overlapping ranges",
-            required_flags: &[],
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_swap_disjoint),
-        },
+        custom!(
+            "cgroup_cpuset_swap_disjoint",
+            "cpuset",
+            "Swap cpusets to non-overlapping ranges",
+            custom_cgroup_cpuset_swap_disjoint
+        ),
         // IO + work conservation
-        Scenario {
-            name: "cgroup_io_compute_imbalance",
-            category: "advanced",
-            description: "IO cgroup frees CPUs for compute cgroup",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_io_compute_imbalance),
-        },
+        custom!(
+            "cgroup_io_compute_imbalance",
+            "advanced",
+            "IO cgroup frees CPUs for compute cgroup",
+            F_BORROW,
+            custom_cgroup_io_compute_imbalance
+        ),
         // 4-way load imbalance
-        Scenario {
-            name: "cgroup_4way_load_imbalance",
-            category: "advanced",
-            description: "4 cgroups with asymmetric demand",
-            required_flags: F_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_4way_load_imbalance),
-        },
+        custom!(
+            "cgroup_4way_load_imbalance",
+            "advanced",
+            "4 cgroups with asymmetric demand",
+            F_REBAL,
+            custom_cgroup_4way_load_imbalance
+        ),
         // Work conservation + overlapping cpusets
         Scenario {
             name: "cgroup_cpuset_overlap_imbalance",
@@ -699,112 +653,75 @@ pub fn all_scenarios() -> Vec<Scenario> {
             action: Action::Steady,
         },
         // Interactions: work conservation + rebalancing + cpusets
-        Scenario {
-            name: "cgroup_cpuset_imbalance_combined",
-            category: "interaction",
-            description: "Imbalanced load with cpusets, work conservation + rebalancing",
-            required_flags: F_BORROW_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_imbalance_combined),
-        },
-        Scenario {
-            name: "cgroup_cpuset_overlap_imbalance_combined",
-            category: "interaction",
-            description: "Imbalanced load with overlapping cpusets, work conservation + rebalancing",
-            required_flags: F_BORROW_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_overlap_imbalance_combined),
-        },
+        custom!(
+            "cgroup_cpuset_imbalance_combined",
+            "interaction",
+            "Imbalanced load with cpusets, work conservation + rebalancing",
+            F_BORROW_REBAL,
+            custom_cgroup_cpuset_imbalance_combined
+        ),
+        custom!(
+            "cgroup_cpuset_overlap_imbalance_combined",
+            "interaction",
+            "Imbalanced load with overlapping cpusets, work conservation + rebalancing",
+            F_BORROW_REBAL,
+            custom_cgroup_cpuset_overlap_imbalance_combined
+        ),
         // No controller + work conservation
-        Scenario {
-            name: "cgroup_noctrl_imbalance",
-            category: "interaction",
-            description: "Per-task moves during imbalanced load without controller",
-            required_flags: F_NO_CTRL_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_noctrl_imbalance),
-        },
+        custom!(
+            "cgroup_noctrl_imbalance",
+            "interaction",
+            "Per-task moves during imbalanced load without controller",
+            F_NO_CTRL_BORROW,
+            custom_cgroup_noctrl_imbalance
+        ),
         // No controller + cpusets
-        Scenario {
-            name: "cgroup_noctrl_cpuset_change",
-            category: "interaction",
-            description: "Cpuset add/clear without controller",
-            required_flags: F_NO_CTRL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_noctrl_cpuset_change),
-        },
+        custom!(
+            "cgroup_noctrl_cpuset_change",
+            "interaction",
+            "Cpuset add/clear without controller",
+            F_NO_CTRL,
+            custom_cgroup_noctrl_cpuset_change
+        ),
         // No controller + rebalancing
-        Scenario {
-            name: "cgroup_noctrl_load_imbalance",
-            category: "interaction",
-            description: "Heavy + light cgroups without controller",
-            required_flags: F_NO_CTRL_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_noctrl_load_imbalance),
-        },
+        custom!(
+            "cgroup_noctrl_load_imbalance",
+            "interaction",
+            "Heavy + light cgroups without controller",
+            F_NO_CTRL_REBAL,
+            custom_cgroup_noctrl_load_imbalance
+        ),
         // Affinity rejection + cpusets
-        Scenario {
-            name: "cgroup_cpuset_multicpu_pin",
-            category: "interaction",
-            description: "Multi-CPU pin within cpuset-constrained cgroups",
-            required_flags: F_REJECT_PIN,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_multicpu_pin),
-        },
+        custom!(
+            "cgroup_cpuset_multicpu_pin",
+            "interaction",
+            "Multi-CPU pin within cpuset-constrained cgroups",
+            F_REJECT_PIN,
+            custom_cgroup_cpuset_multicpu_pin
+        ),
         // Cgroup add/remove + cpusets
-        Scenario {
-            name: "cgroup_cpuset_add_remove",
-            category: "interaction",
-            description: "Add/remove cpuset-constrained cgroups",
-            required_flags: &[],
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_add_remove),
-        },
+        custom!(
+            "cgroup_cpuset_add_remove",
+            "interaction",
+            "Add/remove cpuset-constrained cgroups",
+            custom_cgroup_cpuset_add_remove
+        ),
         // Cgroup add during imbalance
-        Scenario {
-            name: "cgroup_add_during_imbalance",
-            category: "interaction",
-            description: "Add cgroup during imbalanced load",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_add_during_imbalance),
-        },
+        custom!(
+            "cgroup_add_during_imbalance",
+            "interaction",
+            "Add cgroup during imbalanced load",
+            F_BORROW,
+            custom_cgroup_add_during_imbalance
+        ),
         // Nested + work conservation
-        Scenario {
-            name: "nested_cgroup_imbalance",
-            category: "interaction",
-            description: "Nested cgroups with imbalanced load",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_nested_cgroup_imbalance),
-        },
+        custom!(
+            "nested_cgroup_imbalance",
+            "interaction",
+            "Nested cgroups with imbalanced load",
+            F_BORROW,
+            custom_nested_cgroup_imbalance
+        ),
         // Dispatch contention
         custom!(
             "cgroup_dsq_contention",
@@ -832,77 +749,53 @@ pub fn all_scenarios() -> Vec<Scenario> {
             custom_cgroup_dynamic_workload_variety
         ),
         // Cross-LLC cpuset race
-        Scenario {
-            name: "cgroup_cpuset_crossllc_race",
-            category: "stress",
-            description: "Rapid cpuset flips across LLC boundaries",
-            required_flags: F_LLC_REBAL,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cgroup_cpuset_crossllc_race),
-        },
+        custom!(
+            "cgroup_cpuset_crossllc_race",
+            "stress",
+            "Rapid cpuset flips across LLC boundaries",
+            F_LLC_REBAL,
+            custom_cgroup_cpuset_crossllc_race
+        ),
         // Performance: cache pressure vs compute imbalance
-        Scenario {
-            name: "cache_pressure_imbalance",
-            category: "performance",
-            description: "CachePressure vs CpuSpin cgroups",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cache_pressure_imbalance),
-        },
+        custom!(
+            "cache_pressure_imbalance",
+            "performance",
+            "CachePressure vs CpuSpin cgroups",
+            F_BORROW,
+            custom_cache_pressure_imbalance
+        ),
         // Performance: cache yield wake-affine placement
-        Scenario {
-            name: "cache_yield_wake_affine",
-            category: "performance",
-            description: "CacheYield workers testing wake-affine placement",
-            required_flags: F_LLC,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cache_yield_wake_affine),
-        },
+        custom!(
+            "cache_yield_wake_affine",
+            "performance",
+            "CacheYield workers testing wake-affine placement",
+            F_LLC,
+            custom_cache_yield_wake_affine
+        ),
         // Performance: cache pipe + compute imbalance
-        Scenario {
-            name: "cache_pipe_io_compute_imbalance",
-            category: "performance",
-            description: "CachePipe vs CpuSpin cgroups",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_cache_pipe_io_compute_imbalance),
-        },
+        custom!(
+            "cache_pipe_io_compute_imbalance",
+            "performance",
+            "CachePipe vs CpuSpin cgroups",
+            F_BORROW,
+            custom_cache_pipe_io_compute_imbalance
+        ),
         // Performance: 1:N fan-out wake pattern
-        Scenario {
-            name: "fanout_wake",
-            category: "performance",
-            description: "1:N futex fan-out wake vs compute workers",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_fanout_wake),
-        },
+        custom!(
+            "fanout_wake",
+            "performance",
+            "1:N futex fan-out wake vs compute workers",
+            F_BORROW,
+            custom_fanout_wake
+        ),
         // Performance: schbench-style messenger/worker workload
-        Scenario {
-            name: "schbench_style",
-            category: "performance",
-            description: "Schbench-style wake latency vs compute workers",
-            required_flags: F_BORROW,
-            excluded_flags: &[],
-            num_cgroups: 0,
-            cpuset_partition: CpusetPartition::None,
-            cgroup_works: vec![],
-            action: Action::custom(custom_schbench_style),
-        },
+        custom!(
+            "schbench_style",
+            "performance",
+            "Schbench-style wake latency vs compute workers",
+            F_BORROW,
+            custom_schbench_style
+        ),
         // Stress: task creation/destruction churn
         s!(
             "fork_exit_churn",

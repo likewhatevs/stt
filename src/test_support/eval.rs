@@ -77,31 +77,9 @@ pub(crate) fn run_ktstr_test_inner(
         entry.name.to_string(),
     ];
 
-    let mut cmdline_parts = vec!["iomem=relaxed".to_string()];
-    for s in entry.scheduler.sysctls {
-        cmdline_parts.push(format!("sysctl.{}={}", s.key, s.value));
-    }
-    for &karg in entry.scheduler.kargs {
-        cmdline_parts.push(karg.to_string());
-    }
-    // Propagate RUST_BACKTRACE and RUST_LOG to the guest so
-    // guest-side code can gate verbose output and tracing.
-    if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
-        cmdline_parts.push(format!("RUST_BACKTRACE={bt}"));
-    }
-    if let Ok(log) = std::env::var("RUST_LOG") {
-        cmdline_parts.push(format!("RUST_LOG={log}"));
-    }
-    let cmdline_extra = cmdline_parts.join(" ");
+    let cmdline_extra = super::runtime::build_cmdline_extra(entry);
 
-    let (vm_topology, memory_mb) = match topo {
-        Some(t) => (vmm::Topology::from(t), t.memory_mb),
-        None => {
-            let cpus = entry.topology.total_cpus();
-            let mem = (cpus * 64).max(256).max(entry.memory_mb);
-            (entry.topology, mem)
-        }
-    };
+    let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
     let mut builder = vmm::KtstrVm::builder()
@@ -138,12 +116,7 @@ pub(crate) fn run_ktstr_test_inner(
         sched_args.push("--config".to_string());
         sched_args.push(guest_path);
     }
-    if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
-        sched_args.push("--cell-parent-cgroup".to_string());
-        sched_args.push(cgroup_path.to_string());
-    }
-    sched_args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
-    sched_args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
+    super::runtime::append_base_sched_args(entry, &mut sched_args);
     for flag_name in active_flags {
         if let Some(args) = entry.scheduler.flag_args(flag_name) {
             sched_args.extend(args.iter().map(|s| s.to_string()));

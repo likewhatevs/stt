@@ -668,6 +668,63 @@ fn resolve_sched_domain_stats_offsets(
     })
 }
 
+/// Byte offsets for walking a kernel `struct idr` — the shared
+/// allocator that both `map_idr` and `prog_idr` use. Resolved once
+/// per BTF load and spliced into [`BpfMapOffsets`] and
+/// [`BpfProgOffsets`], each of which used to compute the same four
+/// fields independently.
+#[derive(Debug, Clone, Copy)]
+pub struct IdrOffsets {
+    /// Offset of `slots` within `struct xa_node`.
+    pub xa_node_slots: usize,
+    /// Offset of `shift` (u8) within `struct xa_node`.
+    pub xa_node_shift: usize,
+    /// Offset of `xa_head` within `struct idr`.
+    /// Computed as idr.idr_rt (xarray) offset + xarray.xa_head offset.
+    pub idr_xa_head: usize,
+    /// Offset of `idr_next` (unsigned int) within `struct idr`.
+    /// The next ID to allocate — scanning `0..idr_next` covers all
+    /// allocated entries without wrapping past the xarray's slot count.
+    pub idr_next: usize,
+}
+
+impl IdrOffsets {
+    /// All-zero IDR offsets for tests that never actually walk an idr.
+    #[cfg(test)]
+    pub(crate) const EMPTY: Self = Self {
+        xa_node_slots: 0,
+        xa_node_shift: 0,
+        idr_xa_head: 0,
+        idr_next: 0,
+    };
+
+    /// Resolve IDR + xa_node offsets from a pre-loaded BTF object.
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (xa_node, _) = find_struct(btf, "xa_node")?;
+        let xa_node_slots = member_byte_offset(btf, &xa_node, "slots")?;
+        let xa_node_shift = member_byte_offset(btf, &xa_node, "shift")?;
+
+        // struct idr { struct xarray idr_rt; ... }
+        // xa_head offset within idr = idr_rt offset + xa_head offset in xarray.
+        let (idr_struct, _) = find_struct(btf, "idr")?;
+        let (idr_rt_off, idr_rt_member) =
+            member_byte_offset_with_member(btf, &idr_struct, "idr_rt")?;
+        let xa_struct = resolve_member_struct(btf, &idr_rt_member)
+            .context("btf: resolve type of idr.idr_rt")?;
+        let xa_head_off = member_byte_offset(btf, &xa_struct, "xa_head")?;
+        let idr_xa_head = idr_rt_off + xa_head_off;
+
+        let idr_next = member_byte_offset(btf, &idr_struct, "idr_next")?;
+
+        Ok(Self {
+            xa_node_slots,
+            xa_node_shift,
+            idr_xa_head,
+            idr_next,
+        })
+    }
+}
+
 /// Byte offsets within kernel BPF structures needed for host-side
 /// BPF map discovery and value access.
 #[derive(Debug, Clone)]
@@ -759,21 +816,7 @@ impl BpfMapOffsets {
         let (bpf_array, _) = find_struct(btf, "bpf_array")?;
         let array_value = member_byte_offset(btf, &bpf_array, "value")?;
 
-        let (xa_node, _) = find_struct(btf, "xa_node")?;
-        let xa_node_slots = member_byte_offset(btf, &xa_node, "slots")?;
-        let xa_node_shift = member_byte_offset(btf, &xa_node, "shift")?;
-
-        // struct idr { struct xarray idr_rt; ... }
-        // xa_head offset within idr = idr_rt offset + xa_head offset in xarray.
-        let (idr_struct, _) = find_struct(btf, "idr")?;
-        let (idr_rt_off, idr_rt_member) =
-            member_byte_offset_with_member(btf, &idr_struct, "idr_rt")?;
-        let xa_struct = resolve_member_struct(btf, &idr_rt_member)
-            .context("btf: resolve type of idr.idr_rt")?;
-        let xa_head_off = member_byte_offset(btf, &xa_struct, "xa_head")?;
-        let idr_xa_head = idr_rt_off + xa_head_off;
-
-        let idr_next = member_byte_offset(btf, &idr_struct, "idr_next")?;
+        let idr = IdrOffsets::from_btf(btf)?;
 
         let map_btf = member_byte_offset(btf, &bpf_map, "btf")?;
         let map_btf_value_type_id = member_byte_offset(btf, &bpf_map, "btf_value_type_id")?;
@@ -792,10 +835,10 @@ impl BpfMapOffsets {
             value_size,
             max_entries,
             array_value,
-            xa_node_slots,
-            xa_node_shift,
-            idr_xa_head,
-            idr_next,
+            xa_node_slots: idr.xa_node_slots,
+            xa_node_shift: idr.xa_node_shift,
+            idr_xa_head: idr.idr_xa_head,
+            idr_next: idr.idr_next,
             map_btf,
             map_btf_value_type_id,
             btf_data,
@@ -918,19 +961,7 @@ impl BpfProgOffsets {
         let aux_verified_insns = member_byte_offset(btf, &bpf_prog_aux, "verified_insns")?;
         let aux_name = member_byte_offset(btf, &bpf_prog_aux, "name")?;
 
-        let (xa_node, _) = find_struct(btf, "xa_node")?;
-        let xa_node_slots = member_byte_offset(btf, &xa_node, "slots")?;
-        let xa_node_shift = member_byte_offset(btf, &xa_node, "shift")?;
-
-        let (idr_struct, _) = find_struct(btf, "idr")?;
-        let (idr_rt_off, idr_rt_member) =
-            member_byte_offset_with_member(btf, &idr_struct, "idr_rt")?;
-        let xa_struct = resolve_member_struct(btf, &idr_rt_member)
-            .context("btf: resolve type of idr.idr_rt")?;
-        let xa_head_off = member_byte_offset(btf, &xa_struct, "xa_head")?;
-        let idr_xa_head = idr_rt_off + xa_head_off;
-
-        let idr_next = member_byte_offset(btf, &idr_struct, "idr_next")?;
+        let idr = IdrOffsets::from_btf(btf)?;
 
         let prog_stats = member_byte_offset(btf, &bpf_prog, "stats")?;
 
@@ -943,10 +974,10 @@ impl BpfProgOffsets {
             prog_aux,
             aux_verified_insns,
             aux_name,
-            xa_node_slots,
-            xa_node_shift,
-            idr_xa_head,
-            idr_next,
+            xa_node_slots: idr.xa_node_slots,
+            xa_node_shift: idr.xa_node_shift,
+            idr_xa_head: idr.idr_xa_head,
+            idr_next: idr.idr_next,
             prog_stats,
             stats_cnt,
             stats_nsecs,
