@@ -266,9 +266,37 @@ pub struct VmRunResult {
 }
 
 /// Per-scenario result row for gauntlet analysis and run-to-run comparison.
+///
+/// Two constructors populate this struct from different data sources,
+/// and each one leaves a distinct subset of fields at their default
+/// ("unknown") values. Readers that compute derived metrics must
+/// tolerate both partial populations:
+///
+/// - [`sidecar_to_row`] (post-run analysis from on-disk
+///   `SidecarResult`): populates every stats, monitor, benchmark, and
+///   NUMA field. Leaves `flags = ""`, `replica = 1`, and every
+///   `worst_degradation_*` / `degradation_count` field at zero/empty
+///   because on-disk sidecars carry a `MonitorSummary` but not the
+///   per-sample [`Timeline`] used to compute degradation deltas.
+/// - [`extract_rows`] (in-process gauntlet from [`VmRunResult`]s):
+///   parses a `"topology/scenario/flags[/work_type][#replica]"` label
+///   for the identity fields and rebuilds the [`Timeline`] from live
+///   monitor samples, so the `worst_degradation_*` fields are
+///   populated. Leaves `scheduler = ""` (label format does not embed
+///   scheduler) and `skipped = false` (run-in-process path has no skip
+///   semantic — only sidecar rows carry real skip flags).
+///
+/// The comparison pipeline must read through [`MetricDef::read`] /
+/// [`METRICS`] rather than dereferencing fields directly when it
+/// cannot assume which constructor produced the row.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GauntletRow {
     pub scenario: String,
+    /// Scheduler flag set active for this row. Populated by
+    /// [`extract_rows`] from the gauntlet label's flags segment;
+    /// [`sidecar_to_row`] leaves this empty because the sidecar
+    /// carries `active_flags` separately, and `stats` consumers that
+    /// build rows from sidecars do not project it here.
     pub flags: String,
     pub topology: String,
     pub work_type: String,
@@ -279,12 +307,20 @@ pub struct GauntletRow {
     /// Surfaced through the substring filter in [`compare_rows`] so
     /// users can narrow A/B comparisons by scheduler name.
     pub scheduler: String,
+    /// Replica index extracted from a `"#N"` suffix on the gauntlet
+    /// label (via [`extract_rows`]). [`sidecar_to_row`] defaults this
+    /// to `1` because on-disk sidecars are per-run and the replica
+    /// fan-out is already resolved into distinct sidecar files.
     pub replica: u32,
     pub passed: bool,
     /// True when the run was skipped (topology mismatch, missing
     /// resource). `passed` stays `true` for gate-compat; `skipped`
     /// lets stats tooling exclude these from pass counts so skipped
     /// runs don't inflate the apparent pass rate.
+    ///
+    /// Populated only by [`sidecar_to_row`]; [`extract_rows`] always
+    /// leaves this `false` because the in-process gauntlet only runs
+    /// the scenario when preflight has already accepted it.
     pub skipped: bool,
     pub spread: f64,
     pub gap_ms: u64,
@@ -306,7 +342,11 @@ pub struct GauntletRow {
     // NUMA fields.
     pub page_locality: f64,
     pub cross_node_migration_ratio: f64,
-    // Timeline degradation fields.
+    // Timeline degradation fields. Populated only by [`extract_rows`]
+    // (from [`Timeline::build`] over live monitor samples). The
+    // [`sidecar_to_row`] path leaves these zero/empty because
+    // [`SidecarResult`] persists the aggregate `MonitorSummary` but
+    // not the per-sample trace required to compute degradations.
     pub worst_degradation_op: String,
     pub worst_imbalance_delta: f64,
     pub worst_dsq_delta: f64,

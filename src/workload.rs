@@ -217,6 +217,20 @@ pub enum WorkType {
     ///
     /// `name` identifies this work type in logs and sidecar metadata.
     /// [`from_name`](Self::from_name) returns `None` for custom names.
+    ///
+    /// **Telemetry contract:** `Custom` runs the user closure to
+    /// completion and returns its `WorkerReport` verbatim. None of the
+    /// built-in per-iteration instrumentation runs for this variant —
+    /// neither the reservoir-sampled wake latencies, the shared-memory
+    /// `iter_slot` publish that host sampling reads, nor the periodic
+    /// max-gap tracking. The custom closure owns its own telemetry and
+    /// must populate the [`WorkerReport`] fields it wants measured
+    /// (`iterations`, `resume_latencies_ns`, `max_gap_ns`, etc.); any
+    /// field left at `WorkerReport::default()` is reported as zero by
+    /// downstream evaluation. Assertions like
+    /// [`assert_not_starved`](crate::assert::assert_not_starved) that
+    /// compute wake-latency percentiles will produce zero/degenerate
+    /// numbers against a `Custom` report that did not record them.
     Custom {
         name: &'static str,
         run: fn(&AtomicBool) -> WorkerReport,
@@ -465,6 +479,12 @@ impl WorkType {
     /// must return a [`WorkerReport`] when the flag becomes `true`. The
     /// framework handles fork, cgroup placement, affinity, scheduling
     /// policy, and signal setup; `run` owns only the work loop.
+    ///
+    /// The per-iteration built-in instrumentation (wake-latency samples,
+    /// `iter_slot` publish, gap tracking) runs only for built-in variants
+    /// and is bypassed for `Custom`. See the [`Custom`](Self::Custom)
+    /// variant doc for the full telemetry contract and what `run` must
+    /// populate on [`WorkerReport`] to keep downstream assertions honest.
     pub fn custom(name: &'static str, run: fn(&AtomicBool) -> WorkerReport) -> Self {
         WorkType::Custom { name, run }
     }

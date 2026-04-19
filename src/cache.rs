@@ -978,24 +978,26 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
             section.delete = true;
         }
     }
-    let mut out = Vec::new();
-    builder
-        .write(&mut out)
-        .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux: {e}"))?;
 
-    // Verify symtab survived. goblin always includes the null
-    // symbol (index 0), so check for at least one symbol with a
-    // non-empty name.
-    let elf =
-        goblin::elf::Elf::parse(&out).map_err(|e| anyhow::anyhow!("verify stripped ELF: {e}"))?;
-    let named_syms = elf
-        .syms
+    // Verify symtab survivors BEFORE writing. The `Builder` state
+    // already holds every parsed symbol; counting named, non-deleted
+    // entries here lets us fail fast without the post-write
+    // `goblin::elf::Elf::parse(&out)` we used to run. The null symbol
+    // (index 0) is filtered via the empty-name check, matching the
+    // semantics of the old verification pass.
+    let named_syms = builder
+        .symbols
         .iter()
-        .filter(|s| s.st_name != 0 && elf.strtab.get_at(s.st_name).is_some_and(|n| !n.is_empty()))
+        .filter(|s| !s.delete && !s.name.as_slice().is_empty())
         .count();
     if named_syms == 0 {
         anyhow::bail!("keep-list strip emptied symbol table (0 named symbols)");
     }
+
+    let mut out = Vec::new();
+    builder
+        .write(&mut out)
+        .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux: {e}"))?;
     Ok(out)
 }
 

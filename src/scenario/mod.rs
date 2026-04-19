@@ -618,6 +618,139 @@ impl std::fmt::Debug for Ctx<'_> {
     }
 }
 
+/// Fluent builder for [`Ctx`].
+///
+/// Scenario unit tests reach for a [`Ctx`] with sane defaults so they
+/// can exercise scenario logic without booting a VM. The direct
+/// struct-literal construction at ~14 call sites forces every test to
+/// repeat the full 9-field init and keeps diverging defaults in sync
+/// by hand; this builder centralises those defaults and keeps required
+/// fields (borrowed `cgroups`/`topo`) in their types.
+///
+/// Defaults:
+/// - `duration`: 1 s — matches `scenario::basic`/`stress` test helpers
+/// - `workers_per_cgroup`: 1
+/// - `sched_pid`: 0 — matches `Ctx` consumers that treat 0 as
+///   "no scheduler attached"; [`run_scenario`] uses this to short-circuit
+///   liveness checks via [`crate::workload::set_sched_pid`].
+/// - `settle`: 0 ms — tests do not need to wait for scheduler stabilisation
+/// - `work_type_override`: `None`
+/// - `assert`: [`crate::assert::Assert::default_checks()`] —
+///   the same policy production paths merge through
+/// - `wait_for_map_write`: `false`
+///
+/// Override any default via the corresponding method, then materialise
+/// the context with [`CtxBuilder::build`].
+///
+/// # Example
+/// ```ignore
+/// let cgroups = CgroupManager::new("/nonexistent");
+/// let topo = TestTopology::synthetic(4, 1);
+/// let ctx = Ctx::builder(&cgroups, &topo)
+///     .workers_per_cgroup(3)
+///     .duration(Duration::from_secs(2))
+///     .build();
+/// ```
+pub struct CtxBuilder<'a> {
+    cgroups: &'a dyn crate::cgroup::CgroupOps,
+    topo: &'a TestTopology,
+    duration: Duration,
+    workers_per_cgroup: usize,
+    sched_pid: libc::pid_t,
+    settle: Duration,
+    work_type_override: Option<WorkType>,
+    assert: crate::assert::Assert,
+    wait_for_map_write: bool,
+}
+
+impl<'a> CtxBuilder<'a> {
+    /// Wall-clock budget for the workload phase of the scenario.
+    pub fn duration(mut self, d: Duration) -> Self {
+        self.duration = d;
+        self
+    }
+
+    /// Number of worker threads started per cgroup by the default workload.
+    pub fn workers_per_cgroup(mut self, n: usize) -> Self {
+        self.workers_per_cgroup = n;
+        self
+    }
+
+    /// PID of the scheduler process; `0` means "no scheduler attached"
+    /// and disables the liveness checks in [`run_scenario`].
+    pub fn sched_pid(mut self, pid: libc::pid_t) -> Self {
+        self.sched_pid = pid;
+        self
+    }
+
+    /// Time to wait after cgroup creation for scheduler stabilisation.
+    pub fn settle(mut self, s: Duration) -> Self {
+        self.settle = s;
+        self
+    }
+
+    /// Override the default work type for scenarios that would
+    /// otherwise use `CpuSpin`.
+    pub fn work_type_override(mut self, wt: Option<WorkType>) -> Self {
+        self.work_type_override = wt;
+        self
+    }
+
+    /// Merged assertion config. Callers that want the production
+    /// layering should pass `Assert::default_checks().merge(&...)`;
+    /// tests that pin a specific policy can pass
+    /// [`crate::assert::Assert::NO_OVERRIDES`] directly.
+    pub fn assert(mut self, a: crate::assert::Assert) -> Self {
+        self.assert = a;
+        self
+    }
+
+    /// When true, `execute_steps` polls the SHM signal slot after
+    /// writing the scenario start marker. See the field doc on
+    /// [`Ctx::wait_for_map_write`].
+    pub fn wait_for_map_write(mut self, v: bool) -> Self {
+        self.wait_for_map_write = v;
+        self
+    }
+
+    /// Materialise the configured [`Ctx`].
+    pub fn build(self) -> Ctx<'a> {
+        Ctx {
+            cgroups: self.cgroups,
+            topo: self.topo,
+            duration: self.duration,
+            workers_per_cgroup: self.workers_per_cgroup,
+            sched_pid: self.sched_pid,
+            settle: self.settle,
+            work_type_override: self.work_type_override,
+            assert: self.assert,
+            wait_for_map_write: self.wait_for_map_write,
+        }
+    }
+}
+
+impl<'a> Ctx<'a> {
+    /// Start a new [`CtxBuilder`] with required `cgroups` and `topo`
+    /// borrows and sane defaults for every other field. See
+    /// [`CtxBuilder`] for the full default set.
+    pub fn builder(
+        cgroups: &'a dyn crate::cgroup::CgroupOps,
+        topo: &'a TestTopology,
+    ) -> CtxBuilder<'a> {
+        CtxBuilder {
+            cgroups,
+            topo,
+            duration: Duration::from_secs(1),
+            workers_per_cgroup: 1,
+            sched_pid: 0,
+            settle: Duration::from_millis(0),
+            work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
+        }
+    }
+}
+
 /// Run a scenario and return its assertion result.
 ///
 /// Skips early (returning `AssertResult::skip`) when the scenario's

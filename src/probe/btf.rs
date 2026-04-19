@@ -1442,9 +1442,67 @@ fn resolve_bpf_member_size(
     None
 }
 
+/// Classification of a struct/union member that auto-discovery supports.
+///
+/// Both backends (`btf_rs` for vmlinux, `libbpf_rs::btf` for BPF program
+/// BTF) inspect each member type and reduce it to one of these
+/// variants before [`emit_member_field`] appends the access-pattern
+/// tuple. Anything the backend cannot classify is represented by `None`
+/// (skip member) — keeping the shared emission logic library-agnostic
+/// without forcing a deeper trait abstraction over the two incompatible
+/// BTF APIs.
+enum MemberClass {
+    /// Scalar integer with a rendering hint derived from BTF encoding
+    /// (bool / signed / otherwise hex).
+    Int(RenderHint),
+    /// Enum or 64-bit enum; rendered as hex.
+    Enum,
+    /// Pointer to `struct cpumask` / `cpumask_t`. Access pattern
+    /// dereferences `->bits[0]`.
+    CpumaskPtr,
+    /// Pointer to `struct bpf_cpumask`. Access pattern dereferences
+    /// `->cpumask.bits[0]` (inner cpumask field).
+    BpfCpumaskPtr,
+}
+
+/// Append the access-pattern tuple for a classified member to `fields`.
+///
+/// Shared by [`discover_bpf_struct_fields`] and
+/// [`discover_vmlinux_struct_fields`] so the access-pattern strings and
+/// the render hints stay in one place; adding a new member class (or
+/// changing the cpumask offset convention) flows to both backends
+/// automatically.
+fn emit_member_field(
+    fields: &mut Vec<(String, String, RenderHint)>,
+    fname: &str,
+    class: MemberClass,
+) {
+    match class {
+        MemberClass::Int(hint) => fields.push((fname.to_string(), format!("->{fname}"), hint)),
+        MemberClass::Enum => {
+            fields.push((fname.to_string(), format!("->{fname}"), RenderHint::Hex));
+        }
+        MemberClass::CpumaskPtr => fields.push((
+            fname.to_string(),
+            format!("->{fname}->bits[0]"),
+            RenderHint::Hex,
+        )),
+        MemberClass::BpfCpumaskPtr => fields.push((
+            fname.to_string(),
+            format!("->{fname}->cpumask.bits[0]"),
+            RenderHint::Hex,
+        )),
+    }
+}
+
 /// Auto-discover struct fields from BPF program BTF for types not in
 /// STRUCT_FIELDS. Walks members one level deep, emitting access patterns
 /// for scalar, enum, and cpumask pointer fields.
+///
+/// Per-backend classification in [`classify_bpf_member`] feeds the
+/// shared [`emit_member_field`] so the output contract matches
+/// [`discover_vmlinux_struct_fields`] byte-for-byte wherever the two
+/// backends see the same member shape.
 fn discover_bpf_struct_fields(
     btf: &libbpf_rs::btf::Btf<'_>,
     type_id: libbpf_rs::btf::TypeId,
@@ -1485,57 +1543,60 @@ fn discover_bpf_struct_fields(
             None => continue,
         };
 
-        match member_type.kind() {
-            BtfKind::Int => {
-                let hint = if let Ok(int_ty) =
-                    TryInto::<libbpf_rs::btf::types::Int<'_>>::try_into(member_type)
-                {
-                    match int_ty.encoding {
-                        libbpf_rs::btf::types::IntEncoding::Bool => RenderHint::Bool,
-                        libbpf_rs::btf::types::IntEncoding::Signed => RenderHint::Signed,
-                        _ => RenderHint::Hex,
-                    }
-                } else {
-                    RenderHint::Hex
-                };
-                fields.push((fname.clone(), format!("->{fname}"), hint));
-            }
-            BtfKind::Enum | BtfKind::Enum64 => {
-                fields.push((fname.clone(), format!("->{fname}"), RenderHint::Hex));
-            }
-            BtfKind::Ptr => {
-                let deref = member_type.next_type().map(|t| t.skip_mods_and_typedefs());
-                let pointed_name = deref
-                    .as_ref()
-                    .and_then(|t| t.name())
-                    .and_then(|n| n.to_str());
-                match pointed_name {
-                    Some("cpumask") => {
-                        fields.push((
-                            fname.clone(),
-                            format!("->{fname}->bits[0]"),
-                            RenderHint::Hex,
-                        ));
-                    }
-                    Some("bpf_cpumask") => {
-                        fields.push((
-                            fname.clone(),
-                            format!("->{fname}->cpumask.bits[0]"),
-                            RenderHint::Hex,
-                        ));
-                    }
-                    _ => {} // skip unknown pointers
-                }
-            }
-            _ => {}
+        if let Some(class) = classify_bpf_member(member_type) {
+            emit_member_field(&mut fields, &fname, class);
         }
     }
     fields
 }
 
+/// Classify one libbpf-rs member type. Returns `None` when the type
+/// is not supported by auto-discovery (the caller skips it).
+fn classify_bpf_member(member_type: libbpf_rs::btf::BtfType<'_>) -> Option<MemberClass> {
+    use libbpf_rs::btf::{BtfKind, BtfType};
+
+    match member_type.kind() {
+        BtfKind::Int => {
+            let hint = if let Ok(int_ty) =
+                TryInto::<libbpf_rs::btf::types::Int<'_>>::try_into(member_type)
+            {
+                match int_ty.encoding {
+                    libbpf_rs::btf::types::IntEncoding::Bool => RenderHint::Bool,
+                    libbpf_rs::btf::types::IntEncoding::Signed => RenderHint::Signed,
+                    _ => RenderHint::Hex,
+                }
+            } else {
+                RenderHint::Hex
+            };
+            Some(MemberClass::Int(hint))
+        }
+        BtfKind::Enum | BtfKind::Enum64 => Some(MemberClass::Enum),
+        BtfKind::Ptr => {
+            let deref = member_type
+                .next_type()
+                .map(|t: BtfType<'_>| t.skip_mods_and_typedefs());
+            let pointed_name = deref
+                .as_ref()
+                .and_then(|t| t.name())
+                .and_then(|n| n.to_str());
+            match pointed_name {
+                Some("cpumask") => Some(MemberClass::CpumaskPtr),
+                Some("bpf_cpumask") => Some(MemberClass::BpfCpumaskPtr),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Auto-discover struct fields from vmlinux BTF for types not in
 /// STRUCT_FIELDS. Walks members one level deep via btf_rs, emitting
 /// access patterns for scalar, enum, and cpumask pointer fields.
+///
+/// Per-backend classification in [`classify_vmlinux_member`] feeds the
+/// shared [`emit_member_field`] so the output matches the libbpf-rs
+/// sibling [`discover_bpf_struct_fields`] byte-for-byte on the member
+/// shapes both backends recognise.
 fn discover_vmlinux_struct_fields(
     btf: &btf_rs::Btf,
     type_id: u32,
@@ -1579,84 +1640,72 @@ fn discover_vmlinux_struct_fields(
             Err(_) => continue,
         };
 
-        // Follow qualifiers to the underlying type.
-        let mut member_type = match btf.resolve_type_by_id(member_tid) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        for _ in 0..20 {
-            match &member_type {
-                Type::Const(_)
-                | Type::Volatile(_)
-                | Type::Restrict(_)
-                | Type::Typedef(_)
-                | Type::TypeTag(_) => {
-                    member_type = match btf.resolve_chained_type(member_type.as_btf_type().unwrap())
-                    {
-                        Ok(next) => next,
-                        Err(_) => break,
-                    };
-                }
-                _ => break,
-            }
-        }
-
-        match &member_type {
-            Type::Int(i) => {
-                let hint = if i.is_bool() {
-                    RenderHint::Bool
-                } else if i.is_signed() {
-                    RenderHint::Signed
-                } else {
-                    RenderHint::Hex
-                };
-                fields.push((fname.clone(), format!("->{fname}"), hint));
-            }
-            Type::Enum(_) | Type::Enum64(_) => {
-                fields.push((fname.clone(), format!("->{fname}"), RenderHint::Hex));
-            }
-            Type::Ptr(_) => {
-                // Follow pointer to check if it points to cpumask.
-                let pointed = btf.resolve_chained_type(member_type.as_btf_type().unwrap());
-                if let Ok(pointed_type) = pointed {
-                    // Chase qualifiers on the pointed-to type.
-                    let mut inner = pointed_type;
-                    for _ in 0..20 {
-                        match &inner {
-                            Type::Const(_)
-                            | Type::Volatile(_)
-                            | Type::Restrict(_)
-                            | Type::Typedef(_)
-                            | Type::TypeTag(_) => {
-                                inner = match btf.resolve_chained_type(inner.as_btf_type().unwrap())
-                                {
-                                    Ok(next) => next,
-                                    Err(_) => break,
-                                };
-                            }
-                            _ => break,
-                        }
-                    }
-                    let pointed_name = match &inner {
-                        Type::Struct(s) | Type::Union(s) => btf.resolve_name(s).ok(),
-                        _ => None,
-                    };
-                    match pointed_name.as_deref() {
-                        Some("cpumask") | Some("cpumask_t") => {
-                            fields.push((
-                                fname.clone(),
-                                format!("->{fname}->bits[0]"),
-                                RenderHint::Hex,
-                            ));
-                        }
-                        _ => {} // skip unknown pointers
-                    }
-                }
-            }
-            _ => {}
+        if let Some(class) = classify_vmlinux_member(btf, member_tid) {
+            emit_member_field(&mut fields, &fname, class);
         }
     }
     fields
+}
+
+/// Classify one btf-rs member. Returns `None` when the type is not
+/// supported by auto-discovery. Resolves const/volatile/typedef/tag
+/// chains on both the member and the pointer target; loops cap at 20
+/// iterations each to terminate on pathological chains.
+fn classify_vmlinux_member(btf: &btf_rs::Btf, member_tid: u32) -> Option<MemberClass> {
+    use btf_rs::Type;
+
+    let mut member_type = btf.resolve_type_by_id(member_tid).ok()?;
+    for _ in 0..20 {
+        match &member_type {
+            Type::Const(_)
+            | Type::Volatile(_)
+            | Type::Restrict(_)
+            | Type::Typedef(_)
+            | Type::TypeTag(_) => {
+                member_type = btf.resolve_chained_type(member_type.as_btf_type()?).ok()?;
+            }
+            _ => break,
+        }
+    }
+
+    match &member_type {
+        Type::Int(i) => {
+            let hint = if i.is_bool() {
+                RenderHint::Bool
+            } else if i.is_signed() {
+                RenderHint::Signed
+            } else {
+                RenderHint::Hex
+            };
+            Some(MemberClass::Int(hint))
+        }
+        Type::Enum(_) | Type::Enum64(_) => Some(MemberClass::Enum),
+        Type::Ptr(_) => {
+            // Chase qualifiers to find the pointed-to struct name.
+            let mut inner = btf.resolve_chained_type(member_type.as_btf_type()?).ok()?;
+            for _ in 0..20 {
+                match &inner {
+                    Type::Const(_)
+                    | Type::Volatile(_)
+                    | Type::Restrict(_)
+                    | Type::Typedef(_)
+                    | Type::TypeTag(_) => {
+                        inner = btf.resolve_chained_type(inner.as_btf_type()?).ok()?;
+                    }
+                    _ => break,
+                }
+            }
+            let pointed_name = match &inner {
+                Type::Struct(s) | Type::Union(s) => btf.resolve_name(s).ok(),
+                _ => None,
+            };
+            match pointed_name.as_deref() {
+                Some("cpumask") | Some("cpumask_t") => Some(MemberClass::CpumaskPtr),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
