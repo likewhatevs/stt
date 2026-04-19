@@ -64,6 +64,15 @@ pub(crate) fn vcpu_preemption_threshold_ns(kernel_path: Option<&std::path::Path>
 }
 
 /// Determine CONFIG_HZ for the guest kernel.
+///
+/// The host's `/boot/config-$(uname -r)` is only consulted when the
+/// caller passed no explicit `kernel_path` (virtme default: host ==
+/// guest). A cached kernel whose IKCONFIG was stripped and whose
+/// build `.config` is unavailable must NOT inherit the host's
+/// CONFIG_HZ — the cached kernel was built with its own config, and
+/// using the host's CONFIG_HZ would silently misscale every
+/// tick-dependent threshold. Instead, such kernels fall through to
+/// [`DEFAULT_HZ`], which is the conservative default.
 pub(crate) fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
     if let Some(kp) = kernel_path {
         // Try embedded IKCONFIG in the vmlinux.
@@ -77,9 +86,23 @@ pub(crate) fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
         if let Some(hz) = read_hz_from_kernel_dir(kp) {
             return hz;
         }
+
+        // Explicit kernel_path whose config can't be recovered —
+        // don't fall through to the host's /boot/config; host HZ
+        // is unrelated to the cached/built guest kernel's HZ.
+        tracing::warn!(
+            kernel = %kp.display(),
+            default_hz = DEFAULT_HZ,
+            "guest_kernel_hz: no IKCONFIG or .config alongside \
+             kernel; falling back to DEFAULT_HZ rather than host \
+             /boot/config (tick-dependent thresholds may be \
+             conservative)"
+        );
+        return DEFAULT_HZ;
     }
 
-    // Try host /boot/config-$(uname -r).
+    // No kernel path given → virtme-style run where guest kernel ==
+    // host kernel. Host boot config is authoritative.
     if let Some(hz) = read_hz_from_boot_config() {
         return hz;
     }
@@ -1348,6 +1371,43 @@ mod tests {
         assert!(
             (10_000_000..=100_000_000).contains(&t),
             "fallback threshold {t} ns outside expected range"
+        );
+    }
+
+    /// Regression for the "host config leaks into guest HZ" bug:
+    /// when `kernel_path` is `Some`, `guest_kernel_hz` must not fall
+    /// back to `/boot/config-$(uname -r)`. A cached/built guest
+    /// kernel's HZ is independent of the host's HZ, so silently
+    /// picking up host HZ would yield wrong tick-dependent thresholds
+    /// on any mismatch.
+    ///
+    /// This test points `kernel_path` at a nonexistent file. The
+    /// IKCONFIG and `.config` lookups both fail, and the function
+    /// must return exactly [`DEFAULT_HZ`] — NOT whatever the host's
+    /// `/boot/config` happens to contain.
+    #[test]
+    fn guest_kernel_hz_gated_on_kernel_path() {
+        let bogus = std::path::Path::new("/nonexistent/ktstr-kernel/bzImage");
+        let hz = guest_kernel_hz(Some(bogus));
+        assert_eq!(
+            hz, DEFAULT_HZ,
+            "kernel_path=Some with no IKCONFIG/.config must fall back \
+             to DEFAULT_HZ, not host /boot/config; got {hz}"
+        );
+    }
+
+    /// Complement: with `kernel_path=None` (virtme-style run), the
+    /// host config IS authoritative and may legitimately override
+    /// `DEFAULT_HZ`. Verify the returned value is a plausible HZ
+    /// value — i.e., the code path still works when we explicitly
+    /// want host fallback.
+    #[test]
+    fn guest_kernel_hz_none_consults_host_config() {
+        let hz = guest_kernel_hz(None);
+        // Accept any known Linux HZ value (DEFAULT_HZ=250 is in this set).
+        assert!(
+            matches!(hz, 100 | 250 | 300 | 1000),
+            "guest_kernel_hz(None) = {hz} outside plausible HZ set"
         );
     }
 

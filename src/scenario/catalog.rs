@@ -230,8 +230,13 @@ pub fn all_scenarios() -> Vec<Scenario> {
                     num_workers: Some(16),
                     ..Default::default()
                 },
+                // One sentinel worker so assertions see at least one
+                // report for this cgroup (num_workers=0 would make
+                // every downstream check vacuously pass). With 1
+                // worker vs 16 the load asymmetry still exercises the
+                // borrow flag's cross-cgroup CPU reallocation.
                 Work {
-                    num_workers: Some(0),
+                    num_workers: Some(1),
                     ..Default::default()
                 },
             ],

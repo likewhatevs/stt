@@ -572,7 +572,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         if let Err(reason) = cw.mem_policy.validate() {
             anyhow::bail!("cgroup '{}': {}", name, reason);
         }
-        let n = cw.num_workers.unwrap_or(ctx.workers_per_cgroup);
+        let n = resolve_num_workers(&cw, ctx.workers_per_cgroup, name)?;
         let affinity = resolve_affinity_kind(&cw.affinity, cpusets.as_deref(), i, ctx.topo);
         let effective_work_type = crate::workload::resolve_work_type(
             &cw.work_type,
@@ -720,6 +720,26 @@ fn resolve_cpusets(
 /// When a cpuset is active, affinity masks are intersected with it so the
 /// effective `sched_setaffinity` mask matches what the kernel will enforce.
 /// Without a cpuset, the full topology is used.
+/// Resolve a [`Work`]'s `num_workers`, falling back to `default_n` when unset,
+/// and reject `num_workers=0`.
+///
+/// A cgroup with no workers emits no `WorkerReport`s, so every downstream
+/// assertion vacuously passes. Callers that want "no load" on a cgroup
+/// should either drop the `Work` entry entirely (letting the default apply)
+/// or use a single sentinel worker so assertions have something to check.
+pub(crate) fn resolve_num_workers(work: &Work, default_n: usize, label: &str) -> Result<usize> {
+    let n = work.num_workers.unwrap_or(default_n);
+    if n == 0 {
+        anyhow::bail!(
+            "cgroup '{}': num_workers=0 is not allowed — assertions would \
+             vacuously pass with no WorkerReports; use at least 1 worker or \
+             drop this Work entry",
+            label,
+        );
+    }
+    Ok(n)
+}
+
 pub fn resolve_affinity_for_cgroup(
     kind: &AffinityKind,
     cpuset: Option<&BTreeSet<usize>>,
@@ -1721,5 +1741,69 @@ mod tests {
         assert_eq!(total, 4, "holdback 50% of 8 should keep 4");
         assert_eq!(r[0], [0, 1].into_iter().collect());
         assert_eq!(r[1], [2, 3].into_iter().collect());
+    }
+
+    #[test]
+    fn resolve_num_workers_zero_rejected_with_label() {
+        let w = Work {
+            num_workers: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_num_workers(&w, 4, "victim").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cgroup 'victim'"),
+            "label must appear in error: {msg}"
+        );
+        assert!(
+            msg.contains("num_workers=0"),
+            "error must name the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_num_workers_zero_default_also_rejected() {
+        // When num_workers is unset AND the default is 0, still reject.
+        let w = Work {
+            num_workers: None,
+            ..Default::default()
+        };
+        assert!(resolve_num_workers(&w, 0, "cg").is_err());
+    }
+
+    #[test]
+    fn resolve_num_workers_falls_back_to_default() {
+        let w = Work {
+            num_workers: None,
+            ..Default::default()
+        };
+        assert_eq!(resolve_num_workers(&w, 3, "cg").unwrap(), 3);
+    }
+
+    #[test]
+    fn resolve_num_workers_explicit_wins_over_default() {
+        let w = Work {
+            num_workers: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(resolve_num_workers(&w, 3, "cg").unwrap(), 7);
+    }
+
+    /// Catalog sweep: every bundled [`Scenario`] must have
+    /// `num_workers != Some(0)` in each of its `cgroup_works` entries.
+    /// A zero-worker entry would vacuously pass every assertion at runtime.
+    #[test]
+    fn catalog_has_no_zero_worker_cgroup_works() {
+        for scenario in crate::scenario::all_scenarios() {
+            for (idx, cw) in scenario.cgroup_works.iter().enumerate() {
+                assert_ne!(
+                    cw.num_workers,
+                    Some(0),
+                    "scenario {:?} cgroup_works[{}] declares num_workers=Some(0)",
+                    scenario.name,
+                    idx,
+                );
+            }
+        }
     }
 }

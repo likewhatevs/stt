@@ -1036,7 +1036,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             }
         }
         for work in effective_works {
-            let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
+            let n = super::resolve_num_workers(work, ctx.workers_per_cgroup, &def.name)?;
             let effective_work_type = crate::workload::resolve_work_type(
                 &work.work_type,
                 ctx.work_type_override.as_ref(),
@@ -1108,7 +1108,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 if let Err(reason) = work.mem_policy.validate() {
                     anyhow::bail!("cgroup '{}': {}", cgroup, reason);
                 }
-                let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
+                let n = super::resolve_num_workers(work, ctx.workers_per_cgroup, cgroup)?;
                 let cgroup_cpuset = state.cpusets.get(cgroup.as_ref());
                 if let Some(resolved) = cgroup_cpuset {
                     validate_mempolicy_cpuset(&work.mem_policy, resolved, ctx, cgroup)?;
@@ -1174,7 +1174,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 if let Err(reason) = work.mem_policy.validate() {
                     anyhow::bail!("SpawnHost: {}", reason);
                 }
-                let n = work.num_workers.unwrap_or(ctx.workers_per_cgroup);
+                let n = super::resolve_num_workers(work, ctx.workers_per_cgroup, "<host>")?;
                 let affinity = super::resolve_affinity_for_cgroup(&work.affinity, None, ctx.topo);
                 let wl = WorkloadConfig {
                     num_workers: n,

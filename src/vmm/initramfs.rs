@@ -273,12 +273,15 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
 
     // Extract DT_NEEDED, DT_RUNPATH, and DT_RPATH from the root binary.
     let root_needed: Vec<String> = elf.libraries.iter().map(|s| s.to_string()).collect();
-    let mut root_search = elf_search_paths(&elf, binary);
+    let root_search = elf_search_paths(&elf, binary);
 
     // When the binary uses a non-standard interpreter (custom toolchain),
     // collect the interpreter's parent dir and sibling lib dirs. These
-    // are prepended to root search paths and propagated to transitive
-    // deps so the custom environment's libs are found BEFORE system libs.
+    // are passed to resolve_soname as `interp_hints` alongside the
+    // RPATH/RUNPATH split so the custom environment's libs are
+    // consulted before system libs (ld.so.cache, /etc/ld.so.conf,
+    // default paths). LD_LIBRARY_PATH still overrides them per the
+    // resolve_soname order contract.
     // Without this, the system libc gets resolved first, causing version
     // mismatches when the custom ld.so loads a libc that requires GLIBC
     // symbols the custom ld.so doesn't provide.
@@ -300,11 +303,6 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
         }
         _ => Vec::new(),
     };
-    if !interp_search_dirs.is_empty() {
-        let mut combined = interp_search_dirs.clone();
-        combined.append(&mut root_search);
-        root_search = combined;
-    }
 
     // Resolve the full transitive closure via level-parallel BFS.
     // Each level's file reads (read + ELF parse) run in parallel via
@@ -317,7 +315,7 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     let mut visited = std::collections::HashSet::new();
 
     // Current level: (soname, is_direct_dep_of_root, search_paths_from_parent)
-    let mut level: Vec<(String, bool, Vec<PathBuf>)> = root_needed
+    let mut level: Vec<(String, bool, ElfSearchPaths)> = root_needed
         .iter()
         .map(|s| (s.clone(), true, root_search.clone()))
         .collect();
@@ -329,7 +327,7 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
             if !visited.insert(soname.clone()) {
                 continue;
             }
-            if let Some(host_path) = resolve_soname(soname, search_paths) {
+            if let Some(host_path) = resolve_soname(soname, search_paths, &interp_search_dirs) {
                 let canonical =
                     std::fs::canonicalize(&host_path).unwrap_or_else(|_| host_path.clone());
                 let canon_str = canonical.to_string_lossy();
@@ -357,8 +355,11 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
         }
 
         // Phase 2: read + parse resolved libs in parallel to discover
-        // their DT_NEEDED entries and search paths.
-        let next_deps: Vec<(String, Vec<PathBuf>)> = resolved
+        // their DT_NEEDED entries and search paths. The interp-relative
+        // dirs apply uniformly to every resolve_soname call (via the
+        // top-level `interp_search_dirs` slice), so transitive deps
+        // don't need them threaded through per-level.
+        let next_deps: Vec<(String, ElfSearchPaths)> = resolved
             .par_iter()
             .flat_map(|(_, _, canonical)| {
                 let Ok(lib_data) = std::fs::read(canonical) else {
@@ -367,14 +368,7 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
                 let Ok(lib_elf) = goblin::elf::Elf::parse(&lib_data) else {
                     return Vec::new();
                 };
-                let mut lib_search = elf_search_paths(&lib_elf, canonical);
-                // Propagate interpreter-relative dirs to transitive deps
-                // so custom-environment libs resolve consistently.
-                if !interp_search_dirs.is_empty() {
-                    let mut combined = interp_search_dirs.clone();
-                    combined.append(&mut lib_search);
-                    lib_search = combined;
-                }
+                let lib_search = elf_search_paths(&lib_elf, canonical);
                 lib_elf
                     .libraries
                     .iter()
@@ -404,43 +398,77 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     Ok(result)
 }
 
-/// Extract search paths from DT_RUNPATH (preferred) or DT_RPATH, with
-/// dynamic string tokens expanded:
+/// DT_RPATH / DT_RUNPATH directories for a single binary.
+///
+/// glibc's `ld.so` treats these differently:
+/// - **DT_RUNPATH** (modern): consulted AFTER `LD_LIBRARY_PATH`.
+/// - **DT_RPATH** (legacy): consulted BEFORE `LD_LIBRARY_PATH`, but
+///   only when `DT_RUNPATH` is absent (DT_RUNPATH presence causes the
+///   loader to ignore DT_RPATH entirely).
+///
+/// Collapsing these into a single list (as the prior code did)
+/// silently demoted legacy DT_RPATH binaries to DT_RUNPATH order,
+/// which can produce different library resolution than the real
+/// dynamic linker.
+#[derive(Debug, Clone, Default)]
+struct ElfSearchPaths {
+    /// DT_RPATH directories, with dynamic tokens expanded. Non-empty
+    /// only when the binary has DT_RPATH and no DT_RUNPATH (glibc
+    /// ignores DT_RPATH when DT_RUNPATH is present).
+    rpath: Vec<PathBuf>,
+    /// DT_RUNPATH directories, with dynamic tokens expanded.
+    runpath: Vec<PathBuf>,
+}
+
+/// Extract search paths from DT_RUNPATH and DT_RPATH, with dynamic
+/// string tokens expanded:
 /// - `$ORIGIN` / `${ORIGIN}`: binary's parent directory
 /// - `$LIB` / `${LIB}`: `lib` or `lib64` based on ELF class
 /// - `$PLATFORM` / `${PLATFORM}`: `x86_64` or `aarch64`
-fn elf_search_paths(elf: &goblin::elf::Elf, binary: &Path) -> Vec<PathBuf> {
+///
+/// Returns the two sets separately so `resolve_soname` can apply
+/// glibc's ordering rules; see [`ElfSearchPaths`].
+fn elf_search_paths(elf: &goblin::elf::Elf, binary: &Path) -> ElfSearchPaths {
     let origin = binary
         .parent()
         .and_then(|p| std::fs::canonicalize(p).ok())
         .unwrap_or_default();
 
-    // DT_RUNPATH takes precedence over DT_RPATH when both are present.
-    let raw = if !elf.runpaths.is_empty() {
-        elf.runpaths.join(":")
-    } else if !elf.rpaths.is_empty() {
-        elf.rpaths.join(":")
-    } else {
-        return vec![];
-    };
-
     let origin_str = origin.to_string_lossy();
-    // goblin's is_64 distinguishes 64-bit vs 32-bit ELF class.
     let lib_str = if elf.is_64 { "lib64" } else { "lib" };
     let platform_str = std::env::consts::ARCH;
 
-    raw.split(':')
-        .map(|p| {
-            let expanded = p
-                .replace("$ORIGIN", &origin_str)
-                .replace("${ORIGIN}", &origin_str)
-                .replace("$LIB", lib_str)
-                .replace("${LIB}", lib_str)
-                .replace("$PLATFORM", platform_str)
-                .replace("${PLATFORM}", platform_str);
-            PathBuf::from(expanded)
-        })
-        .collect()
+    let expand = |raw: &str| -> Vec<PathBuf> {
+        raw.split(':')
+            .filter(|s| !s.is_empty())
+            .map(|p| {
+                let expanded = p
+                    .replace("$ORIGIN", &origin_str)
+                    .replace("${ORIGIN}", &origin_str)
+                    .replace("$LIB", lib_str)
+                    .replace("${LIB}", lib_str)
+                    .replace("$PLATFORM", platform_str)
+                    .replace("${PLATFORM}", platform_str);
+                PathBuf::from(expanded)
+            })
+            .collect()
+    };
+
+    // Modern: DT_RUNPATH is honored and overrides DT_RPATH completely.
+    if !elf.runpaths.is_empty() {
+        return ElfSearchPaths {
+            rpath: Vec::new(),
+            runpath: expand(&elf.runpaths.join(":")),
+        };
+    }
+    // Legacy: only DT_RPATH. Searched before LD_LIBRARY_PATH.
+    if !elf.rpaths.is_empty() {
+        return ElfSearchPaths {
+            rpath: expand(&elf.rpaths.join(":")),
+            runpath: Vec::new(),
+        };
+    }
+    ElfSearchPaths::default()
 }
 
 /// Well-known system dynamic linker paths. If a binary's PT_INTERP
@@ -502,13 +530,37 @@ static LD_LIBRARY_PATH_DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 
 /// Resolve a soname to a host path.
 /// Search order matches the host dynamic linker (ld.so):
-///   1. LD_LIBRARY_PATH
-///   2. DT_RUNPATH / DT_RPATH from the binary
-///   3. /etc/ld.so.cache (binary cache from ldconfig)
-///   4. /etc/ld.so.conf paths (text config directories)
-///   5. Default library paths (/lib, /usr/lib, etc.)
-fn resolve_soname(soname: &str, elf_search_dirs: &[PathBuf]) -> Option<PathBuf> {
-    // 1. LD_LIBRARY_PATH.
+///   1. DT_RPATH (ONLY if DT_RUNPATH is absent — legacy order)
+///   2. LD_LIBRARY_PATH
+///   3. DT_RUNPATH (modern; ignored when DT_RPATH was used above)
+///   4. interp-relative hints (custom toolchain support, not part of
+///      glibc; treated as "RUNPATH-adjacent" to keep LD_LIBRARY_PATH
+///      able to override them)
+///   5. /etc/ld.so.cache (binary cache from ldconfig — already
+///      covers everything in /etc/ld.so.conf, so no separate
+///      conf-walk step)
+///   6. Default library paths (/lib, /usr/lib, etc.)
+///
+/// This matches glibc ld.so(8) — specifically, DT_RPATH takes
+/// priority over `LD_LIBRARY_PATH` when it is the binary's only
+/// rpath-style entry, and DT_RUNPATH is consulted only AFTER
+/// `LD_LIBRARY_PATH` so an admin override still wins.
+fn resolve_soname(
+    soname: &str,
+    elf_paths: &ElfSearchPaths,
+    interp_hints: &[PathBuf],
+) -> Option<PathBuf> {
+    // 1. DT_RPATH (legacy). Non-empty only when DT_RUNPATH is absent
+    //    per `elf_search_paths`; matches glibc's "DT_RPATH before
+    //    LD_LIBRARY_PATH" rule for pre-RUNPATH binaries.
+    for dir in &elf_paths.rpath {
+        let candidate = dir.join(soname);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 2. LD_LIBRARY_PATH.
     for dir in LD_LIBRARY_PATH_DIRS.iter() {
         let candidate = dir.join(soname);
         if candidate.is_file() {
@@ -516,30 +568,35 @@ fn resolve_soname(soname: &str, elf_search_dirs: &[PathBuf]) -> Option<PathBuf> 
         }
     }
 
-    // 2. DT_RUNPATH / DT_RPATH directories.
-    for dir in elf_search_dirs {
+    // 3. DT_RUNPATH (modern).
+    for dir in &elf_paths.runpath {
         let candidate = dir.join(soname);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
 
-    // 3. ld.so.cache — the binary cache is the real dynamic linker's
+    // 4. Interp-relative hints for non-standard dynamic linkers.
+    //    Not a glibc concept — ktstr uses these to keep custom
+    //    toolchain libs resolvable without requiring the user to
+    //    set LD_LIBRARY_PATH.
+    for dir in interp_hints {
+        let candidate = dir.join(soname);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 5. ld.so.cache — the binary cache is the real dynamic linker's
     //    primary lookup mechanism. Catches libraries in directories
     //    added via `ldconfig /path` that don't appear in ld.so.conf.
     if let Some(cached_path) = LD_SO_CACHE.get(soname) {
         return Some(cached_path.clone());
     }
 
-    // 4. Paths from /etc/ld.so.conf.
-    for dir in LD_SO_CONF_PATHS.iter() {
-        let candidate = dir.join(soname);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    // 5. Default paths.
+    // 6. Default paths. (ld.so.conf step dropped: ldconfig already
+    //    ingests conf paths into ld.so.cache above, so a separate
+    //    walk here was redundant per glibc's search algorithm.)
     for dir in DEFAULT_LIB_PATHS {
         let candidate = Path::new(dir).join(soname);
         if candidate.is_file() {
@@ -1846,12 +1903,102 @@ mod tests {
 
     #[test]
     fn resolve_soname_finds_libc() {
-        let result = resolve_soname("libc.so.6", &[]);
+        let result = resolve_soname("libc.so.6", &ElfSearchPaths::default(), &[]);
         assert!(
             result.is_some(),
             "should resolve libc.so.6 via default paths"
         );
         assert!(result.unwrap().is_file());
+    }
+
+    /// Regression for glibc-divergence bug in [`resolve_soname`]: DT_RPATH
+    /// must be consulted BEFORE DT_RUNPATH (via the LD_LIBRARY_PATH step),
+    /// and DT_RUNPATH must come BEFORE interp-relative hints.
+    ///
+    /// The test populates both a unique `rpath` dir and a unique `runpath`
+    /// dir, each containing a distinct "library" file with the same
+    /// soname. The file picked must be the one from `rpath` — matching
+    /// glibc's "DT_RPATH before LD_LIBRARY_PATH, LD_LIBRARY_PATH before
+    /// DT_RUNPATH" ordering.
+    #[test]
+    fn resolve_soname_rpath_beats_runpath_when_both_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rpath_dir = tmp.path().join("rpath");
+        let runpath_dir = tmp.path().join("runpath");
+        std::fs::create_dir_all(&rpath_dir).unwrap();
+        std::fs::create_dir_all(&runpath_dir).unwrap();
+        let soname = "libktstrfake-rpath-beats-runpath.so.1";
+        std::fs::write(rpath_dir.join(soname), b"rpath-copy").unwrap();
+        std::fs::write(runpath_dir.join(soname), b"runpath-copy").unwrap();
+
+        let paths = ElfSearchPaths {
+            rpath: vec![rpath_dir.clone()],
+            runpath: vec![runpath_dir.clone()],
+        };
+        let got = resolve_soname(soname, &paths, &[]).expect("should resolve");
+        assert_eq!(
+            got,
+            rpath_dir.join(soname),
+            "DT_RPATH must be preferred over DT_RUNPATH when both are \
+             populated (the LD_LIBRARY_PATH step separates them)"
+        );
+    }
+
+    /// Regression: DT_RUNPATH must beat the interp-hint fallback,
+    /// otherwise a binary with a perfectly good DT_RUNPATH could pick
+    /// up a wrong copy from the dynamic linker's directory.
+    #[test]
+    fn resolve_soname_runpath_beats_interp_hints() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runpath_dir = tmp.path().join("runpath");
+        let interp_dir = tmp.path().join("interp");
+        std::fs::create_dir_all(&runpath_dir).unwrap();
+        std::fs::create_dir_all(&interp_dir).unwrap();
+        let soname = "libktstrfake-runpath-beats-interp.so.1";
+        std::fs::write(runpath_dir.join(soname), b"runpath-copy").unwrap();
+        std::fs::write(interp_dir.join(soname), b"interp-copy").unwrap();
+
+        let paths = ElfSearchPaths {
+            rpath: Vec::new(),
+            runpath: vec![runpath_dir.clone()],
+        };
+        let got = resolve_soname(soname, &paths, std::slice::from_ref(&interp_dir))
+            .expect("should resolve");
+        assert_eq!(
+            got,
+            runpath_dir.join(soname),
+            "DT_RUNPATH must be searched before interp-relative hints"
+        );
+    }
+
+    /// Legacy-binary path: when [`elf_search_paths`] populates `rpath`
+    /// with `runpath` empty (binary has DT_RPATH and no DT_RUNPATH),
+    /// DT_RPATH must resolve the soname before interp-relative hints
+    /// get a chance. This guards the "rpath precedes interp_hints"
+    /// ordering in [`resolve_soname`] for the legacy-only-RPATH case.
+    #[test]
+    fn resolve_soname_rpath_only_wins_when_runpath_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rpath_dir = tmp.path().join("rpath-legacy");
+        let interp_dir = tmp.path().join("interp");
+        std::fs::create_dir_all(&rpath_dir).unwrap();
+        std::fs::create_dir_all(&interp_dir).unwrap();
+        let soname = "libktstrfake-rpath-legacy.so.1";
+        std::fs::write(rpath_dir.join(soname), b"rpath-copy").unwrap();
+        std::fs::write(interp_dir.join(soname), b"interp-copy").unwrap();
+
+        let paths = ElfSearchPaths {
+            rpath: vec![rpath_dir.clone()],
+            runpath: Vec::new(),
+        };
+        let got = resolve_soname(soname, &paths, std::slice::from_ref(&interp_dir))
+            .expect("should resolve");
+        assert_eq!(
+            got,
+            rpath_dir.join(soname),
+            "legacy binary with DT_RPATH (no DT_RUNPATH) must resolve \
+             via DT_RPATH, not interp hints"
+        );
     }
 
     #[test]
@@ -2491,7 +2638,7 @@ mod tests {
     #[test]
     fn ld_so_cache_consistent_with_resolve_soname() {
         // If libc.so.6 is in the cache, resolve_soname should find it.
-        let result = resolve_soname("libc.so.6", &[]);
+        let result = resolve_soname("libc.so.6", &ElfSearchPaths::default(), &[]);
         assert!(
             result.is_some(),
             "resolve_soname should find libc.so.6 (cache or paths)"
