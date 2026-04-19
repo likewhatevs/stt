@@ -423,13 +423,18 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
 /// Parse a gauntlet label "topology/scenario/flags[/work_type][#replica]" into
 /// (topology, scenario, flags, work_type, replica).
 fn parse_label(label: &str) -> (&str, &str, &str, &str, u32) {
-    // Strip optional "#N" replica suffix.
+    // Strip optional "#N" replica suffix. Replicas are 1-indexed (the
+    // generator never emits `#0`), so treat a parsed `0` the same way
+    // we treat a non-numeric suffix: keep the `#` as part of the base
+    // and default replica to 1. This keeps the invariant `replica >= 1`
+    // holding for every caller of `parse_label`, including the
+    // proptest that feeds arbitrary `#0` strings.
     let (base, replica) = match label.rfind('#') {
         Some(pos) => {
             let tail = &label[pos + 1..];
             match tail.parse::<u32>() {
-                Ok(r) => (&label[..pos], r),
-                Err(_) => (label, 1),
+                Ok(r) if r >= 1 => (&label[..pos], r),
+                _ => (label, 1),
             }
         }
         None => (label, 1),

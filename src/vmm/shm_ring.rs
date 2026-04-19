@@ -336,7 +336,24 @@ pub struct ShmRingHeader {
     pub write_ptr: u64,
     /// Total bytes read by the host (monotonic).
     pub read_ptr: u64,
-    /// Number of messages dropped due to ring full.
+    /// Number of messages dropped by `shm_write`. Conflates three
+    /// distinct failure modes:
+    ///   1. ring-full — the common case, used-space + message would
+    ///      exceed `capacity`;
+    ///   2. total-size overflow — `MSG_HEADER_SIZE + payload.len()`
+    ///      overflows `usize` (pathological payload, effectively
+    ///      unreachable);
+    ///   3. length-field overflow — `payload.len() > u32::MAX` so the
+    ///      `ShmMessage.length` field cannot represent it
+    ///      (unreachable in the current schema where `capacity: u32`
+    ///      already caps payload size at ~4GB).
+    ///
+    /// Host telemetry readers treat all three as "producer lost a
+    /// message"; the ring-full case dominates and the overflow cases
+    /// exist only as defense-in-depth (see `shm_write`). Splitting
+    /// this into separate counters would add header bytes and
+    /// observable bytes for paths that should never fire in practice,
+    /// so the single counter is the right tradeoff.
     pub drops: u64,
 }
 
@@ -719,6 +736,13 @@ pub fn shm_write(buf: &mut [u8], shm_offset: usize, msg_type: u32, payload: &[u8
     // in the header, so drop it rather than silently truncating and
     // producing a header whose CRC+length mismatch would either
     // crash the reader or cause it to skip downstream messages.
+    //
+    // Defense-in-depth: in the current schema `capacity: u32` (see
+    // `ShmHeader`) makes this branch unreachable — the `needed >
+    // capacity` check above already rejects payloads larger than ~4GB
+    // well before the u32 conversion here could fail. Kept so that a
+    // future refactor widening `capacity` to `u64` cannot silently
+    // produce a torn header with a truncated length field.
     let Ok(length_u32) = u32::try_from(payload.len()) else {
         let drops_offset = shm_offset + 32;
         let current = u64::from_ne_bytes(buf[drops_offset..drops_offset + 8].try_into().unwrap());

@@ -793,46 +793,38 @@ mod tests {
 
     #[test]
     fn for_each_gauntlet_variant_skips_presets_exceeding_host_capacity() {
-        // Pass host_cpus=1 against a preset with 2+ CPUs: the preset
-        // fails `TopologyConstraints::accepts` and `visit` is never
-        // invoked. Any entry works since the constraint check runs
+        // Pass host_cpus=1/host_llcs=1 against the preset list: every
+        // current preset has total_cpus >= 4 (see `gauntlet_presets()`
+        // in src/vm.rs), so every preset fails
+        // `TopologyConstraints::accepts` and `visit` must never be
+        // called. Any entry works since the constraint check runs
         // before the visit — use the test dummy.
         let presets = crate::vm::gauntlet_presets();
-        if presets.is_empty() {
-            // No presets compiled in → nothing to test; the invariant
-            // is that the function returns without calling visit.
-            let mut count = 0;
-            for_each_gauntlet_variant(
-                find_test("__unit_test_dummy__").unwrap(),
-                &presets,
-                1,
-                1,
-                1,
-                |_, _| count += 1,
-            );
-            assert_eq!(count, 0);
-            return;
-        }
-        // host_cpus=1 rejects every multi-CPU preset; at most a
-        // single-CPU preset remains. Count visit invocations.
-        let mut count = 0;
+        // Precondition for the assertion below: if a future preset
+        // with total_cpus <= 1 is added, this test must be updated to
+        // account for it instead of silently under-asserting.
+        let every_preset_needs_more_than_one_cpu = presets
+            .iter()
+            .all(|p| p.topology.total_cpus() > 1 || p.topology.llcs > 1);
+        assert!(
+            presets.is_empty() || every_preset_needs_more_than_one_cpu,
+            "test assumes every preset requires >1 CPU or >1 LLC; \
+             found a single-CPU preset — update the assertion below"
+        );
+
+        let mut visited: Vec<String> = Vec::new();
         for_each_gauntlet_variant(
             find_test("__unit_test_dummy__").unwrap(),
             &presets,
             1,
             1,
             1,
-            |_, _| count += 1,
+            |preset, _| visited.push(preset.name.to_string()),
         );
-        // The dummy entry has default (unconstrained) constraints and
-        // no flags, so any preset that fits host_cpus=1 × host_llcs=1
-        // will yield exactly one `default` profile. We only assert an
-        // upper bound to avoid coupling to the preset list; the key
-        // invariant is that host-cap-exceeding presets are skipped.
-        let max_expected = presets.len();
         assert!(
-            count <= max_expected,
-            "visit count {count} must not exceed preset count {max_expected}"
+            visited.is_empty(),
+            "with host_cpus=1 host_llcs=1, no preset should be visited; \
+             visited: {visited:?}"
         );
     }
 

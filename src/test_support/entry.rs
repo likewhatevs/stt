@@ -835,17 +835,10 @@ mod tests {
         // accidentally leave `func: default_test_func` in their
         // entry must see a clean Err to surface the mistake.
         let (cgroups, topo) = dummy_ctx();
-        let ctx = Ctx {
-            cgroups: &cgroups,
-            topo: &topo,
-            duration: Duration::from_millis(1),
-            workers_per_cgroup: 1,
-            sched_pid: 0,
-            settle: Duration::from_millis(0),
-            work_type_override: None,
-            assert: crate::assert::Assert::NO_OVERRIDES,
-            wait_for_map_write: false,
-        };
+        let ctx = Ctx::builder(&cgroups, &topo)
+            .duration(Duration::from_millis(1))
+            .assert(crate::assert::Assert::NO_OVERRIDES)
+            .build();
         let result = default_test_func(&ctx);
         let err = result.expect_err("default_test_func must return Err, not Ok");
         let msg = format!("{err}");
