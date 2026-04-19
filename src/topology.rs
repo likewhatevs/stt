@@ -426,11 +426,21 @@ impl TestTopology {
                  synthesizing a single fallback LLC covering all online CPUs — \
                  LlcAligned affinity will pin to the entire machine"
             );
+            // Core map: with sysfs unavailable we can't reconstruct
+            // SMT sibling groupings, so assume no SMT — treat each
+            // CPU as its own core. This keeps `num_cores()` equal to
+            // the physical CPU count and `cores()` non-empty so
+            // consumers that iterate sibling groups always see at
+            // least one entry per CPU. The alternative (empty
+            // BTreeMap) forces `num_cores()` into the degenerate
+            // `cpus.len()` fallback branch at L49.
+            let cores: BTreeMap<usize, Vec<usize>> =
+                fallback_cpus.iter().map(|&c| (c, vec![c])).collect();
             vec![LlcInfo {
                 cpus: fallback_cpus,
                 numa_node: fallback_node,
                 cache_size_kb: None,
-                cores: BTreeMap::new(),
+                cores,
             }]
         } else {
             llcs

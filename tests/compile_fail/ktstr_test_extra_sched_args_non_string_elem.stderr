@@ -1,25 +1,5 @@
 error: expected string literal in extra_sched_args
- --> tests/compile_fail/ktstr_test_extra_sched_args_non_string_elem.rs:6:34
+ --> tests/compile_fail/ktstr_test_extra_sched_args_non_string_elem.rs:3:34
   |
-6 | #[ktstr_test(extra_sched_args = [42])]
+3 | #[ktstr_test(extra_sched_args = [42])]
   |                                  ^^
-
-warning: unused import: `anyhow::Result`
- --> tests/compile_fail/ktstr_test_extra_sched_args_non_string_elem.rs:1:5
-  |
-1 | use anyhow::Result;
-  |     ^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: unused import: `ktstr::assert::AssertResult`
- --> tests/compile_fail/ktstr_test_extra_sched_args_non_string_elem.rs:2:5
-  |
-2 | use ktstr::assert::AssertResult;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-warning: unused import: `ktstr::scenario::Ctx`
- --> tests/compile_fail/ktstr_test_extra_sched_args_non_string_elem.rs:4:5
-  |
-4 | use ktstr::scenario::Ctx;
-  |     ^^^^^^^^^^^^^^^^^^^^

@@ -6390,6 +6390,86 @@ mod tests {
         assert!(t.validate().is_err());
     }
 
+    // -- #37: KtstrTestEntry::validate coverage --
+
+    fn validate_entry(
+        name: &'static str,
+        memory_mb: u32,
+        replicas: u32,
+        duration: Duration,
+        workers_per_cgroup: u32,
+    ) -> KtstrTestEntry {
+        KtstrTestEntry {
+            name,
+            memory_mb,
+            replicas,
+            duration,
+            workers_per_cgroup,
+            ..KtstrTestEntry::DEFAULT
+        }
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_accepts_defaults() {
+        let e = validate_entry("ok", 512, 1, Duration::from_secs(2), 2);
+        e.validate().unwrap();
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_empty_name() {
+        let e = validate_entry("", 512, 1, Duration::from_secs(2), 2);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("name") && msg.contains("non-empty"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_zero_memory() {
+        let e = validate_entry("t", 0, 1, Duration::from_secs(2), 2);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("memory_mb") && msg.contains("> 0") && msg.contains("'t'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_zero_replicas() {
+        let e = validate_entry("t", 512, 0, Duration::from_secs(2), 2);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("replicas") && msg.contains("> 0"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_zero_duration() {
+        let e = validate_entry("t", 512, 1, Duration::ZERO, 2);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duration") && msg.contains("> 0"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ktstr_test_entry_validate_rejects_zero_workers() {
+        let e = validate_entry("t", 512, 1, Duration::from_secs(2), 0);
+        let err = e.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workers_per_cgroup") && msg.contains("> 0"),
+            "got: {msg}"
+        );
+    }
+
     // -- evaluate_vm_result error path tests --
 
     fn dummy_test_fn(_ctx: &Ctx) -> Result<AssertResult> {

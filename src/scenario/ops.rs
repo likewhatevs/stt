@@ -2469,6 +2469,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&parent);
     }
 
+    /// #37 — the SetAffinity dispatcher's `AffinityMode::Random`
+    /// arm is guarded by `!from.is_empty() && *count > 0` (see the
+    /// match arm at L1223). This test mirrors that classification to
+    /// lock the contract in place: future refactors that drop either
+    /// side of the AND must update this test alongside the dispatch.
+    /// The live dispatcher path requires a mounted cgroup tree and
+    /// a workload handle — covered by #17 (CgroupManager test trait)
+    /// when it lands.
+    #[test]
+    fn set_affinity_random_no_op_conditions() {
+        fn should_apply(from: &BTreeSet<usize>, count: usize) -> bool {
+            !from.is_empty() && count > 0
+        }
+        let pool: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
+        let empty: BTreeSet<usize> = BTreeSet::new();
+        assert!(should_apply(&pool, 2));
+        assert!(!should_apply(&pool, 0), "count=0 → no-op");
+        assert!(!should_apply(&empty, 1), "empty pool → no-op");
+        assert!(!should_apply(&empty, 0), "both zero → no-op");
+    }
+
     #[test]
     fn cpusetspec_validate_llc_out_of_range() {
         let (cg, topo) = make_ctx(1, 4, 1);

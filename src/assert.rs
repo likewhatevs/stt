@@ -1303,6 +1303,8 @@ impl Assert {
 /// #     wake_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
 /// #     schedstat_cpu_time_ns: 0,
+/// #     numa_pages: std::collections::BTreeMap::new(),
+/// #     vmstat_numa_pages_migrated: 0,
 /// # };
 /// let expected: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
 /// assert!(assert_isolation(&[report], &expected).passed);
@@ -1335,6 +1337,8 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// #     wake_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
 /// #     schedstat_cpu_time_ns: 0,
+/// #     numa_pages: std::collections::BTreeMap::new(),
+/// #     vmstat_numa_pages_migrated: 0,
 /// # };
 /// let r = assert_not_starved(&[report]);
 /// assert!(r.passed);
@@ -1543,6 +1547,8 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 /// #     wake_latencies_ns: vec![], iterations: 0,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
 /// #     schedstat_cpu_time_ns: 0,
+/// #     numa_pages: std::collections::BTreeMap::new(),
+/// #     vmstat_numa_pages_migrated: 0,
 /// # };
 /// // Equal throughput -> low CV -> passes.
 /// let reports = [mk(1000, 1_000_000_000), mk(1000, 1_000_000_000)];
@@ -1625,6 +1631,8 @@ pub fn assert_throughput_parity(
 /// #     iterations: 1000,
 /// #     schedstat_run_delay_ns: 0, schedstat_ctx_switches: 0,
 /// #     schedstat_cpu_time_ns: 0,
+/// #     numa_pages: std::collections::BTreeMap::new(),
+/// #     vmstat_numa_pages_migrated: 0,
 /// # };
 /// // p99 = 500ns, well under 10000ns limit.
 /// assert!(assert_benchmarks(&[report], Some(10000), None, None).passed);

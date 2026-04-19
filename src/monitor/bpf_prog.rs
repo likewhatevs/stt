@@ -240,17 +240,23 @@ pub(crate) fn read_prog_runtime_stats(
 pub struct BpfProgAccessor<'a> {
     kernel: &'a super::guest::GuestKernel<'a>,
     prog_idr_kva: u64,
-    offsets: BpfProgOffsets,
+    /// Borrowed from the caller. Mirrors the `BpfMapAccessor` pattern:
+    /// `BpfProgOffsets` is a ~160-byte POD built once from the
+    /// vmlinux BTF, and every hot-path method reads it by reference,
+    /// so owning it in the accessor would charge a clone that serves
+    /// no purpose.
+    offsets: &'a BpfProgOffsets,
 }
 
 impl<'a> BpfProgAccessor<'a> {
-    /// Create from an existing [`GuestKernel`](super::guest::GuestKernel) and vmlinux path.
+    /// Create from an existing [`GuestKernel`](super::guest::GuestKernel)
+    /// and a caller-owned [`BpfProgOffsets`]. The accessor borrows both
+    /// for its lifetime — build `offsets` once via
+    /// [`BpfProgOffsets::from_vmlinux`] and reuse across calls.
     pub fn from_guest_kernel(
         kernel: &'a super::guest::GuestKernel<'a>,
-        vmlinux: &std::path::Path,
+        offsets: &'a BpfProgOffsets,
     ) -> anyhow::Result<Self> {
-        let offsets = BpfProgOffsets::from_vmlinux(vmlinux)?;
-
         let prog_idr_kva = kernel
             .symbol_kva("prog_idr")
             .ok_or_else(|| anyhow::anyhow!("prog_idr symbol not found in vmlinux"))?;
@@ -269,7 +275,7 @@ impl<'a> BpfProgAccessor<'a> {
             self.kernel.cr3_pa(),
             self.kernel.page_offset(),
             self.prog_idr_kva,
-            &self.offsets,
+            self.offsets,
             self.kernel.l5(),
         )
     }

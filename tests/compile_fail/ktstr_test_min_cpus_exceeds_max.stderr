@@ -1,27 +1,7 @@
 error: min_cpus (64) exceeds max_cpus (32). Set max_cpus explicitly.
- --> tests/compile_fail/ktstr_test_min_cpus_exceeds_max.rs:6:1
+ --> tests/compile_fail/ktstr_test_min_cpus_exceeds_max.rs:3:1
   |
-6 | #[ktstr_test(min_cpus = 64, max_cpus = 32)]
+3 | #[ktstr_test(min_cpus = 64, max_cpus = 32)]
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-warning: unused import: `anyhow::Result`
- --> tests/compile_fail/ktstr_test_min_cpus_exceeds_max.rs:1:5
-  |
-1 | use anyhow::Result;
-  |     ^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: unused import: `ktstr::assert::AssertResult`
- --> tests/compile_fail/ktstr_test_min_cpus_exceeds_max.rs:2:5
-  |
-2 | use ktstr::assert::AssertResult;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-warning: unused import: `ktstr::scenario::Ctx`
- --> tests/compile_fail/ktstr_test_min_cpus_exceeds_max.rs:4:5
-  |
-4 | use ktstr::scenario::Ctx;
-  |     ^^^^^^^^^^^^^^^^^^^^

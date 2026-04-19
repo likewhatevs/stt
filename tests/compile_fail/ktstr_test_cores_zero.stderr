@@ -1,27 +1,7 @@
-error: cores must be > 0
- --> tests/compile_fail/ktstr_test_cores_zero.rs:6:1
+error: cores must be > 0 (a topology with zero cores per LLC has zero CPUs — `total_cpus = llcs * cores * threads` — so the VM would boot with no addressable processors)
+ --> tests/compile_fail/ktstr_test_cores_zero.rs:3:1
   |
-6 | #[ktstr_test(cores = 0)]
+3 | #[ktstr_test(cores = 0)]
   | ^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-warning: unused import: `anyhow::Result`
- --> tests/compile_fail/ktstr_test_cores_zero.rs:1:5
-  |
-1 | use anyhow::Result;
-  |     ^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: unused import: `ktstr::assert::AssertResult`
- --> tests/compile_fail/ktstr_test_cores_zero.rs:2:5
-  |
-2 | use ktstr::assert::AssertResult;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-warning: unused import: `ktstr::scenario::Ctx`
- --> tests/compile_fail/ktstr_test_cores_zero.rs:4:5
-  |
-4 | use ktstr::scenario::Ctx;
-  |     ^^^^^^^^^^^^^^^^^^^^

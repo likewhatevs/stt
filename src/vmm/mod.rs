@@ -3199,8 +3199,12 @@ impl KtstrVm {
             Ok(k) => k,
             Err(_) => return Vec::new(),
         };
+        let offsets = match monitor::btf_offsets::BpfProgOffsets::from_vmlinux(&vmlinux) {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
         let accessor =
-            match monitor::bpf_prog::BpfProgAccessor::from_guest_kernel(&kernel, &vmlinux) {
+            match monitor::bpf_prog::BpfProgAccessor::from_guest_kernel(&kernel, &offsets) {
                 Ok(a) => a,
                 Err(_) => return Vec::new(),
             };
@@ -4552,6 +4556,126 @@ mod tests {
         let b = KtstrVmBuilder::default();
         assert_eq!(b.memory_mb, Some(256));
         assert_eq!(b.topology.total_cpus(), 1);
+    }
+
+    /// #37 — explicit `memory_mb(0)` must be rejected at build time
+    /// rather than surfacing as an opaque KVM ioctl failure later.
+    /// The builder default (None→256) passes.
+    #[test]
+    fn builder_rejects_explicit_zero_memory() {
+        // Point at a real file so the kernel-existence check
+        // (which runs before the memory_mb guard) does not short-
+        // circuit. /bin/true exists on every host the tests care
+        // about; its contents don't matter for this check.
+        let kernel = std::path::PathBuf::from("/bin/true");
+        let result = KtstrVmBuilder::default()
+            .kernel(&kernel)
+            .memory_mb(0)
+            .no_perf_mode(true)
+            .build();
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("build() must reject memory_mb(0)"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("memory_mb") && msg.contains("> 0"),
+            "error must name the field and constraint: {msg}"
+        );
+    }
+
+    /// #4 — `shm_try_create_excl` winner gets a locked fd; a second
+    /// call with the same name returns `Exists`. The winner's
+    /// `shm_unlink` cleanup keeps subsequent tests independent.
+    #[test]
+    fn shm_try_create_excl_winner_then_exists() {
+        // Unique name per test process + nanos so parallel tests
+        // don't collide on the global /dev/shm namespace.
+        let name = format!(
+            "/ktstr-test-shm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+
+        match shm_try_create_excl(&name) {
+            ShmCreateResult::Winner(fd) => {
+                // Second attempt sees the existing segment.
+                match shm_try_create_excl(&name) {
+                    ShmCreateResult::Exists => {}
+                    ShmCreateResult::Winner(other) => {
+                        // Impossible if O_EXCL worked; clean up and fail.
+                        unsafe { libc::close(other) };
+                        if let Ok(cname) = std::ffi::CString::new(name.clone()) {
+                            unsafe { libc::shm_unlink(cname.as_ptr()) };
+                        }
+                        unsafe { libc::close(fd) };
+                        panic!("second shm_try_create_excl must return Exists, not Winner");
+                    }
+                    ShmCreateResult::Error => {
+                        unsafe { libc::close(fd) };
+                        if let Ok(cname) = std::ffi::CString::new(name.clone()) {
+                            unsafe { libc::shm_unlink(cname.as_ptr()) };
+                        }
+                        panic!("second shm_try_create_excl returned Error");
+                    }
+                }
+                // Clean up: write path then unlink so this test
+                // doesn't leave /dev/shm residue.
+                shm_write_and_release(fd, b"ok", &name);
+                if let Ok(cname) = std::ffi::CString::new(name.clone()) {
+                    unsafe { libc::shm_unlink(cname.as_ptr()) };
+                }
+            }
+            ShmCreateResult::Exists => {
+                // A stale segment with this name exists. Unlink and retry.
+                if let Ok(cname) = std::ffi::CString::new(name.clone()) {
+                    unsafe { libc::shm_unlink(cname.as_ptr()) };
+                }
+                panic!("test setup collision on shm name {name}");
+            }
+            ShmCreateResult::Error => {
+                // Environment without /dev/shm — skip rather than fail.
+                eprintln!("skip: shm_open unavailable in this environment");
+            }
+        }
+    }
+
+    /// #4 — `shm_write_and_release` on a happy path publishes the
+    /// data and releases the lock. After unlink the segment is gone.
+    #[test]
+    fn shm_write_and_release_publishes_data() {
+        let name = format!(
+            "/ktstr-test-shm-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let fd = match shm_try_create_excl(&name) {
+            ShmCreateResult::Winner(fd) => fd,
+            _ => {
+                eprintln!("skip: shm_open unavailable");
+                return;
+            }
+        };
+        let payload = b"shm-unit-test-payload";
+        shm_write_and_release(fd, payload, &name);
+
+        // Reopen read-only and verify size + contents.
+        let cname = std::ffi::CString::new(name.clone()).unwrap();
+        unsafe {
+            let rfd = libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0);
+            assert!(rfd >= 0, "shm_open for read failed");
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(rfd, &mut st), 0);
+            assert_eq!(st.st_size as usize, payload.len());
+            libc::close(rfd);
+            libc::shm_unlink(cname.as_ptr());
+        }
     }
 
     #[test]

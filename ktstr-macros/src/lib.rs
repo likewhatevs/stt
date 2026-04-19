@@ -482,24 +482,44 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Reject zero values at compile time (only for explicitly set values).
     if llcs_set && llcs == 0 {
-        return syn::Error::new(proc_macro2::Span::call_site(), "llcs must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "llcs must be > 0 (a topology with zero LLCs has zero CPUs — \
+             `total_cpus = llcs * cores * threads` — so the VM would boot \
+             with no addressable processors)",
+        )
+        .to_compile_error()
+        .into();
     }
     if cores_set && cores == 0 {
-        return syn::Error::new(proc_macro2::Span::call_site(), "cores must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "cores must be > 0 (a topology with zero cores per LLC has \
+             zero CPUs — `total_cpus = llcs * cores * threads` — so the \
+             VM would boot with no addressable processors)",
+        )
+        .to_compile_error()
+        .into();
     }
     if threads_set && threads == 0 {
-        return syn::Error::new(proc_macro2::Span::call_site(), "threads must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "threads must be > 0 (a topology with zero threads per core \
+             has zero CPUs — `total_cpus = llcs * cores * threads` — so \
+             the VM would boot with no addressable processors)",
+        )
+        .to_compile_error()
+        .into();
     }
     if numa_nodes_set && numa_nodes == 0 {
-        return syn::Error::new(proc_macro2::Span::call_site(), "numa_nodes must be > 0")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "numa_nodes must be > 0 (a topology with zero NUMA nodes has \
+             nothing to attach LLCs or memory to; every downstream \
+             accessor would observe an empty node set)",
+        )
+        .to_compile_error()
+        .into();
     }
     if llcs_set && numa_nodes_set && !llcs.is_multiple_of(numa_nodes) {
         return syn::Error::new(
