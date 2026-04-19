@@ -145,7 +145,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_topo_zero_sockets() {
+    fn parse_topo_zero_llcs_legacy() {
+        // Legacy three-part format "NsNcNt" — the `s` token originally
+        // meant "sockets" but, after the sockets→LLCs rename, the leading
+        // field is the LLC count. A zero here must still be rejected.
         assert!(parse_topo_string("0s4c2t").is_none());
     }
 

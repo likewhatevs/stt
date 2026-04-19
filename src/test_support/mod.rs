@@ -4,9 +4,10 @@
 //! and result evaluation. Includes guest-side profraw flush for
 //! coverage-instrumented builds.
 //!
-//! See the [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
-//! and [`#[ktstr_test]` Macro](https://likewhatevs.github.io/ktstr/guide/writing-tests/ktstr-test-macro.html)
-//! chapters of the guide.
+//! The entry point for test authors is the [`macro@crate::ktstr_test`]
+//! attribute macro; see the user-facing Writing Tests guide shipped
+//! with the crate's mdbook for end-to-end examples and the full
+//! attribute grammar.
 //!
 //! # Consumer API
 //!

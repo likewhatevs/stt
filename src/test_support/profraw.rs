@@ -31,7 +31,11 @@ use std::path::{Path, PathBuf};
 use crate::vmm;
 
 /// SHM ring message type for profraw data.
-pub(crate) const MSG_TYPE_PROFRAW: u32 = 0x50524157; // "PRAW"
+///
+/// Derived from the ASCII bytes `b"PRAW"` in big-endian order so the
+/// constant reads as the tag it represents in a hex dump, not as an
+/// opaque 32-bit magic number. Equivalent to `0x50524157`.
+pub(crate) const MSG_TYPE_PROFRAW: u32 = u32::from_be_bytes(*b"PRAW");
 
 /// Flush LLVM coverage profraw to the SHM ring buffer.
 ///

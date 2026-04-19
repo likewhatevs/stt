@@ -8,18 +8,18 @@
 //!   VM launch, guest-side test execution, or nextest protocol handling.
 //! - [`ktstr_main`]: the nextest protocol handler — `--list` returns
 //!   `ktstr/` and `gauntlet/` test names, `--exact` runs a single test.
-//! - [`run_ktstr_test`] / [`run_ktstr_test_with_topo_and_flags`]:
-//!   programmatic entry points used by library consumers and the
-//!   macro-generated `#[test]` wrappers.
+//! - [`run_ktstr_test`]: programmatic entry point used by library
+//!   consumers and the macro-generated `#[test]` wrappers.
 //! - [`analyze_sidecars`]: collects sidecar JSON from a run directory
 //!   and renders the full gauntlet analysis (rows + verifier + callback
 //!   profile + KVM stats) into a string.
 //!
-//! The heavy lifting — [`run_ktstr_test_inner`](super::run_ktstr_test_inner),
-//! [`evaluate_vm_result`](super::evaluate_vm_result),
-//! sidecar I/O, probe pipeline, argument extraction, VM launch — lives
-//! in sibling modules or the parent `mod.rs` and is called through
-//! `super::`.
+//! The heavy lifting lives in sibling submodules:
+//! [`super::eval::run_ktstr_test_inner`] /
+//! [`super::eval::evaluate_vm_result`] (host-side result judgment),
+//! [`super::sidecar`] (per-run JSON), [`super::probe`] (auto-repro +
+//! BPF probe pipeline), [`super::args`] (CLI extraction), and the
+//! [`crate::vmm`] VM launcher.
 
 use anyhow::Result;
 
@@ -53,7 +53,7 @@ pub fn ktstr_test_early_dispatch() {
     // PID 1: the binary is /init in the VM. Perform full init lifecycle
     // (mounts, scheduler, test dispatch, reboot). Never returns.
     if unsafe { libc::getpid() } == 1 {
-        ktstr_guest_init();
+        crate::vmm::rust_init::ktstr_guest_init();
     }
 
     if let Some(code) = maybe_dispatch_host_test() {
@@ -89,13 +89,6 @@ pub fn ktstr_test_early_dispatch() {
             }
         }
     }
-}
-
-/// Guest init entry point. Called when running as PID 1 (the binary is
-/// `/init` in the VM). Handles the full init lifecycle: mounts,
-/// scheduler start, test dispatch, cleanup, and reboot. Never returns.
-pub(crate) fn ktstr_guest_init() -> ! {
-    crate::vmm::rust_init::ktstr_guest_init()
 }
 
 /// Host-side dispatch: if both `--ktstr-test-fn` and `--ktstr-topo` are
@@ -169,9 +162,12 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
 }
 
 /// Like `run_ktstr_test` but with an explicit topology override and
-/// active flags that map to
-/// scheduler CLI args via `Scheduler::flag_args()`.
-pub(crate) fn run_ktstr_test_with_topo_and_flags(
+/// active flags that map to scheduler CLI args via
+/// `Scheduler::flag_args()`. Only consumed inside this module by
+/// `maybe_dispatch_host_test`; kept as a named helper so the
+/// `--ktstr-test-fn` + `--ktstr-topo` dispatch path reads symmetrically
+/// with the zero-override [`run_ktstr_test`] library entry point.
+fn run_ktstr_test_with_topo_and_flags(
     entry: &KtstrTestEntry,
     topo: &TopoOverride,
     active_flags: &[String],

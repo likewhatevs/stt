@@ -42,13 +42,17 @@ pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
     b".bss",    // already SHT_NOBITS; holds scx_root (uninitialized global)
 ];
 
-/// ELF data sections whose addresses (`st_value` via `.symtab`) are
-/// read by this module, but whose backing bytes are not — guest
-/// memory is the source of truth at runtime.
+/// ELF data sections whose **addresses** (via `.symtab` `st_value`) are
+/// consumed here as guest-memory offsets — the vmlinux file contributes
+/// the symbol-to-address mapping only. The **runtime bytes** for these
+/// sections come from the live guest, not from the vmlinux image, so
+/// the strip pipeline can drop the file-backed contents safely.
 ///
-/// The strip pipeline preserves the section headers as
-/// `SHT_NOBITS` with zero-length data so symbol-table entries with
-/// `st_shndx` pointing here survive `Builder::delete_orphans`.
+/// Concretely, the strip pipeline rewrites these sections as
+/// `SHT_NOBITS` with zero-length data so symbol-table entries whose
+/// `st_shndx` points here survive `Builder::delete_orphans`. An address
+/// resolved from `.data` / `.data..percpu` is then translated via
+/// `text_kva_to_pa` / `kva_to_pa` and read out of `GuestMem`.
 pub(crate) const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
     b".data",         // init_top_pgt, map_idr, prog_idr, scx_watchdog_timeout
     b".data..percpu", // runqueues (per-CPU runqueue template)
