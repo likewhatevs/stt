@@ -145,15 +145,26 @@ fn load_kallsyms() -> Option<std::collections::HashMap<String, u64>> {
 ///
 /// A failed load (unreadable `/proc/kallsyms` — typical for
 /// unprivileged processes where the file is either missing or
-/// returns zeroed addresses) is NOT cached: the next call retries.
-/// This matters when the process escalates privileges mid-run (e.g.
-/// a test harness that re-execs under `sudo` after the first miss),
-/// where a cached `None` from the pre-escalation attempt would
-/// otherwise permanently suppress post-escalation resolution.
+/// returns zeroed addresses) is rate-limited to one retry per
+/// [`RETRY_MIN_INTERVAL`] (1 s); calls within that window return
+/// `None` immediately. This matters both for performance — a caller
+/// resolving N symbols under a permanently unreadable
+/// `/proc/kallsyms` pays one load attempt, not N — and for
+/// privilege-escalation correctness, where a test harness that
+/// re-execs under `sudo` after the first miss still sees a retry
+/// within seconds.
 pub fn resolve_func_ip(name: &str) -> Option<u64> {
     use std::sync::{OnceLock, RwLock};
+    use std::time::Instant;
     static CACHE: OnceLock<RwLock<Option<std::collections::HashMap<String, u64>>>> =
         OnceLock::new();
+    // Rate-limit the load retry on chronic failure. Without a
+    // floor, a caller that resolves N symbols under a permanently
+    // unreadable /proc/kallsyms triggers N * (read + parse) of a
+    // ~10 MB file. The floor turns that into one retry per window
+    // and returns `None` fast in between.
+    static LAST_LOAD_ATTEMPT: OnceLock<RwLock<Option<Instant>>> = OnceLock::new();
+
     let slot = CACHE.get_or_init(|| RwLock::new(None));
     // Fast path: take the read lock when the cache is populated.
     // Post-load the lookup is read-only and batches resolving many
@@ -164,14 +175,39 @@ pub fn resolve_func_ip(name: &str) -> Option<u64> {
             return map.get(name).copied();
         }
     }
-    // Slow path: escalate to write lock to populate. Re-check under
-    // the write lock in case a racing thread filled it first.
+    // Optional fast-decline: when the retry clock rules the caller
+    // out, avoid the write-lock acquire entirely. This is a
+    // performance hint only — correctness is enforced by the
+    // re-check below under the write lock, so a concurrent racer
+    // that slips past this gate still gets serialized.
+    let last_slot = LAST_LOAD_ATTEMPT.get_or_init(|| RwLock::new(None));
+    {
+        let last = last_slot.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *last
+            && t.elapsed() < RETRY_MIN_INTERVAL
+        {
+            return None;
+        }
+    }
+    // Slow path: escalate to write lock to populate. Re-check both
+    // the cache and the retry clock under the write lock so N
+    // concurrent first-callers don't stampede into N serialized
+    // loads: only the winner gets past the timestamp gate, everyone
+    // else observes `*last = Some(now)` and bails.
     let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
     if write.is_none() {
-        *write = load_kallsyms();
+        let mut last = last_slot.write().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| t.elapsed() >= RETRY_MIN_INTERVAL) {
+            *write = load_kallsyms();
+            *last = Some(Instant::now());
+        }
     }
     write.as_ref()?.get(name).copied()
 }
+
+/// Minimum interval between retry attempts when `/proc/kallsyms` is
+/// unreadable; see [`resolve_func_ip`] for the rationale.
+const RETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Populate a `func_meta` with field specs from BTF-resolved offsets.
 /// Shared between kprobe and fentry paths.

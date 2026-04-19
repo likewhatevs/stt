@@ -1283,4 +1283,39 @@ mod tests {
         };
         validate_entry_flags(&entry);
     }
+
+    // -- SchedulerSpec::display_name --
+
+    #[test]
+    fn display_name_eevdf() {
+        assert_eq!(SchedulerSpec::Eevdf.display_name(), "eevdf");
+    }
+
+    #[test]
+    fn display_name_discover_returns_binary_name() {
+        assert_eq!(
+            SchedulerSpec::Discover("scx_mitosis").display_name(),
+            "scx_mitosis"
+        );
+    }
+
+    #[test]
+    fn display_name_path_returns_path_string() {
+        assert_eq!(
+            SchedulerSpec::Path("/usr/bin/scx_my_sched").display_name(),
+            "/usr/bin/scx_my_sched"
+        );
+    }
+
+    #[test]
+    fn display_name_kernel_builtin_returns_kernel() {
+        assert_eq!(
+            SchedulerSpec::KernelBuiltin {
+                enable: &[],
+                disable: &[],
+            }
+            .display_name(),
+            "kernel"
+        );
+    }
 }

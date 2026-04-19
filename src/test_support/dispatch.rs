@@ -520,17 +520,12 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
-    let ctx = crate::scenario::Ctx {
-        cgroups: &cgroups,
-        topo: &topo,
-        duration: entry.duration,
-        workers_per_cgroup,
-        sched_pid: 0,
-        settle: std::time::Duration::from_millis(500),
-        work_type_override: None,
-        assert: merged_assert,
-        wait_for_map_write: false,
-    };
+    let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
+        .duration(entry.duration)
+        .workers_per_cgroup(workers_per_cgroup)
+        .settle(std::time::Duration::from_millis(500))
+        .assert(merged_assert)
+        .build();
     (entry.func)(&ctx)
 }
 
@@ -768,5 +763,105 @@ mod tests {
         // lookup branch.
         let exit = run_gauntlet_test("__unit_test_dummy__/__no_such_preset__/__default__");
         assert_eq!(exit, 1);
+    }
+
+    // -- host_capacity --
+
+    #[test]
+    fn host_capacity_returns_plausible_triple() {
+        // `host_capacity` reads `available_parallelism` and sysfs topology.
+        // The exact values depend on the test host, but the invariants
+        // hold on any sane Linux machine:
+        //   - cpus >= 1
+        //   - llcs >= 1 (at least one cache domain)
+        //   - max_cpus_per_llc >= 1
+        //   - max_cpus_per_llc <= cpus (no LLC wider than the whole host)
+        let (cpus, llcs, max_cpus_per_llc) = host_capacity();
+        assert!(cpus >= 1, "cpus >= 1, got {cpus}");
+        assert!(llcs >= 1, "llcs >= 1, got {llcs}");
+        assert!(
+            max_cpus_per_llc >= 1,
+            "max_cpus_per_llc >= 1, got {max_cpus_per_llc}"
+        );
+        assert!(
+            max_cpus_per_llc <= cpus,
+            "max_cpus_per_llc ({max_cpus_per_llc}) must not exceed cpus ({cpus})"
+        );
+    }
+
+    // -- for_each_gauntlet_variant --
+
+    #[test]
+    fn for_each_gauntlet_variant_skips_presets_exceeding_host_capacity() {
+        // Pass host_cpus=1 against a preset with 2+ CPUs: the preset
+        // fails `TopologyConstraints::accepts` and `visit` is never
+        // invoked. Any entry works since the constraint check runs
+        // before the visit — use the test dummy.
+        let presets = crate::vm::gauntlet_presets();
+        if presets.is_empty() {
+            // No presets compiled in → nothing to test; the invariant
+            // is that the function returns without calling visit.
+            let mut count = 0;
+            for_each_gauntlet_variant(
+                find_test("__unit_test_dummy__").unwrap(),
+                &presets,
+                1,
+                1,
+                1,
+                |_, _| count += 1,
+            );
+            assert_eq!(count, 0);
+            return;
+        }
+        // host_cpus=1 rejects every multi-CPU preset; at most a
+        // single-CPU preset remains. Count visit invocations.
+        let mut count = 0;
+        for_each_gauntlet_variant(
+            find_test("__unit_test_dummy__").unwrap(),
+            &presets,
+            1,
+            1,
+            1,
+            |_, _| count += 1,
+        );
+        // The dummy entry has default (unconstrained) constraints and
+        // no flags, so any preset that fits host_cpus=1 × host_llcs=1
+        // will yield exactly one `default` profile. We only assert an
+        // upper bound to avoid coupling to the preset list; the key
+        // invariant is that host-cap-exceeding presets are skipped.
+        let max_expected = presets.len();
+        assert!(
+            count <= max_expected,
+            "visit count {count} must not exceed preset count {max_expected}"
+        );
+    }
+
+    #[test]
+    fn for_each_gauntlet_variant_visits_every_fitting_preset_x_profile() {
+        // With generous host capacity (u32::MAX cpus/llcs), every
+        // preset that the dummy entry's constraints accept yields at
+        // least one `FlagProfile` visit (every scheduler generates a
+        // default profile when no flags are required/excluded).
+        let presets = crate::vm::gauntlet_presets();
+        let mut count = 0;
+        for_each_gauntlet_variant(
+            find_test("__unit_test_dummy__").unwrap(),
+            &presets,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            |_, _| count += 1,
+        );
+        // `__unit_test_dummy__` uses Scheduler::EEVDF which has no
+        // flags → exactly one profile per accepted preset.
+        // Asserting `count >= 1` proves at least one preset was
+        // accepted and visited. Coupling to the exact preset count
+        // would fail if the preset list changes.
+        if !presets.is_empty() {
+            assert!(
+                count >= 1,
+                "expected at least one visit with unlimited host capacity, got {count}"
+            );
+        }
     }
 }

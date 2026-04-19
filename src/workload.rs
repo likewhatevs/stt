@@ -885,10 +885,29 @@ pub struct Migration {
 /// Each field is populated by the worker itself (inside the VM) and
 /// serialized via a pipe to the parent process.
 ///
-/// [`Default`] produces a zero/empty report. Callers building a sentinel
-/// report should spread `..WorkerReport::default()` rather than listing
-/// every field by hand -- the sentinel drifts silently when a field
-/// is added.
+/// # Default trade-off
+///
+/// [`Default`] produces a zero/empty report. The trade-off:
+///
+/// - **Pro:** sentinel/test code can spread `..WorkerReport::default()`
+///   so adding a field does not require touching every sentinel site.
+/// - **Con:** zero-valued fields are valid report outputs (e.g. a
+///   worker that never blocked has `resume_latencies_ns: vec![]`), so
+///   a missing field cannot be distinguished from a real-zero field at
+///   the reader. Consumers that need "was this field actually set"
+///   must track presence out-of-band (e.g. whether the work type
+///   populates the field per [`resume_latencies_ns`]'s doc).
+///
+/// Decision: keep the `Default` impl. Sentinel ergonomics outweigh
+/// the distinguishability cost — every real consumer already knows
+/// which fields a given `WorkType` populates, and the alternative
+/// (removing `Default` and hand-listing every field at sentinel
+/// sites) introduces a worse drift problem that silently skips new
+/// telemetry instead of reporting it as zero.
+///
+/// Callers building a sentinel report should spread
+/// `..WorkerReport::default()` rather than listing every field by hand
+/// -- the sentinel drifts silently when a field is added.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkerReport {
     /// Worker process ID (from `getpid()` in the forked child).
@@ -2784,6 +2803,80 @@ mod tests {
     #[test]
     fn work_type_all_names_count() {
         assert_eq!(WorkType::ALL_NAMES.len(), 20);
+    }
+
+    // -- schbench_matrix_multiply --
+
+    #[test]
+    fn schbench_matrix_multiply_1x1_produces_product() {
+        // Size=1: A=[a], B=[b], expected C=[a*b]. The `black_box` calls
+        // prevent constant folding, so the test directly exercises the
+        // wrapping_mul path without any compiler optimization eating
+        // the multiplication.
+        let mut data = vec![0u64; 3];
+        data[0] = 3; // A
+        data[1] = 5; // B
+        schbench_matrix_multiply(&mut data, 1);
+        assert_eq!(data[2], 15, "C = A * B for 1x1 matrix");
+    }
+
+    #[test]
+    fn schbench_matrix_multiply_2x2_against_reference() {
+        // A = [[1, 2], [3, 4]], B = [[5, 6], [7, 8]]
+        // C = A * B = [[19, 22], [43, 50]]
+        let size = 2;
+        let stride = size * size;
+        let mut data = vec![0u64; 3 * stride];
+        data[0] = 1;
+        data[1] = 2;
+        data[2] = 3;
+        data[3] = 4;
+        data[stride] = 5;
+        data[stride + 1] = 6;
+        data[stride + 2] = 7;
+        data[stride + 3] = 8;
+        schbench_matrix_multiply(&mut data, size);
+        assert_eq!(data[2 * stride], 19);
+        assert_eq!(data[2 * stride + 1], 22);
+        assert_eq!(data[2 * stride + 2], 43);
+        assert_eq!(data[2 * stride + 3], 50);
+    }
+
+    #[test]
+    fn schbench_matrix_multiply_3x3_diagonal() {
+        // Identity-like: A = diag(2, 3, 5), B = diag(1, 1, 1) = I.
+        // Expected C = A = diag(2, 3, 5).
+        let size = 3;
+        let stride = size * size;
+        let mut data = vec![0u64; 3 * stride];
+        data[0] = 2;
+        data[4] = 3;
+        data[8] = 5;
+        data[stride] = 1;
+        data[stride + 4] = 1;
+        data[stride + 8] = 1;
+        schbench_matrix_multiply(&mut data, size);
+        let c = &data[2 * stride..3 * stride];
+        assert_eq!(c[0], 2);
+        assert_eq!(c[4], 3);
+        assert_eq!(c[8], 5);
+        // Off-diagonal entries remain 0.
+        assert_eq!(c[1], 0);
+        assert_eq!(c[3], 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "assertion")]
+    fn schbench_matrix_multiply_mismatched_len_panics_in_debug() {
+        // debug_assert_eq!(data.len(), 3 * size * size) guards the
+        // bounds contract. Under cfg(debug_assertions) this panics.
+        // Release builds skip the assert (no panic), so the test
+        // itself is gated on `cfg(debug_assertions)` — otherwise
+        // `cargo nextest run --release` would run the test expecting
+        // a panic the release binary can't raise.
+        let mut data = vec![0u64; 5]; // 3 * 2 * 2 = 12, so 5 is wrong.
+        schbench_matrix_multiply(&mut data, 2);
     }
 
     #[test]

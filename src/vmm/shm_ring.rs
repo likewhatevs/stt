@@ -714,10 +714,21 @@ pub fn shm_write(buf: &mut [u8], shm_offset: usize, msg_type: u32, payload: &[u8
 
     let data_start = shm_offset + HEADER_SIZE;
 
-    // Write message header
+    // Write message header. `ShmMessage.length` is `u32`; a payload
+    // whose length exceeds u32::MAX cannot be faithfully represented
+    // in the header, so drop it rather than silently truncating and
+    // producing a header whose CRC+length mismatch would either
+    // crash the reader or cause it to skip downstream messages.
+    let Ok(length_u32) = u32::try_from(payload.len()) else {
+        let drops_offset = shm_offset + 32;
+        let current = u64::from_ne_bytes(buf[drops_offset..drops_offset + 8].try_into().unwrap());
+        buf[drops_offset..drops_offset + 8]
+            .copy_from_slice(&current.saturating_add(1).to_ne_bytes());
+        return 0;
+    };
     let msg = ShmMessage {
         msg_type,
-        length: payload.len() as u32,
+        length: length_u32,
         crc32: crc32fast::hash(payload),
         _pad: 0,
     };

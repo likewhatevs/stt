@@ -147,4 +147,211 @@ mod tests {
         };
         assert!(config_file_parts(&entry).is_none());
     }
+
+    // -- build_cmdline_extra --
+
+    use super::super::entry::{KtstrTestEntry, Sysctl};
+    use super::super::test_helpers::ENV_LOCK;
+
+    #[test]
+    fn build_cmdline_extra_includes_iomem_relaxed_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Make sure the env does not inject spurious RUST_BACKTRACE /
+        // RUST_LOG entries that would break the default assertion.
+        let prev_bt = std::env::var("RUST_BACKTRACE").ok();
+        let prev_log = std::env::var("RUST_LOG").ok();
+        // SAFETY: test holds ENV_LOCK — no other thread may mutate env concurrently.
+        unsafe {
+            std::env::remove_var("RUST_BACKTRACE");
+            std::env::remove_var("RUST_LOG");
+        }
+
+        let entry = KtstrTestEntry {
+            name: "cmdline_test",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let out = build_cmdline_extra(&entry);
+        assert_eq!(out, "iomem=relaxed");
+
+        // SAFETY: single-threaded test restoration under ENV_LOCK.
+        unsafe {
+            match prev_bt {
+                Some(v) => std::env::set_var("RUST_BACKTRACE", v),
+                None => std::env::remove_var("RUST_BACKTRACE"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_cmdline_extra_appends_sysctls_kargs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_bt = std::env::var("RUST_BACKTRACE").ok();
+        let prev_log = std::env::var("RUST_LOG").ok();
+        // SAFETY: test holds ENV_LOCK.
+        unsafe {
+            std::env::remove_var("RUST_BACKTRACE");
+            std::env::remove_var("RUST_LOG");
+        }
+
+        static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.foo", "1")];
+        static SCHED: Scheduler = Scheduler::new("s").sysctls(SYSCTLS).kargs(&["quiet"]);
+        let entry = KtstrTestEntry {
+            name: "cmd",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let out = build_cmdline_extra(&entry);
+        assert_eq!(out, "iomem=relaxed sysctl.kernel.foo=1 quiet");
+
+        // SAFETY: single-threaded test restoration under ENV_LOCK.
+        unsafe {
+            match prev_bt {
+                Some(v) => std::env::set_var("RUST_BACKTRACE", v),
+                None => std::env::remove_var("RUST_BACKTRACE"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_cmdline_extra_propagates_rust_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_bt = std::env::var("RUST_BACKTRACE").ok();
+        let prev_log = std::env::var("RUST_LOG").ok();
+        // SAFETY: test holds ENV_LOCK.
+        unsafe {
+            std::env::set_var("RUST_BACKTRACE", "1");
+            std::env::set_var("RUST_LOG", "debug");
+        }
+
+        let entry = KtstrTestEntry {
+            name: "cmd",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let out = build_cmdline_extra(&entry);
+        assert!(
+            out.contains("RUST_BACKTRACE=1"),
+            "expected RUST_BACKTRACE propagation: {out}"
+        );
+        assert!(
+            out.contains("RUST_LOG=debug"),
+            "expected RUST_LOG propagation: {out}"
+        );
+
+        // SAFETY: single-threaded test restoration under ENV_LOCK.
+        unsafe {
+            match prev_bt {
+                Some(v) => std::env::set_var("RUST_BACKTRACE", v),
+                None => std::env::remove_var("RUST_BACKTRACE"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+    }
+
+    // -- resolve_vm_topology --
+
+    #[test]
+    fn resolve_vm_topology_override_is_verbatim() {
+        let entry = KtstrTestEntry {
+            name: "topo_test",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let over = super::super::topo::TopoOverride {
+            numa_nodes: 2,
+            llcs: 4,
+            cores: 8,
+            threads: 2,
+            memory_mb: 4096,
+        };
+        let (topo, mem) = resolve_vm_topology(&entry, Some(&over));
+        assert_eq!(mem, 4096);
+        assert_eq!(topo.llcs, 4);
+        assert_eq!(topo.cores_per_llc, 8);
+        assert_eq!(topo.threads_per_core, 2);
+        assert_eq!(topo.numa_nodes, 2);
+    }
+
+    #[test]
+    fn resolve_vm_topology_none_floors_memory_at_256() {
+        // Tiny topology: 1*1*1=1 cpu -> 64 MB raw, entry.memory_mb=0,
+        // floor = max(64, 256, 0) = 256.
+        //
+        // Override memory_mb explicitly to 0 — KtstrTestEntry::DEFAULT
+        // sets memory_mb=2048, which would bypass the floor entirely
+        // and leave this test vacuously passing regardless of the
+        // max(…, 256, …) branch. Setting memory_mb=0 makes the 256
+        // floor the exact lower bound the assertion verifies.
+        let entry = KtstrTestEntry {
+            name: "tiny",
+            memory_mb: 0,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_topo, mem) = resolve_vm_topology(&entry, None);
+        assert_eq!(mem, 256, "memory floor = 256 MB, got {mem}");
+    }
+
+    #[test]
+    fn resolve_vm_topology_none_honors_entry_memory_mb() {
+        // Entry with explicit memory_mb above the cpu*64 and 256 floors.
+        let entry = KtstrTestEntry {
+            name: "mem",
+            memory_mb: 8192,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_topo, mem) = resolve_vm_topology(&entry, None);
+        assert_eq!(mem, 8192);
+    }
+
+    // -- append_base_sched_args --
+
+    #[test]
+    fn append_base_sched_args_empty_when_none_set() {
+        let entry = KtstrTestEntry {
+            name: "nosched",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert!(args.is_empty(), "no sched args expected: {args:?}");
+    }
+
+    #[test]
+    fn append_base_sched_args_includes_cgroup_parent_and_sched_args() {
+        use super::super::entry::CgroupPath;
+        static CG: CgroupPath = CgroupPath::new("/sys/fs/cgroup/ktstr");
+        static SCHED: Scheduler = Scheduler::new("s")
+            .cgroup_parent("/sys/fs/cgroup/ktstr")
+            .sched_args(&["-v", "--flag"]);
+        // Touch the static so the compiler doesn't drop it; verifies
+        // the path we store matches what cgroup_parent produces.
+        let _ = &CG;
+        let entry = KtstrTestEntry {
+            name: "sched",
+            scheduler: &SCHED,
+            extra_sched_args: &["--extra"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let mut args = Vec::new();
+        append_base_sched_args(&entry, &mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--cell-parent-cgroup".to_string(),
+                "/sys/fs/cgroup/ktstr".to_string(),
+                "-v".to_string(),
+                "--flag".to_string(),
+                "--extra".to_string(),
+            ],
+        );
+    }
 }

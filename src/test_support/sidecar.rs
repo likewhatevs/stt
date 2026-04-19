@@ -1330,4 +1330,74 @@ mod tests {
         // Deduplicated: total should be 50000, not 100000.
         assert!(result.contains("total verified insns: 50000"));
     }
+
+    // -- scheduler_fingerprint --
+
+    #[test]
+    fn scheduler_fingerprint_eevdf_empty_extras() {
+        // Default scheduler (EEVDF) has no sysctls/kargs; fingerprint
+        // returns the display name and two empty vecs.
+        let entry = KtstrTestEntry {
+            name: "eevdf_test",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (name, sysctls, kargs) = scheduler_fingerprint(&entry);
+        assert_eq!(name, "eevdf");
+        assert!(sysctls.is_empty());
+        assert!(kargs.is_empty());
+    }
+
+    #[test]
+    fn scheduler_fingerprint_formats_sysctls_with_prefix() {
+        use super::super::entry::Sysctl;
+        static SYSCTLS: &[Sysctl] = &[
+            Sysctl::new("kernel.foo", "1"),
+            Sysctl::new("kernel.bar", "yes"),
+        ];
+        static SCHED: super::super::entry::Scheduler =
+            super::super::entry::Scheduler::new("s").sysctls(SYSCTLS);
+        let entry = KtstrTestEntry {
+            name: "s_test",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (name, sysctls, kargs) = scheduler_fingerprint(&entry);
+        assert_eq!(name, "eevdf");
+        assert_eq!(
+            sysctls,
+            vec![
+                "sysctl.kernel.foo=1".to_string(),
+                "sysctl.kernel.bar=yes".to_string(),
+            ]
+        );
+        assert!(kargs.is_empty());
+    }
+
+    #[test]
+    fn scheduler_fingerprint_forwards_kargs_verbatim() {
+        static SCHED: super::super::entry::Scheduler =
+            super::super::entry::Scheduler::new("s").kargs(&["quiet", "splash"]);
+        let entry = KtstrTestEntry {
+            name: "s_test",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (_name, sysctls, kargs) = scheduler_fingerprint(&entry);
+        assert_eq!(kargs, vec!["quiet".to_string(), "splash".to_string()]);
+        assert!(sysctls.is_empty());
+    }
+
+    #[test]
+    fn scheduler_fingerprint_uses_display_name_for_discover() {
+        use super::super::entry::SchedulerSpec;
+        static SCHED: super::super::entry::Scheduler =
+            super::super::entry::Scheduler::new("s").binary(SchedulerSpec::Discover("scx_relaxed"));
+        let entry = KtstrTestEntry {
+            name: "rel_test",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (name, _, _) = scheduler_fingerprint(&entry);
+        assert_eq!(name, "scx_relaxed");
+    }
 }

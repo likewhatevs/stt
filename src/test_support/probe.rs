@@ -750,17 +750,15 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     });
 
     let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
-    let ctx = crate::scenario::Ctx {
-        cgroups: &cgroups,
-        topo: &topo,
-        duration: entry.duration,
-        workers_per_cgroup: entry.workers_per_cgroup as usize,
-        sched_pid,
-        settle: Duration::from_millis(500),
-        work_type_override,
-        assert: merged_assert,
-        wait_for_map_write: !entry.bpf_map_write.is_empty(),
-    };
+    let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
+        .duration(entry.duration)
+        .workers_per_cgroup(entry.workers_per_cgroup as usize)
+        .sched_pid(sched_pid)
+        .settle(Duration::from_millis(500))
+        .work_type_override(work_type_override)
+        .assert(merged_assert)
+        .wait_for_map_write(!entry.bpf_map_write.is_empty())
+        .build();
 
     let result = match (entry.func)(&ctx) {
         Ok(r) => r,
@@ -1085,17 +1083,15 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     }
 
     let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
-    let ctx = crate::scenario::Ctx {
-        cgroups: &cgroups,
-        topo: &topo,
-        duration: entry.duration,
-        workers_per_cgroup: entry.workers_per_cgroup as usize,
-        sched_pid,
-        settle: std::time::Duration::from_millis(500),
-        work_type_override,
-        assert: merged_assert,
-        wait_for_map_write: !entry.bpf_map_write.is_empty(),
-    };
+    let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
+        .duration(entry.duration)
+        .workers_per_cgroup(entry.workers_per_cgroup as usize)
+        .sched_pid(sched_pid)
+        .settle(std::time::Duration::from_millis(500))
+        .work_type_override(work_type_override)
+        .assert(merged_assert)
+        .wait_for_map_write(!entry.bpf_map_write.is_empty())
+        .build();
 
     let result = match (entry.func)(&ctx) {
         Ok(r) => r,
