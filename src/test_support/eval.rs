@@ -745,7 +745,7 @@ fn scheduler_label(spec: &SchedulerSpec) -> String {
 /// Resolve a scheduler binary from a `SchedulerSpec`.
 ///
 /// Returns `Ok(None)` for `SchedulerSpec::Eevdf` (EEVDF).
-/// For `Name`, searches: `KTSTR_SCHEDULER` env, sibling of current_exe,
+/// For `Discover`, searches: `KTSTR_SCHEDULER` env, sibling of current_exe,
 /// `target/debug/`, `target/release/`.
 /// For `Path`, validates the file exists.
 pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
