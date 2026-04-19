@@ -155,9 +155,7 @@ pub(crate) fn run_ktstr_test_inner(
 
     builder = builder.watchdog_timeout(entry.watchdog_timeout);
 
-    // Current VM builder consumes a single write; take the first
-    // entry when the slice is non-empty.
-    if let Some(&bpf_write) = entry.bpf_map_write.first() {
+    for bpf_write in entry.bpf_map_write {
         builder =
             builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }

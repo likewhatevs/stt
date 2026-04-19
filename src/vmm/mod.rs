@@ -1115,10 +1115,13 @@ pub struct KtstrVm {
     /// Converted to jiffies via CONFIG_HZ at monitor start time and
     /// written at each monitor iteration after the scheduler attaches.
     watchdog_timeout: Option<Duration>,
-    /// Host-side BPF map write parameters. When set, a thread polls for
-    /// BPF map discoverability, waits for scenario start via SHM ring,
-    /// then writes a u32 value at the specified offset.
-    bpf_map_write: Option<BpfMapWriteParams>,
+    /// Host-side BPF map writes. Empty slice disables the thread.
+    /// When non-empty, a thread polls for BPF map discoverability,
+    /// waits for scenario start via SHM ring, then writes each
+    /// `u32` value at its specified map/offset. All writes complete
+    /// before the guest is signaled via SHM slot 0, so the guest
+    /// sees a single unblock regardless of how many writes ran.
+    bpf_map_writes: Vec<BpfMapWriteParams>,
     /// Performance mode: vCPU pinning to host LLCs, hugepage-backed
     /// guest memory, NUMA mbind, and RT scheduling on both
     /// architectures. On x86_64, additionally: KVM_HINTS_REALTIME
@@ -2835,9 +2838,9 @@ impl KtstrVm {
         vm: &kvm::KtstrKvm,
         kill: &Arc<AtomicBool>,
     ) -> Result<Option<JoinHandle<()>>> {
-        let Some(ref params) = self.bpf_map_write else {
+        if self.bpf_map_writes.is_empty() {
             return Ok(None);
-        };
+        }
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             eprintln!("bpf_map_write: vmlinux not found, skipping");
             return Ok(None);
@@ -2855,7 +2858,7 @@ impl KtstrVm {
             }
         };
         let kill_clone = kill.clone();
-        let params = params.clone();
+        let writes = self.bpf_map_writes.clone();
         let shm_size = self.shm_size;
 
         let handle = std::thread::Builder::new()
@@ -2884,33 +2887,44 @@ impl KtstrVm {
                     }
                 };
 
-                // Phase 2: poll find_map until the scheduler's BPF maps are discoverable.
-                let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                let mut attempt = 0u32;
-                let map_info = loop {
-                    attempt += 1;
-                    if let Some(info) = accessor.find_map(&params.map_name_suffix) {
-                        break info;
-                    }
-                    if kill_clone.load(Ordering::Acquire) {
-                        eprintln!("bpf_map_write: VM exited during map search");
-                        return;
-                    }
-                    if std::time::Instant::now() >= retry_deadline {
-                        eprintln!(
-                            "bpf_map_write: map *{} not found after {} attempts",
-                            params.map_name_suffix, attempt,
-                        );
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                };
-                eprintln!(
-                    "bpf_map_write: map '{}' found after {} attempts",
-                    map_info.name, attempt,
-                );
+                // Phase 2: resolve every queued map before signaling the
+                // guest. Running writes serially against partially-
+                // resolved maps would let a late-discovery failure
+                // leave the guest blocked waiting for slot 0 with no
+                // way to recover.
+                let retry_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut resolved: Vec<(BpfMapWriteParams, monitor::bpf_map::BpfMapInfo)> =
+                    Vec::with_capacity(writes.len());
+                for params in writes.iter() {
+                    let mut attempt = 0u32;
+                    let map_info = loop {
+                        attempt += 1;
+                        if let Some(info) = accessor.find_map(&params.map_name_suffix) {
+                            break info;
+                        }
+                        if kill_clone.load(Ordering::Acquire) {
+                            eprintln!("bpf_map_write: VM exited during map search");
+                            return;
+                        }
+                        if std::time::Instant::now() >= retry_deadline {
+                            eprintln!(
+                                "bpf_map_write: map *{} not found after {} attempts",
+                                params.map_name_suffix, attempt,
+                            );
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    };
+                    eprintln!(
+                        "bpf_map_write: map '{}' found after {} attempts",
+                        map_info.name, attempt,
+                    );
+                    resolved.push((params.clone(), map_info));
+                }
 
-                // Phase 3: wait for probes ready, write crash, signal guest.
+                // Phase 3: wait for probes ready, run every queued
+                // write, signal guest once all writes complete.
                 //
                 // The guest signals slot 1 with SIGNAL_PROBES_READY after
                 // the probe pipeline attaches and the scenario is starting.
@@ -2934,7 +2948,7 @@ impl KtstrVm {
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    eprintln!("bpf_map_write: guest probes ready, writing crash trigger");
+                    eprintln!("bpf_map_write: guest probes ready, applying queued writes");
                 }
 
                 // Log all maps for diagnostic visibility.
@@ -2949,21 +2963,30 @@ impl KtstrVm {
                         .join(", "),
                 );
 
-                // Read before write for round-trip verification.
-                let before = accessor.read_value_u32(&map_info, params.offset);
-                let ok = accessor.write_value_u32(&map_info, params.offset, params.value);
-                let after = accessor.read_value_u32(&map_info, params.offset);
+                let mut all_ok = true;
+                for (params, map_info) in &resolved {
+                    let before = accessor.read_value_u32(map_info, params.offset);
+                    let ok = accessor.write_value_u32(map_info, params.offset, params.value);
+                    let after = accessor.read_value_u32(map_info, params.offset);
+                    eprintln!(
+                        "bpf_map_write: map '{}' write={} (value={} offset={} before={:?} after={:?})",
+                        map_info.name, ok, params.value, params.offset, before, after,
+                    );
+                    all_ok &= ok;
+                }
 
-                eprintln!(
-                    "bpf_map_write: map '{}' write={} (value={} offset={} before={:?} after={:?})",
-                    map_info.name, ok, params.value, params.offset, before, after,
-                );
-
-                // Signal the guest that the BPF map write is done.
-                if ok && shm_size > 0 {
+                // Signal the guest once every queued write has been
+                // applied. Partial success (one failing write) still
+                // suppresses the signal so the guest proceeds under
+                // its own timeout rather than observing half-applied
+                // state.
+                if all_ok && shm_size > 0 {
                     let shm_base = mem.size() - shm_size;
                     shm_ring::signal_guest(&mem, shm_base, 0);
-                    eprintln!("bpf_map_write: signaled slot 0");
+                    eprintln!(
+                        "bpf_map_write: signaled slot 0 after {} write(s)",
+                        resolved.len(),
+                    );
                 }
             })
             .context("spawn bpf-map-write thread")?;
@@ -3828,7 +3851,7 @@ pub struct KtstrVmBuilder {
     shm_size: u64,
     monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
     watchdog_timeout: Option<Duration>,
-    bpf_map_write: Option<BpfMapWriteParams>,
+    bpf_map_writes: Vec<BpfMapWriteParams>,
     performance_mode: bool,
     no_perf_mode: bool,
     sched_enable_cmds: Vec<String>,
@@ -3862,7 +3885,7 @@ impl Default for KtstrVmBuilder {
             shm_size: 0,
             monitor_thresholds: None,
             watchdog_timeout: Some(Duration::from_secs(4)),
-            bpf_map_write: None,
+            bpf_map_writes: Vec::new(),
             performance_mode: false,
             no_perf_mode: false,
             sched_enable_cmds: Vec::new(),
@@ -4026,9 +4049,14 @@ impl KtstrVmBuilder {
     /// `bpf_map.name` (kernel truncates to 15 chars); `offset` is
     /// the byte offset within the array-map value region; `value`
     /// is a `u32` written in native byte order.
+    ///
+    /// Repeated calls queue additional writes; all queued writes run
+    /// sequentially on the same `BpfMapAccessor` after the scheduler
+    /// attaches, with a single guest-side unblock once every write
+    /// completes. Order of calls is preserved.
     #[allow(dead_code)]
     pub fn bpf_map_write(mut self, map_name_suffix: &str, offset: usize, value: u32) -> Self {
-        self.bpf_map_write = Some(BpfMapWriteParams {
+        self.bpf_map_writes.push(BpfMapWriteParams {
             map_name_suffix: map_name_suffix.to_string(),
             offset,
             value,
@@ -4184,7 +4212,7 @@ impl KtstrVmBuilder {
             shm_size: self.shm_size,
             monitor_thresholds: self.monitor_thresholds,
             watchdog_timeout: self.watchdog_timeout,
-            bpf_map_write: self.bpf_map_write,
+            bpf_map_writes: self.bpf_map_writes,
             performance_mode: self.performance_mode,
             pinning_plan,
             mbind_node_map,

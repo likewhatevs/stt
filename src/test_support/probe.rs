@@ -222,9 +222,7 @@ pub(crate) fn attempt_auto_repro(
 
     // Forward bpf_map_write and watchdog_timeout so the repro VM
     // reproduces the same exit as the first VM with probes attached.
-    // Current builder consumes a single write; take the first slice
-    // entry when present.
-    if let Some(&bpf_write) = entry.bpf_map_write.first() {
+    for bpf_write in entry.bpf_map_write {
         builder =
             builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }
