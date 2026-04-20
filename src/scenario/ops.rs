@@ -1210,6 +1210,79 @@ pub fn execute_steps(ctx: &Ctx, steps: Vec<Step>) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, None)
 }
 
+/// Execute a [`Backdrop`](super::backdrop::Backdrop) + Steps sequence
+/// against the given context.
+///
+/// The Backdrop declares persistent scenario-wide state
+/// (long-running payloads, cgroups referenced by many Steps) while
+/// Steps express bounded per-phase behavior. The runtime sets up
+/// the Backdrop before the first Step, runs the Step sequence, and
+/// tears the Backdrop down at the end.
+///
+/// # Stage 1 note
+///
+/// Step/Backdrop is introduced alongside the existing
+/// [`execute_steps`] / [`execute_steps_with`] wrappers. Step
+/// effects still carry across steps under the current runtime —
+/// per-step auto-cleanup (the full promise of the split) lands in
+/// subsequent stages. Callers that move persistent entities into a
+/// [`Backdrop`](super::backdrop::Backdrop) and switch to
+/// `execute_scenario` today get a forward-compatible shape that
+/// stays correct when the per-step cleanup lands.
+pub fn execute_scenario(
+    ctx: &Ctx,
+    backdrop: super::backdrop::Backdrop,
+    steps: Vec<Step>,
+) -> Result<AssertResult> {
+    execute_scenario_with(ctx, backdrop, steps, None)
+}
+
+/// [`execute_scenario`] with an explicit
+/// [`Assert`](crate::assert::Assert) override — the Backdrop
+/// equivalent of [`execute_steps_with`].
+pub fn execute_scenario_with(
+    ctx: &Ctx,
+    backdrop: super::backdrop::Backdrop,
+    mut steps: Vec<Step>,
+    checks: Option<&crate::assert::Assert>,
+) -> Result<AssertResult> {
+    // Stage 1 semantics (no runtime split yet): fold Backdrop
+    // contents into the Step sequence so the existing runtime sees
+    // an equivalent layout. Persistent cgroups merge into the first
+    // Step's setup (they still outlive every Step because the
+    // current runtime carries StepState across the whole sequence).
+    // Persistent payloads fold into a leading Step whose only op is
+    // `Op::RunPayload` for each entry; the handles live in the
+    // shared StepState and drain at final teardown.
+    if !backdrop.cgroups.is_empty() {
+        match steps.first_mut() {
+            Some(first) => {
+                let mut merged = backdrop.cgroups.clone();
+                if let Setup::Defs(ref existing) = first.setup {
+                    merged.extend(existing.iter().cloned());
+                }
+                first.setup = Setup::Defs(merged);
+            }
+            None => {
+                steps.push(Step::with_defs(backdrop.cgroups.clone(), HoldSpec::FULL));
+            }
+        }
+    }
+    if !backdrop.payloads.is_empty() {
+        let run_ops: Vec<Op> = backdrop
+            .payloads
+            .iter()
+            .map(|p| Op::run_payload(p, Vec::<String>::new()))
+            .collect();
+        let prelude = Step::new(
+            run_ops,
+            HoldSpec::Fixed(std::time::Duration::from_millis(1)),
+        );
+        steps.insert(0, prelude);
+    }
+    execute_steps_with(ctx, steps, checks)
+}
+
 /// Execute steps with an explicit [`Assert`](crate::assert::Assert) for
 /// worker checks. When `checks` is `Some`, it overrides `ctx.assert`.
 /// When `None`, uses `ctx.assert` (the merged three-layer config).

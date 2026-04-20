@@ -24,6 +24,7 @@
 //! chapters of the guide.
 
 pub mod affinity;
+pub mod backdrop;
 pub mod basic;
 mod catalog;
 pub mod cpuset;
