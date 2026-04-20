@@ -139,11 +139,10 @@
 // `#[derive(Payload)]` and `#[derive(Scheduler)]` expand into
 // `::ktstr::test_support::...` paths so downstream crates can use
 // them without a `use` import. This alias lets the same derives be
-// used inside the ktstr crate itself — notably by
-// `test_support::fixtures`, which uses the derive macro to declare
-// `FIO` / `FIO_JSON` / `STRESS_NG` via the same path downstream
-// authors take. No runtime cost: `extern crate self as ktstr` is
-// a pure name-binding.
+// used inside the ktstr crate itself — for example by doctests and
+// by integration-test modules under `tests/common/` that pull the
+// derive through the same public path downstream authors take. No
+// runtime cost: `extern crate self as ktstr` is a pure name-binding.
 extern crate self as ktstr;
 
 #[allow(

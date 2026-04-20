@@ -44,7 +44,6 @@ mod args;
 mod dispatch;
 mod entry;
 mod eval;
-pub mod fixtures;
 mod metrics;
 mod model;
 mod output;

@@ -270,12 +270,20 @@ impl CpusetSpec {
 /// // The binary runs inside the same cgroup as the Work handles;
 /// // both spawn in apply_setup, the Work groups first, then the
 /// // Payload after the cpuset settles.
-/// # use ktstr::test_support::fixtures::FIO_JSON;
+/// # use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
+/// # const BENCH: Payload = Payload {
+/// #     name: "bench",
+/// #     kind: PayloadKind::Binary("bench"),
+/// #     output: OutputFormat::ExitCode,
+/// #     default_args: &[],
+/// #     default_checks: &[],
+/// #     metrics: &[],
+/// # };
 /// let def = CgroupDef::named("io_and_spin")
 ///     .with_cpuset(CpusetSpec::disjoint(0, 2))
 ///     .workers(2)
 ///     .work_type(WorkType::CpuSpin)
-///     .workload(&FIO_JSON);
+///     .workload(&BENCH);
 ///
 /// assert!(def.payload.is_some());
 /// assert_eq!(def.works[0].num_workers, Some(2));

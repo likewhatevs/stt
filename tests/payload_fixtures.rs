@@ -1,85 +1,146 @@
-//! Integration-level smoke tests for the public [`fixtures`] module.
+//! Integration smoke tests for the FIO / FIO_JSON / STRESS_NG
+//! payload fixtures.
 //!
-//! These tests exercise the fixtures exactly as a downstream crate
-//! would — via the public re-export path
-//! `ktstr::test_support::fixtures::{FIO, FIO_JSON, STRESS_NG}` — so a
-//! silent drop-in-visibility change (e.g. accidentally making
-//! `fixtures` private in `test_support/mod.rs`) surfaces here
-//! instead of manifesting as a compile error in user code.
+//! The fixtures themselves live under `tests/common/fixtures.rs`
+//! because they are test scaffolding, not shipped API. This test
+//! file exercises the declarations the same way a downstream
+//! scheduler-author test crate would — via plain `#[derive(Payload)]`
+//! on local consts.
 //!
 //! Lives in its own test crate rather than `ktstr_test_macro.rs`
 //! because that file's `#[ktstr_test]` entries drive nextest's
 //! `--list` through `ktstr_main`, hiding plain `#[test]` functions.
 //! Isolating the fixture smoke tests here keeps them visible to the
 //! standard Rust test harness.
-//!
-//! [`fixtures`]: ktstr::test_support::fixtures
 
-use ktstr::test_support::fixtures::{FIO, FIO_JSON, STRESS_NG};
-use ktstr::test_support::{Check, OutputFormat, PayloadKind, Polarity, extract_metrics};
+mod common;
 
-/// The public fixtures are reachable from a downstream crate via
-/// the documented path. This test would fail at the `use` line
-/// above if `fixtures` were accidentally demoted to `pub(crate)`.
+use common::fixtures::{FIO, FIO_JSON, STRESS_NG};
+use ktstr::test_support::{
+    Check, MetricHint, MetricSource, OutputFormat, PayloadKind, Polarity, extract_metrics,
+};
+
+/// FIO is a binary-kind payload named "fio" with JSON output.
+/// Pins the identity fields so a test author can rely on them.
 #[test]
-fn fixtures_are_publicly_reachable() {
+fn fio_identity_fields_are_stable() {
     assert_eq!(FIO.name, "fio");
-    assert_eq!(FIO_JSON.name, "fio_json");
-    assert_eq!(STRESS_NG.name, "stress-ng");
+    assert!(matches!(FIO.kind, PayloadKind::Binary("fio")));
+    assert!(matches!(FIO.output, OutputFormat::Json));
 }
 
-/// End-to-end: feed realistic fio JSON stdout to `extract_metrics`
-/// using `FIO.output`, verify the canonical metric paths land with
-/// the expected values. Mirrors the in-module smoke test but goes
-/// through the public API surface.
+/// FIO's default_checks include the exit-code gate so a
+/// misconfigured invocation fails loudly instead of silently
+/// landing zero metrics.
 #[test]
-fn fio_fixture_extract_metrics_from_public_api() {
-    let stdout = r#"{"jobs": [{
-        "jobname": "pub_api",
-        "read":  {"iops": 50000.0, "lat_ns": {"mean": 200.0}},
-        "write": {"iops":    10.0, "lat_ns": {"mean": 1500.0}}
-    }]}"#;
-    let metrics = extract_metrics(stdout, &FIO.output);
+fn fio_default_checks_include_exit_code_zero() {
+    assert_eq!(FIO.default_checks.len(), 1);
+    assert!(matches!(FIO.default_checks[0], Check::ExitCodeEq(0)));
+}
 
+/// FIO's metric hints cover iops (higher-better) and lat_ns
+/// (lower-better) for both read and write sides of job 0. The
+/// test asserts every hint's polarity + unit so a silent drift
+/// in the MetricHint shape surfaces here, not in downstream
+/// regression reports.
+#[test]
+fn fio_metric_hints_cover_canonical_paths() {
+    let by_name: std::collections::BTreeMap<&str, &MetricHint> =
+        FIO.metrics.iter().map(|m| (m.name, m)).collect();
+
+    let rops = by_name.get("jobs.0.read.iops").expect("read iops hint");
+    assert_eq!(rops.polarity, Polarity::HigherBetter);
+    assert_eq!(rops.unit, "iops");
+
+    let wops = by_name.get("jobs.0.write.iops").expect("write iops hint");
+    assert_eq!(wops.polarity, Polarity::HigherBetter);
+    assert_eq!(wops.unit, "iops");
+
+    let rlat = by_name
+        .get("jobs.0.read.lat_ns.mean")
+        .expect("read lat hint");
+    assert_eq!(rlat.polarity, Polarity::LowerBetter);
+    assert_eq!(rlat.unit, "ns");
+
+    let wlat = by_name
+        .get("jobs.0.write.lat_ns.mean")
+        .expect("write lat hint");
+    assert_eq!(wlat.polarity, Polarity::LowerBetter);
+    assert_eq!(wlat.unit, "ns");
+}
+
+/// FIO_JSON bakes `--output-format=json` into default_args.
+/// Distinct name + binary (same binary, different name for
+/// the fixture) so both fio fixtures can coexist in a
+/// `#[ktstr_test(workloads = [...])]` attribute without the
+/// pairwise dedup rejecting them.
+#[test]
+fn fio_json_identity_and_default_args() {
+    assert_eq!(FIO_JSON.name, "fio_json");
+    assert!(matches!(FIO_JSON.kind, PayloadKind::Binary("fio")));
+    assert_eq!(FIO_JSON.default_args, &["--output-format=json"]);
+    assert_eq!(FIO_JSON.metrics.len(), FIO.metrics.len());
+}
+
+/// STRESS_NG is an exit-code-only binary-kind payload with the
+/// exit-code gate as its sole default check.
+#[test]
+fn stress_ng_identity_fields_are_stable() {
+    assert_eq!(STRESS_NG.name, "stress-ng");
+    assert!(matches!(STRESS_NG.kind, PayloadKind::Binary("stress-ng")));
+    assert!(matches!(STRESS_NG.output, OutputFormat::ExitCode));
+    assert!(STRESS_NG.metrics.is_empty());
+    assert_eq!(STRESS_NG.default_checks.len(), 1);
+    assert!(matches!(STRESS_NG.default_checks[0], Check::ExitCodeEq(0),));
+}
+
+/// Smoke test: FIO's extraction pipeline produces Json-sourced
+/// metrics from a realistic fio JSON payload. Exercises the
+/// OutputFormat::Json branch of extract_metrics end-to-end
+/// against the fixture's declared output format.
+#[test]
+fn fio_extract_metrics_smoke_from_realistic_json() {
+    let stdout = r#"{
+      "jobs": [{
+        "jobname": "example",
+        "read":  {"iops": 12345.6, "lat_ns": {"mean": 500.0}},
+        "write": {"iops": 78.9,    "lat_ns": {"mean": 2500.0}}
+      }]
+    }"#;
+    let metrics = extract_metrics(stdout, &FIO.output);
     let by_name: std::collections::BTreeMap<&str, f64> =
         metrics.iter().map(|m| (m.name.as_str(), m.value)).collect();
 
-    assert_eq!(by_name.get("jobs.0.read.iops"), Some(&50000.0));
-    assert_eq!(by_name.get("jobs.0.write.iops"), Some(&10.0));
-    assert_eq!(by_name.get("jobs.0.read.lat_ns.mean"), Some(&200.0));
-    assert_eq!(by_name.get("jobs.0.write.lat_ns.mean"), Some(&1500.0));
+    assert_eq!(by_name.get("jobs.0.read.iops"), Some(&12345.6));
+    assert_eq!(by_name.get("jobs.0.write.iops"), Some(&78.9));
+    assert_eq!(by_name.get("jobs.0.read.lat_ns.mean"), Some(&500.0));
+    assert_eq!(by_name.get("jobs.0.write.lat_ns.mean"), Some(&2500.0));
+    for m in &metrics {
+        assert_eq!(
+            m.source,
+            MetricSource::Json,
+            "fixture declares Json output; every metric must land with Json source tag"
+        );
+    }
 }
 
-/// FIO_JSON bakes `--output-format=json` — a downstream test
-/// relying on that for the common "just emit JSON" path should
-/// see it.
+/// Smoke test: STRESS_NG's exit-code format produces an empty
+/// metric set (check pass/fail is handled by the ExitCodeEq
+/// pre-pass, not by metric values).
 #[test]
-fn fio_json_default_args_include_output_format() {
+fn stress_ng_extract_metrics_smoke_returns_empty() {
+    let metrics = extract_metrics("irrelevant stdout", &STRESS_NG.output);
     assert!(
-        FIO_JSON.default_args.contains(&"--output-format=json"),
-        "FIO_JSON must bake --output-format=json; got: {:?}",
-        FIO_JSON.default_args,
+        metrics.is_empty(),
+        "ExitCode output emits no metrics; got {metrics:?}"
     );
 }
 
-/// STRESS_NG uses ExitCode output — emissions carry zero metrics.
+/// Neither fixture is a scheduler-kind payload — they must not
+/// be accepted by CgroupDef::workload's scheduler-kind rejection
+/// gate (which panics at builder time).
 #[test]
-fn stress_ng_fixture_outputs_nothing_from_stdout() {
-    let metrics = extract_metrics("anything at all", &STRESS_NG.output);
-    assert!(metrics.is_empty());
-}
-
-/// Both fixtures are binary-kind (`PayloadKind::Binary`), not
-/// scheduler-kind. The runtime rejects scheduler-kind Payloads from
-/// `CgroupDef::workload` at declaration time; this test pins the
-/// `is_scheduler()` predicate so a future Payload-field
-/// rearrangement that accidentally swaps the kind stays visible
-/// from the consumer perspective.
-#[test]
-fn fixtures_are_binary_kind_not_scheduler_kind() {
-    assert!(matches!(FIO.kind, PayloadKind::Binary(_)));
-    assert!(matches!(FIO_JSON.kind, PayloadKind::Binary(_)));
-    assert!(matches!(STRESS_NG.kind, PayloadKind::Binary(_)));
+fn fixtures_are_not_scheduler_kind() {
     assert!(!FIO.is_scheduler());
     assert!(!FIO_JSON.is_scheduler());
     assert!(!STRESS_NG.is_scheduler());
@@ -114,17 +175,14 @@ fn fixtures_default_checks_pin_exit_code_gate() {
         assert!(matches!(FIO_JSON.default_checks[0], Check::ExitCodeEq(0)));
         assert!(matches!(STRESS_NG.default_checks[0], Check::ExitCodeEq(0)));
     };
-    // Also assert at runtime so the test name shows as pass rather
-    // than no-op in nextest output.
     assert!(!FIO.default_checks.is_empty());
     assert!(!FIO_JSON.default_checks.is_empty());
     assert!(!STRESS_NG.default_checks.is_empty());
 }
 
-/// Identity-tag both fixtures' output formats so a consumer reading
-/// this file sees the two cases side-by-side — Json vs ExitCode —
-/// the canonical two-ends-of-the-spectrum demonstration #7 ships
-/// with.
+/// Identity-tag all three fixtures' output formats so a consumer
+/// reading this file sees the cases side-by-side — Json vs
+/// ExitCode — the canonical two-ends-of-the-spectrum demonstration.
 #[test]
 fn fixture_output_formats_span_json_and_exit_code() {
     assert!(matches!(FIO.output, OutputFormat::Json));
