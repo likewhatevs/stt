@@ -1,0 +1,5 @@
+error: expected Payload path in workloads array
+ --> tests/compile_fail/ktstr_test_workloads_non_path_element.rs:5:27
+  |
+5 | #[ktstr_test(workloads = [42])]
+  |                           ^^

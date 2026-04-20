@@ -1,0 +1,5 @@
+error: struct name cannot be just "Payload"
+  --> tests/compile_fail/derive_payload_struct_named_payload.rs:11:8
+   |
+11 | struct Payload;
+   |        ^^^^^^^

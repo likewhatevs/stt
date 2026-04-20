@@ -38,6 +38,18 @@ fn host_only_attr_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+/// #27: `workloads = []` must compile cleanly. The macro accepts an
+/// empty array as "no additional binary workloads composed under
+/// the scheduler" — the same semantic as omitting the attribute.
+/// The emitted `KtstrTestEntry.workloads` is `&[]`, which entry
+/// validation accepts (the Scheduler-kind rejection loop iterates
+/// zero elements and passes). Host-only so nextest discovery does
+/// not drag the test through a VM boot.
+#[ktstr_test(host_only = true, workloads = [])]
+fn empty_workloads_compiles(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
 /// Verify resolve_func_ip returns a real nonzero address inside the VM.
 /// On the host, kptr_restrict or kernel lockdown hides addresses.
 #[cfg(feature = "integration")]
