@@ -752,6 +752,24 @@ mod tests {
     }
 
     #[test]
+    fn numa_node_of_out_of_bounds_explicit_saturates() {
+        static TWO: [NumaNode; 2] = [NumaNode::new(2, 512), NumaNode::new(2, 512)];
+        let t = Topology::with_nodes(2, 1, &TWO);
+        // Total LLCs = 4. Any llc_id >= 4 must saturate to last node (1).
+        assert_eq!(t.numa_node_of(4), 1);
+        assert_eq!(t.numa_node_of(999), 1);
+    }
+
+    #[test]
+    fn numa_node_of_out_of_bounds_uniform_no_check() {
+        // Uniform: numa_nodes=2, llcs=4 => llcs_per_node=2.
+        // Per documented behavior: no bounds check, returns llc_id/2.
+        let t = Topology::new(2, 4, 2, 1);
+        assert_eq!(t.numa_node_of(100), 50);
+        assert!(t.numa_node_of(100) > t.numa_nodes - 1);
+    }
+
+    #[test]
     fn num_numa_nodes() {
         let t = Topology {
             llcs: 6,
@@ -1333,5 +1351,22 @@ mod tests {
         let t = Topology::new(2, 4, 2, 1);
         assert_eq!(t.first_llc_in_node(0), 0);
         assert_eq!(t.first_llc_in_node(1), 2);
+    }
+
+    #[test]
+    fn first_llc_in_node_at_numa_nodes_returns_total() {
+        // Documented behavior: node_id == numa_nodes does NOT panic for
+        // explicit nodes; the walk sums all llcs and returns the total.
+        let t = Topology::with_nodes(2, 1, &TWO_NODES);
+        assert_eq!(t.first_llc_in_node(2), 4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn first_llc_in_node_above_numa_nodes_panics() {
+        // Documented behavior: node_id > numa_nodes indexes past the
+        // end of the node slice on the walk, panicking.
+        let t = Topology::with_nodes(2, 1, &TWO_NODES);
+        let _ = t.first_llc_in_node(3);
     }
 }
