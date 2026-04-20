@@ -1,0 +1,5 @@
+error: metric attribute is missing `name = "..."`
+ --> tests/compile_fail/derive_payload_metric_missing_name.rs:9:1
+  |
+9 | #[metric(polarity = HigherBetter)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

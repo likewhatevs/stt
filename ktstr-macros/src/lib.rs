@@ -1799,6 +1799,7 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
     let mut default_args: Vec<String> = Vec::new();
     let mut default_checks: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut metrics: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut seen_metric_names: Vec<String> = Vec::new();
 
     for attr in &input.attrs {
         if attr.path().is_ident("default_args") {
@@ -1836,8 +1837,25 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
             }
         } else if attr.path().is_ident("metric") {
             // Kwarg form: name = "...", polarity = ..., unit = "...".
-            let parsed = parse_metric_attr(attr)?;
-            metrics.push(parsed);
+            let (metric_name, tokens) = parse_metric_attr(attr)?;
+            // Reject duplicate metric names — two `#[metric(name = "x", ...)]`
+            // lines with the same name are almost certainly a copy-paste
+            // typo; the runtime pipeline's `resolve_polarities` uses
+            // last-wins semantics, so a duplicate silently shadows the
+            // first hint without any signal to the test author.
+            if let Some(existing) = seen_metric_names.iter().find(|n| *n == &metric_name) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "duplicate metric name `{existing}` — each \
+                         `#[metric(name = \"...\")]` declaration must name a \
+                         distinct metric. Remove the duplicate or rename one \
+                         of them."
+                    ),
+                ));
+            }
+            seen_metric_names.push(metric_name);
+            metrics.push(tokens);
         }
     }
 
@@ -1953,13 +1971,15 @@ fn output_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
 }
 
 /// Parse one `#[metric(name = "...", polarity = ..., unit = "...")]`
-/// attribute into a `MetricHint { ... }` token stream.
+/// attribute into a `(name, MetricHint { ... } token stream)` pair.
+/// The name is returned separately so the caller can check for
+/// duplicate `#[metric(name = ...)]` declarations across the struct.
 ///
 /// `polarity` accepts bare idents `HigherBetter`, `LowerBetter`,
 /// `Unknown`, and the call form `TargetValue(<float literal>)`. The
 /// float literal is stamped into a `Polarity::TargetValue(lit)` so
 /// the generated const is const-evaluable.
-fn parse_metric_attr(attr: &syn::Attribute) -> syn::Result<proc_macro2::TokenStream> {
+fn parse_metric_attr(attr: &syn::Attribute) -> syn::Result<(String, proc_macro2::TokenStream)> {
     let mut name: Option<String> = None;
     let mut polarity: Option<proc_macro2::TokenStream> = None;
     let mut unit: String = String::new();
@@ -1995,13 +2015,14 @@ fn parse_metric_attr(attr: &syn::Attribute) -> syn::Result<proc_macro2::TokenStr
     let polarity = polarity.unwrap_or_else(|| {
         quote! { ::ktstr::test_support::Polarity::Unknown }
     });
-    Ok(quote! {
+    let tokens = quote! {
         ::ktstr::test_support::MetricHint {
             name: #name,
             polarity: #polarity,
             unit: #unit,
         }
-    })
+    };
+    Ok((name, tokens))
 }
 
 /// Does this `#[default_check(...)]` expression already spell

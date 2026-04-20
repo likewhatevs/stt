@@ -1,0 +1,5 @@
+error: duplicate metric name `iops` — each `#[metric(name = "...")]` declaration must name a distinct metric. Remove the duplicate or rename one of them.
+  --> tests/compile_fail/derive_payload_metric_duplicate_name.rs:13:1
+   |
+13 | #[metric(name = "iops", polarity = LowerBetter)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

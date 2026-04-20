@@ -1,0 +1,5 @@
+error: unknown polarity `Nonsense`
+  --> tests/compile_fail/derive_payload_metric_unknown_polarity.rs:10:36
+   |
+10 | #[metric(name = "iops", polarity = Nonsense)]
+   |                                    ^^^^^^^^
