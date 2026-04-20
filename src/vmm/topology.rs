@@ -514,15 +514,15 @@ impl Topology {
 
     /// LLCs per NUMA node (uniform distribution only).
     ///
-    /// Panics via debug_assert if the topology uses explicit nodes
-    /// with non-uniform LLC distribution.
+    /// Panics if the topology uses explicit nodes with non-uniform LLC
+    /// distribution.
     pub fn llcs_per_numa_node(&self) -> u32 {
-        debug_assert!(
+        assert!(
             self.nodes.is_none(),
             "llcs_per_numa_node() requires uniform topology; use llcs_in_node() instead"
         );
-        debug_assert!(self.numa_nodes > 0, "numa_nodes must be > 0");
-        debug_assert!(
+        assert!(self.numa_nodes > 0, "numa_nodes must be > 0");
+        assert!(
             self.llcs.is_multiple_of(self.numa_nodes),
             "llcs ({}) must be divisible by numa_nodes ({})",
             self.llcs,

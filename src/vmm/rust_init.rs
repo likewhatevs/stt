@@ -1181,7 +1181,10 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                             }
                             ScxAttachStatus::Attached => unreachable!(),
                         }
-                        write_com2("KTSTR_EXIT=1");
+                        write_com2(&format!(
+                            "{prefix}1",
+                            prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
+                        ));
                         force_reboot();
                     }
                     (Some(child), Some(log_path.to_string()))
@@ -1197,8 +1200,11 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
             write_com2(crate::verifier::SCHED_OUTPUT_START);
             write_com2(&format!("failed to spawn: {e}"));
             write_com2(crate::verifier::SCHED_OUTPUT_END);
-            write_com2("SCHEDULER_DIED");
-            write_com2("KTSTR_EXIT=1");
+            write_com2(crate::test_support::SENTINEL_SCHEDULER_DIED);
+            write_com2(&format!(
+                "{prefix}1",
+                prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
+            ));
             force_reboot();
         }
     }
