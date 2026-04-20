@@ -1950,36 +1950,6 @@ fn output_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
 /// Parse one `#[metric(name = "...", polarity = ..., unit = "...")]`
 /// attribute into a `MetricHint { ... }` token stream.
 ///
-/// Does this `#[default_check(...)]` expression already spell
-/// `Check::` somewhere in its function path? Returns true for
-/// `Check::min(...)` and `::ktstr::test_support::Check::min(...)`;
-/// false for bare `min(...)`. Used to skip the macro's implicit
-/// `::ktstr::test_support::Check::` prepend when the user has
-/// already written the prefix, so `Check::Check::min(...)` can't
-/// happen.
-///
-/// Only inspects the callee path of an `Expr::Call`; non-call
-/// expressions (rare but legal: a free function returning `Check`,
-/// or a `const` value) fall back to the prepend path, matching the
-/// pre-bugfix behavior for anything that isn't a plain constructor
-/// call. A future refactor could lift this to also handle
-/// `MethodCall` / `Path`, but the Check API today is constructor
-/// calls only — adding more shapes is a no-op until a new constructor
-/// form lands.
-fn expr_has_check_prefix(expr: &syn::Expr) -> bool {
-    let syn::Expr::Call(call) = expr else {
-        return false;
-    };
-    let syn::Expr::Path(expr_path) = &*call.func else {
-        return false;
-    };
-    expr_path
-        .path
-        .segments
-        .iter()
-        .any(|seg| seg.ident == "Check")
-}
-
 /// `polarity` accepts bare idents `HigherBetter`, `LowerBetter`,
 /// `Unknown`, and the call form `TargetValue(<float literal>)`. The
 /// float literal is stamped into a `Polarity::TargetValue(lit)` so
@@ -2027,6 +1997,36 @@ fn parse_metric_attr(attr: &syn::Attribute) -> syn::Result<proc_macro2::TokenStr
             unit: #unit,
         }
     })
+}
+
+/// Does this `#[default_check(...)]` expression already spell
+/// `Check::` somewhere in its function path? Returns true for
+/// `Check::min(...)` and `::ktstr::test_support::Check::min(...)`;
+/// false for bare `min(...)`. Used to skip the macro's implicit
+/// `::ktstr::test_support::Check::` prepend when the user has
+/// already written the prefix, so `Check::Check::min(...)` can't
+/// happen.
+///
+/// Only inspects the callee path of an `Expr::Call`; non-call
+/// expressions (rare but legal: a free function returning `Check`,
+/// or a `const` value) fall back to the prepend path, matching the
+/// pre-bugfix behavior for anything that isn't a plain constructor
+/// call. A future refactor could lift this to also handle
+/// `MethodCall` / `Path`, but the Check API today is constructor
+/// calls only — adding more shapes is a no-op until a new constructor
+/// form lands.
+fn expr_has_check_prefix(expr: &syn::Expr) -> bool {
+    let syn::Expr::Call(call) = expr else {
+        return false;
+    };
+    let syn::Expr::Path(expr_path) = &*call.func else {
+        return false;
+    };
+    expr_path
+        .path
+        .segments
+        .iter()
+        .any(|seg| seg.ident == "Check")
 }
 
 /// Translate the user-facing `polarity = ...` expression to a

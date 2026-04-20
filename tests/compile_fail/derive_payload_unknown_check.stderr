@@ -1,7 +1,7 @@
 error[E0599]: no variant, associated function, or constant named `nonexistent_check` found for enum `Check` in the current scope
-  --> tests/compile_fail/derive_payload_unknown_check.rs:12:17
+  --> tests/compile_fail/derive_payload_unknown_check.rs:14:17
    |
-12 | #[default_check(nonexistent_check("metric", 1.0))]
+14 | #[default_check(nonexistent_check("metric", 1.0))]
    |                 ^^^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `Check`
    |
 note: if you're trying to build a new `Check` consider using one of the following associated functions:
