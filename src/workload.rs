@@ -155,9 +155,14 @@ pub enum WorkType {
     CachePipe { size_kb: usize, burst_iters: u64 },
     /// 1:N fan-out wake pattern without cache pressure. One messenger per
     /// group does CPU spin work then wakes N receivers via FUTEX_WAKE.
-    /// Receivers measure wake-to-run latency. For cache-aware fan-out with
-    /// matrix multiply work, see [`SchBench`](Self::SchBench). Requires
-    /// num_workers divisible by (fan_out + 1).
+    /// Receivers measure wake-to-run latency as the interval from
+    /// stamping `before_block = Instant::now()` just before the wait
+    /// loop to observing the futex generation advance. Unlike
+    /// [`SchBench`](Self::SchBench), there is no shared messenger
+    /// timestamp — the measurement is receiver-local and excludes the
+    /// messenger's pre-wake delay. For cache-aware fan-out with matrix
+    /// multiply work, see `SchBench`. Requires num_workers divisible
+    /// by (fan_out + 1).
     FutexFanOut { fan_out: usize, spin_iters: u64 },
     /// Compound work pattern: loop through phases in order, repeat.
     /// Each phase runs for its duration before the next starts.

@@ -347,8 +347,10 @@ fn format_probe_events_inner(
         return out;
     }
 
-    // Show all events chronologically — tid filtering in process.rs
-    // ensures these are from one task's scheduling journey.
+    // Show all events in input order — the producer in process.rs
+    // sorts by timestamp and applies tid filtering, so these are
+    // chronologically ordered events from one task's scheduling
+    // journey.
     let events: Vec<&super::process::ProbeEvent> = events.iter().collect();
 
     // Resolve source locations. When vmlinux DWARF is available,
