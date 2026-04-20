@@ -1712,6 +1712,11 @@ pub fn derive_payload(input: TokenStream) -> TokenStream {
 
 fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let struct_name = &input.ident;
+    // Inherit the input struct's visibility so the emitted `const`
+    // matches: `pub struct FooPayload` → `pub const FOO: Payload`.
+    // Private structs produce private consts, preserving the
+    // previous behavior for in-crate tests that rely on it.
+    let struct_vis = &input.vis;
 
     // Reject non-struct inputs; the flag-variant grammar is specific
     // to `Scheduler` (enums) and a struct-only payload keeps the
@@ -1829,7 +1834,7 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
     let const_name = format_ident!("{}", camel_to_screaming_snake(base));
 
     let expanded = quote! {
-        const #const_name: ::ktstr::test_support::Payload = ::ktstr::test_support::Payload {
+        #struct_vis const #const_name: ::ktstr::test_support::Payload = ::ktstr::test_support::Payload {
             name: #payload_name,
             kind: ::ktstr::test_support::PayloadKind::Binary(#binary),
             output: #output_tokens,

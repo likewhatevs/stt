@@ -107,18 +107,29 @@ pub enum Op {
     /// Block until the payload named `name` exits naturally, then
     /// evaluate its checks and record metrics to the per-test sidecar.
     ///
-    /// The handle is consumed on success: a subsequent `WaitPayload`
-    /// / `KillPayload` targeting the same name would find no handle
-    /// and bail. A `WaitPayload` for an unknown name is also an
-    /// error — test authors must not silently wait for payloads
-    /// that were never started.
+    /// A consumed or unknown name returns `Err` with an actionable
+    /// message — test authors must not silently wait for payloads
+    /// that were never started or have already been consumed by a
+    /// prior `WaitPayload`/`KillPayload`.
+    ///
+    /// Check failures from the payload are recorded to the sidecar
+    /// for regression analysis but do NOT fail the step or the test
+    /// in-process. Use
+    /// [`ctx.payload(&X).run()`](crate::scenario::payload_run::PayloadRun::run)
+    /// directly if the test body needs to gate on check results.
     WaitPayload { name: Cow<'static, str> },
     /// SIGKILL the payload named `name`, reap the child, evaluate
     /// checks, and record metrics. Mirrors the behavior of
     /// step-teardown drain for an explicitly-targeted payload.
     ///
-    /// Like [`WaitPayload`], the handle is consumed on success and
-    /// an unknown name is an error.
+    /// A consumed or unknown name returns `Err` with an actionable
+    /// message, identical to [`Op::WaitPayload`]'s lookup semantics.
+    ///
+    /// Check failures from the payload are recorded to the sidecar
+    /// for regression analysis but do NOT fail the step or the test
+    /// in-process. Use
+    /// [`ctx.payload(&X).run()`](crate::scenario::payload_run::PayloadRun::run)
+    /// directly if the test body needs to gate on check results.
     KillPayload { name: Cow<'static, str> },
 }
 

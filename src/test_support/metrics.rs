@@ -31,9 +31,9 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 /// [`Check`](crate::test_support::Check) evaluation reports each
 /// referenced metric as missing rather than failing the whole run.
 ///
-/// [`OutputFormat::LlmExtract(hint)`] delegates to
-/// [`crate::test_support::model::extract_via_llm`] which composes a
-/// prompt (with the optional `hint` appended), invokes the local
+/// [`OutputFormat::LlmExtract`] with an optional `hint` delegates to
+/// [`crate::test_support::model::extract_via_llm`], which composes a
+/// prompt (appending the hint when present), invokes the local
 /// inference backend, retries once on a JSON-parse failure, and walks
 /// the resulting JSON with [`MetricSource::LlmExtract`]. An
 /// unwired/unavailable inference backend yields an empty metric
