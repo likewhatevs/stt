@@ -1199,6 +1199,173 @@ mod tests {
         assert!(r.passed);
     }
 
+    /// #21: Multiple checks on the same metric all fire — the
+    /// evaluator does not dedup by metric name. Two `Min`s on the
+    /// same path either both pass (value >= max threshold) or both
+    /// fail (value < one of the thresholds, depending on which is
+    /// more restrictive). This test uses a pair where the metric
+    /// value (100) is below the second threshold (200) but above
+    /// the first (50). The second failure must appear in the
+    /// details list — the evaluator MUST NOT short-circuit after
+    /// the first matching metric check.
+    #[test]
+    fn evaluate_checks_duplicate_min_on_same_metric_both_evaluated() {
+        let pm = PayloadMetrics {
+            metrics: vec![Metric {
+                name: "iops".to_string(),
+                value: 100.0,
+                polarity: Polarity::HigherBetter,
+                unit: String::new(),
+                source: MetricSource::Json,
+            }],
+            exit_code: 0,
+        };
+        let r = evaluate_checks(
+            &[Check::min("iops", 50.0), Check::min("iops", 200.0)],
+            &pm,
+            "",
+        );
+        assert!(!r.passed, "second min must fail");
+        assert_eq!(r.details.len(), 1, "only the failing check emits a detail");
+        // The passing check produces no detail; only the failing one
+        // shows up. The message must reference the 200 threshold.
+        assert!(
+            r.details[0].message.contains("below minimum 200"),
+            "failing check must cite its threshold: {:?}",
+            r.details,
+        );
+    }
+
+    /// #21: Two conflicting checks on the same metric (Min 100 and
+    /// Max 50) produce TWO failures in the details list — not one
+    /// collapsed failure. Pins the "each check evaluated
+    /// independently" invariant so a future optimization doesn't
+    /// accidentally merge / dedup.
+    #[test]
+    fn evaluate_checks_conflicting_checks_on_same_metric_both_report() {
+        let pm = PayloadMetrics {
+            metrics: vec![Metric {
+                name: "iops".to_string(),
+                value: 75.0,
+                polarity: Polarity::HigherBetter,
+                unit: String::new(),
+                source: MetricSource::Json,
+            }],
+            exit_code: 0,
+        };
+        let r = evaluate_checks(
+            &[
+                Check::min("iops", 100.0), // 75 < 100: fail
+                Check::max("iops", 50.0),  // 75 > 50: fail
+            ],
+            &pm,
+            "",
+        );
+        assert!(!r.passed);
+        assert_eq!(
+            r.details.len(),
+            2,
+            "both conflicting checks must each emit a detail: {:?}",
+            r.details,
+        );
+    }
+
+    /// #22: `Check::Exists` with a zero-value metric passes. The
+    /// check is presence-only — a metric of 0.0 is still present
+    /// in the PayloadMetrics map and `pm.get(name).is_some()`
+    /// returns true. Previously susceptible to a bug where a
+    /// naive `pm.get(name).filter(|v| *v != 0.0)` would spuriously
+    /// fail here; pin the "exists is sign-agnostic and zero-
+    /// friendly" invariant.
+    #[test]
+    fn evaluate_checks_exists_passes_for_zero_value_metric() {
+        let pm = PayloadMetrics {
+            metrics: vec![Metric {
+                name: "errors".to_string(),
+                value: 0.0,
+                polarity: Polarity::LowerBetter,
+                unit: String::new(),
+                source: MetricSource::Json,
+            }],
+            exit_code: 0,
+        };
+        let r = evaluate_checks(&[Check::exists("errors")], &pm, "");
+        assert!(
+            r.passed,
+            "exists('errors') must pass when metric is 0.0: {:?}",
+            r.details,
+        );
+    }
+
+    /// #22: Negative zero (`-0.0`) also counts as present for
+    /// `Check::Exists`. Paranoid pin because f64 `-0.0` surprises
+    /// some pattern-matching code (`0.0 == -0.0` but they differ
+    /// under `f64::to_bits`).
+    #[test]
+    fn evaluate_checks_exists_passes_for_negative_zero() {
+        let pm = PayloadMetrics {
+            metrics: vec![Metric {
+                name: "drift".to_string(),
+                value: -0.0,
+                polarity: Polarity::Unknown,
+                unit: String::new(),
+                source: MetricSource::Json,
+            }],
+            exit_code: 0,
+        };
+        let r = evaluate_checks(&[Check::exists("drift")], &pm, "");
+        assert!(r.passed);
+    }
+
+    /// #42: `PayloadRun`'s custom `Debug` impl renders the stable
+    /// identity fields — payload name, args/checks lengths, and
+    /// cgroup placement — without dumping the `Ctx` pointer. Pins
+    /// the output shape so a future rename can't silently drop a
+    /// field that debug-printing consumers rely on.
+    #[test]
+    fn payload_run_debug_renders_identity_fields() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        let run = PayloadRun::new(&ctx, &TRUE_BIN)
+            .arg("--foo")
+            .arg("--bar")
+            .check(Check::exit_code_eq(0))
+            .in_cgroup("workers");
+        let s = format!("{run:?}");
+        assert!(s.contains("PayloadRun"), "prefix: {s}");
+        assert!(s.contains("payload:"), "payload field: {s}");
+        assert!(s.contains("true_bin"), "payload name: {s}");
+        assert!(s.contains("args_len"), "args_len field: {s}");
+        assert!(s.contains("checks_len"), "checks_len field: {s}");
+        assert!(s.contains("cgroup:"), "cgroup field: {s}");
+        // Values: 2 args added (on top of 0 default) + 1 check.
+        assert!(s.contains("args_len: 2"), "computed args_len: {s}");
+        assert!(s.contains("checks_len: 1"), "computed checks_len: {s}");
+        // cgroup is Some("workers"); the debug form of Cow<str>
+        // renders as "workers" inside Some(..).
+        assert!(s.contains("workers"), "cgroup value: {s}");
+        // Must NOT leak the Ctx pointer (no raw-address tokens).
+        assert!(
+            !s.contains("Ctx {"),
+            "Ctx should not appear in PayloadRun Debug: {s}"
+        );
+    }
+
+    /// #42: Default `PayloadRun` (no args, no checks, no cgroup)
+    /// renders sensible zeroes.
+    #[test]
+    fn payload_run_debug_renders_defaults() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        let run = PayloadRun::new(&ctx, &TRUE_BIN);
+        let s = format!("{run:?}");
+        assert!(s.contains("args_len: 0"), "default args_len: {s}");
+        assert!(s.contains("checks_len: 0"), "default checks_len: {s}");
+        assert!(s.contains("cgroup: None"), "default cgroup: {s}");
+    }
+
     #[test]
     fn resolve_polarities_applies_hints() {
         let mut metrics = vec![Metric {

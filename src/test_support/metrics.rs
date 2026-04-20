@@ -425,6 +425,54 @@ mod tests {
         assert!(serde_json::Number::from_f64(2.78).is_some());
     }
 
+    /// #34: `find_and_parse_json` tries the whole trimmed input as
+    /// a single document on the fast path. If the input has a
+    /// balanced object followed by trailing non-JSON text, the
+    /// whole-input parse fails (strict serde) and the region-
+    /// finder slow path extracts the leading `{...}` region and
+    /// parses that. Pins the "trailing garbage is stripped by the
+    /// region finder" behavior.
+    #[test]
+    fn find_and_parse_json_recovers_object_with_trailing_garbage() {
+        let s = r#"{"a": 1, "b": 2} --- trailing prose from banner"#;
+        let v = find_and_parse_json(s).expect("trailing garbage must not block parse");
+        assert_eq!(v["a"], serde_json::json!(1));
+        assert_eq!(v["b"], serde_json::json!(2));
+    }
+
+    /// #34: A leading array followed by trailing garbage recovers
+    /// symmetrically — the region finder handles `[...]` the same
+    /// way it handles `{...}`.
+    #[test]
+    fn find_and_parse_json_recovers_array_with_trailing_garbage() {
+        let s = "[1, 2, 3]\nextra: banner line\n";
+        let v = find_and_parse_json(s).expect("array with trailing garbage must parse");
+        assert_eq!(v, serde_json::json!([1, 2, 3]));
+    }
+
+    /// #34: Real-world fio pattern — banner line, JSON body,
+    /// *and* trailing "done" marker. The region finder locks to
+    /// the first balanced opener/closer, so the trailing content
+    /// is ignored even if it contains unbalanced braces.
+    #[test]
+    fn find_and_parse_json_with_banner_and_trailer() {
+        let s = "fio-3.36 starting up\n{\"iops\": 100}\nfio done }";
+        let v = find_and_parse_json(s).expect("banner + trailer must resolve to body");
+        assert_eq!(v["iops"], serde_json::json!(100));
+    }
+
+    /// #34: When the trailing garbage itself contains a
+    /// BALANCED brace pair, the region finder still returns the
+    /// first one — downstream parsing uses the first match, not
+    /// a merged document.
+    #[test]
+    fn find_and_parse_json_returns_first_region_when_trailer_also_balanced() {
+        let s = r#"{"first": 1} unrelated {"second": 2}"#;
+        let v = find_and_parse_json(s).expect("first balanced region parses");
+        assert_eq!(v["first"], serde_json::json!(1));
+        assert!(v.get("second").is_none(), "second region must not merge in");
+    }
+
     /// #31: Negative numeric leaves extract at their declared value
     /// without any sign-absoluting or filtering. Canonical for
     /// metrics like scheduler_delta_ns that can legitimately be

@@ -590,6 +590,34 @@ mod tests {
         assert_eq!(p, Polarity::TargetValue(0.5));
     }
 
+    /// #43: `Polarity::target(NaN)` must panic in release
+    /// too — non-finite target values produce silent incorrect
+    /// regression verdicts in `compare_rows`, so the gate is a
+    /// runtime `assert!` (not `debug_assert!`). Pins that a
+    /// release build won't silently let NaN slip through.
+    #[test]
+    #[should_panic(expected = "Polarity::TargetValue target must be finite")]
+    fn polarity_target_rejects_nan_panics() {
+        let _ = Polarity::target(f64::NAN);
+    }
+
+    /// #43: `Polarity::target(+inf)` panics symmetrically with
+    /// NaN. `compare_rows` would produce inf-vs-finite verdicts
+    /// that depend on IEEE-754 infinity arithmetic rather than
+    /// meaningful regression direction.
+    #[test]
+    #[should_panic(expected = "Polarity::TargetValue target must be finite")]
+    fn polarity_target_rejects_positive_infinity_panics() {
+        let _ = Polarity::target(f64::INFINITY);
+    }
+
+    /// #43: `Polarity::target(-inf)` ditto.
+    #[test]
+    #[should_panic(expected = "Polarity::TargetValue target must be finite")]
+    fn polarity_target_rejects_negative_infinity_panics() {
+        let _ = Polarity::target(f64::NEG_INFINITY);
+    }
+
     // Item 1 + 2: Debug + helper method surface.
     #[test]
     fn payload_debug_renders_identity_fields() {
