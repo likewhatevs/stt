@@ -35,13 +35,18 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 /// worth calling out because their names differ from the underlying
 /// field or because they have nontrivial defaults:
 ///
-///   - `llcs = N` / `sockets = N` (default: inherited from scheduler, or 1)
+///   - `llcs = N` — number of LLCs (default: inherited from
+///     scheduler, or 1). `sockets = N` is a deprecated alias kept
+///     for backward compatibility with pre-topology-rename tests;
+///     prefer `llcs` in new code.
 ///   - `cores = N` (default: inherited from scheduler, or 2)
 ///   - `threads = N` (default: inherited from scheduler, or 1)
 ///   - `numa_nodes = N` (default: inherited from scheduler, or 1)
 ///   - `memory_mb = N` (default: 2048)
-///   - `duration_s = N` — maps onto `KtstrTestEntry::duration`
-///   - `watchdog_timeout_s = N` — maps onto `KtstrTestEntry::watchdog_timeout`
+///   - `duration_s = N` — scenario run duration in seconds; maps
+///     onto `KtstrTestEntry::duration`
+///   - `watchdog_timeout_s = N` — watchdog fire threshold in
+///     seconds; maps onto `KtstrTestEntry::watchdog_timeout`
 ///   - `scheduler = PATH` — path to a `const Scheduler` (default
 ///     `Scheduler::EEVDF`, which runs without an scx scheduler)
 ///   - `payload = PATH` — path to a `const Payload` used as the

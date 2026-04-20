@@ -272,8 +272,8 @@ pub struct AssertResult {
     /// Whether all checks passed.
     pub passed: bool,
     /// True when the scenario was skipped (e.g. topology mismatch,
-    /// missing resource). `passed` stays `true` for backward compat
-    /// with callers that treat skip as "not a failure"; stats tooling
+    /// missing resource). `passed` stays `true` so gate callers that
+    /// treat skip as "not a failure" continue to work; stats tooling
     /// must subtract skipped runs from pass counts so they don't
     /// count as successful executions.
     pub skipped: bool,

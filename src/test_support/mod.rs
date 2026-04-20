@@ -20,16 +20,19 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 11 private submodules re-exported
-//! at `test_support::*` for a flat public API: `entry` (scheduler +
-//! test-entry types), `eval` (host-side VM result evaluation), `probe`
-//! (auto-repro and BPF probe pipeline), `dispatch` (ktstr / cargo-ktstr
-//! CLI entry points), `sidecar` (per-run JSON records), `output`
-//! (guest-output and console parsing), `args` (CLI argument extraction),
-//! `profraw` (coverage flush), `topo` (topology override parsing),
-//! `timefmt` (ISO-8601 + run-id helpers), and `runtime` (neutral
-//! home for verbose/shm-size/config-file-parts shared by eval and
-//! probe so they don't circularly depend on each other).
+//! Implementation is split across 14 private submodules re-exported
+//! at `test_support::*` for a flat public API: `args` (CLI argument
+//! extraction), `dispatch` (ktstr / cargo-ktstr CLI entry points),
+//! `entry` (scheduler + test-entry types), `eval` (host-side VM
+//! result evaluation), `metrics` (payload stdout → `Metric` list),
+//! `model` (LLM backend + model cache), `output` (guest-output and
+//! console parsing), `payload` (`Payload` / `Check` / `Metric` /
+//! `Polarity`), `probe` (auto-repro and BPF probe pipeline),
+//! `profraw` (coverage flush), `runtime` (neutral home for
+//! verbose/shm-size/config-file-parts shared by eval and probe so
+//! they don't circularly depend on each other), `sidecar` (per-run
+//! JSON records), `timefmt` (ISO-8601 + run-id helpers), and `topo`
+//! (topology override parsing).
 
 #[cfg(test)]
 use crate::assert::AssertResult;

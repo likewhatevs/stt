@@ -467,22 +467,36 @@ pub enum Check {
 }
 
 impl Check {
+    /// Fail when the named metric is below `value`. Missing metric
+    /// fails loudly per the evaluation pipeline's missing-metric
+    /// contract.
     pub const fn min(metric: &'static str, value: f64) -> Check {
         Check::Min { metric, value }
     }
 
+    /// Fail when the named metric exceeds `value`. Missing metric
+    /// fails loudly.
     pub const fn max(metric: &'static str, value: f64) -> Check {
         Check::Max { metric, value }
     }
 
+    /// Fail when the named metric falls outside `[lo, hi]` (inclusive
+    /// on both ends). Missing metric fails loudly.
     pub const fn range(metric: &'static str, lo: f64, hi: f64) -> Check {
         Check::Range { metric, lo, hi }
     }
 
+    /// Fail when the named metric is absent from the extracted set.
+    /// Presence-only — the metric value can be any finite number,
+    /// including zero or negative.
     pub const fn exists(metric: &'static str) -> Check {
         Check::Exists(metric)
     }
 
+    /// Fail when the payload's exit code differs from `expected`.
+    /// Evaluated before metric-path checks so a mis-exited binary
+    /// reports the exit-code mismatch rather than chained
+    /// missing-metric failures.
     pub const fn exit_code_eq(expected: i32) -> Check {
         Check::ExitCodeEq(expected)
     }
@@ -496,8 +510,12 @@ pub enum MetricSource {
     /// Extracted directly from JSON output via
     /// [`OutputFormat::Json`].
     Json,
-    /// Extracted by feeding stdout through the local model (LlmExtract
-    /// path). Treat with somewhat lower confidence than `Json`.
+    /// Extracted by feeding stdout through the local model
+    /// (`OutputFormat::LlmExtract` path). Values depend on the model's
+    /// prompt-driven parse rather than the payload's own structured
+    /// output; downstream tooling that compares runs should surface
+    /// the source so users can filter out LLM-derived metrics when
+    /// reproducibility matters.
     LlmExtract,
 }
 

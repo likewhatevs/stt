@@ -159,10 +159,9 @@ pub enum Op {
     /// outer test watchdog fires. For time-boxed long-running
     /// payloads, prefer [`KillPayload`](Self::KillPayload) paired
     /// with a [`HoldSpec::Fixed`] / [`HoldSpec::Frac`] step
-    /// boundary that guarantees forward progress, or invoke the
-    /// payload via
-    /// [`ctx.payload(&X).run()`](crate::scenario::payload_run::PayloadRun::run)
-    /// which accepts a future `.timeout(Duration)` builder method.
+    /// boundary that guarantees forward progress; the payload's
+    /// own CLI (`--runtime`, `--timeout`) is the reliable way to
+    /// cap a single invocation's runtime.
     ///
     /// Check failures from the payload are recorded to the sidecar
     /// for regression analysis but do NOT fail the step or the test

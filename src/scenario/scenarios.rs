@@ -189,8 +189,8 @@ pub fn nested_steady(ctx: &Ctx) -> Result<AssertResult> {
 /// Move tasks between nested cgroups.
 ///
 /// Creates nested cgroups, spawns workers in one, then moves them
-/// through the hierarchy (sub -> parent -> sibling/sub -> sibling).
-/// Tests task migration across nesting levels.
+/// through the hierarchy (sub -> parent -> cross-hierarchy sub ->
+/// parent). Tests task migration across nesting levels.
 pub fn nested_task_move(ctx: &Ctx) -> Result<AssertResult> {
     super::nested::custom_nested_cgroup_task_move(ctx)
 }

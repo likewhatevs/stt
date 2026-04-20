@@ -19,8 +19,10 @@ use crate::vmm::shm_ring;
 
 /// How multiple rows sharing a pairing key collapse into one
 /// value during comparison. The rule per metric is set on
-/// [`MetricDef::aggregate`]; see
-/// `doc/design/cross-test-stats-comparison.md` for the policy.
+/// [`MetricDef::aggregate`]: `Mean` for rate/latency metrics,
+/// `Sum` for counter totals, `Max` for worst-case peaks, `Min`
+/// for higher-is-better metrics (so the pairing key reports the
+/// worst observed value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Aggregator {
     /// Arithmetic mean of per-row values.

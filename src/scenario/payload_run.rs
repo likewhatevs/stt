@@ -5,24 +5,20 @@
 //! terminal `.run()` (foreground) or `.spawn()` (background)
 //! executes the binary inside the guest VM.
 //!
-//! Per the frozen #162 design, `.run()` blocks until the child
-//! exits and returns `Result<(AssertResult, PayloadMetrics)>`. The
-//! builder is a pure guest-side std::process::Child wrapper — no
-//! cross-VM proxy.
+//! `.run()` blocks until the child exits and returns
+//! `Result<(AssertResult, PayloadMetrics)>`. The builder is a pure
+//! guest-side std::process::Child wrapper — no cross-VM proxy.
 //!
 //! `PayloadKind::Scheduler` payloads are rejected at `.run()`:
 //! schedulers are launched by the framework at test start, not by
 //! test-body invocation. Only `PayloadKind::Binary` payloads are
 //! runnable via this builder.
 //!
-//! Args composition (per frozen design):
+//! Args composition:
 //! 1. `payload.default_args` unless `.clear_args()` was called.
 //! 2. Plus any runtime `.arg(...)` / `.args(...)` appends.
 //!
 //! Checks composition is identical in shape.
-//!
-//! Timeout and affinity wiring land in follow-up work orders — the
-//! builder exposes only controls backed by real behavior.
 
 use std::borrow::Cow;
 use std::ffi::CString;
@@ -418,7 +414,7 @@ fn resolve_polarities(metrics: &mut [Metric], payload: &Payload) {
 /// Evaluate [`Check`]s against a [`PayloadMetrics`] and fold the
 /// verdict into an [`AssertResult`].
 ///
-/// Evaluation order (per frozen design):
+/// Evaluation order:
 /// 1. [`Check::ExitCodeEq`] pre-pass — evaluated FIRST so a
 ///    misconfigured binary fails with an actionable exit-code error
 ///    rather than "metric X not found".
@@ -430,7 +426,9 @@ fn resolve_polarities(metrics: &mut [Metric], payload: &Payload) {
 /// captured stderr almost always explains why, and forcing the test
 /// author to go hunt it down defeats actionable diagnostics.
 ///
-/// Missing metrics fail loudly per the frozen design.
+/// Missing metrics fail loudly — a `Min` / `Max` / `Range` / `Exists`
+/// check against an absent metric reports a "not found" detail
+/// instead of silently passing.
 fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> AssertResult {
     let mut result = AssertResult::pass();
     // Pre-pass: exit-code checks first.
@@ -1600,8 +1598,8 @@ mod tests {
     fn arg_then_clear_args_then_arg_yields_only_the_final_arg() {
         // clear_args() wipes EVERYTHING — the default_args AND any
         // previously-appended .arg(...) — and subsequent .arg(...)
-        // calls start from empty. Regression guard for the frozen
-        // design's "clear_args truncates, arg appends" contract.
+        // calls start from empty. Regression guard for the
+        // "clear_args truncates, arg appends" contract.
         let cgroups = CgroupManager::new("/nonexistent");
         let topo = TestTopology::synthetic(4, 1);
         let ctx = make_ctx(&cgroups, &topo);
@@ -1614,10 +1612,10 @@ mod tests {
 
     #[test]
     fn default_checks_are_inherited_by_new_builder() {
-        // Payload.default_checks are the frozen design's starting
-        // check list: they MUST be present on a fresh PayloadRun
-        // before any runtime .check() calls. `.check` appends on
-        // top, `.clear_checks` wipes them.
+        // Payload.default_checks are the starting check list: they
+        // MUST be present on a fresh PayloadRun before any runtime
+        // .check() calls. `.check` appends on top, `.clear_checks`
+        // wipes them.
         const CHECKED: Payload = Payload {
             name: "checked",
             kind: PayloadKind::Binary("checked"),
