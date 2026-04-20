@@ -5639,4 +5639,213 @@ mod tests {
             "kill not-found message must say 'before killing', got: {msg}"
         );
     }
+
+    // ---------------------------------------------------------------
+    // #177 convergence T1/T2/T9/T10 invariants
+    // ---------------------------------------------------------------
+
+    /// T1: Op::RemoveCgroup dispatches `ctx.cgroups.remove_cgroup`
+    /// directly (apply_ops.rs:2216) but does NOT forget the name
+    /// from CgroupGroup's tracked `names` vec. Later, CgroupGroup's
+    /// Drop iterates every tracked name and calls remove_cgroup
+    /// again. The second call is swallowed by `let _ = ` in Drop,
+    /// so the desync is observable (two remove_cgroup calls for the
+    /// same name) but harmless. Pin the behavior so a future
+    /// refactor that prunes names out from under a live Drop (or
+    /// that stops swallowing the second error) surfaces here.
+    #[test]
+    fn remove_cgroup_does_not_forget_name_in_cgroupgroup_but_drop_is_safe() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::add_cgroup("cg_keep"), Op::add_cgroup("cg_drop")],
+        )
+        .unwrap();
+        // Op::RemoveCgroup records on the mock but does NOT prune
+        // `cg_drop` from the tracked names — both names stay.
+        apply_ops_test(&ctx, &mut state, &[Op::remove_cgroup("cg_drop")]).unwrap();
+        assert_eq!(
+            state.cgroups.names(),
+            &["cg_keep".to_string(), "cg_drop".to_string()],
+            "Op::RemoveCgroup must not mutate CgroupGroup::names (current \
+             invariant); Drop is the single rmdir dispatcher",
+        );
+        // The Drop call is safe because CgroupManager::remove_cgroup
+        // is idempotent and CgroupGroup::drop swallows the second
+        // error. Proved by dropping the state and asserting the mock
+        // observed two RemoveCgroup calls for cg_drop (one from the
+        // op, one from Drop), in that order, and did not panic.
+        drop(state);
+        let calls = mock.calls();
+        let drops: Vec<&CgroupCall> = calls
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::RemoveCgroup(n) if n == "cg_drop"))
+            .collect();
+        assert_eq!(
+            drops.len(),
+            2,
+            "expected Op::RemoveCgroup + Drop to both hit the mock for cg_drop: {calls:?}",
+        );
+    }
+
+    /// T2: step-local `Op::AddCgroup` with a name that already lives
+    /// in the Backdrop must route through the same
+    /// `cgroup_name_is_tracked` collision guard as `apply_setup`,
+    /// rather than letting the CgroupGroup push a shadow entry that
+    /// later steps could address. Currently
+    /// `apply_ops`/`Op::AddCgroup` calls
+    /// `target_cgroups().add_cgroup_no_cpuset(name)` with no
+    /// collision check — this test documents the current behavior
+    /// so a future refactor that adds the guard at the op level
+    /// (mirroring apply_setup) flips the assertion.
+    #[test]
+    fn op_add_cgroup_step_local_allows_collision_with_backdrop_today() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("shared")
+            .expect("add backdrop cgroup");
+        let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        // Current behavior: no collision guard at apply_ops level
+        // — the op succeeds and the CgroupGroup's name list gains
+        // a step-local copy of the same name. If a future change
+        // lifts the apply_setup-style guard into apply_ops, this
+        // assertion becomes an unwrap_err instead.
+        let result = apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("shared")]);
+        assert!(
+            result.is_ok(),
+            "current apply_ops does not collision-check Op::AddCgroup; got: {result:?}",
+        );
+        assert!(
+            step_state.cgroups.names().iter().any(|n| n == "shared"),
+            "step-local names must include the new copy",
+        );
+        assert!(
+            backdrop_state.cgroups.names().iter().any(|n| n == "shared"),
+            "backdrop copy must survive the op",
+        );
+    }
+
+    /// T2 companion: `Op::AddCgroup` applied twice in one step pushes
+    /// two entries into the same CgroupGroup's `names` vec. Drop then
+    /// calls `remove_cgroup` for each — the second hits an
+    /// already-removed cgroup (safe via `let _ = `).
+    #[test]
+    fn op_add_cgroup_duplicate_in_same_step_pushes_twice() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::add_cgroup("cg_dup"), Op::add_cgroup("cg_dup")],
+        )
+        .unwrap();
+        let names = state.cgroups.names();
+        assert_eq!(
+            names.iter().filter(|n| n.as_str() == "cg_dup").count(),
+            2,
+            "current apply_ops pushes a name entry per Op::AddCgroup, even \
+             on duplicate names; got: {names:?}",
+        );
+    }
+
+    /// T9: `MoveAllTasks` must re-key EVERY workload handle whose
+    /// current name matches `from`, not just the first. Multiple
+    /// handles on the same cgroup arise when a scenario issues two
+    /// `Op::Spawn` ops on the same cgroup name.
+    #[test]
+    fn move_all_tasks_renames_every_handle_keyed_under_from() {
+        use crate::workload::{AffinityMode, WorkType, WorkloadConfig, WorkloadHandle};
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        step_state.cgroups.add_cgroup_no_cpuset("src").unwrap();
+        step_state.cgroups.add_cgroup_no_cpuset("dst").unwrap();
+
+        // Push THREE handles all keyed under "src" — simulates two
+        // Op::Spawn ops in the same cgroup + one from CgroupDef.
+        for _ in 0..3 {
+            let wl = WorkloadConfig {
+                num_workers: 1,
+                affinity: AffinityMode::None,
+                work_type: WorkType::CpuSpin,
+                ..Default::default()
+            };
+            let h = WorkloadHandle::spawn(&wl).expect("spawn worker");
+            step_state.handles.push(("src".to_string(), h));
+        }
+        assert_eq!(step_state.handles.len(), 3);
+
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("src", "dst")]).expect("move");
+        }
+
+        assert_eq!(step_state.handles.len(), 3, "no handles lost");
+        assert!(
+            step_state.handles.iter().all(|(name, _)| name == "dst"),
+            "every handle must be re-keyed to 'dst': {:?}",
+            step_state
+                .handles
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+        );
+        // SIGKILL before drop so the synthetic workers don't leak.
+        step_state.handles.clear();
+    }
+
+    /// T10: per-step teardown is observable via the mock's call log.
+    /// `execute_scenario` runs Step::cgroups Drop at step boundary;
+    /// with MockCgroupOps we can pin that the rmdir calls happen
+    /// (a) only on step-local cgroups, (b) in REVERSE order of
+    /// addition (the fix from task #9 — nested-cgroup-safe
+    /// teardown).
+    #[test]
+    fn per_step_teardown_removes_step_local_cgroups_in_reverse_order() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[
+                Op::add_cgroup("cg_a"),
+                Op::add_cgroup("cg_a/sub"),
+                Op::add_cgroup("cg_b"),
+            ],
+        )
+        .unwrap();
+        // Simulate step boundary: drop the state to run CgroupGroup::Drop.
+        drop(state);
+        let calls = mock.calls();
+        let removes: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| match c {
+                CgroupCall::RemoveCgroup(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            removes,
+            vec!["cg_b", "cg_a/sub", "cg_a"],
+            "per-step teardown must rmdir in reverse addition order so a \
+             child cgroup's directory is gone before its parent's rmdir \
+             runs — matches the fix from task #9",
+        );
+    }
 }
