@@ -62,6 +62,8 @@ pub fn should_skip_probe(name: &str) -> bool {
 /// `expand_bpf_to_kernel_callers`, which keeps the BPF function for
 /// fentry attachment and adds the kernel caller for a bridge kprobe).
 /// The task_struct pointer is at arg{task_arg_idx}.
+///
+/// Order matters: `.find()` returns the first matching fragment.
 pub(super) const BPF_OP_CALLERS: &[(&str, &str, u32)] = &[
     ("select_cpu", "do_enqueue_task", 1),
     ("enqueue", "do_enqueue_task", 1),

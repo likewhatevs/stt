@@ -37,6 +37,7 @@ pub struct GuestKernel<'a> {
     symbols: HashMap<String, u64>,
     page_offset: u64,
     cr3_pa: u64,
+    /// 5-level paging flag — true when the guest uses 5-level page tables (LA57).
     l5: bool,
 }
 

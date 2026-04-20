@@ -208,6 +208,9 @@ pub(crate) fn discover_struct_ops_stats(
 /// For each program, reads `cnt` and `nsecs` from each CPU's
 /// `bpf_prog_stats` and sums across CPUs. Uses pre-resolved
 /// `__per_cpu_offset` array for address resolution.
+///
+/// Uses direct-mapping translation only (kva_to_pa); percpu arenas
+/// are always in the direct mapping.
 pub(crate) fn read_prog_runtime_stats(
     mem: &GuestMem,
     cached: &[CachedProgInfo],
