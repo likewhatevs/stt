@@ -32,7 +32,7 @@ pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 /// Move workers through nested hierarchy: sub -> parent ->
-/// cross-hierarchy sub -> sibling.
+/// cross-hierarchy sub -> parent.
 pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step::with_defs(
