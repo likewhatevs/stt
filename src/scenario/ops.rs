@@ -4393,8 +4393,8 @@ mod tests {
 
     /// The drain helper kills + removes entries whose cgroup name
     /// matches the target. Non-matching entries stay in the vector
-    /// so subsequent step teardown / final collect_result kills
-    /// them in turn.
+    /// so subsequent step teardown (via `collect_step`) or scenario
+    /// end (via `collect_backdrop`) kills them in turn.
     #[test]
     fn drain_payload_handles_for_cgroup_removes_matching_only() {
         use crate::cgroup::CgroupManager;
