@@ -446,15 +446,18 @@ pub struct SchedDomainSnapshot {
     /// Consecutive load balance failures (`sd->nr_balance_failed`).
     pub nr_balance_failed: u32,
     /// Number of newidle balance calls (`sd->newidle_call`).
-    /// None on 6.16+ where this field was removed.
+    /// None when BTF lacks this field (added in 7.0; backported to
+    /// 6.18.5+, 6.12.65+). Not present on 6.16-6.18.4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newidle_call: Option<u32>,
     /// Successful newidle balance calls (`sd->newidle_success`).
-    /// None on 6.16+ where this field was removed.
+    /// None when BTF lacks this field (added in 7.0; backported to
+    /// 6.18.5+, 6.12.65+). Not present on 6.16-6.18.4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newidle_success: Option<u32>,
     /// Newidle balance ratio (`sd->newidle_ratio`).
-    /// None on 6.16+ where this field was removed.
+    /// None when BTF lacks this field (added in 7.0; backported to
+    /// 6.18.5+, 6.12.65+). Not present on 6.16-6.18.4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newidle_ratio: Option<u32>,
     /// Max cost of newidle load balancing in ns (`sd->max_newidle_lb_cost`).
