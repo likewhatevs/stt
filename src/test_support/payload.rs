@@ -832,6 +832,65 @@ mod tests {
         let _ = Polarity::target(f64::NEG_INFINITY);
     }
 
+    /// `Polarity::TargetValue(NaN)` — which bypasses the
+    /// `Polarity::target` constructor's runtime assert when a hand-
+    /// built struct literal is used — serializes to
+    /// `{"TargetValue":null}` via serde_json because
+    /// `serde_json::Number::from_f64` returns `None` on non-finite
+    /// values and the default serializer falls back to `null`.
+    /// The resulting document does NOT round-trip: deserialization
+    /// fails because `null` can't satisfy the inner `f64` slot.
+    /// So NaN cannot survive a sidecar write + read pair, even
+    /// though the write step silently coerces it. Pins both halves
+    /// of this asymmetric guard so a future serde-attribute change
+    /// (e.g. `serialize_with = "serialize_nan_as_zero"`) or a
+    /// custom deserializer gets surfaced here.
+    #[test]
+    fn polarity_target_nan_serializes_as_null_and_fails_to_round_trip() {
+        let p = Polarity::TargetValue(f64::NAN);
+        let s = serde_json::to_string(&p).expect("NaN→null serialization is the current behavior");
+        assert_eq!(s, "{\"TargetValue\":null}");
+        assert!(
+            serde_json::from_str::<Polarity>(&s).is_err(),
+            "the null-coerced round-trip must fail to deserialize so a NaN written \
+             by an un-guarded producer cannot silently re-enter a run",
+        );
+    }
+
+    /// Raw `NaN` / `Infinity` tokens are not valid JSON, so a
+    /// sidecar file hand-edited (or emitted by a non-serde writer)
+    /// to contain them will be rejected at parse time. Pairs with
+    /// the null-round-trip test above.
+    #[test]
+    fn polarity_target_nan_cannot_deserialize_from_non_json_literals() {
+        assert!(serde_json::from_str::<Polarity>("{\"TargetValue\":NaN}").is_err());
+        assert!(serde_json::from_str::<Polarity>("{\"TargetValue\":Infinity}").is_err());
+        assert!(serde_json::from_str::<Polarity>("{\"TargetValue\":-Infinity}").is_err());
+    }
+
+    /// `Check::Range { lo: hi, hi: lo }` — i.e. reversed bounds that
+    /// make `lo > hi` — produces an empty interval that every finite
+    /// metric fails against. The Check API has no runtime validation
+    /// for `lo <= hi`, so the failure manifests as "metric outside
+    /// [lo, hi]" for any probe value. Pin that current behavior so a
+    /// future validation pass (which SHOULD exist, since a reversed
+    /// range is almost certainly a bug on the user's side) surfaces
+    /// here instead of quietly flipping semantics.
+    #[test]
+    fn check_range_reversed_bounds_fails_every_finite_value() {
+        let reversed = Check::range("iops", 100.0, 50.0); // lo=100, hi=50
+        match reversed {
+            Check::Range { metric, lo, hi } => {
+                assert_eq!(metric, "iops");
+                assert!(
+                    lo > hi,
+                    "constructor does not reorder bounds: lo={lo}, hi={hi}",
+                );
+            }
+            _ => panic!("expected Range variant"),
+        }
+    }
+
     // Item 1 + 2: Debug + helper method surface.
     #[test]
     fn payload_debug_renders_identity_fields() {

@@ -536,6 +536,24 @@ mod tests {
         assert!(v.get("second").is_none(), "second region must not merge in");
     }
 
+    /// Embedded `{` / `}` characters inside a JSON string literal
+    /// must NOT be counted as structural openers/closers by the
+    /// region finder. The in-string tracker flips on `"` and
+    /// suppresses nesting accounting until the matching closing
+    /// `"`, so the only braces that affect `depth` are the
+    /// structural outer ones. Pins that a log message which happens
+    /// to contain `{` / `}` inside a quoted string still round-trips
+    /// through the slow path.
+    #[test]
+    fn find_and_parse_json_ignores_braces_inside_string_literals() {
+        let s = "fio-3.36 starting up\n\
+                 {\"msg\": \"look at {nested} in text\", \"ok\": 1}\n\
+                 trailing banner";
+        let v = find_and_parse_json(s).expect("embedded braces in string must not break scan");
+        assert_eq!(v["msg"], serde_json::json!("look at {nested} in text"));
+        assert_eq!(v["ok"], serde_json::json!(1));
+    }
+
     /// Negative numeric leaves extract at their declared value
     /// without any sign-absoluting or filtering. Canonical for
     /// metrics like scheduler_delta_ns that can legitimately be

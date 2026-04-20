@@ -1027,6 +1027,87 @@ mod tests {
         );
     }
 
+    /// Signal-terminated payloads report `exit_code = -1` because
+    /// `std::process::ExitStatus::code()` returns `None` on
+    /// signal death and the spawn layer maps that to `-1`
+    /// (payload_run.rs:730). A user who expects the signal-death
+    /// case can assert `Check::exit_code_eq(-1)`, and the pre-pass
+    /// comparison must pass under exact `i32` equality.
+    #[test]
+    fn evaluate_checks_exit_code_eq_negative_one_matches_signal_death() {
+        let pm = PayloadMetrics {
+            metrics: vec![],
+            exit_code: -1,
+        };
+        let r = evaluate_checks(&[Check::exit_code_eq(-1)], &pm, "");
+        assert!(
+            r.passed,
+            "exit_code_eq(-1) must pass when exit_code == -1: {:?}",
+            r.details,
+        );
+    }
+
+    /// Symmetric negative case: `Check::exit_code_eq(-1)` against a
+    /// CLEAN exit (`exit_code == 0`) must fail and surface the
+    /// mismatch with both integers printed so the user sees what
+    /// they asked for vs what happened.
+    #[test]
+    fn evaluate_checks_exit_code_eq_negative_one_fails_on_clean_exit() {
+        let pm = PayloadMetrics {
+            metrics: vec![],
+            exit_code: 0,
+        };
+        let r = evaluate_checks(&[Check::exit_code_eq(-1)], &pm, "");
+        assert!(!r.passed);
+        let msg = &r.details[0].message;
+        assert!(
+            msg.contains("exited with code 0"),
+            "mismatch detail must cite the actual exit code, got: {msg}"
+        );
+        assert!(
+            msg.contains("-1"),
+            "mismatch detail must cite the expected exit code, got: {msg}"
+        );
+    }
+
+    /// `Check::Range { lo: 100, hi: 50 }` — reversed bounds that make
+    /// `lo > hi` — currently fails EVERY finite metric value because
+    /// the evaluator tests `(actual < lo) || (actual > hi)` and both
+    /// halves are always true for an empty interval. No up-front
+    /// validation rejects the reversed construction. Pin the current
+    /// behavior so a future constructor-level validation (which
+    /// SHOULD exist, since a reversed range is almost certainly a
+    /// user error) flips this assertion visibly instead of silently
+    /// changing the failure mode.
+    #[test]
+    fn evaluate_checks_range_reversed_bounds_fails_every_finite_value() {
+        use crate::test_support::{Metric, MetricSource, Polarity};
+        let reversed = Check::range("iops", 100.0, 50.0);
+        for actual in &[0.0, 50.0, 75.0, 100.0, 200.0, -1000.0, 1e9] {
+            let pm = PayloadMetrics {
+                metrics: vec![Metric {
+                    name: "iops".to_string(),
+                    value: *actual,
+                    polarity: Polarity::HigherBetter,
+                    unit: String::new(),
+                    source: MetricSource::Json,
+                }],
+                exit_code: 0,
+            };
+            let r = evaluate_checks(&[reversed], &pm, "");
+            assert!(
+                !r.passed,
+                "reversed range must fail for value {actual}: {:?}",
+                r.details,
+            );
+            assert!(
+                r.details[0].message.contains("outside [100, 50]"),
+                "detail must cite the (reversed) declared bounds verbatim, got: {:?}",
+                r.details,
+            );
+        }
+    }
+
     #[test]
     fn stderr_tail_truncates_long_input() {
         // Build >STDERR_TAIL_BYTES of ASCII so char-boundary logic
