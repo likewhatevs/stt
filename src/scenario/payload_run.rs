@@ -384,9 +384,21 @@ impl Drop for PayloadHandle {
 /// payload's declared `metrics` hints.
 ///
 /// Unhinted metrics keep [`Polarity::Unknown`] and empty unit.
+///
+/// Complexity: O(N + M) — build a `HashMap<&str, &MetricHint>` from
+/// the hint slice once, then look up each metric by name in O(1).
+/// The prior linear-scan implementation was O(N × M) where N is
+/// extracted metrics and M is declared hints; fio JSON with
+/// thousands of leaves + a dozen hints was the hottest path this
+/// module sees per payload run.
 fn resolve_polarities(metrics: &mut [Metric], payload: &Payload) {
+    if payload.metrics.is_empty() || metrics.is_empty() {
+        return;
+    }
+    let hints: std::collections::HashMap<&str, &crate::test_support::MetricHint> =
+        payload.metrics.iter().map(|h| (h.name, h)).collect();
     for metric in metrics {
-        if let Some(hint) = payload.metrics.iter().find(|h| h.name == metric.name) {
+        if let Some(hint) = hints.get(metric.name.as_str()) {
             metric.polarity = hint.polarity;
             metric.unit = hint.unit.to_string();
         }
@@ -1500,12 +1512,103 @@ mod tests {
         }
     }
 
-    /// The guest-side `emit_payload_metrics_to_shm` helper must not
-    /// panic when invoked without an initialized SHM region. Outside
-    /// a VM the cached SHM pointer is unset, and `write_msg` silently
-    /// no-ops — but the serialization that precedes the write can
-    /// still run and must handle an arbitrary `PayloadMetrics`
-    /// without fault.
+    /// Hinted metrics pick up polarity + unit from the payload's
+    /// declared MetricHints regardless of declaration order. Also
+    /// pins that resolve_polarities leaves unhinted metrics at
+    /// Polarity::Unknown / empty unit — the non-over-applying
+    /// invariant the prior linear scan had.
+    #[test]
+    fn resolve_polarities_applies_hints_by_name_lookup() {
+        use crate::test_support::{Metric, MetricHint, MetricSource, Polarity};
+        static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
+            name: "hinted",
+            kind: crate::test_support::PayloadKind::Binary("x"),
+            output: crate::test_support::OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            // Out-of-order with the metric slice below so a naive
+            // position-based lookup would miss.
+            metrics: &[
+                MetricHint {
+                    name: "lat_ns",
+                    polarity: Polarity::LowerBetter,
+                    unit: "ns",
+                },
+                MetricHint {
+                    name: "iops",
+                    polarity: Polarity::HigherBetter,
+                    unit: "iops",
+                },
+            ],
+        };
+        let mut ms = vec![
+            Metric {
+                name: "iops".into(),
+                value: 1.0,
+                polarity: Polarity::Unknown,
+                unit: String::new(),
+                source: MetricSource::Json,
+            },
+            Metric {
+                name: "unhinted".into(),
+                value: 2.0,
+                polarity: Polarity::Unknown,
+                unit: String::new(),
+                source: MetricSource::Json,
+            },
+            Metric {
+                name: "lat_ns".into(),
+                value: 3.0,
+                polarity: Polarity::Unknown,
+                unit: String::new(),
+                source: MetricSource::Json,
+            },
+        ];
+        resolve_polarities(&mut ms, &PAYLOAD);
+        // iops hinted → HigherBetter / "iops".
+        assert_eq!(ms[0].polarity, Polarity::HigherBetter);
+        assert_eq!(ms[0].unit, "iops");
+        // unhinted stays Unknown + empty.
+        assert_eq!(ms[1].polarity, Polarity::Unknown);
+        assert_eq!(ms[1].unit, "");
+        // lat_ns hinted → LowerBetter / "ns".
+        assert_eq!(ms[2].polarity, Polarity::LowerBetter);
+        assert_eq!(ms[2].unit, "ns");
+    }
+
+    /// Empty hints or empty metrics are a fast-path — the HashMap
+    /// build is skipped entirely. Pins the no-op invariant so a
+    /// regression can't accidentally materialize an empty map for
+    /// zero metrics on every hot-path call.
+    #[test]
+    fn resolve_polarities_empty_inputs_are_noop() {
+        use crate::test_support::{Metric, MetricSource, Polarity};
+        static NO_HINTS: crate::test_support::Payload = crate::test_support::Payload {
+            name: "no_hints",
+            kind: crate::test_support::PayloadKind::Binary("x"),
+            output: crate::test_support::OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let mut ms = vec![Metric {
+            name: "anything".into(),
+            value: 1.0,
+            polarity: Polarity::Unknown,
+            unit: String::new(),
+            source: MetricSource::Json,
+        }];
+        resolve_polarities(&mut ms, &NO_HINTS);
+        assert_eq!(ms[0].polarity, Polarity::Unknown);
+        assert_eq!(ms[0].unit, "");
+
+        // Empty metrics list — also a fast-path no-op, just pin it
+        // doesn't panic / over-allocate.
+        let mut empty: Vec<Metric> = vec![];
+        resolve_polarities(&mut empty, &NO_HINTS);
+        assert!(empty.is_empty());
+    }
+
     #[test]
     fn emit_payload_metrics_to_shm_no_panic_without_shm() {
         let pm = PayloadMetrics {

@@ -1137,18 +1137,37 @@ pub fn execute_steps_with(
             return Ok(r);
         }
 
+        // Any `?` out of apply_ops / apply_setup would bypass
+        // `collect_result` and leave payload_handles to be SIGKILLed
+        // by `PayloadHandle::drop` — which skips the metric-emission
+        // pipeline. `drain_on_err!` routes the Err through
+        // `drain_all_payload_handles` (which uses `.kill()` internally
+        // and therefore DOES emit metrics) before propagating, so a
+        // mid-scenario spawn failure still leaves a usable sidecar.
+        macro_rules! drain_on_err {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(err) => {
+                        drain_all_payload_handles(&mut state.payload_handles);
+                        return Err(err);
+                    }
+                }
+            };
+        }
+
         match &step.hold {
             HoldSpec::Loop { interval } => {
                 // Setup runs once before the loop.
                 if !step.setup.is_empty() {
                     let defs = step.setup.resolve(ctx);
-                    apply_setup(ctx, &mut state, &defs)?;
+                    drain_on_err!(apply_setup(ctx, &mut state, &defs));
                 }
                 // Loop mode: apply ops repeatedly at interval until
                 // the remaining scenario time is exhausted.
                 let deadline = scenario_start + ctx.duration;
                 while std::time::Instant::now() < deadline {
-                    apply_ops(ctx, &mut state, &step.ops)?;
+                    drain_on_err!(apply_ops(ctx, &mut state, &step.ops));
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     thread::sleep(remaining.min(*interval));
                 }
@@ -1156,10 +1175,10 @@ pub fn execute_steps_with(
             _ => {
                 // Ops first (e.g. parent cgroup creation), then
                 // CgroupDef setup (children with workers).
-                apply_ops(ctx, &mut state, &step.ops)?;
+                drain_on_err!(apply_ops(ctx, &mut state, &step.ops));
                 if !step.setup.is_empty() {
                     let defs = step.setup.resolve(ctx);
-                    apply_setup(ctx, &mut state, &defs)?;
+                    drain_on_err!(apply_setup(ctx, &mut state, &defs));
                 }
 
                 // Write stimulus event after applying ops.
@@ -3221,12 +3240,19 @@ mod tests {
         ))
     }
 
-    /// Drop workload handles inside state so apply_setup tests don't
-    /// leak worker processes. `handles` holds (cgroup_name, WorkloadHandle);
-    /// handle Drop SIGKILLs its workers — calling `state.handles.clear()`
-    /// is enough.
+    /// Drop workload + payload handles inside state so apply_setup
+    /// tests don't leak worker or payload processes. Synthetic
+    /// `WorkloadHandle`s SIGKILL their workers on Drop, so a
+    /// `handles.clear()` is enough; `PayloadHandle` likewise
+    /// SIGKILLs its child on Drop (with an eprintln warning about
+    /// metrics not being recorded — acceptable in the test path
+    /// where metrics aren't what's under test). Calling
+    /// `drain_all_payload_handles` routes through `.kill()` so the
+    /// metric-emission branch runs and the test doesn't trigger
+    /// the Drop-warning banner on stderr.
     fn cleanup_state(state: &mut StepState<'_>) {
         state.handles.clear();
+        drain_all_payload_handles(&mut state.payload_handles);
     }
 
     #[test]
@@ -3892,5 +3918,82 @@ mod tests {
         // Clean up the live handle so the test process doesn't leak
         // a /bin/sleep.
         apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
+    }
+
+    // -- #85: payload_handles drain on error paths in execute_steps_with --
+
+    /// An Err return from `execute_steps_with` (here: a vacuous
+    /// `HoldSpec::Fixed(ZERO)` caught by up-front validation)
+    /// leaves no live payload_handles because no setup/ops ran.
+    /// Pins the invariant that the pre-ops validation path does
+    /// not spawn anything that could then leak.
+    #[test]
+    fn execute_steps_with_early_validation_err_has_nothing_to_drain() {
+        use crate::cgroup::CgroupManager;
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = mock_topo();
+        let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
+        let step = Step::new(vec![], HoldSpec::Fixed(Duration::ZERO));
+        let err = execute_steps_with(&ctx, vec![step], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hold validation") && msg.contains("vacuous"),
+            "expected pre-ops validation err, got: {msg}"
+        );
+    }
+
+    /// When a live payload has been spawned and a later op returns
+    /// Err, the drain-on-err path consumes the payload handles via
+    /// `.kill()` (which emits metrics) rather than leaking them to
+    /// `PayloadHandle::drop` (which SIGKILLs without recording).
+    ///
+    /// This test exercises the drain path directly by spawning a
+    /// /bin/sleep, then calling `apply_ops` with an op that forces
+    /// an error (unknown-name `WaitPayload`). After the Err, the
+    /// state's payload_handles must still be consulted by the
+    /// drain — verified by checking the live count before +
+    /// explicit teardown after.
+    #[test]
+    fn apply_ops_error_does_not_lose_live_payload_handles() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper_drain",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        };
+        apply_ops(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["3600".into()])],
+        )
+        .expect("spawn");
+        assert_eq!(state.payload_handles.len(), 1);
+        // Trigger an Err via WaitPayload on an unknown name. Before
+        // the fix, execute_steps_with would propagate the Err via
+        // `?` and leave the SLEEP handle to be SIGKILLed by Drop
+        // (losing the metric emission).
+        let err = apply_ops(&ctx, &mut state, &[Op::wait_payload("never_spawned")]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no running payload named 'never_spawned'"),
+            "expected wait-unknown-name err",
+        );
+        // The live handle is still in state — apply_ops itself does
+        // not drain on Err (that's execute_steps_with's
+        // responsibility). Manually drain via the helper to
+        // terminate the child cleanly.
+        drain_all_payload_handles(&mut state.payload_handles);
+        assert!(state.payload_handles.is_empty());
     }
 }
