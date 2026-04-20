@@ -209,7 +209,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
                 let _ = tcsetattr(stdout_fd, SetArg::TCSANOW, &termios);
             }
             // Restore SIGCHLD so waitpid can reap the child and
-            // retrieve the real exit code. SIG_IGN (set at line 80)
+            // retrieve the real exit code. The default SIG_IGN on
+            // SIGCHLD (installed earlier in main for zombie prevention)
             // causes the kernel to auto-reap, making waitpid return
             // ECHILD and losing the exit status. Safe: single-threaded
             // PID 1 context, no other children running in exec mode.

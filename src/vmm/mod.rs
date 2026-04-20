@@ -4521,7 +4521,7 @@ impl TerminalRawGuard {
         SAVED_TERMIOS_FD.store(fd, std::sync::atomic::Ordering::Release);
 
         // Install signal handlers with SA_RESETHAND. Matches the raw libc
-        // pattern used by register_vcpu_signal_handler (mod.rs:870).
+        // pattern used by register_vcpu_signal_handler.
         let mut prev_sigint: libc::sigaction = unsafe { std::mem::zeroed() };
         let mut prev_sigterm: libc::sigaction = unsafe { std::mem::zeroed() };
         let mut prev_sigquit: libc::sigaction = unsafe { std::mem::zeroed() };

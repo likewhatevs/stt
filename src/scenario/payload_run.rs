@@ -1029,8 +1029,8 @@ mod tests {
 
     /// Signal-terminated payloads report `exit_code = -1` because
     /// `std::process::ExitStatus::code()` returns `None` on
-    /// signal death and the spawn layer maps that to `-1`
-    /// (payload_run.rs:730). A user who expects the signal-death
+    /// signal death and the spawn layer maps that to `-1` (see
+    /// `spawn_foreground`). A user who expects the signal-death
     /// case can assert `Check::exit_code_eq(-1)`, and the pre-pass
     /// comparison must pass under exact `i32` equality.
     #[test]

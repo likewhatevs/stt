@@ -3404,12 +3404,12 @@ mod tests {
     /// EAGAIN on `fork`: with num_workers=1 and CpuSpin (no pipe
     /// pairs, no futex), cap RLIMIT_NPROC to 0 so the very first
     /// `libc::fork` inside the per-worker loop returns -1. At bail
-    /// time the local cleanup has closed the report+start pipes
-    /// (lines 1278-1283), so the guard carries only its empty
-    /// `pipe_pairs`, zero children, and the iter_counters mmap. The
-    /// Drop munmaps the iter_counters region (no-op for the fd
-    /// count but proves the guard path fires) and returns cleanly.
-    /// No zombies, no fd leak.
+    /// time the local cleanup (in the per-worker fork dispatch in
+    /// `WorkloadHandle::spawn`) has closed the report+start pipes, so
+    /// the guard carries only its empty `pipe_pairs`, zero children,
+    /// and the iter_counters mmap. The Drop munmaps the iter_counters
+    /// region (no-op for the fd count but proves the guard path
+    /// fires) and returns cleanly. No zombies, no fd leak.
     #[test]
     fn spawn_guard_cleans_up_on_fork_eagain() {
         let code = run_in_forked_child(|| {
