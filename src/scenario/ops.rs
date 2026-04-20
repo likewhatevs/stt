@@ -1803,23 +1803,32 @@ fn run_scenario(
             Ok::<(), anyhow::Error>(())
         });
         if let Err(err) = setup_res {
-            drain_all_payload_handles(&mut step_staging.payload_handles);
-            drain_all_payload_handles(&mut backdrop_state.payload_handles);
-            // step_staging's CgroupGroup RAII drops here too,
-            // removing any cgroups the failed Backdrop setup
-            // happened to route into step-local state.
+            // Collect any workers that DID spawn before the failure
+            // so their stats reach the final result instead of being
+            // discarded by `WorkloadHandle::drop` (which SIGKILLs
+            // without gathering scheduler-side data). `collect_*`
+            // drain `payload_handles` internally, so the backdrop-
+            // and step-side payloads still get `.kill()` (SHM metric
+            // emission) on the error path.
             //
-            // Surface the error as a detail on the accumulated result
-            // so the caller keeps any metric emissions the payload
-            // drains produced and gets a failure report with the
-            // error context, instead of an opaque Err that discards
-            // the in-progress AssertResult.
-            result.passed = false;
-            result.details.push(crate::assert::AssertDetail::new(
+            // `with_target_backdrop` routes every target writer to
+            // the backdrop slot, so `step_staging` normally holds
+            // nothing — but collect defensively so a partial-failure
+            // path that leaks a non-backdrop write surfaces here
+            // rather than disappearing into `StepState::drop`.
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            let staging_result = collect_step(&mut step_staging, effective_checks, ctx.topo);
+            r.merge(staging_result);
+            r.merge(result);
+            // step_staging's CgroupGroup RAII still drops here,
+            // removing any cgroups the failed Backdrop setup routed
+            // into step-local state.
+            r.passed = false;
+            r.details.push(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Other,
                 format!("Backdrop setup failed: {err:#}"),
             ));
-            return Ok(result);
+            return Ok(r);
         }
         // `step_staging` should not have accumulated anything
         // because `with_target_backdrop` routed every target writer
