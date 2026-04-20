@@ -1073,7 +1073,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | `topology(N, L, C, T)` | no | Default VM topology `(numa_nodes, llcs, cores, threads)`. Defaults to `(1, 1, 2, 1)`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path. Must begin with `/` (e.g. `"/ktstr"`). |
 /// | `sched_args = [...]` | no | Default scheduler CLI args. |
-/// | `sysctls = [Sysctl::new("key", "value"), ...]` | no | Guest sysctls applied before the scheduler starts. |
+/// | `sysctls = [Sysctl::new("key", "value"), ...]` | no | Guest sysctls applied before the scheduler starts. Each element is a fully-qualified Rust expression that evaluates to a [`Sysctl`](crate::test_support::Sysctl); the macro inserts the token stream verbatim, so `Sysctl::new(...)`, a path to a `const Sysctl`, or any user-written constructor call all work. Unlike the bare-form `default_check(min(...))` grammar, `sysctls` has no implicit path prefix — write the type name explicitly (or bring it into scope with `use`). |
 /// | `kargs = ["arg1", "arg2"]` | no | Extra kernel command-line args appended when booting the VM. |
 /// | `min_numa_nodes = N` | no | Minimum NUMA nodes for gauntlet filtering. |
 /// | `max_numa_nodes = N` | no | Maximum NUMA nodes for gauntlet filtering. |
