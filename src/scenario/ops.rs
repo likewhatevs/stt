@@ -1138,13 +1138,54 @@ impl CpusetSpec {
 // Step executor
 // ---------------------------------------------------------------------------
 
-/// State tracked across step execution.
-struct StepState<'a> {
-    /// RAII cgroup guard — removes cgroups on drop.
+/// Persistent scenario-wide state owned by
+/// [`execute_scenario_with`]. Lives for the entire step sequence;
+/// cgroups, workload handles, and payload handles declared by the
+/// [`Backdrop`](super::backdrop::Backdrop) go here and only tear
+/// down at scenario end (success or Err).
+///
+/// `StepState` is the step-local counterpart — created fresh per
+/// step, torn down at step boundary. The two together form the
+/// execution state passed through `apply_setup` / `apply_ops` /
+/// `collect_result`; name lookups resolve step-local first, then
+/// fall through to backdrop so a step's ops can reference
+/// persistent cgroups by name.
+struct BackdropState<'a> {
+    /// RAII cgroup guard for persistent cgroups — removes them on drop.
     cgroups: CgroupGroup<'a>,
-    /// Active workload handles keyed by cgroup name.
+    /// Active workload handles in persistent cgroups, keyed by cgroup name.
     handles: Vec<(String, WorkloadHandle)>,
-    /// Resolved cpusets per cgroup name, for isolation checks.
+    /// Resolved cpusets per persistent cgroup name.
+    cpusets: std::collections::HashMap<String, BTreeSet<usize>>,
+    /// Active payload-binary handles owned by the backdrop. Drained
+    /// via `.kill()` at scenario teardown so the metric-emission
+    /// pipeline still fires.
+    payload_handles: Vec<PayloadEntry>,
+}
+
+impl<'a> BackdropState<'a> {
+    /// Empty backdrop state (no persistent entities), scoped to `ctx.cgroups`.
+    fn empty(ctx: &'a Ctx) -> Self {
+        Self {
+            cgroups: CgroupGroup::new(ctx.cgroups),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        }
+    }
+}
+
+/// Step-local execution state. Fresh per step, torn down at step
+/// boundary: cgroups removed (via RAII drop), workload handles
+/// collected, payload handles killed with metric emission. Any ops
+/// in the step that reference a cgroup name look here first before
+/// falling through to [`BackdropState`].
+struct StepState<'a> {
+    /// RAII cgroup guard — removes step-local cgroups on drop.
+    cgroups: CgroupGroup<'a>,
+    /// Active workload handles keyed by step-local cgroup name.
+    handles: Vec<(String, WorkloadHandle)>,
+    /// Resolved cpusets per step-local cgroup name, for isolation checks.
     cpusets: std::collections::HashMap<String, BTreeSet<usize>>,
     /// Active payload-binary handles keyed by cgroup name. Each entry
     /// came from either a [`CgroupDef::workload`] spawn in
@@ -1154,6 +1195,254 @@ struct StepState<'a> {
     /// are killed during step-teardown / cgroup removal so cgroupfs
     /// cleanup never trips EBUSY on a live process.
     payload_handles: Vec<PayloadEntry>,
+}
+
+impl<'a> StepState<'a> {
+    /// Empty step state scoped to `ctx.cgroups`.
+    fn empty(ctx: &'a Ctx) -> Self {
+        Self {
+            cgroups: CgroupGroup::new(ctx.cgroups),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        }
+    }
+}
+
+/// Combined mutable view over step-local and backdrop state.
+///
+/// Every function that touches execution state (apply_setup,
+/// apply_ops, collect_result, the drain helpers) receives a
+/// `ScenarioState`; lookups prefer step-local, falling through to
+/// backdrop. New state created via ops/setup inside a step writes
+/// to step-local by default — that is the primary mechanism
+/// enforcing per-step bounded lifetime. Setup for the Backdrop
+/// itself (run once before the step loop) writes straight to the
+/// backdrop side via [`ScenarioState::with_target_backdrop`].
+struct ScenarioState<'a, 'b> {
+    step: &'b mut StepState<'a>,
+    backdrop: &'b mut BackdropState<'a>,
+    /// When true, all mutations route to [`Self::backdrop`] instead
+    /// of [`Self::step`]. Set by [`Self::with_target_backdrop`] when
+    /// running the Backdrop's initial `apply_setup` / `apply_ops`
+    /// before the first step.
+    write_to_backdrop: bool,
+}
+
+impl<'a, 'b> ScenarioState<'a, 'b> {
+    fn new(step: &'b mut StepState<'a>, backdrop: &'b mut BackdropState<'a>) -> Self {
+        Self {
+            step,
+            backdrop,
+            write_to_backdrop: false,
+        }
+    }
+
+    /// Run `f` with writes routed to the backdrop side.
+    fn with_target_backdrop<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.write_to_backdrop;
+        self.write_to_backdrop = true;
+        let r = f(self);
+        self.write_to_backdrop = prev;
+        r
+    }
+
+    /// `cgroups` group that receives newly-created cgroups. Step-local
+    /// by default; backdrop when [`Self::with_target_backdrop`] is active.
+    fn target_cgroups(&mut self) -> &mut CgroupGroup<'a> {
+        if self.write_to_backdrop {
+            &mut self.backdrop.cgroups
+        } else {
+            &mut self.step.cgroups
+        }
+    }
+
+    /// `handles` vec that receives newly-spawned workload handles.
+    fn target_handles(&mut self) -> &mut Vec<(String, WorkloadHandle)> {
+        if self.write_to_backdrop {
+            &mut self.backdrop.handles
+        } else {
+            &mut self.step.handles
+        }
+    }
+
+    /// `cpusets` map that receives resolved cpusets for new cgroups.
+    fn target_cpusets(&mut self) -> &mut std::collections::HashMap<String, BTreeSet<usize>> {
+        if self.write_to_backdrop {
+            &mut self.backdrop.cpusets
+        } else {
+            &mut self.step.cpusets
+        }
+    }
+
+    /// `payload_handles` vec that receives newly-spawned payload handles.
+    fn target_payload_handles(&mut self) -> &mut Vec<PayloadEntry> {
+        if self.write_to_backdrop {
+            &mut self.backdrop.payload_handles
+        } else {
+            &mut self.step.payload_handles
+        }
+    }
+
+    /// Resolved cpuset for a cgroup name, looked up step-first then backdrop.
+    fn lookup_cpuset(&self, name: &str) -> Option<&BTreeSet<usize>> {
+        self.step
+            .cpusets
+            .get(name)
+            .or_else(|| self.backdrop.cpusets.get(name))
+    }
+
+    /// True when a payload with the given name is live in either
+    /// step-local or backdrop state. Used for the `Op::RunPayload`
+    /// duplicate-name guard.
+    fn find_live_payload(&self, payload_name: &str) -> Option<&PayloadEntry> {
+        self.step
+            .payload_handles
+            .iter()
+            .find(|e| e.handle.payload_name() == payload_name)
+            .or_else(|| {
+                self.backdrop
+                    .payload_handles
+                    .iter()
+                    .find(|e| e.handle.payload_name() == payload_name)
+            })
+    }
+
+    /// Drop a payload handle by name. Checks step-local first, then
+    /// backdrop. Returns the removed entry; `None` when no match.
+    fn take_payload_by_name(&mut self, name: &str) -> Option<PayloadEntry> {
+        if let Some(idx) = self
+            .step
+            .payload_handles
+            .iter()
+            .position(|e| e.handle.payload_name() == name)
+        {
+            return Some(self.step.payload_handles.swap_remove(idx));
+        }
+        if let Some(idx) = self
+            .backdrop
+            .payload_handles
+            .iter()
+            .position(|e| e.handle.payload_name() == name)
+        {
+            return Some(self.backdrop.payload_handles.swap_remove(idx));
+        }
+        None
+    }
+
+    /// Drain every live payload handle in step + backdrop state by
+    /// calling `.kill()` so the metric-emission pipeline fires. Used
+    /// on error paths in the step loop so mid-scenario failure still
+    /// leaves a usable sidecar.
+    fn drain_all_payloads(&mut self) {
+        drain_all_payload_handles(&mut self.step.payload_handles);
+        drain_all_payload_handles(&mut self.backdrop.payload_handles);
+    }
+
+    /// Kill every payload handle (step-first, then backdrop) whose
+    /// cgroup matches `cgroup`. Called before a cgroup removal so
+    /// cgroupfs cleanup does not trip EBUSY on a live process.
+    fn drain_payloads_for_cgroup(&mut self, cgroup: &str) {
+        drain_payload_handles_for_cgroup(&mut self.step.payload_handles, cgroup);
+        drain_payload_handles_for_cgroup(&mut self.backdrop.payload_handles, cgroup);
+    }
+
+    /// Remove every workload handle whose key matches `cgroup`. The
+    /// handles themselves drop (which SIGKILLs the workers) — this is
+    /// appropriate for `Op::StopCgroup` and `Op::RemoveCgroup`.
+    fn drop_handles_for_cgroup(&mut self, cgroup: &str) {
+        self.step.handles.retain(|(n, _)| n.as_str() != cgroup);
+        self.backdrop.handles.retain(|(n, _)| n.as_str() != cgroup);
+    }
+
+    /// Forget a tracked cpuset (step-first, then backdrop) for a cgroup.
+    fn forget_cpuset(&mut self, cgroup: &str) {
+        self.step.cpusets.remove(cgroup);
+        self.backdrop.cpusets.remove(cgroup);
+    }
+
+    /// Record / overwrite the resolved cpuset for a cgroup. If the
+    /// cgroup is known to step-local state, the step-local entry
+    /// updates; if it's known to backdrop, the backdrop entry
+    /// updates; otherwise the entry goes into the currently-active
+    /// target (step-local, or backdrop inside `with_target_backdrop`).
+    fn record_cpuset(&mut self, cgroup: &str, cpuset: BTreeSet<usize>) {
+        if self.step.cpusets.contains_key(cgroup) {
+            self.step.cpusets.insert(cgroup.to_string(), cpuset);
+        } else if self.backdrop.cpusets.contains_key(cgroup) {
+            self.backdrop.cpusets.insert(cgroup.to_string(), cpuset);
+        } else {
+            self.target_cpusets().insert(cgroup.to_string(), cpuset);
+        }
+    }
+
+    /// Re-key every workload handle from `from` to `to`. When `to`
+    /// names a Backdrop-owned cgroup, step-local handles are also
+    /// transferred into [`Self::backdrop`] so their lifetime extends
+    /// to scenario end instead of dying at step teardown. Backdrop
+    /// handles stay in the backdrop slot regardless of `to`.
+    ///
+    /// Called by `Op::MoveAllTasks` after the kernel-side
+    /// `cgroup.procs` writes succeed so subsequent ops that address
+    /// the moved workers by cgroup name find them under the new key
+    /// and in the correct state slot.
+    fn rename_handles(&mut self, from: &str, to: &str) {
+        let to_is_backdrop = self.cgroup_name_is_backdrop(to);
+        if to_is_backdrop {
+            // Move step-local handles keyed under `from` into the
+            // backdrop slot, re-keyed to `to`. Iterate in reverse so
+            // swap_remove indices stay stable.
+            let mut i = self.step.handles.len();
+            while i > 0 {
+                i -= 1;
+                if self.step.handles[i].0.as_str() == from {
+                    let (_, handle) = self.step.handles.swap_remove(i);
+                    self.backdrop.handles.push((to.to_string(), handle));
+                }
+            }
+        } else {
+            // Step-local destination: keep ownership, just rename.
+            for (name, _) in &mut self.step.handles {
+                if name.as_str() == from {
+                    *name = to.to_string();
+                }
+            }
+        }
+        // Backdrop handles are never demoted to step-local ownership
+        // regardless of destination — a backdrop worker is declared
+        // persistent and stays persistent for the scenario. Rename
+        // in place so subsequent ops still find it under the new key.
+        for (name, _) in &mut self.backdrop.handles {
+            if name.as_str() == from {
+                *name = to.to_string();
+            }
+        }
+    }
+
+    /// Iterate every live workload handle across step + backdrop.
+    /// Used by `Op::MoveAllTasks` / `Op::SetAffinity` which act on
+    /// whichever cgroup owns the handle without caring about which
+    /// state slot it's in.
+    fn all_handles(&self) -> impl Iterator<Item = &(String, WorkloadHandle)> {
+        self.step.handles.iter().chain(self.backdrop.handles.iter())
+    }
+
+    /// True iff a cgroup with the given name is already tracked by
+    /// either step-local or backdrop state. Used to reject duplicate
+    /// names at `apply_setup` time so a user can't accidentally
+    /// shadow a Backdrop cgroup with a step-local `CgroupDef`.
+    fn cgroup_name_is_tracked(&self, name: &str) -> bool {
+        self.step.cgroups.names().iter().any(|n| n == name)
+            || self.backdrop.cgroups.names().iter().any(|n| n == name)
+    }
+
+    /// True iff a cgroup with the given name is tracked by backdrop
+    /// (persistent) state. Used by `Op::RemoveCgroup` to reject a
+    /// step-local op that would remove a Backdrop-owned cgroup out
+    /// from under later Steps.
+    fn cgroup_name_is_backdrop(&self, name: &str) -> bool {
+        self.backdrop.cgroups.names().iter().any(|n| n == name)
+    }
 }
 
 /// Whether a live payload handle was spawned by an explicit
@@ -1216,19 +1505,10 @@ pub fn execute_steps(ctx: &Ctx, steps: Vec<Step>) -> Result<AssertResult> {
 /// The Backdrop declares persistent scenario-wide state
 /// (long-running payloads, cgroups referenced by many Steps) while
 /// Steps express bounded per-phase behavior. The runtime sets up
-/// the Backdrop before the first Step, runs the Step sequence, and
-/// tears the Backdrop down at the end.
-///
-/// # Stage 1 note
-///
-/// Step/Backdrop is introduced alongside the existing
-/// [`execute_steps`] / [`execute_steps_with`] wrappers. Step
-/// effects still carry across steps under the current runtime —
-/// per-step auto-cleanup (the full promise of the split) lands in
-/// subsequent stages. Callers that move persistent entities into a
-/// [`Backdrop`](super::backdrop::Backdrop) and switch to
-/// `execute_scenario` today get a forward-compatible shape that
-/// stays correct when the per-step cleanup lands.
+/// the Backdrop before the first Step, runs the Step sequence
+/// with per-Step teardown (cgroups removed, workload handles
+/// collected, payload handles killed at step boundary), and tears
+/// the Backdrop down at the end.
 pub fn execute_scenario(
     ctx: &Ctx,
     backdrop: super::backdrop::Backdrop,
@@ -1243,51 +1523,32 @@ pub fn execute_scenario(
 pub fn execute_scenario_with(
     ctx: &Ctx,
     backdrop: super::backdrop::Backdrop,
-    mut steps: Vec<Step>,
+    steps: Vec<Step>,
     checks: Option<&crate::assert::Assert>,
 ) -> Result<AssertResult> {
-    // Stage 1 semantics (no runtime split yet): fold Backdrop
-    // contents into the Step sequence so the existing runtime sees
-    // an equivalent layout. Persistent cgroups merge into the first
-    // Step's setup (they still outlive every Step because the
-    // current runtime carries StepState across the whole sequence).
-    // Persistent payloads fold into a leading Step whose only op is
-    // `Op::RunPayload` for each entry; the handles live in the
-    // shared StepState and drain at final teardown.
-    if !backdrop.cgroups.is_empty() {
-        match steps.first_mut() {
-            Some(first) => {
-                let mut merged = backdrop.cgroups.clone();
-                if let Setup::Defs(ref existing) = first.setup {
-                    merged.extend(existing.iter().cloned());
-                }
-                first.setup = Setup::Defs(merged);
-            }
-            None => {
-                steps.push(Step::with_defs(backdrop.cgroups.clone(), HoldSpec::FULL));
-            }
-        }
-    }
-    if !backdrop.payloads.is_empty() {
-        let run_ops: Vec<Op> = backdrop
-            .payloads
-            .iter()
-            .map(|p| Op::run_payload(p, Vec::<String>::new()))
-            .collect();
-        let prelude = Step::new(
-            run_ops,
-            HoldSpec::Fixed(std::time::Duration::from_millis(1)),
-        );
-        steps.insert(0, prelude);
-    }
-    execute_steps_with(ctx, steps, checks)
+    run_scenario(ctx, backdrop, steps, checks)
 }
 
 /// Execute steps with an explicit [`Assert`](crate::assert::Assert) for
 /// worker checks. When `checks` is `Some`, it overrides `ctx.assert`.
 /// When `None`, uses `ctx.assert` (the merged three-layer config).
+///
+/// Thin wrapper around [`execute_scenario_with`] with an empty
+/// [`Backdrop`](super::backdrop::Backdrop) — every Step's effects
+/// (cgroups, workloads, payloads) tear down at the step boundary.
 pub fn execute_steps_with(
     ctx: &Ctx,
+    steps: Vec<Step>,
+    checks: Option<&crate::assert::Assert>,
+) -> Result<AssertResult> {
+    execute_scenario_with(ctx, super::backdrop::Backdrop::EMPTY, steps, checks)
+}
+
+/// Internal driver: runs Backdrop setup, the Step loop with
+/// per-Step teardown, and final Backdrop teardown.
+fn run_scenario(
+    ctx: &Ctx,
+    backdrop: super::backdrop::Backdrop,
     steps: Vec<Step>,
     checks: Option<&crate::assert::Assert>,
 ) -> Result<AssertResult> {
@@ -1299,13 +1560,27 @@ pub fn execute_steps_with(
             anyhow::bail!("step {i} hold validation: {reason}");
         }
     }
+    // Validate Backdrop payloads before creating any runtime state.
+    // Only binary payloads can be spawned by Op::RunPayload, which
+    // is what the Backdrop setup uses under the hood. Reject
+    // scheduler-kind payloads here so the failure surface is the
+    // Backdrop declaration, not a mid-scenario spawn error after
+    // cgroups have already been created.
+    for p in &backdrop.payloads {
+        if p.is_scheduler() {
+            anyhow::bail!(
+                "Backdrop::with_payload received scheduler-kind Payload '{}' — \
+                 only PayloadKind::Binary payloads run in the Backdrop; \
+                 place scheduler-kind payloads on the #[ktstr_test(scheduler = ...)] \
+                 attribute instead",
+                p.name,
+            );
+        }
+    }
     let effective_checks = checks.unwrap_or(&ctx.assert);
-    let mut state = StepState {
-        cgroups: CgroupGroup::new(ctx.cgroups),
-        handles: Vec::new(),
-        cpusets: std::collections::HashMap::new(),
-        payload_handles: Vec::new(),
-    };
+
+    let mut backdrop_state = BackdropState::empty(ctx);
+    let mut result = AssertResult::pass();
 
     // Open SHM once for the entire step sequence. No-op outside a VM.
     let shm = ShmWriter::try_open();
@@ -1333,10 +1608,56 @@ pub fn execute_steps_with(
         }
     }
 
+    // --- Backdrop setup (persistent) ---
+    // Run before the first Step. Cgroups + payloads declared on
+    // `backdrop` land in `backdrop_state` so they survive every
+    // Step's teardown. On error, drain Backdrop payload handles
+    // (metric emission) and propagate.
+    if !backdrop.is_empty() {
+        let mut step_staging = StepState::empty(ctx);
+        let mut scratch = ScenarioState::new(&mut step_staging, &mut backdrop_state);
+        let setup_res = scratch.with_target_backdrop(|s| {
+            // Payloads: one Op::RunPayload per entry, in order.
+            if !backdrop.payloads.is_empty() {
+                let ops: Vec<Op> = backdrop
+                    .payloads
+                    .iter()
+                    .map(|p| Op::run_payload(p, Vec::<String>::new()))
+                    .collect();
+                apply_ops(ctx, s, &ops)?;
+            }
+            // Cgroups: a single apply_setup pass.
+            if !backdrop.cgroups.is_empty() {
+                apply_setup(ctx, s, &backdrop.cgroups)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        if let Err(err) = setup_res {
+            drain_all_payload_handles(&mut step_staging.payload_handles);
+            drain_all_payload_handles(&mut backdrop_state.payload_handles);
+            // step_staging's CgroupGroup RAII drops here too,
+            // removing any cgroups the failed Backdrop setup
+            // happened to route into step-local state.
+            return Err(err);
+        }
+        // `step_staging` should not have accumulated anything
+        // because `with_target_backdrop` routed every target writer
+        // to the backdrop side. Collect any stray handles defensively
+        // before dropping so a future refactor that leaks a non-
+        // backdrop write here surfaces as a missed teardown rather
+        // than silently discarded state.
+        drain_all_payload_handles(&mut step_staging.payload_handles);
+    }
+
+    // --- Step loop with per-Step teardown ---
     for (step_idx, step) in steps.iter().enumerate() {
         // Check scheduler liveness between steps (skip before first).
         if step_idx > 0 && !process_alive(ctx.sched_pid) {
-            let mut r = collect_result(&mut state, effective_checks, ctx.topo);
+            // Collect backdrop-owned workload handles into the
+            // result before reporting the crash so whatever the
+            // persistent workers produced is still assertable.
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Monitor,
@@ -1350,66 +1671,34 @@ pub fn execute_steps_with(
             return Ok(r);
         }
 
-        // Any `?` out of apply_ops / apply_setup would bypass
-        // `collect_result` and leave payload_handles to be SIGKILLed
-        // by `PayloadHandle::drop` — which skips the metric-emission
-        // pipeline. `drain_on_err!` routes the Err through
-        // `drain_all_payload_handles` (which uses `.kill()` internally
-        // and therefore DOES emit metrics) before propagating, so a
-        // mid-scenario spawn failure still leaves a usable sidecar.
-        macro_rules! drain_on_err {
-            ($e:expr) => {
-                match $e {
-                    Ok(v) => v,
-                    Err(err) => {
-                        drain_all_payload_handles(&mut state.payload_handles);
-                        return Err(err);
-                    }
-                }
-            };
-        }
+        let mut step_state = StepState::empty(ctx);
+        let step_res = run_step(
+            ctx,
+            step,
+            step_idx,
+            &mut step_state,
+            &mut backdrop_state,
+            shm.as_ref(),
+            scenario_start,
+            effective_checks,
+        );
 
-        match &step.hold {
-            HoldSpec::Loop { interval } => {
-                // Setup runs once before the loop.
-                if !step.setup.is_empty() {
-                    let defs = step.setup.resolve(ctx);
-                    drain_on_err!(apply_setup(ctx, &mut state, &defs));
-                }
-                // Loop mode: apply ops repeatedly at interval until
-                // the remaining scenario time is exhausted.
-                let deadline = scenario_start + ctx.duration;
-                while std::time::Instant::now() < deadline {
-                    drain_on_err!(apply_ops(ctx, &mut state, &step.ops));
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    thread::sleep(remaining.min(*interval));
-                }
-            }
-            _ => {
-                // Ops first (e.g. parent cgroup creation), then
-                // CgroupDef setup (children with workers).
-                drain_on_err!(apply_ops(ctx, &mut state, &step.ops));
-                if !step.setup.is_empty() {
-                    let defs = step.setup.resolve(ctx);
-                    drain_on_err!(apply_setup(ctx, &mut state, &defs));
-                }
+        // Per-Step teardown ALWAYS runs — on success and on error.
+        // This is the core of the "Step is fully bounded" invariant:
+        // cgroups created this step go away, workload handles are
+        // collected into the result, payload handles are killed
+        // with metric emission. Backdrop state is untouched.
+        let step_result = collect_step(&mut step_state, effective_checks, ctx.topo);
+        result.merge(step_result);
 
-                // Write stimulus event after applying ops.
-                if let Some(ref w) = shm {
-                    let payload = build_stimulus(&scenario_start, step_idx, &step.ops, &state);
-                    w.write(
-                        shm_ring::MSG_TYPE_STIMULUS,
-                        zerocopy::IntoBytes::as_bytes(&payload),
-                    );
-                }
-
-                let hold_dur = match &step.hold {
-                    HoldSpec::Frac(f) => Duration::from_secs_f64(ctx.duration.as_secs_f64() * f),
-                    HoldSpec::Fixed(d) => *d,
-                    HoldSpec::Loop { .. } => unreachable!(),
-                };
-                thread::sleep(hold_dur);
-            }
+        // Propagate a step-level error after teardown has run so
+        // every step boundary leaves clean state behind even on
+        // failure.
+        if let Err(err) = step_res {
+            // The Backdrop's payload handles still need `.kill()`
+            // so their metrics emit on the error path.
+            drain_all_payload_handles(&mut backdrop_state.payload_handles);
+            return Err(err);
         }
     }
 
@@ -1422,7 +1711,9 @@ pub fn execute_steps_with(
     // Final liveness check.
     let sched_dead = !process_alive(ctx.sched_pid);
 
-    let mut result = collect_result(&mut state, effective_checks, ctx.topo);
+    // --- Backdrop teardown ---
+    let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+    result.merge(backdrop_result);
 
     if sched_dead {
         result.passed = false;
@@ -1439,12 +1730,92 @@ pub fn execute_steps_with(
     Ok(result)
 }
 
-/// Build a StimulusPayload from the current step state.
+/// Run a single step's setup + ops + hold against step-local state.
+///
+/// On error, the caller is expected to invoke `collect_step` for
+/// per-step teardown (which runs regardless) and then propagate.
+#[allow(clippy::too_many_arguments)]
+fn run_step<'a>(
+    ctx: &Ctx,
+    step: &Step,
+    step_idx: usize,
+    step_state: &mut StepState<'a>,
+    backdrop_state: &mut BackdropState<'a>,
+    shm: Option<&ShmWriter>,
+    scenario_start: std::time::Instant,
+    _effective_checks: &crate::assert::Assert,
+) -> Result<()> {
+    let mut scenario = ScenarioState::new(step_state, backdrop_state);
+
+    // Any `?` out of apply_ops / apply_setup would bypass the
+    // per-step teardown ordering; `drain_on_err!` kills payload
+    // handles across step + backdrop (metric-emitting) before
+    // propagating so a mid-scenario spawn failure still leaves a
+    // usable sidecar.
+    macro_rules! drain_on_err {
+        ($scenario:expr, $e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(err) => {
+                    $scenario.drain_all_payloads();
+                    return Err(err);
+                }
+            }
+        };
+    }
+
+    match &step.hold {
+        HoldSpec::Loop { interval } => {
+            // Setup runs once before the loop.
+            if !step.setup.is_empty() {
+                let defs = step.setup.resolve(ctx);
+                drain_on_err!(scenario, apply_setup(ctx, &mut scenario, &defs));
+            }
+            // Loop mode: apply ops repeatedly at interval until
+            // the remaining scenario time is exhausted.
+            let deadline = scenario_start + ctx.duration;
+            while std::time::Instant::now() < deadline {
+                drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                thread::sleep(remaining.min(*interval));
+            }
+        }
+        _ => {
+            // Ops first (e.g. parent cgroup creation), then
+            // CgroupDef setup (children with workers).
+            drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
+            if !step.setup.is_empty() {
+                let defs = step.setup.resolve(ctx);
+                drain_on_err!(scenario, apply_setup(ctx, &mut scenario, &defs));
+            }
+
+            // Write stimulus event after applying ops.
+            if let Some(w) = shm {
+                let payload = build_stimulus(&scenario_start, step_idx, &step.ops, &scenario);
+                w.write(
+                    shm_ring::MSG_TYPE_STIMULUS,
+                    zerocopy::IntoBytes::as_bytes(&payload),
+                );
+            }
+
+            let hold_dur = match &step.hold {
+                HoldSpec::Frac(f) => Duration::from_secs_f64(ctx.duration.as_secs_f64() * f),
+                HoldSpec::Fixed(d) => *d,
+                HoldSpec::Loop { .. } => unreachable!(),
+            };
+            thread::sleep(hold_dur);
+        }
+    }
+
+    Ok(())
+}
+
+/// Build a StimulusPayload from the current scenario state (step + backdrop).
 fn build_stimulus(
     scenario_start: &std::time::Instant,
     step_idx: usize,
     ops: &[Op],
-    state: &StepState<'_>,
+    state: &ScenarioState<'_, '_>,
 ) -> StimulusPayload {
     let mut op_kinds: u32 = 0;
     for op in ops {
@@ -1452,18 +1823,20 @@ fn build_stimulus(
     }
 
     let total_iterations: u64 = state
-        .handles
-        .iter()
+        .all_handles()
         .flat_map(|(_, h)| h.snapshot_iterations())
         .sum();
+
+    let cgroup_count = state.step.cgroups.names().len() + state.backdrop.cgroups.names().len();
+    let worker_count = state.step.handles.len() + state.backdrop.handles.len();
 
     StimulusPayload {
         elapsed_ms: scenario_start.elapsed().as_millis() as u32,
         step_index: step_idx as u16,
         op_count: ops.len() as u16,
         op_kinds,
-        cgroup_count: state.cgroups.names().len() as u16,
-        worker_count: state.handles.len() as u16,
+        cgroup_count: cgroup_count as u16,
+        worker_count: worker_count as u16,
         total_iterations,
     }
 }
@@ -1508,10 +1881,22 @@ fn validate_mempolicy_cpuset(
 ///
 /// When `works` is empty, a single default Work is used (CpuSpin, Normal,
 /// ctx.workers_per_cgroup workers).
-fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Result<()> {
+///
+/// Cgroups created here route into step-local or backdrop state per
+/// `state.write_to_backdrop`. A duplicate name (already tracked by
+/// either state) bails — a `CgroupDef` must not silently shadow a
+/// cgroup that another state slot has already created.
+fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef]) -> Result<()> {
     let default_work = [Work::default()];
     for def in defs {
-        state.cgroups.add_cgroup_no_cpuset(&def.name)?;
+        if state.cgroup_name_is_tracked(&def.name) {
+            anyhow::bail!(
+                "cgroup '{}' is already tracked (by a prior Backdrop or step-local CgroupDef) — \
+                 declare it in exactly one place; use a fresh name for the step-local cgroup",
+                def.name,
+            );
+        }
+        state.target_cgroups().add_cgroup_no_cpuset(&def.name)?;
         if let Some(ref cpuset_spec) = def.cpuset {
             if let Err(reason) = cpuset_spec.validate(ctx) {
                 anyhow::bail!(
@@ -1522,7 +1907,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             }
             let resolved = cpuset_spec.resolve(ctx);
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
-            state.cpusets.insert(def.name.to_string(), resolved);
+            state.record_cpuset(&def.name, resolved);
         }
         let effective_works: &[Work] = if def.works.is_empty() {
             &default_work
@@ -1534,8 +1919,10 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
                 anyhow::bail!("cgroup '{}': {}", def.name, reason);
             }
         }
-        let cgroup_cpuset = state.cpusets.get(def.name.as_ref());
-        if let Some(resolved) = cgroup_cpuset {
+        // Clone the cpuset out so we don't keep a borrow into
+        // `state` across the mutable spawn calls below.
+        let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(&def.name).cloned();
+        if let Some(ref resolved) = cgroup_cpuset {
             for work in effective_works {
                 validate_mempolicy_cpuset(&work.mem_policy, resolved, ctx, &def.name)?;
             }
@@ -1548,8 +1935,11 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
                 def.swappable,
                 n,
             );
-            let affinity =
-                super::resolve_affinity_for_cgroup(&work.affinity, cgroup_cpuset, ctx.topo);
+            let affinity = super::resolve_affinity_for_cgroup(
+                &work.affinity,
+                cgroup_cpuset.as_ref(),
+                ctx.topo,
+            );
             let wl = WorkloadConfig {
                 num_workers: n,
                 affinity,
@@ -1561,7 +1951,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             let mut h = WorkloadHandle::spawn(&wl)?;
             ctx.cgroups.move_tasks(&def.name, &h.tids())?;
             h.start();
-            state.handles.push((def.name.to_string(), h));
+            state.target_handles().push((def.name.to_string(), h));
         }
         // After synthetic workers are in place, spawn the optional
         // userspace payload inside the same cgroup. The payload runs
@@ -1582,7 +1972,7 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
                         e,
                     )
                 })?;
-            state.payload_handles.push(PayloadEntry {
+            state.target_payload_handles().push(PayloadEntry {
                 cgroup: def.name.to_string(),
                 source: PayloadSource::CgroupDefWorkload,
                 handle,
@@ -1593,20 +1983,50 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
 }
 
 /// Apply a slice of Ops to the running state.
-fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
+///
+/// Ops that create new entities (`AddCgroup`, `Spawn`, `SpawnHost`,
+/// `RunPayload`) route into step-local state by default, or into
+/// backdrop when the Backdrop's initial setup phase is active.
+/// Ops that read or mutate existing entities (`SetCpuset`,
+/// `ClearCpuset`, `SwapCpusets`, `SetAffinity`, `MoveAllTasks`,
+/// `RemoveCgroup`, `StopCgroup`, `WaitPayload`, `KillPayload`)
+/// resolve the target name against step-local first, then backdrop
+/// — so a Step's ops can reach into Backdrop-declared cgroups by
+/// name without the Backdrop leaking implementation details.
+fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result<()> {
     for op in ops {
         match op {
             Op::AddCgroup { name } => {
-                state.cgroups.add_cgroup_no_cpuset(name)?;
+                state.target_cgroups().add_cgroup_no_cpuset(name)?;
             }
             Op::RemoveCgroup { cgroup } => {
+                // A Step's ops must not remove a Backdrop-owned
+                // cgroup — later Steps expect the Backdrop's cgroups
+                // to survive every per-step teardown. Reject
+                // explicitly so a typo in the cgroup name does not
+                // silently dismantle a persistent cgroup and let
+                // subsequent Steps fail with confusing
+                // "cgroup missing" errors. Ops running during the
+                // Backdrop's own setup pass (`write_to_backdrop`)
+                // are exempt: the Backdrop is allowed to structure
+                // its own state however it needs before the Step
+                // loop starts.
+                if !state.write_to_backdrop && state.cgroup_name_is_backdrop(cgroup) {
+                    anyhow::bail!(
+                        "Op::RemoveCgroup targets Backdrop-owned cgroup '{}' — \
+                         Backdrop cgroups live for the full scenario and must \
+                         not be removed from a Step; drop the op or move the \
+                         cgroup declaration out of the Backdrop",
+                        cgroup,
+                    );
+                }
                 // Stop workers + payload binaries in this cgroup
                 // before the cgroupfs removal. A live process in the
                 // cgroup makes `rmdir` fail with EBUSY; kill the
                 // payload handles first so the cgroup frees up.
-                drain_payload_handles_for_cgroup(&mut state.payload_handles, cgroup);
-                state.handles.retain(|(n, _)| n.as_str() != *cgroup);
-                state.cpusets.remove(cgroup.as_ref());
+                state.drain_payloads_for_cgroup(cgroup);
+                state.drop_handles_for_cgroup(cgroup);
+                state.forget_cpuset(cgroup);
                 let _ = ctx.cgroups.remove_cgroup(cgroup);
             }
             Op::SetCpuset { cgroup, cpus } => {
@@ -1619,23 +2039,23 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 }
                 let resolved = cpus.resolve(ctx);
                 ctx.cgroups.set_cpuset(cgroup, &resolved)?;
-                state.cpusets.insert(cgroup.to_string(), resolved);
+                state.record_cpuset(cgroup, resolved);
             }
             Op::ClearCpuset { cgroup } => {
                 ctx.cgroups.clear_cpuset(cgroup)?;
-                state.cpusets.remove(cgroup.as_ref());
+                state.forget_cpuset(cgroup);
             }
             Op::SwapCpusets { a, b } => {
                 // Read current cpusets from the cgroup filesystem, swap them.
                 let cpus_a = read_cpuset(ctx, a);
                 let cpus_b = read_cpuset(ctx, b);
-                if let Some(ref ca) = cpus_a {
-                    ctx.cgroups.set_cpuset(b, ca)?;
-                    state.cpusets.insert(b.to_string(), ca.clone());
+                if let Some(ca) = cpus_a {
+                    ctx.cgroups.set_cpuset(b, &ca)?;
+                    state.record_cpuset(b, ca);
                 }
-                if let Some(ref cb) = cpus_b {
-                    ctx.cgroups.set_cpuset(a, cb)?;
-                    state.cpusets.insert(a.to_string(), cb.clone());
+                if let Some(cb) = cpus_b {
+                    ctx.cgroups.set_cpuset(a, &cb)?;
+                    state.record_cpuset(a, cb);
                 }
             }
             Op::Spawn { cgroup, work } => {
@@ -1643,12 +2063,15 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     anyhow::bail!("cgroup '{}': {}", cgroup, reason);
                 }
                 let n = super::resolve_num_workers(work, ctx.workers_per_cgroup, cgroup)?;
-                let cgroup_cpuset = state.cpusets.get(cgroup.as_ref());
-                if let Some(resolved) = cgroup_cpuset {
+                let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
+                if let Some(ref resolved) = cgroup_cpuset {
                     validate_mempolicy_cpuset(&work.mem_policy, resolved, ctx, cgroup)?;
                 }
-                let affinity =
-                    super::resolve_affinity_for_cgroup(&work.affinity, cgroup_cpuset, ctx.topo);
+                let affinity = super::resolve_affinity_for_cgroup(
+                    &work.affinity,
+                    cgroup_cpuset.as_ref(),
+                    ctx.topo,
+                );
                 let wl = WorkloadConfig {
                     num_workers: n,
                     affinity,
@@ -1660,17 +2083,17 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 let mut h = WorkloadHandle::spawn(&wl)?;
                 ctx.cgroups.move_tasks(cgroup, &h.tids())?;
                 h.start();
-                state.handles.push((cgroup.to_string(), h));
+                state.target_handles().push((cgroup.to_string(), h));
             }
             Op::StopCgroup { cgroup } => {
-                drain_payload_handles_for_cgroup(&mut state.payload_handles, cgroup);
-                state.handles.retain(|(n, _)| n.as_str() != *cgroup);
+                state.drain_payloads_for_cgroup(cgroup);
+                state.drop_handles_for_cgroup(cgroup);
             }
             Op::SetAffinity { cgroup, affinity } => {
-                let cgroup_cpuset = state.cpusets.get(cgroup.as_ref());
+                let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
                 let resolved =
-                    super::resolve_affinity_for_cgroup(affinity, cgroup_cpuset, ctx.topo);
-                for (name, handle) in &state.handles {
+                    super::resolve_affinity_for_cgroup(affinity, cgroup_cpuset.as_ref(), ctx.topo);
+                for (name, handle) in state.all_handles() {
                     if name.as_str() == *cgroup {
                         match &resolved {
                             crate::workload::AffinityMode::None => {}
@@ -1730,7 +2153,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 let mut h = WorkloadHandle::spawn(&wl)?;
                 h.start();
                 // Empty string key: workers in parent cgroup, not a managed cgroup.
-                state.handles.push((String::new(), h));
+                state.target_handles().push((String::new(), h));
             }
             Op::MoveAllTasks { from, to } => {
                 // Clear subtree_control on the destination before moving
@@ -1744,16 +2167,25 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                         "failed to clear subtree_control before task move"
                     );
                 }
-                for (name, handle) in state.handles.iter() {
+                // Perform the cgroup.procs writes for every handle
+                // currently keyed under `from` (step-local and backdrop).
+                for (name, handle) in state.all_handles() {
                     if name.as_str() == *from {
                         ctx.cgroups.move_tasks(to, &handle.tids())?;
                     }
                 }
-                for (name, _) in &mut state.handles {
-                    if name.as_str() == *from {
-                        *name = to.to_string();
-                    }
-                }
+                // Re-key handles under `to` and transfer ownership
+                // when required. A step-local handle whose `to`
+                // names a Backdrop cgroup moves into the backdrop
+                // slot so its lifetime extends with the destination
+                // cgroup — without the transfer, the step's
+                // teardown would SIGKILL the worker even though the
+                // user moved it into a persistent cgroup. Backdrop
+                // handles always stay in the backdrop slot
+                // regardless of `to`; "Backdrop is persistent" does
+                // not degrade to step-local ownership because a
+                // later MoveAllTasks targets a step-local cgroup.
+                state.rename_handles(from, to);
             }
             Op::RunPayload {
                 payload,
@@ -1767,11 +2199,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                         payload.name,
                     );
                 }
-                if let Some(existing) = state
-                    .payload_handles
-                    .iter()
-                    .find(|e| e.handle.payload_name() == payload.name)
-                {
+                if let Some(existing) = state.find_live_payload(payload.name) {
                     // Name the surface that spawned the live handle
                     // so the user can find the original site without
                     // guessing. `CgroupDef::workload` fires at
@@ -1804,24 +2232,19 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                         render_cgroup_key(&cgroup_key),
                     )
                 })?;
-                state.payload_handles.push(PayloadEntry {
+                state.target_payload_handles().push(PayloadEntry {
                     cgroup: cgroup_key,
                     source: PayloadSource::OpRunPayload,
                     handle,
                 });
             }
             Op::WaitPayload { name } => {
-                let idx = state
-                    .payload_handles
-                    .iter()
-                    .position(|e| e.handle.payload_name() == name.as_ref())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Op::WaitPayload: no running payload named '{name}' \
-                             (spawn it via Op::RunPayload or CgroupDef::workload before waiting)",
-                        )
-                    })?;
-                let entry = state.payload_handles.swap_remove(idx);
+                let entry = state.take_payload_by_name(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Op::WaitPayload: no running payload named '{name}' \
+                         (spawn it via Op::RunPayload or CgroupDef::workload before waiting)",
+                    )
+                })?;
                 // Check verdicts + metrics are recorded to the sidecar
                 // via the SHM ring inside `handle.wait()`; the returned
                 // tuple is discarded here because step-ops surface per-
@@ -1832,17 +2255,12 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
             }
             Op::KillPayload { name } => {
-                let idx = state
-                    .payload_handles
-                    .iter()
-                    .position(|e| e.handle.payload_name() == name.as_ref())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Op::KillPayload: no running payload named '{name}' \
-                             (spawn it via Op::RunPayload or CgroupDef::workload before killing)",
-                        )
-                    })?;
-                let entry = state.payload_handles.swap_remove(idx);
+                let entry = state.take_payload_by_name(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Op::KillPayload: no running payload named '{name}' \
+                         (spawn it via Op::RunPayload or CgroupDef::workload before killing)",
+                    )
+                })?;
                 let _result = entry
                     .handle
                     .kill()
@@ -1867,25 +2285,48 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
     Some(cpus)
 }
 
-/// Collect all worker results and produce an AssertResult.
+/// Collect step-local worker results and produce an AssertResult.
 ///
-/// Drains handles from state and delegates to [`collect_handles`](super::collect_handles),
-/// passing each cgroup's tracked cpuset for isolation checks.
-fn collect_result(
-    state: &mut StepState<'_>,
+/// Drains step-local handles + payload handles; backdrop state is
+/// untouched. Called at every step boundary (success AND error
+/// paths) as the "Step is fully bounded" teardown. The
+/// `step_state.cgroups` RAII guard drops the step-local cgroups
+/// immediately after this returns.
+fn collect_step(
+    step_state: &mut StepState<'_>,
     checks: &crate::assert::Assert,
     topo: &crate::topology::TestTopology,
 ) -> AssertResult {
-    // Kill any CgroupDef::workload payload binaries still live at
-    // teardown so cgroupfs cleanup does not trip EBUSY. Metrics are
-    // still emitted to the SHM ring by PayloadHandle::kill via the
-    // `evaluate()` pipeline wired in #18.
-    drain_all_payload_handles(&mut state.payload_handles);
-    let handles = std::mem::take(&mut state.handles);
+    // Kill any CgroupDef::workload / Op::RunPayload payload binaries
+    // still live at step teardown so cgroupfs cleanup does not trip
+    // EBUSY. Metrics are emitted to the SHM ring by PayloadHandle::kill
+    // via the `evaluate()` pipeline wired in #18.
+    drain_all_payload_handles(&mut step_state.payload_handles);
+    let handles = std::mem::take(&mut step_state.handles);
     super::collect_handles(
         handles
             .into_iter()
-            .map(|(name, h)| (h, state.cpusets.get(&name))),
+            .map(|(name, h)| (h, step_state.cpusets.get(&name))),
+        checks,
+        Some(topo),
+    )
+}
+
+/// Collect backdrop (persistent) worker results. Called once at
+/// scenario end after every Step has torn down. The
+/// `backdrop_state.cgroups` RAII guard drops persistent cgroups
+/// when `backdrop_state` itself drops.
+fn collect_backdrop(
+    backdrop_state: &mut BackdropState<'_>,
+    checks: &crate::assert::Assert,
+    topo: &crate::topology::TestTopology,
+) -> AssertResult {
+    drain_all_payload_handles(&mut backdrop_state.payload_handles);
+    let handles = std::mem::take(&mut backdrop_state.handles);
+    super::collect_handles(
+        handles
+            .into_iter()
+            .map(|(name, h)| (h, backdrop_state.cpusets.get(&name))),
         checks,
         Some(topo),
     )
@@ -3507,6 +3948,28 @@ mod tests {
         drain_all_payload_handles(&mut state.payload_handles);
     }
 
+    /// Test helper: call `apply_setup` against a step-local-only
+    /// [`ScenarioState`]. Constructs a throwaway backdrop state
+    /// pointing at the same mock-cgroups handle `state` uses so
+    /// tests that only exercise step-local semantics stay terse.
+    fn apply_setup_test<'a>(
+        ctx: &'a Ctx<'a>,
+        state: &mut StepState<'a>,
+        defs: &[CgroupDef],
+    ) -> Result<()> {
+        let mut backdrop = BackdropState::empty(ctx);
+        let mut scenario = ScenarioState::new(state, &mut backdrop);
+        apply_setup(ctx, &mut scenario, defs)
+    }
+
+    /// Test helper: call `apply_ops` against a step-local-only
+    /// [`ScenarioState`]. Mirrors [`apply_setup_test`] for ops.
+    fn apply_ops_test<'a>(ctx: &'a Ctx<'a>, state: &mut StepState<'a>, ops: &[Op]) -> Result<()> {
+        let mut backdrop = BackdropState::empty(ctx);
+        let mut scenario = ScenarioState::new(state, &mut backdrop);
+        apply_ops(ctx, &mut scenario, ops)
+    }
+
     #[test]
     fn apply_setup_empty_defs_is_noop() {
         let mock = MockCgroupOps::new();
@@ -3518,7 +3981,7 @@ mod tests {
             cpusets: std::collections::HashMap::new(),
             payload_handles: Vec::new(),
         };
-        apply_setup(&ctx, &mut state, &[]).unwrap();
+        apply_setup_test(&ctx, &mut state, &[]).unwrap();
         assert!(
             mock.calls().is_empty(),
             "apply_setup on zero defs must not call any cgroup op, got: {:?}",
@@ -3542,7 +4005,7 @@ mod tests {
             CgroupDef::named("cg_a").workers(1),
             CgroupDef::named("cg_b").workers(1),
         ];
-        apply_setup(&ctx, &mut state, &defs).unwrap();
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
         let calls = mock.calls();
         let creates: Vec<&CgroupCall> = calls
             .iter()
@@ -3576,7 +4039,7 @@ mod tests {
                 .with_cpuset(CpusetSpec::Exact(cpus.clone()))
                 .workers(1),
         ];
-        apply_setup(&ctx, &mut state, &defs).unwrap();
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
         let calls = mock.calls();
         assert!(
             calls.contains(&CgroupCall::SetCpuset("cg_0".to_string(), cpus.clone())),
@@ -3606,7 +4069,7 @@ mod tests {
         // cpuset: None → inherit parent's set, apply_setup must not
         // emit a set_cpuset call.
         let defs = vec![CgroupDef::named("cg_inherit").workers(1)];
-        apply_setup(&ctx, &mut state, &defs).unwrap();
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
         let calls = mock.calls();
         let has_set_cpuset = calls
             .iter()
@@ -3636,7 +4099,7 @@ mod tests {
         // workers(2): after spawn, apply_setup must call move_tasks
         // with 2 pids.
         let defs = vec![CgroupDef::named("cg_move").workers(2)];
-        apply_setup(&ctx, &mut state, &defs).unwrap();
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
         let calls = mock.calls();
         assert!(
             calls.contains(&CgroupCall::MoveTasks("cg_move".to_string(), 2)),
@@ -3684,7 +4147,7 @@ mod tests {
                 .with_cpuset(CpusetSpec::Exact(cpus.clone()))
                 .workers(2),
         ];
-        apply_setup(&ctx, &mut state, &defs).unwrap();
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
         let calls = mock.calls();
         let set_idx = calls
             .iter()
@@ -3716,7 +4179,7 @@ mod tests {
         // bails after create_cgroup runs but before set_cpuset / move_tasks
         // fire.
         let defs = vec![CgroupDef::named("cg_bad").with_cpuset(CpusetSpec::Llc(99))];
-        let err = apply_setup(&ctx, &mut state, &defs).unwrap_err();
+        let err = apply_setup_test(&ctx, &mut state, &defs).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("CpusetSpec validation failed"),
@@ -3754,7 +4217,7 @@ mod tests {
                 .with_cpuset(CpusetSpec::Exact(cpus))
                 .workers(1),
         ];
-        let err = apply_setup(&ctx, &mut state, &defs).unwrap_err();
+        let err = apply_setup_test(&ctx, &mut state, &defs).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("set_cpuset kernel EBUSY"),
@@ -3797,7 +4260,7 @@ mod tests {
                 .mem_policy(MemPolicy::Bind(bind))
                 .workers(1),
         ];
-        let err = apply_setup(&ctx, &mut state, &defs).unwrap_err();
+        let err = apply_setup_test(&ctx, &mut state, &defs).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("cg_memfail"),
@@ -4017,7 +4480,7 @@ mod tests {
             args: vec![],
             cgroup: None,
         }];
-        let err = apply_ops(&ctx, &mut state, &ops).unwrap_err();
+        let err = apply_ops_test(&ctx, &mut state, &ops).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("scheduler-kind Payload") && msg.contains("eevdf"),
@@ -4044,7 +4507,7 @@ mod tests {
             cpusets: std::collections::HashMap::new(),
             payload_handles: Vec::new(),
         };
-        let err = apply_ops(
+        let err = apply_ops_test(
             &ctx,
             &mut state,
             &[Op::WaitPayload {
@@ -4070,7 +4533,7 @@ mod tests {
             cpusets: std::collections::HashMap::new(),
             payload_handles: Vec::new(),
         };
-        let err = apply_ops(
+        let err = apply_ops_test(
             &ctx,
             &mut state,
             &[Op::KillPayload {
@@ -4113,7 +4576,7 @@ mod tests {
             cpusets: std::collections::HashMap::new(),
             payload_handles: Vec::new(),
         };
-        apply_ops(
+        apply_ops_test(
             &ctx,
             &mut state,
             &[Op::run_payload(&SLEEP, vec!["3600".into()])],
@@ -4122,7 +4585,8 @@ mod tests {
         assert_eq!(state.payload_handles.len(), 1, "one payload is live");
         assert_eq!(state.payload_handles[0].handle.payload_name(), "sleeper");
 
-        apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("kill the live payload");
+        apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")])
+            .expect("kill the live payload");
         assert!(
             state.payload_handles.is_empty(),
             "handle must be consumed by KillPayload"
@@ -4154,14 +4618,14 @@ mod tests {
             cpusets: std::collections::HashMap::new(),
             payload_handles: Vec::new(),
         };
-        apply_ops(
+        apply_ops_test(
             &ctx,
             &mut state,
             &[Op::run_payload(&SLEEP, vec!["3600".into()])],
         )
         .expect("first spawn");
 
-        let err = apply_ops(
+        let err = apply_ops_test(
             &ctx,
             &mut state,
             &[Op::run_payload(&SLEEP, vec!["3600".into()])],
@@ -4198,7 +4662,7 @@ mod tests {
 
         // Clean up the live handle so the test process doesn't leak
         // a /bin/sleep.
-        apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
+        apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
     }
 
     /// #122: when the first spawn came from `CgroupDef::workload`
@@ -4244,7 +4708,7 @@ mod tests {
             handle: h,
         });
 
-        let err = apply_ops(
+        let err = apply_ops_test(
             &ctx,
             &mut state,
             &[Op::run_payload(&SLEEP, vec!["1".into()])],
@@ -4262,7 +4726,7 @@ mod tests {
         // Only the original handle remains — op branch bailed pre-spawn.
         assert_eq!(state.payload_handles.len(), 1);
 
-        apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
+        apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
     }
 
     /// #127: [`render_cgroup_key`] renders an empty string as
@@ -4328,7 +4792,7 @@ mod tests {
             cpusets: std::collections::HashMap::new(),
             payload_handles: Vec::new(),
         };
-        apply_ops(
+        apply_ops_test(
             &ctx,
             &mut state,
             &[Op::run_payload(&SLEEP, vec!["3600".into()])],
@@ -4339,7 +4803,8 @@ mod tests {
         // the fix, execute_steps_with would propagate the Err via
         // `?` and leave the SLEEP handle to be SIGKILLed by Drop
         // (losing the metric emission).
-        let err = apply_ops(&ctx, &mut state, &[Op::wait_payload("never_spawned")]).unwrap_err();
+        let err =
+            apply_ops_test(&ctx, &mut state, &[Op::wait_payload("never_spawned")]).unwrap_err();
         assert!(
             format!("{err:#}").contains("no running payload named 'never_spawned'"),
             "expected wait-unknown-name err",
@@ -4350,5 +4815,258 @@ mod tests {
         // terminate the child cleanly.
         drain_all_payload_handles(&mut state.payload_handles);
         assert!(state.payload_handles.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // #177 Step/Backdrop refactor — ruling invariants
+    // ---------------------------------------------------------------
+
+    /// Ruling #2: a step-local `Op::RemoveCgroup` that targets a
+    /// Backdrop-owned cgroup must bail before any cgroupfs write.
+    /// Ops running inside the Backdrop's own setup pass (i.e.
+    /// `write_to_backdrop == true`) stay exempt.
+    #[test]
+    fn remove_cgroup_rejects_backdrop_target() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+
+        // Populate a backdrop cgroup and leave the step state empty.
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("bd_cg")
+            .expect("add backdrop cgroup");
+
+        // Step-local RemoveCgroup must reject.
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            let err = apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")]).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("Backdrop-owned") && msg.contains("bd_cg"),
+                "error must name the backdrop cgroup and explain why, got: {msg}"
+            );
+        }
+        // The backdrop cgroup is still tracked.
+        assert_eq!(backdrop_state.cgroups.names(), &["bd_cg".to_string()]);
+        // No remove_cgroup call was issued to the mock — the bail
+        // happened before any cgroupfs write.
+        let calls = mock.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, CgroupCall::RemoveCgroup(_))),
+            "pre-bail path must not invoke remove_cgroup, got: {calls:?}"
+        );
+
+        // Backdrop-pass RemoveCgroup (write_to_backdrop = true) is
+        // allowed and routes through to the mock.
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            scenario
+                .with_target_backdrop(|s| apply_ops(&ctx, s, &[Op::remove_cgroup("bd_cg")]))
+                .expect("backdrop-pass remove is permitted");
+        }
+        let calls = mock.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, CgroupCall::RemoveCgroup(n) if n == "bd_cg")),
+            "backdrop-pass remove must reach the cgroup ops, got: {calls:?}"
+        );
+
+        cleanup_state(&mut step_state);
+    }
+
+    /// Rulings #5 + #10: `Op::MoveAllTasks` from a step-local cgroup
+    /// to a Backdrop cgroup must TRANSFER the handle from
+    /// step-local slot to backdrop slot so the worker survives the
+    /// step boundary. A step-to-step move keeps ownership
+    /// step-local. A backdrop-to-step move keeps the handle in the
+    /// backdrop slot (persistent does not degrade).
+    #[test]
+    fn move_all_tasks_transfers_handle_ownership_step_to_backdrop() {
+        use crate::workload::{Work, WorkloadConfig, WorkloadHandle};
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        // Backdrop owns "bd_cg"; the step owns "step_cg" and a
+        // handle keyed under it.
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("bd_cg")
+            .unwrap();
+        step_state.cgroups.add_cgroup_no_cpuset("step_cg").unwrap();
+        let w = Work::default();
+        let wl = WorkloadConfig {
+            num_workers: 1,
+            affinity: crate::workload::AffinityMode::None,
+            work_type: w.work_type,
+            sched_policy: w.sched_policy,
+            mem_policy: w.mem_policy,
+            mpol_flags: w.mpol_flags,
+        };
+        let h = WorkloadHandle::spawn(&wl).expect("spawn worker");
+        step_state.handles.push(("step_cg".to_string(), h));
+        assert_eq!(step_state.handles.len(), 1);
+        assert_eq!(backdrop_state.handles.len(), 0);
+
+        // Move tasks from step_cg to bd_cg: ownership transfers.
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(
+                &ctx,
+                &mut scenario,
+                &[Op::move_all_tasks("step_cg", "bd_cg")],
+            )
+            .expect("move into backdrop");
+        }
+        assert_eq!(
+            step_state.handles.len(),
+            0,
+            "step-local handle must leave the step slot after transfer",
+        );
+        assert_eq!(
+            backdrop_state.handles.len(),
+            1,
+            "backdrop slot must receive the transferred handle",
+        );
+        assert_eq!(
+            backdrop_state.handles[0].0, "bd_cg",
+            "transferred handle must be re-keyed to `to`",
+        );
+
+        // Clear the handles before the test drops (handles SIGKILL on
+        // drop — avoid leaking the worker process).
+        backdrop_state.handles.clear();
+        step_state.handles.clear();
+    }
+
+    /// Ruling #5 companion: step→step move does NOT cross state slots.
+    #[test]
+    fn move_all_tasks_step_to_step_keeps_step_ownership() {
+        use crate::workload::{Work, WorkloadConfig, WorkloadHandle};
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        step_state.cgroups.add_cgroup_no_cpuset("src").unwrap();
+        step_state.cgroups.add_cgroup_no_cpuset("dst").unwrap();
+        let w = Work::default();
+        let wl = WorkloadConfig {
+            num_workers: 1,
+            affinity: crate::workload::AffinityMode::None,
+            work_type: w.work_type,
+            sched_policy: w.sched_policy,
+            mem_policy: w.mem_policy,
+            mpol_flags: w.mpol_flags,
+        };
+        let h = WorkloadHandle::spawn(&wl).expect("spawn");
+        step_state.handles.push(("src".to_string(), h));
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("src", "dst")])
+                .expect("step-to-step move");
+        }
+        assert_eq!(step_state.handles.len(), 1);
+        assert_eq!(step_state.handles[0].0, "dst");
+        assert_eq!(backdrop_state.handles.len(), 0);
+        step_state.handles.clear();
+    }
+
+    /// Ruling #5 companion: a backdrop-owned handle moved into a
+    /// step-local cgroup stays in the backdrop slot — persistent
+    /// workers never demote to step-local ownership.
+    #[test]
+    fn move_all_tasks_backdrop_to_step_keeps_backdrop_ownership() {
+        use crate::workload::{Work, WorkloadConfig, WorkloadHandle};
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state.cgroups.add_cgroup_no_cpuset("bd").unwrap();
+        step_state.cgroups.add_cgroup_no_cpuset("step").unwrap();
+        let w = Work::default();
+        let wl = WorkloadConfig {
+            num_workers: 1,
+            affinity: crate::workload::AffinityMode::None,
+            work_type: w.work_type,
+            sched_policy: w.sched_policy,
+            mem_policy: w.mem_policy,
+            mpol_flags: w.mpol_flags,
+        };
+        let h = WorkloadHandle::spawn(&wl).expect("spawn");
+        backdrop_state.handles.push(("bd".to_string(), h));
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("bd", "step")])
+                .expect("backdrop-to-step move");
+        }
+        assert_eq!(
+            step_state.handles.len(),
+            0,
+            "step slot must not pick up a backdrop handle",
+        );
+        assert_eq!(backdrop_state.handles.len(), 1);
+        assert_eq!(backdrop_state.handles[0].0, "step");
+        backdrop_state.handles.clear();
+    }
+
+    /// Ruling #6: `run_scenario` rejects a scheduler-kind payload in
+    /// `Backdrop::payloads` before running any setup.
+    #[test]
+    fn run_scenario_rejects_scheduler_kind_backdrop_payload() {
+        use crate::cgroup::CgroupManager;
+        use crate::test_support::Payload;
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = mock_topo();
+        let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
+        let backdrop = super::super::backdrop::Backdrop::new().with_payload(&Payload::EEVDF);
+        let err = execute_scenario_with(
+            &ctx,
+            backdrop,
+            vec![Step::new(vec![], HoldSpec::Fixed(Duration::from_millis(1)))],
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("scheduler-kind") && msg.contains("Backdrop"),
+            "error must name the kind mismatch and the Backdrop surface, got: {msg}"
+        );
+    }
+
+    /// Ruling #3: `apply_setup` rejects a step-local CgroupDef whose
+    /// name collides with a Backdrop-tracked cgroup.
+    #[test]
+    fn apply_setup_rejects_name_collision_with_backdrop() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("shared")
+            .unwrap();
+        let defs = vec![CgroupDef::named("shared").workers(1)];
+        let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        let err = apply_setup(&ctx, &mut scenario, &defs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already tracked") && msg.contains("shared"),
+            "error must cite the collision and the offending name, got: {msg}"
+        );
+        cleanup_state(&mut step_state);
     }
 }

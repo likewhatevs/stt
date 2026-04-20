@@ -10,9 +10,14 @@
 //! # Step vs Backdrop
 //!
 //! - A [`Step`](super::ops::Step) is bounded: everything it creates
-//!   cleans up when the step ends.
-//! - A [`Backdrop`] is persistent: what it sets up lives until the
-//!   end of the Step sequence, and RAII-teardown happens there.
+//!   (cgroups, workload handles, payload handles) is torn down when
+//!   the step finishes. The runtime enforces this automatically —
+//!   no explicit teardown op is required.
+//! - A [`Backdrop`] is persistent: what it sets up lives for the
+//!   entire Step sequence. Its cgroups are created once before the
+//!   first Step and RAII-removed at scenario end; its payloads
+//!   spawn once and are killed (with metric emission) after the
+//!   last Step tears down.
 //!
 //! In the "bursty load + scheduler stress test" pattern:
 //!
@@ -23,16 +28,13 @@
 //!   contention", "measure") with its own CgroupDefs that come and
 //!   go.
 //!
-//! # Stage 1 scope note
-//!
-//! This commit introduces the [`Backdrop`] type and the
-//! [`execute_scenario`](super::ops::execute_scenario) entry point
-//! WITHOUT changing per-Step lifecycle semantics yet. Step effects
-//! still carry over across steps in the current runtime — that
-//! auto-cleanup lands in subsequent stages. The primitive is in
-//! place so downstream scenarios and tests can already move
-//! persistent entities into a Backdrop, and the runtime plumbing
-//! catches up around them.
+//! Steps may reference Backdrop-owned cgroups by name through
+//! cgroup-addressing ops (`Op::SetCpuset`, `Op::MoveAllTasks`, etc.)
+//! — name lookups resolve step-local first, then fall through to
+//! the Backdrop. Step-local cgroups must not shadow a Backdrop
+//! cgroup name, and step-local `Op::RemoveCgroup` targeting a
+//! Backdrop cgroup is rejected so later Steps cannot find it
+//! missing.
 
 use super::ops::CgroupDef;
 use crate::test_support::Payload;
@@ -75,15 +77,16 @@ use crate::test_support::Payload;
 ///     .with_cgroup(CgroupDef::named("bg_cell").with_cpuset(CpusetSpec::disjoint(0, 2)))
 ///     .with_payload(&BG_LOAD);
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Backdrop {
     /// Long-lived cgroups created once and removed at scenario end.
     /// Any Step can reference them by name via `Op::MoveAllTasks`,
     /// `Op::SetCpuset`, etc.
     pub cgroups: Vec<CgroupDef>,
     /// Long-lived binary payloads spawned once before the first
-    /// Step. Handles live in [`BackdropState`] and are drained via
-    /// `.kill()` (preserving metric emission) at scenario teardown.
+    /// Step. The runtime holds the live handles for the duration of
+    /// the Step sequence and drains them via `.kill()` (preserving
+    /// metric emission) at scenario teardown.
     pub payloads: Vec<&'static Payload>,
 }
 
@@ -97,9 +100,7 @@ impl Backdrop {
         payloads: Vec::new(),
     };
 
-    /// Fresh Backdrop builder. Equivalent to
-    /// [`Backdrop::EMPTY.clone()`](Self::EMPTY) but reads more
-    /// naturally in chain position:
+    /// Fresh Backdrop builder. Reads naturally in chain position:
     /// `Backdrop::new().with_cgroup(...).with_payload(...)`.
     pub fn new() -> Self {
         Backdrop::EMPTY

@@ -623,7 +623,11 @@ impl<'a> CgroupGroup<'a> {
 
 impl Drop for CgroupGroup<'_> {
     fn drop(&mut self) {
-        for name in &self.names {
+        // Reverse-iterate so nested cgroups (children created AFTER
+        // their parents) are removed before their parents. Removing a
+        // cgroup directory that still has child cgroup directories
+        // under it fails with ENOTEMPTY.
+        for name in self.names.iter().rev() {
             let _ = self.cgroups.remove_cgroup(name);
         }
     }
