@@ -1808,7 +1808,18 @@ fn run_scenario(
             // step_staging's CgroupGroup RAII drops here too,
             // removing any cgroups the failed Backdrop setup
             // happened to route into step-local state.
-            return Err(err);
+            //
+            // Surface the error as a detail on the accumulated result
+            // so the caller keeps any metric emissions the payload
+            // drains produced and gets a failure report with the
+            // error context, instead of an opaque Err that discards
+            // the in-progress AssertResult.
+            result.passed = false;
+            result.details.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!("Backdrop setup failed: {err:#}"),
+            ));
+            return Ok(result);
         }
         // `step_staging` should not have accumulated anything
         // because `with_target_backdrop` routed every target writer
@@ -1861,14 +1872,28 @@ fn run_scenario(
         let step_result = collect_step(&mut step_state, effective_checks, ctx.topo);
         result.merge(step_result);
 
-        // Propagate a step-level error after teardown has run so
-        // every step boundary leaves clean state behind even on
-        // failure.
+        // A step-level error is converted into a failure on the
+        // accumulated result after teardown has run so every step
+        // boundary leaves clean state behind even on failure. The
+        // caller keeps the prior-steps' merged AssertResult plus
+        // the error context as a detail, instead of an opaque Err
+        // that discards everything.
         if let Err(err) = step_res {
             // The Backdrop's payload handles still need `.kill()`
             // so their metrics emit on the error path.
             drain_all_payload_handles(&mut backdrop_state.payload_handles);
-            return Err(err);
+            // Collect Backdrop-owned workload handles into the
+            // result too — the step that failed might have depended
+            // on persistent workers, and their stats still belong in
+            // the final report.
+            let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            result.merge(backdrop_result);
+            result.passed = false;
+            result.details.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!("step {step_idx} failed: {err:#}"),
+            ));
+            return Ok(result);
         }
     }
 
@@ -2213,7 +2238,26 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 state.drain_payloads_for_cgroup(cgroup);
                 state.drop_handles_for_cgroup(cgroup);
                 state.forget_cpuset(cgroup);
-                let _ = ctx.cgroups.remove_cgroup(cgroup);
+                // ENOENT is expected (e.g. the cgroup was already
+                // removed by a prior op or never created under the
+                // MockCgroupOps backend) and stays silent. Any other
+                // error — EBUSY from a surviving task, EACCES from a
+                // permissions regression, etc. — gets logged so the
+                // failure shows up in test output instead of being
+                // swallowed by `let _ = `.
+                if let Err(err) = ctx.cgroups.remove_cgroup(cgroup) {
+                    let is_enoent = err
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                    if !is_enoent {
+                        tracing::warn!(
+                            cgroup = %cgroup,
+                            err = %format!("{err:#}"),
+                            "Op::RemoveCgroup: rmdir returned non-ENOENT error",
+                        );
+                    }
+                }
             }
             Op::SetCpuset { cgroup, cpus } => {
                 if let Err(reason) = cpus.validate(ctx) {
