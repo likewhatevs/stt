@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(tail, "short error");
     }
 
-    /// #37: When `s.len() - max_bytes` lands inside a multi-byte UTF-8
+    /// When `s.len() - max_bytes` lands inside a multi-byte UTF-8
     /// code unit, `stderr_tail` snaps the start index forward to the
     /// next char boundary so the slice operation never panics. This
     /// test uses a 2-byte UTF-8 character ("é") placed at the exact
@@ -1068,8 +1068,8 @@ mod tests {
         );
     }
 
-    /// #37: When the whole multi-byte character sits at the snap-
-    /// forward boundary (start lands exactly on its first byte), the
+    /// When the whole multi-byte character sits at the snap-forward
+    /// boundary (start lands exactly on its first byte), the
     /// character is preserved intact — no off-by-one that drops its
     /// first byte.
     #[test]
@@ -1089,7 +1089,7 @@ mod tests {
         );
     }
 
-    /// #37: `stderr_tail` is valid UTF-8 regardless of where the
+    /// `stderr_tail` is valid UTF-8 regardless of where the
     /// multi-byte character falls. Property-style sanity check
     /// constructing every single-byte offset within a surrounding
     /// multi-byte character and verifying `str::from_utf8` round-trips.
@@ -1207,15 +1207,15 @@ mod tests {
         assert!(r.passed);
     }
 
-    /// #21: Multiple checks on the same metric all fire — the
-    /// evaluator does not dedup by metric name. Two `Min`s on the
-    /// same path either both pass (value >= max threshold) or both
-    /// fail (value < one of the thresholds, depending on which is
-    /// more restrictive). This test uses a pair where the metric
-    /// value (100) is below the second threshold (200) but above
-    /// the first (50). The second failure must appear in the
-    /// details list — the evaluator MUST NOT short-circuit after
-    /// the first matching metric check.
+    /// Multiple checks on the same metric all fire — the evaluator
+    /// does not dedup by metric name. Two `Min`s on the same path
+    /// either both pass (value >= max threshold) or both fail
+    /// (value < one of the thresholds, depending on which is more
+    /// restrictive). This test uses a pair where the metric value
+    /// (100) is below the second threshold (200) but above the
+    /// first (50). The second failure must appear in the details
+    /// list — the evaluator must not short-circuit after the first
+    /// matching metric check.
     #[test]
     fn evaluate_checks_duplicate_min_on_same_metric_both_evaluated() {
         let pm = PayloadMetrics {
@@ -1244,11 +1244,11 @@ mod tests {
         );
     }
 
-    /// #21: Two conflicting checks on the same metric (Min 100 and
-    /// Max 50) produce TWO failures in the details list — not one
-    /// collapsed failure. Pins the "each check evaluated
-    /// independently" invariant so a future optimization doesn't
-    /// accidentally merge / dedup.
+    /// Two conflicting checks on the same metric (Min 100 and Max 50)
+    /// produce TWO failures in the details list — not one collapsed
+    /// failure. Pins the "each check evaluated independently"
+    /// invariant so a future optimization doesn't accidentally merge
+    /// / dedup.
     #[test]
     fn evaluate_checks_conflicting_checks_on_same_metric_both_report() {
         let pm = PayloadMetrics {
@@ -1278,11 +1278,10 @@ mod tests {
         );
     }
 
-    /// #22: `Check::Exists` with a zero-value metric passes. The
-    /// check is presence-only — a metric of 0.0 is still present
-    /// in the PayloadMetrics map and `pm.get(name).is_some()`
-    /// returns true. Previously susceptible to a bug where a
-    /// naive `pm.get(name).filter(|v| *v != 0.0)` would spuriously
+    /// `Check::Exists` with a zero-value metric passes. The check is
+    /// presence-only — a metric of 0.0 is still present in the
+    /// PayloadMetrics map and `pm.get(name).is_some()` returns true.
+    /// A naive `pm.get(name).filter(|v| *v != 0.0)` would spuriously
     /// fail here; pin the "exists is sign-agnostic and zero-
     /// friendly" invariant.
     #[test]
@@ -1305,7 +1304,7 @@ mod tests {
         );
     }
 
-    /// #22: Negative zero (`-0.0`) also counts as present for
+    /// Negative zero (`-0.0`) also counts as present for
     /// `Check::Exists`. Paranoid pin because f64 `-0.0` surprises
     /// some pattern-matching code (`0.0 == -0.0` but they differ
     /// under `f64::to_bits`).
@@ -1325,7 +1324,7 @@ mod tests {
         assert!(r.passed);
     }
 
-    /// #42: `PayloadRun`'s custom `Debug` impl renders the stable
+    /// `PayloadRun`'s custom `Debug` impl renders the stable
     /// identity fields — payload name, args/checks lengths, and
     /// cgroup placement — without dumping the `Ctx` pointer. Pins
     /// the output shape so a future rename can't silently drop a
@@ -1360,7 +1359,7 @@ mod tests {
         );
     }
 
-    /// #42: Default `PayloadRun` (no args, no checks, no cgroup)
+    /// Default `PayloadRun` (no args, no checks, no cgroup)
     /// renders sensible zeroes.
     #[test]
     fn payload_run_debug_renders_defaults() {
@@ -1817,10 +1816,10 @@ mod tests {
     /// build is skipped entirely. Pins the no-op invariant so a
     /// regression can't accidentally materialize an empty map for
     /// zero metrics on every hot-path call.
-    /// #30: When the payload declares two MetricHints with the
-    /// same name, the HashMap build keeps the LAST insertion. The
-    /// test pins that behavior so a future switch to a multimap or
-    /// to first-wins semantics surfaces here. First-wins would be
+    /// When the payload declares two MetricHints with the same
+    /// name, the HashMap build keeps the LAST insertion. The test
+    /// pins that behavior so a future switch to a multimap or to
+    /// first-wins semantics surfaces here. First-wins would be
     /// surprising: users who copy-paste a hint to tweak it expect
     /// the new value.
     #[test]
@@ -1858,12 +1857,11 @@ mod tests {
         assert_eq!(ms[0].unit, "overridden");
     }
 
-    /// #30: When the metric slice has duplicate names (e.g. a
-    /// payload emitting the same dotted path twice in one run), the
-    /// hint is applied to each occurrence. Each is a distinct
-    /// Metric value in the sidecar; both must carry the hinted
-    /// polarity + unit so downstream regression reports are
-    /// consistent.
+    /// When the metric slice has duplicate names (e.g. a payload
+    /// emitting the same dotted path twice in one run), the hint
+    /// is applied to each occurrence. Each is a distinct Metric
+    /// value in the sidecar; both must carry the hinted polarity +
+    /// unit so downstream regression reports are consistent.
     #[test]
     fn resolve_polarities_duplicate_metric_names_each_gets_hint() {
         use crate::test_support::{Metric, MetricHint, MetricSource, Polarity};
@@ -1940,7 +1938,7 @@ mod tests {
         emit_payload_metrics_to_shm(&pm);
     }
 
-    // -- #46: PayloadHandle double-consume returns Err, not panic --
+    // -- PayloadHandle double-consume returns Err, not panic --
 
     /// After `try_wait()` returns `Ok(Some(..))` (terminal branch
     /// that takes the child), a subsequent `try_wait()` on the same

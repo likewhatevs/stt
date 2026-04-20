@@ -4592,9 +4592,9 @@ mod tests {
         assert_eq!(b.topology.total_cpus(), 1);
     }
 
-    /// #37 — explicit `memory_mb(0)` must be rejected at build time
-    /// rather than surfacing as an opaque KVM ioctl failure later.
-    /// The builder default (None→256) passes.
+    /// Explicit `memory_mb(0)` must be rejected at build time rather
+    /// than surfacing as an opaque KVM ioctl failure later. The
+    /// builder default (None→256) passes.
     #[test]
     fn builder_rejects_explicit_zero_memory() {
         // Point at a real file so the kernel-existence check
@@ -4618,8 +4618,8 @@ mod tests {
         );
     }
 
-    /// #4 — `shm_try_create_excl` winner gets a locked fd; a second
-    /// call with the same name returns `Exists`. The winner's
+    /// `shm_try_create_excl` winner gets a locked fd; a second call
+    /// with the same name returns `Exists`. The winner's
     /// `shm_unlink` cleanup keeps subsequent tests independent.
     #[test]
     fn shm_try_create_excl_winner_then_exists() {
@@ -4668,8 +4668,8 @@ mod tests {
         }
     }
 
-    /// #4 — `shm_write_and_release` on a happy path publishes the
-    /// data and releases the lock. After unlink the segment is gone.
+    /// `shm_write_and_release` on a happy path publishes the data
+    /// and releases the lock. After unlink the segment is gone.
     #[test]
     fn shm_write_and_release_publishes_data() {
         let name = format!(
@@ -5778,11 +5778,10 @@ mod tests {
 
     #[test]
     fn hash_file_is_siphash13_stable_golden() {
-        // Regression for #28: hash_file must use SipHasher13 with
-        // zero keys so the value is stable across Rust toolchain
-        // versions. Golden check pins the concrete algorithm —
-        // if this value changes, the cache is about to silently
-        // invalidate every prior artifact.
+        // hash_file must use SipHasher13 with zero keys so the value
+        // is stable across Rust toolchain versions. Golden check
+        // pins the concrete algorithm — if this value changes, the
+        // cache is about to silently invalidate every prior artifact.
         let tmp =
             std::env::temp_dir().join(format!("ktstr-hash-golden-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();

@@ -1245,11 +1245,11 @@ mod tests {
 
     #[test]
     fn numa_aware_llc_order_uneven_llcs_preserves_remainder() {
-        // Regression for #31: with llcs=5 and numa_nodes=2, integer
-        // division yielded llcs_per_node=2 → only 4 entries in `order`,
-        // dropping the remainder LLC. Fixed to distribute the
-        // remainder across the first `llcs % numa_nodes` guest nodes:
-        // node 0 → 3 LLCs, node 1 → 2 LLCs, total 5.
+        // With llcs=5 and numa_nodes=2, naive integer division would
+        // yield llcs_per_node=2 → only 4 entries in `order`, dropping
+        // the remainder LLC. The implementation distributes the
+        // remainder across the first `llcs % numa_nodes` guest
+        // nodes: node 0 → 3 LLCs, node 1 → 2 LLCs, total 5.
         //
         // Host: 6 LLCs, 3 per NUMA node — satisfies the ceiling
         // eligibility check (each host node must supply max_per_node=3).
@@ -1295,9 +1295,8 @@ mod tests {
 
     #[test]
     fn numa_aware_llc_order_zero_numa_nodes_is_safe() {
-        // Regression for #31 guard: numa_nodes=0 formerly
-        // divide-by-zero'd on `llcs / numa_nodes`. Now falls back to
-        // sequential mapping.
+        // numa_nodes=0 would divide-by-zero on `llcs / numa_nodes`.
+        // Falls back to sequential mapping instead.
         let topo = synthetic_topo_numa(vec![(0, vec![0, 1]), (0, vec![2, 3])]);
         let order = topo.numa_aware_llc_order(0, 2, 0);
         assert_eq!(
@@ -1309,9 +1308,9 @@ mod tests {
 
     #[test]
     fn numa_aware_llc_order_fewer_llcs_than_nodes_falls_back() {
-        // Regression for #31 guard: llcs < numa_nodes would give
-        // base_per_node = 0 and leave some guest nodes empty. Fall
-        // back to sequential mapping so all requested LLCs land.
+        // llcs < numa_nodes would give base_per_node = 0 and leave
+        // some guest nodes empty. Falls back to sequential mapping
+        // so all requested LLCs land.
         let topo = synthetic_topo_numa(vec![
             (0, vec![0, 1]),
             (0, vec![2, 3]),

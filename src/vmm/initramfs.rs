@@ -2078,9 +2078,9 @@ mod tests {
         // the MappedShm is dropped, the lock releases and a subsequent
         // LOCK_EX | LOCK_NB must succeed.
         //
-        // This is the core invariant of the #2 fix — if it regresses,
-        // shm_store's ftruncate can race with a live reader and cause
-        // SIGBUS on the mapped pages.
+        // This is the core invariant — if it regresses, shm_store's
+        // ftruncate can race with a live reader and cause SIGBUS on
+        // the mapped pages.
         let hash = 0xD0D0_BEEF_F00D_BA5Eu64;
         shm_unlink_base(hash); // clean any stale segment
         shm_store_base(hash, &vec![0x55u8; 256]).unwrap();

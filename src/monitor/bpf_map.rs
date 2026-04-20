@@ -3107,7 +3107,7 @@ mod tests {
         );
     }
 
-    // -- find_all_bpf_maps tests (fix #3) --
+    // -- find_all_bpf_maps tests --
 
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -3192,7 +3192,7 @@ mod tests {
         assert!(maps.is_empty());
     }
 
-    // -- value_kva Option tests (fix #4) --
+    // -- value_kva Option tests --
 
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -3256,7 +3256,7 @@ mod tests {
         ));
     }
 
-    // -- map_flags test (fix #5) --
+    // -- map_flags test --
 
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -3279,7 +3279,7 @@ mod tests {
         assert_eq!(maps[0].map_flags, 0x0400);
     }
 
-    // -- xa_node_shift non-zero offset test (fix #7) --
+    // -- xa_node_shift non-zero offset test --
 
     #[test]
     fn xa_node_shift_nonzero_offset() {

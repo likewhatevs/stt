@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(llm_tagged[0].source, MetricSource::LlmExtract);
     }
 
-    // Speculative-coverage patches (#306 pass 1 response):
+    // Additional edge-case coverage for walk_json_leaves paths.
 
     #[test]
     fn json_deeply_nested_array_of_objects() {

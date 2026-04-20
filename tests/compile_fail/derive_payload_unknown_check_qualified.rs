@@ -1,4 +1,4 @@
-// #62: a Check-prefixed constructor that isn't real also fails to
+// A Check-prefixed constructor that isn't real also fails to
 // compile. When the user writes `Check::nonexistent_check(...)`, the
 // macro sees the prefix via `expr_has_check_prefix`, skips its
 // implicit `::ktstr::test_support::Check::` prepend, and emits the

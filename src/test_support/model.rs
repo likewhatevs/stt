@@ -305,8 +305,8 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     // Stream the body straight into the tempfile via `std::io::copy`
     // so a 400 MiB model doesn't first materialize in a heap Vec.
     // `response` implements `std::io::Read`; the tempfile handle
-    // from `NamedTempFile` implements `Write`. Previous buffer-then-
-    // write approach held the full body in memory (#116, #106).
+    // from `NamedTempFile` implements `Write`. A buffer-then-write
+    // approach would hold the full body in memory.
     {
         use std::io::Write;
         let file = tmp.as_file_mut();
@@ -739,7 +739,7 @@ mod tests {
         assert!(format!("{err:#}").contains("non-hex"), "err: {err:#}");
     }
 
-    /// #108: Non-empty short file — SHA-256 of ASCII "abc" is a
+    /// Non-empty short file — SHA-256 of ASCII "abc" is a
     /// well-known external anchor (NIST FIPS 180-2 appendix). Pins
     /// the non-empty happy path between the empty-file test above
     /// and the multi-chunk test below; a regression that broke
@@ -753,7 +753,7 @@ mod tests {
         assert!(verify_sha256(tmp.path(), expected).unwrap());
     }
 
-    /// #108: Multi-chunk file (larger than a single read buffer)
+    /// Multi-chunk file (larger than a single read buffer)
     /// exercises the streaming `Read`-loop branch of `verify_sha256`
     /// (vs the single-buffer fast path for small files). 192 KiB of
     /// repeated "a" bytes is large enough to cross any reasonable
@@ -831,7 +831,7 @@ mod tests {
         }
     }
 
-    /// #98: status() on a file that exists but whose SHA does not
+    /// status() on a file that exists but whose SHA does not
     /// match must report `cached = true, sha_matches = false`. That
     /// is the branch ensure() consults to decide between "reuse
     /// cached copy" and "re-download"; a regression that lost the
@@ -870,7 +870,7 @@ mod tests {
         }
     }
 
-    /// #100: With `KTSTR_CACHE_DIR` unset, `resolve_cache_root` falls
+    /// With `KTSTR_CACHE_DIR` unset, `resolve_cache_root` falls
     /// through to `XDG_CACHE_HOME` and appends `ktstr/models`.
     #[test]
     fn resolve_cache_root_honors_xdg_cache_home() {
@@ -901,7 +901,7 @@ mod tests {
         }
     }
 
-    /// #100: With both `KTSTR_CACHE_DIR` and `XDG_CACHE_HOME` unset,
+    /// With both `KTSTR_CACHE_DIR` and `XDG_CACHE_HOME` unset,
     /// `resolve_cache_root` falls through to `$HOME/.cache/ktstr/models`.
     /// The third-tier fallback must hold so `~/.cache` remains the
     /// documented default on a fresh system.
@@ -943,7 +943,7 @@ mod tests {
         }
     }
 
-    /// #100: Empty `KTSTR_CACHE_DIR` must fall through to XDG
+    /// Empty `KTSTR_CACHE_DIR` must fall through to XDG
     /// exactly like "unset", mirroring the `!dir.is_empty()` gate in
     /// `resolve_cache_root`. A regression that treated the empty
     /// string as a valid root would produce an empty `PathBuf` and
@@ -978,7 +978,7 @@ mod tests {
         }
     }
 
-    /// #117: `sanitize_env_value` replaces control characters (newline,
+    /// `sanitize_env_value` replaces control characters (newline,
     /// tab, backspace, escape) with `?` and passes printable ASCII +
     /// Unicode through unchanged. Pins the predicate used before
     /// echoing a user-controlled env value into error output — a
@@ -998,7 +998,7 @@ mod tests {
         assert_eq!(sanitize_env_value("\r\n"), "??");
     }
 
-    /// #117: An overlong value is truncated to a byte-bounded prefix
+    /// An overlong value is truncated to a byte-bounded prefix
     /// with a `...` marker. The marker (three ASCII dots) makes it
     /// obvious the value was cut, and the truncation walks a char
     /// boundary so a multi-byte UTF-8 codepoint straddling the limit
@@ -1014,7 +1014,7 @@ mod tests {
         assert_eq!(out.len(), 67);
     }
 
-    /// #117: ensure()'s offline-bail error echoes the env value
+    /// ensure()'s offline-bail error echoes the env value
     /// through `sanitize_env_value`. Set `OFFLINE_ENV` to a value
     /// containing both control chars and overlong content, and
     /// verify the error string contains neither a raw newline nor

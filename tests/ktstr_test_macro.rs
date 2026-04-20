@@ -38,7 +38,7 @@ fn host_only_attr_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// #27: `workloads = []` must compile cleanly. The macro accepts an
+/// `workloads = []` must compile cleanly. The macro accepts an
 /// empty array as "no additional binary workloads composed under
 /// the scheduler" — the same semantic as omitting the attribute.
 /// The emitted `KtstrTestEntry.workloads` is `&[]`, which entry
@@ -730,7 +730,7 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 // ---------------------------------------------------------------------------
-// #[ktstr_test(payload = ..., workloads = [...])] — #162 macro surface
+// #[ktstr_test(payload = ..., workloads = [...])] macro surface
 // ---------------------------------------------------------------------------
 
 // Payload fixtures live in this test crate so the #[ktstr_test]

@@ -3084,13 +3084,14 @@ mod tests {
     }
 
     // -- Defense-in-depth: resolve must not panic on spec shapes that
-    // -- validate rejects. Each test exercises a concrete panic that
-    // -- would fire before the #81 hardening.
+    // -- validate rejects. Each test exercises a concrete panic the
+    // -- resolver's hardening guards against.
 
     #[test]
     fn resolve_disjoint_of_zero_returns_empty_instead_of_panicking() {
-        // Pre-#81: `usable.len() / of` with of=0 panics. Post-fix:
-        // returns an empty BTreeSet with a tracing::warn.
+        // `usable.len() / of` with of=0 would panic without hardening.
+        // Current behavior: returns an empty BTreeSet with a
+        // tracing::warn.
         let (cg, topo) = make_ctx(1, 4, 1);
         let ctx = ctx_from(&cg, &topo);
         let spec = CpusetSpec::Disjoint { index: 0, of: 0 };
@@ -3111,10 +3112,10 @@ mod tests {
 
     #[test]
     fn resolve_range_inverted_fracs_returns_empty_instead_of_panicking() {
-        // Pre-#81: `usable[start.min(len)..end.min(len)]` with
-        // start_frac > end_frac produced start > end after clamping
-        // and panicked the slice operation. Post-fix: the slice is
-        // clamped to length-zero instead.
+        // Without hardening, `usable[start.min(len)..end.min(len)]`
+        // with start_frac > end_frac produced start > end after
+        // clamping and panicked the slice operation. Current
+        // behavior: the slice is clamped to length-zero instead.
         let (cg, topo) = make_ctx(1, 4, 1);
         let ctx = ctx_from(&cg, &topo);
         let spec = CpusetSpec::Range {
@@ -4893,14 +4894,14 @@ mod tests {
             msg.contains("payload 'sleeper' already running"),
             "error must flag the duplicate, got: {msg}"
         );
-        // #122: the dup error must identify the surface that spawned
-        // the live handle so the user knows where to go to fix it. The
+        // The dup error must identify the surface that spawned the
+        // live handle so the user knows where to go to fix it. The
         // first spawn was via Op::RunPayload, not CgroupDef::workload.
         assert!(
             msg.contains("Op::RunPayload"),
             "dup error must name the originating surface, got: {msg}"
         );
-        // #127: the Op::RunPayload in this test ran without a
+        // The Op::RunPayload in this test ran without a
         // `cgroup = Some(..)`, so the rendered cgroup key must be
         // `(no cgroup)`, not an empty-quoted `''`.
         assert!(
@@ -4990,7 +4991,7 @@ mod tests {
         .expect("teardown kill");
     }
 
-    /// #127: [`render_cgroup_key`] renders an empty string as
+    /// [`render_cgroup_key`] renders an empty string as
     /// `(no cgroup)` and a populated name as single-quoted prose.
     /// Pins the formatting so every error path that echoes the
     /// cgroup key through this helper stays consistent.
@@ -5000,7 +5001,7 @@ mod tests {
         assert_eq!(render_cgroup_key("cg_a"), "'cg_a'");
     }
 
-    // -- #85: payload_handles drain on error paths in execute_steps_with --
+    // -- payload_handles drain on error paths in execute_steps_with --
 
     /// An Err return from `execute_steps_with` (here: a vacuous
     /// `HoldSpec::Fixed(ZERO)` caught by up-front validation)
@@ -5204,7 +5205,8 @@ mod tests {
         step_state.handles.clear();
     }
 
-    /// Ruling #5 companion: step→step move does NOT cross state slots.
+    /// Step→step move does NOT cross state slots (companion to the
+    /// step→backdrop transfer test above).
     #[test]
     fn move_all_tasks_step_to_step_keeps_step_ownership() {
         use crate::workload::{Work, WorkloadConfig, WorkloadHandle};
@@ -5272,7 +5274,7 @@ mod tests {
         );
     }
 
-    /// Ruling #6: `run_scenario` rejects a scheduler-kind payload in
+    /// `run_scenario` rejects a scheduler-kind payload in
     /// `Backdrop::payloads` before running any setup.
     #[test]
     fn run_scenario_rejects_scheduler_kind_backdrop_payload() {

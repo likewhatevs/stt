@@ -1,5 +1,5 @@
-// #62: an unrecognized constructor inside #[default_check(...)]
-// must fail to compile — the macro prepends
+// An unrecognized constructor inside #[default_check(...)] must
+// fail to compile — the macro prepends
 // `::ktstr::test_support::Check::` so a typo like
 // `nonexistent_check(...)` resolves to
 // `::ktstr::test_support::Check::nonexistent_check(...)`, which

@@ -210,7 +210,7 @@ fn derive_payload_default_checks_resolve_all_constructors() {
     ));
 }
 
-/// #62: both bare (`min(...)`) and qualified (`Check::min(...)`)
+/// Both bare (`min(...)`) and qualified (`Check::min(...)`)
 /// constructor forms must resolve to the same generated `Check::...`
 /// variant. The macro detects the explicit `Check` segment on the
 /// callee path and skips its implicit `::ktstr::test_support::Check::`
@@ -241,7 +241,7 @@ fn derive_payload_accepts_qualified_check_prefix() {
     ));
 }
 
-/// #60: Explicit `output = ExitCode` must parse through the same
+/// Explicit `output = ExitCode` must parse through the same
 /// PascalCase output grammar as `Json` / `LlmExtract` and emit a
 /// Payload whose `.output == OutputFormat::ExitCode`. The default
 /// (no `output =` kwarg) also lands at `ExitCode`, but a future
@@ -263,7 +263,7 @@ fn derive_payload_explicit_exit_code_output() {
     ));
 }
 
-/// #62: the fully-qualified crate path
+/// The fully-qualified crate path
 /// `::ktstr::test_support::Check::min(...)` must also resolve
 /// through the same prefix-detection branch as the shorter
 /// `Check::min(...)` form. `expr_has_check_prefix` scans every
