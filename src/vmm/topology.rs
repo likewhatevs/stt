@@ -266,7 +266,8 @@ impl NumaDistance {
     }
 }
 
-/// Formats as `NnNlNcNt` — e.g. `1n2l4c2t` (1 NUMA node, 2 LLCs, 4 cores, 2 threads).
+/// Formats as `{numa}n{llcs}l{cores}c{threads}t` — e.g. `1n2l4c2t` =
+/// 1 NUMA node, 2 LLCs, 4 cores/LLC, 2 threads/core.
 impl std::fmt::Display for Topology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -535,6 +536,11 @@ impl Topology {
     ///
     /// With explicit nodes, walks the node list to find the owning node.
     /// With uniform distribution, computes `llc_id / llcs_per_node`.
+    ///
+    /// Out-of-bounds `llc_id` (>= total LLCs): with explicit nodes,
+    /// saturates to the last node index; with uniform distribution, no
+    /// bounds check — returns `llc_id / llcs_per_node`, which may
+    /// exceed `numa_nodes - 1`.
     pub fn numa_node_of(&self, llc_id: u32) -> u32 {
         match &self.nodes {
             Some(nodes) => {
@@ -555,6 +561,11 @@ impl Topology {
     }
 
     /// First LLC index owned by NUMA node `node_id`.
+    ///
+    /// Panics if `node_id > numa_nodes` for explicit-node topologies
+    /// (the walk would index past the end of the node slice). Uniform
+    /// topologies do not bounds-check and return `node_id *
+    /// llcs_per_node` for any input.
     pub fn first_llc_in_node(&self, node_id: u32) -> u32 {
         match &self.nodes {
             Some(nodes) => {

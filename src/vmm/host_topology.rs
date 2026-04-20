@@ -92,6 +92,11 @@ impl HostTopology {
     }
 
     /// NUMA nodes used by the given set of host CPUs.
+    ///
+    /// Returns the sorted, deduplicated set of NUMA node IDs that own
+    /// the given CPUs. CPUs absent from `cpu_to_node` fall back to
+    /// node 0 — matches the single-node-system assumption used
+    /// elsewhere in this module (see [`llc_numa_node`](Self::llc_numa_node)).
     pub fn numa_nodes_for_cpus(&self, cpus: &[usize]) -> Vec<usize> {
         let mut nodes: Vec<usize> = cpus
             .iter()
