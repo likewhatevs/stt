@@ -2,10 +2,11 @@ use anyhow::Result;
 use ktstr::assert::{Assert, AssertResult};
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
-use ktstr::test_support::{KtstrTestEntry, Scheduler, SchedulerSpec};
+use ktstr::test_support::{KtstrTestEntry, Payload, Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
     let steps = vec![Step {
@@ -39,7 +40,7 @@ macro_rules! gate_test {
         static $name: KtstrTestEntry = KtstrTestEntry {
             name: stringify!($name),
             func: $name::scenario,
-            scheduler: &KTSTR_SCHED,
+            scheduler: &KTSTR_SCHED_PAYLOAD,
             auto_repro: false,
             performance_mode: $perf,
             extra_sched_args: if $neg { &["--degrade"] } else { &[] },

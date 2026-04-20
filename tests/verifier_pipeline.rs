@@ -2,7 +2,7 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
-use ktstr::test_support::{KtstrTestEntry, Scheduler, SchedulerSpec};
+use ktstr::test_support::{KtstrTestEntry, Payload, Scheduler, SchedulerSpec};
 
 /// Build a scheduler package and resolve paths for verifier tests.
 /// Returns `Ok(None)` when no kernel is available (CI without a custom
@@ -116,6 +116,7 @@ static __KTSTR_ENTRY_CYCLE_COLLAPSE: KtstrTestEntry = KtstrTestEntry {
 
 const FAIL_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+const FAIL_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&FAIL_SCHED);
 
 fn scenario_fail_verify(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
@@ -131,7 +132,7 @@ fn scenario_fail_verify(ctx: &Ctx) -> Result<AssertResult> {
 static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_fail_verify",
     func: scenario_fail_verify,
-    scheduler: &FAIL_SCHED,
+    scheduler: &FAIL_SCHED_PAYLOAD,
     extra_sched_args: &["--fail-verify"],
     duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 2,
@@ -143,7 +144,7 @@ static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
 static __KTSTR_ENTRY_VERIFY_REJECT: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_cycle_collapse",
     func: scenario_fail_verify,
-    scheduler: &FAIL_SCHED,
+    scheduler: &FAIL_SCHED_PAYLOAD,
     extra_sched_args: &["--verify-loop"],
     duration: std::time::Duration::from_secs(5),
     workers_per_cgroup: 2,

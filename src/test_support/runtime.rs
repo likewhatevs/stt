@@ -30,7 +30,7 @@ pub(crate) const KTSTR_TEST_SHM_SIZE: u64 = 16 * 1024 * 1024;
 /// Derive initramfs archive path, host path, and guest path from a
 /// scheduler's `config_file`. Returns `None` when no config file is set.
 pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
-    let config_path = entry.scheduler.config_file?;
+    let config_path = entry.scheduler.config_file()?;
     let file_name = Path::new(config_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -47,10 +47,10 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
 /// `attempt_auto_repro`) previously re-implemented side-by-side.
 pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     let mut parts = vec!["iomem=relaxed".to_string()];
-    for s in entry.scheduler.sysctls {
+    for s in entry.scheduler.sysctls() {
         parts.push(format!("sysctl.{}={}", s.key, s.value));
     }
-    for &karg in entry.scheduler.kargs {
+    for &karg in entry.scheduler.kargs() {
         parts.push(karg.to_string());
     }
     if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
@@ -98,25 +98,27 @@ pub(crate) fn resolve_vm_topology(
 /// does, probe-only repro pipelines that already pass `include_files`
 /// can skip it).
 pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<String>) {
-    if let Some(ref cgroup_path) = entry.scheduler.cgroup_parent {
+    if let Some(cgroup_path) = entry.scheduler.cgroup_parent() {
         args.push("--cell-parent-cgroup".to_string());
         args.push(cgroup_path.to_string());
     }
-    args.extend(entry.scheduler.sched_args.iter().map(|s| s.to_string()));
+    args.extend(entry.scheduler.sched_args().iter().map(|s| s.to_string()));
     args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::entry::Scheduler;
+    use super::super::payload::Payload;
     use super::*;
 
     #[test]
     fn config_file_parts_nested_path() {
         static SCHED: Scheduler = Scheduler::new("cfg").config_file("configs/my_sched.toml");
+        static SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SCHED);
         let entry = KtstrTestEntry {
             name: "cfg_test",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
         let (archive, host, guest) = config_file_parts(&entry).unwrap();
@@ -128,9 +130,10 @@ mod tests {
     #[test]
     fn config_file_parts_bare_filename() {
         static SCHED: Scheduler = Scheduler::new("cfg").config_file("config.toml");
+        static SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SCHED);
         let entry = KtstrTestEntry {
             name: "cfg_bare",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
         let (archive, host, guest) = config_file_parts(&entry).unwrap();
@@ -199,9 +202,10 @@ mod tests {
 
         static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.foo", "1")];
         static SCHED: Scheduler = Scheduler::new("s").sysctls(SYSCTLS).kargs(&["quiet"]);
+        static SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SCHED);
         let entry = KtstrTestEntry {
             name: "cmd",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
         let out = build_cmdline_extra(&entry);
@@ -332,12 +336,13 @@ mod tests {
         static SCHED: Scheduler = Scheduler::new("s")
             .cgroup_parent("/sys/fs/cgroup/ktstr")
             .sched_args(&["-v", "--flag"]);
+        static SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SCHED);
         // Touch the static so the compiler doesn't drop it; verifies
         // the path we store matches what cgroup_parent produces.
         let _ = &CG;
         let entry = KtstrTestEntry {
             name: "sched",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             extra_sched_args: &["--extra"],
             ..KtstrTestEntry::DEFAULT
         };

@@ -162,7 +162,7 @@ enum FlagAttrsTestFlag {
 
 /// Test with required_flags and excluded_flags attributes.
 #[ktstr_test(
-    scheduler = FLAG_ATTRS_TEST,
+    scheduler = FLAG_ATTRS_TEST_PAYLOAD,
     required_flags = ["borrow", "rebal"],
     excluded_flags = ["steal"]
 )]
@@ -240,7 +240,7 @@ fn entry_max_constraints_match_attrs() {
 enum ConstrainedSchedFlag {}
 
 /// Inherits constraints from CONSTRAINED_SCHED without overriding.
-#[ktstr_test(scheduler = CONSTRAINED_SCHED)]
+#[ktstr_test(scheduler = CONSTRAINED_SCHED_PAYLOAD)]
 fn inherit_sched_constraints(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -260,7 +260,7 @@ fn entry_inherit_sched_constraints() {
 }
 
 /// Overrides max_llcs from the scheduler while inheriting everything else.
-#[ktstr_test(scheduler = CONSTRAINED_SCHED, max_llcs = 16)]
+#[ktstr_test(scheduler = CONSTRAINED_SCHED_PAYLOAD, max_llcs = 16)]
 fn override_sched_constraint(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -280,9 +280,11 @@ fn entry_override_sched_constraint() {
 /// not scheduler behavior.
 const TOPO_SCHED: ktstr::test_support::Scheduler =
     ktstr::test_support::Scheduler::new("topo_test").topology(1, 2, 3, 1);
+const TOPO_SCHED_PAYLOAD: ktstr::test_support::Payload =
+    ktstr::test_support::Payload::from_scheduler(&TOPO_SCHED);
 
 /// Full topology inheritance: all three dimensions from TOPO_SCHED.
-#[ktstr_test(scheduler = TOPO_SCHED)]
+#[ktstr_test(scheduler = TOPO_SCHED_PAYLOAD)]
 fn topo_inherit_full(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -290,7 +292,7 @@ fn topo_inherit_full(ctx: &Ctx) -> Result<AssertResult> {
 
 /// Partial topology inheritance: threads overridden, LLCs and cores
 /// inherited from TOPO_SCHED.
-#[ktstr_test(scheduler = TOPO_SCHED, threads = 2)]
+#[ktstr_test(scheduler = TOPO_SCHED_PAYLOAD, threads = 2)]
 fn topo_inherit_partial(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -453,7 +455,7 @@ fn derive_profiles_respect_requires() {
 
 /// Verify typed flag refs work in #[ktstr_test] required_flags.
 #[ktstr_test(
-    scheduler = TEST_DERIVE,
+    scheduler = TEST_DERIVE_PAYLOAD,
     required_flags = [TestDeriveFlag::ALPHA, TestDeriveFlag::BETA],
     excluded_flags = [TestDeriveFlag::GAMMA_DELTA]
 )]
@@ -472,7 +474,7 @@ fn entry_typed_flags_match() {
 
 /// Verify mixed string/path flag refs work.
 #[ktstr_test(
-    scheduler = TEST_DERIVE,
+    scheduler = TEST_DERIVE_PAYLOAD,
     required_flags = ["alpha", TestDeriveFlag::BETA]
 )]
 fn mixed_flags_compile(ctx: &Ctx) -> Result<AssertResult> {
@@ -488,7 +490,7 @@ fn entry_mixed_flags_match() {
 }
 
 /// Verify topology inheritance from derived scheduler.
-#[ktstr_test(scheduler = TEST_DERIVE)]
+#[ktstr_test(scheduler = TEST_DERIVE_PAYLOAD)]
 fn derive_topo_inherit(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())

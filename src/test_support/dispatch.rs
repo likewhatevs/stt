@@ -518,7 +518,7 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
     let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/ktstr");
     let workers_per_cgroup = entry.workers_per_cgroup as usize;
     let merged_assert = crate::assert::Assert::default_checks()
-        .merge(&entry.scheduler.assert)
+        .merge(entry.scheduler.assert())
         .merge(&entry.assert);
     let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
         .duration(entry.duration)

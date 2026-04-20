@@ -519,9 +519,19 @@ pub struct KtstrTestEntry {
     pub constraints: TopologyConstraints,
     /// Guest memory in MB.
     pub memory_mb: u32,
-    /// Scheduler definition to load inside the guest. Defaults to
-    /// `Scheduler::EEVDF` (no scx scheduler).
-    pub scheduler: &'static Scheduler,
+    /// Primary payload that drives the test. Defaults to
+    /// `Payload::EEVDF` (the no-scx-scheduler placeholder).
+    ///
+    /// For scheduler-centric tests this is a scheduler-kind
+    /// `Payload` (typically the `{NAME}_PAYLOAD` wrapper emitted by
+    /// `#[derive(Scheduler)]`); for pure binary workloads it is a
+    /// binary-kind `Payload` built via `#[derive(Payload)]`. The
+    /// slot accepts either because `Payload` is the unified
+    /// primitive — callers that need scheduler-specific fields go
+    /// through forwarding accessors like
+    /// [`Payload::sysctls`](crate::test_support::Payload::sysctls)
+    /// which return empty slices for binary-kind values.
+    pub scheduler: &'static crate::test_support::Payload,
     /// Optional binary payload to run as the primary workload. When
     /// `Some`, the test runs the referenced [`Payload`](crate::test_support::Payload)
     /// (which must be [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary))
@@ -626,7 +636,7 @@ impl KtstrTestEntry {
     /// static ENTRY: KtstrTestEntry = KtstrTestEntry {
     ///     name: "my_test",
     ///     func: my_test_fn,
-    ///     scheduler: &Scheduler::EEVDF,
+    ///     scheduler: &crate::test_support::Payload::EEVDF,
     ///     ..KtstrTestEntry::DEFAULT
     /// };
     /// ```
@@ -643,7 +653,7 @@ impl KtstrTestEntry {
         },
         constraints: TopologyConstraints::DEFAULT,
         memory_mb: 2048,
-        scheduler: &Scheduler::EEVDF,
+        scheduler: &crate::test_support::Payload::EEVDF,
         payload: None,
         workloads: &[],
         auto_repro: true,
@@ -769,11 +779,12 @@ pub fn find_test(name: &str) -> Option<&'static KtstrTestEntry> {
 ///   (whose error reporting is much weaker than a panic's backtrace).
 ///   The panic IS the actionable feedback path.
 pub(crate) fn validate_entry_flags(entry: &KtstrTestEntry) {
-    if entry.scheduler.flags.is_empty() {
+    if entry.scheduler.flags().is_empty() {
         if !entry.required_flags.is_empty() || !entry.excluded_flags.is_empty() {
             panic!(
                 "ktstr_test: '{}' specifies flags but scheduler '{}' has no flag declarations",
-                entry.name, entry.scheduler.name,
+                entry.name,
+                entry.scheduler.scheduler_name(),
             );
         }
         return;
@@ -785,7 +796,7 @@ pub(crate) fn validate_entry_flags(entry: &KtstrTestEntry) {
                 "ktstr_test: '{}' references unknown required_flag '{}'; valid flags for scheduler '{}': {}",
                 entry.name,
                 flag,
-                entry.scheduler.name,
+                entry.scheduler.scheduler_name(),
                 valid.join(", "),
             );
         }
@@ -796,7 +807,7 @@ pub(crate) fn validate_entry_flags(entry: &KtstrTestEntry) {
                 "ktstr_test: '{}' references unknown excluded_flag '{}'; valid flags for scheduler '{}': {}",
                 entry.name,
                 flag,
-                entry.scheduler.name,
+                entry.scheduler.scheduler_name(),
                 valid.join(", "),
             );
         }
@@ -846,9 +857,9 @@ mod tests {
         assert!(d.topology.distances.is_none());
         assert_eq!(d.constraints, TopologyConstraints::DEFAULT);
         assert_eq!(d.memory_mb, 2048);
-        // scheduler defaults to the crate's &Scheduler::EEVDF.
-        assert_eq!(d.scheduler.name, "eevdf");
-        assert!(!d.scheduler.binary.has_active_scheduling());
+        // scheduler defaults to the crate's &Payload::EEVDF.
+        assert_eq!(d.scheduler.scheduler_name(), "eevdf");
+        assert!(!d.scheduler.has_active_scheduling());
         assert!(d.auto_repro);
         assert!(d.extra_sched_args.is_empty());
         assert_eq!(d.watchdog_timeout, Duration::from_secs(4));
@@ -1428,9 +1439,17 @@ mod tests {
     #[should_panic(expected = "unknown required_flag")]
     fn validate_entry_flags_unknown_required() {
         static SCHED: Scheduler = Scheduler::new("sched").flags(FLAGS_AB);
+        static SCHED_PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
+            name: "sched",
+            kind: crate::test_support::PayloadKind::Scheduler(&SCHED),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
         let entry = KtstrTestEntry {
             name: "bad_required",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             required_flags: &["nonexistent"],
             ..KtstrTestEntry::DEFAULT
         };
@@ -1441,9 +1460,17 @@ mod tests {
     #[should_panic(expected = "in both required_flags and excluded_flags")]
     fn validate_entry_flags_both_required_and_excluded() {
         static SCHED: Scheduler = Scheduler::new("sched").flags(FLAGS_AB);
+        static SCHED_PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
+            name: "sched",
+            kind: crate::test_support::PayloadKind::Scheduler(&SCHED),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
         let entry = KtstrTestEntry {
             name: "bad_both",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             required_flags: &["a"],
             excluded_flags: &["a"],
             ..KtstrTestEntry::DEFAULT

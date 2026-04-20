@@ -572,7 +572,7 @@ fn build_dispatch_ctx_parts(
         .unwrap_or(0);
     // Three-layer merge: default_checks → scheduler.assert → entry.assert.
     let merged_assert = crate::assert::Assert::default_checks()
-        .merge(&entry.scheduler.assert)
+        .merge(entry.scheduler.assert())
         .merge(&entry.assert);
     (topo, cgroups, sched_pid, merged_assert)
 }

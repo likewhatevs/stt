@@ -69,7 +69,10 @@ pub(crate) fn run_ktstr_test_inner(
     }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
-    let scheduler = resolve_scheduler(&entry.scheduler.binary)?;
+    let scheduler = match entry.scheduler.scheduler_binary() {
+        Some(b) => resolve_scheduler(b)?,
+        None => None,
+    };
     let ktstr_bin = crate::resolve_current_exe()?;
 
     let guest_args = vec![
@@ -97,17 +100,19 @@ pub(crate) fn run_ktstr_test_inner(
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
     let merged_assert = crate::assert::Assert::default_checks()
-        .merge(&entry.scheduler.assert)
+        .merge(entry.scheduler.assert())
         .merge(&entry.assert);
 
     if let Some(ref sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);
     }
-    if let SchedulerSpec::KernelBuiltin { enable, disable } = &entry.scheduler.binary {
+    if let Some(SchedulerSpec::KernelBuiltin { enable, disable }) =
+        entry.scheduler.scheduler_binary()
+    {
         builder = builder.sched_enable_cmds(enable);
         builder = builder.sched_disable_cmds(disable);
     }
-    if entry.scheduler.binary.has_active_scheduling() {
+    if entry.scheduler.has_active_scheduling() {
         builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
     }
 
@@ -182,9 +187,7 @@ pub(crate) fn run_ktstr_test_inner(
 
     // When running with a struct_ops scheduler, verify that host-side
     // BPF program enumeration found programs with non-zero verified_insns.
-    if entry.scheduler.binary.has_active_scheduling()
-        && result.success
-        && result.verifier_stats.is_empty()
+    if entry.scheduler.has_active_scheduling() && result.success && result.verifier_stats.is_empty()
     {
         eprintln!("ktstr_test: WARNING: scheduler loaded but verifier_stats is empty");
     }
@@ -300,7 +303,10 @@ fn evaluate_vm_result(
         .as_ref()
         .map(|m| crate::timeline::Timeline::build(stimulus_events, &m.samples));
 
-    let sched_label = scheduler_label(&entry.scheduler.binary);
+    let sched_label = match entry.scheduler.scheduler_binary() {
+        Some(b) => scheduler_label(b),
+        None => String::new(),
+    };
     let output = &result.output;
     let dump_section = extract_sched_ext_dump(&result.stderr)
         .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
@@ -324,7 +330,7 @@ fn evaluate_vm_result(
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
         topology: Some(format!("{topo} ({} cpus)", topo.total_cpus())),
-        scheduler: Some(entry.scheduler.name.to_string()),
+        scheduler: Some(entry.scheduler.scheduler_name().to_string()),
         scenario: Some(entry.name.to_string()),
         duration_s: Some(result.duration.as_secs_f64()),
     };
@@ -340,7 +346,7 @@ fn evaluate_vm_result(
             .unwrap_or_default()
     };
     let build_monitor_section = || -> String {
-        if entry.scheduler.binary.has_active_scheduling()
+        if entry.scheduler.has_active_scheduling()
             && let Some(ref monitor) = result.monitor
         {
             format_monitor_section(monitor, merged_assert)
@@ -378,7 +384,7 @@ fn evaluate_vm_result(
                 .map(|d| d.message.as_str())
                 .collect::<Vec<_>>()
                 .join("\n  ");
-            let repro = if entry.scheduler.binary.has_active_scheduling() {
+            let repro = if entry.scheduler.has_active_scheduling() {
                 repro_fn(output)
             } else {
                 None
@@ -451,7 +457,7 @@ fn evaluate_vm_result(
         // and initramfs unpacking the scheduler tick may not fire for hundreds
         // of milliseconds. These transient stalls are real but not indicative
         // of scheduler bugs.
-        if entry.scheduler.binary.has_active_scheduling()
+        if entry.scheduler.has_active_scheduling()
             && let Some(ref monitor) = result.monitor
         {
             let eval_report = trim_settle_samples(monitor);
@@ -489,7 +495,7 @@ fn evaluate_vm_result(
     // stalls all land here. Previous code required specific string patterns
     // ("SCHEDULER_DIED", "sched_ext:" + "disabled") which missed mid-test
     // deaths where the sched_exit_monitor writes to SHM but not COM2.
-    let repro_section = if entry.scheduler.binary.has_active_scheduling() {
+    let repro_section = if entry.scheduler.has_active_scheduling() {
         repro_fn(output)
             .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
             .unwrap_or_default()
@@ -536,7 +542,7 @@ fn evaluate_vm_result(
         format!("guest crashed:\n{shm_crash}")
     } else if let Some(crash_msg) = extract_panic_message(output) {
         format!("guest crashed: {crash_msg}")
-    } else if entry.scheduler.binary.has_active_scheduling() {
+    } else if entry.scheduler.has_active_scheduling() {
         "no test result received from guest \
          (scheduler may have crashed, or guest output was lost \
          before reaching the host)"

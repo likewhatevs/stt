@@ -477,16 +477,16 @@ pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
 /// change to the sidecar schema (e.g. a new scheduler-level field)
 /// shows up in all writers automatically.
 fn scheduler_fingerprint(entry: &KtstrTestEntry) -> (String, Vec<String>, Vec<String>) {
-    let sched_name = entry.scheduler.binary.display_name().to_string();
+    let sched_name = entry.scheduler.scheduler_name().to_string();
     let sysctls: Vec<String> = entry
         .scheduler
-        .sysctls
+        .sysctls()
         .iter()
         .map(|s| format!("sysctl.{}={}", s.key, s.value))
         .collect();
     let kargs: Vec<String> = entry
         .scheduler
-        .kargs
+        .kargs()
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -1467,13 +1467,15 @@ mod tests {
         ];
         static SCHED: super::super::entry::Scheduler =
             super::super::entry::Scheduler::new("s").sysctls(SYSCTLS);
+        static SCHED_PAYLOAD: super::super::payload::Payload =
+            super::super::payload::Payload::from_scheduler(&SCHED);
         let entry = KtstrTestEntry {
             name: "s_test",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
         let (name, sysctls, kargs) = scheduler_fingerprint(&entry);
-        assert_eq!(name, "eevdf");
+        assert_eq!(name, "s");
         assert_eq!(
             sysctls,
             vec![
@@ -1488,9 +1490,11 @@ mod tests {
     fn scheduler_fingerprint_forwards_kargs_verbatim() {
         static SCHED: super::super::entry::Scheduler =
             super::super::entry::Scheduler::new("s").kargs(&["quiet", "splash"]);
+        static SCHED_PAYLOAD: super::super::payload::Payload =
+            super::super::payload::Payload::from_scheduler(&SCHED);
         let entry = KtstrTestEntry {
             name: "s_test",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
         let (_name, sysctls, kargs) = scheduler_fingerprint(&entry);
@@ -1503,13 +1507,15 @@ mod tests {
         use super::super::entry::SchedulerSpec;
         static SCHED: super::super::entry::Scheduler =
             super::super::entry::Scheduler::new("s").binary(SchedulerSpec::Discover("scx_relaxed"));
+        static SCHED_PAYLOAD: super::super::payload::Payload =
+            super::super::payload::Payload::from_scheduler(&SCHED);
         let entry = KtstrTestEntry {
             name: "rel_test",
-            scheduler: &SCHED,
+            scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
         let (name, _, _) = scheduler_fingerprint(&entry);
-        assert_eq!(name, "scx_relaxed");
+        assert_eq!(name, "s");
     }
 
     // -- write_skip_sidecar --

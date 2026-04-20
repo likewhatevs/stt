@@ -145,6 +145,202 @@ impl Payload {
     pub const fn is_scheduler(&self) -> bool {
         matches!(self.kind, PayloadKind::Scheduler(_))
     }
+
+    /// Minimal const wrapper: build a `Payload` that references an
+    /// existing `&'static Scheduler`. Used by unit tests and by the
+    /// `#[derive(Scheduler)]` wrapper emission to produce the
+    /// `{CONST}_PAYLOAD` const alongside the Scheduler const. Copies
+    /// the scheduler's `name` into the payload's `name` so the two
+    /// surfaces render with matching identity.
+    pub const fn from_scheduler(sched: &'static Scheduler) -> Payload {
+        Payload {
+            name: sched.name,
+            kind: PayloadKind::Scheduler(sched),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Scheduler-slot forwarding accessors
+    //
+    // These methods let every site that consumed `entry.scheduler:
+    // &Scheduler` read the equivalent field off `entry.scheduler:
+    // &Payload` without the caller having to unwrap
+    // `as_scheduler()`. For a scheduler-kind payload the accessor
+    // forwards to the inner `Scheduler`. For a binary-kind payload
+    // the accessor returns a sensible default — usually the empty
+    // slice or the no-op value — matching the semantics a binary
+    // payload in the scheduler slot should carry (no sysctls, no
+    // kargs, no scheduler-specific CLI flags).
+    //
+    // The binary-kind branch is not "best effort": a binary payload
+    // in the scheduler slot is a valid configuration (pure userspace
+    // test under the kernel default scheduler), and every accessor
+    // below returns exactly what that scenario should see.
+    // -----------------------------------------------------------------
+
+    /// The scheduler's display name. For scheduler-kind payloads this
+    /// is the inner `Scheduler::name`; for binary-kind it is
+    /// `"eevdf"` (a binary payload runs under the kernel default).
+    pub const fn scheduler_name(&self) -> &'static str {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.name,
+            PayloadKind::Binary(_) => "eevdf",
+        }
+    }
+
+    /// The scheduler's binary spec when scheduler-kind; `None` for
+    /// binary-kind payloads. Consumers that dispatch on the
+    /// `SchedulerSpec` variant (e.g. `KernelBuiltin { enable, disable }`
+    /// hook invocation) use this rather than the `scheduler_name`
+    /// shortcut.
+    pub const fn scheduler_binary(&self) -> Option<&'static crate::test_support::SchedulerSpec> {
+        match self.kind {
+            PayloadKind::Scheduler(s) => Some(&s.binary),
+            PayloadKind::Binary(_) => None,
+        }
+    }
+
+    /// True when this payload drives an active scheduling policy
+    /// (anything other than the kernel default EEVDF). Forwards to
+    /// `SchedulerSpec::has_active_scheduling` for scheduler-kind
+    /// payloads; binary-kind payloads always return `false` — a
+    /// binary runs under whatever scheduler the test declares, and
+    /// does not itself impose one.
+    pub const fn has_active_scheduling(&self) -> bool {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.binary.has_active_scheduling(),
+            PayloadKind::Binary(_) => false,
+        }
+    }
+
+    /// Scheduler flag declarations. Empty slice for binary-kind
+    /// payloads (binaries have no scheduler flags).
+    pub const fn flags(&self) -> &'static [&'static crate::scenario::flags::FlagDecl] {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.flags,
+            PayloadKind::Binary(_) => &[],
+        }
+    }
+
+    /// Guest sysctls applied before the scheduler starts. Empty slice
+    /// for binary-kind payloads.
+    pub const fn sysctls(&self) -> &'static [crate::test_support::Sysctl] {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.sysctls,
+            PayloadKind::Binary(_) => &[],
+        }
+    }
+
+    /// Extra guest kernel command-line arguments appended when
+    /// booting the VM. Empty slice for binary-kind payloads.
+    pub const fn kargs(&self) -> &'static [&'static str] {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.kargs,
+            PayloadKind::Binary(_) => &[],
+        }
+    }
+
+    /// Scheduler CLI args prepended before per-test `extra_sched_args`.
+    /// Empty slice for binary-kind payloads.
+    pub const fn sched_args(&self) -> &'static [&'static str] {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.sched_args,
+            PayloadKind::Binary(_) => &[],
+        }
+    }
+
+    /// Cgroup parent path. `None` for binary-kind payloads and for
+    /// scheduler-kind payloads that did not set one.
+    pub const fn cgroup_parent(&self) -> Option<crate::test_support::CgroupPath> {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.cgroup_parent,
+            PayloadKind::Binary(_) => None,
+        }
+    }
+
+    /// Host-side path to the scheduler config file. `None` for
+    /// binary-kind payloads and for scheduler-kind payloads that
+    /// did not set one.
+    pub const fn config_file(&self) -> Option<&'static str> {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.config_file,
+            PayloadKind::Binary(_) => None,
+        }
+    }
+
+    /// Scheduler-wide assertion overrides. For binary-kind payloads
+    /// returns `Assert::NO_OVERRIDES` — the default identity value
+    /// merge that leaves per-entry assertions untouched.
+    pub const fn assert(&self) -> &'static crate::assert::Assert {
+        match self.kind {
+            PayloadKind::Scheduler(s) => &s.assert,
+            PayloadKind::Binary(_) => &crate::assert::Assert::NO_OVERRIDES,
+        }
+    }
+
+    /// Names of all scheduler flags the scheduler-kind payload
+    /// supports. Empty for binary-kind.
+    pub fn supported_flag_names(&self) -> Vec<&'static str> {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.supported_flag_names(),
+            PayloadKind::Binary(_) => Vec::new(),
+        }
+    }
+
+    /// Extra CLI args associated with a scheduler flag. Always
+    /// `None` for binary-kind.
+    pub fn flag_args(&self, name: &str) -> Option<&'static [&'static str]> {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.flag_args(name),
+            PayloadKind::Binary(_) => None,
+        }
+    }
+
+    /// Default VM topology for this payload. Scheduler-kind payloads
+    /// expose the topology declared on the inner `Scheduler` so tests
+    /// that inherit from the scheduler slot stay consistent with the
+    /// rest of the scheduler's test surface; binary-kind payloads
+    /// return a minimal placeholder
+    /// ([`Topology::DEFAULT_FOR_PAYLOAD`](crate::test_support::Topology::DEFAULT_FOR_PAYLOAD))
+    /// — a pure binary workload has no scheduler-level topology
+    /// opinion, so per-entry `#[ktstr_test(...)]` overrides are what
+    /// actually drive the VM shape.
+    pub const fn topology(&self) -> crate::test_support::Topology {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.topology,
+            PayloadKind::Binary(_) => crate::test_support::Topology::DEFAULT_FOR_PAYLOAD,
+        }
+    }
+
+    /// Gauntlet topology constraints. Scheduler-kind payloads forward
+    /// to the inner `Scheduler::constraints`; binary-kind payloads
+    /// return [`TopologyConstraints::DEFAULT`].
+    pub const fn constraints(&self) -> crate::test_support::TopologyConstraints {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.constraints,
+            PayloadKind::Binary(_) => crate::test_support::TopologyConstraints::DEFAULT,
+        }
+    }
+
+    /// Generate scheduler-flag profiles for gauntlet expansion.
+    /// Forwards to [`Scheduler::generate_profiles`] for scheduler-kind
+    /// payloads; returns a single empty profile for binary-kind (a
+    /// binary has no scheduler flags, and the gauntlet expander still
+    /// wants one profile to run the test under).
+    pub fn generate_profiles(
+        &self,
+        required: &[&'static str],
+        excluded: &[&'static str],
+    ) -> Vec<crate::scenario::FlagProfile> {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.generate_profiles(required, excluded),
+            PayloadKind::Binary(_) => vec![crate::scenario::FlagProfile { flags: Vec::new() }],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -278,6 +278,22 @@ impl std::fmt::Display for Topology {
 }
 
 impl Topology {
+    /// Fallback topology used by
+    /// [`Payload::topology`](crate::test_support::Payload::topology)
+    /// for binary-kind payloads that have no scheduler-side topology
+    /// opinion. Matches the inline default previously baked into
+    /// [`KtstrTestEntry::DEFAULT`](crate::test_support::KtstrTestEntry::DEFAULT):
+    /// 1 NUMA node / 1 LLC / 2 cores / 1 thread (2 CPUs total), the
+    /// smallest VM shape that runs the harness meaningfully.
+    pub const DEFAULT_FOR_PAYLOAD: Topology = Topology {
+        llcs: 1,
+        cores_per_llc: 2,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+
     /// Validated const constructor for uniform topologies.
     ///
     /// Produces a topology where LLCs and memory are distributed evenly

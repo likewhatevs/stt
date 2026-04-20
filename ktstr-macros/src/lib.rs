@@ -743,25 +743,31 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    // Build the scheduler reference token
+    // Build the scheduler reference token. The `scheduler` slot on
+    // `KtstrTestEntry` is `&'static Payload`; callers pass either a
+    // `{NAME}_PAYLOAD` wrapper emitted by `#[derive(Scheduler)]` or
+    // `Payload::EEVDF` directly. The default is the kernel-default
+    // placeholder.
     let scheduler_tokens = match &scheduler {
         Some(p) => {
             quote! { &#p }
         }
         None => {
-            quote! { &::ktstr::test_support::Scheduler::EEVDF }
+            quote! { &::ktstr::test_support::Payload::EEVDF }
         }
     };
 
     // Build topology tokens. Each dimension independently inherits from
-    // the scheduler's topology when not explicitly set. Scheduler
-    // topology fields are const, so field access is valid in static
-    // initializers.
+    // the scheduler payload's topology when not explicitly set.
+    // `Payload::topology()` is a `const fn` that returns the inner
+    // scheduler's `Topology` for scheduler-kind payloads and
+    // `Topology::DEFAULT_FOR_PAYLOAD` for binary-kind, so the field
+    // access below remains valid inside a `const` initializer.
     let llcs_tokens = if llcs_set {
         let l = llcs;
         quote! { #l }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology.llcs }
+        quote! { #p.topology().llcs }
     } else {
         let l = llcs;
         quote! { #l }
@@ -770,7 +776,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let c = cores;
         quote! { #c }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology.cores_per_llc }
+        quote! { #p.topology().cores_per_llc }
     } else {
         let c = cores;
         quote! { #c }
@@ -779,7 +785,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = threads;
         quote! { #t }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology.threads_per_core }
+        quote! { #p.topology().threads_per_core }
     } else {
         let t = threads;
         quote! { #t }
@@ -788,7 +794,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let n = numa_nodes;
         quote! { #n }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology.numa_nodes }
+        quote! { #p.topology().numa_nodes }
     } else {
         let n = numa_nodes;
         quote! { #n }
@@ -876,7 +882,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let v = min_numa_nodes;
         quote! { #v }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints.min_numa_nodes }
+        quote! { #p.constraints().min_numa_nodes }
     } else {
         let v = min_numa_nodes;
         quote! { #v }
@@ -885,7 +891,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = option_tokens(&max_numa_nodes);
         quote! { #t }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints.max_numa_nodes }
+        quote! { #p.constraints().max_numa_nodes }
     } else {
         let t = option_tokens(&max_numa_nodes);
         quote! { #t }
@@ -894,7 +900,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let v = min_llcs;
         quote! { #v }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints.min_llcs }
+        quote! { #p.constraints().min_llcs }
     } else {
         let v = min_llcs;
         quote! { #v }
@@ -903,7 +909,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = option_tokens(&max_llcs);
         quote! { #t }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints.max_llcs }
+        quote! { #p.constraints().max_llcs }
     } else {
         let t = option_tokens(&max_llcs);
         quote! { #t }
@@ -911,7 +917,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let requires_smt_tokens = if requires_smt_set {
         quote! { #requires_smt }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints.requires_smt }
+        quote! { #p.constraints().requires_smt }
     } else {
         quote! { #requires_smt }
     };
@@ -919,7 +925,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let v = min_cpus;
         quote! { #v }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints.min_cpus }
+        quote! { #p.constraints().min_cpus }
     } else {
         let v = min_cpus;
         quote! { #v }
@@ -928,7 +934,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = option_tokens(&max_cpus);
         quote! { #t }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints.max_cpus }
+        quote! { #p.constraints().max_cpus }
     } else {
         let t = option_tokens(&max_cpus);
         quote! { #t }

@@ -2,10 +2,11 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
+use ktstr::test_support::{BpfMapWrite, Payload, Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 // -- basic --
 
@@ -14,7 +15,7 @@ fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_cgroup_pipe_io(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
@@ -85,14 +86,14 @@ fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15)]
 fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
 }
 
 // -- dynamic --
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::dynamic::custom_cgroup_add_midrun(ctx)
 }
@@ -129,7 +130,7 @@ fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_add_load_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }
@@ -169,7 +170,7 @@ fn cover_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_noctrl_load_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
 fn cover_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_io_compute_imbalance(ctx)
 }
@@ -268,7 +269,7 @@ fn cover_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
 // -- watchdog timeout overwrite --
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED,
+    scheduler = KTSTR_SCHED_PAYLOAD,
     llcs = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_s = 60,
     max_imbalance_ratio = 10.0,
@@ -329,7 +330,7 @@ static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
         nodes: None,
         distances: None,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &KTSTR_SCHED_PAYLOAD,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(2),
     performance_mode: true,
@@ -350,7 +351,7 @@ static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
         nodes: None,
         distances: None,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &KTSTR_SCHED_PAYLOAD,
     auto_repro: false,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(3),
@@ -371,7 +372,7 @@ static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
         nodes: None,
         distances: None,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &KTSTR_SCHED_PAYLOAD,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(3),
     duration: std::time::Duration::from_secs(10),
@@ -392,7 +393,7 @@ static __KTSTR_ENTRY_AUTO_REPRO_VERIFY: KtstrTestEntry = KtstrTestEntry {
         nodes: None,
         distances: None,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &KTSTR_SCHED_PAYLOAD,
     expect_err: true,
     ..KtstrTestEntry::DEFAULT
 };
@@ -410,7 +411,7 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
         nodes: None,
         distances: None,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &KTSTR_SCHED_PAYLOAD,
     bpf_map_write: &[&BPF_CRASH],
     expect_err: true,
     ..KtstrTestEntry::DEFAULT
@@ -429,7 +430,7 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
         nodes: None,
         distances: None,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &KTSTR_SCHED_PAYLOAD,
     bpf_map_write: &[&BPF_CRASH],
     ..KtstrTestEntry::DEFAULT
 };
@@ -447,7 +448,7 @@ static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
         nodes: None,
         distances: None,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &KTSTR_SCHED_PAYLOAD,
     bpf_map_write: &[&BPF_CRASH],
     expect_err: true,
     ..KtstrTestEntry::DEFAULT
@@ -466,7 +467,7 @@ static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
         nodes: None,
         distances: None,
     },
-    scheduler: &KTSTR_SCHED,
+    scheduler: &KTSTR_SCHED_PAYLOAD,
     bpf_map_write: &[&BPF_CRASH],
     ..KtstrTestEntry::DEFAULT
 };
@@ -474,7 +475,7 @@ static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
 // -- monitor evaluation path with default thresholds --
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED,
+    scheduler = KTSTR_SCHED_PAYLOAD,
     llcs = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_s = 60,
     max_imbalance_ratio = 20.0,

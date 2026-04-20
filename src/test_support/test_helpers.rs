@@ -131,6 +131,12 @@ pub(crate) static SCHED_TEST: Scheduler = Scheduler {
     config_file: None,
 };
 
+/// Payload wrapper around [`SCHED_TEST`] so tests can plug it into
+/// the `scheduler: &'static Payload` slot without re-wrapping at
+/// every call site.
+pub(crate) static SCHED_TEST_PAYLOAD: crate::test_support::Payload =
+    crate::test_support::Payload::from_scheduler(&SCHED_TEST);
+
 /// Build a minimal `KtstrTestEntry` bound to the scx-style
 /// `SCHED_TEST` fixture. Pair to `eevdf_entry` for the scheduler
 /// path in evaluate_vm_result tests.
@@ -138,7 +144,7 @@ pub(crate) fn sched_entry(name: &'static str) -> KtstrTestEntry {
     KtstrTestEntry {
         name,
         func: dummy_test_fn,
-        scheduler: &SCHED_TEST,
+        scheduler: &SCHED_TEST_PAYLOAD,
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     }
