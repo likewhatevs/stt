@@ -265,6 +265,20 @@ impl CpusetSpec {
 ///     .work(Work::default().workers(2).work_type(WorkType::YieldHeavy));
 ///
 /// assert_eq!(def.works.len(), 2);
+///
+/// // Synthetic work + userspace binary side-by-side via .workload(&X).
+/// // The binary runs inside the same cgroup as the Work handles;
+/// // both spawn in apply_setup, the Work groups first, then the
+/// // Payload after the cpuset settles.
+/// # use ktstr::test_support::fixtures::FIO_JSON;
+/// let def = CgroupDef::named("io_and_spin")
+///     .with_cpuset(CpusetSpec::disjoint(0, 2))
+///     .workers(2)
+///     .work_type(WorkType::CpuSpin)
+///     .workload(&FIO_JSON);
+///
+/// assert!(def.payload.is_some());
+/// assert_eq!(def.works[0].num_workers, Some(2));
 /// ```
 #[derive(Clone, Debug)]
 pub struct CgroupDef {

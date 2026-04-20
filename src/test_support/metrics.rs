@@ -60,6 +60,19 @@ pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Vec<Metric> {
 /// both candidates fails. Does NOT heuristically repair malformed
 /// JSON — only brace-balancing for region extraction; serde_json
 /// does the actual parse strictly.
+///
+/// # Multiple JSON objects in one output
+///
+/// When stdout contains more than one balanced top-level region
+/// (e.g. `{"first": 1} noise {"second": 2}`), only the FIRST is
+/// returned. The region finder scans left-to-right for the first
+/// `{` or `[`, walks to its matching closer, and stops — it does
+/// not merge or concatenate subsequent balanced regions. Payloads
+/// that emit multiple JSON documents per run therefore lose all
+/// but the first; authors needing full capture should switch the
+/// payload to a wrapper that emits a single aggregate document
+/// (or use `OutputFormat::LlmExtract` to consolidate prose +
+/// multiple JSONs through the model pipeline).
 pub(crate) fn find_and_parse_json(stdout: &str) -> Option<serde_json::Value> {
     // Fast path: whole stdout is a single JSON document.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {

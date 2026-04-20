@@ -123,13 +123,23 @@ fn derive_payload_llm_extract_empty_call_has_no_hint() {
     ));
 }
 
-/// A struct whose name does not end in `Payload` produces a const
-/// whose name is the full struct name converted to
-/// SCREAMING_SNAKE_CASE (no suffix to strip). `Payload.name` itself
-/// still falls back to the `binary` attribute — this test pins the
-/// const-name path, not the `.name` field. `StressNg` →
-/// `STRESS_NG`: the multi-word CamelCase-to-SCREAMING_SNAKE
-/// conversion reused from derive(Scheduler).
+/// Struct name with NO `Payload` suffix: the derive converts the
+/// full CamelCase ident to SCREAMING_SNAKE and uses that as the
+/// const name. `StressNg` → `STRESS_NG`.
+///
+/// This test pins ONLY the emitted `const` identifier path. It
+/// does NOT pin `Payload.name` — that field comes from the
+/// `#[payload(...)]` attribute: here neither `name = "..."` nor a
+/// short alias is supplied, so the `.name` field falls back to
+/// the `binary` attribute (`"stress-ng"`), which happens to be
+/// identical to the lowercased const name. That coincidence is
+/// NOT the invariant under test; the const-identifier derivation
+/// is. If a future const-name rule changed (e.g. to keep CamelCase
+/// untouched), only line 1's assertion would break — line 2's
+/// `Binary("stress-ng")` would still hold because it comes from
+/// the attribute, not the ident. The two assertions exercise
+/// different code paths that happen to produce matching strings
+/// here; do not collapse them.
 #[derive(ktstr::Payload)]
 #[payload(binary = "stress-ng")]
 #[allow(dead_code)]

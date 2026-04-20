@@ -596,9 +596,23 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // SAFETY: lock serializes process-wide env mutations; the
-        // save-before/restore-after window keeps other tests' state
-        // intact.
+        // SAFETY: `std::env::set_var` / `remove_var` are `unsafe` in
+        // Rust 2024 because a concurrent thread calling
+        // `std::env::var_os` may UB-observe a half-updated environ
+        // table. The guards here are:
+        //   (a) `ENV_LOCK` above serializes every env-mutating test
+        //       in this crate — no parallel writer exists within
+        //       the ktstr test binary's threads.
+        //   (b) No reader thread is spawned inside this test — the
+        //       only consumers of the env var (`resolve_cache_root`)
+        //       run on the test thread after the mutation returns.
+        //   (c) The save-before / restore-after pair keeps other
+        //       tests' environment state intact across the critical
+        //       section, so a subsequent test that reads the same
+        //       key sees its prior value.
+        // Remaining residual risk: a signal handler or child process
+        // spawned during the critical section would observe mid-
+        // mutation env state. No tests in this module spawn such.
         let prev = std::env::var("KTSTR_CACHE_DIR").ok();
         unsafe { std::env::set_var("KTSTR_CACHE_DIR", "/explicit/override") };
         let root = resolve_cache_root().unwrap();

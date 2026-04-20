@@ -108,6 +108,18 @@ pub struct FioPayload;
 ///    `&[]`. Everything else — `kind`, `output`, `default_checks`,
 ///    `metrics` — is character-for-character identical to
 ///    [`FIO`]. See the unit tests for the pinned invariants.
+///
+/// **Caveat: simultaneous FIO + FIO_JSON.** Both fixtures have
+/// `kind = PayloadKind::Binary("fio")`, so a scenario that lists
+/// `#[ktstr_test(workloads = [FIO, FIO_JSON])]` spawns the `fio`
+/// binary TWICE — each with its own argv set, inside whatever
+/// cgroup the framework places each fixture in. The pairwise-dedup
+/// on the `workloads` attribute only rejects identical Payload
+/// paths; two distinct Payload constants that happen to share a
+/// binary are NOT deduped. Test authors who want the same fio
+/// binary once should pick ONE of the two fixtures, and extend it
+/// via `ctx.payload(&FIO).arg("--output-format=json")` if the
+/// `FIO_JSON` preset's args don't match their scenario.
 #[derive(Payload)]
 #[payload(binary = "fio", name = "fio_json", output = Json)]
 #[default_args("--output-format=json")]
