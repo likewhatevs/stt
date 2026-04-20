@@ -223,11 +223,21 @@ fn evaluate(
 /// guest-to-host SHM ring under
 /// [`MSG_TYPE_PAYLOAD_METRICS`](crate::vmm::shm_ring::MSG_TYPE_PAYLOAD_METRICS).
 ///
-/// A serialization failure logs to stderr and drops the entry — the
-/// metric set is already in hand at the call site; a corrupt JSON
-/// encoding only costs the host-side sidecar entry for this one
-/// invocation and cannot fail the test. A full SHM ring behaves
-/// similarly (the writer silently discards when no space is left).
+/// The `serde_json::to_vec` call is infallible in practice for
+/// `PayloadMetrics`: every field is an owned, serde-trivial value
+/// (`Vec<Metric>` of `{ name: String, value: f64, polarity, unit:
+/// String, source }` plus an `i32` exit code). None of these can
+/// fail serialization for any inhabited `PayloadMetrics` value —
+/// the Err arm exists only to satisfy `serde_json::to_vec`'s
+/// `Result` signature. The defensive `eprintln!` guards against a
+/// future struct change that introduces a fallible field (e.g. a
+/// `#[serde(with = "...")]` custom serializer) rather than any
+/// currently-reachable failure path.
+///
+/// A full SHM ring is handled silently by `write_msg` itself —
+/// the writer drops the payload when no ring space is left. This
+/// function does not re-handle ring pressure; it only handles the
+/// serialize step.
 fn emit_payload_metrics_to_shm(pm: &PayloadMetrics) {
     match serde_json::to_vec(pm) {
         Ok(bytes) => {

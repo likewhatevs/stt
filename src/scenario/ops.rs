@@ -191,7 +191,8 @@ impl CpusetSpec {
 // CgroupDef
 // ---------------------------------------------------------------------------
 
-/// Declarative cgroup definition: name + cpuset + workload(s).
+/// Declarative cgroup definition: name + cpuset + synthetic
+/// [`Work`] groups + optional userspace [`Payload`](crate::test_support::Payload).
 ///
 /// Bundles the ops that always go together (AddCgroup + SetCpuset +
 /// Spawn) into a single value. The executor creates the cgroup, optionally
@@ -199,7 +200,11 @@ impl CpusetSpec {
 /// them into the cgroup.
 ///
 /// Multiple [`Work`] entries run in parallel within the cgroup. Each
-/// entry spawns its own set of worker processes.
+/// entry spawns its own set of worker processes. The optional
+/// [`Self::payload`] slot is a *single* userspace binary that runs
+/// alongside those synthetic [`Work`] groups (hence "plural works,
+/// singular payload" — the pluralization in the legacy "workload(s)"
+/// prose elided this distinction).
 ///
 /// Use `CgroupDef` in `Step::with_defs` for scenarios where cgroups are
 /// created once and run for the step duration. Use `Op::AddCgroup` +
@@ -240,9 +245,20 @@ pub struct CgroupDef {
     /// work_type (applied per-Work via resolve_work_type).
     pub swappable: bool,
     /// Optional userspace [`Payload`](crate::test_support::Payload) to
-    /// launch inside this cgroup. Spawned AFTER synthetic [`Work`]
-    /// groups so the cgroup cpuset and mempolicy settle first; runs
-    /// concurrently once started. Only
+    /// launch inside this cgroup.
+    ///
+    /// **Spawn order within `apply_setup`**: the cgroup is created
+    /// (`add_cgroup_no_cpuset`), its cpuset is resolved + set, then
+    /// each `Work` entry is spawned and moved into the cgroup in
+    /// declaration order, and finally — after every synthetic
+    /// `Work` handle has started — the `Payload` is spawned via
+    /// `PayloadRun::new(ctx, p).in_cgroup(name).spawn()`. This
+    /// fixed order lets the cgroup cpuset and mempolicy settle on
+    /// the `Work` handles before the binary inherits placement, so
+    /// the binary sees a stable topology. Once spawned, all three
+    /// (cgroup, works, payload) run concurrently until teardown.
+    ///
+    /// Only
     /// [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary)
     /// payloads are accepted — scheduler-kind payloads are rejected
     /// at construction time via [`Self::workload`]. The payload is
@@ -339,9 +355,35 @@ impl CgroupDef {
     /// [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary)
     /// payloads are accepted; passing a scheduler-kind
     /// [`Payload`](crate::test_support::Payload) panics with an
-    /// actionable message. The panic fires at declaration time
-    /// (rather than deferring to run time) so misuse surfaces
-    /// immediately without requiring a VM boot.
+    /// actionable message.
+    ///
+    /// **Why panic at declaration time, not at spawn time?** Three
+    /// reasons, all of which favor failing fast:
+    /// 1. **Discovery-time surfacing.** `CgroupDef` builders run
+    ///    during test construction, which nextest's `--list`
+    ///    invocation reaches BEFORE any VM boot. A panic here
+    ///    emits a full backtrace inside the test binary and
+    ///    surfaces the offending call site immediately; a deferred
+    ///    runtime error would require a KVM-capable host + a
+    ///    kernel image + an initramfs build to observe — a 30+
+    ///    second feedback loop for what is purely a
+    ///    typed-API misuse.
+    /// 2. **No side effects.** The panic happens before
+    ///    `CgroupDef.payload = Some(p)` assignment runs, so the
+    ///    in-progress builder is left in its prior (no-payload)
+    ///    state. A caller that catches the panic via
+    ///    `catch_unwind` sees a valid CgroupDef either way.
+    /// 3. **Scheduler-kind is always a programming error here.**
+    ///    `Payload::EEVDF` in `CgroupDef::workload` is never a
+    ///    legitimate use case — it means the author confused the
+    ///    `scheduler` slot (test-level) with the `workload` slot
+    ///    (cgroup-level). There is no recovery path; the only
+    ///    resolution is editing the source.
+    ///
+    /// Scheduler-kind payloads in the step-level `Op::RunPayload`
+    /// path bail with an `anyhow::Error` instead of panicking —
+    /// that path runs during scenario execution where one bad op
+    /// should not crash a whole test run.
     pub fn workload(mut self, p: &'static crate::test_support::Payload) -> Self {
         assert!(
             !p.is_scheduler(),
@@ -1664,6 +1706,15 @@ fn collect_result(
 /// removed or stopped; failures are logged to stderr but do not
 /// propagate — the cgroup removal is best-effort already, and the
 /// payload-kill failure is never the primary error.
+///
+/// **Metric emission depends on the explicit `.kill()` call** —
+/// if a future refactor replaces the `.kill()` below with plain
+/// `drop(handle)`, the `PayloadHandle::drop` SIGKILLs the child
+/// but skips the evaluate-and-emit pipeline that records metrics
+/// to the SHM ring. The test-path drain via `cleanup_state`
+/// likewise routes through `drain_all_payload_handles` for the
+/// same reason. Preserve `.kill()` on every path that claims to
+/// drain handles for metric capture.
 fn drain_payload_handles_for_cgroup(
     handles: &mut Vec<(String, crate::scenario::payload_run::PayloadHandle)>,
     cgroup: &str,
