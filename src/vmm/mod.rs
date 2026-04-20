@@ -5419,9 +5419,9 @@ mod tests {
             "no crash expected with 300s watchdog: {:?}",
             result.crash_message
         );
-        // SCHEDULER_DIED / SCHEDULER_NOT_ATTACHED are written by
-        // rust_init when the scx scheduler exits (rust_init.rs:1152,
-        // 1177, 1180, 1200). "sched_ext: disabled" is the kernel's
+        // SCHEDULER_DIED / SCHEDULER_NOT_ATTACHED sentinels are
+        // written by start_scheduler in rust_init on attach failure
+        // or scheduler death. "sched_ext: disabled" is the kernel's
         // own disable message when scx tears down a scheduler (e.g.
         // on watchdog stall). Any of these appearing proves the
         // watchdog either fired or the scheduler failed for another
@@ -5430,13 +5430,14 @@ mod tests {
         let output = &result.output;
         let stderr = &result.stderr;
         assert!(
-            !output.contains("SCHEDULER_DIED") && !stderr.contains("SCHEDULER_DIED"),
+            !output.contains(crate::test_support::SENTINEL_SCHEDULER_DIED)
+                && !stderr.contains(crate::test_support::SENTINEL_SCHEDULER_DIED),
             "scheduler died during 15s run — either the watchdog fired or the \
              scheduler failed for another reason. output: {output:?}, stderr: {stderr:?}",
         );
         assert!(
-            !output.contains("SCHEDULER_NOT_ATTACHED")
-                && !stderr.contains("SCHEDULER_NOT_ATTACHED"),
+            !output.contains(crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED)
+                && !stderr.contains(crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED),
             "scheduler did not attach — no watchdog override to evaluate. \
              output: {output:?}, stderr: {stderr:?}",
         );

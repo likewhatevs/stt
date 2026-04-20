@@ -147,6 +147,13 @@ pub(crate) const SENTINEL_EXEC_EXIT_PREFIX: &str = "KTSTR_EXEC_EXIT=";
 /// startup. Paired with `KTSTR_EXIT=1` on the surrounding lines.
 pub(crate) const SENTINEL_SCHEDULER_DIED: &str = "SCHEDULER_DIED";
 
+/// Written by guest init when the scheduler process stays alive but
+/// never attaches to sched_ext (BPF verifier reject, ops mismatch,
+/// sysfs absent). Emitted as `SCHEDULER_NOT_ATTACHED: <reason>`; the
+/// reason suffix is appended by the caller. Paired with `KTSTR_EXIT=1`
+/// on the surrounding lines.
+pub(crate) const SENTINEL_SCHEDULER_NOT_ATTACHED: &str = "SCHEDULER_NOT_ATTACHED";
+
 /// Classify the failure stage based on which sentinels appear in COM2 output.
 pub(crate) fn classify_init_stage(output: &str) -> &'static str {
     if output.contains(SENTINEL_PAYLOAD_STARTING) {

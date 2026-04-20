@@ -1173,12 +1173,14 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                         dump_file_to_com2(log_path);
                         write_com2(crate::verifier::SCHED_OUTPUT_END);
                         match status {
-                            ScxAttachStatus::Timeout => {
-                                write_com2("SCHEDULER_NOT_ATTACHED: timeout")
-                            }
-                            ScxAttachStatus::SysfsAbsent => {
-                                write_com2("SCHEDULER_NOT_ATTACHED: sched_ext sysfs absent")
-                            }
+                            ScxAttachStatus::Timeout => write_com2(&format!(
+                                "{}: timeout",
+                                crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED,
+                            )),
+                            ScxAttachStatus::SysfsAbsent => write_com2(&format!(
+                                "{}: sched_ext sysfs absent",
+                                crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED,
+                            )),
                             ScxAttachStatus::Attached => unreachable!(),
                         }
                         write_com2(&format!(

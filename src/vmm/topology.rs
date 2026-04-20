@@ -514,8 +514,8 @@ impl Topology {
 
     /// LLCs per NUMA node (uniform distribution only).
     ///
-    /// Panics if the topology uses explicit nodes with non-uniform LLC
-    /// distribution.
+    /// Panics if the topology uses explicit nodes (use `llcs_in_node()`
+    /// instead).
     pub fn llcs_per_numa_node(&self) -> u32 {
         assert!(
             self.nodes.is_none(),
@@ -752,6 +752,14 @@ mod tests {
         };
         assert_eq!(t.num_numa_nodes(), 3);
         assert_eq!(t.llcs_per_numa_node(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "llcs_per_numa_node() requires uniform topology")]
+    fn llcs_per_numa_node_panics_on_explicit_nodes() {
+        static EXPLICIT: [NumaNode; 2] = [NumaNode::new(2, 512), NumaNode::new(2, 512)];
+        let t = Topology::with_nodes(2, 1, &EXPLICIT);
+        t.llcs_per_numa_node();
     }
 
     #[test]
