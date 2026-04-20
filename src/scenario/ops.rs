@@ -1626,6 +1626,13 @@ fn run_scenario(
                     .collect();
                 apply_ops(ctx, s, &ops)?;
             }
+            // Raw ops: run before CgroupDef setup so a later
+            // CgroupDef can reference entities these ops create.
+            // Primary use is Op::AddCgroup for empty move-target
+            // cgroups that need backdrop lifetime but no Workers.
+            if !backdrop.ops.is_empty() {
+                apply_ops(ctx, s, &backdrop.ops)?;
+            }
             // Cgroups: a single apply_setup pass.
             if !backdrop.cgroups.is_empty() {
                 apply_setup(ctx, s, &backdrop.cgroups)?;

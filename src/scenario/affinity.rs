@@ -1,7 +1,10 @@
 //! CPU affinity scenario implementations.
 
 use super::Ctx;
-use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_steps, execute_steps_with};
+use super::backdrop::Backdrop;
+use super::ops::{
+    CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_scenario, execute_scenario_with,
+};
 use crate::assert::{Assert, AssertResult};
 use crate::workload::AffinityKind;
 use anyhow::Result;
@@ -9,9 +12,15 @@ use std::collections::BTreeSet;
 
 /// Two cgroups with worker affinities randomized four times during the
 /// run. Each randomization assigns half the available CPUs to each worker.
+///
+/// Both cgroups persist on the Backdrop so every `SetAffinity` op in
+/// the four randomization Steps finds the same live workers.
 pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
-    let mut steps = vec![Step::with_defs(
-        vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
+    let backdrop = Backdrop::new()
+        .with_cgroup(CgroupDef::named("cg_0"))
+        .with_cgroup(CgroupDef::named("cg_1"));
+    let mut steps = vec![Step::new(
+        vec![],
         HoldSpec::Fixed(ctx.settle + ctx.duration / 5),
     )];
 
@@ -25,7 +34,7 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
         ));
     }
 
-    execute_steps(ctx, steps)
+    execute_scenario(ctx, backdrop, steps)
 }
 
 /// Two cgroups with all workers pinned to the same 2-CPU subset.
@@ -43,11 +52,11 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     // spread under EEVDF; relax the default 35% threshold.
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
+    let backdrop = Backdrop::new()
+        .with_cgroup(CgroupDef::named("cg_0"))
+        .with_cgroup(CgroupDef::named("cg_1"));
     let steps = vec![
-        Step::with_defs(
-            vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
-            HoldSpec::Fixed(ctx.settle),
-        ),
+        Step::new(vec![], HoldSpec::Fixed(ctx.settle)),
         Step::new(
             vec![
                 Op::set_affinity("cg_0", AffinityKind::Exact(pin_cpus.clone())),
@@ -57,7 +66,7 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
         ),
     ];
 
-    execute_steps_with(ctx, steps, Some(&checks))
+    execute_scenario_with(ctx, backdrop, steps, Some(&checks))
 }
 
 /// Two cgroups with disjoint cpusets, workers pinned to 2 CPUs within
@@ -76,14 +85,12 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     // concentrates load and increases spread; relax the threshold.
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
+    let backdrop = Backdrop::new().with_cgroups([
+        CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)),
+        CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
+    ]);
     let steps = vec![
-        Step::with_defs(
-            vec![
-                CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)),
-                CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)),
-            ],
-            HoldSpec::Fixed(ctx.settle),
-        ),
+        Step::new(vec![], HoldSpec::Fixed(ctx.settle)),
         Step::new(
             vec![
                 Op::set_affinity("cg_0", AffinityKind::Exact(pin_a)),
@@ -93,5 +100,5 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
         ),
     ];
 
-    execute_steps_with(ctx, steps, Some(&checks))
+    execute_scenario_with(ctx, backdrop, steps, Some(&checks))
 }

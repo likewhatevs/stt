@@ -36,7 +36,7 @@
 //! Backdrop cgroup is rejected so later Steps cannot find it
 //! missing.
 
-use super::ops::CgroupDef;
+use super::ops::{CgroupDef, Op};
 use crate::test_support::Payload;
 
 /// Persistent state for a Step sequence.
@@ -81,13 +81,25 @@ use crate::test_support::Payload;
 pub struct Backdrop {
     /// Long-lived cgroups created once and removed at scenario end.
     /// Any Step can reference them by name via `Op::MoveAllTasks`,
-    /// `Op::SetCpuset`, etc.
+    /// `Op::SetCpuset`, etc. Every [`CgroupDef`] here spawns its
+    /// declared [`Work`](crate::workload::Work) entries inside the
+    /// cgroup — declare empty move-target cgroups via [`Self::ops`]
+    /// / [`Self::with_op`] using [`Op::AddCgroup`].
     pub cgroups: Vec<CgroupDef>,
     /// Long-lived binary payloads spawned once before the first
     /// Step. The runtime holds the live handles for the duration of
     /// the Step sequence and drains them via `.kill()` (preserving
     /// metric emission) at scenario teardown.
     pub payloads: Vec<&'static Payload>,
+    /// Raw [`Op`]s applied during Backdrop setup, before any Step
+    /// runs. Run in order, AFTER [`Self::payloads`] spawn and
+    /// BEFORE [`Self::cgroups`] apply_setup. The primary use is
+    /// declaring empty move-target cgroups via [`Op::AddCgroup`] —
+    /// anything a [`CgroupDef`] cannot express because
+    /// `CgroupDef::works` forces a worker spawn. Any cgroup
+    /// produced by these ops is tracked by the Backdrop slot and
+    /// tears down at scenario end.
+    pub ops: Vec<Op>,
 }
 
 impl Backdrop {
@@ -98,6 +110,7 @@ impl Backdrop {
     pub const EMPTY: Backdrop = Backdrop {
         cgroups: Vec::new(),
         payloads: Vec::new(),
+        ops: Vec::new(),
     };
 
     /// Fresh Backdrop builder. Reads naturally in chain position:
@@ -121,13 +134,42 @@ impl Backdrop {
         self
     }
 
-    /// Add a persistent binary payload. The payload spawns before
-    /// the first Step runs and is killed + metric-drained after the
-    /// last Step. Scheduler-kind payloads are rejected at
-    /// `execute_scenario` entry; this builder does not check the
-    /// kind so the check stays in one place.
+    /// Add a persistent binary payload with no extra args. The
+    /// payload spawns before the first Step runs and is killed +
+    /// metric-drained after the last Step. Scheduler-kind payloads
+    /// are rejected at `execute_scenario` entry; this builder does
+    /// not check the kind so the check stays in one place.
+    ///
+    /// **Need custom args or a cgroup placement?** Use
+    /// [`Self::with_op`] instead:
+    /// `.with_op(Op::run_payload(&BG, vec!["--cpu".into(), "4".into()]))`
+    /// or `Op::run_payload_in_cgroup(...)` — both spawn through the
+    /// same pipeline as this shorthand but expose the full argument
+    /// and placement surface that [`Op::RunPayload`] carries.
     pub fn with_payload(mut self, payload: &'static Payload) -> Self {
         self.payloads.push(payload);
+        self
+    }
+
+    /// Append a raw [`Op`] to run during Backdrop setup. Typical
+    /// use: `Op::AddCgroup { .. }` to create empty move-target
+    /// cgroups that persist for the scenario but never spawn
+    /// workers (a [`CgroupDef`] always spawns at least one Work
+    /// entry, so empty cgroups are only expressible via ops).
+    ///
+    /// Setup order: payloads spawn, ops run, then CgroupDefs apply.
+    /// Backdrop ops execute with `write_to_backdrop = true` so any
+    /// cgroup / handle / payload they create is tracked by the
+    /// Backdrop slot and survives every Step's teardown.
+    pub fn with_op(mut self, op: Op) -> Self {
+        self.ops.push(op);
+        self
+    }
+
+    /// Append several raw [`Op`]s at once. See [`Self::with_op`]
+    /// for the ordering and routing contract.
+    pub fn with_ops<I: IntoIterator<Item = Op>>(mut self, ops: I) -> Self {
+        self.ops.extend(ops);
         self
     }
 
@@ -136,7 +178,7 @@ impl Backdrop {
     /// teardown path entirely — zero overhead for scenarios that
     /// do not use persistent state.
     pub fn is_empty(&self) -> bool {
-        self.cgroups.is_empty() && self.payloads.is_empty()
+        self.cgroups.is_empty() && self.payloads.is_empty() && self.ops.is_empty()
     }
 }
 
@@ -159,6 +201,7 @@ mod tests {
         let b = Backdrop::EMPTY;
         assert!(b.cgroups.is_empty());
         assert!(b.payloads.is_empty());
+        assert!(b.ops.is_empty());
         assert!(b.is_empty());
     }
 
@@ -215,5 +258,34 @@ mod tests {
         assert!(d.is_empty());
         assert_eq!(d.cgroups.len(), Backdrop::EMPTY.cgroups.len());
         assert_eq!(d.payloads.len(), Backdrop::EMPTY.payloads.len());
+        assert_eq!(d.ops.len(), Backdrop::EMPTY.ops.len());
+    }
+
+    #[test]
+    fn with_op_appends_and_loses_empty() {
+        let b = Backdrop::new().with_op(Op::add_cgroup("empty_target"));
+        assert_eq!(b.ops.len(), 1);
+        assert!(matches!(&b.ops[0], Op::AddCgroup { name } if name.as_ref() == "empty_target"));
+        assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn with_ops_appends_several_in_order() {
+        let b = Backdrop::new().with_ops(vec![Op::add_cgroup("cg_1"), Op::add_cgroup("cg_1/sub")]);
+        assert_eq!(b.ops.len(), 2);
+        assert!(matches!(&b.ops[0], Op::AddCgroup { name } if name.as_ref() == "cg_1"));
+        assert!(matches!(&b.ops[1], Op::AddCgroup { name } if name.as_ref() == "cg_1/sub"));
+    }
+
+    #[test]
+    fn chain_with_op_interleaves_with_other_builders() {
+        let b = Backdrop::new()
+            .with_cgroup(CgroupDef::named("cg_workers"))
+            .with_op(Op::add_cgroup("cg_empty"))
+            .with_payload(&TEST_PAYLOAD);
+        assert_eq!(b.cgroups.len(), 1);
+        assert_eq!(b.ops.len(), 1);
+        assert_eq!(b.payloads.len(), 1);
+        assert!(!b.is_empty());
     }
 }

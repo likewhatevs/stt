@@ -1,6 +1,7 @@
 //! Nested cgroup hierarchy scenario implementations.
 
-use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+use super::backdrop::Backdrop;
+use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_scenario, execute_steps};
 use super::{CgroupGroup, Ctx, collect_all, dfl_wl, setup_cgroups};
 use crate::assert::{self, AssertResult};
 use crate::workload::*;
@@ -33,18 +34,31 @@ pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
 
 /// Move workers through nested hierarchy: sub -> parent ->
 /// cross-hierarchy sub -> parent.
+///
+/// The four cgroups (`cg_0/sub` with workers; `cg_0`, `cg_1`, and
+/// `cg_1/sub` as empty move targets) all persist for the full
+/// scenario — declaring them on the Backdrop is what lets every
+/// Step's `MoveAllTasks` resolve the target cgroup without the
+/// previous Step's teardown rmdir'ing it. Workers spawn inside
+/// `cg_0/sub` via [`CgroupDef`]; the empty peer cgroups go through
+/// [`Backdrop::with_ops`] so no implicit worker spawn happens
+/// there.
 pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![
-        Step::with_defs(
-            vec![CgroupDef::named("cg_0/sub")],
-            HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration / 4),
-        )
+    let backdrop = Backdrop::new()
+        .with_cgroup(CgroupDef::named("cg_0/sub"))
         .with_ops(vec![
-            // Create parents and empty targets for MoveAllTasks.
             Op::add_cgroup("cg_0"),
             Op::add_cgroup("cg_1"),
             Op::add_cgroup("cg_1/sub"),
-        ]),
+        ]);
+    let steps = vec![
+        // Settle: hold once so workers run inside cg_0/sub before
+        // the first MoveAllTasks. Matches the legacy 2s + duration/4
+        // budget the pre-refactor single-Step version used.
+        Step::new(
+            vec![],
+            HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration / 4),
+        ),
         Step::new(
             vec![Op::move_all_tasks("cg_0/sub", "cg_0")],
             HoldSpec::Frac(0.25),
@@ -59,7 +73,7 @@ pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
         ),
     ];
 
-    execute_steps(ctx, steps)
+    execute_scenario(ctx, backdrop, steps)
 }
 
 /// Rapid nested cgroup create/destroy with dynamic names. Custom logic
