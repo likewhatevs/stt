@@ -878,7 +878,7 @@ mod tests {
     // -- format_probe_events additional --
 
     #[test]
-    fn format_probe_events_sorts_by_timestamp() {
+    fn format_probe_events_preserves_input_order() {
         use crate::probe::process::ProbeEvent;
 
         let events = vec![
@@ -911,8 +911,8 @@ mod tests {
         let out = format_probe_events(&events, &func_names, None, None);
         let pos_second = out.find("second_func").unwrap();
         let pos_first = out.find("first_func").unwrap();
-        // Both appear but order depends on input (not sorted by this function)
-        assert!(pos_second < pos_first || pos_first < pos_second);
+        // Events are emitted in input order; ts=200 precedes ts=100 here.
+        assert!(pos_second < pos_first);
     }
 
     #[test]

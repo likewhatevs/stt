@@ -28,7 +28,7 @@ impl vm_superio::Trigger for EventFdTrigger {
     }
 }
 
-/// Port-addressed serial wrapping vm-superio::Serial with output capture.
+/// Serial wrapper around vm-superio::Serial with output capture.
 pub struct Serial {
     base: u16,
     inner: vm_superio::Serial<EventFdTrigger, vm_superio::serial::NoEvents, Vec<u8>>,

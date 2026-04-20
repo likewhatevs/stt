@@ -1141,9 +1141,10 @@ impl MonitorThresholds {
 
         // Stall detection: any CPU whose rq_clock did not advance between
         // consecutive samples. Uses the sustained_samples window like
-        // imbalance and DSQ checks. Exempt idle CPUs (nr_running==0 in
-        // both samples): NOHZ stops the tick so rq_clock legitimately
-        // does not advance.
+        // imbalance and DSQ checks. Exempt idle CPUs (NOHZ stopped the
+        // tick so rq_clock legitimately doesn't advance) and preempted
+        // vCPUs (host stole the core, so the vCPU couldn't tick the
+        // clock). See `reader::is_cpu_stalled` for the predicate.
         if self.fail_on_stall {
             let threshold = if report.preemption_threshold_ns > 0 {
                 report.preemption_threshold_ns
@@ -1410,7 +1411,7 @@ mod tests {
 
     // -- IKCONFIG extraction tests --
 
-    /// Build a synthetic blob: padding + IKCFG_ST marker + gzip(config_text).
+    /// Build a synthetic blob: padding + IKCFG_ST marker + gzip(config_text) + IKCFG_ED marker.
     fn make_ikconfig_blob(config_text: &str) -> Vec<u8> {
         use flate2::Compression;
         use flate2::write::GzEncoder;

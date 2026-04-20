@@ -2491,9 +2491,9 @@ mod tests {
         // and the post-hoc path (evaluate) agree on stall detection.
         // Build a scenario where stall fires: stuck rq_clock, nr_running>0,
         // sustained_samples=2.
-        // Two CPUs: cpu0 stuck (rq_clock=5000), cpu1 advancing (rq_clock
-        // changes each sample because it reads from a different rq buffer).
-        // This ensures data_looks_valid passes in evaluate.
+        // Two CPUs: cpu0 stuck (rq_clock=5000), cpu1 has a different
+        // clock value from cpu0 in each sample, so data_looks_valid
+        // sees non-identical clocks.
         let offsets = test_offsets();
         let buf0 = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
         let buf1 = make_rq_buffer(&offsets, 1, 1, 1, 9000, 0);
