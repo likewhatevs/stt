@@ -1,3 +1,5 @@
+//! Probe output decoders: DSQ IDs, cpumasks, enq/kick/exit/ops flags, and named-value formatting.
+
 use super::scx_defs::*;
 
 /// Decode a sched_ext dispatch queue ID into a human-readable name.

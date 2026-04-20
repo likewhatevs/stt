@@ -1,3 +1,5 @@
+//! Probe skeleton lifecycle: load, attach, run, collect.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

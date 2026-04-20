@@ -1,3 +1,5 @@
+//! BTF parsing and BPF program symbol resolution for probe attachment and output decoding.
+
 use super::stack::StackFunction;
 
 /// ELF sections the probe BTF loader reads from a vmlinux ELF

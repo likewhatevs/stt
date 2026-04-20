@@ -1,10 +1,12 @@
+//! Single-port virtio-console with inline MMIO transport.
+//!
+//! Two virtqueues (RX index 0, TX index 1), no multiport/control queues.
+//! VIRTIO_F_VERSION_1 only. MMIO register layout per virtio-v1.2 §4.2.2.
+//! Interrupt delivery via irqfd (eventfd → KVM GSI). TX data arrival
+//! signaled via `tx_evt` eventfd for zero-latency host-side wakeup.
+
 use std::collections::VecDeque;
-/// Single-port virtio-console with inline MMIO transport.
-///
-/// Two virtqueues (RX index 0, TX index 1), no multiport/control queues.
-/// VIRTIO_F_VERSION_1 only. MMIO register layout per virtio-v1.2 §4.2.2.
-/// Interrupt delivery via irqfd (eventfd → KVM GSI). TX data arrival
-/// signaled via `tx_evt` eventfd for zero-latency host-side wakeup.
+
 use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
     VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1,

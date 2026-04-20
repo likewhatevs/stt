@@ -223,15 +223,10 @@ pub fn sample_looks_valid(sample: &MonitorSample) -> bool {
 
 /// Find a vmlinux for tests.
 ///
-/// Delegates to [`crate::kernel_path::resolve_btf`] so tests use the
-/// same kernel resolution as the rest of ktstr.
-///
-/// Resolution order (first directory with a `vmlinux` wins):
-/// 1. `KTSTR_KERNEL` env var
-/// 2. `./linux`
-/// 3. `../linux`
-/// 4. `/lib/modules/{release}/build`
-/// 5. `/sys/kernel/btf/vmlinux` (host kernel raw BTF — no ELF symbols)
+/// Reads `KTSTR_KERNEL` for an explicit directory override and
+/// delegates the remaining search to [`crate::kernel_path::resolve_btf`]
+/// so tests pick the same kernel the rest of ktstr does. See that
+/// function for the exact resolution order.
 #[cfg(test)]
 pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
     let kernel_dir = std::env::var("KTSTR_KERNEL").ok();

@@ -8,8 +8,9 @@
 //! sched domain tree walking ([`SchedDomainOffsets`]) with optional
 //! load balancing stats ([`SchedDomainStatsOffsets`]), BPF map
 //! discovery ([`BpfMapOffsets`]), BPF hash map iteration
-//! ([`HtabOffsets`]), and BPF program enumeration
-//! ([`BpfProgOffsets`]).
+//! ([`HtabOffsets`]), BPF program enumeration
+//! ([`BpfProgOffsets`]), and shared `struct idr` walking
+//! ([`IdrOffsets`]).
 
 use std::path::Path;
 

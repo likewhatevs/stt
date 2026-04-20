@@ -4521,7 +4521,7 @@ impl TerminalRawGuard {
         SAVED_TERMIOS_FD.store(fd, std::sync::atomic::Ordering::Release);
 
         // Install signal handlers with SA_RESETHAND. Matches the raw libc
-        // pattern used by register_vcpu_signal_handler (mod.rs:625-639).
+        // pattern used by register_vcpu_signal_handler (mod.rs:870).
         let mut prev_sigint: libc::sigaction = unsafe { std::mem::zeroed() };
         let mut prev_sigterm: libc::sigaction = unsafe { std::mem::zeroed() };
         let mut prev_sigquit: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -5420,8 +5420,8 @@ mod tests {
             result.crash_message
         );
         // SCHEDULER_DIED / SCHEDULER_NOT_ATTACHED are written by
-        // rust_init when the scx scheduler exits (rust_init.rs:1140,
-        // 1165, 1168, 1188). "sched_ext: disabled" is the kernel's
+        // rust_init when the scx scheduler exits (rust_init.rs:1152,
+        // 1177, 1180, 1200). "sched_ext: disabled" is the kernel's
         // own disable message when scx tears down a scheduler (e.g.
         // on watchdog stall). Any of these appearing proves the
         // watchdog either fired or the scheduler failed for another

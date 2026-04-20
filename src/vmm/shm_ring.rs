@@ -11,7 +11,7 @@
 /// The SHM region is excluded from usable RAM: on x86_64 via an E820 gap
 /// (no E820 entry covers it), on aarch64 via FDT /reserved-memory and
 /// /memreserve/. The guest init binary discovers the region via KTSTR_SHM_BASE
-/// and KTSTR_SHM_SIZE environment variables on the kernel command line.
+/// and KTSTR_SHM_SIZE parameters on the kernel command line.
 use zerocopy::{FromBytes, IntoBytes};
 
 /// Result of a successful `/dev/mem` mmap of the SHM region.
@@ -215,7 +215,8 @@ pub fn signal_value(slot: u8, value: u8) {
 }
 
 /// Set the cached SHM base pointer and region size. Called from
-/// `start_shm_poll` in the guest init after parsing /proc/cmdline.
+/// `shm_poll_loop` (spawned by `start_shm_poll`) in the guest init
+/// after the /dev/mem mmap succeeds.
 pub fn init_shm_ptr(base: *mut u8, size: usize) {
     let _ = SHM_PTR.set(ShmPtr { ptr: base, size });
 }
@@ -257,7 +258,7 @@ pub fn write_msg_nonblocking(msg_type: u32, payload: &[u8]) -> bool {
 }
 
 /// Wrapper for a raw pointer + size that is Send+Sync.
-/// SAFETY: The SHM pointer is set once during single-threaded init and
+/// SAFETY: The SHM pointer is set once via OnceLock during init and
 /// points into a /dev/mem mmap that outlives all guest threads.
 struct ShmPtr {
     ptr: *mut u8,

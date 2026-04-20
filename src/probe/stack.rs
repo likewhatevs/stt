@@ -1,3 +1,5 @@
+//! Crash-stack parsing, probe filtering, and BPF-to-kernel caller expansion.
+
 /// Return true if a function should not be probed.
 ///
 /// Skips generic scheduler
