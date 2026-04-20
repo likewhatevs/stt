@@ -50,9 +50,9 @@ struct StatsMeta {
     descs: Vec<StatDesc>,
 }
 
-/// Read the entire stats fd content via sequential read. Must be
-/// called once immediately after opening (position starts at 0;
-/// noop_llseek prevents resetting).
+/// Read the entire stats fd content via sequential read. Called
+/// once from open(); position tracking relies on initial sequential
+/// read (position starts at 0; noop_llseek prevents resetting).
 fn read_initial(fd: RawFd) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(8192);
     let mut chunk = [0u8; 4096];

@@ -1,4 +1,4 @@
-/// MP table setup for SMP boot.
+/// MP table setup for boot (single-CPU and SMP topologies).
 /// The kernel reads this to discover CPUs and their APIC IDs.
 /// Uses topology-aware APIC IDs for multi-LLC support.
 use anyhow::{Context, Result};

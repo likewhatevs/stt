@@ -41,7 +41,7 @@ pub(crate) const MMIO_GAP_END: u64 = 0x1_0000_0000;
 /// Virtio-console MMIO base: start of the MMIO gap.
 pub(crate) const VIRTIO_CONSOLE_MMIO_BASE: u64 = MMIO_GAP_START;
 
-/// IRQ for virtio-console (GSI routed through IOAPIC/LAPIC).
+/// IRQ for virtio-console (GSI routed through IOAPIC).
 /// Uses IRQ 5 — available with full IRQ chip. With split IRQ chip
 /// (no IOAPIC), MSI would be needed; not supported for now.
 pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
@@ -90,7 +90,7 @@ const REQUIRED_CAPS: &[Cap] = &[
 ];
 
 /// A KVM virtual machine with configured topology.
-#[allow(dead_code)] // kvm/vm_fd/topology fields are held for Drop (fd lifetime)
+#[allow(dead_code)] // configuration fields read conditionally; reservation held for RAII drop
 pub struct KtstrKvm {
     pub kvm: Kvm,
     pub vm_fd: VmFd,

@@ -53,7 +53,8 @@ const APIC_MODE_EXTINT: u32 = 0x7;
 
 /// Result of loading a kernel.
 pub struct KernelLoadResult {
-    /// Entry point address.
+    /// 64-bit entry point as a guest physical address (kernel_load +
+    /// STARTUP64_OFFSET). The guest starts executing here in long mode.
     pub entry: u64,
     /// Setup header from the bzImage.
     pub setup_header: Option<linux_loader::loader::bootparam::setup_header>,
