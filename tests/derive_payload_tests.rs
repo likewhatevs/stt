@@ -262,3 +262,31 @@ fn derive_payload_explicit_exit_code_output() {
         PayloadKind::Binary("exit_code_bin"),
     ));
 }
+
+/// #62: the fully-qualified crate path
+/// `::ktstr::test_support::Check::min(...)` must also resolve
+/// through the same prefix-detection branch as the shorter
+/// `Check::min(...)` form. `expr_has_check_prefix` scans every
+/// segment for an ident named `Check`, so any absolute path that
+/// carries the type still lands on the user-written callee
+/// without the macro double-prepending its implicit
+/// `::ktstr::test_support::Check::` segment.
+#[derive(ktstr::Payload)]
+#[payload(binary = "fully_qualified_check_bin")]
+#[default_check(::ktstr::test_support::Check::min("iops", 500.0))]
+#[default_check(::ktstr::test_support::Check::exit_code_eq(0))]
+#[allow(dead_code)]
+struct FullyQualifiedCheckPayload;
+
+#[test]
+fn derive_payload_accepts_fully_qualified_check_path() {
+    assert_eq!(FULLY_QUALIFIED_CHECK.default_checks.len(), 2);
+    assert!(matches!(
+        FULLY_QUALIFIED_CHECK.default_checks[0],
+        Check::Min { metric, value } if metric == "iops" && value == 500.0,
+    ));
+    assert!(matches!(
+        FULLY_QUALIFIED_CHECK.default_checks[1],
+        Check::ExitCodeEq(0),
+    ));
+}

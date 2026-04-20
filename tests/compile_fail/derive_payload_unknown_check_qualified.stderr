@@ -1,0 +1,28 @@
+error[E0599]: no variant, associated function, or constant named `nonexistent_check` found for enum `Check` in the current scope
+  --> tests/compile_fail/derive_payload_unknown_check_qualified.rs:14:24
+   |
+14 | #[default_check(Check::nonexistent_check("metric", 1.0))]
+   |                        ^^^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `Check`
+   |
+note: if you're trying to build a new `Check` consider using one of the following associated functions:
+      Check::min
+      Check::max
+      Check::range
+      Check::exists
+      Check::exit_code_eq
+  --> src/test_support/payload.rs
+   |
+   |     pub const fn min(metric: &'static str, value: f64) -> Check {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   |     pub const fn max(metric: &'static str, value: f64) -> Check {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   |     pub const fn range(metric: &'static str, lo: f64, hi: f64) -> Check {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   |     pub const fn exists(metric: &'static str) -> Check {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   |     pub const fn exit_code_eq(expected: i32) -> Check {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
