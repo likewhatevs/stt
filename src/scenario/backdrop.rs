@@ -51,18 +51,16 @@ use crate::test_support::Payload;
 ///
 /// Scenarios with no persistent state pass
 /// [`Backdrop::EMPTY`](Self::EMPTY), which is also what the
-/// legacy [`execute_steps`](super::ops::execute_steps) /
+/// shorthand [`execute_steps`](super::ops::execute_steps) /
 /// [`execute_defs`](super::ops::execute_defs) wrappers forward to
 /// internally. There is no cost to using the empty default — the
-/// runtime skips the Backdrop setup/teardown phases entirely when
-/// every vec is empty.
+/// runtime skips the Backdrop setup phase entirely when every vec
+/// is empty.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use ktstr::scenario::backdrop::Backdrop;
-/// use ktstr::scenario::ops::{CgroupDef, CpusetSpec};
-/// use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
+/// use ktstr::prelude::*;
 ///
 /// const BG_LOAD: Payload = Payload {
 ///     name: "bg_load",
@@ -73,18 +71,22 @@ use crate::test_support::Payload;
 ///     metrics: &[],
 /// };
 ///
+/// // Worker-bearing cgroup + empty move target + long-running payload,
+/// // all persistent for the scenario.
 /// let backdrop = Backdrop::new()
 ///     .with_cgroup(CgroupDef::named("bg_cell").with_cpuset(CpusetSpec::disjoint(0, 2)))
+///     .with_op(Op::add_cgroup("bg_overflow"))
 ///     .with_payload(&BG_LOAD);
 /// ```
 #[derive(Debug, Default)]
 pub struct Backdrop {
     /// Long-lived cgroups created once and removed at scenario end.
     /// Any Step can reference them by name via `Op::MoveAllTasks`,
-    /// `Op::SetCpuset`, etc. Every [`CgroupDef`] here spawns its
-    /// declared [`Work`](crate::workload::Work) entries inside the
-    /// cgroup — declare empty move-target cgroups via [`Self::ops`]
-    /// / [`Self::with_op`] using [`Op::AddCgroup`].
+    /// `Op::SetCpuset`, etc. Every [`CgroupDef`] here spawns at
+    /// least one worker (declared [`Work`](crate::workload::Work)
+    /// entries, or a single default Work when `works` is empty).
+    /// Declare empty move-target cgroups via [`Self::ops`] /
+    /// [`Self::with_op`] using [`Op::AddCgroup`] instead.
     pub cgroups: Vec<CgroupDef>,
     /// Long-lived binary payloads spawned once before the first
     /// Step. The runtime holds the live handles for the duration of
@@ -92,13 +94,18 @@ pub struct Backdrop {
     /// metric emission) at scenario teardown.
     pub payloads: Vec<&'static Payload>,
     /// Raw [`Op`]s applied during Backdrop setup, before any Step
-    /// runs. Run in order, AFTER [`Self::payloads`] spawn and
-    /// BEFORE [`Self::cgroups`] apply_setup. The primary use is
-    /// declaring empty move-target cgroups via [`Op::AddCgroup`] —
-    /// anything a [`CgroupDef`] cannot express because
-    /// `CgroupDef::works` forces a worker spawn. Any cgroup
-    /// produced by these ops is tracked by the Backdrop slot and
-    /// tears down at scenario end.
+    /// runs. Run AFTER [`Self::cgroups`] apply_setup and BEFORE
+    /// [`Self::payloads`] spawn, in declaration order. Backdrop
+    /// ops run with full authority — they can target Backdrop
+    /// cgroups with [`Op::RemoveCgroup`] / [`Op::StopCgroup`] /
+    /// [`Op::MoveAllTasks`] where step-local ops would be
+    /// rejected, since the Backdrop owns the cgroups it's setting
+    /// up. Any cgroup / handle / payload these ops create is
+    /// tracked by the Backdrop slot and tears down at scenario
+    /// end. The typical use is [`Op::AddCgroup`] for empty
+    /// move-target cgroups (a [`CgroupDef`] can't express the
+    /// zero-worker case because apply_setup forces a worker
+    /// spawn).
     pub ops: Vec<Op>,
 }
 
@@ -157,10 +164,11 @@ impl Backdrop {
     /// workers (a [`CgroupDef`] always spawns at least one Work
     /// entry, so empty cgroups are only expressible via ops).
     ///
-    /// Setup order: payloads spawn, ops run, then CgroupDefs apply.
-    /// Backdrop ops execute with `write_to_backdrop = true` so any
-    /// cgroup / handle / payload they create is tracked by the
-    /// Backdrop slot and survives every Step's teardown.
+    /// Setup order: CgroupDefs apply first, then ops run, then
+    /// payloads spawn last. Backdrop ops execute with the backdrop
+    /// target slot active so any cgroup / handle / payload they
+    /// create is tracked by the Backdrop and survives every Step's
+    /// teardown.
     pub fn with_op(mut self, op: Op) -> Self {
         self.ops.push(op);
         self
@@ -174,9 +182,9 @@ impl Backdrop {
     }
 
     /// True when the Backdrop has no persistent entities declared.
-    /// `execute_scenario` checks this to skip the Backdrop setup /
-    /// teardown path entirely — zero overhead for scenarios that
-    /// do not use persistent state.
+    /// `execute_scenario` checks this to skip the Backdrop setup
+    /// phase entirely — zero overhead for scenarios that do not
+    /// use persistent state.
     pub fn is_empty(&self) -> bool {
         self.cgroups.is_empty() && self.payloads.is_empty() && self.ops.is_empty()
     }

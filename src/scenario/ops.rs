@@ -97,8 +97,9 @@ pub enum Op {
     /// unset inherits the spawning process's cgroup.
     ///
     /// Handles not explicitly consumed by `WaitPayload` / `KillPayload`
-    /// are drained at step-teardown by `collect_result`, matching the
-    /// [`CgroupDef::workload`] semantics.
+    /// are drained at step-teardown by `collect_step` (step-local) or
+    /// at scenario end by `collect_backdrop` (when the handle lives on
+    /// the Backdrop), matching the [`CgroupDef::workload`] semantics.
     ///
     /// # Scheduler-kind rejection across surfaces
     ///
@@ -1142,14 +1143,8 @@ impl CpusetSpec {
 /// [`execute_scenario_with`]. Lives for the entire step sequence;
 /// cgroups, workload handles, and payload handles declared by the
 /// [`Backdrop`](super::backdrop::Backdrop) go here and only tear
-/// down at scenario end (success or Err).
-///
-/// `StepState` is the step-local counterpart — created fresh per
-/// step, torn down at step boundary. The two together form the
-/// execution state passed through `apply_setup` / `apply_ops` /
-/// `collect_result`; name lookups resolve step-local first, then
-/// fall through to backdrop so a step's ops can reference
-/// persistent cgroups by name.
+/// down at scenario end (success or Err). See [`StepState`] for
+/// the step-local counterpart.
 struct BackdropState<'a> {
     /// RAII cgroup guard for persistent cgroups — removes them on drop.
     cgroups: CgroupGroup<'a>,
@@ -1212,7 +1207,7 @@ impl<'a> StepState<'a> {
 /// Combined mutable view over step-local and backdrop state.
 ///
 /// Every function that touches execution state (apply_setup,
-/// apply_ops, collect_result, the drain helpers) receives a
+/// apply_ops, the drain helpers) receives a
 /// `ScenarioState`; lookups prefer step-local, falling through to
 /// backdrop. New state created via ops/setup inside a step writes
 /// to step-local by default — that is the primary mechanism
@@ -1226,31 +1221,35 @@ struct ScenarioState<'a, 'b> {
     /// of [`Self::step`]. Set by [`Self::with_target_backdrop`] when
     /// running the Backdrop's initial `apply_setup` / `apply_ops`
     /// before the first step.
-    write_to_backdrop: bool,
+    target_backdrop: bool,
 }
 
 impl<'a, 'b> ScenarioState<'a, 'b> {
+    /// Build a combined scenario view. Starts with the step-local
+    /// slot as the mutation target — call [`Self::with_target_backdrop`]
+    /// to flip into backdrop-setup mode for Backdrop's own
+    /// apply_setup / apply_ops pass.
     fn new(step: &'b mut StepState<'a>, backdrop: &'b mut BackdropState<'a>) -> Self {
         Self {
             step,
             backdrop,
-            write_to_backdrop: false,
+            target_backdrop: false,
         }
     }
 
     /// Run `f` with writes routed to the backdrop side.
     fn with_target_backdrop<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.write_to_backdrop;
-        self.write_to_backdrop = true;
+        let prev = self.target_backdrop;
+        self.target_backdrop = true;
         let r = f(self);
-        self.write_to_backdrop = prev;
+        self.target_backdrop = prev;
         r
     }
 
     /// `cgroups` group that receives newly-created cgroups. Step-local
     /// by default; backdrop when [`Self::with_target_backdrop`] is active.
     fn target_cgroups(&mut self) -> &mut CgroupGroup<'a> {
-        if self.write_to_backdrop {
+        if self.target_backdrop {
             &mut self.backdrop.cgroups
         } else {
             &mut self.step.cgroups
@@ -1259,7 +1258,7 @@ impl<'a, 'b> ScenarioState<'a, 'b> {
 
     /// `handles` vec that receives newly-spawned workload handles.
     fn target_handles(&mut self) -> &mut Vec<(String, WorkloadHandle)> {
-        if self.write_to_backdrop {
+        if self.target_backdrop {
             &mut self.backdrop.handles
         } else {
             &mut self.step.handles
@@ -1268,7 +1267,7 @@ impl<'a, 'b> ScenarioState<'a, 'b> {
 
     /// `cpusets` map that receives resolved cpusets for new cgroups.
     fn target_cpusets(&mut self) -> &mut std::collections::HashMap<String, BTreeSet<usize>> {
-        if self.write_to_backdrop {
+        if self.target_backdrop {
             &mut self.backdrop.cpusets
         } else {
             &mut self.step.cpusets
@@ -1277,7 +1276,7 @@ impl<'a, 'b> ScenarioState<'a, 'b> {
 
     /// `payload_handles` vec that receives newly-spawned payload handles.
     fn target_payload_handles(&mut self) -> &mut Vec<PayloadEntry> {
-        if self.write_to_backdrop {
+        if self.target_backdrop {
             &mut self.backdrop.payload_handles
         } else {
             &mut self.step.payload_handles
@@ -1577,6 +1576,23 @@ fn run_scenario(
             );
         }
     }
+    // Scheduler-kind payloads smuggled via Backdrop::with_op(Op::RunPayload { ... })
+    // would otherwise bypass the check above and only bail deep inside
+    // apply_ops. Reject them here with a Backdrop-specific error so
+    // the failure surface matches the declaration surface.
+    for op in &backdrop.ops {
+        if let Op::RunPayload { payload, .. } = op
+            && payload.is_scheduler()
+        {
+            anyhow::bail!(
+                "Backdrop::with_op(Op::RunPayload) received scheduler-kind Payload '{}' — \
+                 only PayloadKind::Binary payloads run in the Backdrop; \
+                 place scheduler-kind payloads on the #[ktstr_test(scheduler = ...)] \
+                 attribute instead",
+                payload.name,
+            );
+        }
+    }
     let effective_checks = checks.unwrap_or(&ctx.assert);
 
     let mut backdrop_state = BackdropState::empty(ctx);
@@ -1617,7 +1633,25 @@ fn run_scenario(
         let mut step_staging = StepState::empty(ctx);
         let mut scratch = ScenarioState::new(&mut step_staging, &mut backdrop_state);
         let setup_res = scratch.with_target_backdrop(|s| {
-            // Payloads: one Op::RunPayload per entry, in order.
+            // Order: cgroups → ops → payloads. CgroupDefs go first so
+            // a later `Op::add_cgroup` / `Op::run_payload_in_cgroup`
+            // can target cgroups that `apply_setup` just created.
+            // Payloads spawn last so `run_payload` resolving a cgroup
+            // placement lands inside a cgroup that either apply pass
+            // already built.
+            if !backdrop.cgroups.is_empty() {
+                apply_setup(ctx, s, &backdrop.cgroups)?;
+            }
+            // Raw ops: typically `Op::AddCgroup` for empty move-target
+            // cgroups (can't be expressed via CgroupDef because
+            // apply_setup forces a worker spawn), or placement-aware
+            // `Op::RunPayload` targeting a just-created backdrop
+            // cgroup.
+            if !backdrop.ops.is_empty() {
+                apply_ops(ctx, s, &backdrop.ops)?;
+            }
+            // Shorthand payloads: one Op::RunPayload per entry,
+            // inherited cgroup placement.
             if !backdrop.payloads.is_empty() {
                 let ops: Vec<Op> = backdrop
                     .payloads
@@ -1625,17 +1659,6 @@ fn run_scenario(
                     .map(|p| Op::run_payload(p, Vec::<String>::new()))
                     .collect();
                 apply_ops(ctx, s, &ops)?;
-            }
-            // Raw ops: run before CgroupDef setup so a later
-            // CgroupDef can reference entities these ops create.
-            // Primary use is Op::AddCgroup for empty move-target
-            // cgroups that need backdrop lifetime but no Workers.
-            if !backdrop.ops.is_empty() {
-                apply_ops(ctx, s, &backdrop.ops)?;
-            }
-            // Cgroups: a single apply_setup pass.
-            if !backdrop.cgroups.is_empty() {
-                apply_setup(ctx, s, &backdrop.cgroups)?;
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -1890,7 +1913,7 @@ fn validate_mempolicy_cpuset(
 /// ctx.workers_per_cgroup workers).
 ///
 /// Cgroups created here route into step-local or backdrop state per
-/// `state.write_to_backdrop`. A duplicate name (already tracked by
+/// `state.target_backdrop`. A duplicate name (already tracked by
 /// either state) bails — a `CgroupDef` must not silently shadow a
 /// cgroup that another state slot has already created.
 fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef]) -> Result<()> {
@@ -2014,11 +2037,11 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 // silently dismantle a persistent cgroup and let
                 // subsequent Steps fail with confusing
                 // "cgroup missing" errors. Ops running during the
-                // Backdrop's own setup pass (`write_to_backdrop`)
+                // Backdrop's own setup pass (`target_backdrop`)
                 // are exempt: the Backdrop is allowed to structure
                 // its own state however it needs before the Step
                 // loop starts.
-                if !state.write_to_backdrop && state.cgroup_name_is_backdrop(cgroup) {
+                if !state.target_backdrop && state.cgroup_name_is_backdrop(cgroup) {
                     anyhow::bail!(
                         "Op::RemoveCgroup targets Backdrop-owned cgroup '{}' — \
                          Backdrop cgroups live for the full scenario and must \
@@ -2093,6 +2116,23 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 state.target_handles().push((cgroup.to_string(), h));
             }
             Op::StopCgroup { cgroup } => {
+                // Same invariant as Op::RemoveCgroup: a Step's ops
+                // must not stop a Backdrop-owned cgroup's workers.
+                // `drain_payloads_for_cgroup` and
+                // `drop_handles_for_cgroup` both touch step + backdrop
+                // state by name, so a silent step-local stop would
+                // kill persistent workers. Ops running inside the
+                // Backdrop's own setup pass (`target_backdrop`)
+                // stay exempt.
+                if !state.target_backdrop && state.cgroup_name_is_backdrop(cgroup) {
+                    anyhow::bail!(
+                        "Op::StopCgroup targets Backdrop-owned cgroup '{}' — \
+                         Backdrop workers live for the full scenario and must \
+                         not be stopped from a Step; drop the op or move the \
+                         cgroup declaration out of the Backdrop",
+                        cgroup,
+                    );
+                }
                 state.drain_payloads_for_cgroup(cgroup);
                 state.drop_handles_for_cgroup(cgroup);
             }
@@ -2163,6 +2203,26 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 state.target_handles().push((String::new(), h));
             }
             Op::MoveAllTasks { from, to } => {
+                // A step-local MoveAllTasks that pulls from a
+                // Backdrop-owned cgroup into a step-local cgroup
+                // would strand persistent workers inside a cgroup
+                // that gets rmdir'd at step boundary. Reject
+                // explicitly. Ops running inside the Backdrop's
+                // own setup pass (`target_backdrop`) stay exempt.
+                if !state.target_backdrop
+                    && state.cgroup_name_is_backdrop(from)
+                    && !state.cgroup_name_is_backdrop(to)
+                {
+                    anyhow::bail!(
+                        "Op::MoveAllTasks from Backdrop-owned '{}' to step-local '{}' \
+                         would leave persistent workers in a cgroup that disappears \
+                         at step boundary; declare `{}` in the Backdrop too, or \
+                         move the workers back into a Backdrop-owned cgroup",
+                        from,
+                        to,
+                        to,
+                    );
+                }
                 // Clear subtree_control on the destination before moving
                 // tasks. The kernel's no-internal-process constraint
                 // (cgroup_migrate_vet_dst) returns EBUSY when writing to
@@ -2297,8 +2357,10 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
 /// Drains step-local handles + payload handles; backdrop state is
 /// untouched. Called at every step boundary (success AND error
 /// paths) as the "Step is fully bounded" teardown. The
-/// `step_state.cgroups` RAII guard drops the step-local cgroups
-/// immediately after this returns.
+/// `step_state` goes out of scope at the end of this step's
+/// iteration, so its `CgroupGroup` drop removes every step-local
+/// cgroup immediately after `run_scenario` propagates the result
+/// of this call.
 fn collect_step(
     step_state: &mut StepState<'_>,
     checks: &crate::assert::Assert,
@@ -2349,8 +2411,8 @@ fn collect_backdrop(
 /// if a future refactor replaces the `.kill()` below with plain
 /// `drop(handle)`, the `PayloadHandle::drop` SIGKILLs the child
 /// but skips the evaluate-and-emit pipeline that records metrics
-/// to the SHM ring. The test-path drain via `cleanup_state`
-/// likewise routes through `drain_all_payload_handles` for the
+/// to the SHM ring. Test helpers that drain payload handles
+/// likewise route through `drain_all_payload_handles` for the
 /// same reason. Preserve `.kill()` on every path that claims to
 /// drain handles for metric capture.
 fn drain_payload_handles_for_cgroup(handles: &mut Vec<PayloadEntry>, cgroup: &str) {
@@ -4831,7 +4893,7 @@ mod tests {
     /// Ruling #2: a step-local `Op::RemoveCgroup` that targets a
     /// Backdrop-owned cgroup must bail before any cgroupfs write.
     /// Ops running inside the Backdrop's own setup pass (i.e.
-    /// `write_to_backdrop == true`) stay exempt.
+    /// `target_backdrop == true`) stay exempt.
     #[test]
     fn remove_cgroup_rejects_backdrop_target() {
         let mock = MockCgroupOps::new();
@@ -4868,7 +4930,7 @@ mod tests {
             "pre-bail path must not invoke remove_cgroup, got: {calls:?}"
         );
 
-        // Backdrop-pass RemoveCgroup (write_to_backdrop = true) is
+        // Backdrop-pass RemoveCgroup (target_backdrop = true) is
         // allowed and routes through to the mock.
         {
             let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
@@ -4989,13 +5051,14 @@ mod tests {
         step_state.handles.clear();
     }
 
-    /// Ruling #5 companion: a backdrop-owned handle moved into a
-    /// step-local cgroup stays in the backdrop slot — persistent
-    /// workers never demote to step-local ownership.
+    /// Ruling (pass 1 / F1): a step-local `Op::MoveAllTasks` that
+    /// pulls from a Backdrop-owned cgroup into a step-local cgroup
+    /// must bail before touching cgroupfs. The persistent worker
+    /// would otherwise be stranded in a cgroup that gets rmdir'd at
+    /// the step boundary. Backdrop-setup ops (`target_backdrop`)
+    /// stay exempt.
     #[test]
-    fn move_all_tasks_backdrop_to_step_keeps_backdrop_ownership() {
-        use crate::workload::{Work, WorkloadConfig, WorkloadHandle};
-
+    fn move_all_tasks_backdrop_to_step_rejected() {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
@@ -5003,30 +5066,23 @@ mod tests {
         let mut backdrop_state = BackdropState::empty(&ctx);
         backdrop_state.cgroups.add_cgroup_no_cpuset("bd").unwrap();
         step_state.cgroups.add_cgroup_no_cpuset("step").unwrap();
-        let w = Work::default();
-        let wl = WorkloadConfig {
-            num_workers: 1,
-            affinity: crate::workload::AffinityMode::None,
-            work_type: w.work_type,
-            sched_policy: w.sched_policy,
-            mem_policy: w.mem_policy,
-            mpol_flags: w.mpol_flags,
-        };
-        let h = WorkloadHandle::spawn(&wl).expect("spawn");
-        backdrop_state.handles.push(("bd".to_string(), h));
-        {
-            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-            apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("bd", "step")])
-                .expect("backdrop-to-step move");
-        }
-        assert_eq!(
-            step_state.handles.len(),
-            0,
-            "step slot must not pick up a backdrop handle",
+
+        let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        let err = apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("bd", "step")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Backdrop-owned 'bd'") && msg.contains("step-local 'step'"),
+            "error must name both cgroups and the direction, got: {msg}"
         );
-        assert_eq!(backdrop_state.handles.len(), 1);
-        assert_eq!(backdrop_state.handles[0].0, "step");
-        backdrop_state.handles.clear();
+        // The mock must not have seen a cgroup.procs write — the
+        // guard bails before any kernel-side work.
+        let calls = mock.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, CgroupCall::MoveTasks(_, _))),
+            "pre-bail path must not invoke move_tasks, got: {calls:?}"
+        );
     }
 
     /// Ruling #6: `run_scenario` rejects a scheduler-kind payload in

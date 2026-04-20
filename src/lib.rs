@@ -125,7 +125,7 @@
 //! - [`cgroup`] -- cgroup v2 filesystem operations
 //! - [`cli`] -- shared helpers backing the `ktstr` and `cargo-ktstr` binaries
 //! - [`runner`] -- host-side scenario runner used by `ktstr run`
-//! - [`scenario`] -- declarative ops API (`CgroupDef`, `Step`, `Op`, `execute_defs`, `execute_steps`)
+//! - [`scenario`] -- declarative ops API (`CgroupDef`, `Step`, `Op`, `Backdrop`, `execute_defs`, `execute_steps`, `execute_scenario`)
 //! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
 //! - [`mod@assert`] -- pass/fail assertions (starvation, isolation, fairness)
 //! - [`workload`] -- worker process types and telemetry collection

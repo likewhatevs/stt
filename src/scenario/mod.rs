@@ -6,8 +6,10 @@
 //! - [`ops::Op`] -- atomic cgroup topology operation
 //! - [`ops::CpusetSpec`] -- how to compute a cpuset from topology
 //! - [`ops::HoldSpec`] -- how long to hold after a step
+//! - [`backdrop::Backdrop`] -- persistent scenario state shared across every Step
 //! - [`ops::execute_defs`] -- run cgroup definitions for the full duration
 //! - [`ops::execute_steps`] -- run a multi-step sequence
+//! - [`ops::execute_scenario`] -- run a Backdrop + Steps sequence
 //!
 //! Types defined in this module:
 //! - [`Ctx`] -- runtime context passed to scenario functions
@@ -37,6 +39,7 @@ pub mod performance;
 pub mod scenarios;
 pub mod stress;
 
+pub use backdrop::Backdrop;
 pub use catalog::all_scenarios;
 
 use std::collections::BTreeSet;

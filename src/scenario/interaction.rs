@@ -59,55 +59,37 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
 
 /// Oscillate load between two cgroups across four phases.
 ///
-/// The two cgroups (`cg_0`, `cg_1`) persist for the whole scenario
-/// and live in the [`Backdrop`]; each Step's `Op::stop_cgroup` +
-/// `Op::spawn` cycle would otherwise fight with per-Step cgroup
-/// teardown because later Steps reference the cgroups by name.
-/// Step 0 holds the Backdrop's initial workload assignment; Steps
-/// 1-3 swap the heavy/light assignment between `cg_0` and `cg_1`
-/// by stopping the currently-running workers (both Backdrop and
-/// step-local) and spawning replacements.
+/// Each phase declares fresh step-local `cg_0` / `cg_1` CgroupDefs
+/// with the heavy/light assignment swapped from the prior phase.
+/// The per-Step auto-teardown at every step boundary IS the
+/// "stop + respawn" event — there's no cross-step reference so no
+/// Backdrop is needed. A Backdrop migration would fight the new
+/// `Op::stop_cgroup` / `Op::MoveAllTasks` guards that protect
+/// persistent workers from step-local teardown, so this scenario
+/// stays on `execute_steps`.
 pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
-    let heavy = Work::default().workers(ctx.workers_per_cgroup * 2);
-    let light = Work::default().workers(1).work_type(WorkType::YieldHeavy);
+    let heavy_cg = |name: &'static str| CgroupDef::named(name).workers(ctx.workers_per_cgroup * 2);
+    let light_cg = |name: &'static str| {
+        CgroupDef::named(name)
+            .workers(1)
+            .work_type(WorkType::YieldHeavy)
+    };
 
-    let backdrop = Backdrop::new()
-        .with_cgroup(CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup * 2))
-        .with_cgroup(
-            CgroupDef::named("cg_1")
-                .workers(1)
-                .work_type(WorkType::YieldHeavy),
-        );
-
-    // Step 0: hold the Backdrop's initial assignment for the first
-    // quarter of the run.
-    let mut steps = vec![Step::new(
-        vec![],
+    let mut steps = vec![Step::with_defs(
+        vec![heavy_cg("cg_0"), light_cg("cg_1")],
         HoldSpec::Fixed(ctx.settle + ctx.duration / 4),
     )];
 
-    // Phases 1-3: swap load by stopping and respawning. Workers
-    // spawned here are step-local and die at step teardown — which
-    // is exactly what the next iteration's `Op::stop_cgroup` was
-    // doing explicitly before the Backdrop split landed.
     for i in 1..4 {
-        let (heavy_cgroup, light_cgroup): (&str, &str) = if i % 2 == 0 {
-            ("cg_0", "cg_1")
+        let defs = if i % 2 == 0 {
+            vec![heavy_cg("cg_0"), light_cg("cg_1")]
         } else {
-            ("cg_1", "cg_0")
+            vec![light_cg("cg_0"), heavy_cg("cg_1")]
         };
-        steps.push(Step::new(
-            vec![
-                Op::stop_cgroup("cg_0"),
-                Op::stop_cgroup("cg_1"),
-                Op::spawn(heavy_cgroup, heavy.clone()),
-                Op::spawn(light_cgroup, light.clone()),
-            ],
-            HoldSpec::Frac(0.25),
-        ));
+        steps.push(Step::with_defs(defs, HoldSpec::Frac(0.25)));
     }
 
-    execute_scenario(ctx, backdrop, steps)
+    execute_steps(ctx, steps)
 }
 
 /// Four cgroups with 16/1/8/4 workers testing multi-cell rebalancing.
@@ -183,21 +165,20 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
 ///
 /// All three cgroups persist for the scenario (the `MoveAllTasks`
 /// ops reference them by name across every Step), so they live in
-/// the [`Backdrop`]. `cg_1` is declared without `.workers(...)` but
-/// still receives a default `Work` under the current
-/// `apply_setup` semantics — the `MoveAllTasks` body targets the
-/// handle whose key matches `from`, so an extra default worker in
-/// `cg_1` participates in the ping-pong. Workers that
-/// [`Op::MoveAllTasks`] transfers into a Backdrop cgroup retain
-/// their Backdrop ownership so the persistent workers survive
-/// every step teardown.
+/// the [`Backdrop`]. `cg_1` is an empty move target declared via
+/// [`Backdrop::with_op`] so it never spawns its own workers — only
+/// the `cg_mobile` handle ping-pongs between `cg_mobile` and
+/// `cg_1`. Workers that [`Op::MoveAllTasks`] transfers into a
+/// Backdrop cgroup retain their Backdrop ownership so the
+/// persistent workers survive every step teardown.
 pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
     // cg_0: permanent residents. cg_mobile: workers that ping-pong to cg_1.
-    // Each cgroup has exactly one handle so MoveAllTasks tracks correctly.
+    // cg_1: empty move target (no workers). Exactly one handle participates
+    // in MoveAllTasks.
     let backdrop = Backdrop::new()
         .with_cgroup(CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup))
         .with_cgroup(CgroupDef::named("cg_mobile").workers(ctx.workers_per_cgroup))
-        .with_cgroup(CgroupDef::named("cg_1"));
+        .with_op(Op::add_cgroup("cg_1"));
 
     // Settle: let the Backdrop-spawned workers stabilize before the
     // first move.
@@ -234,9 +215,9 @@ pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     // cg_heavy: 6 permanent CPU-spin workers.
     // cg_light: 2 permanent bursty workers.
     // cg_mobile: 2 workers that ping-pong to cg_overflow.
-    // cg_overflow: empty move target (gets a default Work under
-    // apply_setup semantics; the move_all_tasks body moves whichever
-    // handle is keyed under `from` into `to`).
+    // cg_overflow: empty move target declared via with_op so it never
+    // spawns workers of its own — only the cg_mobile handle participates
+    // in MoveAllTasks.
     let backdrop = Backdrop::new()
         .with_cgroup(CgroupDef::named("cg_heavy").workers(6))
         .with_cgroup(CgroupDef::named("cg_mobile").workers(2))
@@ -245,7 +226,7 @@ pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 .workers(2)
                 .work_type(WorkType::bursty(50, 100)),
         )
-        .with_cgroup(CgroupDef::named("cg_overflow"));
+        .with_op(Op::add_cgroup("cg_overflow"));
 
     let mut steps = vec![Step::new(vec![], HoldSpec::Fixed(ctx.settle))];
 
