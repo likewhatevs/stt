@@ -134,38 +134,52 @@ fn extract_json_region(s: &str) -> Option<&str> {
 /// polarity.
 pub(crate) fn walk_json_leaves(value: &serde_json::Value, source: MetricSource) -> Vec<Metric> {
     let mut out = Vec::new();
-    walk(value, String::new(), source, &mut out);
+    // Single reusable path buffer: children push their segment,
+    // recurse, then truncate back. O(total_path_chars) work across
+    // the whole walk instead of O(depth × path_chars) per leaf.
+    let mut path = String::new();
+    walk(value, &mut path, source, &mut out);
     out
 }
 
-fn walk(value: &serde_json::Value, path: String, source: MetricSource, out: &mut Vec<Metric>) {
+fn walk(value: &serde_json::Value, path: &mut String, source: MetricSource, out: &mut Vec<Metric>) {
     match value {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                let next = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{path}.{k}")
-                };
-                walk(v, next, source, out);
+                let saved_len = path.len();
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(k);
+                walk(v, path, source, out);
+                path.truncate(saved_len);
             }
         }
         serde_json::Value::Array(items) => {
             for (i, v) in items.iter().enumerate() {
-                let next = if path.is_empty() {
-                    i.to_string()
-                } else {
-                    format!("{path}.{i}")
-                };
-                walk(v, next, source, out);
+                let saved_len = path.len();
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                // Avoid an extra String allocation for the index
+                // segment by writing directly into `path` via the
+                // fmt::Write impl (infallible for String).
+                use std::fmt::Write;
+                let _ = write!(path, "{i}");
+                walk(v, path, source, out);
+                path.truncate(saved_len);
             }
         }
         serde_json::Value::Number(n) => {
             if let Some(f) = n.as_f64()
                 && f.is_finite()
             {
+                // Leaf emission is the one unavoidable allocation —
+                // `Metric.name` is owned. `clone()` copies exactly
+                // the current path bytes, not every intermediate
+                // ancestor path that `format!` used to materialize.
                 out.push(Metric {
-                    name: path,
+                    name: path.clone(),
                     value: f,
                     polarity: Polarity::Unknown,
                     unit: String::new(),
@@ -409,6 +423,52 @@ mod tests {
         assert!(serde_json::Number::from_f64(f64::NEG_INFINITY).is_none());
         // Finite values ARE accepted:
         assert!(serde_json::Number::from_f64(2.78).is_some());
+    }
+
+    /// #12 regression: walk_json_leaves uses push/pop on a single
+    /// path buffer instead of per-level format!(). This test pins
+    /// the *behavior* (path output unchanged across deep nesting)
+    /// so a future refactor of the path plumbing can't silently
+    /// drop a segment or duplicate a dot.
+    #[test]
+    fn walk_json_leaves_deep_nesting_paths_are_correct() {
+        // 6 levels deep → one leaf at a.b.c.d.e.f.
+        let s = r#"{"a":{"b":{"c":{"d":{"e":{"f": 42.0}}}}}}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].name, "a.b.c.d.e.f");
+        assert_eq!(m[0].value, 42.0);
+    }
+
+    /// Sibling keys under the same parent must see the parent
+    /// segment truncated between each child — the bug that the
+    /// push/pop refactor would hit is "path accumulates across
+    /// siblings" producing `root.a.b`, `root.a.b.c` etc. instead
+    /// of `root.a.b`, `root.a.c`.
+    #[test]
+    fn walk_json_leaves_siblings_do_not_accumulate_path() {
+        let s = r#"{"root":{"a": 1, "b": 2, "c": 3}}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        assert_eq!(m.len(), 3);
+        let names: std::collections::BTreeSet<&str> = m.iter().map(|x| x.name.as_str()).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["root.a", "root.b", "root.c"].into_iter().collect();
+        assert_eq!(names, expected, "path must truncate between siblings");
+    }
+
+    /// Array indices use the same push/pop path: `arr.0`, `arr.1`.
+    /// Deep array-of-array-of-object combinations exercise every
+    /// code path in the walker.
+    #[test]
+    fn walk_json_leaves_deep_array_object_interleaving() {
+        let s = r#"{"data":[{"vals":[10.0, 20.0]},{"vals":[30.0]}]}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        let by_name: std::collections::BTreeMap<&str, f64> =
+            m.iter().map(|x| (x.name.as_str(), x.value)).collect();
+        assert_eq!(by_name.get("data.0.vals.0"), Some(&10.0));
+        assert_eq!(by_name.get("data.0.vals.1"), Some(&20.0));
+        assert_eq!(by_name.get("data.1.vals.0"), Some(&30.0));
+        assert_eq!(by_name.len(), 3);
     }
 
     #[test]

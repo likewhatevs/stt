@@ -716,6 +716,24 @@ impl KtstrTestEntry {
                 self.name,
             );
         }
+        // Mirror the payload-slot gate for every workload entry. The
+        // `workloads` slot is for userspace binaries composed with
+        // the primary payload under the scheduler; a scheduler-kind
+        // Payload here would be silently ignored at spawn time and
+        // is almost always a `Payload::EEVDF`-shaped typo in a
+        // `workloads = [...]` attribute.
+        for (idx, w) in self.workloads.iter().enumerate() {
+            if w.is_scheduler() {
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.workloads[{idx}] (name='{}') must be \
+                     PayloadKind::Binary, not Scheduler-kind (schedulers belong \
+                     in the `scheduler` slot; the `workloads` slot is for \
+                     userspace binaries composed under the scheduler)",
+                    self.name,
+                    w.name,
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -897,6 +915,79 @@ mod tests {
         assert_eq!(entry.workloads.len(), 2);
         assert_eq!(entry.workloads[0].name, "fio");
         assert_eq!(entry.workloads[1].name, "stress-ng");
+    }
+
+    /// `validate()` rejects any `workloads[i]` that is a
+    /// Scheduler-kind Payload — symmetric with the existing
+    /// `payload`-slot rejection. Catches the typo where a test
+    /// author writes `workloads = [Payload::EEVDF]` instead of a
+    /// binary payload.
+    #[test]
+    fn validate_rejects_scheduler_kind_in_workloads() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        const GOOD: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "mixed_kinds",
+            func: good_test_func,
+            // Second workload is scheduler-kind → must bail.
+            workloads: &[&GOOD, &Payload::EEVDF],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workloads[1]") && msg.contains("Scheduler-kind"),
+            "expected workloads[1] Scheduler-kind bail, got: {msg}"
+        );
+        assert!(
+            msg.contains("eevdf"),
+            "error must name the offending workload entry, got: {msg}"
+        );
+    }
+
+    /// Binary-only workloads slip past `validate()` cleanly — the
+    /// Scheduler-kind check does not over-reject. Pins the happy
+    /// path against the rejection path so future edits to the
+    /// workloads loop don't flip polarity.
+    #[test]
+    fn validate_accepts_binary_only_workloads() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        const FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        const STRESS_NG: Payload = Payload {
+            name: "stress-ng",
+            kind: PayloadKind::Binary("stress-ng"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "all_binary",
+            func: good_test_func,
+            workloads: &[&FIO, &STRESS_NG],
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry.validate().expect("binary-only workloads must pass");
     }
 
     #[test]

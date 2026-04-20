@@ -299,7 +299,7 @@ impl PayloadHandle {
         let child = self
             .child
             .take()
-            .expect("child already consumed by wait/kill");
+            .ok_or_else(|| already_consumed(self.payload))?;
         let output = wait_and_capture(child)
             .with_context(|| format!("wait payload '{}'", self.payload.name))?;
         Ok(evaluate(self.payload, &self.checks, output))
@@ -316,7 +316,7 @@ impl PayloadHandle {
         let mut child = self
             .child
             .take()
-            .expect("child already consumed by wait/kill");
+            .ok_or_else(|| already_consumed(self.payload))?;
         let _ = child.kill();
         let output = wait_and_capture(child)
             .with_context(|| format!("reap killed payload '{}'", self.payload.name))?;
@@ -335,10 +335,15 @@ impl PayloadHandle {
         let child = self
             .child
             .as_mut()
-            .expect("child already consumed by wait/kill");
+            .ok_or_else(|| already_consumed(self.payload))?;
         match child.try_wait()? {
             Some(_status) => {
-                let child = self.child.take().unwrap();
+                // `child` was Some above; the earlier branch didn't
+                // `take()` it, so this unwrap is guaranteed to hold.
+                let child = self
+                    .child
+                    .take()
+                    .expect("child still present on terminal branch");
                 let output = wait_and_capture(child)
                     .with_context(|| format!("reap payload '{}'", self.payload.name))?;
                 Ok(Some(evaluate(self.payload, &self.checks, output)))
@@ -346,6 +351,19 @@ impl PayloadHandle {
             None => Ok(None),
         }
     }
+}
+
+/// Error value produced when `wait`/`kill`/`try_wait` is called on a
+/// handle whose child has already been taken by a prior call. The
+/// payload name anchors the error to a specific handle so the
+/// test log points directly at the misuse site.
+fn already_consumed(payload: &'static Payload) -> anyhow::Error {
+    anyhow!(
+        "PayloadHandle for '{}' already consumed by a prior \
+         wait/kill/try_wait call; each handle can only produce \
+         one (AssertResult, PayloadMetrics) pair",
+        payload.name,
+    )
 }
 
 impl Drop for PayloadHandle {
@@ -1495,5 +1513,95 @@ mod tests {
             exit_code: 0,
         };
         emit_payload_metrics_to_shm(&pm);
+    }
+
+    // -- #46: PayloadHandle double-consume returns Err, not panic --
+
+    /// After `try_wait()` returns `Ok(Some(..))` (terminal branch
+    /// that takes the child), a subsequent `try_wait()` on the same
+    /// handle must return `Err` instead of panicking. Previously
+    /// the implementation unwrapped `self.child.as_mut()` with a
+    /// panicking `.expect(...)`.
+    #[test]
+    fn try_wait_after_terminal_returns_err() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        let mut handle = PayloadRun::new(&ctx, &TRUE_BIN)
+            .spawn()
+            .expect("spawn /bin/true");
+        // First terminal: /bin/true exits immediately; spin until
+        // try_wait returns Some.
+        for _ in 0..100 {
+            if handle.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Second call must not panic — expect Err describing the
+        // consumed state.
+        let err = handle
+            .try_wait()
+            .expect_err("second try_wait on consumed handle must be Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already consumed") && msg.contains("true_bin"),
+            "error must name the handle + misuse, got: {msg}"
+        );
+    }
+
+    /// Calling `wait()` after `try_wait()` has consumed the child
+    /// must Err rather than panic. Test pairs with
+    /// `try_wait_after_terminal_returns_err`: same state, different
+    /// terminal method.
+    #[test]
+    fn wait_after_try_wait_consumed_returns_err() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        let mut handle = PayloadRun::new(&ctx, &TRUE_BIN)
+            .spawn()
+            .expect("spawn /bin/true");
+        for _ in 0..100 {
+            if handle.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Child is now taken; wait() must return Err, not panic.
+        let err = handle
+            .wait()
+            .expect_err("wait() on consumed handle must return Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already consumed") && msg.contains("true_bin"),
+            "error must name the handle + misuse, got: {msg}"
+        );
+    }
+
+    /// Calling `kill()` after `try_wait()` has consumed the child
+    /// must Err rather than panic.
+    #[test]
+    fn kill_after_try_wait_consumed_returns_err() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        let mut handle = PayloadRun::new(&ctx, &TRUE_BIN)
+            .spawn()
+            .expect("spawn /bin/true");
+        for _ in 0..100 {
+            if handle.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let err = handle
+            .kill()
+            .expect_err("kill() on consumed handle must return Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already consumed") && msg.contains("true_bin"),
+            "error must name the handle + misuse, got: {msg}"
+        );
     }
 }
