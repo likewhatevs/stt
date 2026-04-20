@@ -1952,9 +1952,9 @@ mod tests {
 
     #[test]
     fn is_skipped_true_for_skip_result() {
-        // Regression for #36: skip results must be distinguishable
-        // from pass results so stats tooling can subtract them from
-        // pass counts (a skipped test is not a successful execution).
+        // Skip results must be distinguishable from pass results so
+        // stats tooling can subtract them from pass counts — a
+        // skipped test is not a successful execution.
         let r = AssertResult::skip("no LLC available");
         assert!(r.passed, "skip keeps passed=true for simple gate");
         assert!(r.is_skipped(), "skip must report is_skipped");
@@ -2250,10 +2250,9 @@ mod tests {
 
     #[test]
     fn plan_custom_gap_threshold_produces_stuck_kind() {
-        // Regression for #22: AssertPlan's custom-threshold stuck
-        // re-emission must tag DetailKind::Stuck so downstream kind
-        // filters (and any test expecting structural categorization)
-        // see it.
+        // AssertPlan's custom-threshold stuck re-emission must tag
+        // DetailKind::Stuck so downstream kind filters (and any test
+        // expecting structural categorization) see it.
         let plan = AssertPlan::new().check_not_starved().max_gap_ms(1500);
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
         let r = plan.assert_cgroup(&reports, None, None);
@@ -2267,11 +2266,10 @@ mod tests {
 
     #[test]
     fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_starved() {
-        // Regression for #22: when custom spread + gap thresholds are
-        // permissive enough to absorb the default-threshold failures,
-        // AssertPlan must strip the Unfair/Stuck details it generated
-        // but keep the Starved detail (kind-based filtering, not
-        // substring match).
+        // When custom spread + gap thresholds are permissive enough
+        // to absorb the default-threshold failures, AssertPlan must
+        // strip the Unfair/Stuck details it generated but keep the
+        // Starved detail (kind-based filtering, not substring match).
         //
         // Worker 1: 10% off-CPU, 500ms gap — fair, not stuck.
         // Worker 2: work=0 — starved (kind=Starved).
@@ -3155,13 +3153,12 @@ mod tests {
 
     #[test]
     fn assert_benchmarks_p99_n100_at_limit_passes() {
-        // Regression for #23: with samples [0..100], the corrected p99
-        // is 98 (nearest-rank: sorted[ceil(100*0.99) - 1] = sorted[98]).
-        // Setting the limit to 99 must pass (98 <= 99). Under the old
-        // off-by-one formulation, the returned p99 was 99 (the max),
-        // which would have been exactly at the limit (99 <= 99) — the
-        // same pass, but for the wrong reason. Pairing this with the
-        // _fail test below pins down the correct index.
+        // With samples [0..100], the nearest-rank p99 is 98
+        // (sorted[ceil(100*0.99) - 1] = sorted[98]). Setting the
+        // limit to 99 must pass (98 <= 99). An off-by-one that
+        // returns sorted[99] = 99 would pass the same limit for
+        // the wrong reason — the paired _fail test below pins
+        // down the correct index.
         let latencies: Vec<u64> = (0..100).collect();
         let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
         let r = assert_benchmarks(&reports, Some(99), None, None);
@@ -3191,12 +3188,12 @@ mod tests {
 
     #[test]
     fn assert_not_starved_p99_n100_is_99_microseconds() {
-        // Regression for #23: assert_not_starved exposes p99 as
-        // microseconds via ScenarioStats. Samples = [1000, 2000, ...,
-        // 100_000] ns (100 values at kilo-ns spacing) so the reported
-        // p99 is exactly 99.0us with the corrected index
+        // assert_not_starved exposes p99 as microseconds via
+        // ScenarioStats. Samples = [1000, 2000, ..., 100_000] ns
+        // (100 values at kilo-ns spacing) so the reported p99 is
+        // exactly 99.0us with the correct index
         // (sorted[ceil(100*0.99) - 1] = sorted[98] = 99_000ns = 99us).
-        // The old off-by-one returned sorted[99] = 100_000ns = 100us.
+        // An off-by-one that returns sorted[99] would yield 100us.
         let latencies: Vec<u64> = (1..=100).map(|v: u64| v * 1000).collect();
         let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
         let r = assert_not_starved(&reports);

@@ -690,7 +690,7 @@ mod tests {
 
     // Proves an arbitrary `Payload` (not just `Payload::EEVDF`) is
     // const-constructible via struct literal — the #[derive(Payload)]
-    // proc-macro (WO-162-J) will emit exactly this shape.
+    // proc-macro emits exactly this shape.
     const _PAYLOAD_CONST_BUILD: Payload = Payload {
         name: "fio",
         kind: PayloadKind::Binary("fio"),
@@ -726,7 +726,7 @@ mod tests {
         );
     }
 
-    /// #33: Round-trip bool → Polarity → bool for HigherBetter /
+    /// Round-trip bool → Polarity → bool for HigherBetter /
     /// LowerBetter yields the identity. Pins the "inverse sense"
     /// contract documented on `MetricDef::higher_is_worse` and
     /// `Polarity::from_higher_is_worse` so a future polarity
@@ -772,12 +772,12 @@ mod tests {
         );
     }
 
-    /// #33: `MetricDef::higher_is_worse` is total over every
-    /// `Polarity` variant — the current implementation lumps
-    /// `LowerBetter`, `TargetValue`, and `Unknown` all into
-    /// `true`. Pin that so a subtle change (e.g. TargetValue → its
-    /// own category) doesn't silently flip regression direction
-    /// for every test using target metrics.
+    /// `MetricDef::higher_is_worse` is total over every `Polarity`
+    /// variant — the current implementation lumps `LowerBetter`,
+    /// `TargetValue`, and `Unknown` all into `true`. Pinned so a
+    /// subtle change (e.g. TargetValue → its own category) doesn't
+    /// silently flip regression direction for every test using
+    /// target metrics.
     #[test]
     fn higher_is_worse_covers_all_polarity_variants() {
         use crate::stats::{Aggregator, MetricDef};
@@ -804,19 +804,19 @@ mod tests {
         assert_eq!(p, Polarity::TargetValue(0.5));
     }
 
-    /// #43: `Polarity::target(NaN)` must panic in release
-    /// too — non-finite target values produce silent incorrect
-    /// regression verdicts in `compare_rows`, so the gate is a
-    /// runtime `assert!` (not `debug_assert!`). Pins that a
-    /// release build won't silently let NaN slip through.
+    /// `Polarity::target(NaN)` must panic in release too — non-finite
+    /// target values produce silent incorrect regression verdicts in
+    /// `compare_rows`, so the gate is a runtime `assert!` (not
+    /// `debug_assert!`). Pins that a release build won't silently
+    /// let NaN slip through.
     #[test]
     #[should_panic(expected = "Polarity::TargetValue target must be finite")]
     fn polarity_target_rejects_nan_panics() {
         let _ = Polarity::target(f64::NAN);
     }
 
-    /// #43: `Polarity::target(+inf)` panics symmetrically with
-    /// NaN. `compare_rows` would produce inf-vs-finite verdicts
+    /// `Polarity::target(+inf)` panics symmetrically with NaN.
+    /// `compare_rows` would otherwise produce inf-vs-finite verdicts
     /// that depend on IEEE-754 infinity arithmetic rather than
     /// meaningful regression direction.
     #[test]
@@ -825,7 +825,7 @@ mod tests {
         let _ = Polarity::target(f64::INFINITY);
     }
 
-    /// #43: `Polarity::target(-inf)` ditto.
+    /// `Polarity::target(-inf)` ditto.
     #[test]
     #[should_panic(expected = "Polarity::TargetValue target must be finite")]
     fn polarity_target_rejects_negative_infinity_panics() {

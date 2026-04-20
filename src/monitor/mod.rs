@@ -2725,11 +2725,11 @@ mod tests {
 
     #[test]
     fn event_deltas_counter_reset_clamps_to_zero() {
-        // Regression for #29: a scheduler restart between samples
-        // resets the per-CPU counters to smaller (or zero) values. The
-        // raw delta `last - first` is then negative — which, before the
-        // fix, flowed through as a negative fallback_rate / negative
-        // total. Clamp to zero so the downstream rate is sane.
+        // A scheduler restart between samples resets the per-CPU
+        // counters to smaller (or zero) values. The raw delta
+        // `last - first` is then negative — which would flow through
+        // as a negative fallback_rate / negative total. Clamp to zero
+        // so the downstream rate is sane.
         //
         // Sample 0 at t=0ms has high counters (pre-restart).
         // Sample 1 at t=1000ms has low counters (post-restart).

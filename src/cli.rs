@@ -1903,12 +1903,11 @@ mod tests {
 
     #[test]
     fn configure_kernel_rejects_numeric_prefix_false_match() {
-        // Regression for #24: fragment asks `CONFIG_NR_CPUS=1`, .config
-        // has `CONFIG_NR_CPUS=128`. Under the old
-        // `config_content.contains(fragment_line)`, the substring
-        // "CONFIG_NR_CPUS=1" IS present inside "CONFIG_NR_CPUS=128"
-        // (numeric prefix), so the fragment line was reported as
-        // already-configured and the append was skipped — wrong.
+        // Fragment asks `CONFIG_NR_CPUS=1`, .config has
+        // `CONFIG_NR_CPUS=128`. A plain
+        // `config_content.contains(fragment_line)` would treat the
+        // substring "CONFIG_NR_CPUS=1" as present inside
+        // "CONFIG_NR_CPUS=128" (numeric prefix) and skip the append.
         // Exact-line matching via the HashSet helper correctly
         // distinguishes the two and appends.
         let dir = tempfile::TempDir::new().unwrap();

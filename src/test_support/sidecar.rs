@@ -1081,10 +1081,10 @@ mod tests {
 
     #[test]
     fn write_sidecar_variant_hash_distinguishes_active_flags() {
-        // Regression for #34: two gauntlet variants differing ONLY in
-        // active_flags must produce distinct sidecar filenames so
-        // neither clobbers the other. This is the scenario the prior
-        // fix (based on work_type/sysctls/kargs alone) missed.
+        // Two gauntlet variants differing ONLY in active_flags must
+        // produce distinct sidecar filenames so neither clobbers the
+        // other. A hash of work_type/sysctls/kargs alone would miss
+        // this difference.
         let _guard = ENV_LOCK.lock().unwrap();
         let key = "KTSTR_SIDECAR_DIR";
         let prev = std::env::var(key).ok();
@@ -1142,9 +1142,9 @@ mod tests {
 
     #[test]
     fn write_sidecar_variant_hash_distinguishes_work_types() {
-        // Regression for #34: two gauntlet variants differing only in
-        // work_type must produce distinct sidecar filenames so neither
-        // clobbers the other.
+        // Two gauntlet variants differing only in work_type must
+        // produce distinct sidecar filenames so neither clobbers the
+        // other.
         let _guard = ENV_LOCK.lock().unwrap();
         let key = "KTSTR_SIDECAR_DIR";
         let prev = std::env::var(key).ok();
@@ -1626,7 +1626,7 @@ mod tests {
         }
     }
 
-    // -- #162 sidecar payload + metrics fields --
+    // -- sidecar payload + metrics fields --
 
     /// Empty `payload` + `metrics` must round-trip omitted from
     /// JSON: stats tooling for scheduler-only tests (the vast
@@ -1681,8 +1681,7 @@ mod tests {
     /// `ctx.payload(X).run()` call, each carrying its exit code and
     /// any extracted metrics. Regression guard against a future
     /// schema shift that flattens metrics across payloads (which
-    /// would lose the per-payload provenance the frozen #162 design
-    /// requires).
+    /// would lose the per-payload provenance the design requires).
     #[test]
     fn sidecar_payload_and_metrics_roundtrip_populated() {
         use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};

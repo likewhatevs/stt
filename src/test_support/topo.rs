@@ -303,9 +303,9 @@ mod tests {
 
     #[test]
     fn parse_topo_rejects_trailing_garbage() {
-        // Regression for #27: trailing characters after the 't'
-        // terminator previously parsed as the clean form, silently
-        // dropping the trailing garbage. Now rejected.
+        // Trailing characters after the 't' terminator must cause
+        // None. A previous implementation parsed them as the clean
+        // form, silently dropping the trailing garbage.
         assert!(
             parse_topo_string("1n2l4c2tEXTRA").is_none(),
             "trailing garbage after 't' must cause None"

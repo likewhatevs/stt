@@ -2587,7 +2587,7 @@ fn collect_step(
     // Kill any CgroupDef::workload / Op::RunPayload payload binaries
     // still live at step teardown so cgroupfs cleanup does not trip
     // EBUSY. Metrics are emitted to the SHM ring by PayloadHandle::kill
-    // via the `evaluate()` pipeline wired in #18.
+    // via the `evaluate()` pipeline.
     drain_all_payload_handles(&mut step_state.payload_handles);
     let handles = std::mem::take(&mut step_state.handles);
     super::collect_handles(
@@ -3965,11 +3965,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&parent);
     }
 
-    /// #37 — the SetAffinity dispatcher's `AffinityMode::Random`
-    /// arm is guarded by `!from.is_empty() && *count > 0` (see the
+    /// The SetAffinity dispatcher's `AffinityMode::Random` arm is
+    /// guarded by `!from.is_empty() && *count > 0` (see the
     /// `AffinityMode::Random` arm with that same guard in
-    /// `apply_ops`). This test mirrors that classification to
-    /// lock the contract in place: future refactors that drop either
+    /// `apply_ops`). This test mirrors that classification to lock
+    /// the contract in place: future refactors that drop either
     /// side of the AND must update this test alongside the dispatch.
     /// The live dispatcher path is partially covered by the
     /// `apply_setup_*` tests via `MockCgroupOps`, but the SetAffinity
@@ -4922,13 +4922,12 @@ mod tests {
         apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
     }
 
-    /// #122 + #133: when the first spawn came from
-    /// `CgroupDef::workload` in `cg_def` and a subsequent
-    /// `Op::run_payload_in_cgroup` TARGETS THE SAME `cg_def` with
-    /// the same payload name, the composite-key dup check fires
-    /// and names `CgroupDef::workload` as the originating surface.
-    /// A cross-cgroup duplicate (same name, different cgroup) is
-    /// legitimate and tested separately.
+    /// When the first spawn came from `CgroupDef::workload` in
+    /// `cg_def` and a subsequent `Op::run_payload_in_cgroup` targets
+    /// the same `cg_def` with the same payload name, the composite-
+    /// key dup check fires and names `CgroupDef::workload` as the
+    /// originating surface. A cross-cgroup duplicate (same name,
+    /// different cgroup) is legitimate and tested separately.
     #[test]
     fn apply_ops_run_rejects_payload_already_owned_by_cgroup_def() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -5075,13 +5074,13 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // #177 Step/Backdrop refactor — ruling invariants
+    // Step/Backdrop ruling invariants
     // ---------------------------------------------------------------
 
-    /// Ruling #2: a step-local `Op::RemoveCgroup` that targets a
-    /// Backdrop-owned cgroup must bail before any cgroupfs write.
-    /// Ops running inside the Backdrop's own setup pass (i.e.
-    /// `target_backdrop == true`) stay exempt.
+    /// A step-local `Op::RemoveCgroup` that targets a Backdrop-owned
+    /// cgroup must bail before any cgroupfs write. Ops running inside
+    /// the Backdrop's own setup pass (i.e. `target_backdrop == true`)
+    /// stay exempt.
     #[test]
     fn remove_cgroup_rejects_backdrop_target() {
         let mock = MockCgroupOps::new();
@@ -5137,12 +5136,12 @@ mod tests {
         cleanup_state(&mut step_state);
     }
 
-    /// Rulings #5 + #10: `Op::MoveAllTasks` from a step-local cgroup
-    /// to a Backdrop cgroup must TRANSFER the handle from
-    /// step-local slot to backdrop slot so the worker survives the
-    /// step boundary. A step-to-step move keeps ownership
-    /// step-local. A backdrop-to-step move keeps the handle in the
-    /// backdrop slot (persistent does not degrade).
+    /// `Op::MoveAllTasks` from a step-local cgroup to a Backdrop
+    /// cgroup must transfer the handle from step-local slot to
+    /// backdrop slot so the worker survives the step boundary. A
+    /// step-to-step move keeps ownership step-local. A backdrop-to-
+    /// step move keeps the handle in the backdrop slot (persistent
+    /// does not degrade).
     #[test]
     fn move_all_tasks_transfers_handle_ownership_step_to_backdrop() {
         use crate::workload::{Work, WorkloadConfig, WorkloadHandle};
@@ -5297,8 +5296,8 @@ mod tests {
         );
     }
 
-    /// Ruling #3: `apply_setup` rejects a step-local CgroupDef whose
-    /// name collides with a Backdrop-tracked cgroup.
+    /// `apply_setup` rejects a step-local CgroupDef whose name
+    /// collides with a Backdrop-tracked cgroup.
     #[test]
     fn apply_setup_rejects_name_collision_with_backdrop() {
         let mock = MockCgroupOps::new();
@@ -5322,7 +5321,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // #133 composite-key (name, cgroup) dedup for Op::RunPayload
+    // composite-key (name, cgroup) dedup for Op::RunPayload
     // ---------------------------------------------------------------
 
     /// Push a synthetic live PayloadEntry into `state`'s step slot
@@ -5348,11 +5347,11 @@ mod tests {
         });
     }
 
-    /// #133: same payload live in `cg_a` AND `cg_b`; a third
-    /// `Op::RunPayload` targeting a brand-new `cg_c` must NOT
-    /// trip the composite-key dedup because the (name, cgroup)
-    /// pair is fresh. Simulated via direct state injection so the
-    /// test doesn't depend on cgroupfs.
+    /// Same payload live in `cg_a` AND `cg_b`; a third
+    /// `Op::RunPayload` targeting a brand-new `cg_c` must NOT trip
+    /// the composite-key dedup because the (name, cgroup) pair is
+    /// fresh. Simulated via direct state injection so the test
+    /// doesn't depend on cgroupfs.
     #[test]
     fn apply_ops_run_duplicate_name_different_cgroups_allowed() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -5407,9 +5406,8 @@ mod tests {
         cleanup_state(&mut state);
     }
 
-    /// #133: `take_payload_by_name` in composite mode matches only
-    /// the exact `(name, cgroup)` pair and leaves sibling copies
-    /// alone.
+    /// `take_payload_by_name` in composite mode matches only the
+    /// exact `(name, cgroup)` pair and leaves sibling copies alone.
     #[test]
     fn take_payload_by_composite_key_matches_exact_cgroup() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -5455,7 +5453,7 @@ mod tests {
         let _ = taken.handle.kill();
     }
 
-    /// #133: bare `take_payload_by_name(name, None)` returns
+    /// Bare `take_payload_by_name(name, None)` returns
     /// `Err(ambiguous_cgroups)` when two or more copies are live,
     /// surfacing both cgroup keys so the caller can disambiguate.
     #[test]
@@ -5501,9 +5499,10 @@ mod tests {
         drain_all_payload_handles(&mut state.payload_handles);
     }
 
-    /// #133: bare `take_payload_by_name(name, None)` succeeds when
-    /// exactly one copy is live — backward-compat for
-    /// `Op::wait_payload(name)` / `Op::kill_payload(name)`.
+    /// Bare `take_payload_by_name(name, None)` succeeds when
+    /// exactly one copy is live, so `Op::wait_payload(name)` and
+    /// `Op::kill_payload(name)` don't need to carry a cgroup
+    /// argument in the single-copy case.
     #[test]
     fn take_payload_by_bare_name_succeeds_on_single_copy() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -5538,11 +5537,11 @@ mod tests {
         let _ = taken.handle.kill();
     }
 
-    /// #133: the apply_ops ambiguity hint must spell the full
-    /// snake_case constructor path so a user copying the hint
-    /// into source writes something that actually compiles.
-    /// Covers both `Op::wait_payload` and `Op::kill_payload`
-    /// entry points because they route through the same helper.
+    /// The apply_ops ambiguity hint must spell the full snake_case
+    /// constructor path so a user copying the hint into source
+    /// writes something that actually compiles. Covers both
+    /// `Op::wait_payload` and `Op::kill_payload` entry points
+    /// because they route through the same helper.
     #[test]
     fn apply_ops_bare_wait_and_kill_ambiguity_hint_names_full_constructor() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -5612,9 +5611,9 @@ mod tests {
         drain_all_payload_handles(&mut state.payload_handles);
     }
 
-    /// #133: the not-found arm uses `-ing` verb form ("before
-    /// waiting" / "before killing"), not the collapsed single-word
-    /// lowercase the previous implementation emitted.
+    /// The not-found arm uses `-ing` verb form ("before waiting" /
+    /// "before killing"), not the collapsed single-word lowercase
+    /// a previous implementation emitted.
     #[test]
     fn apply_ops_not_found_message_uses_gerund_verb() {
         let mock = MockCgroupOps::new();
@@ -5641,18 +5640,18 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // #177 convergence T1/T2/T9/T10 invariants
+    // Step-local vs Backdrop state invariants
     // ---------------------------------------------------------------
 
-    /// T1: Op::RemoveCgroup dispatches `ctx.cgroups.remove_cgroup`
-    /// directly (apply_ops.rs:2216) but does NOT forget the name
-    /// from CgroupGroup's tracked `names` vec. Later, CgroupGroup's
-    /// Drop iterates every tracked name and calls remove_cgroup
-    /// again. The second call is swallowed by `let _ = ` in Drop,
-    /// so the desync is observable (two remove_cgroup calls for the
-    /// same name) but harmless. Pin the behavior so a future
-    /// refactor that prunes names out from under a live Drop (or
-    /// that stops swallowing the second error) surfaces here.
+    /// Op::RemoveCgroup dispatches `ctx.cgroups.remove_cgroup`
+    /// directly but does NOT forget the name from CgroupGroup's
+    /// tracked `names` vec. Later, CgroupGroup's Drop iterates every
+    /// tracked name and calls remove_cgroup again. The second call
+    /// is swallowed by `let _ = ` in Drop, so the desync is
+    /// observable (two remove_cgroup calls for the same name) but
+    /// harmless. Pin the behavior so a future refactor that prunes
+    /// names out from under a live Drop (or that stops swallowing
+    /// the second error) surfaces here.
     #[test]
     fn remove_cgroup_does_not_forget_name_in_cgroupgroup_but_drop_is_safe() {
         let mock = MockCgroupOps::new();
@@ -5808,12 +5807,11 @@ mod tests {
         step_state.handles.clear();
     }
 
-    /// T10: per-step teardown is observable via the mock's call log.
+    /// Per-step teardown is observable via the mock's call log.
     /// `execute_scenario` runs Step::cgroups Drop at step boundary;
     /// with MockCgroupOps we can pin that the rmdir calls happen
     /// (a) only on step-local cgroups, (b) in REVERSE order of
-    /// addition (the fix from task #9 — nested-cgroup-safe
-    /// teardown).
+    /// addition — nested-cgroup-safe teardown.
     #[test]
     fn per_step_teardown_removes_step_local_cgroups_in_reverse_order() {
         let mock = MockCgroupOps::new();
@@ -5845,7 +5843,7 @@ mod tests {
             vec!["cg_b", "cg_a/sub", "cg_a"],
             "per-step teardown must rmdir in reverse addition order so a \
              child cgroup's directory is gone before its parent's rmdir \
-             runs — matches the fix from task #9",
+             runs",
         );
     }
 }

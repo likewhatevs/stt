@@ -3301,7 +3301,7 @@ mod tests {
         assert_eq!(xa_node_shift(&mem, page_offset, node_kva, 0), 0);
     }
 
-    // -- xa_load continue past failed entry test (fix #12) --
+    // -- xa_load continues past failed entry --
 
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -3416,7 +3416,7 @@ mod tests {
         assert_eq!(good.unwrap().map_type, BPF_MAP_TYPE_ARRAY);
     }
 
-    // -- bounds check tests (fix #12) --
+    // -- bounds check tests --
 
     #[test]
     #[cfg(target_arch = "x86_64")]

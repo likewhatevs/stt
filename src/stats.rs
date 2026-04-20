@@ -1279,7 +1279,7 @@ fn format_cgroup_pass_rates(df: &DataFrame) -> String {
             col("work_type"),
         ])
         .agg([
-            // pass_count excludes skipped rows (see #36).
+            // pass_count excludes skipped rows.
             (col("passed").and(col("skipped").not()))
                 .cast(DataType::UInt32)
                 .sum()
@@ -2843,12 +2843,12 @@ mod tests {
 
     #[test]
     fn compare_rows_skipped_side_drops_pair_into_skipped_failed() {
-        // Regression for #36: a skipped row on either side of the
-        // comparison must not contribute to regressions/improvements
-        // — a skipped run carries no executed metrics. Previously,
-        // `row.passed == true` for skips let the pair through the
-        // regression math, producing meaningless deltas against the
-        // default-zero metric values.
+        // A skipped row on either side of the comparison must not
+        // contribute to regressions/improvements — a skipped run
+        // carries no executed metrics. `row.passed == true` for skips
+        // would otherwise let the pair through the regression math,
+        // producing meaningless deltas against default-zero metric
+        // values.
         let mut row_a = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         let mut row_b = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         row_a.skipped = true; // A side was skipped

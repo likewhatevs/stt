@@ -1464,11 +1464,11 @@ mod tests {
 
     #[test]
     fn profile_sched_args_unknown_flag_errors() {
-        // Regression for #35: silently dropping unknown flag names
-        // masked typos in --profiles CLI lists and version-drift in
-        // cached nextest args — the profile NAME would still say
-        // "foo+bar" while the scheduler was invoked without the
-        // corresponding CLI switches.
+        // Silently dropping unknown flag names would mask typos in
+        // --profiles CLI lists and version-drift in cached nextest
+        // args — the profile NAME would still say "foo+bar" while
+        // the scheduler was invoked without the corresponding CLI
+        // switches.
         let flags = vec![ktstr::scenario::flags::FlagDeclJson {
             name: "llc".to_string(),
             args: vec!["--llc".to_string()],

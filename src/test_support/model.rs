@@ -1,8 +1,8 @@
 //! Local LLM model cache + LlmExtract runtime for
 //! [`OutputFormat::LlmExtract`] payloads.
 //!
-//! The frozen #162 design routes `OutputFormat::LlmExtract` stdout
-//! through a small local model that emits JSON, which the existing
+//! `OutputFormat::LlmExtract` routes stdout through a small local
+//! model that emits JSON, which the existing
 //! [`walk_json_leaves`](crate::test_support::metrics) pipeline then
 //! consumes. The model binary itself lives under
 //! `~/.cache/ktstr/models/`. This module owns both the cache
@@ -542,11 +542,10 @@ impl std::error::Error for InferenceError {
 /// open. The blockers for wiring a real backend are host-side:
 /// binary size of the host test process (candle + tokenizer
 /// alone ~40 MiB), and a C/C++ toolchain dependency that would
-/// affect every `cargo build` of the ktstr crate. Per the frozen
-/// #162 design, the pipeline lands ahead of the backend so
-/// downstream callers (`extract_via_llm`, `extract_metrics`)
-/// wire end-to-end; the backend lands as a follow-up that swaps
-/// this function's body.
+/// affect every `cargo build` of the ktstr crate. The pipeline
+/// lands ahead of the backend so downstream callers
+/// (`extract_via_llm`, `extract_metrics`) wire end-to-end; the
+/// backend lands as a follow-up that swaps this function's body.
 ///
 /// `ensure(&DEFAULT_MODEL)` is still called so a misconfigured
 /// cache surfaces as `ModelLoad` rather than silently passing as

@@ -438,7 +438,7 @@ mod tests {
         assert!(serde_json::Number::from_f64(2.78).is_some());
     }
 
-    /// #32: JSON integers above 2^53 lose precision when coerced to
+    /// JSON integers above 2^53 lose precision when coerced to
     /// f64 via `serde_json::Number::as_f64` — the f64 mantissa is 52
     /// bits, so consecutive integers beyond 9007199254740992 round
     /// to the nearest representable f64. Pin the observed behavior:
@@ -476,7 +476,7 @@ mod tests {
         assert_ne!(m[0].value as u64, 9_007_199_254_740_993_u64);
     }
 
-    /// #32: At exactly 2^53 the f64 IS exact — the precision loss is
+    /// At exactly 2^53 the f64 IS exact — the precision loss is
     /// strictly one-above-the-boundary. Pair with
     /// `json_large_integer_above_2_pow_53_loses_precision` so both
     /// sides of the precision cliff are pinned.
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(m[0].value, 9_007_199_254_740_992.0_f64);
     }
 
-    /// #34: `find_and_parse_json` tries the whole trimmed input as
+    /// `find_and_parse_json` tries the whole trimmed input as
     /// a single document on the fast path. If the input has a
     /// balanced object followed by trailing non-JSON text, the
     /// whole-input parse fails (strict serde) and the region-
@@ -503,7 +503,7 @@ mod tests {
         assert_eq!(v["b"], serde_json::json!(2));
     }
 
-    /// #34: A leading array followed by trailing garbage recovers
+    /// A leading array followed by trailing garbage recovers
     /// symmetrically — the region finder handles `[...]` the same
     /// way it handles `{...}`.
     #[test]
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(v, serde_json::json!([1, 2, 3]));
     }
 
-    /// #34: Real-world fio pattern — banner line, JSON body,
+    /// Real-world fio pattern — banner line, JSON body,
     /// *and* trailing "done" marker. The region finder locks to
     /// the first balanced opener/closer, so the trailing content
     /// is ignored even if it contains unbalanced braces.
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(v["iops"], serde_json::json!(100));
     }
 
-    /// #34: When the trailing garbage itself contains a
+    /// When the trailing garbage itself contains a
     /// BALANCED brace pair, the region finder still returns the
     /// first one — downstream parsing uses the first match, not
     /// a merged document.
@@ -536,7 +536,7 @@ mod tests {
         assert!(v.get("second").is_none(), "second region must not merge in");
     }
 
-    /// #31: Negative numeric leaves extract at their declared value
+    /// Negative numeric leaves extract at their declared value
     /// without any sign-absoluting or filtering. Canonical for
     /// metrics like scheduler_delta_ns that can legitimately be
     /// negative (improvement from baseline).
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(by_name.get("underflow"), Some(&-1_000_000.0));
     }
 
-    /// #31: Zero is emitted as a real metric value, not filtered
+    /// Zero is emitted as a real metric value, not filtered
     /// out. A payload that genuinely measured zero (idle CPU, no
     /// errors) must produce a zero metric — otherwise downstream
     /// checks like `Check::exit_code_eq(0)` against an `exit_code`
@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(by_name.get("count"), Some(&0.0));
     }
 
-    /// #31: Mixed positive + negative + zero in one document
+    /// Mixed positive + negative + zero in one document
     /// exercises the walker's sign-agnostic branch.
     #[test]
     fn json_mixed_signs_and_zero_all_extract() {
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(m.len(), 3);
     }
 
-    /// #36: An empty JSON object `{}` at the top level parses
+    /// An empty JSON object `{}` at the top level parses
     /// successfully but yields no metric leaves — the walker
     /// traverses zero children and falls through to produce an
     /// empty Vec. No `None` return, no panic.
@@ -588,7 +588,7 @@ mod tests {
         assert!(m.is_empty(), "empty object has no leaves: {m:?}");
     }
 
-    /// #36: An empty array at the top level likewise yields zero
+    /// An empty array at the top level likewise yields zero
     /// metrics.
     #[test]
     fn json_empty_array_yields_no_metrics() {
@@ -596,7 +596,7 @@ mod tests {
         assert!(m.is_empty(), "empty array has no leaves: {m:?}");
     }
 
-    /// #36: Nested empty containers also produce no leaves — the
+    /// Nested empty containers also produce no leaves — the
     /// walker still recurses but finds nothing numeric at the
     /// bottom. Pins the "no ghost metrics from empty containers"
     /// invariant.
@@ -607,7 +607,7 @@ mod tests {
         assert!(m.is_empty(), "nested empties emit nothing: {m:?}");
     }
 
-    /// #36: Empty container alongside real metrics — empties are
+    /// Empty container alongside real metrics — empties are
     /// silent, real leaves still emit.
     #[test]
     fn json_empty_container_mixed_with_real_metrics() {
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(m[0].value, 100.0);
     }
 
-    /// #12 regression: walk_json_leaves uses push/pop on a single
+    /// walk_json_leaves uses push/pop on a single
     /// path buffer instead of per-level format!(). This test pins
     /// the *behavior* (path output unchanged across deep nesting)
     /// so a future refactor of the path plumbing can't silently

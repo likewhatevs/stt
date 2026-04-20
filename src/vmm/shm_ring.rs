@@ -846,11 +846,11 @@ mod tests {
 
     #[test]
     fn shm_write_rejects_torn_header_read_ptr_past_write_ptr() {
-        // Regression for #30: if the shared header is torn (or corrupt)
-        // such that read_ptr > write_ptr, `wrapping_sub` yields a huge
-        // "used" value. The new capacity check must detect the
-        // invariant violation and return 0 rather than dropping via
-        // the ordinary "ring full" path or silently corrupting state.
+        // If the shared header is torn (or corrupt) such that
+        // read_ptr > write_ptr, `wrapping_sub` yields a huge "used"
+        // value. The capacity check must detect the invariant
+        // violation and return 0 rather than dropping via the
+        // ordinary "ring full" path or silently corrupting state.
         let mut buf = make_ring(1024);
         // write_ptr is at shm_offset + 16; read_ptr is at shm_offset + 24.
         // Force read_ptr > write_ptr to simulate the torn state.
@@ -868,12 +868,12 @@ mod tests {
 
     #[test]
     fn shm_write_wrapping_sub_handles_u64_overflow_of_write_ptr() {
-        // Regression for #30: when the monotonic write_ptr overflows
-        // u64 (extremely rare but theoretically possible over long
-        // runs), `wrapping_sub` gives the correct modular distance
-        // while raw subtraction would underflow. Set write_ptr just
-        // past wrap (= 10) and read_ptr just before wrap
-        // (= u64::MAX - 5). Used distance = 16 via wrapping_sub.
+        // When the monotonic write_ptr overflows u64 (extremely rare
+        // but theoretically possible over long runs), `wrapping_sub`
+        // gives the correct modular distance while raw subtraction
+        // would underflow. Set write_ptr just past wrap (= 10) and
+        // read_ptr just before wrap (= u64::MAX - 5). Used distance
+        // = 16 via wrapping_sub.
         //
         // Ring is sized generously so `used + total_msg <= capacity`
         // and the write should succeed.

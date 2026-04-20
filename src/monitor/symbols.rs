@@ -234,8 +234,9 @@ pub(crate) fn text_kva_to_pa(kva: u64) -> u64 {
 /// per-byte `read_volatile` internally and is alignment-safe even
 /// when `per_cpu_offset_pa` is not 8-aligned. The previous raw
 /// `std::ptr::read_volatile(*const u64)` implementation was UB on
-/// misaligned addresses (same alignment gap that reader.rs closed
-/// in WO-3g). GuestMem also bounds-checks each read against its
+/// misaligned addresses (the same alignment gap that reader.rs
+/// closes via its GuestMem wrapper). GuestMem also bounds-checks
+/// each read against its
 /// mapped size, so reads past the end of guest memory return 0
 /// instead of faulting.
 pub(crate) fn read_per_cpu_offsets(

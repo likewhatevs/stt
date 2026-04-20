@@ -946,12 +946,11 @@ mod tests {
 
     #[test]
     fn compute_metrics_counter_reset_clamps_rates_to_non_negative() {
-        // Regression for #30 (via #29's shared counter_delta helper):
-        // a scheduler restart between samples resets the event
-        // counters to smaller (or zero) values. Raw `last - first`
-        // then produces a negative delta, which downstream would
-        // flow into `fallback_rate = delta / duration` and report a
-        // negative rate. The shared clamp must prevent that.
+        // A scheduler restart between samples resets event counters
+        // to smaller (or zero) values. Raw `last - first` then
+        // produces a negative delta, which would flow into
+        // `fallback_rate = delta / duration` and report a negative
+        // rate. The shared counter_delta helper clamps to 0.
         use crate::monitor::ScxEventCounters;
 
         let s1 = MonitorSample {

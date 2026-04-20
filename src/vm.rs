@@ -573,10 +573,10 @@ mod tests {
         );
     }
 
-    /// #37 — `VmConfig::validate` is the directly-callable entry
-    /// point for the same check that `run_in_vm` gates on. Explicit
-    /// coverage ensures the method itself returns Err rather than
-    /// relying solely on the `run_in_vm` wrapper.
+    /// `VmConfig::validate` is the directly-callable entry point for
+    /// the same check that `run_in_vm` gates on. Explicit coverage
+    /// ensures the method itself returns Err rather than relying
+    /// solely on the `run_in_vm` wrapper.
     #[test]
     fn vm_config_validate_rejects_zero_memory() {
         let cfg = VmConfig {
