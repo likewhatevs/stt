@@ -132,10 +132,17 @@ pub enum Op {
     /// Block until the payload named `name` exits naturally, then
     /// evaluate its checks and record metrics to the per-test sidecar.
     ///
-    /// A consumed or unknown name returns `Err` with an actionable
-    /// message — test authors must not silently wait for payloads
-    /// that were never started or have already been consumed by a
-    /// prior `WaitPayload`/`KillPayload`.
+    /// The target is looked up by composite key (`name`, `cgroup`).
+    /// `cgroup: None` matches the single live `name` regardless of
+    /// placement; if two or more copies of the same payload are
+    /// live in different cgroups, the lookup bails with an
+    /// "ambiguous — specify cgroup" error so the test doesn't
+    /// silently wait on the wrong one.
+    ///
+    /// A consumed or unknown `(name, cgroup)` pair returns `Err`
+    /// with an actionable message — test authors must not silently
+    /// wait for payloads that were never started or have already
+    /// been consumed by a prior `WaitPayload`/`KillPayload`.
     ///
     /// **No timeout.** `WaitPayload` waits indefinitely for the
     /// child to exit. A binary that never terminates (e.g. a
@@ -154,20 +161,30 @@ pub enum Op {
     /// in-process. Use
     /// [`ctx.payload(&X).run()`](crate::scenario::payload_run::PayloadRun::run)
     /// directly if the test body needs to gate on check results.
-    WaitPayload { name: Cow<'static, str> },
+    WaitPayload {
+        name: Cow<'static, str>,
+        cgroup: Option<Cow<'static, str>>,
+    },
     /// SIGKILL the payload named `name`, reap the child, evaluate
     /// checks, and record metrics. Mirrors the behavior of
     /// step-teardown drain for an explicitly-targeted payload.
     ///
-    /// A consumed or unknown name returns `Err` with an actionable
-    /// message, identical to [`Op::WaitPayload`]'s lookup semantics.
+    /// The target is looked up by composite key (`name`, `cgroup`)
+    /// — see [`Op::WaitPayload`] for the ambiguity rules.
+    ///
+    /// A consumed or unknown `(name, cgroup)` pair returns `Err`
+    /// with an actionable message, identical to [`Op::WaitPayload`]'s
+    /// lookup semantics.
     ///
     /// Check failures from the payload are recorded to the sidecar
     /// for regression analysis but do NOT fail the step or the test
     /// in-process. Use
     /// [`ctx.payload(&X).run()`](crate::scenario::payload_run::PayloadRun::run)
     /// directly if the test body needs to gate on check results.
-    KillPayload { name: Cow<'static, str> },
+    KillPayload {
+        name: Cow<'static, str>,
+        cgroup: Option<Cow<'static, str>>,
+    },
 }
 
 /// How to compute a cpuset from topology.
@@ -773,15 +790,61 @@ impl Op {
     }
 
     /// Block until the payload named `name` exits, evaluate checks,
-    /// and record metrics.
+    /// and record metrics. Matches whichever cgroup the payload is
+    /// in when exactly one copy of the name is live; bails when two
+    /// or more copies are live (use
+    /// [`wait_payload_in_cgroup`](Self::wait_payload_in_cgroup) to
+    /// disambiguate).
     pub fn wait_payload(name: impl Into<Cow<'static, str>>) -> Self {
-        Op::WaitPayload { name: name.into() }
+        Op::WaitPayload {
+            name: name.into(),
+            cgroup: None,
+        }
+    }
+
+    /// Block until the payload named `name` that's running inside
+    /// the given `cgroup` exits. Use this form when two or more
+    /// copies of the same payload are live in different cgroups
+    /// and a cgroup-less `wait_payload` would be ambiguous. An
+    /// empty-string `cgroup` matches payloads that inherited their
+    /// parent's placement (spawned via `Op::run_payload(..., cgroup:
+    /// None)`); explicit names match payloads placed via
+    /// [`Op::run_payload_in_cgroup`] or
+    /// [`CgroupDef::workload`](crate::scenario::ops::CgroupDef::workload).
+    pub fn wait_payload_in_cgroup(
+        name: impl Into<Cow<'static, str>>,
+        cgroup: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Op::WaitPayload {
+            name: name.into(),
+            cgroup: Some(cgroup.into()),
+        }
     }
 
     /// SIGKILL the payload named `name`, evaluate checks, and record
-    /// metrics.
+    /// metrics. Matches by name alone; see
+    /// [`wait_payload`](Self::wait_payload) for the ambiguity rules
+    /// and [`kill_payload_in_cgroup`](Self::kill_payload_in_cgroup)
+    /// for the disambiguating form.
     pub fn kill_payload(name: impl Into<Cow<'static, str>>) -> Self {
-        Op::KillPayload { name: name.into() }
+        Op::KillPayload {
+            name: name.into(),
+            cgroup: None,
+        }
+    }
+
+    /// SIGKILL the payload named `name` that's running inside the
+    /// given `cgroup`. See
+    /// [`wait_payload_in_cgroup`](Self::wait_payload_in_cgroup) for
+    /// the placement-matching contract.
+    pub fn kill_payload_in_cgroup(
+        name: impl Into<Cow<'static, str>>,
+        cgroup: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Op::KillPayload {
+            name: name.into(),
+            cgroup: Some(cgroup.into()),
+        }
     }
 }
 
@@ -1291,42 +1354,96 @@ impl<'a, 'b> ScenarioState<'a, 'b> {
             .or_else(|| self.backdrop.cpusets.get(name))
     }
 
-    /// True when a payload with the given name is live in either
-    /// step-local or backdrop state. Used for the `Op::RunPayload`
-    /// duplicate-name guard.
-    fn find_live_payload(&self, payload_name: &str) -> Option<&PayloadEntry> {
+    /// True when a payload with the given composite key
+    /// (`payload_name`, `cgroup_key`) is live in either step-local
+    /// or backdrop state. Used for the `Op::RunPayload` duplicate
+    /// guard, which now treats "same payload in a different cgroup"
+    /// as legitimate rather than a name collision.
+    fn find_live_payload_with_cgroup(
+        &self,
+        payload_name: &str,
+        cgroup_key: &str,
+    ) -> Option<&PayloadEntry> {
+        let matches =
+            |e: &&PayloadEntry| e.handle.payload_name() == payload_name && e.cgroup == cgroup_key;
         self.step
             .payload_handles
             .iter()
-            .find(|e| e.handle.payload_name() == payload_name)
-            .or_else(|| {
-                self.backdrop
-                    .payload_handles
-                    .iter()
-                    .find(|e| e.handle.payload_name() == payload_name)
-            })
+            .find(matches)
+            .or_else(|| self.backdrop.payload_handles.iter().find(matches))
     }
 
-    /// Drop a payload handle by name. Checks step-local first, then
-    /// backdrop. Returns the removed entry; `None` when no match.
-    fn take_payload_by_name(&mut self, name: &str) -> Option<PayloadEntry> {
-        if let Some(idx) = self
-            .step
-            .payload_handles
-            .iter()
-            .position(|e| e.handle.payload_name() == name)
-        {
-            return Some(self.step.payload_handles.swap_remove(idx));
+    /// Drop a payload handle by composite key (`name`, optional
+    /// `cgroup`). Checks step-local first, then backdrop.
+    ///
+    /// - `cgroup = Some(c)`: exact match on both name and cgroup.
+    /// - `cgroup = None`: if exactly one entry matches `name` across
+    ///   both slots, consume it (backward-compat for
+    ///   `Op::wait_payload(name)` / `Op::kill_payload(name)` when
+    ///   only one copy is live). If two or more match, returns
+    ///   `Err(ambiguous_cgroups)` where `ambiguous_cgroups` is the
+    ///   list of cgroup keys for the candidates so the caller can
+    ///   produce an actionable error.
+    ///
+    /// Returns `Ok(None)` when no entry matches.
+    fn take_payload_by_name(
+        &mut self,
+        name: &str,
+        cgroup: Option<&str>,
+    ) -> std::result::Result<Option<PayloadEntry>, Vec<String>> {
+        if let Some(c) = cgroup {
+            // Composite-key path: exact match on both.
+            if let Some(idx) = self
+                .step
+                .payload_handles
+                .iter()
+                .position(|e| e.handle.payload_name() == name && e.cgroup == c)
+            {
+                return Ok(Some(self.step.payload_handles.swap_remove(idx)));
+            }
+            if let Some(idx) = self
+                .backdrop
+                .payload_handles
+                .iter()
+                .position(|e| e.handle.payload_name() == name && e.cgroup == c)
+            {
+                return Ok(Some(self.backdrop.payload_handles.swap_remove(idx)));
+            }
+            return Ok(None);
         }
-        if let Some(idx) = self
-            .backdrop
-            .payload_handles
-            .iter()
-            .position(|e| e.handle.payload_name() == name)
-        {
-            return Some(self.backdrop.payload_handles.swap_remove(idx));
+        // Name-only path: disambiguate across both slots before
+        // consuming, so a mid-test wait on an ambiguous name
+        // surfaces the caller's bug rather than silently waiting
+        // on the first match.
+        let mut step_idx: Option<usize> = None;
+        let mut backdrop_idx: Option<usize> = None;
+        let mut cgroups: Vec<String> = Vec::new();
+        for (i, e) in self.step.payload_handles.iter().enumerate() {
+            if e.handle.payload_name() == name {
+                if step_idx.is_none() {
+                    step_idx = Some(i);
+                }
+                cgroups.push(e.cgroup.clone());
+            }
         }
-        None
+        for (i, e) in self.backdrop.payload_handles.iter().enumerate() {
+            if e.handle.payload_name() == name {
+                if backdrop_idx.is_none() && step_idx.is_none() {
+                    backdrop_idx = Some(i);
+                }
+                cgroups.push(e.cgroup.clone());
+            }
+        }
+        if cgroups.len() > 1 {
+            return Err(cgroups);
+        }
+        if let Some(i) = step_idx {
+            return Ok(Some(self.step.payload_handles.swap_remove(i)));
+        }
+        if let Some(i) = backdrop_idx {
+            return Ok(Some(self.backdrop.payload_handles.swap_remove(i)));
+        }
+        Ok(None)
     }
 
     /// Drain every live payload handle in step + backdrop state by
@@ -1991,6 +2108,22 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
         // handles lets the cgroup cpuset + mempolicy settle first so
         // the binary inherits a stable placement.
         if let Some(payload) = def.payload {
+            // Composite-key dedup: the same payload CAN live in a
+            // different cgroup, but two copies in THIS cgroup would
+            // collide on teardown (one handle masks the other in
+            // the sidecar). Reject upfront with the same error
+            // shape as the Op::RunPayload path.
+            if let Some(existing) =
+                state.find_live_payload_with_cgroup(payload.name, def.name.as_ref())
+            {
+                anyhow::bail!(
+                    "CgroupDef::workload: payload '{}' already running in cgroup '{}' (spawned by {}) — \
+                     declare it in exactly one place per cgroup",
+                    payload.name,
+                    def.name,
+                    existing.source.describe(),
+                );
+            }
             let handle = crate::scenario::payload_run::PayloadRun::new(ctx, payload)
                 .in_cgroup(def.name.clone())
                 .spawn()
@@ -2266,32 +2399,37 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         payload.name,
                     );
                 }
-                if let Some(existing) = state.find_live_payload(payload.name) {
+                // Compute the cgroup key now so the composite-key
+                // dedup sees the same `(name, cgroup)` pair the
+                // spawn is about to record.
+                let cgroup_key = cgroup.as_ref().map(|c| c.to_string()).unwrap_or_default();
+                if let Some(existing) =
+                    state.find_live_payload_with_cgroup(payload.name, &cgroup_key)
+                {
+                    // Same payload in the same cgroup is still a
+                    // collision: two concurrent runs would write
+                    // overlapping metrics to the sidecar and there's
+                    // no way for a subsequent WaitPayload / KillPayload
+                    // to tell them apart. Same payload in a DIFFERENT
+                    // cgroup is now legitimate (placement-disambiguated).
                     // Name the surface that spawned the live handle
                     // so the user can find the original site without
-                    // guessing. `CgroupDef::workload` fires at
-                    // `apply_setup`, `Op::RunPayload` fires inside
-                    // the step's ops — different edit targets to
-                    // resolve the duplicate.
+                    // guessing.
                     anyhow::bail!(
-                        "Op::RunPayload: payload '{}' already running (spawned by {} in cgroup {}) — \
-                         WaitPayload/KillPayload it before spawning another with the same name",
+                        "Op::RunPayload: payload '{}' already running in cgroup {} (spawned by {}) — \
+                         WaitPayload/KillPayload it before spawning another with the same name in the same cgroup",
                         payload.name,
-                        existing.source.describe(),
                         render_cgroup_key(&existing.cgroup),
+                        existing.source.describe(),
                     );
                 }
                 let mut run = crate::scenario::payload_run::PayloadRun::new(ctx, payload);
                 if !args.is_empty() {
                     run = run.args(args.iter().cloned());
                 }
-                let cgroup_key = match cgroup {
-                    Some(c) => {
-                        run = run.in_cgroup(c.clone());
-                        c.to_string()
-                    }
-                    None => String::new(),
-                };
+                if let Some(c) = cgroup {
+                    run = run.in_cgroup(c.clone());
+                }
                 let handle = run.spawn().with_context(|| {
                     format!(
                         "Op::RunPayload: spawn payload '{}' in cgroup {}",
@@ -2305,13 +2443,8 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     handle,
                 });
             }
-            Op::WaitPayload { name } => {
-                let entry = state.take_payload_by_name(name).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Op::WaitPayload: no running payload named '{name}' \
-                         (spawn it via Op::RunPayload or CgroupDef::workload before waiting)",
-                    )
-                })?;
+            Op::WaitPayload { name, cgroup } => {
+                let entry = take_payload_for_op(state, "Op::WaitPayload", name, cgroup.as_deref())?;
                 // Check verdicts + metrics are recorded to the sidecar
                 // via the SHM ring inside `handle.wait()`; the returned
                 // tuple is discarded here because step-ops surface per-
@@ -2321,13 +2454,8 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     .wait()
                     .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
             }
-            Op::KillPayload { name } => {
-                let entry = state.take_payload_by_name(name).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Op::KillPayload: no running payload named '{name}' \
-                         (spawn it via Op::RunPayload or CgroupDef::workload before killing)",
-                    )
-                })?;
+            Op::KillPayload { name, cgroup } => {
+                let entry = take_payload_for_op(state, "Op::KillPayload", name, cgroup.as_deref())?;
                 let _result = entry
                     .handle
                     .kill()
@@ -2336,6 +2464,51 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
         }
     }
     Ok(())
+}
+
+/// Shared lookup for `Op::WaitPayload` / `Op::KillPayload`.
+///
+/// Consumes the payload handle matching the composite key
+/// (`name`, `cgroup`). Produces the op-specific not-found /
+/// ambiguous errors so the match arms stay short.
+///
+/// `op_tag` is the user-facing op name (e.g. `"Op::WaitPayload"`)
+/// so the error text matches the op the user actually wrote.
+fn take_payload_for_op(
+    state: &mut ScenarioState<'_, '_>,
+    op_tag: &str,
+    name: &str,
+    cgroup: Option<&str>,
+) -> Result<PayloadEntry> {
+    match state.take_payload_by_name(name, cgroup) {
+        Ok(Some(entry)) => Ok(entry),
+        Ok(None) => match cgroup {
+            Some(c) => anyhow::bail!(
+                "{op_tag}: no running payload named '{name}' in cgroup {} \
+                 (spawn it via Op::RunPayload or CgroupDef::workload before {})",
+                render_cgroup_key(c),
+                op_tag.strip_prefix("Op::").unwrap_or(op_tag).to_lowercase(),
+            ),
+            None => anyhow::bail!(
+                "{op_tag}: no running payload named '{name}' \
+                 (spawn it via Op::RunPayload or CgroupDef::workload before {})",
+                op_tag.strip_prefix("Op::").unwrap_or(op_tag).to_lowercase(),
+            ),
+        },
+        Err(cgroups) => {
+            // Name-only lookup matched >1 live payload. Enumerate
+            // the candidate cgroups so the caller knows which
+            // qualified form they need.
+            let rendered: Vec<String> = cgroups.iter().map(|c| render_cgroup_key(c)).collect();
+            anyhow::bail!(
+                "{op_tag}: payload '{name}' is ambiguous — {} live copies in cgroups {} — \
+                 use {}_in_cgroup(name, cgroup) to disambiguate",
+                rendered.len(),
+                rendered.join(", "),
+                op_tag.strip_prefix("Op::").unwrap_or(op_tag).to_lowercase(),
+            )
+        }
+    }
 }
 
 /// Read the effective cpuset for a cgroup by reading cpuset.cpus.
@@ -2650,8 +2823,14 @@ mod tests {
                 args: vec![],
                 cgroup: None,
             },
-            Op::WaitPayload { name: "p".into() },
-            Op::KillPayload { name: "p".into() },
+            Op::WaitPayload {
+                name: "p".into(),
+                cgroup: None,
+            },
+            Op::KillPayload {
+                name: "p".into(),
+                cgroup: None,
+            },
         ];
         let mut seen = std::collections::BTreeSet::new();
         for op in &ops {
@@ -2696,8 +2875,22 @@ mod tests {
             .discriminant(),
             10,
         );
-        assert_eq!(Op::WaitPayload { name: "p".into() }.discriminant(), 11);
-        assert_eq!(Op::KillPayload { name: "p".into() }.discriminant(), 12);
+        assert_eq!(
+            Op::WaitPayload {
+                name: "p".into(),
+                cgroup: None,
+            }
+            .discriminant(),
+            11,
+        );
+        assert_eq!(
+            Op::KillPayload {
+                name: "p".into(),
+                cgroup: None,
+            }
+            .discriminant(),
+            12,
+        );
     }
 
     // -- seeded_rng tests --
@@ -4521,10 +4714,28 @@ mod tests {
         }
 
         let op = Op::wait_payload("fio");
-        assert!(matches!(op, Op::WaitPayload { ref name } if name.as_ref() == "fio"));
+        assert!(matches!(
+            op,
+            Op::WaitPayload { ref name, ref cgroup } if name.as_ref() == "fio" && cgroup.is_none(),
+        ));
 
         let op = Op::kill_payload("fio");
-        assert!(matches!(op, Op::KillPayload { ref name } if name.as_ref() == "fio"));
+        assert!(matches!(
+            op,
+            Op::KillPayload { ref name, ref cgroup } if name.as_ref() == "fio" && cgroup.is_none(),
+        ));
+
+        let op = Op::wait_payload_in_cgroup("fio", "cg_0");
+        assert!(matches!(
+            op,
+            Op::WaitPayload { ref name, cgroup: Some(ref c) } if name.as_ref() == "fio" && c.as_ref() == "cg_0",
+        ));
+
+        let op = Op::kill_payload_in_cgroup("fio", "cg_0");
+        assert!(matches!(
+            op,
+            Op::KillPayload { ref name, cgroup: Some(ref c) } if name.as_ref() == "fio" && c.as_ref() == "cg_0",
+        ));
     }
 
     /// Op::RunPayload rejects scheduler-kind payloads at apply time
@@ -4581,6 +4792,7 @@ mod tests {
             &mut state,
             &[Op::WaitPayload {
                 name: "ghost".into(),
+                cgroup: None,
             }],
         )
         .unwrap_err();
@@ -4607,6 +4819,7 @@ mod tests {
             &mut state,
             &[Op::KillPayload {
                 name: "ghost".into(),
+                cgroup: None,
             }],
         )
         .unwrap_err();
@@ -4734,13 +4947,13 @@ mod tests {
         apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
     }
 
-    /// #122: when the first spawn came from `CgroupDef::workload`
-    /// (via `apply_setup`), a subsequent `Op::RunPayload` with the
-    /// same payload name must surface `CgroupDef::workload` as the
-    /// originating surface so the user edits the cgroup def rather
-    /// than hunting through step ops. Pairs with
-    /// `apply_ops_run_duplicate_payload_name_bails`, which pins the
-    /// op-source branch.
+    /// #122 + #133: when the first spawn came from
+    /// `CgroupDef::workload` in `cg_def` and a subsequent
+    /// `Op::run_payload_in_cgroup` TARGETS THE SAME `cg_def` with
+    /// the same payload name, the composite-key dup check fires
+    /// and names `CgroupDef::workload` as the originating surface.
+    /// A cross-cgroup duplicate (same name, different cgroup) is
+    /// legitimate and tested separately.
     #[test]
     fn apply_ops_run_rejects_payload_already_owned_by_cgroup_def() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -4777,10 +4990,15 @@ mod tests {
             handle: h,
         });
 
+        // Targeting the SAME cgroup as the pre-existing entry: dup.
         let err = apply_ops_test(
             &ctx,
             &mut state,
-            &[Op::run_payload(&SLEEP, vec!["1".into()])],
+            &[Op::run_payload_in_cgroup(
+                &SLEEP,
+                vec!["1".into()],
+                "def_cg",
+            )],
         )
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -4795,7 +5013,12 @@ mod tests {
         // Only the original handle remains — op branch bailed pre-spawn.
         assert_eq!(state.payload_handles.len(), 1);
 
-        apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::kill_payload_in_cgroup("sleeper", "def_cg")],
+        )
+        .expect("teardown kill");
     }
 
     /// #127: [`render_cgroup_key`] renders an empty string as
@@ -5131,5 +5354,222 @@ mod tests {
             "error must cite the collision and the offending name, got: {msg}"
         );
         cleanup_state(&mut step_state);
+    }
+
+    // ---------------------------------------------------------------
+    // #133 composite-key (name, cgroup) dedup for Op::RunPayload
+    // ---------------------------------------------------------------
+
+    /// Push a synthetic live PayloadEntry into `state`'s step slot
+    /// so tests can exercise dedup / lookup paths without paying
+    /// the cost of a real cgroupfs-backed spawn (which fails inside
+    /// the MockCgroupOps test harness because `/mock/cgroup/...`
+    /// doesn't exist on disk).
+    fn push_fake_payload_entry<'a>(
+        ctx: &'a Ctx<'a>,
+        state: &mut StepState<'a>,
+        payload: &'static crate::test_support::Payload,
+        cgroup: &str,
+        source: PayloadSource,
+    ) {
+        let h = crate::scenario::payload_run::PayloadRun::new(ctx, payload)
+            .args(["3600".to_string()])
+            .spawn()
+            .expect("manual spawn (no cgroup placement)");
+        state.payload_handles.push(PayloadEntry {
+            cgroup: cgroup.to_string(),
+            source,
+            handle: h,
+        });
+    }
+
+    /// #133: same payload live in `cg_a` AND `cg_b`; a third
+    /// `Op::RunPayload` targeting a brand-new `cg_c` must NOT
+    /// trip the composite-key dedup because the (name, cgroup)
+    /// pair is fresh. Simulated via direct state injection so the
+    /// test doesn't depend on cgroupfs.
+    #[test]
+    fn apply_ops_run_duplicate_name_different_cgroups_allowed() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+
+        let mut backdrop = BackdropState::empty(&ctx);
+        let scenario = ScenarioState::new(&mut state, &mut backdrop);
+        // The `find_live_payload_with_cgroup` lookup for ("sleeper", "cg_c")
+        // returns None because no live entry matches that pair — so
+        // the dup check passes and run_scenario would let the spawn
+        // proceed. We verify the lookup directly (spawning against
+        // MockCgroupOps would fail on the pre_exec cgroup write).
+        assert!(
+            scenario
+                .find_live_payload_with_cgroup("sleeper", "cg_c")
+                .is_none(),
+            "fresh (name, cgroup) pair must not collide with live entries in other cgroups",
+        );
+        // And the existing same-cgroup entry still collides.
+        assert!(
+            scenario
+                .find_live_payload_with_cgroup("sleeper", "cg_a")
+                .is_some(),
+            "same (name, cgroup) still matches — only the pair matters",
+        );
+
+        cleanup_state(&mut state);
+    }
+
+    /// #133: `take_payload_by_name` in composite mode matches only
+    /// the exact `(name, cgroup)` pair and leaves sibling copies
+    /// alone.
+    #[test]
+    fn take_payload_by_composite_key_matches_exact_cgroup() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+
+        let mut backdrop = BackdropState::empty(&ctx);
+        let mut scenario = ScenarioState::new(&mut state, &mut backdrop);
+        let taken = scenario
+            .take_payload_by_name("sleeper", Some("cg_a"))
+            .expect("composite lookup does not bail on ambiguity")
+            .expect("one entry matches");
+        assert_eq!(taken.cgroup, "cg_a");
+        // The cg_b entry survives.
+        assert_eq!(state.payload_handles.len(), 1);
+        assert_eq!(state.payload_handles[0].cgroup, "cg_b");
+        // Drain to avoid leaking the live child.
+        drain_all_payload_handles(&mut state.payload_handles);
+        let _ = taken.handle.kill();
+    }
+
+    /// #133: bare `take_payload_by_name(name, None)` returns
+    /// `Err(ambiguous_cgroups)` when two or more copies are live,
+    /// surfacing both cgroup keys so the caller can disambiguate.
+    #[test]
+    fn take_payload_by_bare_name_reports_ambiguous_cgroups() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+
+        let mut backdrop = BackdropState::empty(&ctx);
+        let mut scenario = ScenarioState::new(&mut state, &mut backdrop);
+        let err = match scenario.take_payload_by_name("sleeper", None) {
+            Err(cgroups) => cgroups,
+            Ok(_) => panic!("bare lookup over multi-copy must surface ambiguity"),
+        };
+        assert_eq!(err.len(), 2);
+        assert!(err.contains(&"cg_a".to_string()) && err.contains(&"cg_b".to_string()));
+        // No handle consumed — both still live.
+        assert_eq!(state.payload_handles.len(), 2);
+        drain_all_payload_handles(&mut state.payload_handles);
+    }
+
+    /// #133: bare `take_payload_by_name(name, None)` succeeds when
+    /// exactly one copy is live — backward-compat for
+    /// `Op::wait_payload(name)` / `Op::kill_payload(name)`.
+    #[test]
+    fn take_payload_by_bare_name_succeeds_on_single_copy() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+
+        let mut backdrop = BackdropState::empty(&ctx);
+        let mut scenario = ScenarioState::new(&mut state, &mut backdrop);
+        let taken = scenario
+            .take_payload_by_name("sleeper", None)
+            .expect("single-copy bare lookup returns Ok")
+            .expect("one entry matches");
+        assert_eq!(taken.cgroup, "cg_a");
+        assert!(state.payload_handles.is_empty());
+        let _ = taken.handle.kill();
     }
 }
