@@ -233,12 +233,15 @@ const RETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 
 /// Populate a `func_meta` with field specs from BTF-resolved offsets.
 /// Shared between kprobe and fentry paths.
+///
+/// Invariant: `meta.nr_field_specs = max(field_idx) + 1`, NOT the count
+/// of specs. The BPF side writes `entry.fields[field_idx]` positionally,
+/// and the Rust side reads `entry.fields[..nr_field_specs]` positionally
+/// against [`build_field_keys`] (which includes skipped fields). A
+/// reorder of either loop that turns this into a count would silently
+/// mismatch keys to values.
 fn populate_field_specs(meta: &mut types::func_meta, field_specs: &[super::btf::FieldSpec]) {
     let n = field_specs.len().min(16);
-    // nr_field_specs must be max(field_idx)+1, not count of specs,
-    // because the BPF program writes entry.fields[field_idx] and
-    // the Rust side reads entry.fields[..nr_field_specs] positionally
-    // against build_field_keys (which includes skipped fields).
     let max_fidx = field_specs
         .iter()
         .take(n)
@@ -270,6 +273,9 @@ fn populate_field_specs(meta: &mut types::func_meta, field_specs: &[super::btf::
 ///
 /// Processes at most 6 params (fentry/kprobe register limit) and
 /// at most 16 fields total (matching `MAX_FIELDS` in intf.h).
+///
+/// Invariant: keys are emitted in the same order [`populate_field_specs`]
+/// consumes `field_specs`, so `entry.fields[i]` maps to the i-th key.
 fn build_field_keys(btf_func: &BtfFunc) -> Vec<(String, RenderHint)> {
     let mut keys = Vec::new();
     let mut field_idx: u32 = 0;

@@ -126,8 +126,9 @@ pub struct CachedProgInfo {
 
 /// Enumerate struct_ops programs and cache their stats pointers.
 ///
-/// Walks `prog_idr` once, reads `bpf_prog->stats` (percpu pointer)
-/// for each struct_ops program. Returns cached info for use by
+/// Walks `prog_idr` once. For each struct_ops program reads
+/// `bpf_prog->stats` (percpu pointer) and `bpf_prog_aux->name` via
+/// the aux pointer on `bpf_prog`. Returns cached info for use by
 /// `read_prog_runtime_stats` in the monitor loop.
 pub(crate) fn discover_struct_ops_stats(
     mem: &GuestMem,

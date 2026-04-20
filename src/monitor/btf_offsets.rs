@@ -24,12 +24,8 @@ use btf_rs::{Btf, Type};
 /// - ELF vmlinux — parsed via `goblin::elf::Elf`; the `.BTF`
 ///   section bytes are extracted and handed to `Btf::from_bytes`.
 ///
-/// Any other input is rejected with an error. The previous fallback
-/// to `Btf::from_file` on non-ELF non-raw-BTF input was removed
-/// because `Btf::from_file` only recognizes raw BTF anyway (it would
-/// reject the same bytes this function already tried) and its error
-/// message obscured the real cause — callers now see a clear
-/// "not recognized as raw BTF or ELF" diagnostic.
+/// Any other input is rejected with a "not recognized as raw BTF or
+/// ELF vmlinux" error.
 pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     let data = std::fs::read(path).context("read file")?;
     // Try raw BTF first (starts with BTF magic 0x9FEB)
@@ -80,8 +76,8 @@ pub struct KernelOffsets {
     /// (6.18+) or `scx_sched.event_stats_cpu` (6.16-6.17) fallback.
     /// None if BTF lacks both paths.
     pub event_offsets: Option<ScxEventOffsets>,
-    /// Offsets for struct rq schedstat fields. None if CONFIG_SCHEDSTATS
-    /// is not enabled (BTF lacks the required fields).
+    /// Offsets for struct rq schedstat fields. None when BTF lacks the
+    /// required fields (typically CONFIG_SCHEDSTATS=n).
     pub schedstat_offsets: Option<SchedstatOffsets>,
     /// Offsets for sched_domain tree walking and stats. None if BTF
     /// lacks the `sd` field on `struct rq` or `struct sched_domain`.
