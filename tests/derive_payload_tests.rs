@@ -209,3 +209,25 @@ fn derive_payload_default_checks_resolve_all_constructors() {
         Check::Exists("sampling_key"),
     ));
 }
+
+/// #60: Explicit `output = ExitCode` must parse through the same
+/// PascalCase output grammar as `Json` / `LlmExtract` and emit a
+/// Payload whose `.output == OutputFormat::ExitCode`. The default
+/// (no `output =` kwarg) also lands at `ExitCode`, but a future
+/// change that silently promoted an absent `output` to
+/// `OutputFormat::Json` would go undetected without this test —
+/// explicit + default both must resolve to `ExitCode`.
+#[derive(ktstr::Payload)]
+#[payload(binary = "exit_code_bin", output = ExitCode)]
+#[allow(dead_code)]
+struct ExplicitExitCodePayload;
+
+#[test]
+fn derive_payload_explicit_exit_code_output() {
+    assert!(matches!(EXPLICIT_EXIT_CODE.output, OutputFormat::ExitCode));
+    assert_eq!(EXPLICIT_EXIT_CODE.name, "exit_code_bin");
+    assert!(matches!(
+        EXPLICIT_EXIT_CODE.kind,
+        PayloadKind::Binary("exit_code_bin"),
+    ));
+}

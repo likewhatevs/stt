@@ -438,6 +438,56 @@ mod tests {
         assert!(serde_json::Number::from_f64(2.78).is_some());
     }
 
+    /// #32: JSON integers above 2^53 lose precision when coerced to
+    /// f64 via `serde_json::Number::as_f64` — the f64 mantissa is 52
+    /// bits, so consecutive integers beyond 9007199254740992 round
+    /// to the nearest representable f64. Pin the observed behavior:
+    /// `9007199254740993` (2^53 + 1) round-trips as `9007199254740992.0`
+    /// (2^53). Payloads emitting integer metrics larger than 2^53
+    /// must scale down (µs → s) or encode as strings — the Json
+    /// walker cannot preserve integer identity past that boundary.
+    #[test]
+    fn json_large_integer_above_2_pow_53_loses_precision() {
+        // 2^53 = 9_007_199_254_740_992 is the last exactly-representable
+        // consecutive integer in f64. 2^53 + 1 rounds down to 2^53
+        // (banker's rounding lands on the even representable
+        // neighbor). Test via u64 → f64 to pin the u64 input value
+        // distinct from the emitted f64 — a direct f64 literal of
+        // 2^53+1 would itself round at parse time, obscuring what
+        // the walker did.
+        let s = r#"{"huge": 9007199254740993}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        assert_eq!(m.len(), 1);
+        // The emitted f64 IS the nearest representable value —
+        // which is 2^53, not 2^53+1. Both literals happen to print
+        // as "9007199254740992.0" because f64 can't distinguish
+        // them; compare against the exact f64 produced by the
+        // next-representable-below path.
+        assert_eq!(m[0].value, 9_007_199_254_740_992.0_f64);
+        // Cast the u64 source input to f64 to reproduce the same
+        // rounding serde_json performed. Both sides land at 2^53;
+        // that equality IS the lossy cast being documented.
+        let rounded: f64 = 9_007_199_254_740_993_u64 as f64;
+        assert_eq!(m[0].value, rounded);
+        // Confirm bit-level that the u64 input and the resulting
+        // f64 are NOT identity-preserving: casting the f64 back to
+        // u64 yields 2^53, not 2^53+1.
+        assert_eq!(m[0].value as u64, 9_007_199_254_740_992_u64);
+        assert_ne!(m[0].value as u64, 9_007_199_254_740_993_u64);
+    }
+
+    /// #32: At exactly 2^53 the f64 IS exact — the precision loss is
+    /// strictly one-above-the-boundary. Pair with
+    /// `json_large_integer_above_2_pow_53_loses_precision` so both
+    /// sides of the precision cliff are pinned.
+    #[test]
+    fn json_integer_at_2_pow_53_is_exact() {
+        let s = r#"{"exact": 9007199254740992}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].value, 9_007_199_254_740_992.0_f64);
+    }
+
     /// #34: `find_and_parse_json` tries the whole trimmed input as
     /// a single document on the fast path. If the input has a
     /// balanced object followed by trailing non-JSON text, the

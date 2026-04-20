@@ -27,7 +27,11 @@
 //!
 //! Both fixtures use short, stable `name` fields (`"fio"`,
 //! `"stress-ng"`) matching the binary names that ktstr's
-//! include-files infrastructure resolves inside the guest.
+//! include-files infrastructure resolves inside the guest. The
+//! host-side pipeline that maps a `PayloadKind::Binary(name)` to a
+//! host-filesystem path, packages it into the initramfs, and
+//! exposes it at `/include-files/<name>` inside the VM lives in
+//! [`cli::resolve_include_files`](crate::cli::resolve_include_files).
 //!
 //! # Extending
 //!

@@ -118,6 +118,24 @@ pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
 /// at invocation time instead of at nextest setup.
 pub const OFFLINE_ENV: &str = "KTSTR_MODEL_OFFLINE";
 
+/// Read [`OFFLINE_ENV`] and return the trimmed value IFF it is set
+/// to a non-empty string. Centralizes the "non-empty env-var means
+/// opt-in" predicate used by [`ensure`] and [`prefetch_if_required`]
+/// so the condition stays uniform (e.g. both treat
+/// `KTSTR_MODEL_OFFLINE=` as "not set" — the empty-string case).
+///
+/// Returns `None` when the env var is absent or set to empty
+/// string. Returns `Some(value)` when set to any non-empty string;
+/// callers that want to surface the user-supplied value in error
+/// messages (`"KTSTR_MODEL_OFFLINE=1 set but ..."`) get it for
+/// free.
+fn read_offline_env() -> Option<String> {
+    match std::env::var(OFFLINE_ENV) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => None,
+    }
+}
+
 /// Status record returned by [`status`]: where the model would live
 /// on disk and whether a verified copy is already there.
 #[derive(Debug, Clone)]
@@ -194,9 +212,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     if st.cached && st.sha_matches {
         return Ok(st.path);
     }
-    if let Ok(v) = std::env::var(OFFLINE_ENV)
-        && !v.is_empty()
-    {
+    if let Some(v) = read_offline_env() {
         anyhow::bail!(
             "{OFFLINE_ENV}={v} set but model '{}' is not cached at {}; \
              pre-seed the cache or unset {OFFLINE_ENV} to fetch.",
@@ -382,9 +398,7 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     if !any_test_requires_model() {
         return Ok(None);
     }
-    if let Ok(v) = std::env::var(OFFLINE_ENV)
-        && !v.is_empty()
-    {
+    if let Some(v) = read_offline_env() {
         eprintln!("ktstr: {OFFLINE_ENV}={v} set; skipping eager model prefetch");
         return Ok(None);
     }
@@ -690,6 +704,52 @@ mod tests {
         let bad = "????????????????????????????????????????????????????????????????";
         let err = verify_sha256(tmp.path(), bad).unwrap_err();
         assert!(format!("{err:#}").contains("non-hex"), "err: {err:#}");
+    }
+
+    /// #108: Non-empty short file — SHA-256 of ASCII "abc" is a
+    /// well-known external anchor (NIST FIPS 180-2 appendix). Pins
+    /// the non-empty happy path between the empty-file test above
+    /// and the multi-chunk test below; a regression that broke
+    /// single-chunk non-empty hashing would surface here.
+    #[test]
+    fn verify_sha256_matches_abc() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"abc").unwrap();
+        // Known SHA-256("abc") — NIST FIPS 180-2 / RFC 6234 test vector.
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_sha256(tmp.path(), expected).unwrap());
+    }
+
+    /// #108: Multi-chunk file (larger than a single read buffer)
+    /// exercises the streaming `Read`-loop branch of `verify_sha256`
+    /// (vs the single-buffer fast path for small files). 192 KiB of
+    /// repeated "a" bytes is large enough to cross any reasonable
+    /// BufReader default (8 KiB) multiple times; the expected SHA
+    /// is computed once here from a known constant so the test
+    /// remains deterministic.
+    #[test]
+    fn verify_sha256_matches_multi_chunk_file() {
+        use sha2::{Digest, Sha256};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // 192 KiB of 'a' bytes. 192 * 1024 = 196_608; several
+        // 64 KiB BufReader refills.
+        let data: Vec<u8> = std::iter::repeat_n(b'a', 192 * 1024).collect();
+        std::fs::write(tmp.path(), &data).unwrap();
+        // Compute the expected digest in-process so the test does
+        // not hard-code a magic number against the body size.
+        let mut h = Sha256::new();
+        h.update(&data);
+        let expected_bytes = h.finalize();
+        let expected_hex = hex_encode(&expected_bytes);
+        assert!(verify_sha256(tmp.path(), &expected_hex).unwrap());
+
+        // Negative: flip one byte at the far end and verify the
+        // digest rejects, proving the hasher walked past the first
+        // chunk.
+        let mut tampered = data;
+        *tampered.last_mut().unwrap() = b'b';
+        std::fs::write(tmp.path(), &tampered).unwrap();
+        assert!(!verify_sha256(tmp.path(), &expected_hex).unwrap());
     }
 
     #[test]
