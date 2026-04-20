@@ -95,9 +95,19 @@ pub struct FioPayload;
 
 /// `fio` with `--output-format=json` pre-baked into `default_args`.
 ///
-/// Equivalent to [`FIO`] for every other field, with a distinct
-/// `name = "fio_json"` so both can register as workloads in the
-/// same scenario without hitting the pairwise-dedup rejection.
+/// Compared to [`FIO`], this fixture differs in exactly two
+/// fields:
+///
+/// 1. **`name`** — `"fio_json"` instead of `"fio"`. The distinct
+///    name lets both fixtures register as workloads in the same
+///    `#[ktstr_test(workloads = [FIO, FIO_JSON])]` attribute
+///    without hitting the pairwise-dedup rejection. The `binary`
+///    field (the name resolved by the include-files
+///    infrastructure) is still `"fio"` in both.
+/// 2. **`default_args`** — `&["--output-format=json"]` instead of
+///    `&[]`. Everything else — `kind`, `output`, `default_checks`,
+///    `metrics` — is character-for-character identical to
+///    [`FIO`]. See the unit tests for the pinned invariants.
 #[derive(Payload)]
 #[payload(binary = "fio", name = "fio_json", output = Json)]
 #[default_args("--output-format=json")]

@@ -99,6 +99,30 @@ pub enum Op {
     /// Handles not explicitly consumed by `WaitPayload` / `KillPayload`
     /// are drained at step-teardown by `collect_result`, matching the
     /// [`CgroupDef::workload`] semantics.
+    ///
+    /// # Scheduler-kind rejection across surfaces
+    ///
+    /// Three surfaces accept a `&Payload` and each rejects a
+    /// scheduler-kind Payload differently — deliberately, to match
+    /// the lifecycle of the caller:
+    ///
+    /// | Surface                                                                                   | Rejection             | When          |
+    /// |-------------------------------------------------------------------------------------------|-----------------------|---------------|
+    /// | [`PayloadRun::run`](crate::scenario::payload_run::PayloadRun::run) (`ctx.payload(&X)...`) | `Err(anyhow::Error)`  | scenario-time |
+    /// | [`CgroupDef::workload`]                                                                   | `panic!`              | declaration-time |
+    /// | `Op::RunPayload` (this variant)                                                           | `Err(anyhow::Error)`  | apply-ops-time |
+    ///
+    /// Rationale: `CgroupDef::workload` is a builder invoked during
+    /// test construction (nextest `--list` phase) — a panic there
+    /// surfaces the misuse before any VM boot, with a full
+    /// backtrace pointing at the offending call. `ctx.payload()`
+    /// and `Op::RunPayload` both run inside an executing scenario
+    /// where one bad misuse should not crash the whole test run;
+    /// they `bail!` with an actionable message and let the
+    /// surrounding step-sequence skip to teardown. The three
+    /// paths are symmetric in *what* they reject (scheduler-kind
+    /// Payloads in non-scheduler slots); they differ only in
+    /// *how* the misuse is surfaced, matched to caller context.
     RunPayload {
         payload: &'static crate::test_support::Payload,
         args: Vec<String>,
@@ -111,6 +135,18 @@ pub enum Op {
     /// message — test authors must not silently wait for payloads
     /// that were never started or have already been consumed by a
     /// prior `WaitPayload`/`KillPayload`.
+    ///
+    /// **No timeout.** `WaitPayload` waits indefinitely for the
+    /// child to exit. A binary that never terminates (e.g. a
+    /// benchmark configured without `--runtime=N`, or a stress-ng
+    /// run without `--timeout`) will hang the step until the
+    /// outer test watchdog fires. For time-boxed long-running
+    /// payloads, prefer [`KillPayload`](Self::KillPayload) paired
+    /// with a [`HoldSpec::Fixed`] / [`HoldSpec::Frac`] step
+    /// boundary that guarantees forward progress, or invoke the
+    /// payload via
+    /// [`ctx.payload(&X).run()`](crate::scenario::payload_run::PayloadRun::run)
+    /// which accepts a future `.timeout(Duration)` builder method.
     ///
     /// Check failures from the payload are recorded to the sidecar
     /// for regression analysis but do NOT fail the step or the test

@@ -1,12 +1,14 @@
-//! Local LLM model cache for [`OutputFormat::LlmExtract`] payloads.
+//! Local LLM model cache + LlmExtract runtime for
+//! [`OutputFormat::LlmExtract`] payloads.
 //!
 //! The frozen #162 design routes `OutputFormat::LlmExtract` stdout
 //! through a small local model that emits JSON, which the existing
 //! [`walk_json_leaves`](crate::test_support::metrics) pipeline then
 //! consumes. The model binary itself lives under
-//! `~/.cache/ktstr/models/`; this module owns locate + fetch +
-//! verify semantics without loading or invoking the model (that
-//! belongs to the forthcoming model-invocation module).
+//! `~/.cache/ktstr/models/`. This module owns both the cache
+//! surface (locate + fetch + verify) and the LlmExtract pipeline
+//! that composes a prompt, invokes inference, and routes the
+//! response back through the JSON walker.
 //!
 //! # Cache layout
 //!
@@ -33,6 +35,34 @@
 //! per-test failure rather than a nextest setup abort, which matches
 //! the semantics test authors already expect from other offline env
 //! gates.
+//!
+//! # Wiring into `nextest_setup`
+//!
+//! [`prefetch_if_required`] is invoked by
+//! [`nextest_setup`](crate::test_support::nextest_setup) during
+//! nextest's test-setup phase, after the kernel + initramfs warm
+//! but before any test body executes. Tests that need
+//! `OutputFormat::LlmExtract` therefore observe the model either
+//! already cached on disk or missing with a surfaced fetch error —
+//! they never race against a half-downloaded artifact. Tests that
+//! do not declare LlmExtract skip the prefetch entirely thanks to
+//! [`any_test_requires_model`]'s scan.
+//!
+//! # LlmExtract extraction pipeline
+//!
+//! [`extract_via_llm`] is the runtime entry point called by
+//! [`extract_metrics`](crate::test_support::extract_metrics) when a
+//! payload's [`OutputFormat::LlmExtract`] fires:
+//!
+//! 1. [`compose_prompt`] assembles `{LLM_EXTRACT_PROMPT_TEMPLATE}\n\n{focus}STDOUT:\n{body}`.
+//! 2. [`invoke_inference`] runs the (currently stubbed) backend.
+//! 3. On `Ok`, [`super::metrics::find_and_parse_json`] extracts the
+//!    JSON region; parsed values flow through
+//!    [`super::metrics::walk_json_leaves`] pre-tagged with
+//!    [`MetricSource::LlmExtract`](crate::test_support::MetricSource::LlmExtract).
+//! 4. A JSON-parse failure retries the inference call ONCE. Infra
+//!    errors (backend not wired, model missing) never retry — the
+//!    second call would hit the same wall.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -451,11 +481,22 @@ impl std::error::Error for InferenceError {
 /// model's raw string output (expected to carry a JSON object per
 /// [`LLM_EXTRACT_PROMPT_TEMPLATE`]).
 ///
-/// The inference backend (candle / llama-cpp-rs / similar) has not
-/// been selected yet — adding either to the initramfs would balloon
-/// the guest image and pull in a C/C++ toolchain dependency. Per
-/// the frozen #162 design, the pipeline lands ahead of the backend
-/// so downstream callers (`extract_via_llm`, `extract_metrics`)
+/// **This function runs on the HOST, not inside the guest VM.**
+/// `extract_via_llm` (and by extension `extract_metrics`) is
+/// invoked host-side after the guest's payload has finished and
+/// its stdout has been captured via the sidecar pipeline. The
+/// model cache lives at `~/.cache/ktstr/models/` on the host and
+/// is consulted by the host-side test process — nothing about
+/// this path touches the guest initramfs, and guest image size
+/// is unaffected by backend selection.
+///
+/// Backend selection (candle / llama-cpp-rs / similar) is still
+/// open. The blockers for wiring a real backend are host-side:
+/// binary size of the host test process (candle + tokenizer
+/// alone ~40 MiB), and a C/C++ toolchain dependency that would
+/// affect every `cargo build` of the ktstr crate. Per the frozen
+/// #162 design, the pipeline lands ahead of the backend so
+/// downstream callers (`extract_via_llm`, `extract_metrics`)
 /// wire end-to-end; the backend lands as a follow-up that swaps
 /// this function's body.
 ///
