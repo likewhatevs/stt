@@ -42,13 +42,18 @@ pub struct NumaNode {
     /// Memory attached to this node in MiB.
     pub memory_mb: u32,
     /// HMAT access latency in nanoseconds. `None` uses the default
-    /// (100ns for CPU-bearing, 300ns for memory-only).
+    /// (100ns for CPU-bearing, 300ns for memory-only). Emitted as
+    /// an SLLBI access_latency entry in the HMAT table by
+    /// `write_hmat` in `x86_64/acpi.rs`. x86_64 only — aarch64 does
+    /// not expose an HMAT-equivalent to the guest.
     pub latency_ns: Option<u32>,
     /// HMAT read bandwidth in MB/s. `None` uses the default
     /// (51200 MB/s for CPU-bearing, 20480 MB/s for memory-only).
+    /// Emitted as an SLLBI access_bandwidth entry in the HMAT table
+    /// by `write_hmat` in `x86_64/acpi.rs`. x86_64 only.
     pub bandwidth_mbs: Option<u32>,
     /// HMAT Type 2 memory-side cache. `None` means no cache entry
-    /// is emitted for this node.
+    /// is emitted for this node. x86_64 only.
     pub mem_side_cache: Option<MemSideCache>,
 }
 
