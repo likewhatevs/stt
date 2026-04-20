@@ -52,7 +52,16 @@ pub enum Aggregator {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricDef {
     pub name: &'static str,
-    pub higher_is_worse: bool,
+    /// Regression direction for this metric. A metric that
+    /// previously used `higher_is_worse: true` maps to
+    /// [`Polarity::LowerBetter`](crate::test_support::Polarity::LowerBetter)
+    /// (bigger values are regressions, so smaller is better);
+    /// `false` maps to
+    /// [`Polarity::HigherBetter`](crate::test_support::Polarity::HigherBetter).
+    /// The sense is INVERSE: the old bool answered "does growing
+    /// this value mean worse?" while the enum answers "what
+    /// direction do we want this to move?".
+    pub polarity: crate::test_support::Polarity,
     pub default_abs: f64,
     pub default_rel: f64,
     pub display_unit: &'static str,
@@ -68,6 +77,19 @@ impl MetricDef {
     /// accessor returns `None`.
     pub fn read(&self, row: &GauntletRow) -> Option<f64> {
         (self.accessor)(row).or_else(|| row.ext_metrics.get(self.name).copied())
+    }
+
+    /// Returns `true` for [`Polarity::LowerBetter`], `false` for
+    /// [`Polarity::HigherBetter`]. [`Polarity::TargetValue`] and
+    /// [`Polarity::Unknown`] branches keep the match total; they
+    /// are unreachable for the current [`METRICS`] entries (guarded
+    /// by the `metric_def_polarity_covers_all_entries` test).
+    pub const fn higher_is_worse(&self) -> bool {
+        use crate::test_support::Polarity;
+        matches!(
+            self.polarity,
+            Polarity::LowerBetter | Polarity::TargetValue(_) | Polarity::Unknown
+        )
     }
 }
 
@@ -88,7 +110,7 @@ impl MetricDef {
 pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_spread",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 5.0,
         default_rel: 0.25,
         display_unit: "%",
@@ -97,7 +119,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "worst_gap_ms",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 500.0,
         default_rel: 0.50,
         display_unit: "ms",
@@ -106,7 +128,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "total_migrations",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 10.0,
         default_rel: 0.30,
         display_unit: "",
@@ -115,7 +137,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "worst_migration_ratio",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
@@ -124,7 +146,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "max_imbalance_ratio",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 1.0,
         default_rel: 0.25,
         display_unit: "x",
@@ -133,7 +155,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "max_dsq_depth",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
@@ -142,7 +164,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "stall_count",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "",
@@ -151,7 +173,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "total_fallback",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 5.0,
         default_rel: 0.30,
         display_unit: "/s",
@@ -160,7 +182,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "total_keep_last",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 5.0,
         default_rel: 0.30,
         display_unit: "/s",
@@ -169,7 +191,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "p99_wake_latency_us",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
@@ -178,7 +200,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "median_wake_latency_us",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 20.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
@@ -187,7 +209,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "wake_latency_cv",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 0.10,
         default_rel: 0.25,
         display_unit: "",
@@ -196,7 +218,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "total_iterations",
-        higher_is_worse: false,
+        polarity: crate::test_support::Polarity::HigherBetter,
         default_abs: 100.0,
         default_rel: 0.10,
         display_unit: "",
@@ -205,7 +227,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "mean_run_delay_us",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
@@ -214,7 +236,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "worst_run_delay_us",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 100.0,
         default_rel: 0.50,
         display_unit: "\u{00b5}s",
@@ -223,7 +245,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "worst_page_locality",
-        higher_is_worse: false,
+        polarity: crate::test_support::Polarity::HigherBetter,
         default_abs: 0.05,
         default_rel: 0.10,
         display_unit: "",
@@ -232,7 +254,7 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         name: "worst_cross_node_migration_ratio",
-        higher_is_worse: true,
+        polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
@@ -1596,7 +1618,7 @@ pub(crate) fn compare_rows(
                 continue;
             }
 
-            let is_regression = if m.higher_is_worse {
+            let is_regression = if m.higher_is_worse() {
                 delta > 0.0
             } else {
                 delta < 0.0
@@ -2359,6 +2381,8 @@ mod tests {
             test_name: "my_test".to_string(),
             topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: true,
             skipped: false,
             stats: ScenarioStats {
@@ -2425,6 +2449,8 @@ mod tests {
             test_name: "eevdf_test".to_string(),
             topology: "1n1l2c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: vec![],
             skipped: false,
             passed: false,
             stats: Default::default(),
@@ -2459,6 +2485,8 @@ mod tests {
             topology: "1n1l1c1t".to_string(),
             skipped: false,
             scheduler: "test".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: true,
             stats: Default::default(),
             monitor: Some(monitor::MonitorSummary {
@@ -2566,19 +2594,51 @@ mod tests {
     fn metric_def_known() {
         let d = metric_def("worst_spread").unwrap();
         assert_eq!(d.name, "worst_spread");
-        assert!(d.higher_is_worse);
+        assert!(d.higher_is_worse());
         assert_eq!(d.display_unit, "%");
     }
 
     #[test]
     fn metric_def_not_higher_is_worse() {
         let d = metric_def("total_iterations").unwrap();
-        assert!(!d.higher_is_worse);
+        assert!(!d.higher_is_worse());
     }
 
     #[test]
     fn metric_def_unknown() {
         assert!(metric_def("nonexistent").is_none());
+    }
+
+    #[test]
+    fn metric_def_polarity_inverse_sense() {
+        use crate::test_support::Polarity;
+        // higher_is_worse=true means growing = regression; the
+        // Polarity for "what do we want it to move toward?" is
+        // LowerBetter.
+        let d = metric_def("worst_spread").unwrap();
+        assert!(d.higher_is_worse());
+        assert_eq!(d.polarity, Polarity::LowerBetter);
+        // higher_is_worse=false means growing = improvement; the
+        // Polarity is HigherBetter.
+        let d = metric_def("total_iterations").unwrap();
+        assert!(!d.higher_is_worse());
+        assert_eq!(d.polarity, Polarity::HigherBetter);
+    }
+
+    #[test]
+    fn metric_def_polarity_covers_all_entries() {
+        use crate::test_support::Polarity;
+        // Every METRICS entry must map cleanly to HigherBetter or
+        // LowerBetter; no entry should produce TargetValue or Unknown
+        // from the bool->Polarity adaptor.
+        for m in METRICS.iter() {
+            assert!(
+                matches!(m.polarity, Polarity::HigherBetter | Polarity::LowerBetter),
+                "metric {} produced non-binary polarity {:?}",
+                m.name,
+                m.polarity
+            );
+        }
     }
 
     #[test]

@@ -44,6 +44,16 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `watchdog_timeout_s = N` — maps onto `KtstrTestEntry::watchdog_timeout`
 ///   - `scheduler = PATH` — path to a `const Scheduler` (default
 ///     `Scheduler::EEVDF`, which runs without an scx scheduler)
+///   - `payload = PATH` — path to a `const Payload` used as the
+///     primary binary workload (must be `PayloadKind::Binary`;
+///     runtime-enforced). Default: `None` (scheduler-only test).
+///     Coexists with `scheduler = PATH` — the payload runs *under*
+///     the selected scheduler.
+///   - `workloads = [PATH, PATH, ...]` — additional `const Payload`
+///     references composed with the primary via `Ctx::payload` in
+///     the test body. Default: `&[]`. Must not contain the same
+///     path as `payload` — reject at expansion time to catch the
+///     common "fio as primary AND workload" slip.
 ///   - `auto_repro = bool` (default: `true`)
 ///   - `host_only = bool` (default: `false`) — run the test function
 ///     on the host instead of inside a VM
@@ -66,6 +76,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut numa_nodes_set = false;
     let mut memory_mb = DEFAULT_MEMORY_MB;
     let mut scheduler: Option<syn::Path> = None;
+    let mut payload: Option<syn::Path> = None;
+    let mut payload_set = false;
+    let mut workloads: Vec<syn::Path> = Vec::new();
+    let mut workloads_set = false;
     let mut auto_repro = true;
     let mut not_starved: Option<bool> = None;
     let mut isolation: Option<bool> = None;
@@ -142,6 +156,68 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         };
                         scheduler = Some(p);
+                    }
+                    "payload" => {
+                        if payload_set {
+                            return syn::Error::new_spanned(
+                                path,
+                                "duplicate `payload = ...` — each test declares at \
+                                 most one primary payload; extras belong in \
+                                 `workloads = [..]`",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        let p = match value {
+                            syn::Expr::Path(ep) => ep.path.clone(),
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected path for payload (e.g. FIO or crate::FIO)",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        payload = Some(p);
+                        payload_set = true;
+                    }
+                    "workloads" => {
+                        if workloads_set {
+                            return syn::Error::new_spanned(
+                                path,
+                                "duplicate `workloads = [...]` — combine all \
+                                 entries into a single array",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        let arr = match value {
+                            syn::Expr::Array(ea) => ea,
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected array of Payload paths for workloads \
+                                     (e.g. [FIO, STRESS_NG])",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        for elem in &arr.elems {
+                            match elem {
+                                syn::Expr::Path(ep) => workloads.push(ep.path.clone()),
+                                _ => {
+                                    return syn::Error::new_spanned(
+                                        elem,
+                                        "expected Payload path in workloads array",
+                                    )
+                                    .to_compile_error()
+                                    .into();
+                                }
+                            }
+                        }
+                        workloads_set = true;
                     }
                     "bpf_map_write" => {
                         let p = match value {
@@ -458,7 +534,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, scheduler, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only"),
+                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only"),
                         )
                         .to_compile_error()
                         .into();
@@ -469,6 +545,59 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 return syn::Error::new_spanned(other, "expected `key = value`")
                     .to_compile_error()
                     .into();
+            }
+        }
+    }
+
+    // Mutual exclusion: the primary payload must not also appear
+    // in the workloads array. A Rust `syn::Path` is compared via
+    // `ToTokens` so `FIO` and `crate::FIO` remain distinct strings —
+    // this catches the common in-file alias case (same ident both
+    // places) but not resolved-path-identity, which is impossible
+    // to verify at macro expansion time. Runtime validation can
+    // add path-deduplication after `payload`/`workloads` are read
+    // back from the registered KtstrTestEntry.
+    if let Some(primary) = payload.as_ref() {
+        let primary_repr = primary.to_token_stream().to_string();
+        for w in &workloads {
+            if w.to_token_stream().to_string() == primary_repr {
+                return syn::Error::new_spanned(
+                    w,
+                    format!(
+                        "`{primary_repr}` appears in both `payload = ...` and \
+                         `workloads = [..]` — pick one. The primary payload \
+                         runs as the test's main workload; entries in \
+                         `workloads` are composed alongside it."
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+
+    // Pairwise dedup inside the workloads array itself. `[FIO, FIO]`
+    // is almost always a typo — a test author meant to list two
+    // distinct payloads and accidentally repeated one. Same caveat
+    // as the payload/workloads cross-check: token-string equality
+    // catches in-file aliases (`FIO` == `FIO`) but not resolved-path
+    // identity (`FIO` vs `crate::FIO`).
+    for (i, wi_path) in workloads.iter().enumerate() {
+        let wi = wi_path.to_token_stream().to_string();
+        for wj_path in workloads.iter().skip(i + 1) {
+            let wj = wj_path.to_token_stream().to_string();
+            if wi == wj {
+                return syn::Error::new_spanned(
+                    wj_path,
+                    format!(
+                        "`{wi}` appears twice in `workloads = [..]` — each \
+                         workload entry must be distinct. Remove the \
+                         duplicate or compose the payload once and rely \
+                         on runtime scheduling to spread it across cgroups."
+                    ),
+                )
+                .to_compile_error()
+                .into();
             }
         }
     }
@@ -711,6 +840,21 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { &[] },
     };
 
+    // Emit `Option<&'static Payload>` for the primary payload. The
+    // user supplies a path (`&FIO` equivalent in source), so we
+    // wrap it in `Some(&#p)` at emission time to preserve the
+    // `entry.payload: Option<&'static Payload>` field type.
+    let payload_tokens = match &payload {
+        Some(p) => quote! { Some(&#p) },
+        None => quote! { None },
+    };
+    // Emit `&'static [&'static Payload]` for workloads. Each path
+    // the user supplied is a `const Payload`; we take `&` on each
+    // to match the stored type.
+    let workload_refs: Vec<proc_macro2::TokenStream> =
+        workloads.iter().map(|p| quote! { &#p }).collect();
+    let workloads_tokens = quote! { &[#(#workload_refs),*] };
+
     let test_body = if expect_err {
         quote! {
             let result = ::ktstr::test_support::run_ktstr_test(&#entry_name);
@@ -811,6 +955,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             },
             memory_mb: #memory_mb,
             scheduler: #scheduler_tokens,
+            payload: #payload_tokens,
+            workloads: #workloads_tokens,
             auto_repro: #auto_repro,
             assert: ::ktstr::assert::Assert {
                 not_starved: #not_starved_tokens,

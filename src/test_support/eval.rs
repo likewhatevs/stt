@@ -189,8 +189,10 @@ pub(crate) fn run_ktstr_test_inner(
         eprintln!("ktstr_test: WARNING: scheduler loaded but verifier_stats is empty");
     }
 
-    // Extract profraw from SHM ring buffer and collect stimulus events.
+    // Extract profraw from SHM ring buffer and collect stimulus
+    // events + per-payload metrics.
     let mut stimulus_events = Vec::new();
+    let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
     if let Some(ref shm) = result.shm_data {
         for entry in &shm.entries {
             if entry.msg_type == MSG_TYPE_PROFRAW
@@ -218,6 +220,13 @@ pub(crate) fn run_ktstr_test_inner(
                         None
                     },
                 });
+            }
+            if entry.msg_type == crate::vmm::shm_ring::MSG_TYPE_PAYLOAD_METRICS && entry.crc_ok {
+                match serde_json::from_slice::<crate::test_support::PayloadMetrics>(&entry.payload)
+                {
+                    Ok(pm) => payload_metrics.push(pm),
+                    Err(e) => eprintln!("ktstr_test: decode payload metrics from SHM: {e}"),
+                }
             }
         }
     }
@@ -258,6 +267,7 @@ pub(crate) fn run_ktstr_test_inner(
         &result,
         &merged_assert,
         &stimulus_events,
+        &payload_metrics,
         &vm_topology,
         active_flags,
         &repro_fn,
@@ -269,13 +279,17 @@ pub(crate) fn run_ktstr_test_inner(
 /// This is the core result-evaluation logic, extracted from
 /// `run_ktstr_test_inner` so that error message formatting can be tested
 /// without booting a VM. The `repro_fn` callback handles auto-repro
-/// (which requires a second VM boot) when provided.
+/// (which requires a second VM boot) when provided. `payload_metrics`
+/// is the per-invocation accumulator drained from the guest SHM ring;
+/// the sidecar writer receives it verbatim so stats tooling sees one
+/// entry per `ctx.payload(X).run()` / `.spawn().wait()`.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_vm_result(
     entry: &KtstrTestEntry,
     result: &vmm::VmResult,
     merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
+    payload_metrics: &[crate::test_support::PayloadMetrics],
     topo: &Topology,
     active_flags: &[String],
     repro_fn: &dyn Fn(&str) -> Option<String>,
@@ -352,6 +366,7 @@ fn evaluate_vm_result(
             &verify_result,
             &work_type,
             active_flags,
+            payload_metrics,
         ) {
             eprintln!("ktstr_test: {e:#}");
         }
@@ -1015,6 +1030,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1049,6 +1065,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1079,6 +1096,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &EVAL_TOPO,
             &[],
@@ -1121,6 +1139,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &repro_fn,
@@ -1162,6 +1181,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &repro_fn,
@@ -1193,6 +1213,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &EVAL_TOPO,
             &[],
@@ -1234,6 +1255,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1260,6 +1282,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &EVAL_TOPO,
             &[],
@@ -1290,6 +1313,7 @@ mod tests {
                 &result,
                 &assertions,
                 &[],
+                &[],
                 &EVAL_TOPO,
                 &[],
                 &no_repro,
@@ -1312,6 +1336,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &EVAL_TOPO,
                 &[],
@@ -1339,6 +1364,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &EVAL_TOPO,
                 &[],
@@ -1368,6 +1394,7 @@ mod tests {
                 &result,
                 &assertions,
                 &[],
+                &[],
                 &EVAL_TOPO,
                 &[],
                 &no_repro
@@ -1391,6 +1418,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &EVAL_TOPO,
             &[],
@@ -1423,6 +1451,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1454,6 +1483,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &EVAL_TOPO,
                 &[],
@@ -1532,6 +1562,7 @@ mod tests {
                 &result,
                 &assertions,
                 &[],
+                &[],
                 &EVAL_TOPO,
                 &[],
                 &no_repro
@@ -1559,6 +1590,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &EVAL_TOPO,
             &[],
@@ -1598,6 +1630,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1621,6 +1654,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &EVAL_TOPO,
             &[],
@@ -1647,6 +1681,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1672,6 +1707,7 @@ mod tests {
             &result,
             &assertions,
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1692,6 +1728,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &EVAL_TOPO,
             &[],
@@ -1717,6 +1754,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &EVAL_TOPO,
             &[],
@@ -1756,6 +1794,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &EVAL_TOPO,
                 &[],
@@ -1807,6 +1846,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &EVAL_TOPO,
                 &[],
@@ -1886,6 +1926,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &EVAL_TOPO,
                 &[],

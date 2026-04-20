@@ -31,6 +31,7 @@ use anyhow::Context;
 
 use crate::assert::{AssertResult, ScenarioStats};
 use crate::monitor::MonitorSummary;
+use crate::test_support::PayloadMetrics;
 use crate::timeline::StimulusEvent;
 use crate::vmm;
 
@@ -49,6 +50,22 @@ pub struct SidecarResult {
     /// Scheduler name (matches `Scheduler::name`); `"eevdf"` for
     /// tests run without an scx scheduler.
     pub scheduler: String,
+    /// Binary payload name (matches `Payload::name` when
+    /// `entry.payload` is set). `None` when the test declared no
+    /// binary payload — serialized out so sidecars for
+    /// scheduler-only tests don't carry a null field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+    /// Per-payload extracted metrics collected from `ctx.payload(X).run()`
+    /// / `.spawn().wait()` call sites during the test body.
+    ///
+    /// One [`PayloadMetrics`] per invocation, in the order the calls
+    /// ran. Empty when no payload calls were made (scheduler-only
+    /// tests, or a binary-only test where the body bailed before
+    /// running the payload). Empty vec → omitted from JSON via
+    /// `skip_serializing_if`; this is NOT a backward-compat shim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<PayloadMetrics>,
     /// Overall pass/fail verdict for this run.
     pub passed: bool,
     /// True when the test was skipped (e.g. topology mismatch,
@@ -420,6 +437,17 @@ pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
     h.write(&[0]);
     h.write(sidecar.scheduler.as_bytes());
     h.write(&[0]);
+    // Binary payload name — two tests that differ only in the
+    // primary payload (e.g. scheduler=EEVDF + payload=FIO vs
+    // scheduler=EEVDF + payload=STRESS_NG) must produce distinct
+    // sidecar filenames. `None` emits a single separator byte so the
+    // absent-payload variant doesn't collide with a payload name that
+    // happens to hash-chain into the next field.
+    h.write(&[0xfc]);
+    if let Some(name) = &sidecar.payload {
+        h.write(name.as_bytes());
+    }
+    h.write(&[0]);
     h.write(sidecar.work_type.as_bytes());
     h.write(&[0]);
     h.write(&[0xfe]);
@@ -503,8 +531,9 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
 ///
 /// This helper writes a sidecar flagged `skipped: true, passed: true`
 /// with empty VM telemetry (no monitor, no stimulus events, no
-/// verifier stats, no kvm stats). Stats tooling that subtracts
-/// skipped runs from the pass count treats the entry correctly.
+/// verifier stats, no kvm stats, no payload metrics). Stats tooling
+/// that subtracts skipped runs from the pass count treats the entry
+/// correctly.
 ///
 /// Returns `Err` when the sidecar directory cannot be created, the
 /// JSON cannot be serialized, or the file write fails. Callers that
@@ -519,6 +548,12 @@ pub(crate) fn write_skip_sidecar(
         test_name: entry.name.to_string(),
         topology: entry.topology.to_string(),
         scheduler,
+        // A skip never runs the payload. Still record the declared
+        // payload name so stats tooling can attribute the skip to
+        // the payload-gauntlet variant rather than losing the
+        // association.
+        payload: entry.payload.map(|p| p.name.to_string()),
+        metrics: Vec::new(),
         passed: true,
         skipped: true,
         stats: Default::default(),
@@ -546,6 +581,11 @@ pub(crate) fn write_skip_sidecar(
 /// (`KTSTR_SIDECAR_DIR` override, or
 /// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`).
 ///
+/// `payload_metrics` is the accumulated per-invocation output from
+/// `ctx.payload(X).run()` / `.spawn().wait()` calls made in the
+/// test body. Empty vec when the test body never called
+/// `Ctx::payload` (scheduler-only tests, host-only probes).
+///
 /// Returns `Err` when the sidecar directory cannot be created, the
 /// JSON cannot be serialized, or the file write fails. Callers that
 /// ignore the Result accept the risk of stats-tooling blind spots on
@@ -557,12 +597,15 @@ pub(crate) fn write_sidecar(
     verify_result: &AssertResult,
     work_type: &str,
     active_flags: &[String],
+    payload_metrics: &[PayloadMetrics],
 ) -> anyhow::Result<()> {
     let (scheduler, sysctls, kargs) = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
         topology: entry.topology.to_string(),
         scheduler,
+        payload: entry.payload.map(|p| p.name.to_string()),
+        metrics: payload_metrics.to_vec(),
         passed: verify_result.passed,
         skipped: verify_result.is_skipped(),
         stats: verify_result.stats.clone(),
@@ -595,6 +638,8 @@ mod tests {
             test_name: "my_test".to_string(),
             topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: true,
             skipped: false,
             stats: crate::assert::ScenarioStats {
@@ -683,6 +728,8 @@ mod tests {
             test_name: "eevdf_test".to_string(),
             topology: "1n1l2c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: false,
             skipped: false,
             stats: Default::default(),
@@ -733,6 +780,8 @@ mod tests {
             test_name: "test_x".to_string(),
             topology: "1n1l2c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: true,
             skipped: false,
             stats: Default::default(),
@@ -767,6 +816,8 @@ mod tests {
             test_name: "nested_test".to_string(),
             topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: false,
             skipped: false,
             stats: Default::default(),
@@ -810,6 +861,8 @@ mod tests {
             test_name: name.to_string(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: true,
             skipped: false,
             stats: Default::default(),
@@ -876,6 +929,8 @@ mod tests {
             test_name: "t".to_string(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: true,
             skipped: false,
             stats: Default::default(),
@@ -940,7 +995,7 @@ mod tests {
             crash_message: None,
         };
         let verify_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[], &[]).unwrap();
 
         // Clean up written file.
         let path = dir.join("__sidecar_default_dir__.ktstr.json");
@@ -996,7 +1051,7 @@ mod tests {
             crash_message: None,
         };
         let verify_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[], &[]).unwrap();
 
         // Sidecar filename now includes a variant hash suffix so
         // gauntlet variants don't clobber each other. Find the file
@@ -1063,8 +1118,8 @@ mod tests {
         let ok = AssertResult::pass();
         let flags_a = vec!["llc".to_string()];
         let flags_b = vec!["llc".to_string(), "steal".to_string()];
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a).unwrap();
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a, &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b, &[]).unwrap();
 
         let names: Vec<String> = std::fs::read_dir(&tmp)
             .unwrap()
@@ -1121,8 +1176,8 @@ mod tests {
             crash_message: None,
         };
         let ok = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[]).unwrap();
-        write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[], &[]).unwrap();
 
         let names: Vec<String> = std::fs::read_dir(&tmp)
             .unwrap()
@@ -1164,6 +1219,8 @@ mod tests {
             test_name: String::new(),
             topology: "1n2l4c1t".to_string(),
             scheduler: "scx-ktstr".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: false,
             skipped: false,
             stats: ScenarioStats::default(),
@@ -1185,7 +1242,7 @@ mod tests {
         // `sidecar_variant_hash`.
         assert_eq!(
             sidecar_variant_hash(&sc),
-            0xcd4044360a818e72,
+            0xbc0f38005915a09f,
             "sidecar_variant_hash output drifted — regenerate expected only if \
              the wire format change is intentional and old sidecars are \
              disposable (which they are per ktstr's pre-1.0 stance)",
@@ -1206,6 +1263,8 @@ mod tests {
             test_name: String::new(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: false,
             skipped: false,
             stats: ScenarioStats::default(),
@@ -1221,7 +1280,57 @@ mod tests {
             timestamp: String::new(),
             run_id: String::new(),
         };
-        assert_eq!(sidecar_variant_hash(&sc), 0xe6b48e8fa3394bd8);
+        assert_eq!(sidecar_variant_hash(&sc), 0x1b61394511b42e01);
+    }
+
+    /// Two sidecars that differ only in `payload` must produce
+    /// distinct variant hashes so gauntlet runs composing the same
+    /// scheduler with different primary payloads (FIO vs STRESS_NG)
+    /// don't clobber each other's files.
+    #[test]
+    fn sidecar_variant_hash_distinguishes_payload() {
+        use crate::assert::ScenarioStats;
+        let base = || SidecarResult {
+            test_name: String::new(),
+            topology: "1n1l1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: Vec::new(),
+            passed: false,
+            skipped: false,
+            stats: ScenarioStats::default(),
+            monitor: None,
+            stimulus_events: Vec::new(),
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            sysctls: Vec::new(),
+            kargs: Vec::new(),
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let none = base();
+        let fio = SidecarResult {
+            payload: Some("fio".to_string()),
+            ..base()
+        };
+        let stress = SidecarResult {
+            payload: Some("stress-ng".to_string()),
+            ..base()
+        };
+        let h_none = sidecar_variant_hash(&none);
+        let h_fio = sidecar_variant_hash(&fio);
+        let h_stress = sidecar_variant_hash(&stress);
+        assert_ne!(
+            h_none, h_fio,
+            "absent vs present payload must hash differently",
+        );
+        assert_ne!(
+            h_fio, h_stress,
+            "different payload names must hash differently",
+        );
     }
 
     // -- format_verifier_stats tests --
@@ -1233,6 +1342,8 @@ mod tests {
             test_name: "t".to_string(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "test".to_string(),
+            payload: None,
+            metrics: vec![],
             passed: true,
             skipped: false,
             stats: Default::default(),
@@ -1503,6 +1614,334 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&blocker);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    // -- #162 sidecar payload + metrics fields --
+
+    /// Empty `payload` + `metrics` must round-trip omitted from
+    /// JSON: stats tooling for scheduler-only tests (the vast
+    /// majority) already parses sidecars without either field, and
+    /// emitting `"payload": null, "metrics": []` on every write
+    /// would bloat every sidecar in a large run.
+    ///
+    /// The `serde(default, skip_serializing_if = ...)` attrs are
+    /// the mechanism; this test pins the observable output so a
+    /// future change that drops `skip_serializing_if` is caught
+    /// before it ships.
+    #[test]
+    fn sidecar_payload_and_metrics_omitted_when_empty() {
+        let sc = SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1n1l1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: vec![],
+            passed: true,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        assert!(
+            !json.contains("\"payload\""),
+            "empty payload must be skipped from JSON: {json}",
+        );
+        assert!(
+            !json.contains("\"metrics\""),
+            "empty metrics must be skipped from JSON: {json}",
+        );
+        // Round-trip still works: the default impls fill both fields.
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert!(loaded.payload.is_none());
+        assert!(loaded.metrics.is_empty());
+    }
+
+    /// Populated `payload` + `metrics` survive round-trip with the
+    /// exact shape stats tooling will consume — one entry per
+    /// `ctx.payload(X).run()` call, each carrying its exit code and
+    /// any extracted metrics. Regression guard against a future
+    /// schema shift that flattens metrics across payloads (which
+    /// would lose the per-payload provenance the frozen #162 design
+    /// requires).
+    #[test]
+    fn sidecar_payload_and_metrics_roundtrip_populated() {
+        use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
+        let pm = PayloadMetrics {
+            metrics: vec![Metric {
+                name: "iops".to_string(),
+                value: 5000.0,
+                polarity: Polarity::HigherBetter,
+                unit: "iops".to_string(),
+                source: MetricSource::Json,
+            }],
+            exit_code: 0,
+        };
+        let sc = SidecarResult {
+            test_name: "fio_run".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            payload: Some("fio".to_string()),
+            metrics: vec![pm],
+            passed: true,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        assert!(json.contains("\"payload\":\"fio\""));
+        assert!(json.contains("\"metrics\""));
+        assert!(json.contains("\"iops\""));
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.payload.as_deref(), Some("fio"));
+        assert_eq!(loaded.metrics.len(), 1);
+        assert_eq!(loaded.metrics[0].exit_code, 0);
+        assert_eq!(loaded.metrics[0].metrics.len(), 1);
+        assert_eq!(loaded.metrics[0].metrics[0].name, "iops");
+        assert_eq!(loaded.metrics[0].metrics[0].value, 5000.0);
+    }
+
+    /// `write_sidecar` must populate `payload` from `entry.payload`
+    /// so a test declaring a binary payload writes the payload name
+    /// into the sidecar even when no payload-metrics have been
+    /// threaded in yet. This pins the half-wired state the
+    /// follow-up WOs will extend: stats tooling that already groups
+    /// by payload name sees the grouping key on the sidecar
+    /// immediately.
+    #[test]
+    fn write_sidecar_records_entry_payload_name() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-payload-name-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        static FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__payload_name_test__",
+            func: dummy,
+            auto_repro: false,
+            payload: Some(&FIO),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let ok = AssertResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+
+        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
+            .expect("sidecar dir was created")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("__payload_name_test__-") && n.ends_with(".ktstr.json")
+                })
+            })
+            .expect("sidecar file with variant suffix should be written");
+        let data = std::fs::read_to_string(&path).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
+        assert_eq!(loaded.payload.as_deref(), Some("fio"));
+        assert!(
+            loaded.metrics.is_empty(),
+            "metrics stay empty until a Ctx-level accumulator lands",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// `write_sidecar` must forward the `payload_metrics` slice
+    /// into `SidecarResult.metrics` unmodified — once the
+    /// follow-up Ctx-accumulator WO lands, stats tooling will see
+    /// every `ctx.payload(X).run()` invocation's output in order.
+    #[test]
+    fn write_sidecar_forwards_payload_metrics_slice() {
+        use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-metrics-slice-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__metrics_slice_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let ok = AssertResult::pass();
+        let metrics = vec![
+            PayloadMetrics {
+                metrics: vec![Metric {
+                    name: "iops".to_string(),
+                    value: 1200.0,
+                    polarity: Polarity::HigherBetter,
+                    unit: "iops".to_string(),
+                    source: MetricSource::Json,
+                }],
+                exit_code: 0,
+            },
+            PayloadMetrics {
+                metrics: vec![],
+                exit_code: 2,
+            },
+        ];
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &metrics).unwrap();
+
+        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
+            .expect("sidecar dir was created")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("__metrics_slice_test__-") && n.ends_with(".ktstr.json")
+                })
+            })
+            .expect("sidecar file should be written");
+        let data = std::fs::read_to_string(&path).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
+        assert_eq!(loaded.metrics.len(), 2);
+        assert_eq!(loaded.metrics[0].exit_code, 0);
+        assert_eq!(loaded.metrics[0].metrics.len(), 1);
+        assert_eq!(loaded.metrics[0].metrics[0].name, "iops");
+        assert_eq!(loaded.metrics[1].exit_code, 2);
+        assert!(loaded.metrics[1].metrics.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// `write_skip_sidecar` must also carry `entry.payload` through
+    /// so a ResourceContention or early-skip on a payload-carrying
+    /// test still records the payload name. Missing this would
+    /// drop skipped runs out of payload-grouped stats.
+    #[test]
+    fn write_skip_sidecar_records_entry_payload_name() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
+        let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-payload-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
+
+        static STRESS: Payload = Payload {
+            name: "stress-ng",
+            kind: PayloadKind::Binary("stress-ng"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__skip_payload_name_test__",
+            func: dummy,
+            auto_repro: false,
+            payload: Some(&STRESS),
+            ..KtstrTestEntry::DEFAULT
+        };
+        write_skip_sidecar(&entry, &[]).unwrap();
+
+        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
+            .expect("sidecar dir was created")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("__skip_payload_name_test__-") && n.ends_with(".ktstr.json")
+                })
+            })
+            .expect("sidecar file should be written");
+        let data = std::fs::read_to_string(&path).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
+        assert_eq!(loaded.payload.as_deref(), Some("stress-ng"));
+        assert!(loaded.skipped);
+        assert!(
+            loaded.metrics.is_empty(),
+            "skip path never accumulates metrics"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
         match prev {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },

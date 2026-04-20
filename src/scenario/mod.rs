@@ -31,6 +31,7 @@ pub mod dynamic;
 pub mod interaction;
 pub mod nested;
 pub mod ops;
+pub mod payload_run;
 pub mod performance;
 pub mod scenarios;
 pub mod stress;
@@ -820,6 +821,24 @@ impl<'a> Ctx<'a> {
             assert: crate::assert::Assert::default_checks(),
             wait_for_map_write: false,
         }
+    }
+
+    /// Start a [`PayloadRun`](crate::scenario::payload_run::PayloadRun)
+    /// builder for the given [`Payload`](crate::test_support::Payload).
+    ///
+    /// The builder inherits `payload.default_args` and
+    /// `payload.default_checks`; chained `.arg(...)` / `.check(...)`
+    /// calls extend them; `.clear_args()` / `.clear_checks()` wipe
+    /// both defaults and prior appends. Terminal `.run()` blocks and
+    /// returns `Result<(AssertResult, PayloadMetrics)>`.
+    ///
+    /// Only `PayloadKind::Binary` payloads are runnable here;
+    /// `.run()` on a `PayloadKind::Scheduler` payload returns `Err`.
+    pub fn payload(
+        &'a self,
+        p: &'static crate::test_support::Payload,
+    ) -> crate::scenario::payload_run::PayloadRun<'a> {
+        crate::scenario::payload_run::PayloadRun::new(self, p)
     }
 }
 

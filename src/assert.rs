@@ -488,7 +488,7 @@ impl AssertResult {
         // first merge, making the subsequent min comparison meaningless.
         for (k, v) in &other.stats.ext_metrics {
             let higher_is_worse = crate::stats::metric_def(k)
-                .map(|m| m.higher_is_worse)
+                .map(|m| m.higher_is_worse())
                 .unwrap_or(true);
             let entry = self.stats.ext_metrics.entry(k.clone()).or_insert(*v);
             *entry = if higher_is_worse {

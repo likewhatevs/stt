@@ -522,6 +522,21 @@ pub struct KtstrTestEntry {
     /// Scheduler definition to load inside the guest. Defaults to
     /// `Scheduler::EEVDF` (no scx scheduler).
     pub scheduler: &'static Scheduler,
+    /// Optional binary payload to run as the primary workload. When
+    /// `Some`, the test runs the referenced [`Payload`](crate::test_support::Payload)
+    /// (which must be [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary))
+    /// alongside the configured scheduler. When `None`, the test runs
+    /// a scheduler-only scenario.
+    ///
+    /// Populated by `#[ktstr_test(payload = SOME_BIN)]`; direct
+    /// programmatic callers may also set this.
+    pub payload: Option<&'static crate::test_support::Payload>,
+    /// Additional binary payloads composed with the primary. Each
+    /// entry is launched via [`Ctx::payload`](crate::scenario::Ctx)
+    /// in the test body.
+    ///
+    /// Populated by `#[ktstr_test(workloads = [A, B])]`.
+    pub workloads: &'static [&'static crate::test_support::Payload],
     /// When true, a crash triggers an auto-repro run with BPF probes
     /// attached to the crash call chain.
     pub auto_repro: bool,
@@ -629,6 +644,8 @@ impl KtstrTestEntry {
         constraints: TopologyConstraints::DEFAULT,
         memory_mb: 2048,
         scheduler: &Scheduler::EEVDF,
+        payload: None,
+        workloads: &[],
         auto_repro: true,
         assert: crate::assert::Assert::NO_OVERRIDES,
         extra_sched_args: &[],
@@ -685,6 +702,17 @@ impl KtstrTestEntry {
                 "KtstrTestEntry '{}'.workers_per_cgroup must be > 0 (a \
                  zero-worker cgroup emits no WorkerReports and assertions \
                  vacuously pass)",
+                self.name,
+            );
+        }
+        if let Some(p) = self.payload
+            && p.is_scheduler()
+        {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.payload must be PayloadKind::Binary, \
+                 not Scheduler-kind (schedulers belong in the `scheduler` \
+                 slot; the `payload` slot is for userspace binaries \
+                 composed under the scheduler)",
                 self.name,
             );
         }
@@ -814,6 +842,61 @@ mod tests {
         assert_eq!(d.workers_per_cgroup, 2);
         assert!(!d.expect_err);
         assert!(!d.host_only);
+        // Payload slot defaults to None (scheduler-only entry); workloads
+        // slice defaults to empty. Macro emits these as explicit None/&[]
+        // so struct-update spreaders also get the right values.
+        assert!(d.payload.is_none());
+        assert!(d.workloads.is_empty());
+    }
+
+    #[test]
+    fn ktstr_test_entry_payload_slot_can_be_populated() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        const FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "payload_entry",
+            payload: Some(&FIO),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let p = entry.payload.expect("payload set");
+        assert_eq!(p.name, "fio");
+        assert!(!p.is_scheduler());
+    }
+
+    #[test]
+    fn ktstr_test_entry_workloads_slot_accepts_multiple_payloads() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        const FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        const STRESS_NG: Payload = Payload {
+            name: "stress-ng",
+            kind: PayloadKind::Binary("stress-ng"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let entry = KtstrTestEntry {
+            name: "multi_workload",
+            workloads: &[&FIO, &STRESS_NG],
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(entry.workloads.len(), 2);
+        assert_eq!(entry.workloads[0].name, "fio");
+        assert_eq!(entry.workloads[1].name, "stress-ng");
     }
 
     #[test]

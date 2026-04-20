@@ -337,11 +337,13 @@ pub mod prelude {
         CgroupDef, CpusetSpec, HoldSpec, Op, Setup, Step, execute_defs, execute_steps,
         execute_steps_with,
     };
+    pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::test_support::{
-        BpfMapWrite, CgroupPath, MemSideCache, NumaDistance, NumaNode, Scheduler, SchedulerSpec,
-        SidecarResult, Sysctl, Topology,
+        BpfMapWrite, CgroupPath, Check, MemSideCache, Metric, MetricHint, MetricSource,
+        NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind, PayloadMetrics, Polarity,
+        Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, extract_metrics,
     };
     // `FlagDecl` is already re-exported via `crate::scenario::flags::FlagDecl`
     // above; omitted here because `test_support::FlagDecl` is the same item

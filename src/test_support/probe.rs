@@ -335,7 +335,7 @@ pub(crate) fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Op
     if json.is_empty() {
         return None;
     }
-    let payload: ProbePayload = match serde_json::from_str(&json) {
+    let payload: ProbeBytes = match serde_json::from_str(&json) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("ktstr_test: probe payload deserialize failed: {e}");
@@ -1138,11 +1138,11 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
 /// Serialized probe data sent from guest to host via COM2.
 /// The host deserializes and formats with kernel_dir for source locations.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct ProbePayload {
+pub(crate) struct ProbeBytes {
     pub events: Vec<crate::probe::process::ProbeEvent>,
     pub func_names: Vec<(u32, String)>,
     pub bpf_source_locs: std::collections::HashMap<String, String>,
-    pub diagnostics: Option<ProbePayloadDiagnostics>,
+    pub diagnostics: Option<ProbeBytesDiagnostics>,
     /// Guest VM CPU count for cpumask masking. Populated by
     /// `emit_probe_payload` which runs inside the guest where
     /// sysfs reports the correct value.
@@ -1158,7 +1158,7 @@ pub(crate) struct ProbePayload {
 
 /// Combined diagnostics for the probe payload.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ProbePayloadDiagnostics {
+pub(crate) struct ProbeBytesDiagnostics {
     pub pipeline: PipelineDiagnostics,
     pub skeleton: crate::probe::process::ProbeDiagnostics,
 }
@@ -1186,11 +1186,11 @@ fn emit_probe_payload(
         .collect();
     let bpf_source_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
 
-    let payload = ProbePayload {
+    let payload = ProbeBytes {
         events: events.to_vec(),
         func_names: func_names.to_vec(),
         bpf_source_locs,
-        diagnostics: Some(ProbePayloadDiagnostics {
+        diagnostics: Some(ProbeBytesDiagnostics {
             pipeline: pipeline_diag.clone(),
             skeleton: skeleton_diag.clone(),
         }),
@@ -1272,7 +1272,7 @@ mod tests {
     #[test]
     fn extract_probe_output_valid_json() {
         use crate::probe::process::ProbeEvent;
-        let payload = ProbePayload {
+        let payload = ProbeBytes {
             events: vec![ProbeEvent {
                 func_idx: 0,
                 task_ptr: 1,
@@ -1325,7 +1325,7 @@ mod tests {
     #[test]
     fn extract_probe_output_enriched_fields() {
         use crate::probe::process::ProbeEvent;
-        let payload = ProbePayload {
+        let payload = ProbeBytes {
             events: vec![
                 ProbeEvent {
                     func_idx: 0,

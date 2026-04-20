@@ -44,7 +44,9 @@ mod args;
 mod dispatch;
 mod entry;
 mod eval;
+mod metrics;
 mod output;
+mod payload;
 mod probe;
 mod profraw;
 mod runtime;
@@ -77,9 +79,14 @@ pub use entry::{
 };
 pub(crate) use eval::run_ktstr_test_inner;
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
+pub use metrics::extract_metrics;
 pub(crate) use output::{
     SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX, SENTINEL_INIT_STARTED,
     SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED,
+};
+pub use payload::{
+    Check, Metric, MetricHint, MetricSource, OutputFormat, Payload, PayloadKind, PayloadMetrics,
+    Polarity,
 };
 pub(crate) use probe::maybe_dispatch_vm_test;
 pub(crate) use probe::{

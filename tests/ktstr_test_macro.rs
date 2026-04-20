@@ -714,3 +714,111 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// #[ktstr_test(payload = ..., workloads = [...])] — #162 macro surface
+// ---------------------------------------------------------------------------
+
+// Payload fixtures live in this test crate so the #[ktstr_test]
+// attribute can reference them by local path, exactly the shape a
+// real test author will write.
+use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
+
+#[allow(dead_code)]
+const PAYLOAD_A: Payload = Payload {
+    name: "payload_a",
+    kind: PayloadKind::Binary("/bin/true"),
+    output: OutputFormat::ExitCode,
+    default_args: &[],
+    default_checks: &[],
+    metrics: &[],
+};
+
+#[allow(dead_code)]
+const PAYLOAD_B: Payload = Payload {
+    name: "payload_b",
+    kind: PayloadKind::Binary("/bin/true"),
+    output: OutputFormat::ExitCode,
+    default_args: &[],
+    default_checks: &[],
+    metrics: &[],
+};
+
+#[allow(dead_code)]
+const PAYLOAD_C: Payload = Payload {
+    name: "payload_c",
+    kind: PayloadKind::Binary("/bin/true"),
+    output: OutputFormat::ExitCode,
+    default_args: &[],
+    default_checks: &[],
+    metrics: &[],
+};
+
+/// `payload = PATH` wires `entry.payload = Some(&PATH)`. Assertions
+/// are inline so the nextest-visible wrapper is the assertion site —
+/// plain `#[test]` fns sharing a file with `#[ktstr_test]` are
+/// filtered out by the crate's ctor-based nextest dispatcher.
+#[ktstr_test(payload = PAYLOAD_A, host_only = true)]
+fn macro_payload_attr_wires_entry(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    let entry = ktstr::test_support::find_test("macro_payload_attr_wires_entry")
+        .expect("self-registration via #[ktstr_test]");
+    let payload = entry.payload.expect("payload= must populate entry.payload");
+    assert_eq!(payload.name, "payload_a");
+    assert!(
+        entry.workloads.is_empty(),
+        "primary-only: workloads stays empty",
+    );
+    Ok(AssertResult::pass())
+}
+
+/// `workloads = [A, B]` wires `entry.workloads = &[&A, &B]`.
+#[ktstr_test(workloads = [PAYLOAD_A, PAYLOAD_B], host_only = true)]
+fn macro_workloads_attr_wires_entry(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    let entry = ktstr::test_support::find_test("macro_workloads_attr_wires_entry")
+        .expect("self-registration via #[ktstr_test]");
+    assert!(entry.payload.is_none());
+    assert_eq!(entry.workloads.len(), 2);
+    assert_eq!(entry.workloads[0].name, "payload_a");
+    assert_eq!(entry.workloads[1].name, "payload_b");
+    Ok(AssertResult::pass())
+}
+
+/// `payload = ...` and `workloads = [...]` coexist — the primary
+/// binary runs UNDER the scheduler and composes with any workloads.
+#[ktstr_test(payload = PAYLOAD_A, workloads = [PAYLOAD_B, PAYLOAD_C], host_only = true)]
+fn macro_payload_and_workloads_coexist(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    let entry = ktstr::test_support::find_test("macro_payload_and_workloads_coexist")
+        .expect("self-registration via #[ktstr_test]");
+    let primary = entry
+        .payload
+        .expect("payload= must populate entry.payload even when workloads= is set");
+    assert_eq!(primary.name, "payload_a");
+    assert_eq!(entry.workloads.len(), 2);
+    assert_eq!(entry.workloads[0].name, "payload_b");
+    assert_eq!(entry.workloads[1].name, "payload_c");
+    Ok(AssertResult::pass())
+}
+
+/// Defaults: neither attribute set ⇒ `None` / `&[]`. The pre-existing
+/// `default_attrs_compile` entry is the subject; this wrapper reads
+/// it back via `find_test` to assert the defaults are actually what
+/// the macro emitted, not what the field type happens to make
+/// visible.
+#[ktstr_test(host_only = true)]
+fn macro_defaults_leave_payload_none_workloads_empty(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    let entry = ktstr::test_support::find_test("default_attrs_compile")
+        .expect("default_attrs_compile must be registered");
+    assert!(
+        entry.payload.is_none(),
+        "default macro invocation must leave entry.payload = None",
+    );
+    assert!(
+        entry.workloads.is_empty(),
+        "default macro invocation must leave entry.workloads empty",
+    );
+    Ok(AssertResult::pass())
+}

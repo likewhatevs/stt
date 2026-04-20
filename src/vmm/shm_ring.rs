@@ -89,6 +89,17 @@ pub const MSG_TYPE_SCHED_EXIT: u32 = 0x5343_4458; // "SCDX"
 /// because the UART cannot drain fast enough before reboot.
 pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
 
+/// Message type for per-payload-invocation metrics (payload: JSON-encoded
+/// [`PayloadMetrics`](crate::test_support::PayloadMetrics)). One entry
+/// per terminal `.run()` / `.wait()` / `.kill()` / `.try_wait()` on a
+/// [`PayloadRun`](crate::scenario::payload_run::PayloadRun) or
+/// [`PayloadHandle`](crate::scenario::payload_run::PayloadHandle). The
+/// host-side eval loop drains every `MSG_TYPE_PAYLOAD_METRICS` entry
+/// in order and feeds the resulting `Vec<PayloadMetrics>` to the
+/// sidecar writer so per-invocation provenance is preserved across
+/// composed payload runs.
+pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
+
 /// Current header version.
 pub const SHM_RING_VERSION: u32 = 1;
 
