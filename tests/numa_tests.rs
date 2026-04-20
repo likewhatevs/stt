@@ -180,3 +180,84 @@ static __KTSTR_ENTRY_VMSTAT_MIGRATION: KtstrTestEntry = KtstrTestEntry {
     duration: std::time::Duration::from_secs(5),
     ..KtstrTestEntry::DEFAULT
 };
+
+// ---------------------------------------------------------------------------
+// MemPolicy::Interleave round-robins allocations across BOTH nodes, so the
+// expected page locality on the binding-cpuset half is roughly 50%. The
+// scenario pins workers to node 0 via cpuset but interleaves their pages
+// across nodes 0 and 1, so the locality assertion sets a low minimum.
+// Exercises the round-robin nodemask path that Bind/Preferred don't reach.
+// ---------------------------------------------------------------------------
+
+fn scenario_mempolicy_interleave_cross_node(ctx: &Ctx) -> Result<AssertResult> {
+    let checks = ktstr::assert::Assert::default_checks().min_page_locality(0.3);
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cg_0")
+                .workers(ctx.workers_per_cgroup)
+                .with_cpuset(CpusetSpec::Numa(0))
+                .mem_policy(MemPolicy::interleave([0, 1])),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
+}
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_MEMPOLICY_INTERLEAVE: KtstrTestEntry = KtstrTestEntry {
+    name: "numa_mempolicy_interleave_cross_node",
+    func: scenario_mempolicy_interleave_cross_node,
+    topology: Topology::new(2, 4, 2, 1),
+    constraints: TopologyConstraints {
+        min_numa_nodes: 2,
+        max_numa_nodes: Some(2),
+        ..TopologyConstraints::DEFAULT
+    },
+    auto_repro: false,
+    duration: std::time::Duration::from_secs(5),
+    ..KtstrTestEntry::DEFAULT
+};
+
+// ---------------------------------------------------------------------------
+// MemPolicy::PreferredMany lists multiple nodes that the kernel may use for
+// allocation, falling back across the set rather than a single fallback path.
+// Workers are pinned to node 0; the policy prefers nodes 0 and 1, so most
+// pages should land on node 0 with the minority spilling to node 1.
+// Exercises the MPOL_PREFERRED_MANY (kernel 5.15+) path that
+// `MemPolicy::Preferred` cannot express.
+// ---------------------------------------------------------------------------
+
+fn scenario_mempolicy_preferred_many_locality(ctx: &Ctx) -> Result<AssertResult> {
+    let checks = ktstr::assert::Assert::default_checks().min_page_locality(0.5);
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cg_0")
+                .workers(ctx.workers_per_cgroup)
+                .with_cpuset(CpusetSpec::Numa(0))
+                .mem_policy(MemPolicy::preferred_many([0, 1])),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
+}
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_MEMPOLICY_PREFERRED_MANY: KtstrTestEntry = KtstrTestEntry {
+    name: "numa_mempolicy_preferred_many_locality",
+    func: scenario_mempolicy_preferred_many_locality,
+    topology: Topology::new(2, 4, 2, 1),
+    constraints: TopologyConstraints {
+        min_numa_nodes: 2,
+        max_numa_nodes: Some(2),
+        ..TopologyConstraints::DEFAULT
+    },
+    auto_repro: false,
+    duration: std::time::Duration::from_secs(5),
+    ..KtstrTestEntry::DEFAULT
+};

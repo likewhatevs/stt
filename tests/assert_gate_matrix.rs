@@ -155,3 +155,29 @@ gate_test!(demo_gate_migration_ratio_perf_off_positive, perf: false, negative: f
     Assert::default_checks().max_migration_ratio(100.0));
 gate_test!(demo_gate_migration_ratio_perf_off_negative, perf: false, negative: true,
     Assert::default_checks().max_migration_ratio(0.0));
+
+// ===========================================================================
+// max_cross_node_migration_ratio
+// ===========================================================================
+
+gate_test!(demo_gate_xnode_migration_ratio_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().max_cross_node_migration_ratio(1.0));
+gate_test!(demo_gate_xnode_migration_ratio_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().max_cross_node_migration_ratio(0.0));
+gate_test!(demo_gate_xnode_migration_ratio_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().max_cross_node_migration_ratio(1.0));
+gate_test!(demo_gate_xnode_migration_ratio_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().max_cross_node_migration_ratio(0.0));
+
+// ===========================================================================
+// max_slow_tier_ratio
+// ===========================================================================
+
+gate_test!(demo_gate_slow_tier_ratio_perf_on_positive, perf: true, negative: false,
+    Assert::default_checks().max_slow_tier_ratio(1.0));
+gate_test!(demo_gate_slow_tier_ratio_perf_on_negative, perf: true, negative: true,
+    Assert::default_checks().max_slow_tier_ratio(0.0));
+gate_test!(demo_gate_slow_tier_ratio_perf_off_positive, perf: false, negative: false,
+    Assert::default_checks().max_slow_tier_ratio(1.0));
+gate_test!(demo_gate_slow_tier_ratio_perf_off_negative, perf: false, negative: true,
+    Assert::default_checks().max_slow_tier_ratio(0.0));
