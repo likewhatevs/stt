@@ -3538,7 +3538,7 @@ mod tests {
         // nr_running transitions from 0 to 1 — the CPU woke up but
         // rq_clock didn't advance. This IS a stall (the CPU is now
         // busy but the scheduler tick hasn't fired).
-        // Second CPU has advancing clock so data_looks_valid passes.
+        // Second CPU has a different clock value so data_looks_valid passes.
         let t = MonitorThresholds {
             fail_on_stall: true,
             sustained_samples: 1,
@@ -3599,7 +3599,7 @@ mod tests {
     #[test]
     fn stall_sustained_window_filters_transient() {
         // With sustained_samples=3, a 2-sample stall doesn't trigger.
-        // Second CPU has advancing clock so data_looks_valid passes.
+        // Second CPU has a different clock value so data_looks_valid passes.
         let t = MonitorThresholds {
             fail_on_stall: true,
             sustained_samples: 3,
@@ -3656,7 +3656,7 @@ mod tests {
     #[test]
     fn stall_sustained_window_catches_real_stall() {
         // With sustained_samples=3, 3+ consecutive stall pairs trigger.
-        // Second CPU has advancing clock so data_looks_valid passes.
+        // Second CPU has a different clock value so data_looks_valid passes.
         let t = MonitorThresholds {
             fail_on_stall: true,
             sustained_samples: 3,
@@ -3735,7 +3735,7 @@ mod tests {
     #[test]
     fn stall_below_sustained_passes() {
         // 1 stall pair with sustained_samples=5 should pass.
-        // Second CPU has advancing clock so data_looks_valid passes.
+        // Second CPU has a different clock value so data_looks_valid passes.
         let t = MonitorThresholds {
             fail_on_stall: true,
             sustained_samples: 5,

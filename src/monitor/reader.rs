@@ -2200,10 +2200,10 @@ mod tests {
         // dump after sustained_samples consecutive stall pairs.
         let offsets = test_offsets();
         // Single CPU: nr_running=2 (busy), rq_clock stuck at 5000.
-        // Need a second CPU with advancing clock so samples differ
-        // (otherwise all-same-clock triggers the uninitialized check in
-        // from_samples, though monitor_loop's reactive path doesn't use
-        // from_samples — it checks inline).
+        // Need a second CPU with a different clock value so samples
+        // differ (otherwise all-same-clock triggers the uninitialized
+        // check in from_samples, though monitor_loop's reactive path
+        // doesn't use from_samples — it checks inline).
         let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
         let shm_pa = buf.len() as u64;
         let mut combined = buf;
