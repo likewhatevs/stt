@@ -128,12 +128,44 @@ pub const OFFLINE_ENV: &str = "KTSTR_MODEL_OFFLINE";
 /// string. Returns `Some(value)` when set to any non-empty string;
 /// callers that want to surface the user-supplied value in error
 /// messages (`"KTSTR_MODEL_OFFLINE=1 set but ..."`) get it for
-/// free.
+/// free. Callers that echo the value into user-facing output MUST
+/// funnel it through [`sanitize_env_value`] first.
 fn read_offline_env() -> Option<String> {
     match std::env::var(OFFLINE_ENV) {
         Ok(v) if !v.is_empty() => Some(v),
         _ => None,
     }
+}
+
+/// Sanitize an env-var value for inclusion in a user-facing error
+/// or log message. Control characters (including TAB/CR/LF) are
+/// replaced with `?` so a malicious or accidental payload cannot
+/// disturb terminal state or forge log-line boundaries, and the
+/// result is truncated to `MAX_ENV_ECHO_LEN` bytes with an ellipsis
+/// marker when longer so a multi-kilobyte value doesn't blow up the
+/// error line. The returned string is always ASCII-safe-to-display.
+fn sanitize_env_value(raw: &str) -> String {
+    const MAX_ENV_ECHO_LEN: usize = 64;
+    let mut cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if cleaned.len() > MAX_ENV_ECHO_LEN {
+        // Truncate on a char boundary by collecting a prefix of chars
+        // whose cumulative byte-length stays within the budget. Saves
+        // allocating a shrink_to then fixing up a mid-codepoint cut.
+        let mut end = 0usize;
+        for (idx, c) in cleaned.char_indices() {
+            let next = idx + c.len_utf8();
+            if next > MAX_ENV_ECHO_LEN {
+                break;
+            }
+            end = next;
+        }
+        cleaned.truncate(end);
+        cleaned.push_str("...");
+    }
+    cleaned
 }
 
 /// Status record returned by [`status`]: where the model would live
@@ -213,8 +245,9 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
         return Ok(st.path);
     }
     if let Some(v) = read_offline_env() {
+        let v_safe = sanitize_env_value(&v);
         anyhow::bail!(
-            "{OFFLINE_ENV}={v} set but model '{}' is not cached at {}; \
+            "{OFFLINE_ENV}={v_safe} set but model '{}' is not cached at {}; \
              pre-seed the cache or unset {OFFLINE_ENV} to fetch.",
             spec.file_name,
             st.path.display(),
@@ -399,7 +432,8 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     if let Some(v) = read_offline_env() {
-        eprintln!("ktstr: {OFFLINE_ENV}={v} set; skipping eager model prefetch");
+        let v_safe = sanitize_env_value(&v);
+        eprintln!("ktstr: {OFFLINE_ENV}={v_safe} set; skipping eager model prefetch");
         return Ok(None);
     }
     ensure(&DEFAULT_MODEL).map(Some)
@@ -786,6 +820,237 @@ mod tests {
         };
         let err = ensure(&fake).unwrap_err();
         assert!(format!("{err:#}").contains(OFFLINE_ENV), "err: {err:#}");
+        unsafe {
+            match prev_offline {
+                Some(v) => std::env::set_var(OFFLINE_ENV, v),
+                None => std::env::remove_var(OFFLINE_ENV),
+            }
+            match prev_cache {
+                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
+                None => std::env::remove_var("KTSTR_CACHE_DIR"),
+            }
+        }
+    }
+
+    /// #98: status() on a file that exists but whose SHA does not
+    /// match must report `cached = true, sha_matches = false`. That
+    /// is the branch ensure() consults to decide between "reuse
+    /// cached copy" and "re-download"; a regression that lost the
+    /// mismatch would silently re-validate any garbage bytes sitting
+    /// at the expected path.
+    #[test]
+    fn status_reports_cached_but_sha_mismatch_for_garbage_bytes() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_cache = std::env::var("KTSTR_CACHE_DIR").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = ModelSpec {
+            file_name: "bogus.gguf",
+            url: "https://placeholder.example/bogus.gguf",
+            // Anything but the SHA of whatever bytes we write.
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 16,
+        };
+        let on_disk = tmp.path().join(spec.file_name);
+        std::fs::write(&on_disk, b"definitely-not-zero-sha").unwrap();
+        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
+        unsafe { std::env::set_var("KTSTR_CACHE_DIR", tmp.path()) };
+        let st = status(&spec).unwrap();
+        assert!(st.cached, "file exists, status must report cached=true");
+        assert!(
+            !st.sha_matches,
+            "SHA is a fixed zero pin — garbage bytes must not match",
+        );
+        assert_eq!(st.path, on_disk);
+        unsafe {
+            match prev_cache {
+                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
+                None => std::env::remove_var("KTSTR_CACHE_DIR"),
+            }
+        }
+    }
+
+    /// #100: With `KTSTR_CACHE_DIR` unset, `resolve_cache_root` falls
+    /// through to `XDG_CACHE_HOME` and appends `ktstr/models`.
+    #[test]
+    fn resolve_cache_root_honors_xdg_cache_home() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_ktstr = std::env::var("KTSTR_CACHE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
+        unsafe {
+            std::env::remove_var("KTSTR_CACHE_DIR");
+            std::env::set_var("XDG_CACHE_HOME", "/xdg/caches");
+        }
+        let root = resolve_cache_root().unwrap();
+        assert_eq!(
+            root,
+            PathBuf::from("/xdg/caches").join("ktstr").join("models"),
+        );
+        unsafe {
+            match prev_ktstr {
+                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
+                None => std::env::remove_var("KTSTR_CACHE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+
+    /// #100: With both `KTSTR_CACHE_DIR` and `XDG_CACHE_HOME` unset,
+    /// `resolve_cache_root` falls through to `$HOME/.cache/ktstr/models`.
+    /// The third-tier fallback must hold so `~/.cache` remains the
+    /// documented default on a fresh system.
+    #[test]
+    fn resolve_cache_root_falls_back_to_home_cache() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_ktstr = std::env::var("KTSTR_CACHE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
+        unsafe {
+            std::env::remove_var("KTSTR_CACHE_DIR");
+            std::env::remove_var("XDG_CACHE_HOME");
+            std::env::set_var("HOME", "/home/fake");
+        }
+        let root = resolve_cache_root().unwrap();
+        assert_eq!(
+            root,
+            PathBuf::from("/home/fake")
+                .join(".cache")
+                .join("ktstr")
+                .join("models"),
+        );
+        unsafe {
+            match prev_ktstr {
+                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
+                None => std::env::remove_var("KTSTR_CACHE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// #100: Empty `KTSTR_CACHE_DIR` must fall through to XDG
+    /// exactly like "unset", mirroring the `!dir.is_empty()` gate in
+    /// `resolve_cache_root`. A regression that treated the empty
+    /// string as a valid root would produce an empty `PathBuf` and
+    /// silently write cache entries into the current working dir.
+    #[test]
+    fn resolve_cache_root_treats_empty_ktstr_cache_dir_as_unset() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_ktstr = std::env::var("KTSTR_CACHE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
+        unsafe {
+            std::env::set_var("KTSTR_CACHE_DIR", "");
+            std::env::set_var("XDG_CACHE_HOME", "/xdg/caches");
+        }
+        let root = resolve_cache_root().unwrap();
+        assert_eq!(
+            root,
+            PathBuf::from("/xdg/caches").join("ktstr").join("models"),
+            "empty KTSTR_CACHE_DIR must be treated as unset so XDG wins",
+        );
+        unsafe {
+            match prev_ktstr {
+                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
+                None => std::env::remove_var("KTSTR_CACHE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+
+    /// #117: `sanitize_env_value` replaces control characters (newline,
+    /// tab, backspace, escape) with `?` and passes printable ASCII +
+    /// Unicode through unchanged. Pins the predicate used before
+    /// echoing a user-controlled env value into error output — a
+    /// regression that let `\x1b` flow through could escape-sequence
+    /// the terminal of whoever reads the error message.
+    #[test]
+    fn sanitize_env_value_replaces_control_chars() {
+        // Printable ASCII passes through untouched.
+        assert_eq!(sanitize_env_value("1"), "1");
+        assert_eq!(sanitize_env_value("true"), "true");
+        assert_eq!(sanitize_env_value("/path/to/thing"), "/path/to/thing");
+        // Every standard control-character class is masked.
+        assert_eq!(sanitize_env_value("a\nb"), "a?b");
+        assert_eq!(sanitize_env_value("a\tb"), "a?b");
+        assert_eq!(sanitize_env_value("a\x1bb"), "a?b");
+        assert_eq!(sanitize_env_value("\x08"), "?");
+        assert_eq!(sanitize_env_value("\r\n"), "??");
+    }
+
+    /// #117: An overlong value is truncated to a byte-bounded prefix
+    /// with a `...` marker. The marker (three ASCII dots) makes it
+    /// obvious the value was cut, and the truncation walks a char
+    /// boundary so a multi-byte UTF-8 codepoint straddling the limit
+    /// isn't split mid-sequence.
+    #[test]
+    fn sanitize_env_value_truncates_overlong_value() {
+        let raw: String = "x".repeat(200);
+        let out = sanitize_env_value(&raw);
+        assert!(out.ends_with("..."), "truncation marker missing: {out:?}");
+        // 64-byte cap + 3-byte marker = 67. Any longer means the
+        // truncation didn't fire; any shorter means the marker path
+        // ran on input that shouldn't have tripped it.
+        assert_eq!(out.len(), 67);
+    }
+
+    /// #117: ensure()'s offline-bail error echoes the env value
+    /// through `sanitize_env_value`. Set `OFFLINE_ENV` to a value
+    /// containing both control chars and overlong content, and
+    /// verify the error string contains neither a raw newline nor
+    /// the full 200-char payload.
+    #[test]
+    fn ensure_offline_error_sanitizes_env_value_in_message() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_offline = std::env::var(OFFLINE_ENV).ok();
+        let prev_cache = std::env::var("KTSTR_CACHE_DIR").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        // Embed a newline + a very long tail; both get rewritten.
+        let hostile = format!("inject\nbreak{}", "z".repeat(200));
+        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
+        unsafe {
+            std::env::set_var(OFFLINE_ENV, &hostile);
+            std::env::set_var("KTSTR_CACHE_DIR", tmp.path());
+        }
+        let fake = ModelSpec {
+            file_name: "not-here.gguf",
+            url: "https://placeholder.example/not-here.gguf",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let msg = format!("{:#}", ensure(&fake).unwrap_err());
+        assert!(!msg.contains('\n'), "raw newline leaked: {msg:?}");
+        assert!(
+            !msg.contains(&"z".repeat(200)),
+            "overlong tail leaked un-truncated: {msg:?}"
+        );
+        assert!(
+            msg.contains("inject?break"),
+            "sanitized stem missing: {msg:?}"
+        );
         unsafe {
             match prev_offline {
                 Some(v) => std::env::set_var(OFFLINE_ENV, v),

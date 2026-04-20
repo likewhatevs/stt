@@ -1139,10 +1139,50 @@ struct StepState<'a> {
     /// Resolved cpusets per cgroup name, for isolation checks.
     cpusets: std::collections::HashMap<String, BTreeSet<usize>>,
     /// Active payload-binary handles keyed by cgroup name. Each entry
-    /// came from a [`CgroupDef::workload`] spawn in `apply_setup` and
-    /// is killed during step-teardown / cgroup removal so cgroupfs
+    /// came from either a [`CgroupDef::workload`] spawn in
+    /// `apply_setup` or an explicit [`Op::RunPayload`] invocation;
+    /// `source` tags which path spawned it so the duplicate-name
+    /// dedup in `Op::RunPayload` can point at the original site. All
+    /// are killed during step-teardown / cgroup removal so cgroupfs
     /// cleanup never trips EBUSY on a live process.
-    payload_handles: Vec<(String, crate::scenario::payload_run::PayloadHandle)>,
+    payload_handles: Vec<PayloadEntry>,
+}
+
+/// Whether a live payload handle was spawned by an explicit
+/// [`Op::RunPayload`] inside the step or by a
+/// [`CgroupDef::workload`] attachment at `apply_setup`. Held by
+/// every [`PayloadEntry`] so the dedup path in `Op::RunPayload`
+/// can name the original source when rejecting a second spawn of
+/// the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadSource {
+    /// Spawned by `CgroupDef::workload(&payload)` during `apply_setup`.
+    CgroupDefWorkload,
+    /// Spawned by `Op::RunPayload { payload, .. }` inside the step's ops.
+    OpRunPayload,
+}
+
+impl PayloadSource {
+    /// Human-readable tag for error output. Describes the API surface
+    /// that originated the spawn, not the internal dispatch site.
+    fn describe(self) -> &'static str {
+        match self {
+            PayloadSource::CgroupDefWorkload => "CgroupDef::workload",
+            PayloadSource::OpRunPayload => "Op::RunPayload",
+        }
+    }
+}
+
+/// One live payload handle plus the cgroup it runs inside and the
+/// API surface that spawned it. `cgroup` is empty iff
+/// `source == PayloadSource::OpRunPayload` was invoked without a
+/// `cgroup = Some(...)` argument — in which case the payload runs
+/// in whatever cgroup its parent process inherited (no explicit
+/// placement).
+struct PayloadEntry {
+    cgroup: String,
+    source: PayloadSource,
+    handle: crate::scenario::payload_run::PayloadHandle,
 }
 
 /// Execute a single step with CgroupDefs that hold for the full duration.
@@ -1461,7 +1501,11 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
                         e,
                     )
                 })?;
-            state.payload_handles.push((def.name.to_string(), handle));
+            state.payload_handles.push(PayloadEntry {
+                cgroup: def.name.to_string(),
+                source: PayloadSource::CgroupDefWorkload,
+                handle,
+            });
         }
     }
     Ok(())
@@ -1642,15 +1686,23 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                         payload.name,
                     );
                 }
-                if state
+                if let Some(existing) = state
                     .payload_handles
                     .iter()
-                    .any(|(_, h)| h.payload_name() == payload.name)
+                    .find(|e| e.handle.payload_name() == payload.name)
                 {
+                    // Name the surface that spawned the live handle
+                    // so the user can find the original site without
+                    // guessing. `CgroupDef::workload` fires at
+                    // `apply_setup`, `Op::RunPayload` fires inside
+                    // the step's ops — different edit targets to
+                    // resolve the duplicate.
                     anyhow::bail!(
-                        "Op::RunPayload: payload '{}' already running — \
+                        "Op::RunPayload: payload '{}' already running (spawned by {} in cgroup {}) — \
                          WaitPayload/KillPayload it before spawning another with the same name",
                         payload.name,
+                        existing.source.describe(),
+                        render_cgroup_key(&existing.cgroup),
                     );
                 }
                 let mut run = crate::scenario::payload_run::PayloadRun::new(ctx, payload);
@@ -1666,29 +1718,35 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 };
                 let handle = run.spawn().with_context(|| {
                     format!(
-                        "Op::RunPayload: spawn payload '{}' in cgroup '{}'",
-                        payload.name, cgroup_key,
+                        "Op::RunPayload: spawn payload '{}' in cgroup {}",
+                        payload.name,
+                        render_cgroup_key(&cgroup_key),
                     )
                 })?;
-                state.payload_handles.push((cgroup_key, handle));
+                state.payload_handles.push(PayloadEntry {
+                    cgroup: cgroup_key,
+                    source: PayloadSource::OpRunPayload,
+                    handle,
+                });
             }
             Op::WaitPayload { name } => {
                 let idx = state
                     .payload_handles
                     .iter()
-                    .position(|(_, h)| h.payload_name() == name.as_ref())
+                    .position(|e| e.handle.payload_name() == name.as_ref())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "Op::WaitPayload: no running payload named '{name}' \
                              (spawn it via Op::RunPayload or CgroupDef::workload before waiting)",
                         )
                     })?;
-                let (_, handle) = state.payload_handles.swap_remove(idx);
+                let entry = state.payload_handles.swap_remove(idx);
                 // Check verdicts + metrics are recorded to the sidecar
                 // via the SHM ring inside `handle.wait()`; the returned
                 // tuple is discarded here because step-ops surface per-
                 // payload results through the sidecar, not the ops API.
-                let _result = handle
+                let _result = entry
+                    .handle
                     .wait()
                     .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
             }
@@ -1696,15 +1754,16 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 let idx = state
                     .payload_handles
                     .iter()
-                    .position(|(_, h)| h.payload_name() == name.as_ref())
+                    .position(|e| e.handle.payload_name() == name.as_ref())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "Op::KillPayload: no running payload named '{name}' \
                              (spawn it via Op::RunPayload or CgroupDef::workload before killing)",
                         )
                     })?;
-                let (_, handle) = state.payload_handles.swap_remove(idx);
-                let _result = handle
+                let entry = state.payload_handles.swap_remove(idx);
+                let _result = entry
+                    .handle
                     .kill()
                     .with_context(|| format!("Op::KillPayload: kill payload '{name}'"))?;
             }
@@ -1765,15 +1824,12 @@ fn collect_result(
 /// likewise routes through `drain_all_payload_handles` for the
 /// same reason. Preserve `.kill()` on every path that claims to
 /// drain handles for metric capture.
-fn drain_payload_handles_for_cgroup(
-    handles: &mut Vec<(String, crate::scenario::payload_run::PayloadHandle)>,
-    cgroup: &str,
-) {
+fn drain_payload_handles_for_cgroup(handles: &mut Vec<PayloadEntry>, cgroup: &str) {
     let mut i = 0;
     while i < handles.len() {
-        if handles[i].0.as_str() == cgroup {
-            let (_, handle) = handles.swap_remove(i);
-            if let Err(e) = handle.kill() {
+        if handles[i].cgroup.as_str() == cgroup {
+            let entry = handles.swap_remove(i);
+            if let Err(e) = entry.handle.kill() {
                 eprintln!("ktstr: kill payload in cgroup '{cgroup}': {e:#}");
             }
         } else {
@@ -1786,13 +1842,27 @@ fn drain_payload_handles_for_cgroup(
 /// vector. Called at step-sequence teardown so every handle gets a
 /// terminal `.kill()` (and therefore a sidecar metric emission) even
 /// when no explicit `RemoveCgroup`/`StopCgroup` op targeted it.
-fn drain_all_payload_handles(
-    handles: &mut Vec<(String, crate::scenario::payload_run::PayloadHandle)>,
-) {
-    for (cgroup, handle) in handles.drain(..) {
-        if let Err(e) = handle.kill() {
-            eprintln!("ktstr: teardown kill payload in cgroup '{cgroup}': {e:#}");
+fn drain_all_payload_handles(handles: &mut Vec<PayloadEntry>) {
+    for entry in handles.drain(..) {
+        if let Err(e) = entry.handle.kill() {
+            eprintln!(
+                "ktstr: teardown kill payload in cgroup {}: {e:#}",
+                render_cgroup_key(&entry.cgroup),
+            );
         }
+    }
+}
+
+/// Render a cgroup key for inclusion in user-facing error text.
+/// An empty string is replaced with `(no cgroup)` so
+/// `Op::RunPayload { cgroup: None }` failures don't produce messages
+/// like `cgroup ''` that look like a corrupt log line. Non-empty
+/// keys are quoted so they read clearly next to surrounding prose.
+fn render_cgroup_key(cgroup: &str) -> String {
+    if cgroup.is_empty() {
+        "(no cgroup)".to_string()
+    } else {
+        format!("'{cgroup}'")
     }
 }
 
@@ -3739,11 +3809,22 @@ mod tests {
             .spawn()
             .expect("spawn /bin/true for cg_b");
 
-        let mut handles = vec![("cg_a".to_string(), h_a), ("cg_b".to_string(), h_b)];
+        let mut handles = vec![
+            PayloadEntry {
+                cgroup: "cg_a".to_string(),
+                source: PayloadSource::CgroupDefWorkload,
+                handle: h_a,
+            },
+            PayloadEntry {
+                cgroup: "cg_b".to_string(),
+                source: PayloadSource::CgroupDefWorkload,
+                handle: h_b,
+            },
+        ];
         drain_payload_handles_for_cgroup(&mut handles, "cg_a");
 
         assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].0, "cg_b");
+        assert_eq!(handles[0].cgroup, "cg_b");
 
         drain_all_payload_handles(&mut handles);
         assert!(handles.is_empty());
@@ -3958,7 +4039,7 @@ mod tests {
         )
         .expect("spawn /bin/sleep");
         assert_eq!(state.payload_handles.len(), 1, "one payload is live");
-        assert_eq!(state.payload_handles[0].1.payload_name(), "sleeper");
+        assert_eq!(state.payload_handles[0].handle.payload_name(), "sleeper");
 
         apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("kill the live payload");
         assert!(
@@ -4010,6 +4091,24 @@ mod tests {
             msg.contains("payload 'sleeper' already running"),
             "error must flag the duplicate, got: {msg}"
         );
+        // #122: the dup error must identify the surface that spawned
+        // the live handle so the user knows where to go to fix it. The
+        // first spawn was via Op::RunPayload, not CgroupDef::workload.
+        assert!(
+            msg.contains("Op::RunPayload"),
+            "dup error must name the originating surface, got: {msg}"
+        );
+        // #127: the Op::RunPayload in this test ran without a
+        // `cgroup = Some(..)`, so the rendered cgroup key must be
+        // `(no cgroup)`, not an empty-quoted `''`.
+        assert!(
+            msg.contains("(no cgroup)"),
+            "empty-cgroup key must render as '(no cgroup)', got: {msg}"
+        );
+        assert!(
+            !msg.contains("cgroup ''"),
+            "empty-cgroup key must not render as quoted empty, got: {msg}"
+        );
         assert_eq!(
             state.payload_handles.len(),
             1,
@@ -4019,6 +4118,80 @@ mod tests {
         // Clean up the live handle so the test process doesn't leak
         // a /bin/sleep.
         apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
+    }
+
+    /// #122: when the first spawn came from `CgroupDef::workload`
+    /// (via `apply_setup`), a subsequent `Op::RunPayload` with the
+    /// same payload name must surface `CgroupDef::workload` as the
+    /// originating surface so the user edits the cgroup def rather
+    /// than hunting through step ops. Pairs with
+    /// `apply_ops_run_duplicate_payload_name_bails`, which pins the
+    /// op-source branch.
+    #[test]
+    fn apply_ops_run_rejects_payload_already_owned_by_cgroup_def() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        };
+        // Simulate the def-owned handle directly — apply_setup pushes
+        // entries with PayloadSource::CgroupDefWorkload, so construct
+        // the equivalent here without invoking the real spawn path
+        // (apply_setup needs workers(N) and cgroupfs ops which MockCgroupOps
+        // does not implement for this test shape).
+        let h = crate::scenario::payload_run::PayloadRun::new(&ctx, &SLEEP)
+            .args(["3600".to_string()])
+            .spawn()
+            .expect("manual def-source spawn");
+        state.payload_handles.push(PayloadEntry {
+            cgroup: "def_cg".to_string(),
+            source: PayloadSource::CgroupDefWorkload,
+            handle: h,
+        });
+
+        let err = apply_ops(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["1".into()])],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CgroupDef::workload"),
+            "dup error must name the def-source surface, got: {msg}"
+        );
+        assert!(
+            msg.contains("'def_cg'"),
+            "dup error must name the cgroup the live handle is in, got: {msg}"
+        );
+        // Only the original handle remains — op branch bailed pre-spawn.
+        assert_eq!(state.payload_handles.len(), 1);
+
+        apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
+    }
+
+    /// #127: [`render_cgroup_key`] renders an empty string as
+    /// `(no cgroup)` and a populated name as single-quoted prose.
+    /// Pins the formatting so every error path that echoes the
+    /// cgroup key through this helper stays consistent.
+    #[test]
+    fn render_cgroup_key_handles_empty_and_populated() {
+        assert_eq!(render_cgroup_key(""), "(no cgroup)");
+        assert_eq!(render_cgroup_key("cg_a"), "'cg_a'");
     }
 
     // -- #85: payload_handles drain on error paths in execute_steps_with --
