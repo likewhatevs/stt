@@ -183,12 +183,13 @@ pub enum WorkType {
     /// and scheduling class transitions.
     PolicyChurn { spin_iters: u64 },
     /// Schbench-style messenger/worker workload. One messenger per group
-    /// wakes `fan_out` workers via shared futex. Each worker does
-    /// `operations` matrix multiplications over a `cache_footprint_kb`-sized
-    /// working set, preceded by a `sleep_usec` microsecond sleep simulating
-    /// think time. Workers measure wake-to-run latency (time from messenger's
-    /// timestamp to worker getting the CPU). Requires num_workers divisible
-    /// by (fan_out + 1).
+    /// wakes `fan_out` workers via shared futex. After recording the
+    /// wake-to-run latency, each worker sleeps for `sleep_usec`
+    /// microseconds (simulating think time), then does `operations`
+    /// matrix multiplications over a `cache_footprint_kb`-sized working
+    /// set. Wake-to-run latency is the interval from the messenger's
+    /// timestamp to the worker observing the generation advance.
+    /// Requires num_workers divisible by (fan_out + 1).
     SchBench {
         fan_out: usize,
         cache_footprint_kb: usize,
@@ -340,7 +341,8 @@ impl WorkType {
     /// Worker group size for this work type, or None if ungrouped.
     ///
     /// `num_workers` must be divisible by this value. Paired types return 2,
-    /// fan-out returns fan_out + 1 (1 messenger + N receivers).
+    /// fan-out returns fan_out + 1 (1 messenger + N receivers), and
+    /// MutexContention returns `contenders`.
     pub fn worker_group_size(&self) -> Option<usize> {
         match self {
             WorkType::PipeIo { .. }
@@ -932,7 +934,9 @@ pub struct WorkerReport {
     pub cpus_used: BTreeSet<usize>,
     /// Ordered list of CPU migration events with timestamps.
     pub migrations: Vec<Migration>,
-    /// Longest gap between work iterations (ms). High = task was stuck waiting for CPU.
+    /// Longest wall-clock gap observed at 1024-work-unit checkpoints
+    /// (ms). High values indicate the task was preempted or descheduled
+    /// near a checkpoint boundary.
     pub max_gap_ms: u64,
     /// CPU where the longest gap happened.
     pub max_gap_cpu: usize,
@@ -1004,7 +1008,7 @@ pub struct WorkloadHandle {
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
-    /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut, 16 for SchBench).
+    /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut/MutexContention, 16 for SchBench).
     futex_region_size: usize,
     /// MAP_SHARED region of per-worker u64 iteration counters. Workers
     /// atomically store their iteration count; parent reads via
@@ -1544,7 +1548,7 @@ impl WorkloadHandle {
 
         // If we just started workers, give them time to begin before stopping.
         // 500ms accommodates parallel test runs where CPU contention delays
-        // fork/exec of worker processes.
+        // fork of worker processes.
         if !was_started {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }

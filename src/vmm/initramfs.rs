@@ -238,13 +238,14 @@ fn read_cstr(data: &[u8], offset: usize) -> Option<&str> {
 /// Resolve shared library dependencies for a dynamically-linked ELF binary.
 /// Parses the ELF dynamic section to read DT_NEEDED entries, then resolves
 /// each soname to a host path matching the host dynamic linker's search
-/// order: LD_LIBRARY_PATH → DT_RUNPATH/DT_RPATH → /etc/ld.so.cache →
-/// /etc/ld.so.conf paths → default library paths. When the binary uses
-/// a non-standard PT_INTERP, the interpreter's parent and sibling lib
-/// dirs are prepended to the search path (before RPATH/RUNPATH) and
-/// propagated to transitive deps. Walks transitive deps via
-/// level-parallel BFS. Returns empty result for static binaries or
-/// non-ELF files.
+/// order: DT_RPATH (legacy; only when DT_RUNPATH is absent) →
+/// LD_LIBRARY_PATH → DT_RUNPATH → interp-relative hints → /etc/ld.so.cache
+/// → default library paths. A separate /etc/ld.so.conf walk is omitted
+/// because ldconfig ingests conf paths into ld.so.cache. When the binary
+/// uses a non-standard PT_INTERP, the interpreter's parent and sibling
+/// lib dirs feed the interp hints and are propagated to transitive deps.
+/// Walks transitive deps via level-parallel BFS. Returns empty result
+/// for static binaries or non-ELF files.
 #[tracing::instrument(skip_all, fields(binary = %binary.display()))]
 pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     // Cache results by canonical path — avoids re-resolving the same

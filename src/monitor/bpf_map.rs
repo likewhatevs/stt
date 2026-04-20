@@ -572,10 +572,11 @@ pub struct BpfValueLayout {
 impl BpfValueLayout {
     /// Build a layout from a btf_rs Btf and a type ID.
     ///
-    /// Chases Volatile/Const/Typedef/TypeTag/Restrict chains to reach
-    /// the underlying Struct, then extracts field offsets and types.
-    /// Returns `None` if the type ID does not resolve to a Struct or
-    /// any named, byte-aligned member has an unresolvable type.
+    /// Chases Ptr and Volatile/Const/Typedef/TypeTag/Restrict chains to
+    /// reach the underlying Struct or Union, then extracts field offsets
+    /// and types. Returns `None` if the type ID does not resolve to a
+    /// Struct or Union, or any named, byte-aligned member has an
+    /// unresolvable type.
     pub fn from_btf(btf: &btf_rs::Btf, type_id: u32) -> Option<Self> {
         let s = resolve_to_struct(btf, type_id)?;
         let total_size = s.size();
@@ -610,10 +611,11 @@ impl BpfValueLayout {
 }
 
 /// Chase modifiers (Volatile, Const, Typedef, TypeTag, Restrict),
-/// pointers, and typedefs from `type_id` to find a Struct.
+/// pointers, and typedefs from `type_id` to find a Struct or Union.
 ///
-/// Returns `None` if the chain ends in a non-Struct type or exceeds
-/// depth 20. Also resolves through Ptr (for pointer-to-struct members).
+/// Returns `None` if the chain ends in a type that is neither Struct
+/// nor Union, or exceeds depth 20. Also resolves through Ptr (for
+/// pointer-to-struct members).
 pub(crate) fn resolve_to_struct(btf: &btf_rs::Btf, type_id: u32) -> Option<btf_rs::Struct> {
     let mut t = btf.resolve_type_by_id(type_id).ok()?;
     for _ in 0..20 {
@@ -634,7 +636,9 @@ pub(crate) fn resolve_to_struct(btf: &btf_rs::Btf, type_id: u32) -> Option<btf_r
 }
 
 /// Determine the BpfFieldKind and byte size for a struct member by
-/// chasing its type chain to the underlying Int or falling back to Bytes.
+/// chasing its type chain to the underlying Int or Enum (both map to
+/// signed/unsigned integer kinds by size, with Bytes as fallback for
+/// non-standard sizes).
 fn resolve_field_kind(btf: &btf_rs::Btf, member: &btf_rs::Member) -> Option<(BpfFieldKind, usize)> {
     let mut t = btf.resolve_chained_type(member).ok()?;
     for _ in 0..20 {
