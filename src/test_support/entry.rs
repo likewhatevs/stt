@@ -625,18 +625,18 @@ impl KtstrTestEntry {
     ///
     /// ```
     /// use ktstr::prelude::*;
-    /// use ktstr::test_support::{KtstrTestEntry, KTSTR_TESTS};
-    /// use linkme::distributed_slice;
+    /// use ktstr::test_support::{KTSTR_TESTS, KtstrTestEntry, Payload};
     ///
     /// fn my_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
     ///     Ok(AssertResult::pass())
     /// }
     ///
-    /// #[distributed_slice(KTSTR_TESTS)]
+    /// #[ktstr::__private::linkme::distributed_slice(KTSTR_TESTS)]
+    /// #[linkme(crate = ktstr::__private::linkme)]
     /// static ENTRY: KtstrTestEntry = KtstrTestEntry {
     ///     name: "my_test",
     ///     func: my_test_fn,
-    ///     scheduler: &crate::test_support::Payload::EEVDF,
+    ///     scheduler: &Payload::EEVDF,
     ///     ..KtstrTestEntry::DEFAULT
     /// };
     /// ```

@@ -66,7 +66,7 @@
 //!     Steal,
 //! }
 //!
-//! #[ktstr_test(scheduler = MY_SCHED)]
+//! #[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
 //! fn basic(ctx: &Ctx) -> Result<AssertResult> {
 //!     execute_defs(ctx, vec![
 //!         CgroupDef::named("cg_0").workers(2),
