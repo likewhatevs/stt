@@ -425,6 +425,88 @@ mod tests {
         assert!(serde_json::Number::from_f64(2.78).is_some());
     }
 
+    /// #31: Negative numeric leaves extract at their declared value
+    /// without any sign-absoluting or filtering. Canonical for
+    /// metrics like scheduler_delta_ns that can legitimately be
+    /// negative (improvement from baseline).
+    #[test]
+    fn json_negative_numbers_extract_preserving_sign() {
+        let s = r#"{"delta_ns": -500.5, "underflow": -1000000}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        let by_name: std::collections::BTreeMap<&str, f64> =
+            m.iter().map(|x| (x.name.as_str(), x.value)).collect();
+        assert_eq!(by_name.get("delta_ns"), Some(&-500.5));
+        assert_eq!(by_name.get("underflow"), Some(&-1_000_000.0));
+    }
+
+    /// #31: Zero is emitted as a real metric value, not filtered
+    /// out. A payload that genuinely measured zero (idle CPU, no
+    /// errors) must produce a zero metric — otherwise downstream
+    /// checks like `Check::exit_code_eq(0)` against an `exit_code`
+    /// metric of 0.0 would spuriously report "missing" instead of
+    /// passing.
+    #[test]
+    fn json_zero_values_are_emitted_not_filtered() {
+        let s = r#"{"errors": 0, "cpu_idle_pct": 0.0, "count": -0.0}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        let by_name: std::collections::BTreeMap<&str, f64> =
+            m.iter().map(|x| (x.name.as_str(), x.value)).collect();
+        assert_eq!(by_name.len(), 3, "all three zeros must extract: {m:?}");
+        assert_eq!(by_name.get("errors"), Some(&0.0));
+        assert_eq!(by_name.get("cpu_idle_pct"), Some(&0.0));
+        // -0.0 round-trips via f64; assert the numeric equality.
+        assert_eq!(by_name.get("count"), Some(&0.0));
+    }
+
+    /// #31: Mixed positive + negative + zero in one document
+    /// exercises the walker's sign-agnostic branch.
+    #[test]
+    fn json_mixed_signs_and_zero_all_extract() {
+        let s = r#"{"pos": 10.0, "neg": -10.0, "zero": 0.0}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        assert_eq!(m.len(), 3);
+    }
+
+    /// #36: An empty JSON object `{}` at the top level parses
+    /// successfully but yields no metric leaves — the walker
+    /// traverses zero children and falls through to produce an
+    /// empty Vec. No `None` return, no panic.
+    #[test]
+    fn json_empty_object_yields_no_metrics() {
+        let m = extract_metrics("{}", &OutputFormat::Json);
+        assert!(m.is_empty(), "empty object has no leaves: {m:?}");
+    }
+
+    /// #36: An empty array at the top level likewise yields zero
+    /// metrics.
+    #[test]
+    fn json_empty_array_yields_no_metrics() {
+        let m = extract_metrics("[]", &OutputFormat::Json);
+        assert!(m.is_empty(), "empty array has no leaves: {m:?}");
+    }
+
+    /// #36: Nested empty containers also produce no leaves — the
+    /// walker still recurses but finds nothing numeric at the
+    /// bottom. Pins the "no ghost metrics from empty containers"
+    /// invariant.
+    #[test]
+    fn json_nested_empty_containers_yield_no_metrics() {
+        let s = r#"{"outer": {"inner": {}, "also": []}}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        assert!(m.is_empty(), "nested empties emit nothing: {m:?}");
+    }
+
+    /// #36: Empty container alongside real metrics — empties are
+    /// silent, real leaves still emit.
+    #[test]
+    fn json_empty_container_mixed_with_real_metrics() {
+        let s = r#"{"iops": 100.0, "meta": {}, "samples": []}"#;
+        let m = extract_metrics(s, &OutputFormat::Json);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].name, "iops");
+        assert_eq!(m[0].value, 100.0);
+    }
+
     /// #12 regression: walk_json_leaves uses push/pop on a single
     /// path buffer instead of per-level format!(). This test pins
     /// the *behavior* (path output unchanged across deep nesting)

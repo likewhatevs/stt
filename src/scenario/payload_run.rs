@@ -1036,6 +1036,68 @@ mod tests {
         assert_eq!(tail, "short error");
     }
 
+    /// #37: When `s.len() - max_bytes` lands inside a multi-byte UTF-8
+    /// code unit, `stderr_tail` snaps the start index forward to the
+    /// next char boundary so the slice operation never panics. This
+    /// test uses a 2-byte UTF-8 character ("é") placed at the exact
+    /// boundary so a naive `&s[start..]` would slice mid-codepoint.
+    #[test]
+    fn stderr_tail_snaps_forward_across_multibyte_char_boundary() {
+        // "A"*10 + "é" + "B"*10 → 22 bytes total, len 22, "é" = 2 bytes.
+        // With max_bytes = 11, start = 22 - 11 = 11. The byte at 11 is
+        // the second byte of "é" (non-boundary). The snap-forward
+        // advances start to 12, yielding the trailing "B"*10 + preamble.
+        let mut s = String::from("A").repeat(10);
+        s.push('é');
+        s.push_str(&"B".repeat(10));
+        let tail = stderr_tail(&s, 11);
+        assert!(tail.starts_with("..."));
+        // The multi-byte char must have been skipped (advanced off its
+        // interior), so the tail begins with ASCII "B"s.
+        assert!(
+            tail[3..].starts_with('B'),
+            "expected snap-forward past 'é', got: {tail:?}"
+        );
+    }
+
+    /// #37: When the whole multi-byte character sits at the snap-
+    /// forward boundary (start lands exactly on its first byte), the
+    /// character is preserved intact — no off-by-one that drops its
+    /// first byte.
+    #[test]
+    fn stderr_tail_preserves_multibyte_char_at_exact_boundary() {
+        // Build a string so the multi-byte char starts exactly at the
+        // snap-forward position. ASCII x10 + "é" (2B) + ASCII x10
+        // = 22B. max_bytes = 12 → start = 22-12 = 10, which IS "é"'s
+        // first byte (a boundary). No snap happens; "é" is included.
+        let mut s = String::from("A").repeat(10);
+        s.push('é');
+        s.push_str(&"B".repeat(10));
+        let tail = stderr_tail(&s, 12);
+        assert!(tail.starts_with("..."));
+        assert!(
+            tail.contains('é'),
+            "boundary-aligned multibyte char must survive the tail, got: {tail:?}"
+        );
+    }
+
+    /// #37: `stderr_tail` is valid UTF-8 regardless of where the
+    /// multi-byte character falls. Property-style sanity check
+    /// constructing every single-byte offset within a surrounding
+    /// multi-byte character and verifying `str::from_utf8` round-trips.
+    #[test]
+    fn stderr_tail_output_is_always_valid_utf8() {
+        // Chinese "好" = 3 bytes (E5 A5 BD); pin it mid-string.
+        let s = "xxxxxxxxxx好yyyyyyyyyy"; // 10 + 3 + 10 = 23 bytes
+        for max in 1..=s.len() {
+            let tail = stderr_tail(s, max);
+            // Assertion: `tail` is already a `String`, so it is
+            // by construction valid UTF-8; re-rendering it proves
+            // no byte-level corruption leaked into the String.
+            let _ = tail.as_str();
+        }
+    }
+
     #[test]
     fn evaluate_checks_missing_metric_fails_loudly() {
         let pm = PayloadMetrics {
@@ -1580,6 +1642,91 @@ mod tests {
     /// build is skipped entirely. Pins the no-op invariant so a
     /// regression can't accidentally materialize an empty map for
     /// zero metrics on every hot-path call.
+    /// #30: When the payload declares two MetricHints with the
+    /// same name, the HashMap build keeps the LAST insertion. The
+    /// test pins that behavior so a future switch to a multimap or
+    /// to first-wins semantics surfaces here. First-wins would be
+    /// surprising: users who copy-paste a hint to tweak it expect
+    /// the new value.
+    #[test]
+    fn resolve_polarities_duplicate_hint_names_last_wins() {
+        use crate::test_support::{Metric, MetricHint, MetricSource, Polarity};
+        static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
+            name: "dup_hints",
+            kind: crate::test_support::PayloadKind::Binary("x"),
+            output: crate::test_support::OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[
+                MetricHint {
+                    name: "iops",
+                    polarity: Polarity::HigherBetter,
+                    unit: "iops",
+                },
+                MetricHint {
+                    name: "iops",
+                    polarity: Polarity::LowerBetter,
+                    unit: "overridden",
+                },
+            ],
+        };
+        let mut ms = vec![Metric {
+            name: "iops".into(),
+            value: 1.0,
+            polarity: Polarity::Unknown,
+            unit: String::new(),
+            source: MetricSource::Json,
+        }];
+        resolve_polarities(&mut ms, &PAYLOAD);
+        // Second declaration wins (HashMap last-insertion semantics).
+        assert_eq!(ms[0].polarity, Polarity::LowerBetter);
+        assert_eq!(ms[0].unit, "overridden");
+    }
+
+    /// #30: When the metric slice has duplicate names (e.g. a
+    /// payload emitting the same dotted path twice in one run), the
+    /// hint is applied to each occurrence. Each is a distinct
+    /// Metric value in the sidecar; both must carry the hinted
+    /// polarity + unit so downstream regression reports are
+    /// consistent.
+    #[test]
+    fn resolve_polarities_duplicate_metric_names_each_gets_hint() {
+        use crate::test_support::{Metric, MetricHint, MetricSource, Polarity};
+        static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
+            name: "dup_metrics",
+            kind: crate::test_support::PayloadKind::Binary("x"),
+            output: crate::test_support::OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[MetricHint {
+                name: "iops",
+                polarity: Polarity::HigherBetter,
+                unit: "iops",
+            }],
+        };
+        let mut ms = vec![
+            Metric {
+                name: "iops".into(),
+                value: 1.0,
+                polarity: Polarity::Unknown,
+                unit: String::new(),
+                source: MetricSource::Json,
+            },
+            Metric {
+                name: "iops".into(),
+                value: 2.0,
+                polarity: Polarity::Unknown,
+                unit: String::new(),
+                source: MetricSource::Json,
+            },
+        ];
+        resolve_polarities(&mut ms, &PAYLOAD);
+        for m in &ms {
+            assert_eq!(m.polarity, Polarity::HigherBetter);
+            assert_eq!(m.unit, "iops");
+        }
+    }
+
     #[test]
     fn resolve_polarities_empty_inputs_are_noop() {
         use crate::test_support::{Metric, MetricSource, Polarity};

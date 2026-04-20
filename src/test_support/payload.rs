@@ -512,6 +512,78 @@ mod tests {
         );
     }
 
+    /// #33: Round-trip bool → Polarity → bool for HigherBetter /
+    /// LowerBetter yields the identity. Pins the "inverse sense"
+    /// contract documented on `MetricDef::higher_is_worse` and
+    /// `Polarity::from_higher_is_worse` so a future polarity
+    /// refactor can't accidentally flip one direction without the
+    /// other and silently break delta-classification downstream.
+    ///
+    /// The test synthesizes a throw-away `MetricDef` for each
+    /// polarity because the production `METRICS` table's entries
+    /// live in `stats.rs` and are test-only not importable from
+    /// here — constructing the struct literal directly keeps the
+    /// round-trip self-contained.
+    #[test]
+    fn higher_is_worse_polarity_round_trip() {
+        use crate::stats::{Aggregator, MetricDef};
+
+        // true (higher-is-worse) → LowerBetter → true.
+        let m = MetricDef {
+            name: "t",
+            polarity: Polarity::from_higher_is_worse(true),
+            default_abs: 0.0,
+            default_rel: 0.0,
+            display_unit: "",
+            aggregate: Aggregator::Max,
+            accessor: |_| None,
+        };
+        assert_eq!(m.polarity, Polarity::LowerBetter);
+        assert!(m.higher_is_worse(), "LowerBetter → higher_is_worse = true");
+
+        // false (higher-is-better) → HigherBetter → false.
+        let m = MetricDef {
+            name: "f",
+            polarity: Polarity::from_higher_is_worse(false),
+            default_abs: 0.0,
+            default_rel: 0.0,
+            display_unit: "",
+            aggregate: Aggregator::Max,
+            accessor: |_| None,
+        };
+        assert_eq!(m.polarity, Polarity::HigherBetter);
+        assert!(
+            !m.higher_is_worse(),
+            "HigherBetter → higher_is_worse = false"
+        );
+    }
+
+    /// #33: `MetricDef::higher_is_worse` is total over every
+    /// `Polarity` variant — the current implementation lumps
+    /// `LowerBetter`, `TargetValue`, and `Unknown` all into
+    /// `true`. Pin that so a subtle change (e.g. TargetValue → its
+    /// own category) doesn't silently flip regression direction
+    /// for every test using target metrics.
+    #[test]
+    fn higher_is_worse_covers_all_polarity_variants() {
+        use crate::stats::{Aggregator, MetricDef};
+        fn make(p: Polarity) -> MetricDef {
+            MetricDef {
+                name: "x",
+                polarity: p,
+                default_abs: 0.0,
+                default_rel: 0.0,
+                display_unit: "",
+                aggregate: Aggregator::Max,
+                accessor: |_| None,
+            }
+        }
+        assert!(!make(Polarity::HigherBetter).higher_is_worse());
+        assert!(make(Polarity::LowerBetter).higher_is_worse());
+        assert!(make(Polarity::TargetValue(42.0)).higher_is_worse());
+        assert!(make(Polarity::Unknown).higher_is_worse());
+    }
+
     #[test]
     fn polarity_target_accepts_finite() {
         let p = Polarity::target(0.5);
