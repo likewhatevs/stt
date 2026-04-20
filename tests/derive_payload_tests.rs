@@ -210,6 +210,37 @@ fn derive_payload_default_checks_resolve_all_constructors() {
     ));
 }
 
+/// #62: both bare (`min(...)`) and qualified (`Check::min(...)`)
+/// constructor forms must resolve to the same generated `Check::...`
+/// variant. The macro detects the explicit `Check` segment on the
+/// callee path and skips its implicit `::ktstr::test_support::Check::`
+/// prepend so a user who imports `Check` and writes the prefix
+/// themselves gets `Check::min(...)`, not `Check::Check::min(...)`.
+#[derive(ktstr::Payload)]
+#[payload(binary = "qualified_check_bin")]
+#[default_check(Check::min("iops", 1000.0))]
+#[default_check(Check::max("latency_us", 500.0))]
+#[default_check(exists("sampling_key"))]
+#[allow(dead_code)]
+struct QualifiedCheckPayload;
+
+#[test]
+fn derive_payload_accepts_qualified_check_prefix() {
+    assert_eq!(QUALIFIED_CHECK.default_checks.len(), 3);
+    assert!(matches!(
+        QUALIFIED_CHECK.default_checks[0],
+        Check::Min { metric, value } if metric == "iops" && value == 1000.0,
+    ));
+    assert!(matches!(
+        QUALIFIED_CHECK.default_checks[1],
+        Check::Max { metric, value } if metric == "latency_us" && value == 500.0,
+    ));
+    assert!(matches!(
+        QUALIFIED_CHECK.default_checks[2],
+        Check::Exists("sampling_key"),
+    ));
+}
+
 /// #60: Explicit `output = ExitCode` must parse through the same
 /// PascalCase output grammar as `Json` / `LlmExtract` and emit a
 /// Payload whose `.output == OutputFormat::ExitCode`. The default

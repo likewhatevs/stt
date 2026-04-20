@@ -1681,10 +1681,12 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
 /// - `#[default_check(...)]` — one [`Check`](ktstr::test_support::Check)
 ///   construction expression (e.g. `min("iops", 1000.0)`,
 ///   `exit_code_eq(0)`). May repeat; entries accumulate in source
-///   order. The expression evaluates in the path context of the
-///   generated const, so `ktstr::test_support::Check::...` is
-///   unnecessary — `min(...)` resolves via the `Check::` prefix the
-///   macro inserts.
+///   order. Both `min(...)` and `Check::min(...)` are accepted: the
+///   macro prepends `::ktstr::test_support::Check::` when the
+///   expression doesn't already spell `Check::` on its callee path,
+///   so bare constructors work without an import and qualified
+///   constructors read naturally in modules that already have
+///   `Check` in scope.
 /// - `#[metric(name = "...", polarity = ..., unit = "...")]` —
 ///   kwarg form. `polarity` is one of `HigherBetter`, `LowerBetter`,
 ///   `TargetValue(f64)`, `Unknown`. May repeat; entries accumulate.
@@ -1808,16 +1810,25 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
                 default_args.push(lit.value());
             }
         } else if attr.path().is_ident("default_check") {
-            // Single Check-constructing expression; emit as
-            // `::ktstr::test_support::Check::#expr` so bare `min(...)`
-            // resolves without the user importing `Check`.
+            // Single Check-constructing expression. Two forms accepted:
+            //   - bare: `min("iops", 1000.0)` — the macro prepends
+            //     `::ktstr::test_support::Check::` so users don't have
+            //     to import `Check` in every module that derives.
+            //   - qualified: `Check::min("iops", 1000.0)` — the user
+            //     wrote `Check::` themselves; emit the expression
+            //     unchanged so the user's own path resolution wins
+            //     (and a double `Check::Check::` prefix can't happen).
             let expr: syn::Expr = attr.parse_args().map_err(|e| {
                 syn::Error::new(
                     e.span(),
                     "default_check must be a Check constructor expression (e.g. min(\"iops\", 1000.0))",
                 )
             })?;
-            default_checks.push(quote! { ::ktstr::test_support::Check::#expr });
+            if expr_has_check_prefix(&expr) {
+                default_checks.push(quote! { #expr });
+            } else {
+                default_checks.push(quote! { ::ktstr::test_support::Check::#expr });
+            }
         } else if attr.path().is_ident("metric") {
             // Kwarg form: name = "...", polarity = ..., unit = "...".
             let parsed = parse_metric_attr(attr)?;
@@ -1939,6 +1950,36 @@ fn output_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
 /// Parse one `#[metric(name = "...", polarity = ..., unit = "...")]`
 /// attribute into a `MetricHint { ... }` token stream.
 ///
+/// Does this `#[default_check(...)]` expression already spell
+/// `Check::` somewhere in its function path? Returns true for
+/// `Check::min(...)` and `::ktstr::test_support::Check::min(...)`;
+/// false for bare `min(...)`. Used to skip the macro's implicit
+/// `::ktstr::test_support::Check::` prepend when the user has
+/// already written the prefix, so `Check::Check::min(...)` can't
+/// happen.
+///
+/// Only inspects the callee path of an `Expr::Call`; non-call
+/// expressions (rare but legal: a free function returning `Check`,
+/// or a `const` value) fall back to the prepend path, matching the
+/// pre-bugfix behavior for anything that isn't a plain constructor
+/// call. A future refactor could lift this to also handle
+/// `MethodCall` / `Path`, but the Check API today is constructor
+/// calls only — adding more shapes is a no-op until a new constructor
+/// form lands.
+fn expr_has_check_prefix(expr: &syn::Expr) -> bool {
+    let syn::Expr::Call(call) = expr else {
+        return false;
+    };
+    let syn::Expr::Path(expr_path) = &*call.func else {
+        return false;
+    };
+    expr_path
+        .path
+        .segments
+        .iter()
+        .any(|seg| seg.ident == "Check")
+}
+
 /// `polarity` accepts bare idents `HigherBetter`, `LowerBetter`,
 /// `Unknown`, and the call form `TargetValue(<float literal>)`. The
 /// float literal is stamped into a `Polarity::TargetValue(lit)` so
