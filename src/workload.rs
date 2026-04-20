@@ -1199,10 +1199,11 @@ impl WorkloadHandle {
             }
         }
 
-        // For FutexPingPong/FutexFanOut/SchBench, allocate one shared region
-        // per worker group via MAP_SHARED|MAP_ANONYMOUS so all members of the
-        // fork see the same physical page. SchBench needs 16 bytes (futex u32
-        // at offset 0, wake timestamp u64 at offset 8); others need 4 bytes.
+        // For FutexPingPong/FutexFanOut/SchBench/MutexContention, allocate
+        // one shared region per worker group via MAP_SHARED|MAP_ANONYMOUS
+        // so all members of the fork see the same physical page. SchBench
+        // needs 16 bytes (futex u32 at offset 0, wake timestamp u64 at
+        // offset 8); others need 4 bytes.
         let futex_group_size = config.work_type.worker_group_size().unwrap_or(2);
         if needs_futex {
             for _ in 0..config.num_workers / futex_group_size {
