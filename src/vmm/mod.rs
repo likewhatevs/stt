@@ -2232,6 +2232,23 @@ impl KtstrVm {
         // Resolve effective memory_mb for boot params / ACPI / SHM.
         let memory_mb = self.effective_memory_mb(&vm.guest_mem);
 
+        // Kernel cmdline rationale (per flag):
+        //   console=ttyS0        — serial console for host-visible output.
+        //   nomodules            — no out-of-tree modules are shipped; skip modprobe paths.
+        //   mitigations=off      — skip Spectre/Meltdown mitigations for VM perf.
+        //   no_timer_check       — suppress APIC timer-calibration failure under KVM.
+        //   clocksource=kvm-clock — stable paravirt clock; avoid TSC drift under KVM.
+        //   random.trust_cpu=on  — seed RNG from RDRAND so userspace doesn't block on entropy.
+        //   swiotlb=noforce      — skip the IOMMU bounce buffer — no passthrough devices.
+        //   i8042.*=noaux/nomux/nopnp/dumbkbd — skip legacy PS/2 probing; no keyboard/mouse in VM.
+        //   pci=off              — no PCI devices emulated; shave boot time by skipping the scan.
+        //   reboot=k             — use keyboard-controller reset method.
+        //   panic=-1             — reboot immediately on panic; host detects via exit.
+        //   iomem=relaxed        — allow guest /dev/mem mmap of the SHM region (see shm_ring.rs).
+        //   nokaslr              — deterministic kernel addresses for symbol/offset resolution.
+        //   lockdown=none        — permit /dev/mem and unrestricted BPF needed by the test runtime.
+        //   sysctl.kernel.unprivileged_bpf_disabled=0 — allow BPF load from the test runtime.
+        //   sysctl.kernel.sched_schedstats=1          — enable /proc/schedstat for workload reports.
         let mut cmdline = concat!(
             "console=ttyS0 nomodules mitigations=off ",
             "no_timer_check clocksource=kvm-clock ",
@@ -3381,6 +3398,14 @@ impl KtstrVm {
     ) -> Result<boot::KernelLoadResult> {
         let memory_mb = self.effective_memory_mb(&vm.guest_mem);
 
+        // Kernel cmdline rationale (per flag) — aarch64 subset of the
+        // x86_64 block above. Flags present on both arches carry the
+        // same justification; see the x86_64 comment for details.
+        // aarch64-specific:
+        //   kfence.sample_interval=0 — disable KFENCE sampling; no real
+        //                              driver faults to catch in the
+        //                              test VM, and KFENCE adds boot-time
+        //                              page-allocation pressure.
         let mut cmdline = concat!(
             "console=ttyS0 ",
             "nomodules mitigations=off ",
