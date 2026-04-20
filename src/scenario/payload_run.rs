@@ -279,6 +279,15 @@ impl std::fmt::Debug for PayloadHandle {
 }
 
 impl PayloadHandle {
+    /// Name of the [`Payload`] this handle was spawned from — i.e.
+    /// the identity key used by step-level ops to address a running
+    /// payload. Step-local ops ([`Op::WaitPayload`](crate::scenario::ops::Op::WaitPayload),
+    /// [`Op::KillPayload`](crate::scenario::ops::Op::KillPayload))
+    /// match handles by this name.
+    pub fn payload_name(&self) -> &'static str {
+        self.payload.name
+    }
+
     /// Block until the child exits naturally, then extract metrics
     /// and evaluate checks, matching the foreground `.run()` return
     /// shape.

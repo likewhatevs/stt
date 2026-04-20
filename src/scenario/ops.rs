@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::assert::AssertResult;
 use crate::vmm::shm_ring::{self, StimulusPayload};
@@ -79,6 +79,47 @@ pub enum Op {
         from: Cow<'static, str>,
         to: Cow<'static, str>,
     },
+    /// Spawn a userspace [`Payload`](crate::test_support::Payload)
+    /// binary in the background and track its
+    /// [`PayloadHandle`](crate::scenario::payload_run::PayloadHandle)
+    /// under the step's payload-handle set.
+    ///
+    /// Subsequent [`Op::WaitPayload`] / [`Op::KillPayload`] address
+    /// the running child by [`Payload::name`](crate::test_support::Payload::name).
+    /// Only [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary)
+    /// payloads are spawnable; scheduler-kind payloads are rejected at
+    /// apply time with an actionable error.
+    ///
+    /// `args` is appended to `payload.default_args`. `cgroup`, when
+    /// set, places the child in the named cgroup (resolved relative
+    /// to the scenario's parent cgroup) via
+    /// [`PayloadRun::in_cgroup`](crate::scenario::payload_run::PayloadRun::in_cgroup);
+    /// unset inherits the spawning process's cgroup.
+    ///
+    /// Handles not explicitly consumed by `WaitPayload` / `KillPayload`
+    /// are drained at step-teardown by `collect_result`, matching the
+    /// [`CgroupDef::workload`] semantics.
+    RunPayload {
+        payload: &'static crate::test_support::Payload,
+        args: Vec<String>,
+        cgroup: Option<Cow<'static, str>>,
+    },
+    /// Block until the payload named `name` exits naturally, then
+    /// evaluate its checks and record metrics to the per-test sidecar.
+    ///
+    /// The handle is consumed on success — a subsequent `WaitPayload`
+    /// / `KillPayload` targeting the same name is a no-op (warning
+    /// logged). A `WaitPayload` for an unknown name is an error:
+    /// test authors should not silently wait for payloads that were
+    /// never started.
+    WaitPayload { name: Cow<'static, str> },
+    /// SIGKILL the payload named `name`, reap the child, evaluate
+    /// checks, and record metrics. Mirrors the behavior of
+    /// step-teardown drain for an explicitly-targeted payload.
+    ///
+    /// Like [`WaitPayload`], the handle is consumed on success and
+    /// an unknown name is an error.
+    KillPayload { name: Cow<'static, str> },
 }
 
 /// How to compute a cpuset from topology.
@@ -415,6 +456,28 @@ impl Step {
         self.ops = ops;
         self
     }
+
+    /// Create a step that spawns a single userspace
+    /// [`Payload`](crate::test_support::Payload) binary in the
+    /// background and holds for the given duration before teardown.
+    ///
+    /// Shorthand for `Step::new(vec![Op::run_payload(payload,
+    /// vec![])], hold)`. The returned step is chainable — add
+    /// `.with_ops(...)` for more operations or use
+    /// `Op::wait_payload(name)` / `Op::kill_payload(name)` on later
+    /// steps to control the spawned child.
+    ///
+    /// Test authors who want the payload placed in a named cgroup
+    /// should use `Op::run_payload_in_cgroup` directly; this
+    /// convenience targets the common "one payload, whole step"
+    /// shape.
+    pub fn with_payload(payload: &'static crate::test_support::Payload, hold: HoldSpec) -> Self {
+        Self {
+            setup: Setup::Defs(vec![]),
+            ops: vec![Op::run_payload(payload, vec![])],
+            hold,
+        }
+    }
 }
 
 /// How a step advances after its ops are applied. `Frac` and `Fixed`
@@ -489,6 +552,9 @@ impl Op {
             Op::SetAffinity { .. } => 7,
             Op::SpawnHost { .. } => 8,
             Op::MoveAllTasks { .. } => 9,
+            Op::RunPayload { .. } => 10,
+            Op::WaitPayload { .. } => 11,
+            Op::KillPayload { .. } => 12,
         }
     }
 
@@ -564,6 +630,46 @@ impl Op {
             from: from.into(),
             to: to.into(),
         }
+    }
+
+    /// Spawn a [`Payload`](crate::test_support::Payload) binary in the
+    /// background. `args` is appended to `payload.default_args`.
+    /// Placement is inherited from the caller; use
+    /// [`run_payload_in_cgroup`](Self::run_payload_in_cgroup) to put
+    /// the child into a named cgroup.
+    pub fn run_payload(payload: &'static crate::test_support::Payload, args: Vec<String>) -> Self {
+        Op::RunPayload {
+            payload,
+            args,
+            cgroup: None,
+        }
+    }
+
+    /// Spawn a [`Payload`](crate::test_support::Payload) in the
+    /// background and place the child in a cgroup (relative to the
+    /// scenario's parent cgroup).
+    pub fn run_payload_in_cgroup(
+        payload: &'static crate::test_support::Payload,
+        args: Vec<String>,
+        cgroup: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Op::RunPayload {
+            payload,
+            args,
+            cgroup: Some(cgroup.into()),
+        }
+    }
+
+    /// Block until the payload named `name` exits, evaluate checks,
+    /// and record metrics.
+    pub fn wait_payload(name: impl Into<Cow<'static, str>>) -> Self {
+        Op::WaitPayload { name: name.into() }
+    }
+
+    /// SIGKILL the payload named `name`, evaluate checks, and record
+    /// metrics.
+    pub fn kill_payload(name: impl Into<Cow<'static, str>>) -> Self {
+        Op::KillPayload { name: name.into() }
     }
 }
 
@@ -1402,6 +1508,84 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                     }
                 }
             }
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => {
+                if payload.is_scheduler() {
+                    anyhow::bail!(
+                        "Op::RunPayload called with scheduler-kind Payload ('{}'); \
+                         only PayloadKind::Binary payloads can be spawned by step ops",
+                        payload.name,
+                    );
+                }
+                if state
+                    .payload_handles
+                    .iter()
+                    .any(|(_, h)| h.payload_name() == payload.name)
+                {
+                    anyhow::bail!(
+                        "Op::RunPayload: payload '{}' already running — \
+                         WaitPayload/KillPayload it before spawning another with the same name",
+                        payload.name,
+                    );
+                }
+                let mut run = crate::scenario::payload_run::PayloadRun::new(ctx, payload);
+                if !args.is_empty() {
+                    run = run.args(args.iter().cloned());
+                }
+                let cgroup_key = match cgroup {
+                    Some(c) => {
+                        run = run.in_cgroup(c.clone());
+                        c.to_string()
+                    }
+                    None => String::new(),
+                };
+                let handle = run.spawn().with_context(|| {
+                    format!(
+                        "Op::RunPayload: spawn payload '{}' in cgroup '{}'",
+                        payload.name, cgroup_key,
+                    )
+                })?;
+                state.payload_handles.push((cgroup_key, handle));
+            }
+            Op::WaitPayload { name } => {
+                let idx = state
+                    .payload_handles
+                    .iter()
+                    .position(|(_, h)| h.payload_name() == name.as_ref())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Op::WaitPayload: no running payload named '{name}' \
+                             (spawn it via Op::RunPayload or CgroupDef::workload before waiting)",
+                        )
+                    })?;
+                let (_, handle) = state.payload_handles.swap_remove(idx);
+                // Check verdicts + metrics are recorded to the sidecar
+                // via the SHM ring inside `handle.wait()`; the returned
+                // tuple is discarded here because step-ops surface per-
+                // payload results through the sidecar, not the ops API.
+                let _result = handle
+                    .wait()
+                    .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
+            }
+            Op::KillPayload { name } => {
+                let idx = state
+                    .payload_handles
+                    .iter()
+                    .position(|(_, h)| h.payload_name() == name.as_ref())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Op::KillPayload: no running payload named '{name}' \
+                             (spawn it via Op::RunPayload or CgroupDef::workload before killing)",
+                        )
+                    })?;
+                let (_, handle) = state.payload_handles.swap_remove(idx);
+                let _result = handle
+                    .kill()
+                    .with_context(|| format!("Op::KillPayload: kill payload '{name}'"))?;
+            }
         }
     }
     Ok(())
@@ -1632,6 +1816,15 @@ mod tests {
 
     #[test]
     fn op_discriminant_unique() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static TRUE_BIN: Payload = Payload {
+            name: "true_bin",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
         let ops: Vec<Op> = vec![
             Op::AddCgroup { name: "a".into() },
             Op::RemoveCgroup { cgroup: "a".into() },
@@ -1660,6 +1853,13 @@ mod tests {
                 from: "a".into(),
                 to: "b".into(),
             },
+            Op::RunPayload {
+                payload: &TRUE_BIN,
+                args: vec![],
+                cgroup: None,
+            },
+            Op::WaitPayload { name: "p".into() },
+            Op::KillPayload { name: "p".into() },
         ];
         let mut seen = std::collections::BTreeSet::new();
         for op in &ops {
@@ -1669,6 +1869,15 @@ mod tests {
 
     #[test]
     fn op_discriminant_values() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static TRUE_BIN: Payload = Payload {
+            name: "true_bin",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
         assert_eq!(Op::AddCgroup { name: "a".into() }.discriminant(), 0);
         assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 1);
         assert_eq!(
@@ -1686,6 +1895,17 @@ mod tests {
             .discriminant(),
             9
         );
+        assert_eq!(
+            Op::RunPayload {
+                payload: &TRUE_BIN,
+                args: vec![],
+                cgroup: None,
+            }
+            .discriminant(),
+            10,
+        );
+        assert_eq!(Op::WaitPayload { name: "p".into() }.discriminant(), 11);
+        assert_eq!(Op::KillPayload { name: "p".into() }.discriminant(), 12);
     }
 
     // -- seeded_rng tests --
@@ -3389,5 +3609,277 @@ mod tests {
 
         drain_all_payload_handles(&mut handles);
         assert!(handles.is_empty());
+    }
+
+    // -- Step::with_payload + Op::RunPayload/WaitPayload/KillPayload --
+
+    /// Step::with_payload emits a step whose ops consist of a single
+    /// Op::RunPayload carrying the supplied payload. Hold passes
+    /// through unchanged.
+    #[test]
+    fn step_with_payload_emits_runpayload_op() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let step = Step::with_payload(&FIO, HoldSpec::Fixed(Duration::from_millis(50)));
+        assert_eq!(step.ops.len(), 1);
+        match &step.ops[0] {
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => {
+                assert_eq!(payload.name, "fio");
+                assert!(args.is_empty());
+                assert!(cgroup.is_none());
+            }
+            other => panic!("expected RunPayload, got {other:?}"),
+        }
+        assert!(matches!(step.hold, HoldSpec::Fixed(d) if d == Duration::from_millis(50)));
+        assert!(matches!(&step.setup, Setup::Defs(d) if d.is_empty()));
+    }
+
+    /// Op convenience constructors — `run_payload`, `wait_payload`,
+    /// `kill_payload`, `run_payload_in_cgroup` — build the expected
+    /// enum shapes with the right field contents.
+    #[test]
+    fn op_payload_constructors_produce_expected_variants() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+
+        let op = Op::run_payload(&FIO, vec!["--warmup".into()]);
+        match op {
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => {
+                assert_eq!(payload.name, "fio");
+                assert_eq!(args, vec!["--warmup".to_string()]);
+                assert!(cgroup.is_none());
+            }
+            other => panic!("expected RunPayload, got {other:?}"),
+        }
+
+        let op = Op::run_payload_in_cgroup(&FIO, vec![], "cg_0");
+        match op {
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => {
+                assert_eq!(payload.name, "fio");
+                assert!(args.is_empty());
+                assert_eq!(cgroup.as_deref(), Some("cg_0"));
+            }
+            other => panic!("expected RunPayload, got {other:?}"),
+        }
+
+        let op = Op::wait_payload("fio");
+        assert!(matches!(op, Op::WaitPayload { ref name } if name.as_ref() == "fio"));
+
+        let op = Op::kill_payload("fio");
+        assert!(matches!(op, Op::KillPayload { ref name } if name.as_ref() == "fio"));
+    }
+
+    /// Op::RunPayload rejects scheduler-kind payloads at apply time
+    /// with an actionable error message. The existing CgroupDef
+    /// path panics at builder time; the Op path runs at scenario
+    /// time and must bail instead of panicking so one bad step in
+    /// a sequence doesn't crash the harness.
+    #[test]
+    fn apply_ops_runpayload_rejects_scheduler_kind() {
+        use crate::test_support::Payload;
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        };
+        let ops = vec![Op::RunPayload {
+            payload: &Payload::EEVDF,
+            args: vec![],
+            cgroup: None,
+        }];
+        let err = apply_ops(&ctx, &mut state, &ops).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("scheduler-kind Payload") && msg.contains("eevdf"),
+            "error must name the scheduler-kind reason AND the payload name, got: {msg}"
+        );
+        assert!(
+            state.payload_handles.is_empty(),
+            "no handle should be stored when RunPayload rejects the kind"
+        );
+    }
+
+    /// Op::WaitPayload with no matching handle surfaces a descriptive
+    /// error rather than silently no-op'ing. Ditto KillPayload. A
+    /// silent no-op would let test authors wait for ghosts and pass
+    /// scenarios that never ran what they claim.
+    #[test]
+    fn apply_ops_wait_unknown_payload_bails() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        };
+        let err = apply_ops(
+            &ctx,
+            &mut state,
+            &[Op::WaitPayload {
+                name: "ghost".into(),
+            }],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no running payload named 'ghost'"),
+            "error must name the missing payload, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_ops_kill_unknown_payload_bails() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        };
+        let err = apply_ops(
+            &ctx,
+            &mut state,
+            &[Op::KillPayload {
+                name: "ghost".into(),
+            }],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no running payload named 'ghost'"),
+            "error must name the missing payload, got: {msg}"
+        );
+    }
+
+    /// End-to-end on a real payload binary: Op::RunPayload spawns
+    /// a long-running `/bin/sleep`, Op::KillPayload matches by
+    /// payload.name and consumes the handle. The handle should
+    /// disappear from state.payload_handles so later teardown
+    /// drains don't double-consume.
+    #[test]
+    fn apply_ops_run_then_kill_consumes_handle() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            // Name distinct from binary so the payload_name lookup
+            // path is exercised against a non-basename key.
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        };
+        apply_ops(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["3600".into()])],
+        )
+        .expect("spawn /bin/sleep");
+        assert_eq!(state.payload_handles.len(), 1, "one payload is live");
+        assert_eq!(state.payload_handles[0].1.payload_name(), "sleeper");
+
+        apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("kill the live payload");
+        assert!(
+            state.payload_handles.is_empty(),
+            "handle must be consumed by KillPayload"
+        );
+    }
+
+    /// Spawning a second payload with the same name while the first
+    /// is still live is a caller bug — the `WaitPayload`/
+    /// `KillPayload` lookup would hit the first match and leave the
+    /// second leaked. Reject at RunPayload time.
+    #[test]
+    fn apply_ops_run_duplicate_payload_name_bails() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState {
+            cgroups: CgroupGroup::new(&mock),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        };
+        apply_ops(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["3600".into()])],
+        )
+        .expect("first spawn");
+
+        let err = apply_ops(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["3600".into()])],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("payload 'sleeper' already running"),
+            "error must flag the duplicate, got: {msg}"
+        );
+        assert_eq!(
+            state.payload_handles.len(),
+            1,
+            "second spawn must not add a handle on failure"
+        );
+
+        // Clean up the live handle so the test process doesn't leak
+        // a /bin/sleep.
+        apply_ops(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
     }
 }
