@@ -3281,6 +3281,8 @@ impl KtstrVm {
 
 #[cfg(target_arch = "aarch64")]
 impl KtstrVm {
+    /// Allocate and register guest memory regions for aarch64, including
+    /// NUMA-aware placement.
     fn setup_memory_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,

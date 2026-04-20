@@ -171,8 +171,9 @@ impl VcpuStatsReader {
     }
 }
 
-/// Holds pre-opened stats readers for all vCPUs. Opened before vCPUs
-/// move to threads; read after VM exit to capture cumulative totals.
+/// Holds pre-opened stats readers for all vCPUs. Read after VM exit
+/// to capture cumulative totals. Same lifetime constraint as
+/// [`VcpuStatsReader`] — opened before vCPU threads start.
 pub(crate) struct StatsContext {
     readers: Vec<VcpuStatsReader>,
 }

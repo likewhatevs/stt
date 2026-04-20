@@ -56,7 +56,8 @@ pub struct KernelLoadResult {
     /// 64-bit entry point as a guest physical address (kernel_load +
     /// STARTUP64_OFFSET). The guest starts executing here in long mode.
     pub entry: u64,
-    /// Setup header from the bzImage.
+    /// Setup header from the bzImage. Always `Some` when loaded from a
+    /// bzImage; the `Option` wrapper exists for future non-bzImage paths.
     pub setup_header: Option<linux_loader::loader::bootparam::setup_header>,
 }
 

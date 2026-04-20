@@ -53,7 +53,7 @@ pub struct PinningPlan {
     pub llc_indices: Vec<usize>,
     /// Held flock fds for resource reservation. Dropped when the plan
     /// (and the KtstrVm holding it) is dropped, releasing all locks.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // RAII: flock fds released on Drop, not read after construction.
     pub(crate) locks: Vec<std::os::fd::OwnedFd>,
 }
 

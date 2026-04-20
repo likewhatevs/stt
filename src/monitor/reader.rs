@@ -495,6 +495,13 @@ impl GuestMem {
 }
 
 /// Read scheduler stats from one CPU's struct rq at the given physical address.
+///
+/// Populates the core rq fields: `nr_running`, `scx_nr_running`,
+/// `local_dsq_depth`, `rq_clock`, `scx_flags`. Leaves `event_counters`,
+/// `schedstat`, `vcpu_cpu_time_ns`, and `sched_domains` as `None` —
+/// those are filled in separately by `read_event_stats`,
+/// `read_rq_schedstat`, vCPU stats collection, and sched_domain
+/// traversal respectively.
 pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets) -> CpuSnapshot {
     CpuSnapshot {
         nr_running: mem.read_u32(rq_pa, offsets.rq_nr_running),
@@ -515,6 +522,9 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
 /// Read scx event counters from one CPU's per-CPU event stats struct.
 /// On 6.18+, `pcpu_pa` points to `scx_sched_pcpu`; on 6.16-6.17, it
 /// points directly to `scx_event_stats` (`event_stats_off` = 0).
+///
+/// Version boundaries are approximate; see [`resolve_event_pcpu_pas`]
+/// for the detection logic.
 pub(crate) fn read_event_stats(
     mem: &GuestMem,
     pcpu_pa: u64,
@@ -540,6 +550,10 @@ pub(crate) fn read_event_stats(
 }
 
 /// Read schedstat fields from one CPU's struct rq at the given physical address.
+///
+/// Reads CONFIG_SCHEDSTATS counters: `run_delay` and `pcount` from the
+/// embedded `sched_info` substruct, plus `yld_count`, `sched_count`,
+/// `sched_goidle`, `ttwu_count`, and `ttwu_local` from the rq itself.
 pub(crate) fn read_rq_schedstat(mem: &GuestMem, rq_pa: u64, ss: &SchedstatOffsets) -> RqSchedstat {
     let sched_info_pa = rq_pa + ss.rq_sched_info as u64;
     RqSchedstat {
@@ -559,6 +573,11 @@ fn read_u32_array(mem: &GuestMem, pa: u64, base_offset: usize) -> [u32; CPU_MAX_
 }
 
 /// Read CONFIG_SCHEDSTATS fields from one sched_domain.
+///
+/// Each load-balance counter (`lb_*`) is a per-idle-type array with
+/// `CPU_MAX_IDLE_TYPES` u32 elements (indexed by `enum cpu_idle_type`);
+/// scalar counters (`alb_*`, `sbe_*`, `sbf_*`, `ttwu_*`) are single
+/// u32 fields on the sched_domain itself.
 fn read_sd_stats(mem: &GuestMem, sd_pa: u64, so: &SchedDomainStatsOffsets) -> SchedDomainStats {
     SchedDomainStats {
         lb_count: read_u32_array(mem, sd_pa, so.sd_lb_count),

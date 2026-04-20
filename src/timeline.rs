@@ -8,7 +8,8 @@
 //!
 //! Correlates [`StimulusEvent`]s (cgroup operations, cpuset changes)
 //! with [`MonitorSample`] windows to
-//! measure per-phase scheduler behavior degradation.
+//! measure per-phase scheduler behavior degradation. Produces
+//! [`Timeline`] entries consumed by the stats and reporting pipeline.
 
 use std::fmt;
 

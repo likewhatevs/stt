@@ -114,7 +114,7 @@ impl KtstrKvm {
     ///
     /// Sets up /dev/kvm, VM fd, vCPUs, and GICv3 — none of which depend
     /// on guest memory size. Memory is allocated later via
-    /// [`allocate_and_register_memory`].
+    /// [`Self::allocate_and_register_memory`].
     pub fn new_deferred(
         topo: Topology,
         use_hugepages: bool,

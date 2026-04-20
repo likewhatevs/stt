@@ -77,6 +77,9 @@ pub struct BtfFunc {
 
 /// Known struct types and their fields for probe output decoding.
 /// Maps struct name -> list of (field_access, output_key) pairs.
+///
+/// Field accesses use a mini-DSL: `->field` follows a pointer,
+/// `.field` reads inline, `[N]` indexes an array.
 pub const STRUCT_FIELDS: &[(&str, &[(&str, &str)])] = &[
     (
         "task_struct",
