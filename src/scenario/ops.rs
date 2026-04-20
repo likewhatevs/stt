@@ -1879,21 +1879,22 @@ fn run_scenario(
         // the error context as a detail, instead of an opaque Err
         // that discards everything.
         if let Err(err) = step_res {
-            // The Backdrop's payload handles still need `.kill()`
-            // so their metrics emit on the error path.
-            drain_all_payload_handles(&mut backdrop_state.payload_handles);
-            // Collect Backdrop-owned workload handles into the
-            // result too — the step that failed might have depended
-            // on persistent workers, and their stats still belong in
-            // the final report.
-            let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
-            result.merge(backdrop_result);
-            result.passed = false;
-            result.details.push(crate::assert::AssertDetail::new(
+            // Collect Backdrop-owned workload handles into a fresh
+            // result first, then merge the accumulated step result
+            // on top. `collect_backdrop` drains
+            // `backdrop_state.payload_handles` internally, so the
+            // backdrop-side payloads still get `.kill()` (metric
+            // emission) on the error path. Ordering mirrors the
+            // scheduler-crash path above so detail order is
+            // consistent across both Ok(failed) returns.
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            r.merge(result);
+            r.passed = false;
+            r.details.push(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Other,
                 format!("step {step_idx} failed: {err:#}"),
             ));
-            return Ok(result);
+            return Ok(r);
         }
     }
 
@@ -2238,13 +2239,20 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 state.drain_payloads_for_cgroup(cgroup);
                 state.drop_handles_for_cgroup(cgroup);
                 state.forget_cpuset(cgroup);
-                // ENOENT is expected (e.g. the cgroup was already
-                // removed by a prior op or never created under the
-                // MockCgroupOps backend) and stays silent. Any other
-                // error — EBUSY from a surviving task, EACCES from a
-                // permissions regression, etc. — gets logged so the
-                // failure shows up in test output instead of being
-                // swallowed by `let _ = `.
+                // ENOENT is expected here only as a TOCTOU outcome:
+                // `CgroupManager::remove_cgroup` first checks
+                // `p.exists()` and returns `Ok(())` when the dir is
+                // already gone, so a clean "already removed by a
+                // prior op" case never reaches this error arm. The
+                // remaining ENOENT path is the narrow race where the
+                // dir is unlinked by another process between
+                // `exists()` and `fs::remove_dir(&p)`, which is
+                // benign — the post-condition we want (no dir) still
+                // holds. Every other error — EBUSY from a surviving
+                // task, EACCES from a permissions regression, I/O
+                // errors from a broken cgroupfs mount — gets logged
+                // so the failure surfaces in test output instead of
+                // being swallowed by `let _ = `.
                 if let Err(err) = ctx.cgroups.remove_cgroup(cgroup) {
                     let is_enoent = err
                         .root_cause()
