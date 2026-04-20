@@ -425,9 +425,13 @@ pub struct StimulusPayload {
     pub op_count: u16,
     /// Bitmask of Op variant discriminants present in this step.
     pub op_kinds: u32,
-    /// Number of live cgroups after this step.
+    /// Number of live cgroups after this step: sum of step-local
+    /// cgroups (from the current Step's `CgroupDef`s + `Op`s) and
+    /// Backdrop-owned cgroups that persist across every Step.
     pub cgroup_count: u16,
-    /// Total worker handles after this step.
+    /// Total worker handles after this step: sum of step-local
+    /// workers and Backdrop-spawned workers that persist across
+    /// every Step.
     pub worker_count: u16,
     /// Sum of all workers' iteration counts at this step boundary.
     /// Read from shared MAP_SHARED counters in the step executor.

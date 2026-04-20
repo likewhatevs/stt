@@ -352,7 +352,14 @@ pub struct CgroupDef {
 
 impl CgroupDef {
     /// Create a CgroupDef with defaults (empty works, no cpuset).
-    /// Empty works means use a single default Work at execution time.
+    ///
+    /// **Worker-spawning default:** `CgroupDef::named("cg_0")` alone
+    /// still spawns workers at execution time — `apply_setup` fills
+    /// an empty `works` slice with one default [`Work`] (CpuSpin,
+    /// SCHED_NORMAL, `ctx.workers_per_cgroup` workers). To express
+    /// an empty move-target cgroup with NO workers, declare it via
+    /// [`Op::AddCgroup`] at step or Backdrop level instead of using
+    /// a `CgroupDef`.
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),

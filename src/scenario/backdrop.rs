@@ -62,14 +62,10 @@ use crate::test_support::Payload;
 /// ```no_run
 /// use ktstr::prelude::*;
 ///
-/// const BG_LOAD: Payload = Payload {
-///     name: "bg_load",
-///     kind: PayloadKind::Binary("stress-ng"),
-///     output: OutputFormat::ExitCode,
-///     default_args: &["--cpu", "2"],
-///     default_checks: &[],
-///     metrics: &[],
-/// };
+/// #[derive(Payload)]
+/// #[payload(binary = "stress-ng")]
+/// #[default_args("--cpu", "2")]
+/// struct BgLoadPayload;
 ///
 /// // Worker-bearing cgroup + empty move target + long-running payload,
 /// // all persistent for the scenario.
