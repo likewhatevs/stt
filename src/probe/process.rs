@@ -1,4 +1,14 @@
 //! Probe skeleton lifecycle: load, attach, run, collect.
+//!
+//! When the pipeline is split into two phases (see [`PhaseBInput`]):
+//! - **Phase A** attaches kprobes + the trigger + kernel fexit before
+//!   the scheduler starts; it runs under the initial skeleton load.
+//! - **Phase B** attaches fentry/fexit to the scheduler's BPF
+//!   struct_ops callbacks after the scheduler is up and BPF programs
+//!   are discoverable.
+//!
+//! In the single-phase path, all probes attach after the scheduler is
+//! up.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

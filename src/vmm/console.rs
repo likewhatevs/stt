@@ -5,6 +5,9 @@
 /// I/O at COM1 (0x3F8) and COM2 (0x2F8). On aarch64, UARTs are
 /// MMIO-mapped. COM1 carries the kernel console, COM2 carries
 /// application stdout/stderr.
+///
+/// x86_64 dispatch uses `handle_in`/`handle_out` (port I/O); aarch64
+/// dispatch uses `inner_read`/`inner_write` (MMIO offset).
 pub(crate) const COM1_BASE: u16 = 0x3F8;
 pub(crate) const COM2_BASE: u16 = 0x2F8;
 

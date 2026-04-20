@@ -485,9 +485,11 @@ impl WorkType {
 
 /// Resolve a work type with an optional override.
 ///
-/// Returns a clone of `override_wt` when `swappable` is true and the
-/// override's group size (if any) divides `num_workers`. Otherwise
-/// returns a clone of `base`.
+/// Returns a clone of `override_wt` when `swappable` is true, an
+/// override is provided, and the override's group size (if any)
+/// divides `num_workers`. Otherwise returns a clone of `base`. When
+/// `override_wt` is `None`, always returns `base` regardless of
+/// `swappable`.
 pub(crate) fn resolve_work_type(
     base: &WorkType,
     override_wt: Option<&WorkType>,
@@ -1499,6 +1501,8 @@ impl WorkloadHandle {
     }
 
     /// Signal all children to start working (after they've been moved to cgroups).
+    ///
+    /// Idempotent — subsequent calls after the first are no-ops.
     pub fn start(&mut self) {
         if self.started {
             return;
