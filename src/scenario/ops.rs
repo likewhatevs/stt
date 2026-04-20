@@ -4268,12 +4268,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         apply_setup_test(&ctx, &mut state, &[]).unwrap();
         assert!(
             mock.calls().is_empty(),
@@ -4288,12 +4283,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         let defs = vec![
             CgroupDef::named("cg_a").workers(1),
             CgroupDef::named("cg_b").workers(1),
@@ -4320,12 +4310,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
             CgroupDef::named("cg_0")
@@ -4353,12 +4338,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         // cpuset: None → inherit parent's set, apply_setup must not
         // emit a set_cpuset call.
         let defs = vec![CgroupDef::named("cg_inherit").workers(1)];
@@ -4383,12 +4363,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         // workers(2): after spawn, apply_setup must call move_tasks
         // with 2 pids.
         let defs = vec![CgroupDef::named("cg_move").workers(2)];
@@ -4428,12 +4403,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
             CgroupDef::named("cg_ordered")
@@ -4462,12 +4432,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         // Llc(99) on a 1-LLC topology is out of range; CpusetSpec::validate
         // bails after create_cgroup runs but before set_cpuset / move_tasks
         // fire.
@@ -4498,12 +4463,7 @@ mod tests {
         mock.fail_call_at(1, "set_cpuset kernel EBUSY");
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
             CgroupDef::named("cg_setfail")
@@ -4537,12 +4497,7 @@ mod tests {
             &crate::vmm::topology::Topology::new(2, 2, 4, 1),
         );
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         // cpuset = NUMA node 0 only (CPUs 0-3); mem_policy binds to
         // node 1 — must bail, no downstream spawn.
         let cpus: BTreeSet<usize> = (0..4).collect();
@@ -4780,12 +4735,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         let ops = vec![Op::RunPayload {
             payload: &Payload::EEVDF,
             args: vec![],
@@ -4812,12 +4762,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         let err = apply_ops_test(
             &ctx,
             &mut state,
@@ -4839,12 +4784,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         let err = apply_ops_test(
             &ctx,
             &mut state,
@@ -4883,12 +4823,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         apply_ops_test(
             &ctx,
             &mut state,
@@ -4925,12 +4860,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         apply_ops_test(
             &ctx,
             &mut state,
@@ -5000,12 +4930,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         // Simulate the def-owned handle directly — apply_setup pushes
         // entries with PayloadSource::CgroupDefWorkload, so construct
         // the equivalent here without invoking the real spawn path
@@ -5109,12 +5034,7 @@ mod tests {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
-        let mut state = StepState {
-            cgroups: CgroupGroup::new(&mock),
-            handles: Vec::new(),
-            cpusets: std::collections::HashMap::new(),
-            payload_handles: Vec::new(),
-        };
+        let mut state = StepState::empty(&ctx);
         apply_ops_test(
             &ctx,
             &mut state,
