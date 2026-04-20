@@ -85,7 +85,14 @@ pub enum Op {
     /// under the step's payload-handle set.
     ///
     /// Subsequent [`Op::WaitPayload`] / [`Op::KillPayload`] address
-    /// the running child by [`Payload::name`](crate::test_support::Payload::name).
+    /// the running child by the composite
+    /// (`Payload::name`, `cgroup`) key — the same payload can run
+    /// concurrently in two different cgroups without a dedup
+    /// collision, but the lookup from the waiting op must match
+    /// the pair the run op recorded. See [`Op::WaitPayload`] /
+    /// [`Op::KillPayload`] for the ambiguity rules when the
+    /// waiting op supplies only the name.
+    ///
     /// Only [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary)
     /// payloads are spawnable; scheduler-kind payloads are rejected at
     /// apply time with an actionable error.
@@ -133,11 +140,12 @@ pub enum Op {
     /// evaluate its checks and record metrics to the per-test sidecar.
     ///
     /// The target is looked up by composite key (`name`, `cgroup`).
-    /// `cgroup: None` matches the single live `name` regardless of
-    /// placement; if two or more copies of the same payload are
+    /// `cgroup: None` matches the unique live copy (whatever its
+    /// placement); if two or more copies of the same payload are
     /// live in different cgroups, the lookup bails with an
     /// "ambiguous — specify cgroup" error so the test doesn't
-    /// silently wait on the wrong one.
+    /// silently wait on the wrong one. Use
+    /// [`Op::wait_payload_in_cgroup`] to disambiguate.
     ///
     /// A consumed or unknown `(name, cgroup)` pair returns `Err`
     /// with an actionable message — test authors must not silently
@@ -822,9 +830,10 @@ impl Op {
     }
 
     /// SIGKILL the payload named `name`, evaluate checks, and record
-    /// metrics. Matches by name alone; see
-    /// [`wait_payload`](Self::wait_payload) for the ambiguity rules
-    /// and [`kill_payload_in_cgroup`](Self::kill_payload_in_cgroup)
+    /// metrics. Matches the unique live copy by name; bails on
+    /// ambiguity. See [`wait_payload`](Self::wait_payload) for the
+    /// full ambiguity rules and
+    /// [`kill_payload_in_cgroup`](Self::kill_payload_in_cgroup)
     /// for the disambiguating form.
     pub fn kill_payload(name: impl Into<Cow<'static, str>>) -> Self {
         Op::KillPayload {
@@ -1354,11 +1363,12 @@ impl<'a, 'b> ScenarioState<'a, 'b> {
             .or_else(|| self.backdrop.cpusets.get(name))
     }
 
-    /// True when a payload with the given composite key
-    /// (`payload_name`, `cgroup_key`) is live in either step-local
-    /// or backdrop state. Used for the `Op::RunPayload` duplicate
-    /// guard, which now treats "same payload in a different cgroup"
-    /// as legitimate rather than a name collision.
+    /// Returns the live payload handle matching the composite key
+    /// (`payload_name`, `cgroup_key`) from either step-local or
+    /// backdrop state, or `None` when no entry matches. Used for
+    /// the `Op::RunPayload` duplicate guard, which now treats
+    /// "same payload in a different cgroup" as legitimate rather
+    /// than a name collision.
     fn find_live_payload_with_cgroup(
         &self,
         payload_name: &str,
@@ -2444,7 +2454,14 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 });
             }
             Op::WaitPayload { name, cgroup } => {
-                let entry = take_payload_for_op(state, "Op::WaitPayload", name, cgroup.as_deref())?;
+                let entry = take_payload_for_op(
+                    state,
+                    "Op::WaitPayload",
+                    "waiting",
+                    "Op::wait_payload_in_cgroup",
+                    name,
+                    cgroup.as_deref(),
+                )?;
                 // Check verdicts + metrics are recorded to the sidecar
                 // via the SHM ring inside `handle.wait()`; the returned
                 // tuple is discarded here because step-ops surface per-
@@ -2455,7 +2472,14 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
             }
             Op::KillPayload { name, cgroup } => {
-                let entry = take_payload_for_op(state, "Op::KillPayload", name, cgroup.as_deref())?;
+                let entry = take_payload_for_op(
+                    state,
+                    "Op::KillPayload",
+                    "killing",
+                    "Op::kill_payload_in_cgroup",
+                    name,
+                    cgroup.as_deref(),
+                )?;
                 let _result = entry
                     .handle
                     .kill()
@@ -2472,11 +2496,22 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
 /// (`name`, `cgroup`). Produces the op-specific not-found /
 /// ambiguous errors so the match arms stay short.
 ///
-/// `op_tag` is the user-facing op name (e.g. `"Op::WaitPayload"`)
-/// so the error text matches the op the user actually wrote.
+/// Callers pass the static trio that shapes the error text:
+///
+/// - `op_tag` — the user-facing op name (e.g. `"Op::WaitPayload"`).
+/// - `verb_ing` — the `-ing` form of the action for "before
+///   waiting" / "before killing" prose (no trailing
+///   `to_lowercase` munging so two-word op names don't collide
+///   into one word).
+/// - `ctor_path` — the fully-qualified constructor the user
+///   should switch to on ambiguity, e.g.
+///   `"Op::wait_payload_in_cgroup"`. Copying this hint into
+///   source must produce a callable path.
 fn take_payload_for_op(
     state: &mut ScenarioState<'_, '_>,
     op_tag: &str,
+    verb_ing: &str,
+    ctor_path: &str,
     name: &str,
     cgroup: Option<&str>,
 ) -> Result<PayloadEntry> {
@@ -2485,14 +2520,12 @@ fn take_payload_for_op(
         Ok(None) => match cgroup {
             Some(c) => anyhow::bail!(
                 "{op_tag}: no running payload named '{name}' in cgroup {} \
-                 (spawn it via Op::RunPayload or CgroupDef::workload before {})",
+                 (spawn it via Op::RunPayload or CgroupDef::workload before {verb_ing})",
                 render_cgroup_key(c),
-                op_tag.strip_prefix("Op::").unwrap_or(op_tag).to_lowercase(),
             ),
             None => anyhow::bail!(
                 "{op_tag}: no running payload named '{name}' \
-                 (spawn it via Op::RunPayload or CgroupDef::workload before {})",
-                op_tag.strip_prefix("Op::").unwrap_or(op_tag).to_lowercase(),
+                 (spawn it via Op::RunPayload or CgroupDef::workload before {verb_ing})",
             ),
         },
         Err(cgroups) => {
@@ -2502,10 +2535,9 @@ fn take_payload_for_op(
             let rendered: Vec<String> = cgroups.iter().map(|c| render_cgroup_key(c)).collect();
             anyhow::bail!(
                 "{op_tag}: payload '{name}' is ambiguous — {} live copies in cgroups {} — \
-                 use {}_in_cgroup(name, cgroup) to disambiguate",
+                 use {ctor_path}(name, cgroup) to disambiguate",
                 rendered.len(),
                 rendered.join(", "),
-                op_tag.strip_prefix("Op::").unwrap_or(op_tag).to_lowercase(),
             )
         }
     }
@@ -5571,5 +5603,107 @@ mod tests {
         assert_eq!(taken.cgroup, "cg_a");
         assert!(state.payload_handles.is_empty());
         let _ = taken.handle.kill();
+    }
+
+    /// #133: the apply_ops ambiguity hint must spell the full
+    /// snake_case constructor path so a user copying the hint
+    /// into source writes something that actually compiles.
+    /// Covers both `Op::wait_payload` and `Op::kill_payload`
+    /// entry points because they route through the same helper.
+    #[test]
+    fn apply_ops_bare_wait_and_kill_ambiguity_hint_names_full_constructor() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+
+        // WaitPayload path.
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+        let err = apply_ops_test(&ctx, &mut state, &[Op::wait_payload("sleeper")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ambiguous"),
+            "wait ambiguity message must flag ambiguity, got: {msg}"
+        );
+        assert!(
+            msg.contains("Op::wait_payload_in_cgroup(name, cgroup)"),
+            "wait ambiguity hint must name the full snake_case constructor \
+             so a copy-paste into source compiles, got: {msg}"
+        );
+        drain_all_payload_handles(&mut state.payload_handles);
+
+        // KillPayload path.
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+        let err = apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Op::kill_payload_in_cgroup(name, cgroup)"),
+            "kill ambiguity hint must name the full snake_case constructor, got: {msg}"
+        );
+        drain_all_payload_handles(&mut state.payload_handles);
+    }
+
+    /// #133: the not-found arm uses `-ing` verb form ("before
+    /// waiting" / "before killing"), not the collapsed single-word
+    /// lowercase the previous implementation emitted.
+    #[test]
+    fn apply_ops_not_found_message_uses_gerund_verb() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(&ctx, &mut state, &[Op::wait_payload("ghost")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("before waiting"),
+            "wait not-found message must say 'before waiting', got: {msg}"
+        );
+        assert!(
+            !msg.contains("before waitpayload"),
+            "must not collapse 'wait payload' into 'waitpayload', got: {msg}"
+        );
+
+        let err = apply_ops_test(&ctx, &mut state, &[Op::kill_payload("ghost")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("before killing"),
+            "kill not-found message must say 'before killing', got: {msg}"
+        );
     }
 }
