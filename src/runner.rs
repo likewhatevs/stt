@@ -1,5 +1,11 @@
 //! Scenario execution engine.
 //!
+//! Primary entry point: [`Runner::run_scenarios`] takes `&[&Scenario]`
+//! and returns `Result<Vec<ScenarioResult>>` — one per (scenario, flag
+//! profile) pair, carrying pass/fail verdict, per-check details, and
+//! run metadata. [`RunConfig`] controls flag selection, duration, and
+//! verification behavior.
+//!
 //! See the [Running Tests](https://likewhatevs.github.io/ktstr/guide/running-tests.html)
 //! chapter of the guide.
 

@@ -135,6 +135,11 @@
 //! - [`test_support`] -- `#[ktstr_test]` runtime and registration
 //! - [`fetch`] -- kernel tarball and git source acquisition
 //! - [`remote_cache`] -- GitHub Actions cache integration
+//!
+//! Internal modules (not re-exported): `monitor` reads live guest
+//! state, `probe` attaches BPF probes to traced functions, `vmm`
+//! owns the KVM VM lifecycle, and `timeline` correlates stimulus
+//! events with monitor samples for phase-aligned reporting.
 
 // `#[derive(Payload)]` and `#[derive(Scheduler)]` expand into
 // `::ktstr::test_support::...` paths so downstream crates can use

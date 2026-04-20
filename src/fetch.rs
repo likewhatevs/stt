@@ -1,7 +1,9 @@
 //! Kernel source acquisition: tarball download, git clone, local tree.
 //!
-//! All source types produce a directory containing a kernel source tree
-//! ready for configuration and building.
+//! Three entry points — [`download_tarball`], [`git_clone`], and
+//! [`local_source`] — each return an [`AcquiredSource`] carrying the
+//! source directory, cache key, and metadata the caller needs to
+//! proceed to configuration and build.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
