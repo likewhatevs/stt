@@ -733,6 +733,23 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
         let _ = vmm::get_or_build_base(bin, &[], &[], false, &key)?;
     }
 
+    // Eager-conditional prefetch: if any registered test declares
+    // OutputFormat::LlmExtract, make sure the default model is in
+    // the cache before tests start. Fetch failures surface as a
+    // warning rather than a hard setup error so scheduler-only test
+    // runs remain decoupled from the model cache's availability;
+    // the LlmExtract invocation path fails loudly when the model is
+    // genuinely missing at test time.
+    match super::model::prefetch_if_required() {
+        Ok(Some(path)) => {
+            eprintln!("ktstr: model cache ready at {}", path.display());
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("ktstr: model prefetch failed ({e:#}); LlmExtract tests may fail");
+        }
+    }
+
     Ok(())
 }
 

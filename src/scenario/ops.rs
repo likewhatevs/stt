@@ -188,8 +188,9 @@ pub struct CgroupDef {
     /// work_type (applied per-Work via resolve_work_type).
     pub swappable: bool,
     /// Optional userspace [`Payload`](crate::test_support::Payload) to
-    /// launch inside this cgroup, running concurrently with any
-    /// synthetic [`Work`] groups declared above. Only
+    /// launch inside this cgroup. Spawned AFTER synthetic [`Work`]
+    /// groups so the cgroup cpuset and mempolicy settle first; runs
+    /// concurrently once started. Only
     /// [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary)
     /// payloads are accepted — scheduler-kind payloads are rejected
     /// at construction time via [`Self::workload`]. The payload is

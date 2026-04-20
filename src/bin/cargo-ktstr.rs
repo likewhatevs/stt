@@ -77,6 +77,15 @@ enum KtstrCommand {
         #[command(subcommand)]
         command: KernelCommand,
     },
+    /// Manage the LLM model cache used by `OutputFormat::LlmExtract`
+    /// payloads. `fetch` downloads the default pinned model to
+    /// `~/.cache/ktstr/models/` (respecting `KTSTR_CACHE_DIR` /
+    /// `XDG_CACHE_HOME`); `status` reports whether a verified copy
+    /// is already cached.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
     /// Collect BPF verifier statistics for a scheduler.
     ///
     /// Builds the scheduler (or uses a pre-built binary), boots a VM,
@@ -159,6 +168,17 @@ enum KtstrCommand {
         #[arg(long)]
         exec: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// Download the default pinned model and verify its SHA-256.
+    /// No-op when the cache already holds a verified copy. Respects
+    /// `KTSTR_MODEL_OFFLINE` — set to `1` to refuse network fetches.
+    Fetch,
+    /// Print the cache path for the default model and whether a
+    /// verified copy is already present.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -753,6 +773,46 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
     clap_complete::generate(shell, &mut cmd, binary, &mut std::io::stdout());
 }
 
+/// `cargo ktstr model fetch` — download + verify the default model
+/// into the user's cache. Wraps `ktstr::test_support::ensure` with a
+/// human-readable progress line; the status is printed after so
+/// users can see the final cache path regardless of whether the
+/// fetch did any work.
+fn run_model_fetch() -> Result<(), String> {
+    let spec = ktstr::test_support::DEFAULT_MODEL;
+    match ktstr::test_support::ensure(&spec) {
+        Ok(path) => {
+            println!(
+                "ktstr: model '{}' ready at {}",
+                spec.file_name,
+                path.display()
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("fetch model '{}': {e:#}", spec.file_name)),
+    }
+}
+
+/// `cargo ktstr model status` — report the cache path and whether a
+/// verified copy of the default model is already present.
+fn run_model_status() -> Result<(), String> {
+    let spec = ktstr::test_support::DEFAULT_MODEL;
+    let status = ktstr::test_support::status(&spec).map_err(|e| format!("{e:#}"))?;
+    println!("model:    {}", status.spec.file_name);
+    println!("path:     {}", status.path.display());
+    println!("cached:   {}", status.cached);
+    println!("verified: {}", status.sha_matches);
+    if !status.cached {
+        println!(
+            "(no cached copy — run `cargo ktstr model fetch` to download {} MiB)",
+            status.spec.size_bytes / 1024 / 1024
+        );
+    } else if !status.sha_matches {
+        println!("(cached file failed SHA-256 verification; re-fetch to replace it)");
+    }
+    Ok(())
+}
+
 fn main() {
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
@@ -810,6 +870,10 @@ fn main() {
             KernelCommand::Clean { keep, force } => {
                 cli::kernel_clean(keep, force).map_err(|e| format!("{e:#}"))
             }
+        },
+        KtstrCommand::Model { command } => match command {
+            ModelCommand::Fetch => run_model_fetch(),
+            ModelCommand::Status => run_model_status(),
         },
         KtstrCommand::Cleanup { parent_cgroup } => {
             cli::cleanup(parent_cgroup).map_err(|e| format!("{e:#}"))

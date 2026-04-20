@@ -88,6 +88,10 @@ rustix = { version = "1", features = ["fs", "shm", "system"] }
 # the list of variant names so `WorkType::ALL_NAMES` stays in lock-step
 # with the enum definition without a hand-maintained parallel table.
 strum = { version = "0.27", features = ["derive"] }
+# SHA-256 for verifying downloaded model-cache artifacts. `gix` pulls
+# in sha1 only; sha2 is a fresh dep and only the model-cache code
+# path needs it, so keep the feature surface minimal.
+sha2 = "0.10"
 
 [profile.release]
 lto = "thin"
