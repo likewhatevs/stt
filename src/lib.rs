@@ -283,6 +283,7 @@ pub fn cache_key_suffix() -> String {
     kconfig_hash()
 }
 
+pub use ktstr_macros::Payload;
 pub use ktstr_macros::Scheduler;
 pub use ktstr_macros::ktstr_test;
 
@@ -328,7 +329,6 @@ pub mod prelude {
     // spelling is intentional: `#[derive(Scheduler)]` generates a
     // `static` of type `Scheduler`, and matching the derive-macro
     // name to its emitted type reads naturally at the call site.
-    pub use crate::Scheduler;
     pub use crate::assert::{Assert, AssertResult};
     pub use crate::cgroup::CgroupManager;
     pub use crate::ktstr_test;
@@ -345,6 +345,7 @@ pub mod prelude {
         NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind, PayloadMetrics, Polarity,
         Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, extract_metrics,
     };
+    pub use crate::{Payload, Scheduler};
     // `FlagDecl` is already re-exported via `crate::scenario::flags::FlagDecl`
     // above; omitted here because `test_support::FlagDecl` is the same item
     // (`pub use crate::scenario::flags::FlagDecl;` in test_support/mod.rs),

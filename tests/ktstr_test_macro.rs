@@ -822,3 +822,30 @@ fn macro_defaults_leave_payload_none_workloads_empty(ctx: &Ctx) -> Result<Assert
     );
     Ok(AssertResult::pass())
 }
+
+// ---------------------------------------------------------------------------
+// #[derive(Payload)] integration with #[ktstr_test(workloads = [...])]
+// ---------------------------------------------------------------------------
+
+/// Derived const is usable as a `&'static Payload` on
+/// `#[ktstr_test(workloads = [...])]` — proves the emitted const
+/// and PayloadKind::Binary value are indeed static + const-
+/// constructible. The remaining structural derive(Payload) tests
+/// live in `tests/derive_payload_tests.rs` so they are reachable
+/// by the standard `#[test]` harness (the ctor dispatcher in this
+/// file intercepts nextest's `--list` for ktstr-registered tests
+/// and hides plain `#[test]` functions).
+#[derive(ktstr::Payload)]
+#[payload(binary = "/bin/true", name = "true")]
+#[allow(dead_code)]
+struct TruePayload;
+
+#[ktstr_test(workloads = [TRUE], host_only = true)]
+fn derive_payload_workloads_accepts_derived_const(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    let entry = ktstr::test_support::find_test("derive_payload_workloads_accepts_derived_const")
+        .expect("self-registration via #[ktstr_test]");
+    assert_eq!(entry.workloads.len(), 1);
+    assert_eq!(entry.workloads[0].name, "true");
+    Ok(AssertResult::pass())
+}

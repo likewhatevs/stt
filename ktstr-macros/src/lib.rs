@@ -1578,12 +1578,35 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     // Generate the ctor function name for --ktstr-list-flags interception.
     let list_flags_ctor = format_ident!("__ktstr_list_flags_{}", enum_upper.to_lowercase());
 
+    // Additionally emit a `Payload` const wrapping the `Scheduler`
+    // so the scheduler can be used wherever a `&'static Payload` is
+    // expected (e.g. `#[ktstr_test(workloads = [MITOSIS_PAYLOAD])]`).
+    // Naming: strip `_PAYLOAD` is the `#[derive(Payload)]` convention
+    // for binary payloads; the scheduler side appends `_PAYLOAD` so
+    // the two surfaces stay symmetric and there's no collision with
+    // the Scheduler const.
+    let payload_const_name = format_ident!("{}_PAYLOAD", const_name);
+    let sched_name_for_payload = sched_name_str;
+
     let expanded = quote! {
         #(#decl_statics)*
 
         static #flags_array_ident: &[&::ktstr::scenario::flags::FlagDecl] = &[#(#decl_refs),*];
 
         const #const_name: ::ktstr::test_support::Scheduler = #builder_chain;
+
+        /// Payload wrapper around the generated `Scheduler` const so
+        /// the scheduler is usable anywhere a `&'static Payload` is
+        /// expected (e.g. `workloads = [..]` on `#[ktstr_test]`).
+        const #payload_const_name: ::ktstr::test_support::Payload =
+            ::ktstr::test_support::Payload {
+                name: #sched_name_for_payload,
+                kind: ::ktstr::test_support::PayloadKind::Scheduler(&#const_name),
+                output: ::ktstr::test_support::OutputFormat::ExitCode,
+                default_args: &[],
+                default_checks: &[],
+                metrics: &[],
+            };
 
         impl #enum_name {
             #(#name_consts)*
@@ -1609,4 +1632,412 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     };
 
     Ok(expanded)
+}
+
+/// Derive macro that generates a `Payload` const from an annotated
+/// struct for a userspace binary workload (stress-ng, fio, and
+/// similar tools test authors compose under a scheduler).
+///
+/// # Required struct-level attributes (`#[payload(...)]`)
+///
+/// - `binary = "..."` — the binary name resolved by the guest's
+///   include-files infrastructure (required). Becomes
+///   [`PayloadKind::Binary(name)`](ktstr::test_support::PayloadKind::Binary).
+///
+/// # Optional struct-level attributes
+///
+/// - `name = "..."` — short name used in logs and sidecar records.
+///   Defaults to the binary name.
+/// - `output = Json | ExitCode | LlmExtract("hint")` — how the
+///   framework extracts metrics from the payload's stdout. The
+///   variant names match the `OutputFormat` enum and the `Polarity`
+///   kwarg grammar. Defaults to `ExitCode`. The `LlmExtract` form
+///   accepts an optional string literal focus hint appended to the
+///   default LLM prompt; bare `LlmExtract` with no parenthesized
+///   argument is a shorthand for `LlmExtract()` (no hint).
+///
+/// # Optional outer attributes
+///
+/// - `#[default_args("--a", "--b", ...)]` — variadic string
+///   literals appended to the binary's argv when the payload runs.
+///   May repeat across multiple `#[default_args(...)]` attrs; entries
+///   accumulate in source order.
+/// - `#[default_check(...)]` — one [`Check`](ktstr::test_support::Check)
+///   construction expression (e.g. `min("iops", 1000.0)`,
+///   `exit_code_eq(0)`). May repeat; entries accumulate in source
+///   order. The expression evaluates in the path context of the
+///   generated const, so `ktstr::test_support::Check::...` is
+///   unnecessary — `min(...)` resolves via the `Check::` prefix the
+///   macro inserts.
+/// - `#[metric(name = "...", polarity = ..., unit = "...")]` —
+///   kwarg form. `polarity` is one of `HigherBetter`, `LowerBetter`,
+///   `TargetValue(f64)`, `Unknown`. May repeat; entries accumulate.
+///
+/// # Const name derivation
+///
+/// Strip trailing `"Payload"` suffix (if present), then convert to
+/// `SCREAMING_SNAKE_CASE`. `FioPayload` → `FIO`,
+/// `StressNgPayload` → `STRESS_NG`, `Fio` (no suffix) → `FIO`.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use ktstr::prelude::*;
+///
+/// #[derive(Payload)]
+/// #[payload(binary = "fio", output = Json)]
+/// #[default_args("--output-format=json", "--minimal")]
+/// #[default_check(exit_code_eq(0))]
+/// #[metric(name = "jobs.0.read.iops", polarity = HigherBetter, unit = "iops")]
+/// struct FioPayload;
+/// ```
+#[proc_macro_derive(Payload, attributes(payload, default_args, default_check, metric))]
+pub fn derive_payload(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match derive_payload_inner(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let struct_name = &input.ident;
+
+    // Reject non-struct inputs; the flag-variant grammar is specific
+    // to `Scheduler` (enums) and a struct-only payload keeps the
+    // attribute space unambiguous.
+    if !matches!(&input.data, Data::Struct(_)) {
+        return Err(syn::Error::new_spanned(
+            struct_name,
+            "Payload can only be derived for structs",
+        ));
+    }
+
+    let mut binary: Option<String> = None;
+    let mut name_override: Option<String> = None;
+    // `None` means "not specified" → default ExitCode at emit time.
+    // `Some(tokens)` holds the fully-qualified OutputFormat variant
+    // the user selected (possibly with an LlmExtract hint expression).
+    let mut output_tokens: Option<proc_macro2::TokenStream> = None;
+
+    for attr in &input.attrs {
+        if !attr.path().is_ident("payload") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("binary") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                binary = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("name") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                name_override = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("output") {
+                let value = meta.value()?;
+                let expr: syn::Expr = value.parse()?;
+                output_tokens = Some(output_from_expr(&expr)?);
+                Ok(())
+            } else {
+                Err(meta.error(format!(
+                    "unknown payload attribute `{}`",
+                    meta.path
+                        .get_ident()
+                        .map(|i| i.to_string())
+                        .unwrap_or_default()
+                )))
+            }
+        })?;
+    }
+
+    let binary = binary.ok_or_else(|| {
+        syn::Error::new_spanned(struct_name, "missing `binary = \"...\"` in #[payload(...)]")
+    })?;
+
+    // Default output = ExitCode. Resolve once here to a canonical
+    // TokenStream so the emitter only has one path.
+    let output_tokens = output_tokens.unwrap_or_else(|| {
+        quote! { ::ktstr::test_support::OutputFormat::ExitCode }
+    });
+
+    // `name` falls back to `binary` when omitted.
+    let payload_name = name_override.unwrap_or_else(|| binary.clone());
+
+    // Walk outer `#[default_args(...)]` / `#[default_check(...)]` /
+    // `#[metric(...)]` attrs in source order so the emitted slices
+    // match the declaration.
+    let mut default_args: Vec<String> = Vec::new();
+    let mut default_checks: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut metrics: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    for attr in &input.attrs {
+        if attr.path().is_ident("default_args") {
+            // Variadic string literals: `#[default_args("--a", "--b")]`.
+            let parser =
+                syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated;
+            let parsed = attr.parse_args_with(parser).map_err(|e| {
+                syn::Error::new(
+                    e.span(),
+                    "default_args must be one or more string literals separated by `,`",
+                )
+            })?;
+            for lit in parsed {
+                default_args.push(lit.value());
+            }
+        } else if attr.path().is_ident("default_check") {
+            // Single Check-constructing expression; emit as
+            // `::ktstr::test_support::Check::#expr` so bare `min(...)`
+            // resolves without the user importing `Check`.
+            let expr: syn::Expr = attr.parse_args().map_err(|e| {
+                syn::Error::new(
+                    e.span(),
+                    "default_check must be a Check constructor expression (e.g. min(\"iops\", 1000.0))",
+                )
+            })?;
+            default_checks.push(quote! { ::ktstr::test_support::Check::#expr });
+        } else if attr.path().is_ident("metric") {
+            // Kwarg form: name = "...", polarity = ..., unit = "...".
+            let parsed = parse_metric_attr(attr)?;
+            metrics.push(parsed);
+        }
+    }
+
+    // Derive the const name: strip "Payload" suffix and uppercase.
+    // The suffix strip matches the derive(Scheduler) convention
+    // (strip "Flag"/"Flags") so the two macros feel consistent to
+    // test authors declaring both.
+    let struct_str = struct_name.to_string();
+    let base = struct_str.strip_suffix("Payload").unwrap_or(&struct_str);
+    if base.is_empty() {
+        return Err(syn::Error::new(
+            struct_name.span(),
+            "struct name cannot be just \"Payload\"",
+        ));
+    }
+    let const_name = format_ident!("{}", camel_to_screaming_snake(base));
+
+    let expanded = quote! {
+        const #const_name: ::ktstr::test_support::Payload = ::ktstr::test_support::Payload {
+            name: #payload_name,
+            kind: ::ktstr::test_support::PayloadKind::Binary(#binary),
+            output: #output_tokens,
+            default_args: &[#(#default_args),*],
+            default_checks: &[#(#default_checks),*],
+            metrics: &[#(#metrics),*],
+        };
+    };
+
+    Ok(expanded)
+}
+
+/// Translate the user-facing `output = ...` expression into a
+/// fully-qualified `OutputFormat` variant token stream. Accepts
+/// the variant names as they appear on the `OutputFormat` enum,
+/// so the attribute reads identically to `Polarity` below:
+///
+/// - `Json` / `ExitCode` — bare idents.
+/// - `LlmExtract` — bare ident (no hint).
+/// - `LlmExtract("hint")` — call with a single string literal.
+/// - `LlmExtract()` — call with no args (no hint).
+fn output_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
+    match expr {
+        syn::Expr::Path(ep) => {
+            let ident = ep.path.get_ident().ok_or_else(|| {
+                syn::Error::new_spanned(expr, "expected `Json`, `ExitCode`, or `LlmExtract`")
+            })?;
+            match ident.to_string().as_str() {
+                "Json" => Ok(quote! { ::ktstr::test_support::OutputFormat::Json }),
+                "ExitCode" => Ok(quote! { ::ktstr::test_support::OutputFormat::ExitCode }),
+                "LlmExtract" => {
+                    Ok(quote! { ::ktstr::test_support::OutputFormat::LlmExtract(None) })
+                }
+                other => Err(syn::Error::new_spanned(
+                    expr,
+                    format!(
+                        "unknown output format `{other}` (expected `Json`, `ExitCode`, or `LlmExtract`)"
+                    ),
+                )),
+            }
+        }
+        syn::Expr::Call(call) => {
+            // Only `LlmExtract(...)` is callable.
+            let ident = match &*call.func {
+                syn::Expr::Path(ep) => ep.path.get_ident().ok_or_else(|| {
+                    syn::Error::new_spanned(expr, "expected `LlmExtract(...)` call form")
+                })?,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        expr,
+                        "expected `LlmExtract(...)` call form",
+                    ));
+                }
+            };
+            if ident != "LlmExtract" {
+                return Err(syn::Error::new_spanned(
+                    expr,
+                    format!(
+                        "unknown output format `{ident}(...)` (only `LlmExtract(...)` takes arguments)"
+                    ),
+                ));
+            }
+            match call.args.len() {
+                0 => Ok(quote! { ::ktstr::test_support::OutputFormat::LlmExtract(None) }),
+                1 => {
+                    let arg = &call.args[0];
+                    match arg {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(ls),
+                            ..
+                        }) => {
+                            let hint = ls.value();
+                            Ok(quote! {
+                                ::ktstr::test_support::OutputFormat::LlmExtract(Some(#hint))
+                            })
+                        }
+                        _ => Err(syn::Error::new_spanned(
+                            arg,
+                            "LlmExtract argument must be a string literal hint",
+                        )),
+                    }
+                }
+                _ => Err(syn::Error::new_spanned(
+                    expr,
+                    "LlmExtract takes at most one string literal argument",
+                )),
+            }
+        }
+        _ => Err(syn::Error::new_spanned(
+            expr,
+            "output must be `Json`, `ExitCode`, `LlmExtract`, or `LlmExtract(\"hint\")`",
+        )),
+    }
+}
+
+/// Parse one `#[metric(name = "...", polarity = ..., unit = "...")]`
+/// attribute into a `MetricHint { ... }` token stream.
+///
+/// `polarity` accepts bare idents `HigherBetter`, `LowerBetter`,
+/// `Unknown`, and the call form `TargetValue(<float literal>)`. The
+/// float literal is stamped into a `Polarity::TargetValue(lit)` so
+/// the generated const is const-evaluable.
+fn parse_metric_attr(attr: &syn::Attribute) -> syn::Result<proc_macro2::TokenStream> {
+    let mut name: Option<String> = None;
+    let mut polarity: Option<proc_macro2::TokenStream> = None;
+    let mut unit: String = String::new();
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("name") {
+            let value = meta.value()?;
+            let lit: syn::LitStr = value.parse()?;
+            name = Some(lit.value());
+            Ok(())
+        } else if meta.path.is_ident("polarity") {
+            let value = meta.value()?;
+            let expr: syn::Expr = value.parse()?;
+            polarity = Some(polarity_from_expr(&expr)?);
+            Ok(())
+        } else if meta.path.is_ident("unit") {
+            let value = meta.value()?;
+            let lit: syn::LitStr = value.parse()?;
+            unit = lit.value();
+            Ok(())
+        } else {
+            Err(meta.error(format!(
+                "unknown metric attribute `{}` (expected name, polarity, unit)",
+                meta.path
+                    .get_ident()
+                    .map(|i| i.to_string())
+                    .unwrap_or_default()
+            )))
+        }
+    })?;
+    let name = name.ok_or_else(|| {
+        syn::Error::new_spanned(attr, "metric attribute is missing `name = \"...\"`")
+    })?;
+    let polarity = polarity.unwrap_or_else(|| {
+        quote! { ::ktstr::test_support::Polarity::Unknown }
+    });
+    Ok(quote! {
+        ::ktstr::test_support::MetricHint {
+            name: #name,
+            polarity: #polarity,
+            unit: #unit,
+        }
+    })
+}
+
+/// Translate the user-facing `polarity = ...` expression to a
+/// fully-qualified `Polarity` variant. Accepts the four enum
+/// variants in bare-ident form (`HigherBetter`, `LowerBetter`,
+/// `Unknown`) or as `TargetValue(<float>)`.
+fn polarity_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
+    match expr {
+        syn::Expr::Path(ep) => {
+            let ident = ep.path.get_ident().ok_or_else(|| {
+                syn::Error::new_spanned(
+                    expr,
+                    "expected `HigherBetter`, `LowerBetter`, `TargetValue(..)`, or `Unknown`",
+                )
+            })?;
+            match ident.to_string().as_str() {
+                "HigherBetter" => Ok(quote! { ::ktstr::test_support::Polarity::HigherBetter }),
+                "LowerBetter" => Ok(quote! { ::ktstr::test_support::Polarity::LowerBetter }),
+                "Unknown" => Ok(quote! { ::ktstr::test_support::Polarity::Unknown }),
+                "TargetValue" => Err(syn::Error::new_spanned(
+                    expr,
+                    "TargetValue requires a float argument: `TargetValue(42.0)`",
+                )),
+                other => Err(syn::Error::new_spanned(
+                    expr,
+                    format!("unknown polarity `{other}`"),
+                )),
+            }
+        }
+        syn::Expr::Call(call) => {
+            let ident = match &*call.func {
+                syn::Expr::Path(ep) => ep.path.get_ident().ok_or_else(|| {
+                    syn::Error::new_spanned(expr, "expected `TargetValue(<float>)`")
+                })?,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        expr,
+                        "expected `TargetValue(<float>)`",
+                    ));
+                }
+            };
+            if ident != "TargetValue" {
+                return Err(syn::Error::new_spanned(
+                    expr,
+                    format!(
+                        "unknown polarity `{ident}(...)` (only `TargetValue` takes an argument)"
+                    ),
+                ));
+            }
+            if call.args.len() != 1 {
+                return Err(syn::Error::new_spanned(
+                    expr,
+                    "TargetValue takes exactly one float literal argument",
+                ));
+            }
+            let arg = &call.args[0];
+            let lit = match arg {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Float(lf),
+                    ..
+                }) => lf,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        arg,
+                        "TargetValue argument must be a float literal (e.g. 42.0)",
+                    ));
+                }
+            };
+            Ok(quote! { ::ktstr::test_support::Polarity::TargetValue(#lit) })
+        }
+        _ => Err(syn::Error::new_spanned(
+            expr,
+            "polarity must be HigherBetter, LowerBetter, TargetValue(<float>), or Unknown",
+        )),
+    }
 }

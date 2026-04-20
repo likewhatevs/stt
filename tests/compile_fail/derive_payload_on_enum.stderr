@@ -1,0 +1,5 @@
+error: Payload can only be derived for structs
+ --> tests/compile_fail/derive_payload_on_enum.rs:6:6
+  |
+6 | enum NotAStruct {
+  |      ^^^^^^^^^^

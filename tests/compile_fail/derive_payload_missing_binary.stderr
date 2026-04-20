@@ -1,0 +1,5 @@
+error: missing `binary = "..."` in #[payload(...)]
+ --> tests/compile_fail/derive_payload_missing_binary.rs:6:8
+  |
+6 | struct NoBinaryPayload;
+  |        ^^^^^^^^^^^^^^^

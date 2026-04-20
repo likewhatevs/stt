@@ -1,0 +1,5 @@
+error: unknown output format `yaml` (expected `Json`, `ExitCode`, or `LlmExtract`)
+ --> tests/compile_fail/derive_payload_unknown_output.rs:4:34
+  |
+4 | #[payload(binary = "x", output = yaml)]
+  |                                  ^^^^
