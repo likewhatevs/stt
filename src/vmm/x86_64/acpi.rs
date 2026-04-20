@@ -802,6 +802,7 @@ fn write_hmat(
 /// Determine whether a given APIC ID should use x2APIC (type 9) or
 /// Local APIC (type 0). APIC ID < 255 uses type 0, >= 255 uses type 9.
 fn use_x2apic_entry(apic_id: u32) -> bool {
+    // 255 = MAX_XAPIC_ID + 1; matches the split_irqchip threshold in kvm.rs.
     apic_id >= 255
 }
 

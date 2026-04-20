@@ -66,6 +66,8 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, topo: &Topology) -> Result<()> {
     for cpu_id in 0..num_cpus {
         // MP table spec uses 8-bit APIC IDs. For topologies with IDs > 255,
         // the kernel uses ACPI MADT (which handles x2APIC) as authoritative.
+        // APIC IDs are truncated to u8 here — intentional because MADT takes
+        // precedence for large topologies.
         let apic_id = apic_id(topo, cpu_id) as u8;
         let mut entry = [0u8; 20];
         entry[0] = MP_PROCESSOR;
