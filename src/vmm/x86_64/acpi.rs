@@ -92,6 +92,7 @@ impl SdtHeader {
                 id
             },
             oem_revision: 1,
+            // 4-byte creator_id field; KTSR is the 4-byte prefix of KTSTR.
             creator_id: *b"KTSR",
             creator_revision: 1,
             ..Default::default()

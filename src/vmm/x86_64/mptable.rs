@@ -141,7 +141,9 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, topo: &Topology) -> Result<()> {
     header[4..6].copy_from_slice(&total_len.to_le_bytes());
     header[6] = 4; // spec revision
     // checksum at [7] — computed last
+    // MP spec OEM ID: 8 bytes, space-padded (vs ACPI's 6-byte null-terminated).
     header[8..16].copy_from_slice(b"KTSTR   "); // OEM ID
+    // Product ID: 12-byte field; zeroed (no product identifier assigned).
     header[16..28].copy_from_slice(b"000000000000"); // product ID
     // OEM table pointer [28..32] = 0
     // OEM table size [32..34] = 0
