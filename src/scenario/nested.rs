@@ -22,7 +22,7 @@ pub fn custom_nested_cgroup_steady(ctx: &Ctx) -> Result<AssertResult> {
             ],
             HoldSpec::Fixed(Duration::from_secs(2) + ctx.duration),
         )
-        .with_ops(vec![
+        .set_ops(vec![
             Op::add_cgroup("cg_0"),
             Op::add_cgroup("cg_1"),
             Op::add_cgroup("cg_1/sub_a"),
@@ -144,7 +144,7 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
             ],
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )
-        .with_ops(vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")]),
+        .set_ops(vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")]),
     ];
 
     execute_steps(ctx, steps)
@@ -160,7 +160,7 @@ pub fn custom_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
             ],
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )
-        .with_ops(vec![
+        .set_ops(vec![
             Op::add_cgroup("cg_0"),
             Op::add_cgroup("cg_0/sub_a"),
             Op::add_cgroup("cg_1"),

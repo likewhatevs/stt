@@ -154,6 +154,16 @@ impl Backdrop {
         self
     }
 
+    /// Append several persistent binary payloads at once. See
+    /// [`Self::with_payload`] for the spawn-order and argument
+    /// contract — every element follows the same no-custom-args
+    /// rule, so pass `with_op(Op::run_payload(..))` entries via
+    /// [`Self::with_ops`] when per-payload args are required.
+    pub fn with_payloads<I: IntoIterator<Item = &'static Payload>>(mut self, payloads: I) -> Self {
+        self.payloads.extend(payloads);
+        self
+    }
+
     /// Append a raw [`Op`] to run during Backdrop setup. Typical
     /// use: `Op::AddCgroup { .. }` to create empty move-target
     /// cgroups that persist for the scenario but never spawn
@@ -241,6 +251,22 @@ mod tests {
         assert_eq!(b.payloads.len(), 1);
         assert_eq!(b.payloads[0].name, "test_bin");
         assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn with_payloads_extends_in_order() {
+        let b = Backdrop::new().with_payloads([&TEST_PAYLOAD, &TEST_PAYLOAD]);
+        assert_eq!(b.payloads.len(), 2);
+        assert_eq!(b.payloads[0].name, "test_bin");
+        assert_eq!(b.payloads[1].name, "test_bin");
+    }
+
+    #[test]
+    fn with_payloads_appends_after_with_payload() {
+        let b = Backdrop::new()
+            .with_payload(&TEST_PAYLOAD)
+            .with_payloads([&TEST_PAYLOAD]);
+        assert_eq!(b.payloads.len(), 2);
     }
 
     #[test]

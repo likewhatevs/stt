@@ -585,7 +585,7 @@ impl Step {
     /// Create a step with CgroupDef setup and a hold period.
     ///
     /// Most steps only need cgroup definitions and a hold duration.
-    /// Use [`with_ops`](Step::with_ops) to chain ops onto the step.
+    /// Use [`set_ops`](Step::set_ops) to chain ops onto the step.
     pub fn with_defs(defs: Vec<CgroupDef>, hold: HoldSpec) -> Self {
         Self {
             setup: Setup::Defs(defs),
@@ -595,7 +595,13 @@ impl Step {
     }
 
     /// Replace the ops for a step, consuming and returning it.
-    pub fn with_ops(mut self, ops: Vec<Op>) -> Self {
+    ///
+    /// Named `set_ops` rather than `with_ops` because the semantics
+    /// are REPLACE, not EXTEND — contrast
+    /// [`Backdrop::with_ops`](crate::scenario::backdrop::Backdrop::with_ops),
+    /// which appends. A chained `Step::new(ops).set_ops(more)`
+    /// drops `ops` and keeps only `more`.
+    pub fn set_ops(mut self, ops: Vec<Op>) -> Self {
         self.ops = ops;
         self
     }
@@ -606,7 +612,8 @@ impl Step {
     ///
     /// Shorthand for `Step::new(vec![Op::run_payload(payload,
     /// vec![])], hold)`. The returned step is chainable — add
-    /// `.with_ops(...)` for more operations or use
+    /// `.set_ops(...)` to replace the ops vec (note the
+    /// REPLACE-not-EXTEND semantics), or use
     /// `Op::wait_payload(name)` / `Op::kill_payload(name)` on later
     /// steps to control the spawned child.
     ///
@@ -3682,7 +3689,7 @@ mod tests {
 
     #[test]
     fn step_with_defs_then_ops() {
-        let step = Step::with_defs(vec![CgroupDef::named("cg_0")], HoldSpec::FULL).with_ops(vec![
+        let step = Step::with_defs(vec![CgroupDef::named("cg_0")], HoldSpec::FULL).set_ops(vec![
             Op::AddCgroup {
                 name: "cg_1".into(),
             },
@@ -3692,12 +3699,12 @@ mod tests {
     }
 
     #[test]
-    fn step_with_ops_replaces() {
+    fn step_set_ops_replaces() {
         let step = Step::new(
             vec![Op::AddCgroup { name: "a".into() }],
             HoldSpec::Frac(0.5),
         )
-        .with_ops(vec![
+        .set_ops(vec![
             Op::AddCgroup { name: "b".into() },
             Op::RemoveCgroup { cgroup: "c".into() },
         ]);

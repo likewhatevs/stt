@@ -12,7 +12,7 @@ fn host_cgroup_contention_steps(ctx: &Ctx) -> Vec<Step> {
             vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )
-        .with_ops(vec![Op::spawn_host(
+        .set_ops(vec![Op::spawn_host(
             Work::default().workers(ctx.topo.total_cpus()),
         )]),
     ]

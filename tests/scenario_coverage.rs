@@ -501,7 +501,7 @@ fn cover_op_move_all_tasks(ctx: &Ctx) -> Result<AssertResult> {
             ],
             HoldSpec::Fixed(std::time::Duration::from_secs(2)),
         )
-        .with_ops(vec![Op::add_cgroup("cg_dst")]),
+        .set_ops(vec![Op::add_cgroup("cg_dst")]),
         Step::new(
             vec![Op::move_all_tasks("cg_src", "cg_dst")],
             HoldSpec::Fixed(std::time::Duration::from_secs(3)),
@@ -519,7 +519,7 @@ fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
             vec![CgroupDef::named("cg_0").workers(2)],
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )
-        .with_ops(vec![Op::spawn_host(
+        .set_ops(vec![Op::spawn_host(
             Work::default().workers(2).work_type(WorkType::CpuSpin),
         )]),
     ];
