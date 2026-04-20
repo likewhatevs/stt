@@ -1579,12 +1579,17 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     let list_flags_ctor = format_ident!("__ktstr_list_flags_{}", enum_upper.to_lowercase());
 
     // Additionally emit a `Payload` const wrapping the `Scheduler`
-    // so the scheduler can be used wherever a `&'static Payload` is
-    // expected (e.g. `#[ktstr_test(workloads = [MITOSIS_PAYLOAD])]`).
-    // Naming: strip `_PAYLOAD` is the `#[derive(Payload)]` convention
-    // for binary payloads; the scheduler side appends `_PAYLOAD` so
-    // the two surfaces stay symmetric and there's no collision with
-    // the Scheduler const.
+    // so the scheduler is usable in the entry's scheduler slot once
+    // the `&Payload` migration lands (WO-162-K), and in compositions
+    // that need a `Payload` reference without calling `.run()`.
+    // Scheduler-kind Payloads in `workloads = [..]` would fail at
+    // `ctx.payload(p).run()` — those slots are binary-only — so the
+    // example is deliberately not about `workloads`.
+    //
+    // Naming: `#[derive(Payload)]` strips the `Payload` suffix from
+    // the struct name; the scheduler side appends `_PAYLOAD` so the
+    // two surfaces stay symmetric and there's no collision with the
+    // Scheduler const.
     let payload_const_name = format_ident!("{}_PAYLOAD", const_name);
     let sched_name_for_payload = sched_name_str;
 
@@ -1596,8 +1601,13 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
         const #const_name: ::ktstr::test_support::Scheduler = #builder_chain;
 
         /// Payload wrapper around the generated `Scheduler` const so
-        /// the scheduler is usable anywhere a `&'static Payload` is
-        /// expected (e.g. `workloads = [..]` on `#[ktstr_test]`).
+        /// the scheduler is usable wherever a `&'static Payload` is
+        /// expected without calling `.run()` — chiefly the entry's
+        /// scheduler slot after the `&Payload` migration (WO-162-K),
+        /// plus any composition site that takes a `&'static Payload`
+        /// reference. Scheduler-kind Payloads are rejected at
+        /// `ctx.payload(p).run()`, so this wrapper is intentionally
+        /// not meant for `workloads = [..]` (which is binary-only).
         const #payload_const_name: ::ktstr::test_support::Payload =
             ::ktstr::test_support::Payload {
                 name: #sched_name_for_payload,

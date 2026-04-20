@@ -187,6 +187,15 @@ pub struct CgroupDef {
     /// When true, the gauntlet work_type override replaces each Work's
     /// work_type (applied per-Work via resolve_work_type).
     pub swappable: bool,
+    /// Optional userspace [`Payload`](crate::test_support::Payload) to
+    /// launch inside this cgroup, running concurrently with any
+    /// synthetic [`Work`] groups declared above. Only
+    /// [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary)
+    /// payloads are accepted — scheduler-kind payloads are rejected
+    /// at construction time via [`Self::workload`]. The payload is
+    /// killed at step-teardown (before cgroup removal) so the cgroup
+    /// removal does not fail with EBUSY.
+    pub payload: Option<&'static crate::test_support::Payload>,
 }
 
 impl CgroupDef {
@@ -267,6 +276,30 @@ impl CgroupDef {
         self.swappable = swappable;
         self
     }
+
+    /// Attach a userspace payload binary that runs inside this cgroup
+    /// alongside any synthetic [`Work`] groups. The payload spawns
+    /// when the step enters `apply_setup` and is killed during
+    /// step-teardown so the cgroup can be removed cleanly.
+    ///
+    /// Only
+    /// [`PayloadKind::Binary`](crate::test_support::PayloadKind::Binary)
+    /// payloads are accepted; passing a scheduler-kind
+    /// [`Payload`](crate::test_support::Payload) panics with an
+    /// actionable message. The panic fires at declaration time
+    /// (rather than deferring to run time) so misuse surfaces
+    /// immediately without requiring a VM boot.
+    pub fn workload(mut self, p: &'static crate::test_support::Payload) -> Self {
+        assert!(
+            !p.is_scheduler(),
+            "CgroupDef::workload called with a scheduler-kind Payload ({}); \
+             CgroupDef.workload is for userspace binary payloads only. \
+             Use #[ktstr_test(scheduler = ...)] for scheduler placement.",
+            p.name,
+        );
+        self.payload = Some(p);
+        self
+    }
 }
 
 impl Default for CgroupDef {
@@ -276,6 +309,7 @@ impl Default for CgroupDef {
             cpuset: None,
             works: vec![],
             swappable: false,
+            payload: None,
         }
     }
 }
@@ -894,6 +928,11 @@ struct StepState<'a> {
     handles: Vec<(String, WorkloadHandle)>,
     /// Resolved cpusets per cgroup name, for isolation checks.
     cpusets: std::collections::HashMap<String, BTreeSet<usize>>,
+    /// Active payload-binary handles keyed by cgroup name. Each entry
+    /// came from a [`CgroupDef::workload`] spawn in `apply_setup` and
+    /// is killed during step-teardown / cgroup removal so cgroupfs
+    /// cleanup never trips EBUSY on a live process.
+    payload_handles: Vec<(String, crate::scenario::payload_run::PayloadHandle)>,
 }
 
 /// Execute a single step with CgroupDefs that hold for the full duration.
@@ -934,6 +973,7 @@ pub fn execute_steps_with(
         cgroups: CgroupGroup::new(ctx.cgroups),
         handles: Vec::new(),
         cpusets: std::collections::HashMap::new(),
+        payload_handles: Vec::new(),
     };
 
     // Open SHM once for the entire step sequence. No-op outside a VM.
@@ -1173,6 +1213,27 @@ fn apply_setup(ctx: &Ctx, state: &mut StepState<'_>, defs: &[CgroupDef]) -> Resu
             h.start();
             state.handles.push((def.name.to_string(), h));
         }
+        // After synthetic workers are in place, spawn the optional
+        // userspace payload inside the same cgroup. The payload runs
+        // concurrently with the Work groups; its metrics are recorded
+        // to the sidecar via the guest-to-host SHM ring when the
+        // handle is killed at step-teardown. Spawning after the Work
+        // handles lets the cgroup cpuset + mempolicy settle first so
+        // the binary inherits a stable placement.
+        if let Some(payload) = def.payload {
+            let handle = crate::scenario::payload_run::PayloadRun::new(ctx, payload)
+                .in_cgroup(def.name.clone())
+                .spawn()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "cgroup '{}': spawn payload '{}': {:#}",
+                        def.name,
+                        payload.name,
+                        e,
+                    )
+                })?;
+            state.payload_handles.push((def.name.to_string(), handle));
+        }
     }
     Ok(())
 }
@@ -1185,7 +1246,11 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 state.cgroups.add_cgroup_no_cpuset(name)?;
             }
             Op::RemoveCgroup { cgroup } => {
-                // Stop workers in this cgroup first.
+                // Stop workers + payload binaries in this cgroup
+                // before the cgroupfs removal. A live process in the
+                // cgroup makes `rmdir` fail with EBUSY; kill the
+                // payload handles first so the cgroup frees up.
+                drain_payload_handles_for_cgroup(&mut state.payload_handles, cgroup);
                 state.handles.retain(|(n, _)| n.as_str() != *cgroup);
                 state.cpusets.remove(cgroup.as_ref());
                 let _ = ctx.cgroups.remove_cgroup(cgroup);
@@ -1244,6 +1309,7 @@ fn apply_ops(ctx: &Ctx, state: &mut StepState<'_>, ops: &[Op]) -> Result<()> {
                 state.handles.push((cgroup.to_string(), h));
             }
             Op::StopCgroup { cgroup } => {
+                drain_payload_handles_for_cgroup(&mut state.payload_handles, cgroup);
                 state.handles.retain(|(n, _)| n.as_str() != *cgroup);
             }
             Op::SetAffinity { cgroup, affinity } => {
@@ -1363,6 +1429,11 @@ fn collect_result(
     checks: &crate::assert::Assert,
     topo: &crate::topology::TestTopology,
 ) -> AssertResult {
+    // Kill any CgroupDef::workload payload binaries still live at
+    // teardown so cgroupfs cleanup does not trip EBUSY. Metrics are
+    // still emitted to the SHM ring by PayloadHandle::kill via the
+    // `evaluate()` pipeline wired in #18.
+    drain_all_payload_handles(&mut state.payload_handles);
     let handles = std::mem::take(&mut state.handles);
     super::collect_handles(
         handles
@@ -1371,6 +1442,42 @@ fn collect_result(
         checks,
         Some(topo),
     )
+}
+
+/// Kill every payload handle whose cgroup matches `cgroup` and drop
+/// the matched entries from `handles`. Runs before the cgroup is
+/// removed or stopped; failures are logged to stderr but do not
+/// propagate — the cgroup removal is best-effort already, and the
+/// payload-kill failure is never the primary error.
+fn drain_payload_handles_for_cgroup(
+    handles: &mut Vec<(String, crate::scenario::payload_run::PayloadHandle)>,
+    cgroup: &str,
+) {
+    let mut i = 0;
+    while i < handles.len() {
+        if handles[i].0.as_str() == cgroup {
+            let (_, handle) = handles.swap_remove(i);
+            if let Err(e) = handle.kill() {
+                eprintln!("ktstr: kill payload in cgroup '{cgroup}': {e:#}");
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Kill every payload handle regardless of cgroup and clear the
+/// vector. Called at step-sequence teardown so every handle gets a
+/// terminal `.kill()` (and therefore a sidecar metric emission) even
+/// when no explicit `RemoveCgroup`/`StopCgroup` op targeted it.
+fn drain_all_payload_handles(
+    handles: &mut Vec<(String, crate::scenario::payload_run::PayloadHandle)>,
+) {
+    for (cgroup, handle) in handles.drain(..) {
+        if let Err(e) = handle.kill() {
+            eprintln!("ktstr: teardown kill payload in cgroup '{cgroup}': {e:#}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2899,6 +3006,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         apply_setup(&ctx, &mut state, &[]).unwrap();
         assert!(
@@ -2918,6 +3026,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         let defs = vec![
             CgroupDef::named("cg_a").workers(1),
@@ -2949,6 +3058,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
@@ -2981,6 +3091,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         // cpuset: None → inherit parent's set, apply_setup must not
         // emit a set_cpuset call.
@@ -3010,6 +3121,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         // workers(2): after spawn, apply_setup must call move_tasks
         // with 2 pids.
@@ -3054,6 +3166,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
@@ -3087,6 +3200,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         // Llc(99) on a 1-LLC topology is out of range; CpusetSpec::validate
         // bails after create_cgroup runs but before set_cpuset / move_tasks
@@ -3122,6 +3236,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
         let defs = vec![
@@ -3160,6 +3275,7 @@ mod tests {
             cgroups: CgroupGroup::new(&mock),
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
         };
         // cpuset = NUMA node 0 only (CPUs 0-3); mem_policy binds to
         // node 1 — must bail, no downstream spawn.
@@ -3189,5 +3305,88 @@ mod tests {
             "mempolicy validation must bail before spawn, got: {calls:?}"
         );
         cleanup_state(&mut state);
+    }
+
+    // -- CgroupDef::workload --
+
+    /// Default CgroupDef has no payload attached — every test that
+    /// doesn't opt in stays Payload-free so the synthetic-workload
+    /// path is unaffected.
+    #[test]
+    fn cgroup_def_default_payload_is_none() {
+        let def = CgroupDef::named("cg_0");
+        assert!(def.payload.is_none());
+    }
+
+    /// The `.workload(&FIO)` builder stores the reference on the
+    /// CgroupDef so apply_setup can spawn it. Because `Payload` is
+    /// `Copy`, the builder preserves identity through pointer
+    /// equality after conversion to `&'static` refs.
+    #[test]
+    fn cgroup_def_workload_stores_payload() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let def = CgroupDef::named("cg_0").workload(&FIO);
+        let p = def.payload.expect("workload was attached");
+        assert_eq!(p.name, "fio");
+        assert!(!p.is_scheduler());
+    }
+
+    /// Scheduler-kind payloads are rejected at builder time — the
+    /// `workload` slot is exclusively for userspace binaries that
+    /// run *under* a scheduler, not for scheduler placement itself.
+    #[test]
+    #[should_panic(expected = "CgroupDef::workload called with a scheduler-kind Payload")]
+    fn cgroup_def_workload_rejects_scheduler_kind_payload() {
+        use crate::test_support::Payload;
+        let _ = CgroupDef::named("cg_0").workload(&Payload::EEVDF);
+    }
+
+    /// The drain helper kills + removes entries whose cgroup name
+    /// matches the target. Non-matching entries stay in the vector
+    /// so subsequent step teardown / final collect_result kills
+    /// them in turn.
+    #[test]
+    fn drain_payload_handles_for_cgroup_removes_matching_only() {
+        use crate::cgroup::CgroupManager;
+        use crate::scenario::payload_run::PayloadRun;
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        use crate::topology::TestTopology;
+
+        static TRUE_BIN: Payload = Payload {
+            name: "true_bin",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        };
+
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
+
+        let h_a = PayloadRun::new(&ctx, &TRUE_BIN)
+            .spawn()
+            .expect("spawn /bin/true for cg_a");
+        let h_b = PayloadRun::new(&ctx, &TRUE_BIN)
+            .spawn()
+            .expect("spawn /bin/true for cg_b");
+
+        let mut handles = vec![("cg_a".to_string(), h_a), ("cg_b".to_string(), h_b)];
+        drain_payload_handles_for_cgroup(&mut handles, "cg_a");
+
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].0, "cg_b");
+
+        drain_all_payload_handles(&mut handles);
+        assert!(handles.is_empty());
     }
 }
