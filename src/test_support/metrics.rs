@@ -10,11 +10,14 @@
 //! pass/fail is handled by the [`Check::ExitCodeEq`] pre-pass
 //! elsewhere.
 //!
-//! [`OutputFormat::LlmExtract`] returns an empty metric set from
-//! [`extract_metrics`] today; the forthcoming model module will call
-//! [`walk_json_leaves`] directly on the model's JSON output with the
-//! source pre-tagged to [`MetricSource::LlmExtract`], keeping a
-//! single extraction pipeline across both paths.
+//! [`OutputFormat::LlmExtract`] routes stdout through
+//! [`crate::test_support::model::extract_via_llm`]: the model owns
+//! prompt composition, retry-once-on-parse-failure, and the initial
+//! JSON-from-prose parse, then feeds the resulting
+//! `serde_json::Value` into this module's
+//! [`walk_json_leaves`] with the source pre-tagged to
+//! [`MetricSource::LlmExtract`]. One extraction walker, two
+//! acquisition paths.
 
 use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 
@@ -28,19 +31,20 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 /// [`Check`](crate::test_support::Check) evaluation reports each
 /// referenced metric as missing rather than failing the whole run.
 ///
-/// [`OutputFormat::LlmExtract`] returns empty here; the forthcoming
-/// model module will call [`walk_json_leaves`] directly on the
-/// model's JSON output with the source pre-tagged to
-/// [`MetricSource::LlmExtract`].
+/// [`OutputFormat::LlmExtract(hint)`] delegates to
+/// [`crate::test_support::model::extract_via_llm`] which composes a
+/// prompt (with the optional `hint` appended), invokes the local
+/// inference backend, retries once on a JSON-parse failure, and walks
+/// the resulting JSON with [`MetricSource::LlmExtract`]. An
+/// unwired/unavailable inference backend yields an empty metric
+/// set, matching the non-fatal contract above.
 pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Vec<Metric> {
     match format {
         OutputFormat::ExitCode => Vec::new(),
         OutputFormat::Json => find_and_parse_json(stdout)
             .map(|v| walk_json_leaves(&v, MetricSource::Json))
             .unwrap_or_default(),
-        // LlmExtract returns empty here; the forthcoming model module
-        // will call walk_json_leaves directly with MetricSource::LlmExtract.
-        OutputFormat::LlmExtract(_) => Vec::new(),
+        OutputFormat::LlmExtract(hint) => super::model::extract_via_llm(stdout, *hint),
     }
 }
 
@@ -266,12 +270,32 @@ mod tests {
     }
 
     #[test]
-    fn llm_extract_returns_empty_without_model() {
-        // LlmExtract has no model wired in this module; returns empty.
-        // The model module (WO-162-L/M) invokes walk_json_leaves
-        // directly with MetricSource::LlmExtract, bypassing this
-        // fallback.
+    fn llm_extract_returns_empty_when_backend_unwired() {
+        // LlmExtract delegates to `model::extract_via_llm`, which
+        // calls `invoke_inference` — currently a stub returning
+        // `InferenceError::NotWired`. The pipeline treats that as
+        // a non-fatal extraction error and returns an empty metric
+        // set so downstream Check evaluation reports each referenced
+        // metric as missing rather than failing the whole run.
+        //
+        // Once the real backend lands (candle/llama-cpp-rs), this
+        // test flips to asserting a non-empty result against a
+        // canned prompt/response fixture. Deliberately not set up
+        // for that yet — stubbed backend + no fixture model file =
+        // empty output, which is the contracted behavior.
         let m = extract_metrics("anything", &OutputFormat::LlmExtract(None));
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn llm_extract_with_hint_still_returns_empty_unwired() {
+        // Same as above but exercising the hint-carrying variant
+        // so the dispatch path that plumbs `hint` into
+        // `extract_via_llm` is covered.
+        let m = extract_metrics(
+            "anything",
+            &OutputFormat::LlmExtract(Some("focus on latency")),
+        );
         assert!(m.is_empty());
     }
 

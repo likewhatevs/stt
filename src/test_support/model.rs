@@ -195,11 +195,25 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     // path so the subsequent rename is an atomic filesystem op
     // (same filesystem guaranteed). A tempfile in /tmp could sit on
     // a separate fs and fall back to a copy+remove under the hood.
-    let tmp = tempfile::NamedTempFile::new_in(parent)
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create tempfile in {}", parent.display()))?;
     let tmp_path = tmp.path().to_path_buf();
 
-    let response = reqwest::blocking::get(spec.url)
+    // Use an explicit Client with connect + overall timeouts rather
+    // than `reqwest::blocking::get`, which has no timeout and will
+    // hang forever on a slow or unreachable mirror. 5m overall is
+    // enough for a few-hundred-MB model download on a typical
+    // connection; 30s connect catches DNS/TLS wedges early. Tests
+    // that don't actually hit the network (offline gate, cached
+    // path) never enter this branch.
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .context("build reqwest::blocking::Client for model fetch")?;
+    let mut response = client
+        .get(spec.url)
+        .send()
         .with_context(|| format!("GET {} (download model '{}')", spec.url, spec.file_name))?;
     if !response.status().is_success() {
         anyhow::bail!(
@@ -209,11 +223,21 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
             spec.file_name,
         );
     }
-    let bytes = response
-        .bytes()
-        .with_context(|| format!("read body from {}", spec.url))?;
-    std::fs::write(&tmp_path, &bytes)
-        .with_context(|| format!("write downloaded model to {}", tmp_path.display()))?;
+    // Stream the body straight into the tempfile via `std::io::copy`
+    // so a 400 MiB model doesn't first materialize in a heap Vec.
+    // `response` implements `std::io::Read`; the tempfile handle
+    // from `NamedTempFile` implements `Write`. Previous buffer-then-
+    // write approach held the full body in memory (#116, #106).
+    {
+        use std::io::Write;
+        let file = tmp.as_file_mut();
+        let mut writer = std::io::BufWriter::new(file);
+        std::io::copy(&mut response, &mut writer)
+            .with_context(|| format!("stream body from {} to {}", spec.url, tmp_path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("flush {} after body stream", tmp_path.display()))?;
+    }
 
     if !verify_sha256(&tmp_path, spec.sha256_hex)? {
         anyhow::bail!(
@@ -337,14 +361,203 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     ensure(&DEFAULT_MODEL).map(Some)
 }
 
+// ---------------------------------------------------------------------------
+// LlmExtract runtime
+// ---------------------------------------------------------------------------
+
+/// Default prompt template prepended to every
+/// [`OutputFormat::LlmExtract`] invocation. Kept here as a const so
+/// tests can assert its exact contents (retry-semantics tests in
+/// particular pin the prompt so a silent wording drift doesn't
+/// invalidate them).
+///
+/// The wording is deliberately terse: the model's role is narrow —
+/// look at benchmark stdout, produce a single JSON object of
+/// numeric leaves. Every word that isn't load-bearing here costs
+/// context tokens on a tiny local model.
+pub(crate) const LLM_EXTRACT_PROMPT_TEMPLATE: &str = "\
+You are a benchmark-output parser. Read the following program stdout \
+and emit ONLY a single JSON object whose keys are metric names \
+(dotted paths for nested values are fine) and whose values are \
+numbers. No prose, no code fences, no commentary. If no numeric \
+metrics are present, emit `{}`.";
+
+/// Compose the full prompt sent to the inference backend for an
+/// [`OutputFormat::LlmExtract`] invocation.
+///
+/// Shape: `{TEMPLATE}\n\n{hint_line}STDOUT:\n{stdout}` — the hint is
+/// appended as its own line before the stdout block so the model
+/// sees the user-declared focus before the raw content. An empty or
+/// absent hint degrades to the bare template without leaving a
+/// dangling "Focus:" header.
+pub(crate) fn compose_prompt(stdout: &str, hint: Option<&str>) -> String {
+    let mut out = String::with_capacity(
+        LLM_EXTRACT_PROMPT_TEMPLATE.len() + stdout.len() + 64 + hint.map_or(0, |h| h.len() + 16),
+    );
+    out.push_str(LLM_EXTRACT_PROMPT_TEMPLATE);
+    out.push_str("\n\n");
+    if let Some(h) = hint
+        && !h.trim().is_empty()
+    {
+        out.push_str("Focus: ");
+        out.push_str(h.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str("STDOUT:\n");
+    out.push_str(stdout);
+    out
+}
+
+/// Errors surfaced by [`invoke_inference`]. Kept distinct from the
+/// top-level `anyhow::Error` so [`extract_via_llm`] can decide
+/// whether to retry (parse failures retry; infra failures don't).
+#[derive(Debug)]
+pub(crate) enum InferenceError {
+    /// The backend itself is not wired yet. The prompt was never
+    /// evaluated; retrying would hit the same wall and waste
+    /// wallclock.
+    NotWired,
+    /// The backend ran but failed to load the model artifact
+    /// (missing file, corrupt GGUF, etc.). Surfaces via `ensure()`
+    /// errors so test authors can tell whether the cache is stale
+    /// or the pipeline is broken.
+    ModelLoad(anyhow::Error),
+}
+
+impl std::fmt::Display for InferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InferenceError::NotWired => write!(
+                f,
+                "LlmExtract inference backend is not yet wired in this build; \
+                 set KTSTR_MODEL_OFFLINE=1 to skip, or declare OutputFormat::Json \
+                 if your payload emits structured stdout natively"
+            ),
+            InferenceError::ModelLoad(e) => write!(f, "LlmExtract model load: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for InferenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            InferenceError::NotWired => None,
+            InferenceError::ModelLoad(e) => e.source(),
+        }
+    }
+}
+
+/// Invoke the local inference backend with `prompt` and return the
+/// model's raw string output (expected to carry a JSON object per
+/// [`LLM_EXTRACT_PROMPT_TEMPLATE`]).
+///
+/// The inference backend (candle / llama-cpp-rs / similar) has not
+/// been selected yet — adding either to the initramfs would balloon
+/// the guest image and pull in a C/C++ toolchain dependency. Per
+/// the frozen #162 design, the pipeline lands ahead of the backend
+/// so downstream callers (`extract_via_llm`, `extract_metrics`)
+/// wire end-to-end; the backend lands as a follow-up that swaps
+/// this function's body.
+///
+/// `ensure(&DEFAULT_MODEL)` is still called so a misconfigured
+/// cache surfaces as `ModelLoad` rather than silently passing as
+/// "backend not wired". Tests that do not set `KTSTR_MODEL_OFFLINE`
+/// and have no cached model therefore get an actionable error
+/// naming the missing artifact.
+pub(crate) fn invoke_inference(_prompt: &str) -> std::result::Result<String, InferenceError> {
+    // Probe the cache so a missing / corrupt model surfaces clearly
+    // rather than hiding behind NotWired. A NotWired verdict must
+    // mean "backend code not yet written"; it must NOT absorb a
+    // missing-artifact error that the test author could fix.
+    if let Err(e) = ensure(&DEFAULT_MODEL) {
+        return Err(InferenceError::ModelLoad(e));
+    }
+    Err(InferenceError::NotWired)
+}
+
+/// Run the full LlmExtract pipeline against `stdout` and return the
+/// resulting metrics, all pre-tagged with
+/// [`MetricSource::LlmExtract`](super::MetricSource::LlmExtract).
+///
+/// Retry semantics: the inference call is made once; on a
+/// JSON-parse failure of the model's first response a second
+/// inference call is made with the same prompt. A second parse
+/// failure (or an infra error at any point) returns an empty
+/// metric set — matching the [`extract_metrics`] contract that
+/// extraction errors are non-fatal and the downstream
+/// [`Check`](crate::test_support::Check) evaluation reports each
+/// referenced metric as missing.
+///
+/// Inference-backend errors never retry — a `NotWired` backend
+/// cannot succeed on a second try and retrying would only burn
+/// wall time. Only JSON-parse failures get a second attempt.
+pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Metric> {
+    let prompt = compose_prompt(stdout, hint);
+
+    // First inference attempt.
+    let response = match invoke_inference(&prompt) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ktstr: LlmExtract inference failed (attempt 1): {e}");
+            return Vec::new();
+        }
+    };
+    if let Some(json) = super::metrics::find_and_parse_json(&response) {
+        return super::metrics::walk_json_leaves(&json, super::MetricSource::LlmExtract);
+    }
+
+    // Retry once — ONLY on JSON parse failure. The assumption is
+    // that a tiny local model can occasionally emit a leading
+    // preamble / code fence despite the prompt's "no prose"
+    // instruction; a second roll of the dice often lands a clean
+    // JSON response. Infra-layer failures (model missing, backend
+    // not wired) don't retry because the second call would hit the
+    // same wall.
+    eprintln!(
+        "ktstr: LlmExtract first response was not parseable JSON \
+         ({} bytes); retrying once",
+        response.len(),
+    );
+    let retry = match invoke_inference(&prompt) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ktstr: LlmExtract inference failed (attempt 2): {e}");
+            return Vec::new();
+        }
+    };
+    match super::metrics::find_and_parse_json(&retry) {
+        Some(json) => super::metrics::walk_json_leaves(&json, super::MetricSource::LlmExtract),
+        None => {
+            eprintln!(
+                "ktstr: LlmExtract retry response also not parseable JSON \
+                 ({} bytes); returning empty metric set",
+                retry.len(),
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn resolve_cache_root_honors_ktstr_cache_dir() {
-        // SAFETY: test-only, single-threaded env mutation; tests
-        // under #[cfg(test)] run serially within this module.
+        // Nextest runs tests in parallel within a binary and
+        // `std::env::set_var` is process-wide. ENV_LOCK serializes
+        // the save/mutate/restore window against every other
+        // env-touching test in this crate so concurrent runners in
+        // sidecar.rs / eval.rs don't race on KTSTR_CACHE_DIR.
+        // Poisoned-lock recovery: env tests don't establish shared
+        // invariants beyond the save/restore pair, so a panic inside
+        // the critical section is safe to unwrap through.
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: lock serializes process-wide env mutations; the
+        // save-before/restore-after window keeps other tests' state
+        // intact.
         let prev = std::env::var("KTSTR_CACHE_DIR").ok();
         unsafe { std::env::set_var("KTSTR_CACHE_DIR", "/explicit/override") };
         let root = resolve_cache_root().unwrap();
@@ -436,10 +649,16 @@ mod tests {
 
     #[test]
     fn ensure_in_offline_mode_fails_loudly_when_uncached() {
+        // See `resolve_cache_root_honors_ktstr_cache_dir` for the
+        // ENV_LOCK rationale.
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_offline = std::env::var(OFFLINE_ENV).ok();
         let prev_cache = std::env::var("KTSTR_CACHE_DIR").ok();
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test-only, single-threaded env mutation.
+        // SAFETY: ENV_LOCK guards process-wide env mutations; the
+        // save/restore pair preserves other tests' state.
         unsafe {
             std::env::set_var(OFFLINE_ENV, "1");
             std::env::set_var("KTSTR_CACHE_DIR", tmp.path());
@@ -460,6 +679,136 @@ mod tests {
             match prev_cache {
                 Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
                 None => std::env::remove_var("KTSTR_CACHE_DIR"),
+            }
+        }
+    }
+
+    // -- LlmExtract pipeline --
+
+    /// The default prompt is constant and load-bearing: a silent
+    /// drift would re-baseline every cached retry-behavior
+    /// expectation. Anchor on a prefix + tail so whitespace cleanup
+    /// still catches surprise edits.
+    #[test]
+    fn llm_extract_prompt_template_is_stable() {
+        assert!(LLM_EXTRACT_PROMPT_TEMPLATE.starts_with("You are a benchmark-output parser."));
+        assert!(LLM_EXTRACT_PROMPT_TEMPLATE.contains("emit ONLY a single JSON object"));
+        assert!(LLM_EXTRACT_PROMPT_TEMPLATE.contains("If no numeric metrics are present"));
+    }
+
+    #[test]
+    fn compose_prompt_without_hint_omits_focus_header() {
+        let p = compose_prompt("benchmark stdout", None);
+        assert!(p.contains(LLM_EXTRACT_PROMPT_TEMPLATE));
+        assert!(p.ends_with("STDOUT:\nbenchmark stdout"));
+        assert!(
+            !p.contains("Focus:"),
+            "absent hint must not leave a dangling Focus header: {p}"
+        );
+    }
+
+    #[test]
+    fn compose_prompt_with_hint_inserts_focus_line() {
+        let p = compose_prompt("stdout body", Some("throughput only"));
+        assert!(p.contains("Focus: throughput only\n\n"));
+        // Hint comes before STDOUT block so the model sees the focus
+        // before the raw content.
+        let focus_idx = p.find("Focus:").expect("Focus header present");
+        let stdout_idx = p.find("STDOUT:").expect("STDOUT header present");
+        assert!(focus_idx < stdout_idx);
+    }
+
+    #[test]
+    fn compose_prompt_trims_hint_whitespace() {
+        let p = compose_prompt("x", Some("  trim me \n "));
+        assert!(p.contains("Focus: trim me\n\n"));
+    }
+
+    #[test]
+    fn compose_prompt_empty_hint_degrades_to_no_focus() {
+        // Whitespace-only hint is effectively absent; don't emit a
+        // dangling "Focus: " header the model would treat as noise.
+        let p = compose_prompt("x", Some("   "));
+        assert!(
+            !p.contains("Focus:"),
+            "whitespace-only hint should not emit Focus header: {p}"
+        );
+    }
+
+    #[test]
+    fn inference_error_not_wired_message_mentions_offline_escape() {
+        let e = InferenceError::NotWired;
+        let msg = format!("{e}");
+        assert!(msg.contains("KTSTR_MODEL_OFFLINE"));
+        assert!(msg.contains("OutputFormat::Json"));
+    }
+
+    #[test]
+    fn inference_error_display_includes_source_chain() {
+        // ModelLoad wraps an anyhow::Error; {:#} should traverse the
+        // source chain so a test author can see *why* the load failed.
+        let inner = anyhow::anyhow!("root cause: cache corrupt");
+        let e = InferenceError::ModelLoad(inner);
+        let msg = format!("{e:#}");
+        assert!(msg.contains("root cause: cache corrupt"), "msg: {msg}");
+    }
+
+    /// With the stub backend, `invoke_inference` must NEVER return
+    /// `Ok`. If the stub is ever lifted accidentally (e.g. someone
+    /// stubs a successful response for testing without wiring the
+    /// retry-on-parse-failure path), this test fires first so the
+    /// pipeline gets the real treatment rather than a half-stub.
+    #[test]
+    fn invoke_inference_stub_always_errs() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_offline = std::env::var(OFFLINE_ENV).ok();
+        // Forcing offline ensures `ensure` bails on the uncached
+        // placeholder model rather than attempting a network fetch;
+        // the downstream invoke_inference should map that to a
+        // `ModelLoad` error, not `NotWired`.
+        // SAFETY: ENV_LOCK serializes process-wide env mutations.
+        unsafe { std::env::set_var(OFFLINE_ENV, "1") };
+        let r = invoke_inference("ignored");
+        assert!(r.is_err());
+        if let Err(InferenceError::ModelLoad(e)) = &r {
+            assert!(
+                format!("{e:#}").contains(OFFLINE_ENV),
+                "expected offline gate error, got: {e:#}"
+            );
+        } else {
+            panic!("expected ModelLoad(...) under offline gate, got {r:?}");
+        }
+        unsafe {
+            match prev_offline {
+                Some(v) => std::env::set_var(OFFLINE_ENV, v),
+                None => std::env::remove_var(OFFLINE_ENV),
+            }
+        }
+    }
+
+    /// End-to-end stub behavior: the LlmExtract pipeline must return
+    /// an empty metric set when the backend is unwired/unavailable,
+    /// and must not panic on any stdout shape. This covers the
+    /// contract metrics.rs relies on for its
+    /// `llm_extract_returns_empty_when_backend_unwired` test.
+    #[test]
+    fn extract_via_llm_returns_empty_under_stub_backend() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_offline = std::env::var(OFFLINE_ENV).ok();
+        // SAFETY: ENV_LOCK serializes process-wide env mutations.
+        unsafe { std::env::set_var(OFFLINE_ENV, "1") };
+        let metrics = extract_via_llm("arbitrary stdout", None);
+        assert!(metrics.is_empty());
+        let metrics = extract_via_llm("stdout with hint", Some("focus"));
+        assert!(metrics.is_empty());
+        unsafe {
+            match prev_offline {
+                Some(v) => std::env::set_var(OFFLINE_ENV, v),
+                None => std::env::remove_var(OFFLINE_ENV),
             }
         }
     }

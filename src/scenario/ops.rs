@@ -107,11 +107,11 @@ pub enum Op {
     /// Block until the payload named `name` exits naturally, then
     /// evaluate its checks and record metrics to the per-test sidecar.
     ///
-    /// The handle is consumed on success — a subsequent `WaitPayload`
-    /// / `KillPayload` targeting the same name is a no-op (warning
-    /// logged). A `WaitPayload` for an unknown name is an error:
-    /// test authors should not silently wait for payloads that were
-    /// never started.
+    /// The handle is consumed on success: a subsequent `WaitPayload`
+    /// / `KillPayload` targeting the same name would find no handle
+    /// and bail. A `WaitPayload` for an unknown name is also an
+    /// error — test authors must not silently wait for payloads
+    /// that were never started.
     WaitPayload { name: Cow<'static, str> },
     /// SIGKILL the payload named `name`, reap the child, evaluate
     /// checks, and record metrics. Mirrors the behavior of
