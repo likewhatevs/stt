@@ -474,10 +474,10 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
 /// a pin bump to a future larger model (e.g. 8B ≈ 5 GiB) working
 /// without hand-editing the constant.
 ///
-/// Overflow is not possible: `size_bytes / 3_000_000` caps the
-/// proportional term at `u64::MAX / 3e6 ≈ 6.15 × 10^12`, six orders
-/// of magnitude below `u64::MAX`, so the `max()` with 60 and the
-/// subsequent `Duration::from_secs` stay comfortably inside `u64`.
+/// No overflow path exists: the three operations in the body
+/// (integer division by a nonzero constant, `u64::max`, and
+/// `Duration::from_secs`) all accept arbitrary `u64` inputs and
+/// produce `u64` outputs without wrapping or panicking.
 fn fetch_timeout_for_size(size_bytes: u64) -> std::time::Duration {
     const FETCH_MIN_TIMEOUT_SECS: u64 = 60;
     const FETCH_MIN_BANDWIDTH_BYTES_PER_SEC: u64 = 3_000_000;
@@ -510,9 +510,12 @@ fn filesystem_available_bytes(dir: &std::path::Path) -> Result<u64> {
 
 /// Pre-flight gate in [`fetch`]: refuse to start a download when the
 /// filesystem backing `parent` does not carry the declared artifact
-/// size plus a 10% margin for tempfile overhead. Returns `Ok(())` when
-/// enough room exists and `Err` with an actionable diagnostic —
-/// `"Need 2.5 GiB free at /path/to/cache; have 512 MiB"` — otherwise.
+/// size plus a 10% safety buffer against concurrent writers
+/// consuming space between this snapshot check and the download's
+/// final byte (see the "Best-effort only" paragraph below). Returns
+/// `Ok(())` when enough room exists and `Err` with an actionable
+/// diagnostic —
+/// `"Need 2.69 GiB free at /path/to/cache; have 512 MiB"` — otherwise.
 ///
 /// The 10% margin (`size_bytes + size_bytes / 10`) is computed with
 /// saturating arithmetic so a future `ModelSpec` pin near `u64::MAX`
@@ -522,9 +525,9 @@ fn filesystem_available_bytes(dir: &std::path::Path) -> Result<u64> {
 /// Sizes are rendered through [`indicatif::HumanBytes`] so the error
 /// message speaks in human-scale IEC prefixes (`GiB` / `MiB` / `KiB`)
 /// instead of raw byte counts. A user reading
-/// `"Need 2.44 GiB free ... ; have 512.03 MiB"` learns both the gap
+/// `"Need 2.69 GiB free ... ; have 512.03 MiB"` learns both the gap
 /// and the order of magnitude at a glance; the raw-byte form
-/// (`"Need 2621440000 bytes ..."`) forces mental arithmetic that
+/// (`"Need 2883584000 bytes ..."`) forces mental arithmetic that
 /// obscures the actionable "free up a couple of gigs" conclusion.
 /// The file_name and the margin's 10% share are intentionally absent
 /// from the one-line format — the former rarely matters to an
@@ -3009,7 +3012,7 @@ mod tests {
 
     /// `fetch_timeout_for_size` for the model (2500 MiB) is well
     /// above the 180 MB crossover so the proportional term wins:
-    /// `2500 × 1024 × 1024 / 3_000_000 = 873` seconds. Pins the
+    /// `(2500 × 1024 × 1024) / 3_000_000 = 873` seconds. Pins the
     /// proportional branch — a regression that clamped the timeout
     /// (e.g. re-introduced a fixed 900 s ceiling) would surface
     /// here, and so would a divisor-unit swap (byte vs KiB vs MiB).
@@ -3129,10 +3132,9 @@ mod tests {
     /// load-bearing piece of the error message: the `"Need "` prefix,
     /// `" free at "` infix, `"; have "` separator shape, the
     /// `parent` path echo, and the presence of an IEC-prefix size
-    /// token (`GiB`, `MiB`, `KiB`, `TiB`, `PiB`, or bare `B`) on both
-    /// sides of the `"; have "` boundary. A regression that dropped
-    /// the human-readable format or reverted to raw bytes would
-    /// surface here.
+    /// token (`KiB`, `MiB`, `GiB`, `TiB`, `PiB`, or `EiB`) on the
+    /// `"Need "` side. A regression that dropped the human-readable
+    /// format or reverted to raw bytes would surface here.
     #[test]
     fn ensure_free_space_bails_when_space_insufficient() {
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -3140,9 +3142,8 @@ mod tests {
             file_name: "ginormous.gguf",
             url: "https://placeholder.example/ginormous.gguf",
             sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
-            // u64::MAX / 2 plus the 10% margin stays within u64 range
-            // and saturates under saturating_add — either way the
-            // needed byte count exceeds any real filesystem's
+            // u64::MAX / 2 plus the 10% margin stays within u64 range —
+            // the needed byte count exceeds any real filesystem's
             // blocks_available * fragment_size product.
             size_bytes: u64::MAX / 2,
         };
@@ -3164,10 +3165,8 @@ mod tests {
             rendered.contains(&format!("{}", tmp.path().display())),
             "error must echo the parent path: {rendered}"
         );
-        // `u64::MAX / 2` is ~8.00 EiB; HumanBytes tops out at PiB and
-        // renders anything larger in PiB as well (e.g. "8191.99 PiB"),
-        // so accept PiB or the smaller IEC prefixes — just not a
-        // bare-byte `"B"` reading with no prefix.
+        // `u64::MAX / 2` is ~8.00 EiB; accept any IEC prefix up through
+        // EiB — just not a bare-byte `"B"` reading with no prefix.
         let rendered_after_need = rendered
             .strip_prefix("Need ")
             .expect("starts_with 'Need ' above");
