@@ -1522,6 +1522,65 @@ mod tests {
     }
 
     #[test]
+    fn cache_dir_list_classifies_malformed_json_as_corrupt() {
+        // metadata.json exists but is not valid JSON. `read_metadata`
+        // returns None on `serde_json::from_str` failure, so list()
+        // must surface the entry as Corrupt with the
+        // unparseable-metadata reason.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("malformed-json");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("metadata.json"), b"not valid json {[").unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "malformed-json");
+        assert!(listed.as_valid().is_none());
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for malformed-json entry");
+        };
+        assert!(
+            reason.contains("metadata.json missing or unparseable"),
+            "malformed-JSON reason should match the unparseable-metadata label, got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_classifies_old_format_metadata_as_corrupt() {
+        // metadata.json is valid JSON but omits required fields
+        // (old format before `image_name` / `source` / `arch` /
+        // `built_at` were mandatory). `serde_json::from_str` fails
+        // because serde-derived `KernelMetadata` is not default-on-
+        // missing for those fields. list() must surface the entry
+        // as Corrupt with the unparseable-metadata reason — same
+        // category as malformed-JSON because the observable failure
+        // is identical (read_metadata returns None).
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("old-format");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("metadata.json"), br#"{"version": "6.14"}"#).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "old-format");
+        assert!(
+            listed.as_valid().is_none(),
+            "old-format metadata missing required fields must not deserialize as Valid",
+        );
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for old-format entry");
+        };
+        assert!(
+            reason.contains("metadata.json missing or unparseable"),
+            "old-format reason should match the unparseable-metadata label, got: {reason}",
+        );
+    }
+
+    #[test]
     fn cache_dir_list_skips_tmp_dirs() {
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().to_path_buf());
