@@ -73,8 +73,11 @@ pub enum KernelSource {
         /// unavailable.
         source_tree_path: Option<PathBuf>,
         /// Git commit hash of the source tree at build time (short
-        /// form). `None` when the tree is not a git repository or
-        /// the hash could not be read.
+        /// form). `None` when the tree is not a git repository, the
+        /// hash could not be read, or the worktree is dirty — a
+        /// HEAD hash does not describe a tree with uncommitted
+        /// changes, so identifying it by that hash would mislead a
+        /// reproducer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         git_hash: Option<String>,
     },

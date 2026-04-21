@@ -549,6 +549,12 @@ pub fn git_clone(
 /// for modifications to tracked files. Submodule checks are skipped
 /// entirely. Untracked files do not affect the dirty flag.
 ///
+/// When the tree is dirty, the HEAD commit does not describe the
+/// source actually being built, so `git_hash` is dropped — no
+/// commit identifies a dirty worktree. `is_dirty=true` carries that
+/// fact forward; callers (see [`crate::cli`]) use it to bypass the
+/// kernel cache entirely.
+///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSource, String> {
@@ -570,13 +576,22 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
             let head = repo.head_id().map_err(|e| format!("read HEAD: {e}"))?;
             let short_hash = format!("{}", head).chars().take(7).collect::<String>();
 
+            // tree_index_status compares a TREE id against the index;
+            // the HEAD commit id is not itself a tree, so peel HEAD
+            // to its root tree before diffing or the diff silently
+            // returns an error and index dirt goes undetected.
+            let head_tree = repo
+                .head_tree()
+                .map_err(|e| format!("read HEAD tree: {e}"))?;
+            let head_tree_id = head_tree.id;
+
             // Check HEAD-vs-index for tracked file changes.
             let mut index_dirty = false;
             let index = repo
                 .index_or_empty()
                 .map_err(|e| format!("open index: {e}"))?;
             let _ = repo.tree_index_status(
-                &head,
+                &head_tree_id,
                 &index,
                 None,
                 gix::status::tree_index::TrackRenames::Disabled,
@@ -606,7 +621,13 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
                 false
             };
 
-            (Some(short_hash), index_dirty || worktree_dirty)
+            let is_dirty = index_dirty || worktree_dirty;
+            // Drop the HEAD hash when dirty — the commit does not
+            // describe the actual source being built, so publishing
+            // it via git_hash / cache_key would misidentify the
+            // build input.
+            let hash = if is_dirty { None } else { Some(short_hash) };
+            (hash, is_dirty)
         }
         Err(_) => {
             eprintln!(
@@ -792,6 +813,173 @@ mod tests {
     #[test]
     fn fetch_patch_level_large() {
         assert_eq!(patch_level("6.12.99"), Some(99));
+    }
+
+    // -- local_source dirty detection --
+
+    /// Initialise a git repo at `dir` with one committed file, using
+    /// the `git` CLI with explicit identity + empty global config so
+    /// the test is deterministic on developer machines and CI runners
+    /// regardless of the ambient git setup.
+    fn init_repo_with_commit(dir: &Path) {
+        use std::process::Command;
+
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                // Empty system/global config: the test owns identity
+                // and default-branch config via -c flags below.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "ktstr-test")
+                .env("GIT_AUTHOR_EMAIL", "ktstr-test@localhost")
+                .env("GIT_COMMITTER_NAME", "ktstr-test")
+                .env("GIT_COMMITTER_EMAIL", "ktstr-test@localhost")
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("file.txt"), "original\n").unwrap();
+        run(&["add", "file.txt"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "initial"]);
+    }
+
+    /// On a clean repo, `local_source` must report `is_dirty=false` and
+    /// populate both the cache key and KernelSource::Local.git_hash
+    /// with the HEAD short-hash.
+    #[test]
+    fn local_source_clean_repo_populates_hash() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: git CLI unavailable");
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        let acquired = local_source(tmp.path(), "ktstr-test").expect("local_source ok");
+        assert!(!acquired.is_dirty, "clean tree must not be dirty");
+
+        let git_hash = match &acquired.kernel_source {
+            crate::cache::KernelSource::Local { git_hash, .. } => git_hash.clone(),
+            other => panic!("expected KernelSource::Local, got {other:?}"),
+        };
+        let hash = git_hash.expect("clean repo must carry a git_hash");
+        assert_eq!(hash.len(), 7, "short hash must be 7 chars, got {hash:?}");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be hex, got {hash:?}"
+        );
+        assert!(
+            acquired.cache_key.contains(&hash),
+            "clean cache_key must embed the short hash, got {}",
+            acquired.cache_key
+        );
+    }
+
+    /// On a dirty tracked-file worktree (worktree mutation after
+    /// commit), `local_source` must report `is_dirty=true` AND clear
+    /// `KernelSource::Local.git_hash`. The HEAD commit does not
+    /// describe a dirty tree, so surfacing the HEAD hash as the
+    /// build's source identity would mislead a reproducer.
+    #[test]
+    fn local_source_dirty_tracked_file_clears_hash() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: git CLI unavailable");
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        // Mutate the tracked file — index-vs-worktree becomes dirty.
+        std::fs::write(tmp.path().join("file.txt"), "modified\n").unwrap();
+
+        let acquired = local_source(tmp.path(), "ktstr-test").expect("local_source ok");
+        assert!(acquired.is_dirty, "worktree mutation must mark dirty");
+        match &acquired.kernel_source {
+            crate::cache::KernelSource::Local { git_hash, .. } => {
+                assert!(
+                    git_hash.is_none(),
+                    "dirty tree must not publish git_hash, got {git_hash:?}"
+                );
+            }
+            other => panic!("expected KernelSource::Local, got {other:?}"),
+        }
+        // Cache key must also fall through to the unknown bucket so
+        // a dirty build can never collide with a clean build at the
+        // same HEAD if caching is ever attempted.
+        assert!(
+            acquired.cache_key.starts_with("local-unknown-"),
+            "dirty cache_key must use local-unknown prefix, got {}",
+            acquired.cache_key
+        );
+    }
+
+    /// Staged-but-not-committed changes are dirty via the HEAD-vs-index
+    /// check (`tree_index_status`) rather than index-vs-worktree. The
+    /// same `git_hash=None` invariant applies.
+    #[test]
+    fn local_source_dirty_staged_only_clears_hash() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: git CLI unavailable");
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        // Modify + stage (so worktree matches index, but index
+        // differs from HEAD).
+        std::fs::write(tmp.path().join("file.txt"), "staged\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(tmp.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git add");
+        assert!(status.success());
+
+        let acquired = local_source(tmp.path(), "ktstr-test").expect("local_source ok");
+        assert!(acquired.is_dirty, "staged-only change must mark dirty");
+        match &acquired.kernel_source {
+            crate::cache::KernelSource::Local { git_hash, .. } => {
+                assert!(
+                    git_hash.is_none(),
+                    "dirty (staged) tree must not publish git_hash, got {git_hash:?}"
+                );
+            }
+            other => panic!("expected KernelSource::Local, got {other:?}"),
+        }
+    }
+
+    /// Non-git directories are treated as permanently dirty and
+    /// produce `git_hash=None` — there is no commit to reference.
+    #[test]
+    fn local_source_non_git_is_dirty_without_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("file.txt"), "no git here\n").unwrap();
+
+        let acquired = local_source(tmp.path(), "ktstr-test").expect("local_source ok");
+        assert!(acquired.is_dirty, "non-git tree must mark dirty");
+        match &acquired.kernel_source {
+            crate::cache::KernelSource::Local { git_hash, .. } => {
+                assert!(
+                    git_hash.is_none(),
+                    "non-git tree must not publish git_hash, got {git_hash:?}"
+                );
+            }
+            other => panic!("expected KernelSource::Local, got {other:?}"),
+        }
+        assert!(
+            acquired.cache_key.starts_with("local-unknown-"),
+            "non-git cache_key must use local-unknown prefix, got {}",
+            acquired.cache_key
+        );
     }
 
     // -- proptest --
