@@ -440,12 +440,40 @@ pub fn run_make_with_output(
     // copies. The child therefore holds the only live write ends
     // (its dup2'd stdout/stderr, fd 1/2). When `make` exits, those
     // fds are closed and the reader here sees EOF naturally.
+    //
+    // Read as bytes and convert each line via `from_utf8_lossy` at
+    // the boundary. Compiler output can include non-UTF-8 bytes —
+    // source paths on exotic filesystems, embedded binary fragments
+    // from diagnostic tools, locale-encoded text — and a pure-String
+    // reader would drop those lines via the `Result::ok` filter,
+    // hiding real compiler errors in CI logs. Lossy conversion keeps
+    // every line visible with U+FFFD where the bytes were not valid
+    // UTF-8.
     let reader = std::fs::File::from(read_fd);
+    let mut reader = std::io::BufReader::new(reader);
     let mut captured = Vec::new();
-    for line in std::io::BufReader::new(reader)
-        .lines()
-        .map_while(Result::ok)
-    {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut buf)
+            .context("read merged make stdout+stderr")?;
+        if n == 0 {
+            break;
+        }
+        // Strip the trailing newline (and an optional preceding CR
+        // for CRLF sources) before lossy conversion so the printed
+        // line matches what a line-oriented reader would have
+        // produced. The final chunk before EOF may carry no
+        // trailing newline; in that case no suffix is stripped.
+        let mut slice: &[u8] = &buf;
+        if let Some(rest) = slice.strip_suffix(b"\n") {
+            slice = rest;
+            if let Some(rest) = slice.strip_suffix(b"\r") {
+                slice = rest;
+            }
+        }
+        let line = String::from_utf8_lossy(slice).into_owned();
         if let Some(sp) = spinner {
             sp.println(&line);
         }

@@ -258,9 +258,24 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
     let (cached, sha_matches) = match std::fs::metadata(&path) {
         Ok(meta) if meta.is_file() => {
             // A cached file is considered "matched" only when the
-            // SHA agrees with the pin; anything else is a corrupt /
-            // interrupted download that ensure() will replace.
-            let matches = verify_sha256(&path, spec.sha256_hex).unwrap_or(false);
+            // SHA agrees with the pin. Distinguish the two Err
+            // sources from verify_sha256: a malformed pin is a
+            // ModelSpec programmer error that MUST surface (hiding
+            // it as "doesn't match" misroutes callers into a
+            // pointless re-download branch), while an I/O failure
+            // on the cached file (open/read error) means the file
+            // is unusable — surface that as `sha_matches = false`
+            // so ensure() replaces it rather than bailing the whole
+            // status() call.
+            let matches = match verify_sha256(&path, spec.sha256_hex) {
+                Ok(m) => m,
+                Err(e) => {
+                    if !is_valid_sha256_hex(spec.sha256_hex) {
+                        return Err(e);
+                    }
+                    false
+                }
+            };
             (true, matches)
         }
         _ => (false, false),
@@ -295,13 +310,15 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // seeding a cache under the offline gate cannot rescue a broken
     // pin, so surfacing the shape failure first gives the clearer
     // diagnostic ("fix the ModelSpec") instead of the downstream
-    // "KTSTR_MODEL_OFFLINE set but not cached" red herring. `status()`
-    // swallowed a malformed pin via `unwrap_or(false)` on
-    // `verify_sha256`, so a placeholder (all-`?`) `sha256_hex` would
-    // silently skip the fast path and drop through to `fetch` —
-    // wasting a 2.44 GiB download before the post-download
-    // `verify_sha256` bails. Catch it here so the error surfaces
-    // before either the offline bail or the network request.
+    // "KTSTR_MODEL_OFFLINE set but not cached" red herring.
+    // `status()` already propagates a malformed-pin Err for the
+    // cached-file branch (so ensure() never reaches this check with
+    // a cached file + malformed pin). This explicit check covers the
+    // no-cache case: status() returned `cached = false` without
+    // calling `verify_sha256`, so without this gate a placeholder
+    // (all-`?`) pin would drop through to `fetch` and waste a
+    // 2.44 GiB download before the post-download `verify_sha256`
+    // bails.
     if !is_valid_sha256_hex(spec.sha256_hex) {
         anyhow::bail!(
             "model '{}' has a placeholder or malformed SHA-256 pin \
@@ -1156,6 +1173,39 @@ mod tests {
             "SHA is a fixed zero pin — garbage bytes must not match",
         );
         assert_eq!(st.path, on_disk);
+    }
+
+    /// status() on a file that exists but whose SHA pin is malformed
+    /// (non-hex chars) must surface the verify_sha256 error instead
+    /// of coercing it into `sha_matches = false`. A malformed pin is
+    /// a programmer error in the ModelSpec — silently reporting
+    /// "SHA doesn't match" hides the defect and misroutes downstream
+    /// logic into a pointless re-download branch.
+    #[test]
+    fn status_surfaces_malformed_pin_error_for_cached_file() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = ModelSpec {
+            file_name: "malformed-pin.gguf",
+            url: "https://placeholder.example/malformed-pin.gguf",
+            // 64 chars, all `?` — right length, zero hex digits.
+            sha256_hex: "????????????????????????????????????????????????????????????????",
+            size_bytes: 1,
+        };
+        let on_disk = tmp.path().join(spec.file_name);
+        std::fs::write(&on_disk, b"any bytes will do").unwrap();
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+        let err = status(&spec).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("non-hex"),
+            "expected malformed-pin error from verify_sha256, got: {rendered}"
+        );
     }
 
     /// With `KTSTR_CACHE_DIR` unset, `resolve_cache_root` falls
