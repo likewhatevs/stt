@@ -2826,9 +2826,9 @@ mod tests {
             .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
             .collect();
 
-        // .debug_* sections deleted. (.comment is also in the fallback's
-        // delete set but this fixture does not emit one, so it is not
-        // exercised here.)
+        // .debug_* sections deleted. The fallback also removes the
+        // `.comment` section, but this fixture does not emit one, so
+        // that branch of the delete set is not exercised here.
         assert!(
             !names.contains(&".debug_info"),
             "fallback should remove .debug_info"
