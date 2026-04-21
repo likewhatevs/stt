@@ -2923,9 +2923,9 @@ mod tests {
             .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
             .collect();
 
-        // .debug_* sections deleted. (.comment is also in the fallback's
-        // delete set but this fixture does not emit one, so it is not
-        // exercised here.)
+        // .debug_* sections deleted. (.comment is exercised by the
+        // dedicated `strip_debug_prefix_removes_dot_comment` test
+        // against a fixture that emits one.)
         assert!(
             !names.contains(&".debug_info"),
             "fallback should remove .debug_info"
@@ -2944,6 +2944,92 @@ mod tests {
                 "fallback must preserve {name}, got sections {names:?}"
             );
         }
+    }
+
+    /// `strip_debug_prefix`'s delete filter matches on two distinct
+    /// predicates: `name.starts_with(b".debug_")` and
+    /// `name == b".comment"`. The `.debug_*` branch is exercised by
+    /// `strip_debug_prefix_removes_debug_and_preserves_rest` against
+    /// the shared fixture. This test covers the `.comment` branch
+    /// against a focused fixture that specifically emits one — the
+    /// shared fixture deliberately does not, to keep the keep-list
+    /// assertions scoped.
+    #[test]
+    fn strip_debug_prefix_removes_dot_comment() {
+        use object::write;
+        // Minimal ELF: one loadable .text (fallback must preserve it)
+        // plus a .comment section (fallback must delete it). A symbol
+        // anchors .text so the `object` writer emits .symtab/.strtab.
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_text_symbol".to_vec(),
+            value: 0x0,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        // `.comment` is ELF's standard toolchain-producer string table
+        // (`SectionKind::OtherString` per object-0.36 common.rs:209).
+        // Real kernel builds carry one stamped by GCC/Clang.
+        let comment_id = obj.add_section(
+            Vec::new(),
+            b".comment".to_vec(),
+            object::SectionKind::OtherString,
+        );
+        obj.append_section_data(comment_id, b"GCC: (GNU) 14.2.1 20250207\0", 1);
+        let data = obj.write().unwrap();
+
+        // Positive control: the fixture must actually carry `.comment`
+        // and `.text` before strip. If `object::write` silently dropped
+        // either (e.g. renaming, or treating OtherString non-standardly),
+        // the post-strip absence assertion on `.comment` would
+        // false-pass. Mirrors the positive-control pattern in
+        // `strip_vmlinux_debug_applies_keep_list`.
+        let source_elf = goblin::elf::Elf::parse(&data).unwrap();
+        let source_names: Vec<&str> = source_elf
+            .section_headers
+            .iter()
+            .filter_map(|s| source_elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+        for name in [".comment", ".text"] {
+            assert!(
+                source_names.contains(&name),
+                "fixture missing expected section {name}; got {source_names:?}"
+            );
+        }
+
+        // `neutralize_alloc_relocs` is a no-op on this fixture (no
+        // SHF_ALLOC relocation sections) — run it anyway so the test
+        // exercises the exact input pipeline `strip_vmlinux_debug` uses.
+        let processed = neutralize_alloc_relocs(&data).unwrap();
+        let stripped = strip_debug_prefix(&processed).unwrap();
+        let elf = goblin::elf::Elf::parse(&stripped).unwrap();
+        let names: Vec<&str> = elf
+            .section_headers
+            .iter()
+            .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+
+        assert!(
+            !names.contains(&".comment"),
+            "fallback must remove .comment, got sections {names:?}"
+        );
+        // Non-comment, non-debug sections survive untouched — guards
+        // against an overly broad filter that accidentally drops
+        // unrelated sections.
+        assert!(
+            names.contains(&".text"),
+            "fallback must preserve .text, got sections {names:?}"
+        );
     }
 
     #[test]
