@@ -453,6 +453,106 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     fetch(spec, &st.path)
 }
 
+/// Compute the overall HTTP-request timeout for a download of
+/// `size_bytes`. Formula:
+///
+/// `max(FETCH_MIN_TIMEOUT_SECS, size_bytes / FETCH_MIN_BANDWIDTH_BYTES_PER_SEC)`
+///
+/// where `FETCH_MIN_BANDWIDTH_BYTES_PER_SEC` is 3 MB/s
+/// (`3_000_000`) and `FETCH_MIN_TIMEOUT_SECS` is 60 s. The
+/// proportional term budgets a 3 MB/s sustained-throughput floor
+/// over the artifact body; the 60 s floor keeps small artifacts
+/// (kilobyte-scale tokenizers, future micro-pins) from getting a
+/// sub-second cap that TLS handshake + request/response round-trip
+/// would blow past before the first body byte arrives. A regression
+/// below the 3 MB/s floor surfaces as a timeout rather than hanging
+/// the test setup until an external watchdog fires. A fixed ceiling
+/// would either over-budget the 11 MiB tokenizer (letting a wedged
+/// download sit for the same 15 min budget a 2.44 GiB model needs)
+/// or starve the model on CDN-throttled CI runners — the linear
+/// formula sizes each artifact independently, and the floor keeps
+/// a pin bump to a future larger model (e.g. 8B ≈ 5 GiB) working
+/// without hand-editing the constant.
+///
+/// Overflow is not possible: `size_bytes / 3_000_000` caps the
+/// proportional term at `u64::MAX / 3e6 ≈ 6.15 × 10^12`, six orders
+/// of magnitude below `u64::MAX`, so the `max()` with 60 and the
+/// subsequent `Duration::from_secs` stay comfortably inside `u64`.
+fn fetch_timeout_for_size(size_bytes: u64) -> std::time::Duration {
+    const FETCH_MIN_TIMEOUT_SECS: u64 = 60;
+    const FETCH_MIN_BANDWIDTH_BYTES_PER_SEC: u64 = 3_000_000;
+    let body_secs = size_bytes / FETCH_MIN_BANDWIDTH_BYTES_PER_SEC;
+    std::time::Duration::from_secs(body_secs.max(FETCH_MIN_TIMEOUT_SECS))
+}
+
+/// Return the free space (in bytes, available to unprivileged users)
+/// on the filesystem that holds `dir`. Wraps
+/// [`nix::sys::statvfs::statvfs`]: `blocks_available` (`f_bavail`) is
+/// expressed in units of `fragment_size` (`f_frsize`), so the
+/// byte-level answer is the product.
+///
+/// `blocks_available` is used rather than `blocks_free` so the reading
+/// honors the reserved-for-root slice POSIX filesystems carry — an
+/// unprivileged process cannot actually consume the reserved slack,
+/// and the fetcher runs unprivileged in the normal case.
+///
+/// Saturating multiplication guards against a pathological statvfs
+/// return (e.g. a FUSE filesystem reporting enormous synthetic
+/// counts) overflowing `u64`. `u64::MAX` is effectively "unbounded
+/// space" for the subsequent comparison; the gate will always pass.
+fn filesystem_available_bytes(dir: &std::path::Path) -> Result<u64> {
+    let vfs =
+        nix::sys::statvfs::statvfs(dir).with_context(|| format!("statvfs {}", dir.display()))?;
+    let blocks = vfs.blocks_available() as u64;
+    let frag = vfs.fragment_size() as u64;
+    Ok(blocks.saturating_mul(frag))
+}
+
+/// Pre-flight gate in [`fetch`]: refuse to start a download when the
+/// filesystem backing `parent` does not carry the declared artifact
+/// size plus a 10% margin for tempfile overhead. Returns `Ok(())` when
+/// enough room exists and `Err` with an actionable diagnostic —
+/// `"Need 2.5 GiB free at /path/to/cache; have 512 MiB"` — otherwise.
+///
+/// The 10% margin (`size_bytes + size_bytes / 10`) is computed with
+/// saturating arithmetic so a future `ModelSpec` pin near `u64::MAX`
+/// cannot wrap the margin calculation into a small positive number
+/// that would let an impossible fetch bypass the gate.
+///
+/// Sizes are rendered through [`indicatif::HumanBytes`] so the error
+/// message speaks in human-scale IEC prefixes (`GiB` / `MiB` / `KiB`)
+/// instead of raw byte counts. A user reading
+/// `"Need 2.44 GiB free ... ; have 512.03 MiB"` learns both the gap
+/// and the order of magnitude at a glance; the raw-byte form
+/// (`"Need 2621440000 bytes ..."`) forces mental arithmetic that
+/// obscures the actionable "free up a couple of gigs" conclusion.
+/// The file_name and the margin's 10% share are intentionally absent
+/// from the one-line format — the former rarely matters to an
+/// operator clearing disk, and the latter is an implementation detail
+/// documented here in the source rather than echoed every time the
+/// gate fires.
+///
+/// Best-effort only: the answer is a snapshot from statvfs at call
+/// time. A concurrent writer on the same filesystem can still exhaust
+/// space mid-download (surfacing later as the same ENOSPC error this
+/// gate pre-empts). The gate catches the common "cache filesystem
+/// nearly full" case before the HTTP request runs — it does not
+/// claim reservation semantics.
+fn ensure_free_space(parent: &std::path::Path, spec: &ModelSpec) -> Result<()> {
+    let available = filesystem_available_bytes(parent)?;
+    let margin = spec.size_bytes / 10;
+    let needed = spec.size_bytes.saturating_add(margin);
+    if available < needed {
+        anyhow::bail!(
+            "Need {} free at {}; have {}",
+            indicatif::HumanBytes(needed),
+            parent.display(),
+            indicatif::HumanBytes(available),
+        );
+    }
+    Ok(())
+}
+
 /// Download the spec to `final_path` through a tempfile, verify SHA,
 /// then atomically rename. Errors are actionable (includes URL +
 /// final path) so a test author can reproduce the fetch by hand.
@@ -467,6 +567,16 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create model cache dir {}", parent.display()))?;
 
+    // Pre-flight free-space gate. Without this, a nearly-full cache
+    // filesystem lets std::io::copy run until ENOSPC and surfaces a
+    // generic I/O error that doesn't name "disk space" as the cause.
+    // Checking here — after create_dir_all so statvfs(parent)
+    // resolves, before NamedTempFile::new_in so a failed gate does
+    // not leave a zero-byte tempfile behind — turns the failure into
+    // an actionable bail with the available/needed byte counts in
+    // the message.
+    ensure_free_space(parent, spec)?;
+
     // NamedTempFile keeps the partial artifact next to the final
     // path so the subsequent rename is an atomic filesystem op
     // (same filesystem guaranteed). A tempfile in /tmp could sit on
@@ -478,20 +588,17 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     // Use an explicit Client with connect + overall timeouts rather
     // than `reqwest::blocking::get`, which has no timeout and will
     // hang forever on a slow or unreachable mirror. 30s connect
-    // catches DNS/TLS wedges early. Tests that don't actually hit
-    // the network (offline gate, cached path) never enter this
-    // branch.
-    //
-    // 15-minute overall timeout sizing: the pinned Qwen3-4B GGUF is
-    // ~2.44 GiB (see DEFAULT_MODEL.size_bytes). 900s tolerates ~2.7
-    // MiB/s sustained throughput, a margin the previous 300s cap
-    // (which required ~8.5 MiB/s) did not hold on CDN-throttled or
-    // bandwidth-limited CI runners. The fetch is idempotent —
-    // subsequent test runs hit the cached-and-verified fast path,
-    // so the slow-path cost is paid once per cache warmup.
+    // catches DNS/TLS wedges early. The overall timeout scales with
+    // `spec.size_bytes` via [`fetch_timeout_for_size`] so a 2.44 GiB
+    // model and an 11 MiB tokenizer do not share a single one-size-
+    // fits-all cap — the previous fixed 15-minute ceiling either let
+    // a wedged tokenizer download hang for 15 minutes past any
+    // reasonable budget or starved the model on slow CI CDNs. Tests
+    // that don't actually hit the network (offline gate, cached path)
+    // never enter this branch.
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(900))
+        .timeout(fetch_timeout_for_size(spec.size_bytes))
         .build()
         .context("build reqwest::blocking::Client for model fetch")?;
     let mut response = client
@@ -2872,5 +2979,228 @@ mod tests {
         std::fs::write(&expected_path, []).unwrap();
         let got = locate(&DEFAULT_MODEL).unwrap();
         assert_eq!(got, expected_path);
+    }
+
+    /// `fetch_timeout_for_size(0)` returns exactly the 60-second
+    /// floor: zero bytes, zero proportional term, so the `max()`
+    /// with the floor wins. Pins that an empty artifact still gets
+    /// the full TLS/handshake + request/response budget instead of
+    /// a sub-second cap that the blocking client would blow past
+    /// before receiving its response head.
+    #[test]
+    fn fetch_timeout_for_size_zero_returns_floor() {
+        assert_eq!(
+            fetch_timeout_for_size(0),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    /// `fetch_timeout_for_size` for the tokenizer (11 MiB) is below
+    /// the body-over-floor crossover point (60 s × 3 MB/s = 180 MB)
+    /// so it returns exactly the 60-second floor. Pins the floor-
+    /// wins branch so a regression that swapped `max()` for `+`
+    /// (adding body seconds to the floor instead of clamping) would
+    /// surface here.
+    #[test]
+    fn fetch_timeout_for_size_tokenizer_hits_floor() {
+        let got = fetch_timeout_for_size(DEFAULT_TOKENIZER.size_bytes);
+        assert_eq!(got, std::time::Duration::from_secs(60));
+    }
+
+    /// `fetch_timeout_for_size` for the model (2500 MiB) is well
+    /// above the 180 MB crossover so the proportional term wins:
+    /// `2500 × 1024 × 1024 / 3_000_000 = 873` seconds. Pins the
+    /// proportional branch — a regression that clamped the timeout
+    /// (e.g. re-introduced a fixed 900 s ceiling) would surface
+    /// here, and so would a divisor-unit swap (byte vs KiB vs MiB).
+    #[test]
+    fn fetch_timeout_for_size_model_scales_up() {
+        let got = fetch_timeout_for_size(DEFAULT_MODEL.size_bytes);
+        assert_eq!(got, std::time::Duration::from_secs(873));
+    }
+
+    /// For two artifacts BOTH above the floor-crossover, the
+    /// timeout is strictly linear in `size_bytes`: the larger one
+    /// gets exactly `(large_bytes - small_bytes) / 3_000_000`
+    /// seconds more. Pin the linear relationship on two synthetic
+    /// sizes that clear the crossover. `DEFAULT_TOKENIZER` and
+    /// `DEFAULT_MODEL` cannot both participate because the former
+    /// sits under the floor — using synthetic sizes keeps this a
+    /// test of the formula, not a test of the current pins.
+    #[test]
+    fn fetch_timeout_for_size_is_linear_above_floor() {
+        let small_bytes: u64 = 300 * 1024 * 1024; // 300 MiB, above floor.
+        let large_bytes: u64 = 3000 * 1024 * 1024; // 3000 MiB.
+        let small = fetch_timeout_for_size(small_bytes);
+        let large = fetch_timeout_for_size(large_bytes);
+        assert!(
+            large > small,
+            "larger artifact must exceed smaller once both clear the floor: {large:?} vs {small:?}"
+        );
+        let expected_delta = large_bytes / 3_000_000 - small_bytes / 3_000_000;
+        assert_eq!(
+            large - small,
+            std::time::Duration::from_secs(expected_delta)
+        );
+    }
+
+    /// Any artifact at or below the `floor_seconds × bandwidth`
+    /// boundary gets the 60-second floor: an 11 MiB tokenizer and
+    /// a 1 KiB fake pin collapse to the same 60 s cap. Pins the
+    /// floor as a hard guarantee for all small artifacts so a
+    /// regression that dropped the floor (e.g. `max` → just the
+    /// proportional term) would surface as a sub-60 s result on
+    /// the small sibling here.
+    #[test]
+    fn fetch_timeout_for_size_floor_applies_uniformly_below_crossover() {
+        let tiny = fetch_timeout_for_size(1024);
+        let tokenizer = fetch_timeout_for_size(DEFAULT_TOKENIZER.size_bytes);
+        assert_eq!(tiny, std::time::Duration::from_secs(60));
+        assert_eq!(tokenizer, std::time::Duration::from_secs(60));
+        assert_eq!(tiny, tokenizer);
+    }
+
+    /// `filesystem_available_bytes` on a real tempdir must return a
+    /// positive byte count: any working test environment has at least
+    /// some free space on the filesystem hosting `/tmp` (or wherever
+    /// `tempfile::tempdir` lands). A zero return would indicate a
+    /// wiring regression — either `blocks_available` was read as a
+    /// signed value and truncated or `fragment_size` was confused
+    /// with zero. Pins the production readings against both
+    /// regressions at once.
+    #[test]
+    fn filesystem_available_bytes_returns_positive_on_tempdir() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let bytes = filesystem_available_bytes(tmp.path()).expect("statvfs");
+        assert!(
+            bytes > 0,
+            "tempdir filesystem must report some available space, got {bytes}"
+        );
+    }
+
+    /// `filesystem_available_bytes` surfaces the underlying statvfs
+    /// error (wrapped with the path-naming context) when the target
+    /// does not exist. The fetcher relies on this propagation so a
+    /// typo in `KTSTR_CACHE_DIR` or a torn-down cache root surfaces
+    /// as a named `statvfs {path}` failure rather than a silent
+    /// pass-through. Pin both halves: the call fails AND the error
+    /// message names the missing path.
+    #[test]
+    fn filesystem_available_bytes_errors_on_missing_path() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let missing = tmp.path().join("does-not-exist");
+        let err = filesystem_available_bytes(&missing).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("statvfs"),
+            "error must carry 'statvfs' context: {rendered}"
+        );
+        assert!(
+            rendered.contains("does-not-exist"),
+            "error must name the missing path: {rendered}"
+        );
+    }
+
+    /// Happy path: `ensure_free_space` returns `Ok(())` when the
+    /// filesystem has more than `size_bytes + 10%` available. Uses
+    /// a 1-byte spec so any tempdir filesystem trivially clears the
+    /// gate — the point is to pin the "returns Ok on enough space"
+    /// branch against a regression that flipped the comparator
+    /// direction (which would cause every fetch to bail regardless
+    /// of real free-space state).
+    #[test]
+    fn ensure_free_space_ok_when_space_sufficient() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let tiny = ModelSpec {
+            file_name: "tiny.gguf",
+            url: "https://placeholder.example/tiny.gguf",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        ensure_free_space(tmp.path(), &tiny).expect("1-byte spec must fit");
+    }
+
+    /// `ensure_free_space` must bail with the documented
+    /// `"Need X free at <path>; have Y"` diagnostic when the declared
+    /// `size_bytes + 10% margin` exceeds the filesystem's available
+    /// bytes. Uses `u64::MAX / 2` so no real filesystem (tempdir or
+    /// otherwise) can clear the gate — the margin calculation
+    /// saturates and the comparison still trips. Pin every
+    /// load-bearing piece of the error message: the `"Need "` prefix,
+    /// `" free at "` infix, `"; have "` separator shape, the
+    /// `parent` path echo, and the presence of an IEC-prefix size
+    /// token (`GiB`, `MiB`, `KiB`, `TiB`, `PiB`, or bare `B`) on both
+    /// sides of the `"; have "` boundary. A regression that dropped
+    /// the human-readable format or reverted to raw bytes would
+    /// surface here.
+    #[test]
+    fn ensure_free_space_bails_when_space_insufficient() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let huge = ModelSpec {
+            file_name: "ginormous.gguf",
+            url: "https://placeholder.example/ginormous.gguf",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            // u64::MAX / 2 plus the 10% margin stays within u64 range
+            // and saturates under saturating_add — either way the
+            // needed byte count exceeds any real filesystem's
+            // blocks_available * fragment_size product.
+            size_bytes: u64::MAX / 2,
+        };
+        let err = ensure_free_space(tmp.path(), &huge).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.starts_with("Need "),
+            "error must lead with 'Need ': {rendered}"
+        );
+        assert!(
+            rendered.contains(" free at "),
+            "error must carry ' free at ' infix: {rendered}"
+        );
+        assert!(
+            rendered.contains("; have "),
+            "error must carry '; have ' separator: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{}", tmp.path().display())),
+            "error must echo the parent path: {rendered}"
+        );
+        // `u64::MAX / 2` is ~8.00 EiB; HumanBytes tops out at PiB and
+        // renders anything larger in PiB as well (e.g. "8191.99 PiB"),
+        // so accept PiB or the smaller IEC prefixes — just not a
+        // bare-byte `"B"` reading with no prefix.
+        let rendered_after_need = rendered
+            .strip_prefix("Need ")
+            .expect("starts_with 'Need ' above");
+        let needed_portion = rendered_after_need
+            .split_once(" free at ")
+            .expect("infix present")
+            .0;
+        assert!(
+            ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
+                .iter()
+                .any(|p| needed_portion.contains(p)),
+            "needed size must render with an IEC prefix, got: {needed_portion:?}"
+        );
+    }
+
+    /// Pin the IEC human-readable rendering for `DEFAULT_MODEL`'s
+    /// 2500 MiB: `HumanBytes(2500 * 1024 * 1024)` lands as
+    /// `"2.44 GiB"`, and `HumanBytes(2750 * 1024 * 1024)` — the
+    /// size plus the 10% margin — lands as `"2.69 GiB"`. This does
+    /// NOT go through `ensure_free_space` because a real tempdir
+    /// filesystem trivially clears a 2.69 GiB gate and the error
+    /// path never fires. The test instead pins the formatter's
+    /// exact string so a regression that swapped to `DecimalBytes`
+    /// (SI prefixes, `"2.88 GB"` for 2750 MiB) or to raw bytes
+    /// would surface here.
+    #[test]
+    fn human_bytes_rendering_is_pinned_for_default_model_size() {
+        let size_only = 2500u64 * 1024 * 1024;
+        let size_plus_margin = size_only + size_only / 10;
+        assert_eq!(format!("{}", indicatif::HumanBytes(size_only)), "2.44 GiB");
+        assert_eq!(
+            format!("{}", indicatif::HumanBytes(size_plus_margin)),
+            "2.69 GiB"
+        );
     }
 }
