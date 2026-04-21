@@ -57,11 +57,6 @@ impl Latch {
             guard = self.cv.wait(guard).unwrap();
         }
     }
-
-    /// Non-blocking probe of the current state.
-    pub fn is_set(&self) -> bool {
-        *self.set.lock().unwrap()
-    }
 }
 
 /// Input for Phase B probe attachment (BPF fentry/fexit).
