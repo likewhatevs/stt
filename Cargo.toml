@@ -30,7 +30,7 @@ gix = { version = "0.81", default-features = false, features = ["sha1", "blockin
 reqwest = { version = "0.13", features = ["blocking"] }
 tar = "0.4"
 tempfile = "3"
-xz2 = "0.1"
+xz2 = { version = "0.1", features = ["static"] }
 opendal = { version = "0.55", default-features = false, features = ["services-ghac"] }
 tokio = { version = "1", features = ["rt"] }
 zstd = { version = "0.13", features = ["zstdmt"] }
@@ -108,6 +108,7 @@ tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy
 
 [profile.release]
 lto = "thin"
+panic = "abort"
 
 [features]
 integration = []
