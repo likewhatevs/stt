@@ -2753,4 +2753,64 @@ mod tests {
         let s = "<think>the string <think> appears</think>";
         assert_eq!(strip_think_block(s), s);
     }
+
+    /// `locate()` is the fast-path sibling of `ensure()` used by
+    /// `load_inference` when `PREFETCH_VERIFIED` is set: it resolves
+    /// the cache path without re-hashing, but bails if the file has
+    /// disappeared between the successful prefetch and the lazy load.
+    /// Pins the error wording for that bail so a caller relying on
+    /// the "has since been removed" diagnostic (or the file-name and
+    /// path in the rendered chain) still sees it if the function is
+    /// refactored. Empty cache dir + absent file drives execution to
+    /// the `!path.is_file()` branch; no SHA check or download fires.
+    #[test]
+    fn locate_errors_when_cached_file_missing() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+        let err = locate(&DEFAULT_MODEL).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("has since been removed"),
+            "expected 'has since been removed' diagnostic, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(DEFAULT_MODEL.file_name),
+            "error must name the missing artifact: {rendered}"
+        );
+        let expected_path = tmp.path().join(DEFAULT_MODEL.file_name);
+        assert!(
+            rendered.contains(&expected_path.display().to_string()),
+            "error must include the resolved cache path: {rendered}"
+        );
+    }
+
+    /// Happy-path complement to [`locate_errors_when_cached_file_missing`].
+    /// With the file present at `root.join(spec.file_name)`, locate()
+    /// must return Ok with the resolved PathBuf — no SHA check, no
+    /// network. File contents are irrelevant: locate() gates on
+    /// `path.is_file()` only (the caller contract is that SHA was
+    /// verified earlier via `prefetch_if_required`). An empty file is
+    /// enough to pass `is_file()` and prove the Ok branch returns the
+    /// expected `root.join(file_name)` path.
+    #[test]
+    fn locate_returns_path_when_cached_file_present() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+        let expected_path = tmp.path().join(DEFAULT_MODEL.file_name);
+        std::fs::write(&expected_path, []).unwrap();
+        let got = locate(&DEFAULT_MODEL).unwrap();
+        assert_eq!(got, expected_path);
+    }
 }
