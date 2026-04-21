@@ -92,6 +92,12 @@ strum = { version = "0.27", features = ["derive"] }
 # in sha1 only; sha2 is a fresh dep and only the model-cache code
 # path needs it, so keep the feature surface minimal.
 sha2 = "0.10"
+# Local inference backend for `OutputFormat::LlmExtract`. CPU-only —
+# no cuda/metal feature flags are forwarded.
+candle = { package = "candle-core", version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+candle-transformers = { version = "0.10", default-features = false }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
 [profile.release]
 lto = "thin"

@@ -55,14 +55,15 @@
 //! payload's [`OutputFormat::LlmExtract`] fires:
 //!
 //! 1. [`compose_prompt`] assembles `{LLM_EXTRACT_PROMPT_TEMPLATE}\n\n{focus}STDOUT:\n{body}`.
-//! 2. [`invoke_inference`] runs the (currently stubbed) backend.
+//! 2. [`invoke_with_model`] runs the backend.
 //! 3. On `Ok`, [`super::metrics::find_and_parse_json`] extracts the
 //!    JSON region; parsed values flow through
 //!    [`super::metrics::walk_json_leaves`] pre-tagged with
 //!    [`MetricSource::LlmExtract`](crate::test_support::MetricSource::LlmExtract).
-//! 4. A JSON-parse failure retries the inference call ONCE. Infra
-//!    errors (backend not wired, model missing) never retry — the
-//!    second call would hit the same wall.
+//! 4. A JSON-parse failure or infra error (model missing, forward-
+//!    pass error) returns an empty metric set. No retry: under
+//!    deterministic ArgMax sampling a second call on the same
+//!    prompt produces byte-identical output.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -100,16 +101,34 @@ pub struct ModelSpec {
 /// Default model served when a payload declares
 /// [`OutputFormat::LlmExtract`] without pointing at a custom pin.
 ///
-/// URL + SHA-256 are placeholder constants until the real Qwen2.5
-/// 0.5B Q4 artifact is mirrored. The SHA is not the zero digest
-/// (that would silently validate an empty file); instead the all-
-/// `?` marker trips the hex-decode step in [`verify_sha256`] with a
-/// clear error.
+/// Qwen3-4B Q4_K_M GGUF (~2.44 GiB). URL points at the official
+/// `Qwen/Qwen3-4B-GGUF` repo on Hugging Face. SHA-256 is a
+/// placeholder until the artifact is hashed locally; the all-`?`
+/// marker trips the hex-decode step in [`verify_sha256`] with a
+/// clear error rather than silently validating the wrong bytes.
 pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
-    file_name: "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-    url: "https://UNPINNED-model-url.example/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    file_name: "Qwen3-4B-Q4_K_M.gguf",
+    url: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
     sha256_hex: "????????????????????????????????????????????????????????????????",
-    size_bytes: 400 * 1024 * 1024,
+    size_bytes: 2500 * 1024 * 1024,
+};
+
+/// Tokenizer artifact paired with [`DEFAULT_MODEL`]. The GGUF file
+/// carries model weights but not the BPE merge table used for
+/// encode/decode, so a separate `tokenizer.json` sits alongside the
+/// model in the cache. Both entries are prefetched together so
+/// LlmExtract inference never trips on a half-ready cache.
+///
+/// URL points at the matching Qwen3-4B repo on Hugging Face.
+/// SHA-256 is a placeholder on the same footing as [`DEFAULT_MODEL`]
+/// — the all-`?` hex trips [`verify_sha256`] with a clear error
+/// until the artifact is hashed locally. Size is ~11 MiB, a typical
+/// BPE tokenizer serialization for Qwen3-class models.
+pub const DEFAULT_TOKENIZER: ModelSpec = ModelSpec {
+    file_name: "Qwen3-4B-tokenizer.json",
+    url: "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json",
+    sha256_hex: "????????????????????????????????????????????????????????????????",
+    size_bytes: 11 * 1024 * 1024,
 };
 
 /// Environment variable that opts out of the eager prefetch.
@@ -420,13 +439,20 @@ pub fn any_test_requires_model() -> bool {
     })
 }
 
-/// Prefetch [`DEFAULT_MODEL`] when at least one registered test
-/// needs it. No-op when `KTSTR_MODEL_OFFLINE` is set (skips fetch,
-/// leaves per-test failures to surface downstream) or when no test
-/// declares [`OutputFormat::LlmExtract`].
+/// Prefetch [`DEFAULT_MODEL`] and [`DEFAULT_TOKENIZER`] when at least
+/// one registered test needs the LlmExtract backend. No-op when
+/// `KTSTR_MODEL_OFFLINE` is set (skips fetch, leaves per-test failures
+/// to surface downstream) or when no test declares
+/// [`OutputFormat::LlmExtract`].
+///
+/// Both artifacts are ensured together because inference needs both —
+/// deferring the tokenizer to first-call would only move a failure
+/// that setup already has the authority to surface.
 ///
 /// Returns `Ok(None)` when no fetch was attempted; `Ok(Some(path))`
-/// when the model is now cached; `Err` on fetch/verify failure.
+/// when both artifacts are now cached (the model path is returned so
+/// callers can log the inference entry point); `Err` on fetch/verify
+/// failure.
 pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     if !any_test_requires_model() {
         return Ok(None);
@@ -436,7 +462,9 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
         eprintln!("ktstr: {OFFLINE_ENV}={v_safe} set; skipping eager model prefetch");
         return Ok(None);
     }
-    ensure(&DEFAULT_MODEL).map(Some)
+    let model_path = ensure(&DEFAULT_MODEL)?;
+    ensure(&DEFAULT_TOKENIZER)?;
+    Ok(Some(model_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,9 +473,8 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
 
 /// Default prompt template prepended to every
 /// [`OutputFormat::LlmExtract`] invocation. Kept here as a const so
-/// tests can assert its exact contents (retry-semantics tests in
-/// particular pin the prompt so a silent wording drift doesn't
-/// invalidate them).
+/// tests can assert its exact contents — a silent wording drift
+/// would re-baseline every downstream behavior expectation.
 ///
 /// The wording is deliberately terse: the model's role is narrow —
 /// look at benchmark stdout, produce a single JSON object of
@@ -486,31 +513,22 @@ pub(crate) fn compose_prompt(stdout: &str, hint: Option<&str>) -> String {
     out
 }
 
-/// Errors surfaced by [`invoke_inference`]. Kept distinct from the
-/// top-level `anyhow::Error` so [`extract_via_llm`] can decide
-/// whether to retry (parse failures retry; infra failures don't).
+/// Errors surfaced by [`invoke_with_model`]. Kept distinct from the
+/// top-level `anyhow::Error` so [`extract_via_llm`] can surface
+/// inference failures separately from the downstream JSON walker.
 #[derive(Debug)]
 pub(crate) enum InferenceError {
-    /// The backend itself is not wired yet. The prompt was never
-    /// evaluated; retrying would hit the same wall and waste
-    /// wallclock.
-    NotWired,
-    /// The backend ran but failed to load the model artifact
-    /// (missing file, corrupt GGUF, etc.). Surfaces via `ensure()`
-    /// errors so test authors can tell whether the cache is stale
-    /// or the pipeline is broken.
+    /// The backend failed to load a model artifact (missing file,
+    /// corrupt GGUF, tokenizer.json missing, etc.) or the forward
+    /// pass itself failed. Surfaces via `ensure()` errors so test
+    /// authors can tell whether the cache is stale or the pipeline
+    /// is broken.
     ModelLoad(anyhow::Error),
 }
 
 impl std::fmt::Display for InferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InferenceError::NotWired => write!(
-                f,
-                "LlmExtract inference backend is not yet wired in this build; \
-                 set KTSTR_MODEL_OFFLINE=1 to skip, or declare OutputFormat::Json \
-                 if your payload emits structured stdout natively"
-            ),
             InferenceError::ModelLoad(e) => write!(f, "LlmExtract model load: {e:#}"),
         }
     }
@@ -519,107 +537,250 @@ impl std::fmt::Display for InferenceError {
 impl std::error::Error for InferenceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            InferenceError::NotWired => None,
             InferenceError::ModelLoad(e) => e.source(),
         }
     }
 }
 
-/// Invoke the local inference backend with `prompt` and return the
-/// model's raw string output (expected to carry a JSON object per
-/// [`LLM_EXTRACT_PROMPT_TEMPLATE`]).
+/// Upper bound on generated tokens for a single LlmExtract
+/// invocation. The prompt template instructs the model to emit a
+/// single JSON object; 512 tokens is enough for a dense metric bag
+/// (hundreds of keys) without letting a runaway generation burn
+/// wall time.
+const SAMPLE_LEN: usize = 512;
+
+/// Deterministic seed. ArgMax sampling ignores the RNG but
+/// `LogitsProcessor::from_sampling` still consumes a seed; pinning
+/// it keeps the constructor call a pure function of the pinned
+/// model weights.
+const SEED: u64 = 299_792_458;
+
+/// Loaded inference state: the Qwen3 weights, its tokenizer, and the
+/// resolved EOS token id. Held on the stack of `extract_via_llm` for
+/// the duration of a single pipeline invocation.
+pub(crate) struct LoadedInference {
+    model: candle_transformers::models::quantized_qwen3::ModelWeights,
+    tokenizer: tokenizers::Tokenizer,
+    eos_id: u32,
+    device: candle::Device,
+}
+
+/// Ensure both artifacts are cached, open the GGUF, build the Qwen3
+/// `ModelWeights`, and load the tokenizer. Returns the bundled state.
 ///
-/// **This function runs on the HOST, not inside the guest VM.**
-/// `extract_via_llm` (and by extension `extract_metrics`) is
-/// invoked host-side after the guest's payload has finished and
-/// its stdout has been captured via the sidecar pipeline. The
-/// model cache lives at `~/.cache/ktstr/models/` on the host and
-/// is consulted by the host-side test process — nothing about
-/// this path touches the guest initramfs, and guest image size
-/// is unaffected by backend selection.
+/// Each failure point surfaces as `InferenceError::ModelLoad` so
+/// `extract_via_llm` can distinguish infra failure from JSON-parse
+/// failure when deciding what to log.
+pub(crate) fn load_inference() -> std::result::Result<LoadedInference, InferenceError> {
+    use candle::{Device, quantized::gguf_file};
+    use candle_transformers::models::quantized_qwen3::ModelWeights;
+    use tokenizers::Tokenizer;
+
+    let model_path = ensure(&DEFAULT_MODEL).map_err(InferenceError::ModelLoad)?;
+    let tokenizer_path = ensure(&DEFAULT_TOKENIZER).map_err(InferenceError::ModelLoad)?;
+
+    let device = Device::Cpu;
+
+    let mut file = std::fs::File::open(&model_path).map_err(|e| {
+        InferenceError::ModelLoad(
+            anyhow::Error::new(e).context(format!("open GGUF model at {}", model_path.display(),)),
+        )
+    })?;
+    let content = gguf_file::Content::read(&mut file)
+        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e.with_path(&model_path))))?;
+    let model = ModelWeights::from_gguf(content, &mut file, &device)
+        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+        InferenceError::ModelLoad(
+            anyhow::Error::msg(e)
+                .context(format!("load tokenizer at {}", tokenizer_path.display(),)),
+        )
+    })?;
+
+    let eos_id = *tokenizer.get_vocab(true).get("<|im_end|>").ok_or_else(|| {
+        InferenceError::ModelLoad(anyhow::anyhow!(
+            "tokenizer vocab missing '<|im_end|>' EOS token",
+        ))
+    })?;
+
+    Ok(LoadedInference {
+        model,
+        tokenizer,
+        eos_id,
+        device,
+    })
+}
+
+/// Run one greedy generation pass against the already-loaded model
+/// and return the decoded assistant text with any `<think>…</think>`
+/// block stripped.
 ///
-/// Backend selection (candle / llama-cpp-rs / similar) is still
-/// open. The blockers for wiring a real backend are host-side:
-/// binary size of the host test process (candle + tokenizer
-/// alone ~40 MiB), and a C/C++ toolchain dependency that would
-/// affect every `cargo build` of the ktstr crate. The pipeline
-/// lands ahead of the backend so downstream callers
-/// (`extract_via_llm`, `extract_metrics`) wire end-to-end; the
-/// backend lands as a follow-up that swaps this function's body.
+/// Caller contract: invoke `model.clear_kv_cache()` between repeated
+/// calls with the same `LoadedInference`. The KV cache otherwise
+/// carries context from the prior attempt and contaminates the
+/// prompt forward pass's position offsets.
 ///
-/// `ensure(&DEFAULT_MODEL)` is still called so a misconfigured
-/// cache surfaces as `ModelLoad` rather than silently passing as
-/// "backend not wired". Tests that do not set `KTSTR_MODEL_OFFLINE`
-/// and have no cached model therefore get an actionable error
-/// naming the missing artifact.
-pub(crate) fn invoke_inference(_prompt: &str) -> std::result::Result<String, InferenceError> {
-    // Probe the cache so a missing / corrupt model surfaces clearly
-    // rather than hiding behind NotWired. A NotWired verdict must
-    // mean "backend code not yet written"; it must NOT absorb a
-    // missing-artifact error that the test author could fix.
-    if let Err(e) = ensure(&DEFAULT_MODEL) {
-        return Err(InferenceError::ModelLoad(e));
+/// Greedy: `Sampling::ArgMax` with a fixed seed. Output is a
+/// deterministic function of the prompt + weights.
+pub(crate) fn invoke_with_model(
+    state: &mut LoadedInference,
+    prompt: &str,
+) -> std::result::Result<String, InferenceError> {
+    use candle::Tensor;
+    use candle_transformers::generation::{LogitsProcessor, Sampling};
+
+    // Qwen3 ChatML prompt. The `/no_think` directive at the end of
+    // the user turn switches the model out of thinking mode per the
+    // Qwen3 model card: the assistant skips the `<think>…</think>`
+    // block and emits the final answer directly. Deterministic JSON
+    // extraction doesn't need the extra tokens a thinking trace
+    // would burn. The post-decode `strip_think_block` below remains
+    // as a belt-and-suspenders defense because the `/no_think`
+    // directive is a soft switch and the model can still emit an
+    // empty `<think></think>` shell.
+    let chat_prompt =
+        format!("<|im_start|>user\n{prompt} /no_think<|im_end|>\n<|im_start|>assistant\n");
+    let encoding = state
+        .tokenizer
+        .encode(chat_prompt, true)
+        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+    let mut logits_processor = LogitsProcessor::from_sampling(SEED, Sampling::ArgMax);
+
+    // Prompt pass: feed the whole prompt at index_pos=0. qwen3's
+    // forward already narrows to the last position and returns shape
+    // `(b, vocab)`; the caller's `squeeze(0)` strips the batch dim.
+    let input = Tensor::new(prompt_tokens.as_slice(), &state.device)
+        .and_then(|t| t.unsqueeze(0))
+        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+    let logits = state
+        .model
+        .forward(&input, 0)
+        .and_then(|l| l.squeeze(0))
+        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+    let mut next_token = logits_processor
+        .sample(&logits)
+        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+
+    let mut generated: Vec<u32> = Vec::with_capacity(SAMPLE_LEN);
+    if next_token != state.eos_id {
+        generated.push(next_token);
     }
-    Err(InferenceError::NotWired)
+
+    // Generation loop. index_pos advances as the sum of prompt
+    // length + positions already generated — the KV cache uses this
+    // to place each new token's Q/K/V in the right slot.
+    for step in 0..SAMPLE_LEN.saturating_sub(1) {
+        if next_token == state.eos_id {
+            break;
+        }
+        let input = Tensor::new(&[next_token], &state.device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        let logits = state
+            .model
+            .forward(&input, prompt_tokens.len() + step)
+            .and_then(|l| l.squeeze(0))
+            .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        next_token = logits_processor
+            .sample(&logits)
+            .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        if next_token == state.eos_id {
+            break;
+        }
+        generated.push(next_token);
+    }
+
+    if next_token != state.eos_id {
+        tracing::warn!(
+            "generation hit {} token cap without EOS — output may be truncated",
+            SAMPLE_LEN,
+        );
+    }
+
+    let decoded = state
+        .tokenizer
+        .decode(&generated, true)
+        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+    Ok(strip_think_block(&decoded).to_string())
+}
+
+/// Strip one or more `<think>…</think>` blocks from the model's raw
+/// output. Qwen3 emits a thinking trace by default; `/no_think` in
+/// the user prompt suppresses it, but an empty `<think></think>`
+/// shell can still appear and a stray trace under other prompts is
+/// also possible. The downstream JSON walker doesn't care about
+/// prose surrounding the JSON region, but a half-balanced think
+/// block (missing closing tag from a truncated generation) is left
+/// as-is to avoid hiding corruption.
+fn strip_think_block(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains("<think>") {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find("<think>") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + "<think>".len()..];
+        match after_open.find("</think>") {
+            Some(close) => {
+                rest = &after_open[close + "</think>".len()..];
+            }
+            None => {
+                // Unterminated: keep the remaining tail verbatim so a
+                // truncation bug is visible rather than masked.
+                out.push_str(&rest[open..]);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Run the full LlmExtract pipeline against `stdout` and return the
 /// resulting metrics, all pre-tagged with
 /// [`MetricSource::LlmExtract`](super::MetricSource::LlmExtract).
 ///
-/// Retry semantics: the inference call is made once; on a
-/// JSON-parse failure of the model's first response a second
-/// inference call is made with the same prompt. A second parse
-/// failure (or an infra error at any point) returns an empty
+/// A single inference call is made. An infra error or a
+/// JSON-parse failure of the model's response returns an empty
 /// metric set — matching the [`extract_metrics`] contract that
 /// extraction errors are non-fatal and the downstream
 /// [`Check`](crate::test_support::Check) evaluation reports each
 /// referenced metric as missing.
 ///
-/// Inference-backend errors never retry — a `NotWired` backend
-/// cannot succeed on a second try and retrying would only burn
-/// wall time. Only JSON-parse failures get a second attempt.
+/// No retry: under `Sampling::ArgMax` with a fixed seed, a second
+/// inference call on the same prompt + weights produces byte-
+/// identical output. Retrying would only burn wall time without
+/// changing the result.
 pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Metric> {
     let prompt = compose_prompt(stdout, hint);
 
-    // First inference attempt.
-    let response = match invoke_inference(&prompt) {
+    let mut state = match load_inference() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ktstr: LlmExtract inference failed (attempt 1): {e}");
+            eprintln!("ktstr: LlmExtract model load failed: {e}");
             return Vec::new();
         }
     };
-    if let Some(json) = super::metrics::find_and_parse_json(&response) {
-        return super::metrics::walk_json_leaves(&json, super::MetricSource::LlmExtract);
-    }
 
-    // Retry once — ONLY on JSON parse failure. The assumption is
-    // that a tiny local model can occasionally emit a leading
-    // preamble / code fence despite the prompt's "no prose"
-    // instruction; a second roll of the dice often lands a clean
-    // JSON response. Infra-layer failures (model missing, backend
-    // not wired) don't retry because the second call would hit the
-    // same wall.
-    eprintln!(
-        "ktstr: LlmExtract first response was not parseable JSON \
-         ({} bytes); retrying once",
-        response.len(),
-    );
-    let retry = match invoke_inference(&prompt) {
+    let response = match invoke_with_model(&mut state, &prompt) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ktstr: LlmExtract inference failed (attempt 2): {e}");
+            eprintln!("ktstr: LlmExtract inference failed: {e}");
             return Vec::new();
         }
     };
-    match super::metrics::find_and_parse_json(&retry) {
+    match super::metrics::find_and_parse_json(&response) {
         Some(json) => super::metrics::walk_json_leaves(&json, super::MetricSource::LlmExtract),
         None => {
             eprintln!(
-                "ktstr: LlmExtract retry response also not parseable JSON \
+                "ktstr: LlmExtract response was not parseable JSON \
                  ({} bytes); returning empty metric set",
-                retry.len(),
+                response.len(),
             );
             Vec::new()
         }
@@ -787,12 +948,12 @@ mod tests {
 
     #[test]
     fn default_model_size_is_in_expected_ballpark() {
-        // The placeholder is 400 MiB; the frozen design targets an
-        // artifact in that order of magnitude. A wildly different
-        // size signals someone swapped the placeholder for a
-        // mistaken pin.
+        // The pinned Qwen3-4B Q4_K_M GGUF is ~2.44 GiB; the frozen
+        // design targets an artifact in the low-GiB range. A wildly
+        // different size signals someone swapped the pin for a
+        // mistaken artifact.
         const { assert!(DEFAULT_MODEL.size_bytes > 100 * 1024 * 1024) };
-        const { assert!(DEFAULT_MODEL.size_bytes < 2 * 1024 * 1024 * 1024) };
+        const { assert!(DEFAULT_MODEL.size_bytes < 4 * 1024 * 1024 * 1024) };
     }
 
     #[test]
@@ -1065,7 +1226,7 @@ mod tests {
     // -- LlmExtract pipeline --
 
     /// The default prompt is constant and load-bearing: a silent
-    /// drift would re-baseline every cached retry-behavior
+    /// drift would re-baseline every downstream behavior
     /// expectation. Anchor on a prefix + tail so whitespace cleanup
     /// still catches surprise edits.
     #[test]
@@ -1115,14 +1276,6 @@ mod tests {
     }
 
     #[test]
-    fn inference_error_not_wired_message_mentions_offline_escape() {
-        let e = InferenceError::NotWired;
-        let msg = format!("{e}");
-        assert!(msg.contains("KTSTR_MODEL_OFFLINE"));
-        assert!(msg.contains("OutputFormat::Json"));
-    }
-
-    #[test]
     fn inference_error_display_includes_source_chain() {
         // ModelLoad wraps an anyhow::Error; {:#} should traverse the
         // source chain so a test author can see *why* the load failed.
@@ -1132,32 +1285,32 @@ mod tests {
         assert!(msg.contains("root cause: cache corrupt"), "msg: {msg}");
     }
 
-    /// With the stub backend, `invoke_inference` must NEVER return
-    /// `Ok`. If the stub is ever lifted accidentally (e.g. someone
-    /// stubs a successful response for testing without wiring the
-    /// retry-on-parse-failure path), this test fires first so the
-    /// pipeline gets the real treatment rather than a half-stub.
+    /// Under the offline gate with no cached artifacts,
+    /// `load_inference` must surface a `ModelLoad` error whose
+    /// message echoes the offline env var — that is the signal the
+    /// caller needs to distinguish a user-requested skip from a
+    /// pipeline bug. Pins the error kind so a regression that
+    /// upgraded the offline error to a generic anyhow surface would
+    /// fire here first.
     #[test]
-    fn invoke_inference_stub_always_errs() {
+    fn load_inference_errs_with_model_load_under_offline_gate() {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev_offline = std::env::var(OFFLINE_ENV).ok();
         // Forcing offline ensures `ensure` bails on the uncached
-        // placeholder model rather than attempting a network fetch;
-        // the downstream invoke_inference should map that to a
-        // `ModelLoad` error, not `NotWired`.
+        // placeholder model rather than attempting a network fetch.
         // SAFETY: ENV_LOCK serializes process-wide env mutations.
         unsafe { std::env::set_var(OFFLINE_ENV, "1") };
-        let r = invoke_inference("ignored");
-        assert!(r.is_err());
-        if let Err(InferenceError::ModelLoad(e)) = &r {
-            assert!(
-                format!("{e:#}").contains(OFFLINE_ENV),
-                "expected offline gate error, got: {e:#}"
-            );
-        } else {
-            panic!("expected ModelLoad(...) under offline gate, got {r:?}");
+        let r = load_inference();
+        match r {
+            Err(InferenceError::ModelLoad(e)) => {
+                assert!(
+                    format!("{e:#}").contains(OFFLINE_ENV),
+                    "expected offline gate error, got: {e:#}"
+                );
+            }
+            Ok(_) => panic!("expected Err under offline gate, got Ok"),
         }
         unsafe {
             match prev_offline {
@@ -1167,13 +1320,14 @@ mod tests {
         }
     }
 
-    /// End-to-end stub behavior: the LlmExtract pipeline must return
-    /// an empty metric set when the backend is unwired/unavailable,
-    /// and must not panic on any stdout shape. This covers the
-    /// contract metrics.rs relies on for its
-    /// `llm_extract_returns_empty_when_backend_unwired` test.
+    /// End-to-end unavailable-backend behavior: the LlmExtract
+    /// pipeline must return an empty metric set when inference
+    /// cannot run (uncached artifacts under the offline gate), and
+    /// must not panic on any stdout shape. The offline gate trips
+    /// `ensure()` before any model load, so the inference call
+    /// fails cleanly and the pipeline reports no metrics.
     #[test]
-    fn extract_via_llm_returns_empty_under_stub_backend() {
+    fn extract_via_llm_returns_empty_when_backend_unavailable() {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1190,5 +1344,47 @@ mod tests {
                 None => std::env::remove_var(OFFLINE_ENV),
             }
         }
+    }
+
+    // -- strip_think_block --
+
+    #[test]
+    fn strip_think_block_noop_on_absent_tag() {
+        let s = "plain output with no think block";
+        let out = strip_think_block(s);
+        // Borrowed fast path: input without `<think>` must not
+        // allocate a new String.
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn strip_think_block_removes_complete_block() {
+        let s = "pre <think>reasoning trace</think> post";
+        assert_eq!(strip_think_block(s), "pre  post");
+    }
+
+    #[test]
+    fn strip_think_block_removes_empty_shell() {
+        // /no_think suppresses thinking but an empty shell can still
+        // leak through. Must be stripped so `find_and_parse_json`
+        // doesn't see the tags at all.
+        let s = "<think></think>{\"latency_ms\": 42}";
+        assert_eq!(strip_think_block(s), "{\"latency_ms\": 42}");
+    }
+
+    #[test]
+    fn strip_think_block_removes_multiple_blocks() {
+        let s = "<think>a</think>middle<think>b</think>end";
+        assert_eq!(strip_think_block(s), "middleend");
+    }
+
+    #[test]
+    fn strip_think_block_preserves_unterminated_open_tag() {
+        // Unterminated trace (e.g. SAMPLE_LEN cut mid-think) is kept
+        // verbatim so the truncation is visible downstream instead
+        // of silently masked by a partial strip.
+        let s = "before <think>unclosed trace and then garbage";
+        assert_eq!(strip_think_block(s), s);
     }
 }

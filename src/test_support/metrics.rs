@@ -297,33 +297,52 @@ mod tests {
     }
 
     #[test]
-    fn llm_extract_returns_empty_when_backend_unwired() {
+    fn llm_extract_returns_empty_when_backend_unavailable() {
         // LlmExtract delegates to `model::extract_via_llm`, which
-        // calls `invoke_inference` — currently a stub returning
-        // `InferenceError::NotWired`. The pipeline treats that as
-        // a non-fatal extraction error and returns an empty metric
-        // set so downstream Check evaluation reports each referenced
+        // calls `invoke_inference`. Forcing the offline gate makes
+        // `ensure()` bail on the uncached placeholder model, so both
+        // inference attempts surface as `ModelLoad` errors and the
+        // pipeline returns an empty metric set — non-fatal extraction
+        // error so downstream Check evaluation reports each referenced
         // metric as missing rather than failing the whole run.
-        //
-        // Once the real backend lands (candle/llama-cpp-rs), this
-        // test flips to asserting a non-empty result against a
-        // canned prompt/response fixture. Deliberately not set up
-        // for that yet — stubbed backend + no fixture model file =
-        // empty output, which is the contracted behavior.
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_offline = std::env::var("KTSTR_MODEL_OFFLINE").ok();
+        // SAFETY: ENV_LOCK serializes process-wide env mutations.
+        unsafe { std::env::set_var("KTSTR_MODEL_OFFLINE", "1") };
         let m = extract_metrics("anything", &OutputFormat::LlmExtract(None));
         assert!(m.is_empty());
+        unsafe {
+            match prev_offline {
+                Some(v) => std::env::set_var("KTSTR_MODEL_OFFLINE", v),
+                None => std::env::remove_var("KTSTR_MODEL_OFFLINE"),
+            }
+        }
     }
 
     #[test]
-    fn llm_extract_with_hint_still_returns_empty_unwired() {
-        // Same as above but exercising the hint-carrying variant
-        // so the dispatch path that plumbs `hint` into
-        // `extract_via_llm` is covered.
+    fn llm_extract_with_hint_returns_empty_when_backend_unavailable() {
+        // Same contract as `llm_extract_returns_empty_when_backend_unavailable`
+        // but exercising the hint-carrying variant so the dispatch path
+        // that plumbs `hint` into `extract_via_llm` is covered.
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_offline = std::env::var("KTSTR_MODEL_OFFLINE").ok();
+        // SAFETY: ENV_LOCK serializes process-wide env mutations.
+        unsafe { std::env::set_var("KTSTR_MODEL_OFFLINE", "1") };
         let m = extract_metrics(
             "anything",
             &OutputFormat::LlmExtract(Some("focus on latency")),
         );
         assert!(m.is_empty());
+        unsafe {
+            match prev_offline {
+                Some(v) => std::env::set_var("KTSTR_MODEL_OFFLINE", v),
+                None => std::env::remove_var("KTSTR_MODEL_OFFLINE"),
+            }
+        }
     }
 
     #[test]
