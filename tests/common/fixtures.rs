@@ -22,7 +22,8 @@
 //! the path up at test time.
 //!
 //! The fixtures cover all three
-//! [`OutputFormat`](ktstr::test_support::OutputFormat) variants:
+//! [`OutputFormat`](ktstr::test_support::OutputFormat) variants
+//! — plus the hinted subvariant of `LlmExtract`:
 //!
 //! - [`FIO`] and [`FIO_JSON`] declare `OutputFormat::Json` with a
 //!   set of [`MetricHint`](ktstr::test_support::MetricHint)s
@@ -36,12 +37,21 @@
 //!   emits human-readable percentile tables, so extraction is
 //!   routed through the local LLM pipeline rather than the JSON
 //!   walker.
+//! - [`SCHBENCH_HINTED`] declares
+//!   `OutputFormat::LlmExtract(Some("focus on wakeup latency
+//!   percentiles"))` — identical to [`SCHBENCH`] in every other
+//!   field, exercising the derive's `LlmExtract("hint")` call
+//!   form and the hint-threading path through
+//!   [`extract_via_llm`](ktstr::test_support::model::extract_via_llm).
 //!
 //! All fixtures use short, stable `name` fields matching their
-//! binary names — except FIO_JSON, which uses `"fio_json"` to
-//! coexist with FIO in the same workloads list. The binary names
-//! themselves (`"fio"`, `"stress-ng"`, `"schbench"`) are what
-//! ktstr's include-files infrastructure resolves inside the guest.
+//! binary names — except FIO_JSON (`"fio_json"`) and
+//! SCHBENCH_HINTED (`"schbench_hinted"`), which use distinct
+//! names so they can coexist with FIO and SCHBENCH respectively
+//! under the pairwise-dedup rule on `#[ktstr_test(workloads =
+//! [...])]`. The binary names themselves (`"fio"`, `"stress-ng"`,
+//! `"schbench"`) are what ktstr's include-files infrastructure
+//! resolves inside the guest.
 
 use ktstr::Payload;
 
@@ -150,3 +160,30 @@ pub struct StressNgPayload;
 #[default_check(exit_code_eq(0))]
 #[allow(dead_code)]
 pub struct SchbenchPayload;
+
+/// Hint-carrying sibling of [`SCHBENCH`] — identical in every
+/// field except `name` (so the two can coexist as workloads in a
+/// single `#[ktstr_test(workloads = [...])]` attribute under the
+/// pairwise-dedup rule) and `output`.
+///
+/// Declares `output = LlmExtract("focus on wakeup latency
+/// percentiles")`. The derive macro translates the call form into
+/// [`OutputFormat::LlmExtract(Some(...))`](ktstr::test_support::OutputFormat::LlmExtract),
+/// and the stored `&'static str` is appended to the default LLM
+/// prompt by
+/// [`extract_via_llm`](ktstr::test_support::model::extract_via_llm)
+/// when the fixture runs — steering the model toward the stat the
+/// scheduler regression cares about instead of whatever numeric
+/// leaf the model picks first.
+///
+/// Exists as a fixture (rather than only as an ad-hoc
+/// `#[derive(Payload)]` inside the test file) so downstream
+/// scheduler-author crates have a copy-ready template for the
+/// hint-carrying shape — the bare [`SCHBENCH`] covers the
+/// no-hint form, this fixture covers the with-hint form.
+#[derive(Payload)]
+#[payload(binary = "schbench", name = "schbench_hinted", output = LlmExtract("focus on wakeup latency percentiles"))]
+#[default_args("--runtime", "30", "--message-threads", "2")]
+#[default_check(exit_code_eq(0))]
+#[allow(dead_code)]
+pub struct SchbenchHintedPayload;
