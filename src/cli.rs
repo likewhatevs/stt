@@ -398,8 +398,13 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
 }
 
 /// Run make with merged stdout+stderr piped through a spinner.
-/// Uses `sh -c "make ... 2>&1"` for a single pipe — one reader,
-/// no threads, no channel, no pipe-buffer deadlock.
+///
+/// Creates a single pipe via `nix::unistd::pipe`, hands the write end
+/// to the child's stdout AND stderr (a clone), and reads from the
+/// read end. One pipe, one reader — no threads, no channel, no
+/// chance of a deadlock where reading stdout blocks while stderr
+/// fills its buffer. Same merged-stream semantics that `sh -c
+/// "make … 2>&1"` gives, without the shell-out.
 ///
 /// When a spinner is active, each line is printed via `println()`
 /// so the spinner redraws below the output. When no spinner,
@@ -409,17 +414,26 @@ pub fn run_make_with_output(
     args: &[&str],
     spinner: Option<&Spinner>,
 ) -> Result<()> {
-    let make_cmd = format!("make {} 2>&1", args.join(" "));
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", &make_cmd])
-        .current_dir(kernel_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let (read_fd, write_fd) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+        .context("create pipe for merged make stdout+stderr")?;
+    let write_fd_err = write_fd
+        .try_clone()
+        .context("clone pipe write end for stderr")?;
 
-    let stdout = child.stdout.take().expect("piped stdout");
+    let mut child = std::process::Command::new("make")
+        .args(args)
+        .current_dir(kernel_dir)
+        .stdout(std::process::Stdio::from(write_fd))
+        .stderr(std::process::Stdio::from(write_fd_err))
+        .spawn()
+        .with_context(|| format!("spawn make {}", args.join(" ")))?;
+
+    // Parent has no remaining writer handles — both clones were
+    // moved into the child's Stdio above. Child's writes end when
+    // it exits, so the reader sees EOF naturally.
+    let reader = std::fs::File::from(read_fd);
     let mut captured = Vec::new();
-    for line in std::io::BufReader::new(stdout)
+    for line in std::io::BufReader::new(reader)
         .lines()
         .map_while(Result::ok)
     {

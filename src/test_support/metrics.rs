@@ -12,9 +12,8 @@
 //!
 //! [`OutputFormat::LlmExtract`] routes stdout through
 //! [`crate::test_support::model::extract_via_llm`]: the model owns
-//! prompt composition, retry-once-on-parse-failure, and the initial
-//! JSON-from-prose parse, then feeds the resulting
-//! `serde_json::Value` into this module's
+//! prompt composition and the initial JSON-from-prose parse, then
+//! feeds the resulting `serde_json::Value` into this module's
 //! [`walk_json_leaves`] with the source pre-tagged to
 //! [`MetricSource::LlmExtract`]. One extraction walker, two
 //! acquisition paths.
@@ -33,11 +32,11 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 ///
 /// [`OutputFormat::LlmExtract`] with an optional `hint` delegates to
 /// [`crate::test_support::model::extract_via_llm`], which composes a
-/// prompt (appending the hint when present), invokes the local
-/// inference backend, retries once on a JSON-parse failure, and walks
-/// the resulting JSON with [`MetricSource::LlmExtract`]. An
-/// unwired/unavailable inference backend yields an empty metric
-/// set, matching the non-fatal contract above.
+/// prompt (appending the hint when present), runs a single
+/// deterministic (ArgMax) inference pass, and walks the resulting
+/// JSON with [`MetricSource::LlmExtract`]. An unavailable inference
+/// backend (missing cache, forward-pass failure) yields an empty
+/// metric set, matching the non-fatal contract above.
 pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Vec<Metric> {
     match format {
         OutputFormat::ExitCode => Vec::new(),

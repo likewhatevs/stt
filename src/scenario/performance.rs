@@ -100,7 +100,7 @@ pub fn custom_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
     let fan_out = 4usize;
     let group_size = fan_out + 1;
     // Round down to nearest multiple of group_size, at least one group.
-    let n_fanout = (ctx.workers_per_cgroup / group_size).max(1) * group_size;
+    let n_fan_out = (ctx.workers_per_cgroup / group_size).max(1) * group_size;
 
     let checks = Assert::default_checks()
         .max_wake_latency_cv(10.0)
@@ -109,7 +109,7 @@ pub fn custom_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0")
-                .workers(n_fanout)
+                .workers(n_fan_out)
                 .work_type(WorkType::futex_fan_out(fan_out, 1024)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],

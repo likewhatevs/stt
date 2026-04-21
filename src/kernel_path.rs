@@ -135,8 +135,16 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
         }
     }
 
-    // 4. Installed kernel build dir.
-    if let Some(rel) = _kernel_release() {
+    // 4. Installed kernel build dir. Read `/proc/sys/kernel/osrelease`
+    // directly instead of shelling out to `uname -r`; the procfs entry
+    // is the same value the kernel exposes via the uname(2) syscall
+    // (see linux/kernel/sys.c: override_release()) and costs only a
+    // read of a small text file.
+    if let Some(rel) = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         let p = std::path::PathBuf::from(format!("/lib/modules/{rel}/build"));
         if p.is_dir() {
             return Some(p);
@@ -264,12 +272,18 @@ pub fn find_image(kernel_dir: Option<&str>, release: Option<&str>) -> Option<std
         return Some(img);
     }
 
-    // Host fallback paths.
+    // Host fallback paths. When `release` is not supplied, read the
+    // running kernel release from `/proc/sys/kernel/osrelease` rather
+    // than shelling out to `uname -r` — it's the same value the
+    // kernel exposes via uname(2) and needs only a small file read.
     let owned_release;
     let rel = match release {
         Some(r) => Some(r),
         None => {
-            owned_release = _kernel_release();
+            owned_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             owned_release.as_deref()
         }
     };
@@ -331,17 +345,6 @@ fn _has_kernel_artifacts(dir: &std::path::Path) -> bool {
         return true;
     }
     false
-}
-
-/// Get the running kernel release string (equivalent to `uname -r`).
-#[allow(dead_code)]
-fn _kernel_release() -> Option<String> {
-    std::process::Command::new("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
 #[cfg(test)]
@@ -596,18 +599,6 @@ mod tests {
         // Nonexistent explicit dir: is_dir() is false, returns None
         // immediately with no fallthrough.
         let _ = find_image(Some("/nonexistent/image/dir/xyz"), None);
-    }
-
-    // -- _kernel_release --
-
-    #[test]
-    fn kernel_path_kernel_release_returns_string() {
-        let rel = _kernel_release();
-        // uname -r should succeed on any Linux host.
-        assert!(rel.is_some());
-        let s = rel.unwrap();
-        assert!(!s.is_empty());
-        assert!(!s.contains('\n'));
     }
 
     // -- KernelId parsing --

@@ -4285,7 +4285,7 @@ mod tests {
     // -- FutexFanOut tests --
 
     #[test]
-    fn spawn_futex_fanout_produces_work() {
+    fn spawn_futex_fan_out_produces_work() {
         let config = WorkloadConfig {
             num_workers: 5, // 1 messenger + 4 receivers
             affinity: AffinityMode::None,
@@ -4307,7 +4307,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_futex_fanout_receivers_record_wake_latency() {
+    fn spawn_futex_fan_out_receivers_record_wake_latency() {
         let config = WorkloadConfig {
             num_workers: 5,
             affinity: AffinityMode::None,
@@ -4328,7 +4328,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_futex_fanout_bad_worker_count_fails() {
+    fn spawn_futex_fan_out_bad_worker_count_fails() {
         let config = WorkloadConfig {
             num_workers: 3, // not divisible by 5
             affinity: AffinityMode::None,
@@ -4349,7 +4349,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_futex_fanout_two_groups() {
+    fn spawn_futex_fan_out_two_groups() {
         let config = WorkloadConfig {
             num_workers: 10, // 2 groups of (1+4)
             affinity: AffinityMode::None,
@@ -4372,7 +4372,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_futex_fanout_fan_out_one() {
+    fn spawn_futex_fan_out_single_receiver() {
         // Minimal fan-out: 1 messenger + 1 receiver per group (like ping-pong).
         let config = WorkloadConfig {
             num_workers: 2,
@@ -4395,7 +4395,7 @@ mod tests {
     }
 
     #[test]
-    fn work_type_futex_fanout_name() {
+    fn work_type_futex_fan_out_name() {
         let wt = WorkType::FutexFanOut {
             fan_out: 4,
             spin_iters: 1024,
@@ -4404,7 +4404,7 @@ mod tests {
     }
 
     #[test]
-    fn work_type_futex_fanout_from_name() {
+    fn work_type_futex_fan_out_from_name() {
         let wt = WorkType::from_name("FutexFanOut").unwrap();
         match wt {
             WorkType::FutexFanOut {
@@ -4419,7 +4419,7 @@ mod tests {
     }
 
     #[test]
-    fn work_type_futex_fanout_group_size() {
+    fn work_type_futex_fan_out_group_size() {
         let wt = WorkType::FutexFanOut {
             fan_out: 4,
             spin_iters: 1024,
