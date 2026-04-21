@@ -458,15 +458,32 @@ pub fn run_make_with_output(
     // hiding real compiler errors in CI logs. Lossy conversion keeps
     // every line visible with U+FFFD where the bytes were not valid
     // UTF-8.
-    let reader = std::fs::File::from(read_fd);
-    let mut reader = std::io::BufReader::new(reader);
+    let mut reader = std::io::BufReader::new(std::fs::File::from(read_fd));
     let mut captured = Vec::new();
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        let n = reader
-            .read_until(b'\n', &mut buf)
-            .context("read merged make stdout+stderr")?;
+        // On pipe-read I/O failure, kill and reap the child before
+        // propagating so `make` doesn't linger as a zombie. `?` would
+        // return with the Child's `Drop` impl also not reaping it
+        // (stdlib documents that Child does not auto-wait on drop).
+        // `kill` is a no-op against a process already waited on —
+        // stdlib's send_signal early-returns when `self.status` is
+        // set. Against a still-running or zombie child the SIGKILL
+        // either terminates or is delivered to the already-dead task
+        // entry; the actual outcome doesn't matter to this path.
+        // `wait` then reaps the process-table entry and yields the
+        // exit status (or the signal we just sent). Both operations
+        // use `.ok()` because the read-side error is the actionable
+        // diagnostic; a secondary wait/kill failure should not mask it.
+        let n = match reader.read_until(b'\n', &mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(e).context("read merged make stdout+stderr");
+            }
+        };
         if n == 0 {
             break;
         }
