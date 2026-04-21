@@ -151,23 +151,23 @@ fn cover_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<AssertRes
 }
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::interaction::custom_cgroup_noctrl_task_migration(ctx)
+fn cover_cgroup_no_ctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::interaction::custom_cgroup_no_ctrl_task_migration(ctx)
 }
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::interaction::custom_cgroup_noctrl_imbalance(ctx)
+fn cover_cgroup_no_ctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::interaction::custom_cgroup_no_ctrl_imbalance(ctx)
 }
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::interaction::custom_cgroup_noctrl_cpuset_change(ctx)
+fn cover_cgroup_no_ctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::interaction::custom_cgroup_no_ctrl_cpuset_change(ctx)
 }
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::interaction::custom_cgroup_noctrl_load_imbalance(ctx)
+fn cover_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::interaction::custom_cgroup_no_ctrl_load_imbalance(ctx)
 }
 
 #[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
@@ -203,8 +203,8 @@ fn cover_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::nested::custom_nested_cgroup_noctrl(ctx)
+fn cover_nested_cgroup_no_ctrl(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::nested::custom_nested_cgroup_no_ctrl(ctx)
 }
 
 // -- stress --
@@ -240,8 +240,8 @@ fn cover_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 #[ktstr_test(llcs = 2, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::stress::custom_cgroup_cpuset_crossllc_race(ctx)
+fn cover_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::stress::custom_cgroup_cpuset_cross_llc_race(ctx)
 }
 
 // -- performance --
@@ -264,6 +264,11 @@ fn cover_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_fan_out_wake(ctx)
+}
+
+#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
+fn cover_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::performance::custom_fan_out_compute(ctx)
 }
 
 // -- watchdog timeout overwrite --

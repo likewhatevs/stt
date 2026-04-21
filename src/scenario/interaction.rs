@@ -171,7 +171,7 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
 /// `cg_1`. Workers that [`Op::MoveAllTasks`] transfers into a
 /// Backdrop cgroup retain their Backdrop ownership so the
 /// persistent workers survive every step teardown.
-pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_cgroup_no_ctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
     // cg_0: permanent residents. cg_mobile: workers that ping-pong to cg_1.
     // cg_1: empty move target (no workers). Exactly one handle participates
     // in MoveAllTasks.
@@ -211,7 +211,7 @@ pub fn custom_cgroup_noctrl_task_migration(ctx: &Ctx) -> Result<AssertResult> {
 /// Declaring them in the [`Backdrop`] makes that persistence
 /// explicit and keeps per-step teardown from removing any of them
 /// at a step boundary.
-pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_cgroup_no_ctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     // cg_heavy: 6 permanent CPU-spin workers.
     // cg_light: 2 permanent bursty workers.
     // cg_mobile: 2 workers that ping-pong to cg_overflow.
@@ -256,7 +256,7 @@ pub fn custom_cgroup_noctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 /// them in the [`Backdrop`] keeps their cpuset assignment alive for
 /// the first phase and lets the second Step reach the same cgroups
 /// without per-step teardown removing them.
-pub fn custom_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_cgroup_no_ctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()
         .with_cgroup(CgroupDef::named("cg_0").with_cpuset(CpusetSpec::disjoint(0, 2)))
         .with_cgroup(CgroupDef::named("cg_1").with_cpuset(CpusetSpec::disjoint(1, 2)));
@@ -275,7 +275,7 @@ pub fn custom_cgroup_noctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 /// Heavy CpuSpin vs light YieldHeavy cgroups with cpu-controller disabled.
-pub fn custom_cgroup_noctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0").workers(16),

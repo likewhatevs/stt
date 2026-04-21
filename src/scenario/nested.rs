@@ -151,7 +151,7 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 /// Three-level nested hierarchy with workers at leaf cgroups.
-pub fn custom_nested_cgroup_noctrl(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_nested_cgroup_no_ctrl(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step::with_defs(
             vec![
