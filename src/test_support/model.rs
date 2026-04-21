@@ -62,8 +62,14 @@
 //!    the tokenizer, and resolves the `<|im_end|>` EOS token id.
 //!    This is the failure point for `KTSTR_MODEL_OFFLINE=1` with an
 //!    uncached artifact and for a placeholder/malformed SHA pin.
-//!    Result is memoized in the process-wide `MODEL_CACHE` static
-//!    on success so subsequent calls skip the 2.44 GiB load.
+//!    The result is memoized in the process-wide [`MODEL_CACHE`]
+//!    `OnceLock<Result<Mutex<LoadedInference>, String>>` via
+//!    [`OnceLock::get_or_init`]: concurrent first-call races
+//!    serialize on the cell (at most one load runs end-to-end), and
+//!    a failed load is cached as `Err` so subsequent calls fail-closed
+//!    without repeating the 2.44 GiB load. The outer `Mutex` then
+//!    serializes repeated generation passes against the shared
+//!    `ModelWeights`.
 //! 3. `invoke_with_model` (module-private) runs one greedy
 //!    generation pass against the loaded state: clears the KV cache
 //!    up front (idempotence guarantee), feeds the ChatML-wrapped
@@ -88,7 +94,34 @@ use std::sync::{Mutex, OnceLock};
 use super::KTSTR_TESTS;
 use super::payload::OutputFormat;
 
-static MODEL_CACHE: OnceLock<Mutex<LoadedInference>> = OnceLock::new();
+/// Process-wide memoized inference state.
+///
+/// # Serialization guarantee
+///
+/// [`OnceLock::get_or_init`] runs the initializer at most once per
+/// process even under concurrent first-call races: every caller
+/// observes the same stored value, and exactly one caller's closure
+/// executes end-to-end. Competing callers block on the cell until that
+/// initializer returns, so the 2.44 GiB GGUF load, tokenizer parse,
+/// and EOS-id resolution in `load_inference` happen at most once
+/// rather than once per racing thread.
+///
+/// # Fail-closed on load error
+///
+/// The stored value is a [`Result`] so a load failure (missing model
+/// under the offline gate, malformed SHA pin, corrupt GGUF, tokenizer
+/// parse error) is memoized as `Err(message)`. Subsequent calls
+/// observe the cached error and return an empty metric set without
+/// re-attempting the load. Retrying would repeat the same failure —
+/// the offline gate does not flip, a placeholder pin does not become
+/// real, and a corrupt cache entry does not self-heal — so re-trying
+/// would only burn wall time. The error is stored pre-rendered as
+/// a `String` (the full `{e:#}` chain of the original
+/// `anyhow::Error`) because `OnceLock` hands out shared `&Err(_)`
+/// references and every cached-miss call wants the same human-
+/// readable message in its `tracing::warn` line — rendering once at
+/// memoization time keeps the hot path a cheap `&str` borrow.
+static MODEL_CACHE: OnceLock<Result<Mutex<LoadedInference>, String>> = OnceLock::new();
 
 /// Pinned description of a model artifact the cache knows how to
 /// fetch and verify.
@@ -887,22 +920,21 @@ fn strip_think_block(s: &str) -> String {
 pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Metric> {
     let prompt = compose_prompt(stdout, hint);
 
-    let cache = match MODEL_CACHE.get() {
-        Some(c) => c,
-        None => {
-            let loaded = match load_inference() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = ?e, "LlmExtract model load failed");
-                    return Vec::new();
-                }
-            };
-            if MODEL_CACHE.set(Mutex::new(loaded)).is_err() {
-                tracing::debug!("MODEL_CACHE init race; discarding duplicate load");
-            }
-            MODEL_CACHE
-                .get()
-                .expect("MODEL_CACHE populated by this or a racing peer")
+    // `get_or_init` serializes concurrent first-call races: every
+    // caller observes the same stored value, and exactly one caller's
+    // closure runs end-to-end while competing callers block on the
+    // cell. A failed load is memoized as `Err` so subsequent calls
+    // return an empty metric set without repeating the 2.44 GiB load.
+    let cache = MODEL_CACHE.get_or_init(|| {
+        load_inference()
+            .map(Mutex::new)
+            .map_err(|e| format!("{e:#}"))
+    });
+    let cache = match cache {
+        Ok(c) => c,
+        Err(msg) => {
+            tracing::warn!(%msg, "LlmExtract model load previously failed");
+            return Vec::new();
         }
     };
     let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
