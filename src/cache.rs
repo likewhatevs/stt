@@ -3032,6 +3032,265 @@ mod tests {
         );
     }
 
+    /// `neutralize_alloc_relocs` rewrites the `sh_size` field to 0
+    /// in every section header whose `sh_type` is `SHT_REL` or
+    /// `SHT_RELA` AND whose `sh_flags` carries `SHF_ALLOC`. Pin the
+    /// three observable invariants against a focused fixture:
+    ///
+    /// 1. SHF_ALLOC + SHT_RELA section has sh_size zeroed post-call.
+    /// 2. Non-ALLOC SHT_RELA section has sh_size preserved (guards
+    ///    against over-matching — real kernel ELFs carry
+    ///    non-ALLOC RELA sections like `.rela.debug_info` that must
+    ///    survive untouched).
+    /// 3. Non-RELA section (e.g. `.text`) has sh_size preserved
+    ///    (guards against an accidentally-broader filter).
+    ///
+    /// Also pins content preservation: `neutralize_alloc_relocs`
+    /// only mutates the section HEADER's sh_size, not the section's
+    /// data bytes. Raw bytes at the original sh_offset must remain
+    /// bit-identical post-call.
+    #[test]
+    fn neutralize_alloc_relocs_zeros_only_sh_size_of_alloc_reloc_sections() {
+        use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
+        use object::write;
+
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        // .text — a normal section. Anchor a symbol so the object
+        // writer emits .symtab/.strtab.
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_text_symbol".to_vec(),
+            value: 0x0,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        // .rela.kaslr — SHT_RELA + SHF_ALLOC. Shape matches what
+        // CONFIG_RELOCATABLE + CONFIG_RANDOMIZE_BASE kernels emit
+        // and motivates this pass per the fn docstring. sh_size
+        // must be zeroed.
+        let kaslr_id = obj.add_section(
+            Vec::new(),
+            b".rela.kaslr".to_vec(),
+            object::SectionKind::Elf(SHT_RELA),
+        );
+        obj.append_section_data(kaslr_id, &[0xA5; 32], 1);
+        obj.section_mut(kaslr_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
+        // .rel.foo — SHT_REL + SHF_ALLOC. The fn's match arm accepts
+        // both SHT_REL and SHT_RELA; exercising only SHT_RELA would
+        // let a regression that dropped SHT_REL ride unnoticed.
+        let rel_id = obj.add_section(
+            Vec::new(),
+            b".rel.foo".to_vec(),
+            object::SectionKind::Elf(SHT_REL),
+        );
+        obj.append_section_data(rel_id, &[0xC7; 24], 1);
+        obj.section_mut(rel_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
+        // .rela.debug_info — SHT_RELA WITHOUT SHF_ALLOC. Negative
+        // control: must be left untouched by neutralize_alloc_relocs.
+        let rdbg_id = obj.add_section(
+            Vec::new(),
+            b".rela.debug_info".to_vec(),
+            object::SectionKind::Elf(SHT_RELA),
+        );
+        obj.append_section_data(rdbg_id, &[0xB6; 16], 1);
+        // flags left as SectionFlags::None — no SHF_ALLOC.
+
+        let data = obj.write().unwrap();
+
+        // Positive-control the fixture: the four sections we assert
+        // on must actually exist in the produced ELF with the expected
+        // sh_type/sh_flags/sh_size. If `object::write` renamed or
+        // reshaped one, the post-call assertions would false-pass.
+        let pre_elf = goblin::elf::Elf::parse(&data).unwrap();
+        let mut pre_kaslr = None;
+        let mut pre_rel = None;
+        let mut pre_rdbg = None;
+        let mut pre_text = None;
+        for sh in pre_elf.section_headers.iter() {
+            let name = pre_elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+            match name {
+                ".rela.kaslr" => pre_kaslr = Some(sh.clone()),
+                ".rel.foo" => pre_rel = Some(sh.clone()),
+                ".rela.debug_info" => pre_rdbg = Some(sh.clone()),
+                ".text" => pre_text = Some(sh.clone()),
+                _ => {}
+            }
+        }
+        let pre_kaslr = pre_kaslr.expect("fixture must carry .rela.kaslr");
+        let pre_rel = pre_rel.expect("fixture must carry .rel.foo");
+        let pre_rdbg = pre_rdbg.expect("fixture must carry .rela.debug_info");
+        let pre_text = pre_text.expect("fixture must carry .text");
+        assert_eq!(
+            pre_kaslr.sh_type, SHT_RELA,
+            ".rela.kaslr sh_type must be SHT_RELA"
+        );
+        assert!(
+            pre_kaslr.sh_flags & u64::from(SHF_ALLOC) != 0,
+            ".rela.kaslr must carry SHF_ALLOC; got sh_flags={:#x}",
+            pre_kaslr.sh_flags
+        );
+        assert_eq!(
+            pre_kaslr.sh_size, 32,
+            ".rela.kaslr sh_size must match 32-byte payload"
+        );
+        assert_eq!(pre_rel.sh_type, SHT_REL, ".rel.foo sh_type must be SHT_REL");
+        assert!(
+            pre_rel.sh_flags & u64::from(SHF_ALLOC) != 0,
+            ".rel.foo must carry SHF_ALLOC; got sh_flags={:#x}",
+            pre_rel.sh_flags
+        );
+        assert_eq!(
+            pre_rel.sh_size, 24,
+            ".rel.foo sh_size must match 24-byte payload"
+        );
+        assert_eq!(
+            pre_rdbg.sh_type, SHT_RELA,
+            ".rela.debug_info sh_type must be SHT_RELA"
+        );
+        assert_eq!(
+            pre_rdbg.sh_flags & u64::from(SHF_ALLOC),
+            0,
+            ".rela.debug_info must NOT carry SHF_ALLOC; got sh_flags={:#x}",
+            pre_rdbg.sh_flags
+        );
+        assert_eq!(
+            pre_rdbg.sh_size, 16,
+            ".rela.debug_info sh_size must match 16-byte payload"
+        );
+        assert_eq!(
+            pre_text.sh_size, 64,
+            ".text sh_size must match 64-byte payload"
+        );
+
+        // Snapshot the .rela.kaslr data bytes before the call so we
+        // can assert they survive the sh_size rewrite.
+        let kaslr_offset = pre_kaslr.sh_offset as usize;
+        let kaslr_size = pre_kaslr.sh_size as usize;
+        let kaslr_original_data = data[kaslr_offset..kaslr_offset + kaslr_size].to_vec();
+
+        let processed = neutralize_alloc_relocs(&data).unwrap();
+        assert_eq!(
+            processed.len(),
+            data.len(),
+            "neutralize_alloc_relocs must not resize the ELF; only sh_size header fields are rewritten"
+        );
+
+        let post_elf = goblin::elf::Elf::parse(&processed).unwrap();
+        let mut post_kaslr = None;
+        let mut post_rel = None;
+        let mut post_rdbg = None;
+        let mut post_text = None;
+        for sh in post_elf.section_headers.iter() {
+            let name = post_elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+            match name {
+                ".rela.kaslr" => post_kaslr = Some(sh.clone()),
+                ".rel.foo" => post_rel = Some(sh.clone()),
+                ".rela.debug_info" => post_rdbg = Some(sh.clone()),
+                ".text" => post_text = Some(sh.clone()),
+                _ => {}
+            }
+        }
+        let post_kaslr = post_kaslr.expect(".rela.kaslr must survive");
+        let post_rel = post_rel.expect(".rel.foo must survive");
+        let post_rdbg = post_rdbg.expect(".rela.debug_info must survive");
+        let post_text = post_text.expect(".text must survive");
+
+        // Invariant 1a: SHF_ALLOC + SHT_RELA section has sh_size zeroed.
+        assert_eq!(
+            post_kaslr.sh_size, 0,
+            ".rela.kaslr sh_size must be zeroed; got {}",
+            post_kaslr.sh_size
+        );
+        // Invariant 1b: SHF_ALLOC + SHT_REL section has sh_size zeroed
+        // (the `|| sh.sh_type == SHT_REL` branch in the filter).
+        assert_eq!(
+            post_rel.sh_size, 0,
+            ".rel.foo sh_size must be zeroed; got {}",
+            post_rel.sh_size
+        );
+        // Invariant 2: Non-ALLOC SHT_RELA preserved.
+        assert_eq!(
+            post_rdbg.sh_size, pre_rdbg.sh_size,
+            ".rela.debug_info sh_size must be preserved (no SHF_ALLOC)"
+        );
+        // Invariant 3: Non-RELA section preserved.
+        assert_eq!(
+            post_text.sh_size, pre_text.sh_size,
+            ".text sh_size must be preserved (not a relocation section)"
+        );
+
+        // Content preservation: the raw bytes at the section's
+        // sh_offset must be bit-identical to pre-call. Only the
+        // sh_size header field was rewritten.
+        assert_eq!(
+            &processed[kaslr_offset..kaslr_offset + kaslr_size],
+            &kaslr_original_data[..],
+            ".rela.kaslr data bytes must be preserved; neutralize only rewrites sh_size"
+        );
+
+        // sh_offset, sh_type, sh_flags of the neutralized section
+        // must also be preserved — the fn touches ONE field per
+        // matching section header.
+        assert_eq!(
+            post_kaslr.sh_offset, pre_kaslr.sh_offset,
+            "sh_offset must be preserved"
+        );
+        assert_eq!(
+            post_kaslr.sh_type, pre_kaslr.sh_type,
+            "sh_type must be preserved"
+        );
+        assert_eq!(
+            post_kaslr.sh_flags, pre_kaslr.sh_flags,
+            "sh_flags must be preserved"
+        );
+    }
+
+    /// For ELFs that carry no SHF_ALLOC relocation sections,
+    /// `neutralize_alloc_relocs` returns an unchanged copy —
+    /// documented as the "no-op" branch in the fn docstring.
+    #[test]
+    fn neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections() {
+        use object::write;
+
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_text_symbol".to_vec(),
+            value: 0x0,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        let data = obj.write().unwrap();
+
+        let processed = neutralize_alloc_relocs(&data).unwrap();
+        assert_eq!(
+            processed, data,
+            "neutralize_alloc_relocs must be a byte-identity no-op when no SHF_ALLOC reloc sections are present"
+        );
+    }
+
     #[test]
     fn strip_vmlinux_debug_nonexistent_file() {
         let result = strip_vmlinux_debug(Path::new("/nonexistent/vmlinux"));
