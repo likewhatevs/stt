@@ -669,6 +669,29 @@ fn load_inference() -> anyhow::Result<LoadedInference> {
     })
 }
 
+/// Wrap a raw user prompt in Qwen3 ChatML with the `/no_think`
+/// directive appended.
+///
+/// The `/no_think` directive at the end of the user turn switches the
+/// model out of thinking mode per the Qwen3 model card: the assistant
+/// skips the `<think>…</think>` block and emits the final answer
+/// directly, keeping the [`SAMPLE_LEN`] token budget available for the
+/// JSON response rather than burning it on a reasoning trace the
+/// downstream walker would discard. The post-decode
+/// [`strip_think_block`] in [`invoke_with_model`] remains as a belt-
+/// and-suspenders defense because the directive is a soft switch and
+/// the model can still emit an empty `<think></think>` shell.
+///
+/// Returned shape is exactly:
+/// `<|im_start|>user\n{prompt} /no_think<|im_end|>\n<|im_start|>assistant\n`.
+/// A single ASCII space separates the prompt from the directive; the
+/// closing `<|im_end|>` sits on the same line as the directive and the
+/// assistant turn opens on the next line with no content so the model
+/// begins generation at byte 0 of its own turn.
+fn wrap_chatml_no_think(prompt: &str) -> String {
+    format!("<|im_start|>user\n{prompt} /no_think<|im_end|>\n<|im_start|>assistant\n")
+}
+
 /// Run one greedy generation pass against the already-loaded model
 /// and return the decoded assistant text with any `<think>…</think>`
 /// block stripped.
@@ -697,18 +720,7 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
     // idempotent across repeated calls on the same state.
     state.model.clear_kv_cache();
 
-    // Qwen3 ChatML prompt. The `/no_think` directive at the end of
-    // the user turn switches the model out of thinking mode per the
-    // Qwen3 model card: the assistant skips the `<think>…</think>`
-    // block and emits the final answer directly, keeping the SAMPLE_LEN
-    // token budget available for the JSON response rather than burning
-    // it on a reasoning trace the downstream walker would discard.
-    // The post-decode `strip_think_block` below remains as a belt-
-    // and-suspenders defense because the `/no_think` directive is a
-    // soft switch and the model can still emit an empty
-    // `<think></think>` shell.
-    let chat_prompt =
-        format!("<|im_start|>user\n{prompt} /no_think<|im_end|>\n<|im_start|>assistant\n");
+    let chat_prompt = wrap_chatml_no_think(prompt);
     let encoding = state
         .tokenizer
         .encode(chat_prompt, true)
@@ -1439,6 +1451,172 @@ mod tests {
         assert!(
             !p.contains("Focus:"),
             "empty-string hint must not emit Focus header: {p}"
+        );
+    }
+
+    /// A control-char-only hint (e.g. `"\x00"`) reaches the prompt
+    /// verbatim because `str::trim` strips `char::is_whitespace()`
+    /// and NUL / SOH / etc. are NOT whitespace. compose_prompt is a
+    /// string-concat helper — input sanitization belongs at the
+    /// call site (or in a model-specific adapter), not here. Pin
+    /// the current behavior so a drive-by "defensive strip" in this
+    /// function doesn't regress callers that intentionally embed
+    /// control chars (none today, but the contract stays documented).
+    #[test]
+    fn compose_prompt_preserves_control_char_only_hint() {
+        let p = compose_prompt("x", Some("\x00"));
+        assert!(
+            p.contains("Focus: \x00\n\n"),
+            "control-char hint must pass through: {p:?}"
+        );
+    }
+
+    /// Internal newlines inside the hint survive trim() — trim only
+    /// strips leading and trailing whitespace, not interior. A
+    /// multi-line hint therefore lands as-is inside the `Focus:`
+    /// header, producing `"Focus: a\nb\n\n"`. Pin this so a future
+    /// change that flattens newlines (e.g. replacing trim with a
+    /// single-line normalizer) is caught — the model sees the
+    /// hint verbatim today.
+    #[test]
+    fn compose_prompt_preserves_internal_newlines_in_hint() {
+        let p = compose_prompt("x", Some("a\nb"));
+        assert!(
+            p.contains("Focus: a\nb\n\n"),
+            "internal newline in hint must survive trim(): {p:?}"
+        );
+    }
+
+    /// The stdout body is concatenated verbatim after the `STDOUT:\n`
+    /// header, even when the body itself contains the literal
+    /// `STDOUT:` substring. compose_prompt does not attempt to escape
+    /// or reject such bodies — the template places exactly one
+    /// header and the raw body follows. Pin so the model sees any
+    /// stdout content the payload emits, including pathological
+    /// inputs that echo the template's own keywords.
+    #[test]
+    fn compose_prompt_treats_stdout_literal_as_body() {
+        let p = compose_prompt("STDOUT:\nmore", None);
+        // Two `STDOUT:` occurrences: the template header plus the body echo.
+        assert_eq!(
+            p.matches("STDOUT:").count(),
+            2,
+            "header plus one echo in body = 2 occurrences: {p:?}"
+        );
+        // The body still includes the literal `STDOUT:\nmore`.
+        assert!(
+            p.ends_with("STDOUT:\nSTDOUT:\nmore"),
+            "header is placed exactly once before the raw body: {p:?}"
+        );
+    }
+
+    /// `DEFAULT_TOKENIZER.sha256_hex` must pass the same shape gate
+    /// that `verify_sha256` and `ensure()` enforce: 64 ASCII hex
+    /// digits, no more, no less. A placeholder or malformed pin
+    /// would fail this check at build time (via
+    /// `default_tokenizer_sha_is_valid_shape`) instead of surfacing
+    /// mid-CI when prefetch tries to verify.
+    #[test]
+    fn default_tokenizer_sha_is_valid_shape() {
+        assert!(
+            is_valid_sha256_hex(DEFAULT_TOKENIZER.sha256_hex),
+            "DEFAULT_TOKENIZER.sha256_hex must be 64 ASCII hex chars: {:?}",
+            DEFAULT_TOKENIZER.sha256_hex
+        );
+    }
+
+    /// `DEFAULT_TOKENIZER.url` must be HTTPS. The cache fetcher
+    /// rejects non-HTTPS URLs via `reject_insecure_url`, so a typo
+    /// that downgraded the scheme to `http://` would fail prefetch
+    /// at first use. Pin the scheme at build time so the regression
+    /// surfaces without running the fetcher.
+    #[test]
+    fn default_tokenizer_url_is_https() {
+        assert!(
+            DEFAULT_TOKENIZER.url.starts_with("https://"),
+            "DEFAULT_TOKENIZER.url must be HTTPS: {:?}",
+            DEFAULT_TOKENIZER.url
+        );
+    }
+
+    /// `DEFAULT_TOKENIZER.file_name` should end with `.json` — the
+    /// tokenizers crate loads by JSON path and a non-JSON extension
+    /// would fail at load time. Pin the convention so a pin swap to
+    /// a different tokenizer format surfaces early.
+    #[test]
+    fn default_tokenizer_file_name_ends_with_json() {
+        assert!(
+            DEFAULT_TOKENIZER.file_name.ends_with(".json"),
+            "DEFAULT_TOKENIZER.file_name should end with .json: {:?}",
+            DEFAULT_TOKENIZER.file_name
+        );
+    }
+
+    /// `DEFAULT_TOKENIZER.size_bytes` is ~11 MiB (the Qwen3-4B
+    /// tokenizer.json on HuggingFace). A silent swap to a completely
+    /// different artifact — a stale truncated file or the wrong
+    /// tokenizer family — would land well outside the 3-50 MiB
+    /// window. Keeps the sanity bounds loose enough to tolerate
+    /// legitimate variation between minor Qwen3 revisions while
+    /// catching obviously-wrong pins.
+    #[test]
+    fn default_tokenizer_size_is_in_expected_ballpark() {
+        const { assert!(DEFAULT_TOKENIZER.size_bytes > 3 * 1024 * 1024) };
+        const { assert!(DEFAULT_TOKENIZER.size_bytes < 50 * 1024 * 1024) };
+    }
+
+    /// Mirror [`default_tokenizer_sha_is_valid_shape`] for
+    /// `DEFAULT_MODEL`. Paired so a pin swap on either artifact
+    /// surfaces through shape verification before the artifact is
+    /// fetched.
+    #[test]
+    fn default_model_sha_is_valid_shape() {
+        assert!(
+            is_valid_sha256_hex(DEFAULT_MODEL.sha256_hex),
+            "DEFAULT_MODEL.sha256_hex must be 64 ASCII hex chars: {:?}",
+            DEFAULT_MODEL.sha256_hex
+        );
+    }
+
+    /// Mirror [`default_tokenizer_url_is_https`] for `DEFAULT_MODEL`.
+    #[test]
+    fn default_model_url_is_https() {
+        assert!(
+            DEFAULT_MODEL.url.starts_with("https://"),
+            "DEFAULT_MODEL.url must be HTTPS: {:?}",
+            DEFAULT_MODEL.url
+        );
+    }
+
+    /// `wrap_chatml_no_think` produces the exact ChatML string
+    /// `invoke_with_model` feeds to the tokenizer. The format is load-
+    /// bearing: a typo in the `<|im_start|>`/`<|im_end|>` markers would
+    /// tokenize as literal text instead of ChatML control tokens and
+    /// silently degrade the model's turn boundaries; a regression on
+    /// the `/no_think` spacing or placement would re-enable thinking
+    /// mode and burn the SAMPLE_LEN budget on a reasoning trace. Pin
+    /// the full output byte-for-byte.
+    #[test]
+    fn wrap_chatml_no_think_produces_exact_format() {
+        let got = wrap_chatml_no_think("hello world");
+        assert_eq!(
+            got, "<|im_start|>user\nhello world /no_think<|im_end|>\n<|im_start|>assistant\n",
+            "ChatML wrap must match the exact byte sequence",
+        );
+    }
+
+    /// A prompt with embedded newlines or ChatML-like tokens inside
+    /// its body is inserted verbatim — the wrapper does not escape or
+    /// sanitize. A later prompt adapter may add escaping; until then,
+    /// callers control prompt content and the wrapper stays
+    /// transparent. Pin this transparency so a defensive-escape
+    /// change surfaces as an explicit behavior break.
+    #[test]
+    fn wrap_chatml_no_think_passes_prompt_body_verbatim() {
+        let got = wrap_chatml_no_think("line 1\n<|im_end|>\nline 3");
+        assert!(
+            got.contains("line 1\n<|im_end|>\nline 3 /no_think<|im_end|>\n"),
+            "prompt body must appear verbatim between user header and /no_think: {got:?}"
         );
     }
 
