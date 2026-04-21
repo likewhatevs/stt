@@ -114,16 +114,23 @@ pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
 };
 
 /// Tokenizer artifact paired with [`DEFAULT_MODEL`]. The GGUF file
-/// carries model weights but not the BPE merge table used for
-/// encode/decode, so a separate `tokenizer.json` sits alongside the
-/// model in the cache. Both entries are prefetched together so
-/// LlmExtract inference never trips on a half-ready cache.
+/// carries model weights but not the byte-level BPE (BBPE) merge
+/// table used for encode/decode, so a separate `tokenizer.json`
+/// sits alongside the model in the cache. Both entries are
+/// prefetched together so LlmExtract inference never trips on a
+/// half-ready cache.
 ///
-/// URL points at the matching Qwen3-4B repo on Hugging Face.
+/// URL sources the tokenizer from `Qwen/Qwen3-4B` (the non-GGUF
+/// upstream repo) because the GGUF repo `Qwen/Qwen3-4B-GGUF` that
+/// hosts [`DEFAULT_MODEL`] only ships the quantized weight file —
+/// its `tokenizer.json` is not published there. Pulling each
+/// artifact from its authoritative repo keeps the two pins in sync
+/// with the same Qwen3-4B release.
+///
 /// SHA-256 is a placeholder on the same footing as [`DEFAULT_MODEL`]
 /// — the all-`?` hex trips [`verify_sha256`] with a clear error
 /// until the artifact is hashed locally. Size is ~11 MiB, a typical
-/// BPE tokenizer serialization for Qwen3-class models.
+/// BBPE tokenizer serialization for Qwen3-class models.
 pub const DEFAULT_TOKENIZER: ModelSpec = ModelSpec {
     file_name: "Qwen3-4B-tokenizer.json",
     url: "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json",
@@ -513,35 +520,6 @@ pub(crate) fn compose_prompt(stdout: &str, hint: Option<&str>) -> String {
     out
 }
 
-/// Errors surfaced by [`invoke_with_model`]. Kept distinct from the
-/// top-level `anyhow::Error` so [`extract_via_llm`] can surface
-/// inference failures separately from the downstream JSON walker.
-#[derive(Debug)]
-pub(crate) enum InferenceError {
-    /// The backend failed to load a model artifact (missing file,
-    /// corrupt GGUF, tokenizer.json missing, etc.) or the forward
-    /// pass itself failed. Surfaces via `ensure()` errors so test
-    /// authors can tell whether the cache is stale or the pipeline
-    /// is broken.
-    ModelLoad(anyhow::Error),
-}
-
-impl std::fmt::Display for InferenceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InferenceError::ModelLoad(e) => write!(f, "LlmExtract model load: {e:#}"),
-        }
-    }
-}
-
-impl std::error::Error for InferenceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            InferenceError::ModelLoad(e) => e.source(),
-        }
-    }
-}
-
 /// Upper bound on generated tokens for a single LlmExtract
 /// invocation. The prompt template instructs the model to emit a
 /// single JSON object; 512 tokens is enough for a dense metric bag
@@ -568,41 +546,34 @@ pub(crate) struct LoadedInference {
 /// Ensure both artifacts are cached, open the GGUF, build the Qwen3
 /// `ModelWeights`, and load the tokenizer. Returns the bundled state.
 ///
-/// Each failure point surfaces as `InferenceError::ModelLoad` so
-/// `extract_via_llm` can distinguish infra failure from JSON-parse
-/// failure when deciding what to log.
-pub(crate) fn load_inference() -> std::result::Result<LoadedInference, InferenceError> {
+/// Every failure point flows through `anyhow::Error` so
+/// `extract_via_llm` surfaces the full chain (path, cause) when
+/// logging.
+pub(crate) fn load_inference() -> anyhow::Result<LoadedInference> {
     use candle::{Device, quantized::gguf_file};
     use candle_transformers::models::quantized_qwen3::ModelWeights;
     use tokenizers::Tokenizer;
 
-    let model_path = ensure(&DEFAULT_MODEL).map_err(InferenceError::ModelLoad)?;
-    let tokenizer_path = ensure(&DEFAULT_TOKENIZER).map_err(InferenceError::ModelLoad)?;
+    let model_path = ensure(&DEFAULT_MODEL)?;
+    let tokenizer_path = ensure(&DEFAULT_TOKENIZER)?;
 
     let device = Device::Cpu;
 
     let mut file = std::fs::File::open(&model_path).map_err(|e| {
-        InferenceError::ModelLoad(
-            anyhow::Error::new(e).context(format!("open GGUF model at {}", model_path.display(),)),
-        )
+        anyhow::Error::new(e).context(format!("open GGUF model at {}", model_path.display()))
     })?;
     let content = gguf_file::Content::read(&mut file)
-        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e.with_path(&model_path))))?;
-    let model = ModelWeights::from_gguf(content, &mut file, &device)
-        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        .map_err(|e| anyhow::Error::msg(e.with_path(&model_path)))?;
+    let model = ModelWeights::from_gguf(content, &mut file, &device).map_err(anyhow::Error::msg)?;
 
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-        InferenceError::ModelLoad(
-            anyhow::Error::msg(e)
-                .context(format!("load tokenizer at {}", tokenizer_path.display(),)),
-        )
+        anyhow::Error::msg(e).context(format!("load tokenizer at {}", tokenizer_path.display()))
     })?;
 
-    let eos_id = *tokenizer.get_vocab(true).get("<|im_end|>").ok_or_else(|| {
-        InferenceError::ModelLoad(anyhow::anyhow!(
-            "tokenizer vocab missing '<|im_end|>' EOS token",
-        ))
-    })?;
+    let eos_id = *tokenizer
+        .get_vocab(true)
+        .get("<|im_end|>")
+        .ok_or_else(|| anyhow::anyhow!("tokenizer vocab missing '<|im_end|>' EOS token"))?;
 
     Ok(LoadedInference {
         model,
@@ -626,7 +597,7 @@ pub(crate) fn load_inference() -> std::result::Result<LoadedInference, Inference
 pub(crate) fn invoke_with_model(
     state: &mut LoadedInference,
     prompt: &str,
-) -> std::result::Result<String, InferenceError> {
+) -> anyhow::Result<String> {
     use candle::Tensor;
     use candle_transformers::generation::{LogitsProcessor, Sampling};
 
@@ -644,7 +615,7 @@ pub(crate) fn invoke_with_model(
     let encoding = state
         .tokenizer
         .encode(chat_prompt, true)
-        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        .map_err(anyhow::Error::msg)?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
     let mut logits_processor = LogitsProcessor::from_sampling(SEED, Sampling::ArgMax);
@@ -654,15 +625,15 @@ pub(crate) fn invoke_with_model(
     // `(b, vocab)`; the caller's `squeeze(0)` strips the batch dim.
     let input = Tensor::new(prompt_tokens.as_slice(), &state.device)
         .and_then(|t| t.unsqueeze(0))
-        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        .map_err(anyhow::Error::msg)?;
     let logits = state
         .model
         .forward(&input, 0)
         .and_then(|l| l.squeeze(0))
-        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        .map_err(anyhow::Error::msg)?;
     let mut next_token = logits_processor
         .sample(&logits)
-        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        .map_err(anyhow::Error::msg)?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(SAMPLE_LEN);
     if next_token != state.eos_id {
@@ -678,15 +649,15 @@ pub(crate) fn invoke_with_model(
         }
         let input = Tensor::new(&[next_token], &state.device)
             .and_then(|t| t.unsqueeze(0))
-            .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+            .map_err(anyhow::Error::msg)?;
         let logits = state
             .model
             .forward(&input, prompt_tokens.len() + step)
             .and_then(|l| l.squeeze(0))
-            .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+            .map_err(anyhow::Error::msg)?;
         next_token = logits_processor
             .sample(&logits)
-            .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+            .map_err(anyhow::Error::msg)?;
         if next_token == state.eos_id {
             break;
         }
@@ -703,7 +674,7 @@ pub(crate) fn invoke_with_model(
     let decoded = state
         .tokenizer
         .decode(&generated, true)
-        .map_err(|e| InferenceError::ModelLoad(anyhow::Error::msg(e)))?;
+        .map_err(anyhow::Error::msg)?;
     Ok(strip_think_block(&decoded).to_string())
 }
 
@@ -762,7 +733,7 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
     let mut state = match load_inference() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ktstr: LlmExtract model load failed: {e}");
+            eprintln!("ktstr: LlmExtract model load failed: {e:#}");
             return Vec::new();
         }
     };
@@ -770,7 +741,7 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
     let response = match invoke_with_model(&mut state, &prompt) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ktstr: LlmExtract inference failed: {e}");
+            eprintln!("ktstr: LlmExtract inference failed: {e:#}");
             return Vec::new();
         }
     };
@@ -1275,25 +1246,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inference_error_display_includes_source_chain() {
-        // ModelLoad wraps an anyhow::Error; {:#} should traverse the
-        // source chain so a test author can see *why* the load failed.
-        let inner = anyhow::anyhow!("root cause: cache corrupt");
-        let e = InferenceError::ModelLoad(inner);
-        let msg = format!("{e:#}");
-        assert!(msg.contains("root cause: cache corrupt"), "msg: {msg}");
-    }
-
     /// Under the offline gate with no cached artifacts,
-    /// `load_inference` must surface a `ModelLoad` error whose
-    /// message echoes the offline env var — that is the signal the
-    /// caller needs to distinguish a user-requested skip from a
-    /// pipeline bug. Pins the error kind so a regression that
-    /// upgraded the offline error to a generic anyhow surface would
-    /// fire here first.
+    /// `load_inference` must surface an error whose message echoes
+    /// the offline env var — that is the signal the caller needs to
+    /// distinguish a user-requested skip from a pipeline bug. Pins
+    /// the offline-gate trip point so a regression that swallowed
+    /// the env var context would fire here first.
     #[test]
-    fn load_inference_errs_with_model_load_under_offline_gate() {
+    fn load_inference_errs_with_offline_message_under_offline_gate() {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1304,7 +1264,7 @@ mod tests {
         unsafe { std::env::set_var(OFFLINE_ENV, "1") };
         let r = load_inference();
         match r {
-            Err(InferenceError::ModelLoad(e)) => {
+            Err(e) => {
                 assert!(
                     format!("{e:#}").contains(OFFLINE_ENV),
                     "expected offline gate error, got: {e:#}"
