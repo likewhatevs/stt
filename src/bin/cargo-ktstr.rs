@@ -1532,6 +1532,12 @@ mod tests {
         assert!(row.contains("2026-04-12T10:00:00Z"));
     }
 
+    /// Sibling of `kconfig_status_reports_stale_on_hash_mismatch`:
+    /// that test pins the `KconfigStatus::Stale` variant returned by
+    /// `CacheEntry::kconfig_status` when the cached hash differs from
+    /// the current hash; this test pins the human-readable tag
+    /// (`(stale kconfig)`) emitted by `cli::format_entry_row` for the
+    /// same state.
     #[test]
     fn format_entry_row_stale_kconfig() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1545,6 +1551,11 @@ mod tests {
         );
     }
 
+    /// Sibling of `kconfig_status_reports_matches_on_hash_equality`:
+    /// that test pins the `KconfigStatus::Matches` variant returned by
+    /// `CacheEntry::kconfig_status` when cached and current hashes
+    /// agree; this test pins the format-row contract that matching
+    /// entries carry no kconfig tag.
     #[test]
     fn format_entry_row_matching_kconfig() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1558,6 +1569,12 @@ mod tests {
         );
     }
 
+    /// Sibling of `kconfig_status_reports_untracked_when_entry_has_no_hash`:
+    /// that test pins the `KconfigStatus::Untracked` variant returned
+    /// by `CacheEntry::kconfig_status` when the entry has no recorded
+    /// hash; this test pins the format-row tag (`(untracked kconfig)`)
+    /// that distinguishes that state from `(stale kconfig)` in human
+    /// output.
     #[test]
     fn format_entry_row_untracked_kconfig_tagged_distinctly_from_stale() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1599,6 +1616,11 @@ mod tests {
 
     // -- kconfig_status (via CacheEntry method) --
 
+    /// Sibling of `format_entry_row_stale_kconfig`: that test pins the
+    /// `(stale kconfig)` tag emitted by `cli::format_entry_row` for a
+    /// hash-mismatch entry; this test pins the enum variant
+    /// (`KconfigStatus::Stale { cached, current }`) returned by
+    /// `CacheEntry::kconfig_status` that drives the tag.
     #[test]
     fn kconfig_status_reports_stale_on_hash_mismatch() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1614,6 +1636,11 @@ mod tests {
         );
     }
 
+    /// Sibling of `format_entry_row_matching_kconfig`: that test pins
+    /// the no-tag contract emitted by `cli::format_entry_row` when the
+    /// hashes agree; this test pins the `KconfigStatus::Matches`
+    /// variant returned by `CacheEntry::kconfig_status` that drives
+    /// the no-tag branch.
     #[test]
     fn kconfig_status_reports_matches_on_hash_equality() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1626,6 +1653,12 @@ mod tests {
         );
     }
 
+    /// Sibling of
+    /// `format_entry_row_untracked_kconfig_tagged_distinctly_from_stale`:
+    /// that test pins the `(untracked kconfig)` tag emitted by
+    /// `cli::format_entry_row` when an entry has no recorded hash;
+    /// this test pins the `KconfigStatus::Untracked` variant returned
+    /// by `CacheEntry::kconfig_status` that drives the tag.
     #[test]
     fn kconfig_status_reports_untracked_when_entry_has_no_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1641,6 +1674,50 @@ mod tests {
     // Corrupt entries no longer surface as CacheEntry — they are
     // ListedEntry::Corrupt with no metadata-bearing struct — so
     // kconfig_status isn't reachable from that state.
+
+    /// Differential pin on the three `KconfigStatus` strings that flow
+    /// into the `kconfig_status` field of `cargo ktstr kernel list
+    /// --json`. `cli::kernel_list` emits the JSON field via
+    /// `entry.kconfig_status(&kconfig_hash).to_string()`, so CI scripts
+    /// that key off the stringified variant break if any of these
+    /// three words changes. This test exercises the full
+    /// `CacheEntry::kconfig_status(..).to_string()` chain (not just
+    /// `KconfigStatus::<variant>.to_string()` in isolation) to pin the
+    /// end-to-end JSON contract in a single test covering all three
+    /// variants.
+    #[test]
+    fn kconfig_status_json_string_pins_all_three_variants() {
+        use ktstr::cache::KconfigStatus;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+
+        let matches_meta = test_metadata().with_ktstr_kconfig_hash(Some("h".to_string()));
+        let matches_entry = store_test_entry(&cache, "matches-key", &matches_meta);
+        let matches_status = matches_entry.kconfig_status("h");
+        assert!(
+            matches!(matches_status, KconfigStatus::Matches),
+            "hash equality must yield KconfigStatus::Matches"
+        );
+        assert_eq!(matches_status.to_string(), "matches");
+
+        let stale_meta = test_metadata().with_ktstr_kconfig_hash(Some("old".to_string()));
+        let stale_entry = store_test_entry(&cache, "stale-key", &stale_meta);
+        let stale_status = stale_entry.kconfig_status("new");
+        assert!(
+            matches!(stale_status, KconfigStatus::Stale { .. }),
+            "hash mismatch must yield KconfigStatus::Stale"
+        );
+        assert_eq!(stale_status.to_string(), "stale");
+
+        let untracked_meta = test_metadata();
+        let untracked_entry = store_test_entry(&cache, "untracked-key", &untracked_meta);
+        let untracked_status = untracked_entry.kconfig_status("anything");
+        assert!(
+            matches!(untracked_status, KconfigStatus::Untracked),
+            "entry without hash must yield KconfigStatus::Untracked"
+        );
+        assert_eq!(untracked_status.to_string(), "untracked");
+    }
 
     // -- embedded_kconfig_hash --
 
