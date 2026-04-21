@@ -1550,12 +1550,18 @@ mod tests {
     #[test]
     fn cache_dir_list_classifies_incomplete_metadata_as_corrupt() {
         // metadata.json is valid JSON but omits fields the current
-        // `KernelMetadata` schema requires. `serde_json::from_str`
-        // fails because non-`Option`, non-`#[serde(default)]` fields
-        // must be present. list() must surface the entry as Corrupt
-        // with the unparseable-metadata reason — same category as
-        // malformed-JSON because the observable failure is identical
-        // (read_metadata returns None).
+        // `KernelMetadata` schema requires: `source`, `arch`,
+        // `image_name`, `built_at`, and `has_vmlinux`. These are
+        // non-`Option`, non-`#[serde(default)]` fields, so
+        // `serde_json::from_str` fails when they are absent. Note
+        // `has_vmlinux: bool` is required even though it is not
+        // wrapped in `Option` — a plain `bool` with no
+        // `#[serde(default)]` attribute must still be present in the
+        // JSON payload. list() must surface the entry as Corrupt with
+        // the unparseable-metadata reason — both incomplete metadata
+        // and malformed JSON surface as Corrupt with the same reason
+        // string because read_metadata returns None for either
+        // failure mode.
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().to_path_buf());
         let entry_dir = tmp.path().join("incomplete-metadata");
@@ -1571,7 +1577,7 @@ mod tests {
             "incomplete-metadata missing required fields must not deserialize as Valid",
         );
         let ListedEntry::Corrupt { reason, .. } = listed else {
-            panic!("expected Corrupt variant for incomplete-metadata entry");
+            panic!("expected Corrupt variant for entry with incomplete metadata");
         };
         assert!(
             reason.contains("metadata.json missing or unparseable"),
