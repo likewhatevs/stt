@@ -514,10 +514,11 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
 /// a pin bump to a future larger model (e.g. 8B ≈ 5 GiB) working
 /// without hand-editing the constant.
 ///
-/// No overflow path exists: the three operations in the body
-/// (integer division by a nonzero constant, `u64::max`, and
-/// `Duration::from_secs`) all accept arbitrary `u64` inputs and
-/// produce `u64` outputs without wrapping or panicking.
+/// No overflow path exists: integer division by the nonzero constant
+/// `FETCH_MIN_BANDWIDTH_BYTES_PER_SEC` cannot panic and produces a
+/// `u64` bounded by `size_bytes`; `u64::max` returns one of its `u64`
+/// operands unchanged; and `Duration::from_secs` accepts any `u64`
+/// without panicking.
 fn fetch_timeout_for_size(size_bytes: u64) -> std::time::Duration {
     const FETCH_MIN_TIMEOUT_SECS: u64 = 60;
     const FETCH_MIN_BANDWIDTH_BYTES_PER_SEC: u64 = 3_000_000;
@@ -3154,7 +3155,6 @@ mod tests {
         let tokenizer = fetch_timeout_for_size(DEFAULT_TOKENIZER.size_bytes);
         assert_eq!(tiny, std::time::Duration::from_secs(60));
         assert_eq!(tokenizer, std::time::Duration::from_secs(60));
-        assert_eq!(tiny, tokenizer);
     }
 
     /// `filesystem_available_bytes` on a real tempdir must return a
@@ -3221,14 +3221,17 @@ mod tests {
     /// `"Need X free at <path>; have Y"` diagnostic when the declared
     /// `size_bytes + 10% margin` exceeds the filesystem's available
     /// bytes. Uses `u64::MAX / 2` so no real filesystem (tempdir or
-    /// otherwise) can clear the gate — the margin calculation
-    /// saturates and the comparison still trips. Pin every
-    /// load-bearing piece of the error message: the `"Need "` prefix,
-    /// `" free at "` infix, `"; have "` separator shape, the
-    /// `parent` path echo, and the presence of an IEC-prefix size
-    /// token (`KiB`, `MiB`, `GiB`, `TiB`, `PiB`, or `EiB`) on the
-    /// `"Need "` side. A regression that dropped the human-readable
-    /// format or reverted to raw bytes would surface here.
+    /// otherwise) can clear the gate — `size_bytes + size_bytes / 10`
+    /// sums well below `u64::MAX` (so `saturating_add` does not
+    /// saturate for this input), and the resulting ~8.8 EiB
+    /// requirement still dwarfs any tempdir's free bytes so the
+    /// comparison trips. Pin every load-bearing piece of the error
+    /// message: the `"Need "` prefix, `" free at "` infix, `"; have "`
+    /// separator shape, the `parent` path echo, and the presence of
+    /// an IEC-prefix size token (`KiB`, `MiB`, `GiB`, `TiB`, `PiB`,
+    /// or `EiB`) on the `"Need "` side. A regression that dropped the
+    /// human-readable format or reverted to raw bytes would surface
+    /// here.
     #[test]
     fn ensure_free_space_bails_when_space_insufficient() {
         let tmp = tempfile::tempdir().expect("create tempdir");
