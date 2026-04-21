@@ -1281,6 +1281,47 @@ mod tests {
         );
     }
 
+    /// Sibling of [`status_surfaces_malformed_pin_error_for_cached_file`]
+    /// for the other malformed-pin branch: the pin is all ASCII hex
+    /// digits but has the wrong length. Exercises the
+    /// `expected_hex.len() != 64` branch of `verify_sha256`, which
+    /// status() routes through the malformed-pin surface path (per
+    /// the is_valid_sha256_hex predicate, wrong length is as much a
+    /// ModelSpec defect as wrong chars). Pins the "64 chars" diagnostic
+    /// from `verify_sha256`'s length branch so a regression that
+    /// collapsed the two wordings into a single generic message would
+    /// surface here.
+    #[test]
+    fn status_surfaces_length_fail_pin_error_for_cached_file() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = ModelSpec {
+            file_name: "short-pin.gguf",
+            url: "https://placeholder.example/short-pin.gguf",
+            // 63 ASCII hex digits — valid chars, wrong length.
+            sha256_hex: "000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let on_disk = tmp.path().join(spec.file_name);
+        std::fs::write(&on_disk, b"any bytes will do").unwrap();
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+        let err = status(&spec).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("64 chars"),
+            "expected length-fail error from verify_sha256, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(spec.file_name),
+            "expected status() context to name the file, got: {rendered}"
+        );
+    }
+
     /// With `KTSTR_CACHE_DIR` unset, `resolve_cache_root` falls
     /// through to `XDG_CACHE_HOME` and appends `ktstr/models`.
     #[test]
@@ -1786,6 +1827,37 @@ mod tests {
         assert!(metrics.is_empty());
         let metrics = extract_via_llm("stdout with hint", Some("focus"));
         assert!(metrics.is_empty());
+    }
+
+    /// `any_test_requires_model()` scans [`KTSTR_TESTS`] and returns
+    /// `true` iff at least one registered entry declares
+    /// `OutputFormat::LlmExtract` on its primary payload or any of its
+    /// workloads. In the lib crate's test binary the only registered
+    /// entry is `__unit_test_dummy__` (see `mod.rs` tests module), which
+    /// is built from `KtstrTestEntry::DEFAULT` and therefore carries
+    /// `payload: None` and `workloads: &[]`. Neither matches
+    /// `OutputFormat::LlmExtract(_)`, so the scan returns `false`.
+    ///
+    /// Pinning this behavior guards two regressions at once:
+    /// (1) a default that silently flipped to an LlmExtract-requiring
+    /// payload would now force every lib-test run to prefetch a 2.44
+    /// GiB model, and (2) a regression in the is_some_and /
+    /// workloads.iter().any scan that reported `true` for empty
+    /// inventories would drag LlmExtract-less test binaries into a
+    /// pointless prefetch attempt.
+    ///
+    /// If a future dev-time test is registered via
+    /// `#[distributed_slice(KTSTR_TESTS)]` with an `LlmExtract` payload,
+    /// this assertion MUST flip to `true` — the test is the pin on the
+    /// current inventory, not a forever-true invariant.
+    #[test]
+    fn any_test_requires_model_returns_false_for_dummy_only_inventory() {
+        assert!(
+            !any_test_requires_model(),
+            "lib crate test binary registers only __unit_test_dummy__ (no LlmExtract payload); \
+             any_test_requires_model() must return false. If this assertion fails, a new test \
+             entry was added with OutputFormat::LlmExtract — update this pin accordingly."
+        );
     }
 
     // -- strip_think_block --
