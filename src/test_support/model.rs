@@ -304,7 +304,9 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
                 Ok(m) => m,
                 Err(e) => {
                     if !is_valid_sha256_hex(spec.sha256_hex) {
-                        return Err(e);
+                        return Err(e).with_context(|| {
+                            format!("verify SHA-256 pin for cached model '{}'", spec.file_name,)
+                        });
                     }
                     false
                 }
@@ -364,6 +366,24 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     }
     if let Some(v) = read_offline_env() {
         let v_safe = sanitize_env_value(&v);
+        // Distinguish the two paths that reach here: a missing cache
+        // entry vs. a present-but-stale one. Both trip the offline
+        // gate, but the remediation differs — a no-cache case needs
+        // pre-seeding, while a stale-cache case needs re-pinning or
+        // re-fetching the bytes. Collapsing them into a single "not
+        // cached" message misroutes the user into a pre-seed step
+        // that a file-present-but-mismatched cache would skip right
+        // past.
+        if st.cached {
+            anyhow::bail!(
+                "{OFFLINE_ENV}={v_safe} set but model '{}' is cached at {} \
+                 with bytes that do not match the declared SHA-256 pin; \
+                 replace the cache entry with bytes matching the pin (or \
+                 unset {OFFLINE_ENV} to re-fetch).",
+                spec.file_name,
+                st.path.display(),
+            );
+        }
         anyhow::bail!(
             "{OFFLINE_ENV}={v_safe} set but model '{}' is not cached at {}; \
              pre-seed the cache or unset {OFFLINE_ENV} to fetch.",

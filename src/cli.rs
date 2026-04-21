@@ -414,6 +414,15 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
 /// When a spinner is active, each line is printed via `println()`
 /// so the spinner redraws below the output. When no spinner,
 /// output is captured and shown only on failure.
+///
+/// Pipe-read I/O errors propagate via `Err` rather than silently
+/// ending the read loop. The prior line-iterator formulation
+/// (`.lines()` + `Result::ok`) dropped every error-tagged item —
+/// a mid-stream read failure just looked like EOF and the child's
+/// tail output disappeared without a diagnostic. The byte-oriented
+/// `read_until` now surfaces such failures with `anyhow` context
+/// naming the merged-stream read, so a broken-pipe or EIO during
+/// make's output is caught at the call site.
 pub fn run_make_with_output(
     kernel_dir: &Path,
     args: &[&str],
