@@ -1557,9 +1557,13 @@ mod tests {
         // `has_vmlinux: bool` is required even though it is not
         // wrapped in `Option` — a plain `bool` with no
         // `#[serde(default)]` attribute must still be present in the
-        // JSON payload. list() must surface the entry as Corrupt with
-        // the unparseable-metadata reason — both incomplete metadata
-        // and malformed JSON surface as Corrupt with the same reason
+        // JSON payload. serde_json reports the first missing required
+        // field in declaration order (`source`) but the test asserts
+        // only the Corrupt classification and the generic
+        // unparseable-metadata label, not the specific field name.
+        // list() must surface the entry as Corrupt with the
+        // unparseable-metadata reason — both incomplete metadata and
+        // malformed JSON surface as Corrupt with the same reason
         // string because read_metadata returns None for either
         // failure mode.
         let tmp = TempDir::new().unwrap();
@@ -3467,14 +3471,46 @@ mod tests {
     /// for preprocess" wrapper in `neutralize_alloc_relocs`; the
     /// goblin-side error text is version-dependent and not part of
     /// the contract.
+    ///
+    /// Exercises two distinct goblin failure paths through the same
+    /// anyhow wrapper:
+    ///
+    /// 1. Bad magic: "not an ELF..." passes the 16-byte length gate but
+    ///    its first four bytes do not match `\x7fELF`, so goblin's
+    ///    `TryFromCtx` for `Header` bails with `Error::BadMagic` before
+    ///    inspecting any later field (see goblin 0.10 `elf/header.rs`
+    ///    `try_from_ctx` at the `ident[0..SELFMAG] != ELFMAG` branch).
+    /// 2. Invalid EI_CLASS: a 16-byte prefix with the correct magic but
+    ///    `ident[EI_CLASS] == 0` (ELFCLASSNONE) passes BOTH the length
+    ///    and magic gates, and fails on the subsequent class-dispatch
+    ///    match with `Error::Malformed("invalid ELF class 0")`. This is
+    ///    the "passes magic, fails deeper" path.
+    ///
+    /// Either failure mode flows through the same `anyhow::anyhow!`
+    /// wrapper, so the test pins the wrapper string for each input
+    /// without pinning the goblin-side sub-error wording.
     #[test]
     fn neutralize_alloc_relocs_rejects_invalid_elf() {
-        let err = neutralize_alloc_relocs(b"not an ELF at all, just some bytes").unwrap_err();
-        let rendered = format!("{err:#}");
-        assert!(
-            rendered.contains("parse vmlinux ELF for preprocess"),
-            "expected error context to name the ELF parse step; got: {rendered}"
-        );
+        // Table-driven so a future goblin upgrade that changes either
+        // sub-error's wording still surfaces both paths distinctly.
+        let cases: &[(&str, &[u8])] = &[
+            ("bad magic", b"not an ELF at all, just some bytes"),
+            (
+                "magic ok but invalid EI_CLASS",
+                &[
+                    0x7f, b'E', b'L', b'F', // magic
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // ident[4..16]: class=0, rest 0
+                ],
+            ),
+        ];
+        for (label, input) in cases {
+            let err = neutralize_alloc_relocs(input).unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("parse vmlinux ELF for preprocess"),
+                "[{label}] expected error context to name the ELF parse step; got: {rendered}"
+            );
+        }
     }
 
     #[test]
