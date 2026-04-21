@@ -1,10 +1,7 @@
 name: Setup ktstr build environment
-description: Install clang-20, bpftool, Rust toolchain, sccache, and optionally KVM + debug symbols
+description: Install clang-20, bpftool, sccache, and optionally KVM + debug symbols. Rust toolchain is provisioned from rust-toolchain.toml on first cargo invocation.
 
 inputs:
-  rust-components:
-    description: Extra rustup components (comma-separated)
-    default: ''
   tools:
     description: Extra cargo tools to install via taiki-e/install-action
     default: ''
@@ -65,9 +62,9 @@ runs:
         make -C bpftool/src -j$(nproc)
         sudo make -C bpftool/src install
 
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: ${{ inputs.rust-components }}
+    - name: Provision Rust toolchain from rust-toolchain.toml
+      shell: bash
+      run: rustup show active-toolchain || rustup toolchain install
 
     - uses: mozilla-actions/sccache-action@v0.0.9
       with:

@@ -78,8 +78,9 @@ memory ring buffer carries scenario markers (`MSG_TYPE_SCENARIO_START`,
 `MSG_TYPE_SCENARIO_END`), test results (`MSG_TYPE_TEST_RESULT`), exit
 codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`),
 scheduler exit notifications (`MSG_TYPE_SCHED_EXIT`), guest crash
-payloads (`MSG_TYPE_CRASH`), and profraw coverage data. Each entry
-has a CRC32 for integrity checking.
+payloads (`MSG_TYPE_CRASH`), profraw coverage data (`MSG_TYPE_PROFRAW`),
+and per-payload-invocation metrics (`MSG_TYPE_PAYLOAD_METRICS`). Each
+entry has a CRC32 for integrity checking.
 
 ## Performance mode
 
