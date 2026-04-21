@@ -386,6 +386,50 @@ mod tests {
     }
 
     #[test]
+    fn kernel_path_resolve_none_returns_osrelease_build_dir_when_present() {
+        // resolve_kernel(None) reads `/proc/sys/kernel/osrelease` and
+        // checks `/lib/modules/{rel}/build` as its last fallback. The
+        // earlier branches (`./linux`, `../linux`) cannot be controlled
+        // from a parallel-safe unit test (`set_current_dir` is process-
+        // wide), so this test is strong only when those local trees are
+        // absent. When `/lib/modules/{rel}/build` is absent on the host
+        // (typical CI without installed kernel headers), skip via early
+        // return — the panic-free contract is already covered by
+        // `kernel_path_resolve_none_falls_through`.
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("host /proc/sys/kernel/osrelease must be readable for this test")
+            .trim()
+            .to_string();
+        let expected = std::path::PathBuf::from(format!("/lib/modules/{release}/build"));
+        if !expected.is_dir() {
+            return;
+        }
+
+        let resolved = resolve_kernel(None).unwrap_or_else(|| {
+            panic!(
+                "resolve_kernel(None) must return Some when {} exists",
+                expected.display(),
+            )
+        });
+        assert!(
+            resolved.is_dir(),
+            "resolved path must be a directory, got {}",
+            resolved.display(),
+        );
+        // Strong pin only when no earlier branch (`./linux`, `../linux`)
+        // shadowed the osrelease path. When an earlier branch matched,
+        // the panic-free + valid-dir contract above is what we get.
+        let local_shadowed = std::path::PathBuf::from("./linux").is_dir()
+            || std::path::PathBuf::from("../linux").is_dir();
+        if !local_shadowed {
+            assert_eq!(
+                resolved, expected,
+                "with no local trees, resolve_kernel(None) must return the osrelease build dir",
+            );
+        }
+    }
+
+    #[test]
     fn kernel_path_resolve_empty_string() {
         // Empty string creates a PathBuf("") which is_dir() returns false,
         // so it falls through to search paths.
@@ -601,6 +645,34 @@ mod tests {
         // Nonexistent explicit dir: is_dir() is false, returns None
         // immediately with no fallthrough.
         let _ = find_image(Some("/nonexistent/image/dir/xyz"), None);
+    }
+
+    #[test]
+    fn kernel_path_find_image_release_none_matches_osrelease() {
+        // The `/proc/sys/kernel/osrelease` path is hardcoded in
+        // find_image and cannot be mocked, so the fallback can only
+        // be verified by equivalence: read osrelease the way the
+        // function does, then assert that find_image(None, None)
+        // equals find_image(None, Some(<that value>)). Identical
+        // post-`rel` logic in both calls means equal outputs prove
+        // the None branch derived `rel` from osrelease (or both
+        // short-circuited via resolve_kernel(None), which is also
+        // a contract — no panic, no divergence).
+        let host_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("host /proc/sys/kernel/osrelease must be readable for this test")
+            .trim()
+            .to_string();
+        assert!(
+            !host_release.is_empty(),
+            "/proc/sys/kernel/osrelease must be non-empty for this test",
+        );
+
+        let derived = find_image(None, None);
+        let explicit = find_image(None, Some(&host_release));
+        assert_eq!(
+            derived, explicit,
+            "find_image(None, None) must equal find_image(None, Some(osrelease)); fallback diverged",
+        );
     }
 
     // -- KernelId parsing --
