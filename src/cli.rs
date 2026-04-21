@@ -1696,6 +1696,56 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::BrokenPipe);
     }
 
+    #[test]
+    fn drain_lines_lossy_mixed_lf_and_crlf() {
+        // A single stream with both LF-only and CRLF line endings.
+        // Each line is stripped independently: the CR strip is nested
+        // inside the LF strip, so an LF-only line passes through
+        // without CR stripping while a CRLF line loses the CR.
+        let input: &[u8] = b"lf-line\ncrlf-line\r\nlf-again\n";
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| {}).unwrap();
+        assert_eq!(captured, vec!["lf-line", "crlf-line", "lf-again"]);
+    }
+
+    #[test]
+    fn drain_lines_lossy_empty_lines_lf() {
+        // A bare `\n` between two non-empty lines produces an empty
+        // string in the captured Vec — after strip_suffix(b"\n")
+        // the remaining slice is empty and from_utf8_lossy("") == "".
+        let input: &[u8] = b"a\n\nb\n";
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| {}).unwrap();
+        assert_eq!(captured, vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn drain_lines_lossy_empty_lines_crlf() {
+        // A bare `\r\n` produces an empty string after both the LF
+        // and the preceding CR are stripped.
+        let input: &[u8] = b"\r\n\r\n";
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| {}).unwrap();
+        assert_eq!(captured, vec!["", ""]);
+    }
+
+    #[test]
+    fn drain_lines_lossy_callback_fires_once_per_line_in_order() {
+        // Pin the externally-observable callback contract: `on_line`
+        // is invoked exactly once per emitted line, in the same order
+        // the lines appear in the returned Vec. Each invocation
+        // records the count of prior invocations, yielding [0, 1, 2]
+        // across three lines — proving once-per-line invocation and
+        // stable ordering.
+        let input: &[u8] = b"a\nb\nc\n";
+        let lens = std::cell::RefCell::new(Vec::<usize>::new());
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_line| {
+            let mut v = lens.borrow_mut();
+            let current = v.len();
+            v.push(current);
+        })
+        .unwrap();
+        assert_eq!(captured, vec!["a", "b", "c"]);
+        assert_eq!(lens.into_inner(), vec![0, 1, 2]);
+    }
+
     // -- resolve_flags --
 
     #[test]
